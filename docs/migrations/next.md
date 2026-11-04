@@ -185,6 +185,55 @@ still need no feature.
 **Automation:** `manual` — the right family depends on which widgets the app
 uses, so no codemod can choose it.
 
+### Features: `jwt` and `push` are now optional
+
+**Why:** Every app compiled `jsonwebtoken` and `p256`, whether or not it
+verified a JWT or sent a Web Push. `jsonwebtoken` brings in `rsa` 0.9
+(RUSTSEC-2023-0071, no fixed release) and `crypto-bigint` 0.5
+(RUSTSEC-2026-0387, fixed only in 0.7.6, which elliptic-curve 0.13 cannot
+take). An app that used neither still had to waive both in its `cargo deny`
+policy. Each crate is now behind its own feature. Both are in `default`, so a
+default build is the same as before.
+
+**Who is affected:** An app that sets `default-features = false` and uses JWT
+tenancy, OIDC or Web Push. An app that keeps the default features needs no
+change.
+
+| Feature | Owns | Covers |
+|---------|------|--------|
+| `jwt` | `jsonwebtoken` | `tenancy.source = "jwt"`, and the OIDC `id_token` check. `oauth2` turns on `jwt`. |
+| `push` | `p256` | `autumn_web::push` (`WebPush`, `PushMessage`, `[push]`), `AppBuilder::with_web_push`, `AppBuilder::with_push_subscription_store`, and the matching `TestApp` methods |
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y.Z}", default-features = false, features = ["maud", "htmx"] }
+```
+
+**After, for an app that uses JWT tenancy and Web Push:**
+
+```toml
+autumn-web = { version = "{X.Z.0}", default-features = false, features = ["maud", "htmx", "jwt", "push"] }
+```
+
+A build without a feature refuses the config that needs it, before it binds
+a port, and names the fix:
+
+- `[push]`, or any `AUTUMN_PUSH__*` variable, without `push`: the boot stops
+  with exit code 1. The `[push]` table still parses, so a strict config file
+  stays valid.
+- `tenancy.enabled = true` with `tenancy.source = "jwt"`, without `jwt`: the
+  boot stops with exit code 1. A router built without `run` fails closed: tenant
+  resolution returns a 500, and never reads a tenant from an unverified token.
+
+An app that leaves out both features (and `oauth2`) compiles neither
+`jsonwebtoken`, `rsa` nor `crypto-bigint` 0.5, and can delete the
+`RUSTSEC-2023-0071` and `RUSTSEC-2026-0387` waivers from its `deny.toml`. A
+passkey app (`webauthn`) still reaches `rsa` through `webauthn-rs`.
+
+**Automation:** `manual` — whether an app verifies a JWT or sends a push is
+not visible from its `Cargo.toml`.
+
 ### {Area}: {Short description}
 
 **Why:** One or two sentences on the motivation.
@@ -517,6 +566,49 @@ DatabaseFleetConfig {
 **Automation:** `manual` — a struct literal needs the values the app wants.
 A codemod cannot choose them.
 
+### Widgets: `AutocompleteConfig` has five new fields
+
+**Why:** `autocomplete_input` has a tags mode (issue #3410). `multiple`
+turns it on. `selected` holds the first chips. `remove_label` is the
+`aria-label` of each remove button. `added_message` and `removed_message`
+are the status texts.
+
+**You are affected only if your code builds an `AutocompleteConfig` with
+a struct literal.** Code that calls `AutocompleteConfig::new` needs no
+change.
+
+**Before (`{X.Y}`):**
+
+```rust
+AutocompleteConfig {
+    action: "/tags/autocomplete",
+    value_name: "tag_id",
+    // … the other fields …
+    free_text: false,
+    initial_value: None,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+AutocompleteConfig {
+    action: "/tags/autocomplete",
+    value_name: "tag_id",
+    // … the other fields …
+    free_text: false,
+    initial_value: None,
+    multiple: false,
+    selected: &[],
+    remove_label: "Remove {label}",
+    added_message: "{label} added",
+    removed_message: "{label} removed",
+}
+```
+
+**Automation:** `manual`. Or use `AutocompleteConfig::new` and the
+builder methods. Then you need no change.
+
 ### Config: an unknown `AUTUMN_ROLE` stops the boot
 
 **Why:** a typo such as `AUTUMN_ROLE=workers` booted the app as `combined`
@@ -539,7 +631,7 @@ The app booted as `combined`.
 **After (`{(X+1).0}`):**
 
 ```text
-configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: combined, all, web_and_worker, server_and_worker, web, server, http, worker, jobs, worker_only)
+configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: combined, all, web_and_worker, server_and_worker, web, server, http, worker, jobs, worker_only), and no [roles.workers] is declared (no roles are declared)
 ```
 
 The app does not boot. Set a valid value, or remove the variable to get
@@ -551,6 +643,93 @@ report "No database URL found". If a CLI command fails in this way, examine
 `AUTUMN_ROLE` in your shell.
 
 **Automation:** `manual` — the fix is in the deployment env, not in code.
+
+### Config: `state.role()` returns `&Role`; `config.role` is a `RoleName`
+
+**Why:** a process can now run a named `[roles.<name>]` preset (issue #3543).
+`ProcessRole` is a closed enum and cannot hold a name. The new `Role` holds
+the name, the built-in base and the capability set.
+
+**You are affected only if your code compares `state.role()` with a
+`ProcessRole`, stores it as a `ProcessRole`, or sets `config.role`.** A call
+such as `state.role().serves_http()` or `state.role().runs_workers()` compiles
+as before.
+
+**Before (`{X.Y}`):**
+
+```rust
+let role: ProcessRole = state.role();
+if state.role() == ProcessRole::Worker { /* … */ }
+config.role = ProcessRole::Web;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let role: ProcessRole = state.role().base();
+if state.role().base() == ProcessRole::Worker { /* … */ }
+config.role = ProcessRole::Web.into();
+```
+
+`Role == ProcessRole` is `true` only for that built-in role. A preset over
+`worker` is not equal to `ProcessRole::Worker`. Compare `base()` to include
+the presets. `state.role().name()` gives the name.
+
+A top-level `[roles]` table now belongs to the framework. If your
+`autumn.toml` uses `[roles]` for app data, move that data to another key. The
+load fails on it otherwise.
+
+A custom config loader that skips `validate()` and sets an undeclared
+`AUTUMN_ROLE` name no longer boots with a warning. The boot stops.
+
+**Automation:** `manual` — the right fix depends on whether the code means
+"this built-in role" or "every tier on this base".
+
+### Routing: `Route` and `AutumnConfig` have new fields
+
+**Why:** route groups and per-role mounting (issue #3544) add `Route::group`
+and `AutumnConfig::route_groups`. These structs have public fields and are
+not `#[non_exhaustive]`, so an old struct literal does not compile. The
+route macros set `group` for you.
+
+**You are affected only if your code builds a `Route { .. }` literal, builds
+an `AutumnConfig { .. }` literal with no `..Default::default()`, or uses a
+top-level `[route_groups]` table for app data.**
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let route = autumn_web::Route {
+    // …
+    criticality: autumn_web::Criticality::Default,
+    seo: Default::default(),
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let route = autumn_web::Route {
+    // …
+    criticality: autumn_web::Criticality::Default,
+    seo: Default::default(),
+    group: None,
+};
+```
+
+`group: None` puts the route in the group of the code that registers it:
+the `routes_in` group, else the plugin group, else `app`. A role without `mount` serves every group, so
+nothing else changes.
+
+`RouteInfo` has a new field `group`, and `graph::manifest::Completeness` has
+a new field `mounted_elsewhere`. Both derive `Default`. Use
+`..Default::default()` in a literal.
+
+A top-level `[route_groups]` table now belongs to the framework. If your
+`autumn.toml` uses it for app data, move that data to another key.
+
+**Automation:** `manual` — a codemod cannot know which group a hand-built
+route belongs to.
 
 ### Toolchain: Rust 1.97.0 or newer
 
@@ -711,6 +890,12 @@ Changes that still compile but behave differently at runtime. Examples:
 
 If nothing changed, delete this section.
 
+- **The graph counts routes that another role serves (#3544).** When an app
+  declares a `[roles.<name>]` preset over `web` or `combined`, the graph of
+  any other role (a worker, say) lists the routes that preset mounts under
+  `completeness.mounted_elsewhere`, not under `unmounted_routes`. A committed
+  graph of such a role changes once. Regenerate it with
+  `autumn graph show --manifest <path>`.
 - **Widgets follow the OS dark mode (#3396).** The widget stylesheet sets
   `color-scheme: light dark`, and each color token has a dark value. On a
   dark OS, fields, cards, alerts, modals and toasts become dark. A page whose

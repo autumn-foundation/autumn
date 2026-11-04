@@ -4,7 +4,7 @@
 //! reports each as ✅/⚠️/❌ with a one-line remediation hint, and exits with
 //! code 0 (all clear) or 1 (any failure detected).
 
-use autumn_web::config::{DeployConfig, ProcessRole};
+use autumn_web::config::{DeployConfig, ProcessRole, Role, RolePreset};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -4974,17 +4974,19 @@ fn check_database_topology_contract(
 /// The `process_role_backend` row. An unknown role fails here, as it fails
 /// the boot (#3541). A valid role goes to [`check_split_topology_on_local`].
 fn check_process_role(
-    role: &Result<ProcessRole, String>,
+    role: &Result<Role, String>,
     jobs_backend: &str,
     database_url: Option<&str>,
 ) -> CheckResult {
     match role {
-        Ok(role) => check_split_topology_on_local(*role, jobs_backend, database_url),
+        Ok(role) => check_split_topology_on_local(role, jobs_backend, database_url),
         Err(message) => CheckResult {
             name: "process_role_backend",
             status: CheckStatus::Fail,
             detail: Some(format!("{message}; the app does not boot")),
-            hint: Some("Set AUTUMN_ROLE (or role in autumn.toml) to combined, web or worker"),
+            hint: Some(
+                "Set AUTUMN_ROLE (or role in autumn.toml) to combined, web, worker or a declared [roles.<name>] preset",
+            ),
         },
     }
 }
@@ -5001,12 +5003,17 @@ fn check_process_role(
 /// replica's enqueue never reaches a worker replica's queue.
 /// [`autumn_web::config::split_role_requires_durable_backend`] flags that invalid
 /// combo; the app itself rejects it at startup, and doctor surfaces it up front.
+///
+/// A `[roles.<name>]` preset is checked on its base, as at boot (#3543). A
+/// `combined` preset that runs no job workers counts as `web`.
 fn check_split_topology_on_local(
-    role: ProcessRole,
+    role: &Role,
     jobs_backend: &str,
     database_url: Option<&str>,
 ) -> CheckResult {
     let backend = jobs_backend.trim();
+    let label = role_label(role);
+    let role = role.guard_base();
     // The sqlite queue is shareable only because both processes open the same
     // FILE. An in-memory target gives each its own database, so the web replica
     // enqueues where no worker can look (issue #1907).
@@ -5015,10 +5022,9 @@ fn check_split_topology_on_local(
             name: "process_role_backend",
             status: CheckStatus::Fail,
             detail: Some(format!(
-                "role={} with jobs.backend=\"sqlite\" on an in-memory database: an in-memory \
+                "role={label} with jobs.backend=\"sqlite\" on an in-memory database: an in-memory \
                  SQLite target is private to each process, so a split web/worker topology would \
                  enqueue into a queue no worker process can see",
-                role.as_str(),
             )),
             hint: Some(
                 "Point database.url at a sqlite:// FILE for a split web/worker role, or run the combined role",
@@ -5030,11 +5036,10 @@ fn check_split_topology_on_local(
             name: "process_role_backend",
             status: CheckStatus::Fail,
             detail: Some(format!(
-                "role={} with jobs.backend=\"{backend}\": a split web/worker role needs a durable \
-                 (postgres/redis/sqlite) jobs backend; \"{backend}\" is not a recognized durable \
-                 backend and falls through to the in-process `local` runtime, which cannot share a \
-                 job queue across the separate web and worker processes",
-                role.as_str(),
+                "role={label} with jobs.backend=\"{backend}\": a split web/worker role needs a \
+                 durable (postgres/redis/sqlite) jobs backend; \"{backend}\" is not a recognized \
+                 durable backend and falls through to the in-process `local` runtime, which cannot \
+                 share a job queue across the separate web and worker processes",
             )),
             hint: Some(
                 "Set jobs.backend = \"postgres\" (or redis, or sqlite on the single-host SQLite tier) for split web/worker roles, or run the combined role",
@@ -5042,15 +5047,24 @@ fn check_split_topology_on_local(
         };
     }
     let detail = if role == ProcessRole::Combined {
-        format!("role={}", role.as_str())
+        format!("role={label}")
     } else {
-        format!("role={}, jobs.backend={backend}", role.as_str())
+        format!("role={label}, jobs.backend={backend}")
     };
     CheckResult {
         name: "process_role_backend",
         status: CheckStatus::Pass,
         detail: Some(detail),
         hint: None,
+    }
+}
+
+/// `name`, or `name (base worker)` for a `[roles.<name>]` preset.
+fn role_label(role: &Role) -> String {
+    if role.is_preset() {
+        format!("{} (base {})", role.name(), role.base().as_str())
+    } else {
+        role.name().to_owned()
     }
 }
 
@@ -5068,27 +5082,30 @@ fn check_split_topology_on_local(
 /// schedule. This check only reports, for operator awareness, what this process
 /// claims and which queues it does not.
 ///
-/// Gated on the `job_workers` capability of the resolved [`ProcessRole`]. A
-/// web-only role runs no job workers, so queue pinning does not apply. The
-/// check passes with a note and does not evaluate the pin.
-fn check_queue_coverage(
-    role: ProcessRole,
-    configured_queues: &[String],
-    pin: &[String],
-) -> CheckResult {
-    // Web-only role: runs no job workers at all, so queue pinning cannot leave a
-    // queue uncovered *in this process* — the check is not applicable. Do not
-    // evaluate pin/empty-schedule; this must never fail `--strict`.
+/// Gated on the `job_workers` capability of the resolved [`Role`]. A role
+/// with no job workers does not apply queue pinning. The check passes with a
+/// note and does not evaluate the pin. A preset `pin` replaces `jobs.pin`
+/// (#3543).
+fn check_queue_coverage(role: &Role, configured_queues: &[String], pin: &[String]) -> CheckResult {
+    // A role with no job workers cannot leave a queue uncovered *in this
+    // process*: the check is not applicable. Do not evaluate pin/empty-schedule;
+    // this must never fail `--strict`.
     if !role.capabilities().job_workers {
+        let who = if role.base() == ProcessRole::Web {
+            "web-only role".to_owned()
+        } else {
+            format!("role {}", role.name())
+        };
         return CheckResult {
             name: "jobs_queue_coverage",
             status: CheckStatus::Pass,
-            detail: Some(
-                "web-only role runs no job workers; queue pinning not applicable".to_string(),
-            ),
+            detail: Some(format!(
+                "{who} runs no job workers; queue pinning not applicable"
+            )),
             hint: None,
         };
     }
+    let pin = role.pin().unwrap_or(pin);
 
     // Unpinned (empty/absent pin): the process drains every configured queue.
     if pin.is_empty() {
@@ -5173,8 +5190,10 @@ struct FleetTopology {
     tiers: Vec<Vec<String>>,
     /// `[jobs.fleet] tiers` was present but not a list of lists, so no topology
     /// could be read from it. Reported as a failure rather than treated as
-    /// "nothing declared" — see [`resolve_fleet_topology`].
+    /// "nothing declared" — see [`resolve_fleet_topology_with_pin`].
     malformed: bool,
+    /// The tiers come from `[roles.*]`, not from `[jobs.fleet] tiers` (#3543).
+    derived: bool,
 }
 
 impl FleetTopology {
@@ -5184,6 +5203,7 @@ impl FleetTopology {
         Self {
             tiers: Vec::new(),
             malformed: true,
+            derived: false,
         }
     }
 
@@ -5225,7 +5245,7 @@ impl FleetTopology {
 /// this delegates verbatim to the informational-only [`check_queue_coverage`],
 /// so absent the topology input the check behaves exactly as it does today.
 fn check_queue_coverage_topology(
-    role: ProcessRole,
+    role: &Role,
     configured_queues: &[String],
     pin: &[String],
     declared_queues: &[String],
@@ -5297,23 +5317,44 @@ fn check_queue_coverage_topology(
     };
 
     let tier_count = fleet.tiers.len();
+    let source = if fleet.derived {
+        ", derived from [roles.*]"
+    } else {
+        ""
+    };
     if gap.is_empty() {
         CheckResult {
             name: "jobs_queue_coverage",
             status: CheckStatus::Pass,
             detail: Some(format!(
-                "declared fleet topology ({tier_count} tier(s)) drains every needed queue {:?} \
+                "declared fleet topology ({tier_count} tier(s){source}) drains every needed queue {:?} \
                  (configured + #[job(queue)]-declared); coverage is provable topology-wide",
                 needed.iter().collect::<Vec<_>>()
             )),
             hint: None,
+        }
+    } else if fleet.derived {
+        // Derived tiers list only the presets. A tier that runs as a plain
+        // built-in role can drain the gap, so warn: `--strict` still fails.
+        CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "declared fleet topology ({tier_count} tier(s){source}) leaves queue(s) {} drained by no \
+                 [roles.<name>] preset; a tier that runs as a built-in role is not in this list",
+                gap.join(", ")
+            )),
+            hint: Some(
+                "Add the uncovered queue(s) to the pin of a [roles.<name>] preset, or set \
+                 [jobs.fleet] tiers to list every tier, built-in roles included",
+            ),
         }
     } else {
         CheckResult {
             name: "jobs_queue_coverage",
             status: CheckStatus::Fail,
             detail: Some(format!(
-                "declared fleet topology ({tier_count} tier(s)) leaves queue(s) {} drained by no \
+                "declared fleet topology ({tier_count} tier(s){source}) leaves queue(s) {} drained by no \
                  worker tier; jobs enqueued to them will accumulate forever",
                 gap.join(", ")
             )),
@@ -6346,7 +6387,7 @@ where
 fn resolve_process_role_and_backend(
     table: Option<&toml::Table>,
     env: &dyn autumn_web::config::Env,
-) -> (Result<ProcessRole, String>, String) {
+) -> (Result<Role, String>, String) {
     resolve_process_role_and_backend_from_sources(
         |key| env.var(key).ok().filter(|value| !value.is_empty()),
         table,
@@ -6356,7 +6397,7 @@ fn resolve_process_role_and_backend(
 fn resolve_process_role_and_backend_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
-) -> (Result<ProcessRole, String>, String)
+) -> (Result<Role, String>, String)
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -6372,22 +6413,24 @@ where
     (role, backend)
 }
 
-/// Resolve the role as the runtime loader does (#3541).
+/// Resolve the role as the runtime loader does (#3541, #3543).
 ///
 /// The loader parses the TOML `role` first, so a bad one is an error even
 /// when `AUTUMN_ROLE` is valid. Then a non-blank `AUTUMN_ROLE` wins. A blank
-/// one is unset. An unknown value is an error with the boot error text.
+/// one is unset. The name resolves against `[roles.*]`. An unknown value or a
+/// bad preset is an error with the boot error text.
 fn resolve_process_role_from_sources<F>(
     env_var: &F,
     table: Option<&toml::Table>,
-) -> Result<ProcessRole, String>
+) -> Result<Role, String>
 where
     F: Fn(&str) -> Option<String>,
 {
+    use autumn_web::config::RoleName;
     let configured = match table.and_then(|t| t.get("role")) {
-        None => ProcessRole::Combined,
+        None => RoleName::default(),
         Some(toml::Value::String(value)) => value
-            .parse::<ProcessRole>()
+            .parse::<RoleName>()
             .map_err(|err| format!("role: {err}"))?,
         // serde's table form of a unit variant, `role = { web = {} }`. The
         // loader accepts it too.
@@ -6400,7 +6443,7 @@ where
             table
                 .keys()
                 .next()
-                .map_or(Ok(ProcessRole::Combined), |name| name.parse())
+                .map_or_else(|| Ok(RoleName::default()), |name| name.parse())
                 .map_err(|err| format!("role: {err}"))?
         }
         Some(other) => {
@@ -6411,11 +6454,174 @@ where
         }
     };
     let from_env = env_var("AUTUMN_ROLE")
-        .map(|value| ProcessRole::parse_env_override(&value))
+        .map(|value| RoleName::parse_env_override(&value))
         .transpose()
         .map_err(|err| format!("AUTUMN_ROLE: {err}"))?
         .flatten();
-    Ok(from_env.unwrap_or(configured))
+    let roles = resolve_role_presets(table)?;
+    // A bad TOML `role` fails even when `AUTUMN_ROLE` is valid, as at boot.
+    autumn_web::config::resolve_role(&configured, &roles).map_err(|err| format!("role: {err}"))?;
+    let source = if from_env.is_some() {
+        "AUTUMN_ROLE"
+    } else {
+        "role"
+    };
+    let name = from_env.unwrap_or(configured);
+    autumn_web::config::resolve_role(&name, &roles).map_err(|err| format!("{source}: {err}"))
+}
+
+/// Read and check `[roles.*]` (#3543) with the loader's own types, so doctor
+/// and boot accept the same presets.
+fn resolve_role_presets(
+    table: Option<&toml::Table>,
+) -> Result<std::collections::BTreeMap<String, RolePreset>, String> {
+    let Some(value) = table.and_then(|t| t.get("roles")) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let roles: std::collections::BTreeMap<String, RolePreset> = value
+        .clone()
+        .try_into()
+        .map_err(|err| format!("roles: {err}"))?;
+    autumn_web::config::validate_role_presets(&roles).map_err(|err| err.to_string())?;
+    Ok(roles)
+}
+
+/// Why `[route_groups] manifest` gave no groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteGroupsManifestError {
+    /// The file is not there. The row warns, so a typo in the path does not
+    /// turn the check off.
+    Missing(String),
+    /// The file has no `group` keys: it is old, or it is not a route dump.
+    NoGroups(String),
+    /// The file is not a JSON array of routes.
+    Corrupt(String),
+}
+
+/// The route groups `[route_groups]` declares: the `group` of each route in
+/// the `manifest` file (the `autumn routes --format json` output), else the
+/// `declared` list. `Ok(None)`: the section declares nothing.
+///
+/// # Errors
+///
+/// A manifest that is missing, has no groups, or is not a JSON array.
+fn resolve_route_groups<F>(
+    table: Option<&toml::Table>,
+    read_file: F,
+) -> Result<Option<Vec<String>>, RouteGroupsManifestError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(section) = table
+        .and_then(|t| t.get("route_groups"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(None);
+    };
+    if let Some(path) = section.get("manifest").and_then(toml::Value::as_str) {
+        let Some(contents) = read_file(path) else {
+            return Err(RouteGroupsManifestError::Missing(format!(
+                "route_groups.manifest {path:?} is not there"
+            )));
+        };
+        let routes: Vec<serde_json::Value> = serde_json::from_str(&contents).map_err(|err| {
+            RouteGroupsManifestError::Corrupt(format!(
+                "route_groups.manifest {path:?} is not `autumn routes --format json` output: {err}"
+            ))
+        })?;
+        let groups: std::collections::BTreeSet<String> = routes
+            .iter()
+            .filter_map(|route| route.get("group").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        if groups.is_empty() {
+            return Err(RouteGroupsManifestError::NoGroups(format!(
+                "route_groups.manifest {path:?} names no route group"
+            )));
+        }
+        return Ok(Some(groups.into_iter().collect()));
+    }
+    let declared: Vec<String> = section
+        .get("declared")
+        .and_then(toml::Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((!declared.is_empty()).then_some(declared))
+}
+
+/// `route_group_mounts` row (#3544): each declared route group needs a
+/// `[roles.<name>]` preset that mounts it.
+///
+/// A gap is a warning, so `--strict` fails on it. A built-in role is not
+/// counted, as for the derived job tiers. The row passes when no preset sets
+/// `mount`, because then every HTTP role serves every group.
+fn check_route_group_mounts<F>(table: Option<&toml::Table>, read_file: F) -> CheckResult
+where
+    F: Fn(&str) -> Option<String>,
+{
+    const NAME: &str = "route_group_mounts";
+    let pass = |detail: String| CheckResult {
+        name: NAME,
+        status: CheckStatus::Pass,
+        detail: Some(detail),
+        hint: None,
+    };
+    let Ok(roles) = resolve_role_presets(table) else {
+        return pass("skipped: [roles] is invalid; see process_role_backend".to_owned());
+    };
+    if !roles.values().any(|preset| preset.mount.is_some()) {
+        return pass("no [roles.<name>] sets mount; every HTTP role serves every group".to_owned());
+    }
+    let groups = match resolve_route_groups(table, read_file) {
+        Ok(Some(groups)) => groups,
+        Ok(None) => {
+            return pass(
+                "not checked: set [route_groups] manifest or declared to check that each \
+                 group has a role"
+                    .to_owned(),
+            );
+        }
+        Err(error) => {
+            let (status, detail) = match error {
+                RouteGroupsManifestError::Corrupt(detail) => (CheckStatus::Fail, detail),
+                RouteGroupsManifestError::Missing(detail)
+                | RouteGroupsManifestError::NoGroups(detail) => (CheckStatus::Warn, detail),
+            };
+            return CheckResult {
+                name: NAME,
+                status,
+                detail: Some(detail),
+                hint: Some("Regenerate it: autumn routes --format json > <manifest path>"),
+            };
+        }
+    };
+    let missing = autumn_web::config::groups_mounted_by_no_preset(&roles, &groups);
+    if missing.is_empty() {
+        return pass(format!(
+            "{} route group(s), each mounted by a role",
+            groups.len()
+        ));
+    }
+    let names: Vec<String> = missing.iter().map(|g| format!("{g:?}")).collect();
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "route group(s) {} mounted by no [roles.<name>] preset; no process serves \
+             their routes",
+            names.join(", ")
+        )),
+        hint: Some(
+            "Add each group to the mount list of a role, or add a role without mount. \
+             A built-in role (web, combined) is not counted.",
+        ),
+    }
 }
 
 /// Resolve the configured queue names and the effective `jobs.pin` for the
@@ -6493,14 +6699,23 @@ where
 
 /// Resolve the declared fleet topology (#1756) from `[jobs.fleet] tiers`. Each
 /// entry is one worker tier's pin (a TOML array of queue names); an empty array
-/// is an unpinned tier that drains every queue. Returns `None` when the section
-/// is absent or declares no tiers, keeping the coverage check informational-only.
+/// is an unpinned tier that drains every queue. Returns `None` when neither
+/// `tiers` nor `[roles.*]` declares a tier, keeping the coverage check
+/// informational-only.
 ///
 /// Chosen as a config section (rather than a repeatable CLI flag) because doctor
 /// already resolves `jobs.queues` / `jobs.pin` from the merged active-profile
 /// table, so the topology lives beside them, is profile-aware, and is checked
 /// into the repo as one source of truth for the fleet.
-fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
+///
+/// With no `tiers` (or `tiers = []`), the tiers come from `[roles.*]`
+/// (#3543). A derived tier without its own `pin` inherits `jobs_pin`: `run()`
+/// passes the pin it resolved, env included. `None` reads `jobs.pin` from
+/// `table`.
+fn resolve_fleet_topology_with_pin(
+    table: Option<&toml::Table>,
+    jobs_pin: Option<&[String]>,
+) -> Option<FleetTopology> {
     // A malformed `[jobs.fleet]` must NOT be silently dropped at ANY level.
     // Every `?` here would otherwise return `None`, which the caller reads as
     // "no topology declared" and answers with the informational-only report —
@@ -6509,13 +6724,17 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
     // pre-deploy gate that passes them has the ordering exactly backwards.
     let jobs = table
         .and_then(|t| t.get("jobs"))
-        .and_then(toml::Value::as_table)?;
-    // Genuinely absent: nothing declared, nothing to check.
-    let fleet = jobs.get("fleet")?;
+        .and_then(toml::Value::as_table);
+    // No `[jobs.fleet] tiers`: derive the tiers from `[roles.*]` (#3543).
+    let Some(fleet) = jobs.and_then(|jobs| jobs.get("fleet")) else {
+        return derive_fleet_topology(table, jobs_pin);
+    };
     let Some(fleet) = fleet.as_table() else {
         return Some(FleetTopology::malformed());
     };
-    let declared = fleet.get("tiers")?;
+    let Some(declared) = fleet.get("tiers") else {
+        return derive_fleet_topology(table, jobs_pin);
+    };
     // `tiers = "critical"` — a bare value rather than a list of lists.
     let Some(declared) = declared.as_array() else {
         return Some(FleetTopology::malformed());
@@ -6541,12 +6760,55 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
         }
         tiers.push(names);
     }
+    // `tiers = []` declares nothing: derive, as for an absent `tiers`.
     if tiers.is_empty() {
-        return None;
+        return derive_fleet_topology(table, jobs_pin);
     }
     Some(FleetTopology {
         tiers,
         malformed: false,
+        derived: false,
+    })
+}
+
+/// [`resolve_fleet_topology_with_pin`] with `jobs.pin` read from `table`.
+#[cfg(test)]
+fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
+    resolve_fleet_topology_with_pin(table, None)
+}
+
+/// The fleet topology that `[roles.*]` declares: one tier for each preset that
+/// runs job workers. `None` when no preset runs job workers. A bad preset also
+/// gives `None`: the `process_role_backend` row fails on it.
+fn derive_fleet_topology(
+    table: Option<&toml::Table>,
+    jobs_pin: Option<&[String]>,
+) -> Option<FleetTopology> {
+    let roles = resolve_role_presets(table).ok()?;
+    if let Some(jobs_pin) = jobs_pin {
+        let tiers = autumn_web::config::derive_fleet_tiers(&roles, jobs_pin).ok()?;
+        return (!tiers.is_empty()).then_some(FleetTopology {
+            tiers,
+            malformed: false,
+            derived: true,
+        });
+    }
+    let jobs_pin: Vec<String> = table
+        .and_then(|t| t.get("jobs"))
+        .and_then(|jobs| jobs.get("pin"))
+        .and_then(toml::Value::as_array)
+        .map(|pin| {
+            pin.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let tiers = autumn_web::config::derive_fleet_tiers(&roles, &jobs_pin).ok()?;
+    (!tiers.is_empty()).then_some(FleetTopology {
+        tiers,
+        malformed: false,
+        derived: true,
     })
 }
 
@@ -9769,14 +10031,16 @@ pub fn run(opts: DoctorOptions) {
     // default here so this row still reports.
     let (queue_coverage_role, _) =
         resolve_process_role_and_backend(Some(&merged_jobs_toml), db_denv.as_ref());
-    let queue_coverage_role = queue_coverage_role.unwrap_or_default();
+    let queue_coverage_role =
+        queue_coverage_role.unwrap_or_else(|_| Role::from(ProcessRole::Combined));
     // Topology/registry inputs (#1756) that let the coverage check restore a
     // SOUND `--strict` hard-fail: the declared fleet topology (all worker tiers'
     // pins) and the compiled `#[job(queue)]` set (from a jobs manifest or an
     // inline list). Absent both, `check_queue_coverage_topology` delegates to the
     // informational-only per-process report, so existing deployments never
     // regress.
-    let fleet_topology = resolve_fleet_topology(Some(&merged_jobs_toml));
+    // Derived tiers inherit the `jobs.pin` this process resolves, env included.
+    let fleet_topology = resolve_fleet_topology_with_pin(Some(&merged_jobs_toml), Some(&jobs_pin));
     let (declared_queues, declared_queues_manifest_error) =
         match resolve_declared_queues(Some(&merged_jobs_toml)) {
             Ok(queues) => (queues, None),
@@ -9786,13 +10050,22 @@ pub fn run(opts: DoctorOptions) {
         };
     tasks.push(Box::new(move || {
         check_queue_coverage_topology(
-            queue_coverage_role,
+            &queue_coverage_role,
             &configured_queues,
             &jobs_pin,
             &declared_queues,
             fleet_topology.as_ref(),
             declared_queues_manifest_error.as_ref(),
         )
+    }));
+
+    // Route groups (#3544): every declared group needs a role that mounts it.
+    // Read from the same merged active-profile table as the roles above.
+    let route_groups_toml = merged_jobs_toml;
+    tasks.push(Box::new(move || {
+        check_route_group_mounts(Some(&route_groups_toml), |path| {
+            std::fs::read_to_string(path).ok()
+        })
     }));
 
     // A `sqlite://` primary boots only as the lone, single-backend, unsharded database
@@ -10957,8 +11230,131 @@ pub fn run(opts: DoctorOptions) {
         ))
     }));
 
+    // 20. Table-ownership boundaries (#3549). Only when the app declares them.
+    let boundaries_path = std::path::Path::new(autumn_web::graph::boundaries::CONFIG_FILE);
+    if boundaries_path.exists() {
+        tasks.push(Box::new(move || check_table_boundaries(boundaries_path)));
+    }
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     run_doctor_tasks(tasks, opts);
+}
+
+/// Check the table-ownership boundaries (#3549).
+///
+/// Doctor does not build the app. So the graph rule reads the committed graph
+/// that `graph` in `boundaries.toml` names, and the crate rule runs
+/// `cargo metadata --offline` with a time budget.
+fn check_table_boundaries(config_path: &std::path::Path) -> CheckResult {
+    use crate::boundaries::{
+        DOCTOR_BUDGET, cargo_facts, load_baseline, load_config, load_graph, relative_to_config,
+    };
+    let config = match load_config(config_path) {
+        Ok(config) => config,
+        Err(e) => return table_boundaries_result(CheckStatus::Fail, e),
+    };
+    let graph = config
+        .graph
+        .as_deref()
+        .map(|p| load_graph(&relative_to_config(config_path, p)));
+    let dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let facts = cargo_facts(dir, &[], true, Some(DOCTOR_BUDGET));
+    let baseline = config
+        .baseline
+        .as_deref()
+        .map(|p| load_baseline(&relative_to_config(config_path, p)))
+        .transpose()
+        .map(Option::flatten);
+    check_table_boundaries_impl(config, graph, facts, baseline)
+}
+
+/// The verdict of [`check_table_boundaries`], from its inputs.
+///
+/// A rule that cannot run warns, so `--strict` does not pass a check that did
+/// not happen. A violation warns too. A config that names one table, node or
+/// crate in two boundaries equally fails.
+fn check_table_boundaries_impl(
+    config: autumn_web::graph::boundaries::BoundaryConfig,
+    graph: Option<Result<autumn_web::graph::manifest::ArchitectureGraph, String>>,
+    facts: Result<crate::boundaries::CargoFacts, String>,
+    baseline: Result<Option<autumn_web::graph::boundaries::Baseline>, String>,
+) -> CheckResult {
+    let mut notes = Vec::new();
+    let graph = match graph {
+        None => {
+            notes.push(
+                "graph rule not run: set `graph` in boundaries.toml to a committed \
+                 architecture graph"
+                    .to_owned(),
+            );
+            None
+        }
+        Some(Err(e)) => {
+            notes.push(format!("graph rule not run: {e}"));
+            None
+        }
+        Some(Ok(graph)) => Some(graph),
+    };
+    let facts = match facts {
+        Ok(facts) => Some(facts),
+        Err(e) => {
+            notes.push(format!("crate rule not run: {e}"));
+            None
+        }
+    };
+    let baseline = match baseline {
+        Ok(baseline) => baseline,
+        Err(e) => return table_boundaries_result(CheckStatus::Warn, e),
+    };
+    let (result, _) = match crate::boundaries::evaluate(
+        config,
+        graph.as_ref(),
+        facts.as_ref(),
+        baseline.as_ref(),
+    ) {
+        Ok(evaluated) => evaluated,
+        Err(e) => return table_boundaries_result(CheckStatus::Fail, e),
+    };
+    if result.passes() && notes.is_empty() {
+        return CheckResult {
+            name: "table_boundaries",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "no new boundary violations ({} known in the baseline, {} pattern warning(s))",
+                result.known.len(),
+                result.warnings.len()
+            )),
+            hint: None,
+        };
+    }
+    let mut detail = if result.passes() {
+        String::new()
+    } else {
+        result.render().trim_end().to_owned()
+    };
+    for note in notes {
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str(&note);
+    }
+    table_boundaries_result(CheckStatus::Warn, detail)
+}
+
+/// A `table_boundaries` result with the shared hint.
+const fn table_boundaries_result(status: CheckStatus, detail: String) -> CheckResult {
+    CheckResult {
+        name: "table_boundaries",
+        status,
+        detail: Some(detail),
+        hint: Some(
+            "Run `autumn graph check-boundaries` for the full report. \
+             See docs/guide/table-ownership.md",
+        ),
+    }
 }
 
 fn run_doctor_tasks(tasks: Vec<Box<dyn FnOnce() -> CheckResult + Send>>, opts: DoctorOptions) {
@@ -19297,7 +19693,7 @@ foo = "bar"
 
     #[test]
     fn split_topology_fails_on_web_role_with_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Web, "local", None);
+        let result = check_split_topology_on_local(&ProcessRole::Web.into(), "local", None);
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap_or_default();
         assert!(
@@ -19313,14 +19709,14 @@ foo = "bar"
 
     #[test]
     fn split_topology_fails_on_worker_role_with_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Worker, "local", None);
+        let result = check_split_topology_on_local(&ProcessRole::Worker.into(), "local", None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("worker"));
     }
 
     #[test]
     fn split_topology_passes_for_combined_role_on_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Combined, "local", None);
+        let result = check_split_topology_on_local(&ProcessRole::Combined.into(), "local", None);
         assert_eq!(result.status, CheckStatus::Pass);
         // Combined never splits, so the detail need not mention the backend.
         assert_eq!(result.detail.as_deref(), Some("role=combined"));
@@ -19329,7 +19725,7 @@ foo = "bar"
 
     #[test]
     fn split_topology_passes_for_web_role_on_postgres_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Web, "postgres", None);
+        let result = check_split_topology_on_local(&ProcessRole::Web.into(), "postgres", None);
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=web"), "got: {detail}");
@@ -19338,7 +19734,7 @@ foo = "bar"
 
     #[test]
     fn split_topology_passes_for_worker_role_on_redis_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Worker, "redis", None);
+        let result = check_split_topology_on_local(&ProcessRole::Worker.into(), "redis", None);
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=worker"), "got: {detail}");
@@ -19350,7 +19746,7 @@ foo = "bar"
     #[test]
     fn split_topology_passes_for_worker_role_on_sqlite_backend() {
         let result = check_split_topology_on_local(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             "sqlite",
             Some("sqlite:///var/lib/app.db"),
         );
@@ -19363,8 +19759,11 @@ foo = "bar"
     /// Issue #1907: the sqlite queue backs a split role only on a FILE.
     #[test]
     fn split_topology_fails_for_sqlite_on_an_in_memory_database() {
-        let result =
-            check_split_topology_on_local(ProcessRole::Web, "sqlite", Some("sqlite::memory:"));
+        let result = check_split_topology_on_local(
+            &ProcessRole::Web.into(),
+            "sqlite",
+            Some("sqlite::memory:"),
+        );
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("in-memory"), "got: {detail}");
@@ -19377,7 +19776,7 @@ foo = "bar"
         // A typo like `postgresql` is not a recognized durable backend: it falls
         // through to the in-process local runtime, so a split role must be
         // rejected exactly as it is for the literal `local`.
-        let result = check_split_topology_on_local(ProcessRole::Web, "postgresql", None);
+        let result = check_split_topology_on_local(&ProcessRole::Web.into(), "postgresql", None);
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap_or_default();
         assert!(
@@ -19394,7 +19793,7 @@ foo = "bar"
     #[test]
     fn split_topology_fails_on_web_role_with_blank_backend() {
         // A blank backend also falls through to the local runtime.
-        let result = check_split_topology_on_local(ProcessRole::Web, "", None);
+        let result = check_split_topology_on_local(&ProcessRole::Web.into(), "", None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("web"));
     }
@@ -19424,7 +19823,7 @@ foo = "bar"
     #[test]
     fn queue_coverage_passes_when_pin_unset() {
         let result = check_queue_coverage(
-            ProcessRole::Combined,
+            &ProcessRole::Combined.into(),
             &["critical".into(), "low".into()],
             &[],
         );
@@ -19436,7 +19835,7 @@ foo = "bar"
         let queues = vec!["critical".to_string(), "low".to_string()];
         let pin = vec!["critical".to_string(), "low".to_string()];
         assert_eq!(
-            check_queue_coverage(ProcessRole::Combined, &queues, &pin).status,
+            check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin).status,
             CheckStatus::Pass
         );
     }
@@ -19449,7 +19848,7 @@ foo = "bar"
         // as informational detail (must NOT fail `--strict`).
         let queues = vec!["critical".to_string(), "low".to_string()];
         let pin = vec!["critical".to_string()];
-        let result = check_queue_coverage(ProcessRole::Combined, &queues, &pin);
+        let result = check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.detail.unwrap().contains("low"));
     }
@@ -19466,7 +19865,7 @@ foo = "bar"
         let pin = vec!["critical".to_string()]; // matches no known queue → would Warn on a worker
 
         // Web role: coverage is not applicable → Pass, and `--strict` stays green.
-        let web = check_queue_coverage(ProcessRole::Web, &queues, &pin);
+        let web = check_queue_coverage(&ProcessRole::Web.into(), &queues, &pin);
         assert_eq!(web.status, CheckStatus::Pass);
         assert!(
             web.detail
@@ -19487,7 +19886,7 @@ foo = "bar"
         // — it Passes and never fails `--strict`. doctor is config-only and
         // per-process, so it cannot prove a genuine zero-coverage gap; the
         // authoritative check is the runtime startup warning.
-        let worker = check_queue_coverage(ProcessRole::Worker, &queues, &pin);
+        let worker = check_queue_coverage(&ProcessRole::Worker.into(), &queues, &pin);
         assert_eq!(worker.status, CheckStatus::Pass);
         let worker_summary = Summary {
             passed: 1,
@@ -19498,7 +19897,7 @@ foo = "bar"
 
         // Combined behaves like Worker here (also runs workers).
         assert_eq!(
-            check_queue_coverage(ProcessRole::Combined, &queues, &pin).status,
+            check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin).status,
             CheckStatus::Pass
         );
     }
@@ -19526,7 +19925,7 @@ foo = "bar"
         // failed `--strict`.
         let table: toml::Table = toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse");
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
-        let result = check_queue_coverage(ProcessRole::Combined, &queues, &pin);
+        let result = check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap();
         // Reports that configured `default` is not claimed by this pin...
@@ -19561,7 +19960,7 @@ foo = "bar"
         assert_eq!(queues, vec!["default"]);
         assert!(pin.is_empty());
         assert_eq!(
-            check_queue_coverage(ProcessRole::Combined, &queues, &pin).status,
+            check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin).status,
             CheckStatus::Pass
         );
     }
@@ -19589,7 +19988,7 @@ foo = "bar"
         assert_eq!(raw_queues, vec!["default"]);
         assert!(raw_pin.is_empty());
         assert_eq!(
-            check_queue_coverage(ProcessRole::Combined, &raw_queues, &raw_pin).status,
+            check_queue_coverage(&ProcessRole::Combined.into(), &raw_queues, &raw_pin).status,
             CheckStatus::Pass
         );
 
@@ -19616,7 +20015,7 @@ foo = "bar"
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&merged));
         assert_eq!(queues, vec!["critical", "bulk"]);
         assert_eq!(pin, vec!["critical"]);
-        let result = check_queue_coverage(ProcessRole::Combined, &queues, &pin);
+        let result = check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.detail.unwrap().contains("bulk"));
         // A valid subset pin must NOT fail `--strict`.
@@ -19652,7 +20051,7 @@ foo = "bar"
         let raw_role = raw_role.expect("valid role");
         assert_eq!(raw_role, ProcessRole::Combined);
         let (raw_queues, raw_pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&base));
-        let raw_result = check_queue_coverage(raw_role, &raw_queues, &raw_pin);
+        let raw_result = check_queue_coverage(&raw_role, &raw_queues, &raw_pin);
         // (raw table also misses the profile's queues/pin, but the load-bearing
         // point is the role: Combined runs workers, so the gate does not skip.)
         assert!(raw_role.runs_workers());
@@ -19686,7 +20085,7 @@ foo = "bar"
         // The web role runs no workers, so the coverage check skips the pin
         // evaluation entirely and PASSES even though the pin matches no queue.
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&merged));
-        let result = check_queue_coverage(merged_role, &queues, &pin);
+        let result = check_queue_coverage(&merged_role, &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(
             result
@@ -19715,7 +20114,7 @@ foo = "bar"
         let env_role = env_role.expect("valid role");
         assert_eq!(env_role, ProcessRole::Worker);
         assert_eq!(
-            check_queue_coverage(env_role, &queues, &pin).status,
+            check_queue_coverage(&env_role, &queues, &pin).status,
             CheckStatus::Pass,
         );
     }
@@ -19732,7 +20131,7 @@ foo = "bar"
         let role = role.expect("valid role");
         assert_eq!(role, ProcessRole::Web);
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
-        let result = check_queue_coverage(role, &queues, &pin);
+        let result = check_queue_coverage(&role, &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         let summary = Summary {
             passed: 1,
@@ -19769,7 +20168,7 @@ foo = "bar"
         let role = role.expect("valid role");
         assert_eq!(role, ProcessRole::Worker);
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&merged));
-        let result = check_queue_coverage(role, &queues, &pin);
+        let result = check_queue_coverage(&role, &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         let summary = Summary {
             passed: 1,
@@ -19793,8 +20192,11 @@ foo = "bar"
 
         // Critical tier: pins only `critical`; the other queues are covered by
         // another tier. Passes, and the informational detail names them.
-        let critical_tier =
-            check_queue_coverage(ProcessRole::Combined, &queues, &["critical".to_string()]);
+        let critical_tier = check_queue_coverage(
+            &ProcessRole::Combined.into(),
+            &queues,
+            &["critical".to_string()],
+        );
         assert_eq!(critical_tier.status, CheckStatus::Pass);
         let detail = critical_tier.detail.unwrap();
         assert!(detail.contains("bulk"), "detail should list bulk: {detail}");
@@ -19805,7 +20207,7 @@ foo = "bar"
 
         // Bulk tier: pins `bulk,default`; also a valid subset → Pass.
         let bulk_tier = check_queue_coverage(
-            ProcessRole::Combined,
+            &ProcessRole::Combined.into(),
             &queues,
             &["bulk".to_string(), "default".to_string()],
         );
@@ -19830,7 +20232,7 @@ foo = "bar"
         let queues = vec!["critical".to_string(), "bulk".to_string()];
         let pin = vec!["critical".to_string()];
         let result = check_queue_coverage_topology(
-            ProcessRole::Combined,
+            &ProcessRole::Combined.into(),
             &queues,
             &pin,
             &[],  // no declared queues
@@ -19862,9 +20264,10 @@ foo = "bar"
                 vec!["bulk".to_string(), "default".to_string()],
             ],
             malformed: false,
+            derived: false,
         };
         let result = check_queue_coverage_topology(
-            ProcessRole::Combined,
+            &ProcessRole::Combined.into(),
             &queues,
             &["critical".to_string()],
             &[],
@@ -19897,10 +20300,11 @@ foo = "bar"
                 vec!["bulk".to_string(), "default".to_string()],
             ],
             malformed: false,
+            derived: false,
         };
         // Run doctor as the critical tier (pin = critical): still Pass.
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &queues,
             &["critical".to_string()],
             &[],
@@ -19929,9 +20333,10 @@ foo = "bar"
             // No tier drains `bulk`.
             tiers: vec![vec!["critical".to_string()], vec!["default".to_string()]],
             malformed: false,
+            derived: false,
         };
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &queues,
             &["critical".to_string()],
             &[],
@@ -19963,9 +20368,10 @@ foo = "bar"
                 Vec::new(), // unpinned tier: drains everything
             ],
             malformed: false,
+            derived: false,
         };
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &queues,
             &["critical".to_string()],
             &[],
@@ -19987,9 +20393,10 @@ foo = "bar"
         let fleet = FleetTopology {
             tiers: vec![vec!["default".to_string(), "email".to_string()]],
             malformed: false,
+            derived: false,
         };
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &queues,
             &["default".to_string(), "email".to_string()],
             &declared,
@@ -20001,7 +20408,7 @@ foo = "bar"
         // And with the declared set UNKNOWN (empty), still Pass — the job-declared
         // pin never manufactures a gap.
         let result_no_manifest = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &queues,
             &["default".to_string(), "email".to_string()],
             &[],
@@ -20098,7 +20505,7 @@ foo = "bar"
             let pin = fleet.tiers.first().cloned().unwrap_or_default();
 
             let result = check_queue_coverage_topology(
-                ProcessRole::Worker,
+                &ProcessRole::Worker.into(),
                 &configured,
                 &pin,
                 &declared,
@@ -20125,9 +20532,10 @@ foo = "bar"
             // No tier pins `email`.
             tiers: vec![vec!["default".to_string()]],
             malformed: false,
+            derived: false,
         };
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &queues,
             &["default".to_string()],
             &declared,
@@ -20146,9 +20554,10 @@ foo = "bar"
         let fleet = FleetTopology {
             tiers: Vec::new(),
             malformed: false,
+            derived: false,
         };
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &queues,
             &["critical".to_string()],
             &[],
@@ -20253,7 +20662,7 @@ foo = "bar"
             assert!(fleet.malformed, "{doc}");
 
             let result = check_queue_coverage_topology(
-                ProcessRole::Worker,
+                &ProcessRole::Worker.into(),
                 &["critical".to_string(), "bulk".to_string()],
                 &["critical".to_string()],
                 &[],
@@ -20293,11 +20702,12 @@ foo = "bar"
         let unpinned = FleetTopology {
             tiers: vec![Vec::new()],
             malformed: false,
+            derived: false,
         };
         assert!(unpinned.has_unpinned_tier());
         assert_eq!(
             check_queue_coverage_topology(
-                ProcessRole::Worker,
+                &ProcessRole::Worker.into(),
                 &["critical".to_string(), "bulk".to_string()],
                 &[],
                 &[],
@@ -20456,9 +20866,10 @@ foo = "bar"
             // because the declared set is unreadable.
             tiers: vec![vec!["critical".to_string(), "thumbnails".to_string()]],
             malformed: false,
+            derived: false,
         };
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &["critical".to_string()],
             &["critical".to_string()],
             &[],
@@ -20510,7 +20921,7 @@ foo = "bar"
 
         let fleet = resolve_fleet_topology(Some(&table)).expect("topology declared");
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &["critical".to_string()],
             &["critical".to_string()],
             &declared,
@@ -20548,7 +20959,7 @@ foo = "bar"
             resolve_declared_queues(Some(&table)).expect("the emitted manifest is well-formed");
         let fleet = resolve_fleet_topology(Some(&table)).expect("topology declared");
         let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
+            &ProcessRole::Worker.into(),
             &["critical".to_string()],
             &["critical".to_string()],
             &declared,
@@ -20571,7 +20982,7 @@ foo = "bar"
         );
         assert_eq!(queues, vec!["default"]);
         assert!(pin.is_empty(), "empty env pin must clear the TOML pin");
-        let result = check_queue_coverage(ProcessRole::Combined, &queues, &pin);
+        let result = check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         // Previously this false-failed (fell back to `pin=[critical]` →
         // empty-schedule Warn); now it passes cleanly under `--strict`.
@@ -20648,7 +21059,10 @@ foo = "bar"
             let message = role.expect_err(source);
             assert!(message.starts_with("role: "), "{source}: {message}");
             assert!(
-                toml::from_str::<autumn_web::config::AutumnConfig>(source).is_err(),
+                toml::from_str::<autumn_web::config::AutumnConfig>(source)
+                    .map_err(|err| err.to_string())
+                    .and_then(|config| config.validate().map_err(|err| err.to_string()))
+                    .is_err(),
                 "{source}"
             );
         }
@@ -20662,8 +21076,9 @@ foo = "bar"
             toml::from_str(source).expect("loader accepts the table form");
         let table: toml::Table = toml::from_str(source).expect("parse toml");
         let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
-        assert_eq!(role, Ok(loaded.role));
-        assert_eq!(role, Ok(ProcessRole::Web));
+        let role = role.expect("table form");
+        assert_eq!(role, loaded.resolve_role().expect("loader resolves"));
+        assert_eq!(role, ProcessRole::Web);
 
         let table: toml::Table = toml::from_str("role = { wrker = {} }\n").expect("parse toml");
         let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
@@ -20696,7 +21111,198 @@ foo = "bar"
 
         let env = autumn_web::config::MockEnv::new().with("AUTUMN_ROLE", "server");
         let (role, _) = resolve_process_role_and_backend(None, &env);
-        assert_eq!(role, Ok(ProcessRole::Web));
+        assert_eq!(role.expect("valid role"), ProcessRole::Web);
+    }
+
+    // ── Named roles (#3543) ──────────────────────────────────────────────
+
+    const ROLES_3543: &str = "[jobs]\nbackend = \"local\"\nqueues = [\"critical\", \"bulk\", \"default\"]\n\
+         [roles.critical]\nbase = \"worker\"\npin = [\"critical\"]\nscheduler = false\n\
+         [roles.bulk]\nbase = \"worker\"\npin = [\"bulk\"]\n\
+         [roles.cron]\nbase = \"worker\"\npin = []\n\
+         [roles.api]\nbase = \"web\"\n";
+
+    fn roles_table_3543(extra: &str) -> toml::Table {
+        toml::from_str(&format!("{extra}{ROLES_3543}")).expect("parse toml")
+    }
+
+    #[test]
+    fn resolve_process_role_selects_a_named_role() {
+        let table = roles_table_3543("role = \"critical\"\n");
+        let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        let role = role.expect("critical");
+        assert_eq!(role.name(), "critical");
+        assert_eq!(role.base(), ProcessRole::Worker);
+        assert!(!role.capabilities().scheduler);
+
+        let (role, _) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "BULK".to_owned()),
+            Some(&table),
+        );
+        assert_eq!(role.expect("bulk").name(), "bulk");
+    }
+
+    #[test]
+    fn resolve_process_role_rejects_an_undeclared_name() {
+        let table = roles_table_3543("");
+        let (role, _) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "critcal".to_owned()),
+            Some(&table),
+        );
+        let message = role.expect_err("undeclared");
+        assert!(message.contains("AUTUMN_ROLE"), "{message}");
+        assert!(message.contains("\"critcal\""), "{message}");
+        assert!(message.contains("critical"), "{message}");
+    }
+
+    /// A bad preset fails the row, as it fails the boot.
+    #[test]
+    fn resolve_process_role_rejects_a_bad_preset() {
+        for body in [
+            "[roles.worker]\nbase = \"worker\"\n",
+            "[roles.api]\nbase = \"web\"\nscheduler = true\n",
+            "[roles.x]\nbase = \"worker\"\nschedular = false\n",
+            "roles = 5\n",
+        ] {
+            let table: toml::Table = toml::from_str(body).expect("parse toml");
+            let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+            let message = role.expect_err(body);
+            assert!(
+                message.starts_with("roles: ") || message.starts_with("[roles."),
+                "{body}: {message}"
+            );
+            let mut config = toml::from_str::<autumn_web::config::AutumnConfig>(body);
+            if let Ok(config) = config.as_mut() {
+                assert!(config.validate().is_err(), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn process_role_row_fails_for_named_split_role_on_local() {
+        for name in ["critical", "api"] {
+            let table = roles_table_3543(&format!("role = \"{name}\"\n"));
+            let (role, backend) =
+                resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+            let result = check_process_role(&role, &backend, None);
+            assert_eq!(result.status, CheckStatus::Fail, "{name}");
+            let detail = result.detail.unwrap_or_default();
+            assert!(detail.contains(&format!("role={name}")), "{detail}");
+        }
+    }
+
+    /// `[jobs.fleet] tiers` is derived from `[roles.*]` when it is not set.
+    #[test]
+    fn strict_coverage_derives_the_fleet_from_roles() {
+        let table = roles_table_3543("");
+        let fleet = resolve_fleet_topology(Some(&table)).expect("derived topology");
+        assert!(fleet.derived);
+        assert_eq!(
+            fleet.tiers,
+            vec![vec!["bulk".to_owned()], vec!["critical".to_owned()]]
+        );
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
+        let role = autumn_web::config::Role::from(ProcessRole::Combined);
+        let result = check_queue_coverage_topology(&role, &queues, &pin, &[], Some(&fleet), None);
+        // A plain built-in tier can drain the gap, so a derived gap warns.
+        // `--strict` turns the warning into a failure.
+        assert_eq!(result.status, CheckStatus::Warn, "{:?}", result.detail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("default"), "{detail}");
+        assert!(detail.contains("[roles.*]"), "{detail}");
+
+        // A role that drains `default` closes the gap.
+        let table = roles_table_3543("[roles.rest]\nbase = \"worker\"\npin = [\"default\"]\n");
+        let fleet = resolve_fleet_topology(Some(&table)).expect("derived topology");
+        let result = check_queue_coverage_topology(&role, &queues, &pin, &[], Some(&fleet), None);
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
+    }
+
+    /// `[jobs.fleet]` with no `tiers`, or `tiers = []`, still derives.
+    #[test]
+    fn fleet_without_tiers_derives_from_roles() {
+        for fleet in [
+            "[jobs.fleet]\ndeclared_queues = [\"thumbnails\"]\n",
+            "[jobs.fleet]\ntiers = []\n",
+        ] {
+            let table = roles_table_3543(fleet);
+            let topology = resolve_fleet_topology(Some(&table)).expect(fleet);
+            assert!(topology.derived, "{fleet}");
+            assert_eq!(topology.tiers.len(), 2, "{fleet}");
+        }
+    }
+
+    /// A derived tier without its own `pin` inherits the resolved `jobs.pin`,
+    /// env included.
+    #[test]
+    fn derived_tier_inherits_the_resolved_jobs_pin() {
+        let table: toml::Table =
+            toml::from_str("[roles.rest]\nbase = \"worker\"\n").expect("parse toml");
+        let pin = vec!["bulk".to_owned()];
+        let fleet = resolve_fleet_topology_with_pin(Some(&table), Some(&pin)).expect("derived");
+        assert_eq!(fleet.tiers, vec![pin]);
+        let fleet = resolve_fleet_topology(Some(&table)).expect("derived");
+        assert_eq!(fleet.tiers, vec![Vec::<String>::new()]);
+    }
+
+    /// A `combined` preset that drains nothing counts as split.
+    #[test]
+    fn process_role_row_fails_for_a_non_draining_combined_preset() {
+        let table: toml::Table = toml::from_str(
+            "role = \"api\"\n[roles.api]\nbase = \"combined\"\njob_workers = false\n",
+        )
+        .expect("parse toml");
+        let (role, backend) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        let result = check_process_role(&role, &backend, None);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result
+                .detail
+                .unwrap_or_default()
+                .contains("role=api (base combined)")
+        );
+    }
+
+    #[test]
+    fn explicit_fleet_tiers_win_over_roles() {
+        let table = roles_table_3543("[jobs.fleet]\ntiers = [[]]\n");
+        let fleet = resolve_fleet_topology(Some(&table)).expect("declared topology");
+        assert!(!fleet.derived);
+        assert_eq!(fleet.tiers, vec![Vec::<String>::new()]);
+    }
+
+    /// Roles with no job workers derive no topology.
+    #[test]
+    fn roles_without_job_workers_derive_no_topology() {
+        let table: toml::Table = toml::from_str(
+            "[roles.api]\nbase = \"web\"\n[roles.cron]\nbase = \"worker\"\npin = []\n",
+        )
+        .expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&table)).is_none());
+    }
+
+    /// The per-process report uses the preset pin of the selected role.
+    #[test]
+    fn queue_coverage_uses_the_named_role_pin() {
+        let table = roles_table_3543("role = \"critical\"\n");
+        let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        let role = role.expect("critical");
+        let result = check_queue_coverage(&role, &["critical".into(), "bulk".into()], &[]);
+        let detail = result.detail.unwrap_or_default();
+        assert!(
+            detail.contains("does not claim configured queue(s): bulk"),
+            "{detail}"
+        );
+
+        let table = roles_table_3543("role = \"cron\"\n");
+        let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        let result = check_queue_coverage(&role.expect("cron"), &["bulk".into()], &[]);
+        assert!(
+            result
+                .detail
+                .unwrap_or_default()
+                .contains("runs no job workers")
+        );
     }
 
     /// #3541: a blank `AUTUMN_ROLE=` is unset. The TOML role applies.
@@ -20708,13 +21314,13 @@ foo = "bar"
                 |key| (key == "AUTUMN_ROLE").then(|| value.to_owned()),
                 Some(&table),
             );
-            assert_eq!(role, Ok(ProcessRole::Web), "{value:?}");
+            assert_eq!(role.expect("blank is unset"), ProcessRole::Web, "{value:?}");
         }
         let (role, _) = resolve_process_role_and_backend_from_sources(
             |key| (key == "AUTUMN_ROLE").then(|| "jobs".to_owned()),
             Some(&table),
         );
-        assert_eq!(role, Ok(ProcessRole::Worker));
+        assert_eq!(role.expect("jobs"), ProcessRole::Worker);
     }
 
     /// #3541: the `process_role_backend` row fails on an unknown role.
@@ -20732,11 +21338,145 @@ foo = "bar"
         assert!(result.hint.is_some());
 
         // A valid role still runs the split-topology check.
-        let result = check_process_role(&Ok(ProcessRole::Worker), "local", None);
+        let result = check_process_role(&Ok(ProcessRole::Worker.into()), "local", None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("worker"));
-        let result = check_process_role(&Ok(ProcessRole::Combined), "local", None);
+        let result = check_process_role(&Ok(ProcessRole::Combined.into()), "local", None);
         assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    // ── Route groups (#3544) ─────────────────────────────────────────────
+
+    const GROUPS_3544: &str = r#"
+[route_groups]
+declared = ["marketing", "service", "app"]
+
+[roles.marketing]
+base = "web"
+mount = ["marketing"]
+
+[roles.service]
+base = "web"
+mount = ["service"]
+"#;
+
+    fn groups_table_3544(extra: &str) -> toml::Table {
+        toml::from_str(&format!("{GROUPS_3544}{extra}")).expect("parse toml")
+    }
+
+    #[test]
+    fn route_group_mounts_warns_for_a_group_no_role_mounts() {
+        let table = groups_table_3544("");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.name, "route_group_mounts");
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        let detail = row.detail.clone().unwrap_or_default();
+        assert!(detail.contains("\"app\""), "{detail}");
+        assert!(!detail.contains("\"marketing\""), "{detail}");
+        assert!(row.hint.is_some());
+        // `--strict` turns the warning into a failure.
+        let summary = compute_summary(&[row]);
+        assert_eq!(exit_code(&summary, true), 1);
+        assert_eq!(exit_code(&summary, false), 0);
+    }
+
+    #[test]
+    fn route_group_mounts_passes_when_every_group_is_mounted() {
+        let table = groups_table_3544("[roles.core]\nbase = \"combined\"\nmount = [\"app\"]\n");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+        // A preset without `mount` mounts every group.
+        let table = groups_table_3544("[roles.api]\nbase = \"web\"\n");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+    }
+
+    #[test]
+    fn route_group_mounts_reads_groups_from_the_routes_manifest() {
+        let table: toml::Table = toml::from_str(
+            "[route_groups]\nmanifest = \"routes.json\"\n\
+             [roles.marketing]\nbase = \"web\"\nmount = [\"marketing\"]\n",
+        )
+        .expect("parse");
+        let manifest = r#"[
+            {"method": "GET", "path": "/landing", "handler": "landing", "source": "user", "middleware": [], "group": "marketing"},
+            {"method": "GET", "path": "/desk", "handler": "desk", "source": "user", "middleware": [], "group": "service"},
+            {"method": "GET", "path": "/live", "handler": "live", "source": "framework", "middleware": []}
+        ]"#;
+        let row = check_route_group_mounts(Some(&table), |path| {
+            (path == "routes.json").then(|| manifest.to_owned())
+        });
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        let detail = row.detail.unwrap_or_default();
+        assert!(detail.contains("\"service\""), "{detail}");
+
+        // A corrupt manifest fails loudly.
+        let row = check_route_group_mounts(Some(&table), |_| Some("not json".to_owned()));
+        assert_eq!(row.status, CheckStatus::Fail, "{:?}", row.detail);
+    }
+
+    /// A manifest path with no file, or a manifest with no `group` key, does
+    /// not turn the check off: the row warns, so `--strict` fails.
+    #[test]
+    fn route_group_mounts_warns_for_a_missing_or_groupless_manifest() {
+        let table: toml::Table = toml::from_str(
+            "[route_groups]\nmanifest = \"routes.json\"\ndeclared = [\"marketing\"]\n\
+             [roles.marketing]\nbase = \"web\"\nmount = [\"marketing\"]\n",
+        )
+        .expect("parse");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        assert!(row.detail.unwrap_or_default().contains("is not there"));
+
+        let old_dump = r#"[{"method": "GET", "path": "/x", "handler": "x", "source": "user", "middleware": []}]"#;
+        let row = check_route_group_mounts(Some(&table), |_| Some(old_dump.to_owned()));
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        assert!(
+            row.detail
+                .unwrap_or_default()
+                .contains("names no route group")
+        );
+    }
+
+    /// `run()` pushes the `route_group_mounts` row.
+    #[test]
+    fn doctor_run_registers_route_group_mounts() {
+        let source = include_str!("doctor.rs");
+        let run = source.find("pub fn run(opts").expect("run exists");
+        let end = run
+            + source[run..]
+                .find("\nfn run_doctor_tasks")
+                .expect("tasks fn");
+        assert!(
+            source[run..end].contains("check_route_group_mounts(Some(&route_groups_toml)"),
+            "doctor run() must push the route_group_mounts row"
+        );
+    }
+
+    #[test]
+    fn route_group_mounts_passes_when_nothing_is_narrowed() {
+        // No preset sets `mount`: every HTTP role serves every group.
+        let table: toml::Table = toml::from_str(
+            "[route_groups]\ndeclared = [\"marketing\"]\n[roles.api]\nbase = \"web\"\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            check_route_group_mounts(Some(&table), |_| None).status,
+            CheckStatus::Pass
+        );
+        // `mount` is set, but no group is declared: nothing to compare.
+        let table: toml::Table =
+            toml::from_str("[roles.m]\nbase = \"web\"\nmount = [\"marketing\"]\n").expect("parse");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.status, CheckStatus::Pass);
+        assert!(
+            row.detail.unwrap_or_default().contains("[route_groups]"),
+            "the row says how to turn the check on"
+        );
+        assert_eq!(
+            check_route_group_mounts(None, |_| None).status,
+            CheckStatus::Pass
+        );
     }
 
     #[test]
@@ -23490,5 +24230,162 @@ redirect_uri = "http://localhost/callback"
             assert!(detail.contains("advisories"), "{detail}");
             assert!(detail.contains("licenses"), "{detail}");
         }
+    }
+}
+
+#[cfg(test)]
+mod table_boundaries_tests {
+    use autumn_web::graph::boundaries::{Baseline, BoundaryConfig, CrateGraph};
+    use autumn_web::graph::manifest::build;
+    use autumn_web::graph::{ModelGraphDescriptor, RouteGraphDescriptor};
+
+    use super::{CheckStatus, check_table_boundaries_impl};
+    use crate::boundaries::CargoFacts;
+
+    const MODELS: &[ModelGraphDescriptor] = &[ModelGraphDescriptor {
+        model: "Contact",
+        model_path: "core::Contact",
+        table: "contacts",
+        relations: &[],
+        module_path: "core::models",
+        file: "src/models.rs",
+        line: 1,
+        crate_version: "0.1.0",
+    }];
+
+    const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+        handler: "report",
+        module_path: "marketing::routes",
+        method: "GET",
+        path: "/report",
+        static_route: false,
+        file: "src/routes.rs",
+        line: 1,
+        crate_version: "0.1.0",
+        signature_symbols: &[],
+        body_symbols: &["contacts"],
+        sql_symbols: &[],
+    }];
+
+    fn config() -> BoundaryConfig {
+        BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\nmodules = [\"core\"]\n\
+             [boundaries.marketing]\nmodules = [\"marketing\"]\n",
+        )
+        .expect("valid")
+    }
+
+    fn facts() -> CargoFacts {
+        CargoFacts {
+            crates: CrateGraph::default(),
+            plugins: Vec::new(),
+        }
+    }
+
+    fn graph() -> autumn_web::graph::manifest::ArchitectureGraph {
+        build(&[], 0, ROUTES, MODELS, &[], &[])
+    }
+
+    #[test]
+    fn a_violation_warns_so_strict_fails() {
+        let result =
+            check_table_boundaries_impl(config(), Some(Ok(graph())), Ok(facts()), Ok(None));
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.expect("detail");
+        assert!(detail.contains("marketing -> core"), "{detail}");
+        assert!(detail.contains("GET /report"), "{detail}");
+    }
+
+    #[test]
+    fn a_baselined_violation_passes() {
+        let report =
+            autumn_web::graph::boundaries::check(&config(), Some(&graph()), None).expect("runs");
+        let baseline = Baseline::from_violations(&report.violations);
+        let result = check_table_boundaries_impl(
+            config(),
+            Some(Ok(graph())),
+            Ok(facts()),
+            Ok(Some(baseline)),
+        );
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
+    }
+
+    #[test]
+    fn a_rule_that_cannot_run_warns() {
+        let result = check_table_boundaries_impl(config(), None, Ok(facts()), Ok(None));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(
+            result
+                .detail
+                .expect("detail")
+                .contains("graph rule not run")
+        );
+        let result = check_table_boundaries_impl(
+            config(),
+            Some(Ok(graph())),
+            Err("no cargo".into()),
+            Ok(None),
+        );
+        assert!(
+            result
+                .detail
+                .expect("detail")
+                .contains("crate rule not run")
+        );
+    }
+
+    #[test]
+    fn a_baseline_without_a_graph_lists_nothing_as_fixed() {
+        let report =
+            autumn_web::graph::boundaries::check(&config(), Some(&graph()), None).expect("runs");
+        let baseline = Baseline::from_violations(&report.violations);
+        let result = check_table_boundaries_impl(config(), None, Ok(facts()), Ok(Some(baseline)));
+        let detail = result.detail.expect("detail");
+        assert!(!detail.contains("no longer occur"), "{detail}");
+        assert!(detail.contains("graph rule not run"), "{detail}");
+    }
+
+    #[test]
+    fn the_wrapper_reads_paths_relative_to_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("boundaries.toml");
+        std::fs::write(
+            &config_path,
+            "graph = \"architecture-graph.json\"\nbaseline = \"baseline.json\"\n\
+             [boundaries.core]\nowns = [\"contacts\"]\nmodules = [\"core\"]\n\
+             [boundaries.marketing]\nmodules = [\"marketing\"]\n",
+        )
+        .expect("write config");
+        std::fs::write(
+            dir.path().join("architecture-graph.json"),
+            graph().to_json(),
+        )
+        .expect("write graph");
+        // The temp dir is no Cargo project, so the crate rule cannot run.
+        let result = super::check_table_boundaries(&config_path);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.expect("detail");
+        assert!(detail.contains("GET /report"), "{detail}");
+        assert!(detail.contains("crate rule not run"), "{detail}");
+        assert!(!detail.contains("graph rule not run"), "{detail}");
+    }
+
+    #[test]
+    fn a_bad_config_file_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("boundaries.toml");
+        std::fs::write(&config_path, "[boundaries.core]\nowns = 3\n").expect("write");
+        let result = super::check_table_boundaries(&config_path);
+        assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn an_ambiguous_config_fails() {
+        let config = BoundaryConfig::parse(
+            "[boundaries.a]\nowns = [\"contacts\"]\n[boundaries.b]\nowns = [\"contacts\"]\n",
+        )
+        .expect("valid");
+        let result = check_table_boundaries_impl(config, Some(Ok(graph())), Ok(facts()), Ok(None));
+        assert_eq!(result.status, CheckStatus::Fail);
     }
 }

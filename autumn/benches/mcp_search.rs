@@ -96,6 +96,7 @@ fn route(resource: &'static str, action: &'static str) -> Route {
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
+        group: None,
     }
 }
 

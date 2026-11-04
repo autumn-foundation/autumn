@@ -16,6 +16,12 @@ lines of crypto**.
 > (APNs/FCM device tokens) is out of scope, as are notification actions,
 > images, badge counts, and per-user quiet hours.
 
+> **Feature.** Web Push is behind the `push` Cargo feature, which is on by
+> default. An app with `default-features = false` adds it by name:
+> `features = ["maud", "htmx", "push"]`. A build without it refuses to boot
+> when `[push]` or an `AUTUMN_PUSH__*` variable is set, so push is never
+> silently dead.
+
 ## Quick start
 
 ### 1. Mint a VAPID key pair
@@ -447,6 +453,6 @@ RFC's inputs, Autumn must reproduce the RFC's output byte-for-byte. That is
 what guarantees the payload actually decrypts in a real browser rather than
 merely round-tripping against Autumn's own code.
 
-Adding Web Push introduced **no new crate** into the dependency graph: `p256`
-was already resolved for `jsonwebtoken`'s ES256 backend, and
-`aes-gcm`/`hmac`/`sha2`/`base64` were already non-optional dependencies.
+The curve is `p256` 0.14, behind the `push` feature. `aes-gcm`, `hmac`,
+`sha2` and `base64` are non-optional dependencies used elsewhere too, so the
+feature adds only `p256` and its elliptic-curve stack.

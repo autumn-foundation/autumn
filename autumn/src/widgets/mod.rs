@@ -12,7 +12,7 @@
 //!
 //! | Feature | Widgets |
 //! |---------|---------|
-//! | `widgets-search` | `active_search`, `autocomplete_input` |
+//! | `widgets-search` | `active_search`, `autocomplete_input` (single or tags mode) |
 //! | `widgets-social` | `reaction_controls`, `comment_thread`, `infinite_feed` |
 //! | `widgets-workflow` | `transition_controls`, `bulk_actions_form` |
 //! | `widgets-charts` | `sparkline`, `bar_chart`, `line_chart` |
@@ -60,6 +60,8 @@
 //! |-----------|-----|
 //! | Keyword search over a rendered list | `active_search` / `active_search_input` |
 //! | Select a single related record and store its ID | `autocomplete_input` |
+//! | Select many values or tags, as removable chips (issue #3410) | `autocomplete_input` with `.multiple()` |
+//! | Pre-fill either mode from a `Changeset` | `autocomplete_input_for` |
 //! | Plain `GET` form is sufficient | `axum::extract::Query` |
 //! | You need unusual htmx wiring | Hand-write `hx-*` attributes |
 //!

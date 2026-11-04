@@ -281,6 +281,7 @@ mod model_field_attrs;
 mod model_votable;
 #[cfg(feature = "db")]
 mod money_ledger_postgres;
+mod named_roles;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -309,6 +310,8 @@ mod openapi;
 mod openapi_direction;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+// The `jwt` and `push` feature-off paths (default-on features).
+mod optional_jwt_and_push;
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 mod outbox_claim_profile;
 #[cfg(feature = "db")]
@@ -347,9 +350,11 @@ mod plugin_sandbox;
 // outbound HTTP, DB, jobs, render hooks, quotas and the audit surface.
 #[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
 mod plugin_sandbox_capabilities;
+#[cfg(feature = "push")]
 mod push_end_to_end;
+#[cfg(feature = "push")]
 mod push_router;
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "push"))]
 mod push_send_many_subscription_lookup_profile;
 mod query_count_asserts;
 mod query_structured;
@@ -367,6 +372,7 @@ mod raw_router_escape_hatch;
 mod read_your_writes_routing;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod ready_db_ping;
+mod route_groups;
 // `test-support` exposes the monitor-step hook the test drives; the Docker
 // sweep enables it, so the test still runs there.
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
@@ -560,6 +566,8 @@ mod stories;
 mod stories_browser;
 #[cfg(feature = "system-tests")]
 mod system_test_api;
+#[cfg(feature = "db")]
+mod table_boundaries;
 #[cfg(feature = "db")]
 mod tenancy;
 mod tenancy_unit;

@@ -231,6 +231,7 @@ pub mod feed;
 pub mod format;
 pub mod health;
 pub(crate) mod health_cache;
+pub mod hedge;
 #[cfg(feature = "db")]
 pub mod hooks;
 pub mod http_server;
@@ -399,6 +400,7 @@ macro_rules! embed_locales {
 pub mod system_info;
 pub use plugin::{Plugin, Plugins};
 
+pub(crate) mod route_group;
 pub mod route_listing;
 
 /// In-place upgrades: swap a running app to a new binary without dropping
@@ -685,7 +687,9 @@ pub mod wire;
 // and an outer doc comment here would make rustdoc resolve that whole
 // combined block in the CRATE-ROOT scope — where `WebPush`, `PushError` and
 // friends are not in scope, breaking every intra-doc link in the module and
-// failing the `-D rustdoc::broken_intra_doc_links` docs gate.
+// failing the `-D rustdoc::broken_intra_doc_links` docs gate. Behind the
+// `push` feature, which owns `p256`.
+#[cfg(feature = "push")]
 pub mod push;
 /// Compile-time per-route database query budgets (#1667).
 ///
@@ -708,7 +712,7 @@ pub use presence::presence_stream;
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
 pub use admission::Criticality;
-pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
+pub use route::{RepositoryApiMeta, Route, RouteGroup, RouteIdempotency, RouteTimeout};
 // Re-exported alongside the other `Route` field types so a hand-built
 // `Route { .. }` needs only the `autumn_web::` prefix.
 pub use seo::SeoRouteDefaults;
@@ -2485,7 +2489,7 @@ pub mod test;
 mod test_html;
 /// Saturating time/duration arithmetic shared by the request-path modules.
 pub(crate) mod time_math;
-pub use config::{Capability, ProcessRole, RoleCapabilities};
+pub use config::{Capability, ProcessRole, Role, RoleCapabilities, RoleName, RolePreset};
 pub use state::AppState;
 
 #[cfg(test)]

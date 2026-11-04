@@ -63,7 +63,9 @@
 #       that is not commented out and carries both `-p autumn-web` and
 #       `-D warnings`), otherwise its deny block is never compiled. The `lint`
 #       job's clippy lanes are the commands in xtask/src/lanes.rs; they count
-#       while ci.yml runs `cargo xtask ci lint`.
+#       while ci.yml runs `cargo xtask ci lint`, or its matrix of shards
+#       (`cargo xtask ci lint --shard ${{ matrix.shard }}`; xtask's own tests
+#       prove the matrix names every shard).
 #
 # NOT covered: a banned call reached only through a `macro_rules!` expansion
 # (clippy suppresses lints inside macro expansions), and the generated code
@@ -71,7 +73,7 @@
 # own `#[allow]` with a reason and is named as a known-open gap in
 # CONTRIBUTING.md "Determinism seam gate".
 #
-# Called from the `lint` job in ci.yml (`cargo xtask ci lint`). Run locally with:
+# Called from the `lint` lane in ci.yml (`cargo xtask ci lint --shard gates`). Run locally with:
 #
 #     ./scripts/check-determinism-gate.sh              # self-test, then the real check
 #     ./scripts/check-determinism-gate.sh --self-test  # synthetic fixtures only
@@ -644,10 +646,12 @@ check_feature_reachability() {
   # runs that target autumn-web and deny warnings.
   # The `lint` job runs `cargo xtask ci lint`; its clippy commands are string
   # literals in xtask/src/lanes.rs. They count only while ci.yml runs that
-  # whole lane (not a filtered `--only` run), and never from a Rust comment.
+  # whole lane, or its matrix of shards (`--shard ${{ matrix.shard }}`, which
+  # xtask's tests prove names every shard) -- not a filtered `--only` run or
+  # one literal shard, and never from a Rust comment.
   local lanes="$tree/$XTASK_LANES" lane_lines=""
   if [[ -f "$lanes" ]] \
-    && grep -qE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*cargo xtask ci lint[[:space:]]*$' "$wf"; then
+    && grep -qE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*cargo xtask ci lint([[:space:]]+--shard[[:space:]]+\$\{\{[[:space:]]*matrix\.shard[[:space:]]*\}\})?[[:space:]]*$' "$wf"; then
     lane_lines="$(grep -vE '^[[:space:]]*//' "$lanes" | grep -F 'cargo clippy' || true)"
   fi
   local enabled
@@ -814,6 +818,20 @@ EOF
   printf '        run: cargo xtask ci lint --only fmt\n' > "$tmp/xtaskfiltered/.github/workflows/ci.yml"
   cp "$tmp/xtasklane/xtask/src/lanes.rs" "$tmp/xtaskfiltered/xtask/src/lanes.rs"
   expect_fail "$tmp/xtaskfiltered" "no enforcing ci.yml clippy lane enables" "filtered xtask lane run does not count"
+
+  # ...but does from the lane run as a matrix of shards...
+  make_fixture "$tmp/xtasksharded"
+  mkdir -p "$tmp/xtasksharded/xtask/src"
+  printf '        run: cargo xtask ci lint --shard ${{ matrix.shard }}\n' > "$tmp/xtasksharded/.github/workflows/ci.yml"
+  cp "$tmp/xtasklane/xtask/src/lanes.rs" "$tmp/xtasksharded/xtask/src/lanes.rs"
+  expect_pass "$tmp/xtasksharded" "feature reachable via the xtask lint lane's shard matrix"
+
+  # ...not from one literal shard of it...
+  make_fixture "$tmp/xtaskoneshard"
+  mkdir -p "$tmp/xtaskoneshard/xtask/src"
+  printf '        run: cargo xtask ci lint --shard gates\n' > "$tmp/xtaskoneshard/.github/workflows/ci.yml"
+  cp "$tmp/xtasklane/xtask/src/lanes.rs" "$tmp/xtaskoneshard/xtask/src/lanes.rs"
+  expect_fail "$tmp/xtaskoneshard" "no enforcing ci.yml clippy lane enables" "one literal lint shard does not count"
 
   # ...nor from a Rust comment in the lane file.
   make_fixture "$tmp/xtaskcomment"

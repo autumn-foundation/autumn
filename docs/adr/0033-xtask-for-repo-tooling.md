@@ -73,11 +73,23 @@ Ported so far:
 | Gate | Was | Now |
 | --- | --- | --- |
 | Markdown links and anchors | `scripts/check-docs-links.sh` | `xtask/src/docs/links.rs` (`cargo xtask check docs-links`) |
+| Guide index completeness | `scripts/check-docs-guide-index.sh` | `xtask/src/docs/guide_index.rs` (`cargo xtask check docs-guide-index`) |
 
 The per-line markdown shapes (block quote, fence, list item, heading) are
 matched by hand rather than by regex. A regex there made the first port ten
 times slower than the Python in a debug build; the hand matchers are tested
 against the original patterns on every line of the corpus.
+
+The guide-index gate reads links the way a renderer does, inside block
+quotes, list items and raw HTML, which is finer than the line model the link
+gate shares. It carries that model in its own modules
+(`xtask/src/docs/guide_index/`), indexed by character as the Python was, and
+uses the shared corpus listing. Its patterns run on a one-byte-per-character
+view of the text, so a regex offset is a character offset and Python's `\s`
+and `\d` classes keep their meaning. The script's 297 self-test cases were
+captured mechanically, one `#[test]` each. The port matched the script on
+2,500 mutated copies of the indexes and README, and the patterns rewritten
+without lookahead matched Python's on 260,000 fuzzed inputs.
 
 The `migration-guides` job installs a toolchain for the ported gates, after
 its bash gates, so those still report in seconds.

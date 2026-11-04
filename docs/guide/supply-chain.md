@@ -436,7 +436,7 @@ When there is no fix — or the vulnerable code path is unreachable from your ap
 [advisories]
 ignore = [
     # Why this is acceptable *here*, and when you will look again.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path (autumn-web `jwt` feature, default-on); reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
 ]
 ```
 
@@ -446,10 +446,13 @@ the rationale are committed to your repository, so the decision is reviewable
 in a pull request rather than living in someone's memory.
 
 Your generated `deny.toml` has two waivers: `RUSTSEC-2023-0071` (`rsa`) and
-`RUSTSEC-2026-0387` (`crypto-bigint` 0.5). Both reach every Autumn app through
-`jsonwebtoken`, which `autumn-web` depends on unconditionally. No patched
-release exists for either. cargo-deny's "this waiver is unused" warning tells
-you when one of *your* waivers has gone stale.
+`RUSTSEC-2026-0387` (`crypto-bigint` 0.5). Both reach an Autumn app through
+`jsonwebtoken`, which `autumn-web` compiles behind its default-on `jwt`
+feature. No fix an app can take exists for either. An app that needs neither
+JWT tenancy nor OIDC can set `default-features = false`, leave out `jwt` (and
+`oauth2`, which turns it on), and delete both waivers. A passkey app still
+reaches `rsa` through `webauthn-rs`. cargo-deny's "this waiver is unused"
+warning tells you when one of *your* waivers has gone stale.
 
 Those waivers are why a freshly scaffolded app's CI is green on day one instead
 of red on the first push. Autumn's CI generates each app flavor and audits it with

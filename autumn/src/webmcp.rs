@@ -470,6 +470,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let on = route.webmcp();
         assert!(on.api_doc.webmcp_tool && !on.api_doc.mcp_tool);

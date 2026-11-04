@@ -858,11 +858,13 @@ mod tests {
     /// `hx-indicator` resolver. It increased them from 44 KiB and 13 KiB.
     /// Issue #3411 added the direct upload controller. It increased them from
     /// 46 KiB and 14 KiB. The test measures the bundle with the search part.
+    /// Issue #3410 added the tags mode of the combobox (chips). It increased
+    /// them from 54 KiB and 16 KiB.
     /// Issue #3412 added the password reveal, the strength hint and the
-    /// one-time code format. It increased them from 54 KiB and 16 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 64 * 1024;
+    /// one-time code format. It increased them from 61 KiB and 18 KiB.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 70 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 19 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 20 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.

@@ -458,6 +458,7 @@ fn conformance_routes(manifest: &SandboxManifest) -> Vec<RouteInfo> {
             // `RouteInfo` built by hand in this crate.
             pools: Vec::new(),
             resource_shape: String::new(),
+            group: None,
         })
         .collect()
 }

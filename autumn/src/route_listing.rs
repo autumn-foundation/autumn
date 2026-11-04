@@ -414,6 +414,11 @@ pub struct RouteInfo {
     /// dimensions of the routes manifest carry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools: Vec<String>,
+    /// The route group (#3544). A `[roles.<name>] mount` list selects routes
+    /// by group. `None` for a framework route or a plugin asset: every role
+    /// that serves HTTP serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// `skip_serializing_if` helper: elide `false` booleans from JSON output.
@@ -623,6 +628,10 @@ fn pools_of(
 /// # Errors
 ///
 /// Returns `RouterBuildError::UnregisteredApiVersion` if a route's version is not registered.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one field initialiser per `RouteInfo` field, for top-level and scoped routes"
+)]
 pub fn collect_route_infos(
     routes: &[Route],
     route_sources: &[RouteSource],
@@ -696,6 +705,7 @@ pub fn collect_route_infos(
             agent_grant: agent_grant_of(&route.api_doc),
             resource_shape: ResourceShape::from_pools(&pools),
             pools,
+            group: Some(route.group_name().to_owned()),
         });
     }
 
@@ -727,6 +737,7 @@ pub fn collect_route_infos(
                 agent_grant: agent_grant_of(&route.api_doc),
                 resource_shape: ResourceShape::from_pools(&pools),
                 pools,
+                group: Some(route.group_name().to_owned()),
             });
         }
     }
@@ -1090,6 +1101,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -1112,6 +1124,29 @@ mod tests {
         assert_eq!(infos[0].handler, "list_posts");
         assert_eq!(infos[0].source, RouteSource::User);
         assert!(infos[0].middleware.is_empty());
+    }
+
+    /// The listing carries the route group (#3544): `app` by default, the
+    /// route's own group otherwise, in a scoped group too.
+    #[test]
+    fn collect_route_infos_sets_the_route_group() {
+        let routes = vec![
+            make_route(Method::GET, "/posts", "list_posts"),
+            make_route(Method::GET, "/landing", "landing").in_group("marketing"),
+        ];
+        let scoped = vec![ScopedGroup {
+            prefix: "/m".to_owned(),
+            routes: vec![make_route(Method::GET, "/promo", "promo").in_group("marketing")],
+            source: RouteSource::User,
+            layer_guarded: false,
+            apply_layer: Box::new(|router| router),
+        }];
+        let infos = collect_route_infos(&routes, &[], &scoped, &[]).unwrap();
+        let groups: Vec<Option<&str>> = infos.iter().map(|i| i.group.as_deref()).collect();
+        assert_eq!(
+            groups,
+            vec![Some("app"), Some("marketing"), Some("marketing")]
+        );
     }
 
     #[test]

@@ -20,6 +20,12 @@ regex = "1"
 # dependency and `fs` adds `tempfile`, already in the build.
 # 0.3.1 for `CommandBuilder::status()`, which passes a script's exit code through.
 smop = { version = "0.3.1", default-features = false, features = ["sh", "fs"] }
+# The guide-index gate folds reference labels with full Unicode case folding
+# (`unicase`) and drops format characters by category
+# (`unicode-general-category`). Neither has dependencies, and both are
+# already in the build.
+unicase = "2.10"
+unicode-general-category = "1.1"
 
 [lints]
 workspace = true

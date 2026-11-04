@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 /// The workspace MSRV: `rust-version` in the root `Cargo.toml`. Generated
 /// projects pin this toolchain.
@@ -11,6 +11,7 @@ mod aeo;
 mod agents;
 mod alert;
 mod assets;
+mod boundaries;
 mod build;
 mod built_artifact;
 mod cache_audit;
@@ -492,6 +493,45 @@ pub struct GraphArgs {
     release: bool,
 }
 
+/// Arguments for `autumn graph check-boundaries` (issue #3549).
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct CheckBoundariesArgs {
+    /// The file that declares the boundaries.
+    #[arg(long, value_name = "PATH", default_value = "boundaries.toml")]
+    config: String,
+    /// Check this committed graph instead of building the app.
+    #[arg(long, value_name = "PATH")]
+    graph: Option<String>,
+    /// The baseline of known violations. Overrides `baseline` in the config.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<String>,
+    /// Write the current violations to the baseline and exit 0.
+    #[arg(long, conflicts_with = "json")]
+    update_baseline: bool,
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable).
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Inspect the release binary rather than the debug one.
+    #[arg(long)]
+    release: bool,
+}
+
 /// Subcommands for `autumn graph`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum GraphSubcommands {
@@ -511,6 +551,8 @@ pub enum GraphSubcommands {
         #[command(flatten)]
         args: GraphArgs,
     },
+    /// Fail when code in one boundary reaches a table another boundary owns.
+    CheckBoundaries(CheckBoundariesArgs),
 }
 
 /// Arguments for `autumn openapi export`.
@@ -1399,15 +1441,17 @@ enum Commands {
         #[arg(short, long)]
         package: Option<String>,
         /// Process role: web serves HTTP only, worker runs jobs+scheduler only,
-        /// combined (default) does both.
-        #[arg(long, value_enum)]
-        role: Option<ServeRole>,
+        /// combined (default) does both. A `[roles.<name>]` preset name is
+        /// accepted too; the app checks that it is declared.
+        #[arg(long, value_parser = parse_serve_role)]
+        role: Option<String>,
         /// Pin this process to a subset of job queues (issue #1623). Repeatable
         /// and comma-separated: `--pin critical,default` or `--pin critical
         /// --pin default`. A pinned process never claims jobs from queues
         /// outside the subset, on every backend. Forwarded to the app binary as
         /// `AUTUMN_JOBS__PIN`; omit it to let the app read `[jobs] pin` from its
-        /// own config (the default: drain every configured queue).
+        /// own config (the default: drain every configured queue). The `pin`
+        /// of a `[roles.<name>]` preset replaces it.
         #[arg(long, value_delimiter = ',', value_name = "QUEUE")]
         pin: Vec<String>,
     },
@@ -3296,27 +3340,14 @@ fn normalize_pin(pin: &[String]) -> Option<Vec<String>> {
     })
 }
 
-/// Process role selector for `autumn serve --role`.
-///
-/// Mirrors `autumn_web::config::ProcessRole`: `web` serves HTTP only, `worker`
-/// runs job workers + the cron scheduler only, and `combined` (the default)
-/// does both. The chosen role is forwarded to the app binary via `AUTUMN_ROLE`.
-#[derive(Clone, Copy, ValueEnum)]
-enum ServeRole {
-    Combined,
-    Web,
-    Worker,
-}
-
-impl ServeRole {
-    /// Stable lowercase identifier forwarded to the app via `AUTUMN_ROLE`.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Combined => "combined",
-            Self::Web => "web",
-            Self::Worker => "worker",
-        }
-    }
+/// Parse `autumn serve --role`: a built-in role or a `[roles.<name>]` preset
+/// name (#3543). Returns the canonical name, which is forwarded to the app
+/// binary via `AUTUMN_ROLE`. The app checks that a preset is declared.
+fn parse_serve_role(value: &str) -> Result<String, String> {
+    value
+        .parse::<autumn_web::config::RoleName>()
+        .map(|name| name.as_str().to_owned())
+        .map_err(|err| err.to_string())
 }
 
 /// Subcommands for `autumn migrate`.
@@ -5418,7 +5449,7 @@ fn run_command(command: Commands) {
                 profile: None,
                 // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
                 // the child pick its default (combined) or read its own env.
-                role: role.map(|r| r.as_str().to_owned()),
+                role,
                 // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3).
                 pin: normalize_pin(&pin),
             };
@@ -5979,28 +6010,7 @@ fn run_command(command: Commands) {
                 release: args.release,
             });
         }
-        Commands::Graph(command) => {
-            let (query, args) = match command {
-                GraphSubcommands::Show(args) => (graph::Query::Show, args),
-                GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
-                GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
-            };
-            let features = routes::CargoFeatures {
-                features: args.features,
-                all: args.all_features,
-                no_default: args.no_default_features,
-            };
-            graph::run(&graph::GraphOptions {
-                query,
-                package: args.package.as_deref(),
-                bin: args.bin.as_deref(),
-                manifest: args.manifest.as_deref(),
-                json: args.json,
-                check: args.check.as_deref(),
-                features,
-                release: args.release,
-            });
-        }
+        Commands::Graph(command) => run_graph(command),
         Commands::DataFlow(args) => {
             let features = routes::CargoFeatures {
                 features: args.features,
@@ -7695,6 +7705,50 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
     }
 }
 
+/// Run one `autumn graph` subcommand.
+fn run_graph(command: GraphSubcommands) {
+    let (query, args) = match command {
+        GraphSubcommands::Show(args) => (graph::Query::Show, args),
+        GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
+        GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
+        GraphSubcommands::CheckBoundaries(args) => {
+            boundaries::run(&boundaries::CheckBoundariesOptions {
+                config: &args.config,
+                graph: args.graph.as_deref(),
+                baseline: args.baseline.as_deref(),
+                update_baseline: args.update_baseline,
+                json: args.json,
+                build: graph::BuildTarget {
+                    package: args.package.as_deref(),
+                    bin: args.bin.as_deref(),
+                    features: routes::CargoFeatures {
+                        features: args.features,
+                        all: args.all_features,
+                        no_default: args.no_default_features,
+                    },
+                    release: args.release,
+                },
+            });
+            return;
+        }
+    };
+    let features = routes::CargoFeatures {
+        features: args.features,
+        all: args.all_features,
+        no_default: args.no_default_features,
+    };
+    graph::run(&graph::GraphOptions {
+        query,
+        package: args.package.as_deref(),
+        bin: args.bin.as_deref(),
+        manifest: args.manifest.as_deref(),
+        json: args.json,
+        check: args.check.as_deref(),
+        features,
+        release: args.release,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -8676,6 +8730,31 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// #3543: `--role` takes a `[roles.<name>]` preset name. The app checks
+    /// that the name is declared. The CLI checks only the name grammar.
+    #[test]
+    fn serve_role_accepts_a_named_role() {
+        for (given, forwarded) in [
+            ("critical", "critical"),
+            ("Worker", "worker"),
+            ("jobs", "worker"),
+        ] {
+            let cli = Cli::try_parse_from(["autumn", "serve", "--role", given]).unwrap();
+            match cli.command {
+                Commands::Serve { role, .. } => {
+                    assert_eq!(role.as_deref(), Some(forwarded), "{given}");
+                }
+                _ => panic!("expected Serve command"),
+            }
+        }
+        for bad in ["a b", "", "1st"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "serve", "--role", bad]).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     /// Issue #1623, AC3: a worker-role process must be pinnable to a subset of
