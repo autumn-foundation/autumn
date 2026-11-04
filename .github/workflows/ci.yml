@@ -995,17 +995,28 @@ jobs:
           retention-days: 1
 
   test-archive:
-    name: Build tests (${{ matrix.os }})
+    name: Build tests (${{ matrix.os }}${{ matrix.linker == 'lld' && ', lld' || '' }})
     needs: [lint, meta]
+    # MEASUREMENT, to be removed before merge: the `lld` leg links the same
+    # build with rust-lld instead of Xcode's ld-prime, so one run compares the
+    # two on the same commit. It uploads nothing and cannot fail the run.
+    continue-on-error: ${{ matrix.linker == 'lld' }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
+        linker: [default]
+        include:
+          - os: macos-latest
+            linker: lld
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
+        # The `lld` leg builds cold, so its time is not a cache hit's.
+        if: matrix.linker != 'lld'
+        id: cache
         continue-on-error: true
         with:
           # See `test-build`.
@@ -1014,6 +1025,39 @@ jobs:
       - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-nextest@0.9.149
+      - name: Time every link, and sample memory (macOS, measurement)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sysctl hw.ncpu hw.memsize vm.swapusage
+          xcodebuild -version || true
+          ld -version_details 2>/dev/null | head -c 300 || true
+          gcc_ld="$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld"
+          extra=""
+          if [ "${{ matrix.linker }}" = lld ]; then
+            ls -l "$gcc_ld"
+            [ -x "$gcc_ld/ld64.lld" ] || { echo "::error::no ld64.lld in $gcc_ld"; exit 1; }
+            extra="-fuse-ld=lld -B$gcc_ld"
+          fi
+          # A wrapper around the system `cc`: it links exactly as rustc asked,
+          # plus `extra`, and appends "<seconds> <output>" to a log.
+          wrapper="${RUNNER_TEMP}/timed-cc"
+          cat > "$wrapper" <<EOF
+          #!/bin/bash
+          out=""; prev=""
+          for a in "\$@"; do [ "\$prev" = "-o" ] && out="\$a"; prev="\$a"; done
+          start=\$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+          /usr/bin/cc $extra "\$@"; rc=\$?
+          perl -MTime::HiRes=time -e 'printf "%.3f %s\\n", time - \$ARGV[0], \$ARGV[1]' "\$start" "\$(basename "\$out")" >> "${RUNNER_TEMP}/links.log"
+          exit \$rc
+          EOF
+          chmod +x "$wrapper"
+          cat "$wrapper"
+          echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=$wrapper" >> "$GITHUB_ENV"
+          # Swap in use, once a minute, to see whether the 7 GB runner pages.
+          nohup bash -c 'while sleep 60; do echo "$(date +%T) $(sysctl -n vm.swapusage)"; done' \
+            > "${RUNNER_TEMP}/swap.log" 2>&1 &
       - name: Archive the workspace test build
         shell: bash
         run: |
@@ -1023,7 +1067,24 @@ jobs:
             --archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
           ls -lh "${RUNNER_TEMP}/nextest-archive"
           df -h
+      - name: Report link and memory figures (macOS, measurement)
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="${RUNNER_TEMP}/links.log"
+          {
+            echo "### Links: ${{ matrix.linker }} (cache hit: ${{ steps.cache.outputs.cache-hit || 'n/a' }})"
+            echo '```'
+            awk '{ n++; s += $1; if ($1 > m) m = $1 } END { printf "links: %d, total: %.0fs, longest: %.1fs\n", n, s, m }' "$log"
+            echo "slowest 15:"
+            sort -rn "$log" | head -15
+            awk '{ for (i = 1; i <= NF; i++) if ($i == "used") { v = $(i + 2); sub(/M/, "", v); if (v + 0 >= m) { m = v + 0; at = $1 } } n++ }
+                 END { printf "swap: peak %.0f MB in use at %s, %d samples\n", m, at, n }' "${RUNNER_TEMP}/swap.log"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
+        if: matrix.linker != 'lld'
         with:
           name: workspace-tests-${{ runner.os }}
           path: ${{ runner.temp }}/nextest-archive/workspace-tests.tar.zst
