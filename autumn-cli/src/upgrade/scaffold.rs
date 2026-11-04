@@ -922,10 +922,12 @@ enum OnDisk {
 fn read_current(root: &Path, relative: &str) -> OnDisk {
     // A swap in flight leaves its path absent for a moment. Wait it out, so a
     // held file is not read as missing. A claim left by a crash costs only
-    // this bounded wait.
+    // this bounded wait. A read that lands while the file is being renamed
+    // back can also fail outright (Windows reports a sharing or pending-delete
+    // error, not "not found"), so an unreadable path waits the same way.
     for attempt in 1..SWAP_ATTEMPTS {
         let now = read_current_once(root, relative);
-        if now != OnDisk::Absent {
+        if now != OnDisk::Absent && now != OnDisk::Opaque(ConflictReason::Unreadable) {
             return now;
         }
         if claim_in_flight(&root.join(relative)).is_none() {
@@ -3881,6 +3883,44 @@ mod tests {
         )
         .unwrap();
         assert!(is_project(tmp.path()));
+    }
+
+    #[test]
+    fn a_read_that_fails_while_a_claim_is_held_waits_out_the_swap() {
+        // A read that lands mid-rename can fail rather than find nothing. A
+        // directory standing in the file's place fails the same way on every
+        // platform. While the claim is held, that failure must wait like an
+        // absent file does, not settle as unreadable.
+        let tmp = scaffolded(GenerateOptions::default());
+        let path = tmp.path().join("Dockerfile");
+        let held = path.with_file_name(".autumn-upgrade-Dockerfile.claim.old");
+        fs::rename(&path, &held).unwrap();
+        fs::create_dir(&path).unwrap();
+        let restore = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            fs::remove_dir(&path).unwrap();
+            fs::rename(&held, &path).unwrap();
+        });
+
+        let report = plan_in(tmp.path());
+        restore.join().unwrap();
+        assert_eq!(*status_of(&report.entries, "Dockerfile"), Status::UpToDate);
+    }
+
+    #[test]
+    fn an_unreadable_file_with_no_claim_is_still_unreadable() {
+        // The wait is only for a swap in flight. With no claim beside it, a
+        // path that cannot be read as text is reported at once.
+        let tmp = scaffolded(GenerateOptions::default());
+        let path = tmp.path().join("Dockerfile");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let report = plan_in(tmp.path());
+        assert_eq!(
+            *status_of(&report.entries, "Dockerfile"),
+            Status::Conflict(ConflictReason::Unreadable)
+        );
     }
 
     #[test]

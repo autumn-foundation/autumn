@@ -97,7 +97,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       # Only comments from users with admin, write or maintain permission count.
       # The job asks GitHub for the permission. It does not use author_association.
       # Each comment goes to its own file, so one comment cannot change another.
@@ -179,7 +179,7 @@ jobs:
           df -h
 
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       # Docker is preinstalled on ubuntu-latest runners, so the testcontainer
@@ -329,7 +329,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       - name: Verify every publishable crate can be packaged
         run: ./scripts/check-publish-dry-run.sh
 
@@ -345,7 +345,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rust-docs
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       - name: Build docs (all features, no broken links)
         run: ./scripts/check-docs.sh
 
@@ -364,7 +364,7 @@ jobs:
       # Pinned toolchain for cargo-semver-checks: the MSRV. Keep in sync with
       # AUTUMN_SEMVER_RUST_VERSION's default in scripts/check-semver.sh.
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       # protoc is required by telemetry-otlp (prost/tonic) in the broadened
       # feature set check-semver.sh enables; it is not in the standard
       # ubuntu-latest image. Mirrors feature-combinations.yml's install so the
@@ -427,13 +427,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
-      # install-action skips its verified download when the pinned version is
-      # already there — the auditor this gate trusts must come from the pin,
-      # not from a cache entry.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
+      # kache caches compiler outputs only, never $CARGO_HOME/bin. That matters
+      # here: install-action skips its verified download when the pinned
+      # version is already there, and the auditor this gate trusts must come
+      # from the pin, not from a cache entry.
+      - uses: ./.github/actions/kache
       - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-deny@0.20.2
@@ -474,7 +472,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       - name: Generate and verify the workspace SBOM
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -556,7 +554,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
 
       - name: Create smoke project
         run: |
@@ -643,7 +641,7 @@ jobs:
       # `--verify` regenerates from THIS checkout and diffs component by
       # component; `--expect-version` pins it to the tag being released.
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       - name: Re-verify the downloaded SBOM against the tagged source
         env:
           RELEASE_TAG: ${{ github.ref_name }}
