@@ -25425,7 +25425,8 @@ workers = 2
             let role = Role::from(base);
             assert_eq!(role.guard_base(), base);
             // `PartialEq` works in both directions.
-            assert!(base == role && role == base);
+            assert_eq!(base, role);
+            assert_eq!(role, base);
         }
     }
 
