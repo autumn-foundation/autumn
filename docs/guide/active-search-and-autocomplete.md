@@ -269,6 +269,96 @@ let config = AutocompleteConfig::new("/tags/autocomplete", "tag")
     .free_text(); // keep hidden field in sync with typed text
 ```
 
+### Multiple values (tags mode)
+
+Use `.multiple()` to select more than one value (issue #3410). Each pick
+is a chip with a remove button. Each chip submits one hidden
+`name=value` input, so the repeated keys decode into a `Vec<T>`:
+
+```rust
+#[derive(Deserialize, Serialize, Validate)]
+struct PostForm {
+    title: String,
+    #[serde(default)] // No chip posts no key.
+    tags: Vec<String>,
+}
+
+let config = AutocompleteConfig::new("/tags/suggest", "tags")
+    .multiple()
+    .free_text(); // Enter adds the typed text as a tag.
+
+html! {
+    // Pre-fill the chips from the changeset, for example after a 422.
+    (autocomplete_input_for(&changeset, "tags", "Tags", &config))
+}
+```
+
+- `autocomplete_input_for` reads `Changeset::field_values("tags")`. The
+  changeset is the source of the chips. It finds each label in
+  `.selected(…)`, then in `.fallback_options(…)`. If no label is found,
+  the label is the value. This is correct for tags. It also shows the
+  field errors.
+- `.selected(&[("42", "rust")])` gives the first chips without a
+  changeset, for example on an edit form.
+- `.remove_label("{label} entfernen")` translates the `aria-label` of each
+  remove button. `{label}` is the chip label. `.added_message(…)` and
+  `.removed_message(…)` translate the status text that a screen reader
+  speaks.
+
+To let the user create a tag, return a "create" entry after the matches:
+
+```rust
+use autumn_web::widgets::{autocomplete_create_option, autocomplete_option};
+
+html! {
+    @for tag in &tags { (autocomplete_option(&tag.name, &tag.name)) }
+    @if !tags.iter().any(|t| t.name == q) {
+        (autocomplete_create_option(q, &format!("Create “{q}”")))
+    }
+}
+```
+
+When the user selects this entry, the widget adds a chip. The chip shows
+the value, not the label. Validate new values on the server. Remove
+duplicate values on the server too.
+
+The listbox does not show an option that is already a chip. The widget
+adds a value one time only. With `free_text`, a form submit adds the text
+that is still in the input.
+
+#### Tags keyboard
+
+| Key | Where | Effect |
+|---|---|---|
+| ArrowDown / ArrowUp, Enter, Escape | Input | As in the single mode. Enter adds a chip and clears the input. |
+| Enter | Input, no active option, `free_text` | Adds the typed text as a chip. |
+| Backspace | Empty input | Removes the last chip. |
+| ArrowLeft | Start of the input | Moves to the last chip. ArrowRight in RTL. |
+| ArrowLeft / ArrowRight, Home, End | Chip | Moves between chips. Does not wrap. |
+| ArrowRight | Last chip | Moves to the input. ArrowLeft in RTL. |
+| Delete, Backspace, Enter, Space | Chip | Removes the chip. Focus goes to the next chip, else the previous chip, else the input. |
+| Tab | Chip | Moves to the input. The chip list is one tab stop. |
+
+A pointer click on a remove button removes the chip and moves focus to
+the input.
+
+#### Tags without JavaScript
+
+The `<noscript>` fallback is a `<select multiple>`. The selected values
+are `selected`. A value with no fallback option gets its own option, so a
+resubmit keeps it. The server renders the chip list `hidden` and its
+inputs `disabled`. The runtime enables them and disables the `<select>`.
+Thus the form sends each value one time.
+
+Without JavaScript, the user can select only the `.fallback_options`
+values. A new tag needs JavaScript.
+
+If JavaScript is on but `autumn-widgets.js` does not load, no chip
+submits. The field then decodes as an empty `Vec`. On an edit form, do
+not delete the stored tags because of an empty field alone. For example,
+also send a hidden `tags_present=1` input from the runtime-enabled form,
+or keep the edit in a separate request.
+
 ---
 
 ## No-JavaScript fallback
@@ -315,6 +405,9 @@ All widgets include:
 - `role="option"` + `tabindex="-1"` on each autocomplete option (focus stays
   on the input; `aria-activedescendant` names the active option)
 - `role="status"` + `aria-live="polite"` on empty-state partials
+- Tags mode: a `<ul>` of chips named by the field label
+  (`aria-labelledby`), and a remove `<button>` per chip with
+  `aria-label="Remove {label}"` and a 24 px target
 
 ---
 
