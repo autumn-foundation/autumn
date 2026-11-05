@@ -50,6 +50,7 @@
 //! See `docs/guide/architecture-graph.md`.
 
 pub mod boundaries;
+pub mod grants;
 pub mod manifest;
 pub mod query;
 

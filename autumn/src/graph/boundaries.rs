@@ -77,7 +77,25 @@ pub struct Boundary {
     /// that declare the models of the owned tables are used.
     #[serde(default)]
     pub schema_crates: Vec<String>,
+    /// The Postgres schema of the owned tables. When unset, `public`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// The database role of this boundary. When set, `autumn db grants`
+    /// gives this role access to the owned tables and the exceptions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
+
+impl Boundary {
+    /// The Postgres schema of the owned tables: [`Self::schema`] or `public`.
+    #[must_use]
+    pub fn schema_name(&self) -> &str {
+        self.schema.as_deref().unwrap_or(DEFAULT_SCHEMA)
+    }
+}
+
+/// The schema of a boundary that sets no `schema`.
+pub const DEFAULT_SCHEMA: &str = "public";
 
 impl BoundaryConfig {
     /// Parse `boundaries.toml`.
@@ -92,6 +110,13 @@ impl BoundaryConfig {
             if boundary.owns.is_empty() && boundary.crates.is_empty() && boundary.modules.is_empty()
             {
                 return Err(BoundaryError::Empty(name.clone()));
+            }
+            for (key, value) in [("schema", &boundary.schema), ("role", &boundary.role)] {
+                if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                    return Err(BoundaryError::Parse(format!(
+                        "boundary `{name}` has an empty `{key}`"
+                    )));
+                }
             }
         }
         Ok(config)
@@ -1075,7 +1100,7 @@ impl<'a> Resolver<'a> {
 
 /// The boundary with the most specific match. A tie between two boundaries
 /// is an error, because the config does not say which one is meant.
-fn pick<'a>(
+pub(super) fn pick<'a>(
     what: &'static str,
     name: &str,
     candidates: &[(&'a str, usize)],
@@ -1101,7 +1126,7 @@ fn pick<'a>(
 }
 
 /// How specific a pattern is: its count of characters that are not `*`.
-fn specificity(pattern: &str) -> usize {
+pub(super) fn specificity(pattern: &str) -> usize {
     pattern.chars().filter(|c| *c != '*').count()
 }
 
@@ -1135,7 +1160,7 @@ fn base_id(id: &str) -> &str {
 }
 
 /// Whether `text` matches `pattern`, where `*` matches any run.
-fn glob(pattern: &str, text: &str) -> bool {
+pub(super) fn glob(pattern: &str, text: &str) -> bool {
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or_default();
     let Some(mut rest) = text.strip_prefix(first) else {

@@ -80,8 +80,127 @@ impl MigrationScope {
     }
 }
 
-/// One registered migration set: its label, the set, and its scope.
-pub(crate) type RegisteredMigrations = (&'static str, EmbeddedMigrations, MigrationScope);
+/// One registered migration set: its label, the set, its scope, and the
+/// Postgres schema it goes into (`None`: the default `search_path`).
+pub(crate) type RegisteredMigrations = (
+    &'static str,
+    EmbeddedMigrations,
+    MigrationScope,
+    Option<&'static str>,
+);
+
+/// The SQL that runs before a migration of a set in `schema` (#3550).
+///
+/// It makes the schema and puts it first on the `search_path`, so an
+/// unqualified `CREATE TABLE campaigns` makes `<schema>.campaigns`. The rest
+/// of the path stays, so `__diesel_schema_migrations` resolves as before.
+///
+/// A transactional migration uses a local setting, which ends at commit. A
+/// non-transactional one uses a session setting; [`SCHEMA_EXIT_SQL`] resets it.
+fn schema_enter_sql(schema: &str, run_in_transaction: bool) -> String {
+    let ident = format!("\"{}\"", schema.replace('"', "\"\""));
+    let literal = format!("'{}, '", ident.replace('\'', "''"));
+    format!(
+        "CREATE SCHEMA IF NOT EXISTS {ident}; \
+         SELECT set_config('search_path', {literal} || current_setting('search_path'), \
+         {run_in_transaction})"
+    )
+}
+
+/// The SQL that runs after a non-transactional migration in a schema.
+const SCHEMA_EXIT_SQL: &str = "RESET search_path";
+
+/// A [`MigrationSource`] whose migrations run in one Postgres schema (#3550).
+/// With no schema, it gives the inner migrations unchanged.
+///
+/// [`AppBuilder::migrations_in_schema`](crate::app::AppBuilder::migrations_in_schema)
+/// uses it at boot. Use it with [`run_pending`] to migrate a schema yourself:
+///
+/// ```rust,no_run
+/// use autumn_web::migrate::{EmbeddedMigrations, SchemaMigrations, embed_migrations, run_pending};
+/// # use autumn_web::reexports::diesel_migrations;
+///
+/// const MARKETING: EmbeddedMigrations = embed_migrations!("migrations");
+///
+/// run_pending("postgres://localhost/app", SchemaMigrations::new(MARKETING, Some("marketing")))
+///     .expect("migrations ran");
+/// ```
+pub struct SchemaMigrations<S> {
+    inner: S,
+    schema: Option<&'static str>,
+}
+
+impl<S> SchemaMigrations<S> {
+    /// Run the migrations of `inner` in `schema`, or as they are with `None`.
+    pub const fn new(inner: S, schema: Option<&'static str>) -> Self {
+        Self { inner, schema }
+    }
+}
+
+impl<DB, S> MigrationSource<DB> for SchemaMigrations<S>
+where
+    DB: diesel::backend::Backend + 'static,
+    S: MigrationSource<DB>,
+{
+    fn migrations(&self) -> diesel::migration::Result<Vec<Box<dyn Migration<DB>>>> {
+        let migrations = self.inner.migrations()?;
+        let Some(schema) = self.schema else {
+            return Ok(migrations);
+        };
+        Ok(migrations
+            .into_iter()
+            .map(|inner| Box::new(SchemaMigration { inner, schema }) as Box<dyn Migration<DB>>)
+            .collect())
+    }
+}
+
+/// A migration that runs in one Postgres schema. See [`schema_enter_sql`].
+struct SchemaMigration<DB> {
+    inner: Box<dyn Migration<DB>>,
+    schema: &'static str,
+}
+
+impl<DB: diesel::backend::Backend> SchemaMigration<DB> {
+    fn in_schema(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+        step: impl FnOnce(
+            &mut dyn diesel::connection::BoxableConnection<DB>,
+        ) -> diesel::migration::Result<()>,
+    ) -> diesel::migration::Result<()> {
+        let in_transaction = self.inner.metadata().run_in_transaction();
+        conn.batch_execute(&schema_enter_sql(self.schema, in_transaction))?;
+        let result = step(conn);
+        if !in_transaction {
+            conn.batch_execute(SCHEMA_EXIT_SQL)?;
+        }
+        result
+    }
+}
+
+impl<DB: diesel::backend::Backend> Migration<DB> for SchemaMigration<DB> {
+    fn run(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.in_schema(conn, |conn| self.inner.run(conn))
+    }
+
+    fn revert(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.in_schema(conn, |conn| self.inner.revert(conn))
+    }
+
+    fn metadata(&self) -> &dyn diesel::migration::MigrationMetadata {
+        self.inner.metadata()
+    }
+
+    fn name(&self) -> &dyn diesel::migration::MigrationName {
+        self.inner.name()
+    }
+}
 
 /// Embedded Autumn framework migrations.
 ///
@@ -5606,6 +5725,46 @@ mod tests {
                 retries: 2,
             }
         );
+    }
+
+    #[test]
+    fn schema_enter_sql_creates_the_schema_and_prepends_it() {
+        assert_eq!(
+            schema_enter_sql("marketing", true),
+            "CREATE SCHEMA IF NOT EXISTS \"marketing\"; \
+             SELECT set_config('search_path', '\"marketing\", ' || current_setting('search_path'), true)"
+        );
+        assert!(schema_enter_sql("marketing", false).ends_with(", false)"));
+    }
+
+    #[test]
+    fn schema_enter_sql_quotes_the_name() {
+        let sql = schema_enter_sql("we\"ird'name", true);
+        assert!(sql.contains("\"we\"\"ird'name\";"), "{sql}");
+        assert!(sql.contains("'\"we\"\"ird''name\", '"), "{sql}");
+    }
+
+    #[test]
+    fn schema_migrations_with_no_schema_pass_through() {
+        let none = HashMap::new();
+        let set = SchemaMigrations::new(
+            DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &none),
+            None,
+        );
+        let wrapped = MigrationSource::<diesel::pg::Pg>::migrations(&set).unwrap();
+        let plain = MigrationSource::<diesel::pg::Pg>::migrations(&FRAMEWORK_MIGRATIONS).unwrap();
+        assert_eq!(wrapped.len(), plain.len());
+        let in_schema = SchemaMigrations::new(
+            DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &none),
+            Some("marketing"),
+        );
+        let names: Vec<String> = MigrationSource::<diesel::pg::Pg>::migrations(&in_schema)
+            .unwrap()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
+        let plain_names: Vec<String> = plain.iter().map(|m| m.name().to_string()).collect();
+        assert_eq!(names, plain_names);
     }
 
     #[test]

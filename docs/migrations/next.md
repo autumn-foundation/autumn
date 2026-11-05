@@ -566,6 +566,39 @@ DatabaseFleetConfig {
 **Automation:** `manual` — a struct literal needs the values the app wants.
 A codemod cannot choose them.
 
+### Database: `DatabaseConfig` has a `roles` field
+
+**Why:** each boundary can connect as its own Postgres role (issue #3550).
+`[database.roles.<boundary>]` sets the connection of that role.
+
+**You are affected only if your code builds a `DatabaseConfig` with a struct
+literal and no `..Default::default()`.** TOML and `AUTUMN_*` config need no
+change: an empty `roles` keeps one role.
+
+**Before (`{X.Y}`):**
+
+```rust
+DatabaseConfig {
+    url: Some(url),
+    // ...every other field...
+    fleet: None,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+DatabaseConfig {
+    url: Some(url),
+    // ...every other field...
+    fleet: None,
+    roles: std::collections::BTreeMap::new(),
+}
+```
+
+**Automation:** `manual` — add `roles: BTreeMap::new()`, or end the literal
+with `..Default::default()`.
+
 ### Widgets: `AutocompleteConfig` has five new fields
 
 **Why:** `autocomplete_input` has a tags mode (issue #3410). `multiple`

@@ -11236,6 +11236,20 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || check_table_boundaries(boundaries_path)));
     }
 
+    // 21. The database role of each boundary (#3550). It connects to the
+    //     database, so it runs with `--strict` or `--online` only.
+    if boundaries_path.exists() && (opts.strict || opts.online) {
+        let primary = db_topology.primary_url.clone();
+        let roles = crate::db::grants::role_urls(
+            Some(&merged_db_toml),
+            db_denv.as_ref(),
+            primary.as_deref(),
+        );
+        tasks.push(Box::new(move || {
+            check_database_roles(boundaries_path, primary.as_deref(), roles)
+        }));
+    }
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     run_doctor_tasks(tasks, opts);
 }
@@ -11353,6 +11367,179 @@ const fn table_boundaries_result(status: CheckStatus, detail: String) -> CheckRe
         hint: Some(
             "Run `autumn graph check-boundaries` for the full report. \
              See docs/guide/table-ownership.md",
+        ),
+    }
+}
+
+/// Check the database role of each boundary (#3550).
+///
+/// Doctor reads the catalog with the primary URL and makes the grant plan.
+/// Then it connects as each role. Each table in the grant must open. Each
+/// other table must give `permission denied`.
+fn check_database_roles(
+    config_path: &std::path::Path,
+    primary: Option<&str>,
+    roles: Result<std::collections::BTreeMap<String, Result<String, String>>, String>,
+) -> CheckResult {
+    use crate::db::grants::{RoleProbe, probe_role, read_catalog};
+    let mut config = match crate::boundaries::load_config(config_path) {
+        Ok(config) => config,
+        Err(e) => return database_roles_result(CheckStatus::Fail, e),
+    };
+    if !config.boundaries.values().any(|b| b.role.is_some()) {
+        return database_roles_result(
+            CheckStatus::Pass,
+            "skipped: no boundary declares a `role`".to_owned(),
+        );
+    }
+    let roles = match roles {
+        Ok(roles) => roles,
+        Err(e) => return database_roles_result(CheckStatus::Warn, e),
+    };
+    let Some(primary) = primary else {
+        return database_roles_result(CheckStatus::Warn, "not checked: no database URL".to_owned());
+    };
+    let dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match crate::boundaries::cargo_facts(dir, &[], true, Some(crate::boundaries::DOCTOR_BUDGET)) {
+        Ok(facts) => {
+            for (krate, owns) in &facts.plugins {
+                config.add_plugin(krate, owns);
+            }
+        }
+        Err(e) => {
+            return database_roles_result(
+                CheckStatus::Warn,
+                format!("not checked: plugin tables not read: {e}"),
+            );
+        }
+    }
+    let probes = crate::pg::block_on(async {
+        let client = crate::pg::connect("doctor", primary)
+            .await
+            .map_err(|_| "cannot connect with the primary URL".to_owned())?;
+        let catalog = read_catalog(&client).await?;
+        let plan = autumn_web::graph::grants::plan(&config, &catalog).map_err(|e| e.to_string())?;
+        let mut probes = Vec::new();
+        for grants in &plan.roles {
+            probes.push(match roles.get(&grants.boundary) {
+                None => RoleProbe::unreachable(
+                    grants,
+                    format!("no [database.roles.{}] in autumn.toml", grants.boundary),
+                ),
+                Some(Err(e)) => RoleProbe::unreachable(grants, e.clone()),
+                Some(Ok(url)) => probe_role(url, grants).await,
+            });
+        }
+        Ok::<_, String>(probes)
+    });
+    match probes {
+        Ok(probes) => database_roles_verdict(&probes),
+        Err(e) => database_roles_result(CheckStatus::Warn, format!("not checked: {e}")),
+    }
+}
+
+/// The verdict of [`check_database_roles`], from the probes.
+///
+/// A table outside a grant that a role can read fails. A role that cannot
+/// connect, connects as another role, or cannot read its own table warns.
+fn database_roles_verdict(probes: &[crate::db::grants::RoleProbe]) -> CheckResult {
+    use crate::db::grants::Access;
+    let mut status = CheckStatus::Pass;
+    let mut lines = Vec::new();
+    let mut warn = |status: &mut CheckStatus| {
+        if *status == CheckStatus::Pass {
+            *status = CheckStatus::Warn;
+        }
+    };
+    for probe in probes {
+        let name = &probe.boundary;
+        match &probe.connected_as {
+            Err(e) => {
+                warn(&mut status);
+                lines.push(format!("{name}: cannot connect as `{}`: {e}", probe.role));
+                continue;
+            }
+            Ok(user) if *user != probe.role => {
+                warn(&mut status);
+                lines.push(format!(
+                    "{name}: connects as `{user}`, not `{}`",
+                    probe.role
+                ));
+            }
+            Ok(_) => {}
+        }
+        let leaks = probe.leaks();
+        if !leaks.is_empty() {
+            status = CheckStatus::Fail;
+            lines.push(format!(
+                "{name}: reads {} table(s) outside its grant: {}",
+                leaks.len(),
+                join_names(leaks.into_iter())
+            ));
+        }
+        let closed: Vec<_> = probe
+            .allowed
+            .iter()
+            .filter(|(_, a)| *a != Access::Allowed)
+            .map(|(t, _)| t)
+            .collect();
+        let readable = probe.allowed.len() - closed.len();
+        if !closed.is_empty() {
+            warn(&mut status);
+            lines.push(format!(
+                "{name}: cannot read {} table(s) of its grant: {}",
+                closed.len(),
+                join_names(closed.into_iter())
+            ));
+        }
+        let unknown: Vec<_> = probe
+            .denied
+            .iter()
+            .filter(|(_, a)| matches!(a, Access::Error(_)))
+            .map(|(t, _)| t)
+            .collect();
+        if !unknown.is_empty() {
+            warn(&mut status);
+            lines.push(format!(
+                "{name}: could not check {} table(s): {}",
+                unknown.len(),
+                join_names(unknown.into_iter())
+            ));
+        }
+        let refused = probe
+            .denied
+            .iter()
+            .filter(|(_, a)| *a == Access::Denied)
+            .count();
+        lines.push(format!(
+            "{name}: {readable} of {} granted table(s) readable; {refused} of {} other table(s) denied",
+            probe.allowed.len(),
+            probe.denied.len()
+        ));
+    }
+    database_roles_result(status, lines.join("\n"))
+}
+
+fn join_names<'a>(
+    names: impl Iterator<Item = &'a autumn_web::graph::grants::QualifiedName>,
+) -> String {
+    names
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+const fn database_roles_result(status: CheckStatus, detail: String) -> CheckResult {
+    CheckResult {
+        name: "database_roles",
+        status,
+        detail: Some(detail),
+        hint: Some(
+            "Run `autumn db grants --apply` after `autumn migrate`. \
+             See docs/guide/database-boundaries.md",
         ),
     }
 }
@@ -24230,6 +24417,91 @@ redirect_uri = "http://localhost/callback"
             assert!(detail.contains("advisories"), "{detail}");
             assert!(detail.contains("licenses"), "{detail}");
         }
+    }
+}
+
+#[cfg(test)]
+mod database_roles_tests {
+    use autumn_web::graph::grants::QualifiedName;
+
+    use super::{CheckStatus, database_roles_verdict};
+    use crate::db::grants::{Access, RoleProbe};
+
+    fn t(name: &str) -> QualifiedName {
+        QualifiedName::new("public", name)
+    }
+
+    fn probe() -> RoleProbe {
+        RoleProbe {
+            boundary: "marketing".into(),
+            role: "marketing".into(),
+            connected_as: Ok("marketing".into()),
+            allowed: vec![(t("campaigns"), Access::Allowed)],
+            denied: vec![
+                (t("contacts"), Access::Denied),
+                (t("deals"), Access::Denied),
+            ],
+        }
+    }
+
+    #[test]
+    fn every_denied_table_refused_passes() {
+        let result = database_roles_verdict(&[probe()]);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("marketing: 1 of 1 granted table(s) readable; 2 of 2 other table(s) denied")
+        );
+    }
+
+    #[test]
+    fn a_readable_table_outside_the_grant_fails() {
+        let mut p = probe();
+        p.denied[1].1 = Access::Allowed;
+        let result = database_roles_verdict(&[p]);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(
+            detail.contains("marketing: reads 1 table(s) outside its grant: public.deals"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn connection_and_grant_problems_warn() {
+        let mut unreachable = probe();
+        unreachable.connected_as = Err("no [database.roles.marketing] in autumn.toml".into());
+        let mut wrong_user = probe();
+        wrong_user.boundary = "billing".into();
+        wrong_user.role = "billing".into();
+        wrong_user.connected_as = Ok("postgres".into());
+        let mut closed = probe();
+        closed.boundary = "core".into();
+        closed.allowed[0].1 = Access::Denied;
+        closed.denied[0].1 = Access::Error("relation does not exist".into());
+        let result = database_roles_verdict(&[unreachable, wrong_user, closed]);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.unwrap();
+        for needle in [
+            "marketing: cannot connect as `marketing`: no [database.roles.marketing]",
+            "billing: connects as `postgres`, not `billing`",
+            "core: cannot read 1 table(s) of its grant: public.campaigns",
+            "core: could not check 1 table(s): public.contacts",
+        ] {
+            assert!(detail.contains(needle), "{needle}: {detail}");
+        }
+    }
+
+    #[test]
+    fn a_leak_beats_a_warning() {
+        let mut leak = probe();
+        leak.denied[0].1 = Access::Allowed;
+        let mut unreachable = probe();
+        unreachable.connected_as = Err("down".into());
+        assert_eq!(
+            database_roles_verdict(&[unreachable, leak]).status,
+            CheckStatus::Fail
+        );
     }
 }
 

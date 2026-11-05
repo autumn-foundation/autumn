@@ -619,12 +619,30 @@ pub fn is_in_comment_or_string(text: &str, at: usize) -> bool {
 
 /// The table name of the `table!` block whose body opens at `open`: the
 /// first code word after attributes (`#[...]`). Doc comments are not code.
+/// In a schema-qualified header (`marketing.campaigns (id) {`), the name is
+/// the word after the `.` (#3550).
 fn block_table_name(text: &str, open: usize) -> Option<String> {
+    let (first, end) = block_first_word(text, open)?;
+    let rest = text[end..].trim_start();
+    let Some(after_dot) = rest.strip_prefix('.') else {
+        return Some(first);
+    };
+    let after_dot = after_dot.trim_start();
+    let table: String = after_dot
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '#')
+        .collect();
+    Some(if table.is_empty() { first } else { table })
+}
+
+/// The first code word of a block and the byte just past it.
+fn block_first_word(text: &str, open: usize) -> Option<(String, usize)> {
+    let mut stop = text.len();
     let mut name: Vec<u8> = Vec::new();
     let mut brackets = 0usize;
     // In a `use ...;` declaration (diesel `print-schema` writes them first).
     let mut in_use = false;
-    scan_code(text, open + 1, |_, c| {
+    scan_code(text, open + 1, |i, c| {
         if in_use {
             in_use = c != b';';
             return false;
@@ -651,9 +669,13 @@ fn block_table_name(text: &str, open: usize) -> Option<String> {
             in_use = c != b';';
             return false;
         }
+        stop = i;
         true
     });
-    String::from_utf8(name).ok().filter(|n| !n.is_empty())
+    String::from_utf8(name)
+        .ok()
+        .filter(|n| !n.is_empty())
+        .map(|n| (n, stop))
 }
 
 /// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
@@ -800,6 +822,20 @@ fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_block_range_finds_a_schema_qualified_block() {
+        let text =
+            "diesel::table! {\n    marketing.campaigns (id) {\n        id -> Int8,\n    }\n}\n";
+        assert_eq!(
+            schema_block_range(text, "campaigns"),
+            Some((0, text.len() - 1))
+        );
+        // The schema is not a table name.
+        assert_eq!(schema_block_range(text, "marketing"), None);
+        let spaced = "table! { marketing . campaigns (id) { id -> Int8, } }";
+        assert!(schema_block_range(spaced, "campaigns").is_some());
+    }
     use crate::generate::Flags;
     use crate::generate::emit::Action;
     use std::fs;

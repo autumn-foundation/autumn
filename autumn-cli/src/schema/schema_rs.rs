@@ -66,8 +66,23 @@ pub struct SchemaRsCheck {
 ///
 /// Returns the reason when the block cannot be rendered.
 pub fn render_block(table: &Table) -> Result<String, String> {
-    let name = ident_token(&table.name)
+    render_block_in(table, None)
+}
+
+/// [`render_block`] in a Postgres schema: the header is
+/// `schema.table (key) {` (#3550).
+///
+/// # Errors
+///
+/// Returns the reason when the block cannot be rendered.
+pub fn render_block_in(table: &Table, schema: Option<&str>) -> Result<String, String> {
+    let mut name = ident_token(&table.name)
         .ok_or_else(|| format!("the table name `{}` is not a Rust identifier", table.name))?;
+    if let Some(schema) = schema {
+        let schema = ident_token(schema)
+            .ok_or_else(|| format!("the schema name `{schema}` is not a Rust identifier"))?;
+        name = format!("{schema}.{name}");
+    }
     if table.primary_key.is_empty() {
         return Err("the table has no primary key".to_owned());
     }
@@ -212,17 +227,21 @@ fn sync(existing: &str, desired: &ParsedSchema, edits: &PlanEdits) -> SchemaRsSy
             ));
             continue;
         }
-        let block = match render_block(table) {
+        let token = ident_token(&table.name).unwrap_or_else(|| table.name.clone());
+        let range = schema_block_range(&out.text, &token);
+        let shape = range.map(|(start, end)| block_shape(&out.text[start..end]));
+        // A block in a Postgres schema keeps its schema (#3550).
+        let schema = shape.as_ref().and_then(|s| s.as_ref()?.schema.clone());
+        let block = match render_block_in(table, schema.as_deref()) {
             Ok(block) => block,
             Err(reason) => {
                 out.skipped.push((table.name.clone(), reason));
                 continue;
             }
         };
-        let token = ident_token(&table.name).unwrap_or_else(|| table.name.clone());
-        match schema_block_range(&out.text, &token) {
+        match range {
             Some((start, end)) => {
-                let shape = block_shape(&out.text[start..end]);
+                let shape = shape.flatten();
                 if shape.as_ref().is_some_and(|s| s.matches(table)) {
                     current.push(table);
                     continue;
@@ -377,6 +396,8 @@ fn unraw(name: &str) -> &str {
 
 /// The shape of a `diesel::table!` block: key, column types and attributes.
 struct Shape {
+    /// The Postgres schema of a `schema.table (key) {` header.
+    schema: Option<String>,
     pk: Vec<String>,
     columns: BTreeMap<String, String>,
     has_attrs: bool,
@@ -410,7 +431,11 @@ fn block_shape(block: &str) -> Option<Shape> {
         has_attrs |= line.starts_with("#[");
         line.contains(" (") && line.ends_with('{')
     })?;
-    let (_, keys) = header.split_once('(')?;
+    let (name, keys) = header.split_once('(')?;
+    let schema = name
+        .trim()
+        .split_once('.')
+        .map(|(schema, _)| unraw(schema.trim()).to_owned());
     let (keys, _) = keys.split_once(')')?;
     let pk = keys
         .split(',')
@@ -429,6 +454,7 @@ fn block_shape(block: &str) -> Option<Shape> {
         }
     }
     Some(Shape {
+        schema,
         pk,
         columns,
         has_attrs,
@@ -583,8 +609,15 @@ fn rename_header(text: &str, old: &str, new: &str) -> Option<String> {
     let mut at = None;
     for line in block.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with(&needle) {
-            at = Some(offset + line.len() - trimmed.len());
+        // A schema-qualified header keeps its `schema.` prefix (#3550).
+        let prefix = trimmed
+            .split_once('.')
+            .filter(|(schema, rest)| {
+                !schema.contains(char::is_whitespace) && rest.starts_with(&needle)
+            })
+            .map_or(0, |(schema, _)| schema.len() + 1);
+        if trimmed[prefix..].starts_with(&needle) {
+            at = Some(offset + line.len() - trimmed.len() + prefix);
             break;
         }
         offset += line.len();
@@ -1342,6 +1375,67 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             from: from.to_owned(),
             to: to.to_owned(),
         }])
+    }
+
+    const MARKETING_POSTS: &str = "diesel::table! {
+    marketing.posts (id) {
+        id -> Int8,
+        title -> Text,
+        body -> Nullable<Text>,
+        created_at -> Timestamp,
+    }
+}
+";
+
+    #[test]
+    fn render_block_in_writes_the_schema() {
+        assert_eq!(
+            render_block_in(&posts(Backend::Postgres), Some("marketing")).unwrap(),
+            MARKETING_POSTS
+        );
+        assert!(
+            render_block_in(&posts(Backend::Postgres), Some("bad name"))
+                .unwrap_err()
+                .contains("schema")
+        );
+    }
+
+    /// A schema-qualified block is the block of its table (#3550): the sync
+    /// keeps it and adds no second block.
+    #[test]
+    fn sync_keeps_a_schema_qualified_block() {
+        let out = sync_for_plan(
+            MARKETING_POSTS,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, MARKETING_POSTS);
+        assert!(out.written.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn sync_replaces_a_stale_qualified_block_in_its_schema() {
+        let stale = "diesel::table! {\n    marketing.posts (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            stale,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, MARKETING_POSTS);
+        assert_eq!(out.written, vec!["posts".to_owned()]);
+    }
+
+    #[test]
+    fn a_rename_keeps_the_schema() {
+        let existing =
+            "diesel::table! {\n    marketing.articles (id) {\n        id -> Int8,\n    }\n}\n";
+        let mut t = posts(Backend::Postgres);
+        t.columns.truncate(1);
+        let out = sync_for_plan(existing, &parsed(vec![t]), &rename("articles", "posts"));
+        assert_eq!(
+            out.text,
+            "diesel::table! {\n    marketing.posts (id) {\n        id -> Int8,\n    }\n}\n"
+        );
     }
 
     /// The rename changes the header line only, not a doc comment.

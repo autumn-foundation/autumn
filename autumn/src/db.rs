@@ -1066,6 +1066,17 @@ pub trait DbState {
         None
     }
 
+    /// Returns the pool of the database role of boundary `name` (#3550).
+    ///
+    /// Defaults to the primary pool, so a state with no roles needs no
+    /// changes. [`AppState`](crate::state::AppState) gives the pool of
+    /// `[database.roles.<name>]`. See
+    /// [`AppState::pool_for`](crate::state::AppState::pool_for).
+    fn boundary_pool(&self, name: &str) -> Option<Pool<RuntimeConnection>> {
+        let _ = name;
+        self.pool().cloned()
+    }
+
     /// Returns any registered database connection checkout interceptors.
     fn db_interceptors(
         &self,
@@ -1547,6 +1558,15 @@ pub enum PoolError {
     /// [`DatabaseBackend`](crate::config::DatabaseBackend).
     #[error("{0}")]
     UnsupportedBackend(String),
+
+    /// A `[database.roles.<name>]` entry has no usable URL (#3550).
+    #[error("database.roles.{name}: {message}")]
+    Role {
+        /// The role name.
+        name: String,
+        /// Why the URL is not usable.
+        message: String,
+    },
 }
 
 /// Primary plus optional read-replica database pools.
@@ -2359,6 +2379,35 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     )?;
 
     Ok(Some(pool))
+}
+
+/// Build one pool for each `[database.roles.<name>]` entry (#3550).
+///
+/// A role pool has `pool_size` connections, or `database.pool_size`. Each
+/// connection uses the URL of
+/// [`DatabaseRoleConfig::effective_url`](crate::db_roles::DatabaseRoleConfig::effective_url).
+/// The pools connect on first use.
+///
+/// # Errors
+///
+/// Returns [`PoolError::Role`] when a role has no usable URL, and the
+/// errors of [`create_pool`].
+pub fn create_role_pools(config: &DatabaseConfig) -> Result<crate::db_roles::RolePools, PoolError> {
+    let mut pools = std::collections::BTreeMap::new();
+    for (name, role) in &config.roles {
+        let url = role
+            .effective_url(config.effective_primary_url())
+            .map_err(|message| PoolError::Role {
+                name: name.clone(),
+                message,
+            })?;
+        let size = role.pool_size.unwrap_or(config.pool_size);
+        pools.insert(
+            name.clone(),
+            build_pool(&url, size, config.connect_timeout_secs)?,
+        );
+    }
+    Ok(crate::db_roles::RolePools::new(pools))
 }
 
 /// Reject a configured `database.statement_timeout` under the `SQLite` backend.
@@ -4521,6 +4570,99 @@ where
             crate::read_your_writes::mark_write();
         }
         result
+    }
+}
+
+/// A [`Db`] connection as the database role of boundary `B` (#3550).
+///
+/// The connection comes from
+/// [`AppState::pool_for::<B>()`](crate::state::AppState::pool_for). With
+/// `[database.roles.<B::NAME>]` set, the database refuses a query on a table
+/// outside the grant of that role. With no `[database.roles]`, it is the
+/// primary connection.
+///
+/// ```rust,no_run
+/// use autumn_web::db::BoundaryDb;
+/// use autumn_web::db_roles::Boundary;
+/// use autumn_web::prelude::*;
+///
+/// pub struct Marketing;
+///
+/// impl Boundary for Marketing {
+///     const NAME: &'static str = "marketing";
+/// }
+///
+/// #[get("/campaigns/count")]
+/// async fn count(mut db: BoundaryDb<Marketing>) -> AutumnResult<String> {
+///     let _conn: &mut Db = &mut db;
+///     Ok("ok".to_owned())
+/// }
+/// ```
+pub struct BoundaryDb<B> {
+    db: Db,
+    boundary: std::marker::PhantomData<fn() -> B>,
+}
+
+impl<B> BoundaryDb<B> {
+    /// The inner connection.
+    #[must_use]
+    pub fn into_inner(self) -> Db {
+        self.db
+    }
+}
+
+impl<B> std::ops::Deref for BoundaryDb<B> {
+    type Target = Db;
+
+    fn deref(&self) -> &Db {
+        &self.db
+    }
+}
+
+impl<B> std::ops::DerefMut for BoundaryDb<B> {
+    fn deref_mut(&mut self) -> &mut Db {
+        &mut self.db
+    }
+}
+
+impl<S, B> FromRequestParts<S> for BoundaryDb<B>
+where
+    S: DbState + Send + Sync,
+    B: crate::db_roles::Boundary,
+{
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let pool = state.boundary_pool(B::NAME).ok_or_else(|| {
+            AutumnError::service_unavailable_msg(format!(
+                "Database role for boundary `{}` not configured",
+                B::NAME
+            ))
+        })?;
+        let ctx = RequestDbContext::from_parts(parts, state);
+        let db = Db::checkout(DbCheckoutParams {
+            pool: &pool,
+            pool_name: B::NAME,
+            shard: None,
+            statement_timeout: ctx.statement_timeout,
+            idle_in_transaction_timeout: ctx.idle_in_transaction_timeout,
+            route_key: ctx.route_key,
+            metrics: ctx.metrics,
+            slow_query_threshold: ctx.slow_query_threshold,
+            interceptors: ctx.interceptors,
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: state.db_capture_gap(),
+            clock: ctx.clock,
+        })
+        .await?;
+        crate::read_your_writes::mark_write();
+        Ok(Self {
+            db,
+            boundary: std::marker::PhantomData,
+        })
     }
 }
 

@@ -73,6 +73,19 @@ warn_on_pooler = false
 
 The environment variable is `AUTUMN_DATABASE__WARN_ON_POOLER=false`.
 
+## One role per boundary
+
+With [database boundaries](database-boundaries.md), each boundary connects as
+its own role. The pooler keeps one server pool for each database and user.
+
+* Give the pooler each role: PgBouncer `auth_file` or `auth_query`, or one
+  secret per role for RDS Proxy.
+* Size the pool of each role. PgBouncer `max_db_connections` limits all
+  roles of one database together.
+* The grants set the `search_path` of each role with `ALTER ROLE`. It holds
+  in transaction mode.
+* Run `autumn db grants --apply` with the direct URL, after `autumn migrate`.
+
 ## Related
 
 - [Distributed locks](distributed-locks.md)

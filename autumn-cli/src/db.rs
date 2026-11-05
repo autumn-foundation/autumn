@@ -49,6 +49,10 @@ pub mod sqlite_snapshot;
 /// connecting to Postgres itself, so it shares no helpers with this module.
 pub mod retention;
 
+/// `autumn db grants` — `GRANT` / `REVOKE` statements for the database role
+/// of each boundary in `boundaries.toml` (issue #3550).
+pub mod grants;
+
 /// The lifecycle subcommands of `autumn db`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbCommand {
