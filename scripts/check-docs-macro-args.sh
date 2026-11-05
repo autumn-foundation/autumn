@@ -10,7 +10,7 @@
 # no-op), `scripts/check-docs-toml.sh` the `autumn.toml` keys they WRITE
 # (dropped silently), `scripts/check-docs-symbols.sh` the `autumn_web::…` paths
 # they IMPORT (E0432 against their own file), and
-# `scripts/check-docs-routes.sh` the `/actuator/…` URLs they REQUEST (a 404
+# `xtask/src/docs/routes.rs` the `/actuator/…` URLs they REQUEST (a 404
 # that reads like a feature they failed to enable). `check-docs-orphans.sh`
 # asserts the page can be reached at all.
 #
@@ -258,8 +258,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # Kept in Python for the same reason as its sibling gates: fence tracking
 # across two comment syntaxes and per-macro key extraction are both work that
 # bash renders unreadable, and python3 is already a dependency of
-# scripts/check-docs-cli.sh, scripts/check-docs-config.sh,
-# scripts/check-docs-toml.sh and scripts/check-docs-routes.sh.
+# scripts/check-docs-cli.sh, scripts/check-docs-config.sh and
+# scripts/check-docs-toml.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
 import collections
