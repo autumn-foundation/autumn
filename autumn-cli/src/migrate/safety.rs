@@ -4352,10 +4352,31 @@ mod tests {
     fn e_string_continues_after_a_newline() {
         // Postgres joins `'..'` after white space with a newline to the
         // literal before it. The joined part keeps the `E` escape rules.
+        // A comment between the parts stays a comment.
         let pg = DatabaseBackend::Postgres;
-        assert_eq!(quoted_len(pg, "E'a'\n'b'x", None), Some(8));
-        assert_eq!(quoted_len(pg, "E'a' -- c\n 'b'x", None), Some(14));
-        assert_eq!(quoted_len(pg, "E'a' 'b'", None), Some(4));
+        let kinds = |sql| {
+            tokens(pg, sql)
+                .filter(|(_, text)| !text.starts_with(is_sql_space))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds("E'\\'' -- c\n '\\'' x"),
+            [
+                (TokenKind::Quoted, "E'\\''"),
+                (TokenKind::LineComment, "-- c"),
+                (TokenKind::Quoted, "'\\''"),
+                (TokenKind::Plain, "x"),
+            ]
+        );
+        // Without a newline, or after a plain literal, `'\''` is not joined.
+        assert_eq!(kinds("E'a' '\\'' x")[1], (TokenKind::Quoted, "'\\'' x"));
+        assert_eq!(kinds("'a'\n'\\'' x")[1], (TokenKind::Quoted, "'\\'' x"));
+        assert_eq!(
+            normalize_statement(pg, "SELECT E'a'\n-- c\n'b'"),
+            "select E'a'\n'b'"
+        );
+        let sql = "SELECT E'a'\n-- create index concurrently\n'b';";
+        assert!(!contains_concurrent_index(sql));
         for gap in ["\n", " -- c\n", "\r\n\t"] {
             let sql = format!("SELECT E''{gap}'\\''; DROP TABLE t; --'");
             assert_eq!(ops(pg, &sql), ["DROP TABLE"], "{sql:?}");
