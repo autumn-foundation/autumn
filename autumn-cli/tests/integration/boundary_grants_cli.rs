@@ -137,10 +137,15 @@ fn apply(root: &Path, url: &str) {
     assert!(output.status.success(), "{}", text(&output.stderr));
 }
 
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
-async fn grants_are_generated_applied_and_checked_by_doctor() {
-    let (_container, url, addr) = start_postgres().await;
+/// Two roles, three tables in two schemas, and a project that declares them.
+async fn boundary_database() -> (
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    String,
+    String,
+    tokio_postgres::Client,
+    tempfile::TempDir,
+) {
+    let (container, url, addr) = start_postgres().await;
     let owner = connect(&url).await;
     owner
         .batch_execute(
@@ -153,7 +158,13 @@ async fn grants_are_generated_applied_and_checked_by_doctor() {
         )
         .await
         .expect("schema");
-    let dir = project();
+    (container, url, addr, owner, project())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn grants_are_generated_applied_and_checked_by_doctor() {
+    let (_container, url, addr, _owner, dir) = boundary_database().await;
     let root = dir.path();
 
     // Print: the SQL names each table, and changes nothing.
@@ -206,6 +217,16 @@ async fn grants_are_generated_applied_and_checked_by_doctor() {
     ] {
         assert!(detail(&check).contains(line), "{check}");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn doctor_finds_grants_outside_the_config() {
+    let (_container, url, addr, owner, dir) = boundary_database().await;
+    let root = dir.path();
+    apply(root, &url);
+    assert_eq!(doctor_roles(root, &url)["status"], "pass");
+    let mkt = connect(&format!("postgres://mkt:mkt-pw@{addr}/postgres")).await;
 
     // A grant outside the config: doctor fails and names it. An apply
     // removes it.

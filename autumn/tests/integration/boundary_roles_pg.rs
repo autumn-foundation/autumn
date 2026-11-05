@@ -102,46 +102,33 @@ fn migrate(url: &str, set: EmbeddedMigrations, schema: Option<&'static str>) {
     run_pending(url, SchemaMigrations::new(set, schema)).expect("migrations run");
 }
 
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
-async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
-    let (_container, url) = start_postgres().await;
-    let mut owner = AsyncPgConnection::establish(&url).await.expect("connect");
-    owner
-        .batch_execute(
-            "CREATE ROLE core LOGIN PASSWORD 'core-pw'; \
-             CREATE ROLE mkt LOGIN PASSWORD 'mkt-pw'; \
-             CREATE ROLE adm LOGIN PASSWORD 'adm-pw';",
-        )
-        .await
-        .expect("roles");
-
-    // Migrations into a named schema, a plugin set among them.
-    let migrate_url = url.clone();
+/// Core into `public`, marketing into `marketing` (with a non-transactional
+/// index), and a plugin set into `admin`. A second run applies nothing.
+async fn migrate_all(url: &str) {
+    let url = url.to_owned();
     tokio::task::spawn_blocking(move || {
-        migrate(&migrate_url, CORE, None);
-        migrate(&migrate_url, MARKETING, Some("marketing"));
-        migrate(&migrate_url, PLUGIN, Some("admin"));
-        // A second run finds nothing to do.
+        migrate(&url, CORE, None);
+        migrate(&url, MARKETING, Some("marketing"));
+        migrate(&url, PLUGIN, Some("admin"));
         assert!(
-            run_pending(
-                &migrate_url,
-                SchemaMigrations::new(MARKETING, Some("marketing"))
-            )
-            .expect("second run")
-            .applied
-            .is_empty()
+            run_pending(&url, SchemaMigrations::new(MARKETING, Some("marketing")))
+                .expect("second run")
+                .applied
+                .is_empty()
         );
     })
     .await
     .expect("migration thread");
+}
 
+/// Each table is in its schema; the migration history stays in `public`.
+async fn assert_schemas(owner: &mut AsyncPgConnection) {
     let tables = diesel::sql_query(
         "SELECT table_schema || '.' || table_name AS name FROM information_schema.tables \
          WHERE table_name IN ('contacts', 'campaigns', 'admin_audit_log', \
          '__diesel_schema_migrations') ORDER BY 1",
     )
-    .load::<Name>(&mut owner)
+    .load::<Name>(owner)
     .await
     .expect("tables")
     .into_iter()
@@ -158,7 +145,7 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
     );
     assert_eq!(
         count(
-            &mut owner,
+            owner,
             "SELECT count(*) AS n FROM pg_indexes \
              WHERE schemaname = 'marketing' AND indexname = 'campaigns_name_idx'"
         )
@@ -166,7 +153,10 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
         Ok(1),
         "the non-transactional migration ran in the schema"
     );
-    // Generated grants.
+}
+
+/// Apply the generated grants twice: the second apply changes nothing.
+async fn apply_grants(owner: &mut AsyncPgConnection) {
     let config = BoundaryConfig::parse(BOUNDARIES).expect("config");
     let catalog = [
         CatalogTable::new("public", "contacts").with_sequence("contacts_id_seq"),
@@ -174,26 +164,25 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
         CatalogTable::new("marketing", "campaigns").with_sequence("campaigns_id_seq"),
         CatalogTable::new("admin", "admin_audit_log").with_sequence("admin_audit_log_id_seq"),
     ];
-    let plan = grants::plan(&config, &catalog).expect("plan");
-    owner
-        .batch_execute(&plan.sql().expect("sql"))
-        .await
-        .expect("grants apply");
-    // They apply again with no change.
-    owner
-        .batch_execute(&plan.sql().expect("sql"))
-        .await
-        .expect("grants apply twice");
+    let sql = grants::plan(&config, &catalog)
+        .expect("plan")
+        .sql()
+        .expect("sql");
+    owner.batch_execute(&sql).await.expect("grants apply");
+    owner.batch_execute(&sql).await.expect("grants apply twice");
+}
 
-    // One pool per role, on the primary URL.
+/// An app state with one pool per role, on the primary URL.
+///
+/// The boundary name keys the pool. The role name differs from the schema
+/// name, so a bare table name resolves only through the role `search_path`
+/// that the grants set.
+fn role_state(url: &str) -> AppState {
     let mut database = DatabaseConfig {
-        url: Some(url.clone()),
+        url: Some(url.to_owned()),
         pool_size: 2,
         ..Default::default()
     };
-    // The boundary name keys the pool. The role name differs from the
-    // schema name, so a bare table name resolves only through the role
-    // `search_path` that the grants set.
     for (boundary, user) in [("core", "core"), ("marketing", "mkt"), ("admin", "adm")] {
         database.roles.insert(boundary.to_owned(), role(user));
     }
@@ -204,9 +193,17 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
             .expect("url"),
     );
     state.insert_extension(autumn_web::db::create_role_pools(&database).expect("role pools"));
+    state
+}
 
-    // Marketing: its own table by bare name (search_path) and through the
-    // schema-qualified `table!`.
+fn assert_denied(result: Result<i64, String>) {
+    let denied = result.expect_err("the role must not read the table");
+    assert!(denied.contains("permission denied"), "{denied}");
+}
+
+/// Marketing: its own table by bare name and through the schema-qualified
+/// `table!`; `may_read` on core; no admin table.
+async fn assert_marketing(state: &AppState) {
     let pool = state.pool_for::<Marketing>().expect("marketing pool");
     let mut conn = pool.get().await.expect("marketing connection");
     diesel::sql_query("INSERT INTO campaigns (name) VALUES ('fall')")
@@ -226,30 +223,44 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
         count(&mut conn, "SELECT count(*) AS n FROM public.contacts").await,
         Ok(0)
     );
-    let denied = count(&mut conn, "SELECT count(*) AS n FROM admin.admin_audit_log")
-        .await
-        .expect_err("marketing must not read the admin table");
-    assert!(denied.contains("permission denied"), "{denied}");
+    assert_denied(count(&mut conn, "SELECT count(*) AS n FROM admin.admin_audit_log").await);
     let denied = diesel::sql_query("INSERT INTO public.contacts (email) VALUES ('x@y')")
         .execute(&mut conn)
         .await
         .expect_err("may_read gives no write")
         .to_string();
     assert!(denied.contains("permission denied"), "{denied}");
+}
 
-    // Admin (the plugin set): its own table, not marketing's.
+/// Admin (the plugin set): its own table, not marketing's or core's.
+async fn assert_admin(state: &AppState) {
     let pool = state.pool_for::<Admin>().expect("admin pool");
     let mut conn = pool.get().await.expect("admin connection");
     assert_eq!(
         count(&mut conn, "SELECT count(*) AS n FROM admin_audit_log").await,
         Ok(0)
     );
-    let denied = count(&mut conn, "SELECT count(*) AS n FROM marketing.campaigns")
+    assert_denied(count(&mut conn, "SELECT count(*) AS n FROM marketing.campaigns").await);
+    assert_denied(count(&mut conn, "SELECT count(*) AS n FROM public.contacts").await);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
+    let (_container, url) = start_postgres().await;
+    let mut owner = AsyncPgConnection::establish(&url).await.expect("connect");
+    owner
+        .batch_execute(
+            "CREATE ROLE core LOGIN PASSWORD 'core-pw'; \
+             CREATE ROLE mkt LOGIN PASSWORD 'mkt-pw'; \
+             CREATE ROLE adm LOGIN PASSWORD 'adm-pw';",
+        )
         .await
-        .expect_err("admin must not read the marketing table");
-    assert!(denied.contains("permission denied"), "{denied}");
-    let denied = count(&mut conn, "SELECT count(*) AS n FROM public.contacts")
-        .await
-        .expect_err("admin must not read the core table");
-    assert!(denied.contains("permission denied"), "{denied}");
+        .expect("roles");
+    migrate_all(&url).await;
+    assert_schemas(&mut owner).await;
+    apply_grants(&mut owner).await;
+    let state = role_state(&url);
+    assert_marketing(&state).await;
+    assert_admin(&state).await;
 }
