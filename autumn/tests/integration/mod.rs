@@ -26,6 +26,7 @@ mod app_metrics_facade;
 mod auth_lockout_race;
 mod authorization_integration;
 mod auto_broadcast;
+mod background_tasks;
 mod bot_protection_pipeline;
 mod boundary_hooks_integration;
 #[cfg(feature = "ws")]

@@ -96,6 +96,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod background;
 pub mod backoff;
 // The build-time agent authority envelope (issue #1691): what an MCP-exposed,
 // agent-operable handler is allowed to do -- which models it writes, whether it

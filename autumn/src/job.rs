@@ -6412,7 +6412,12 @@ pub(crate) fn start_local_runtime_inner(
     // `run_workers`: a web replica (run_workers == false) drains nothing by
     // design and must not warn about queues it will never claim (#1623).
     if should_warn_pin_coverage(run_workers, pin) {
-        warn_pinned_uncovered_queues(&uncovered, pin, schedule.names().is_empty());
+        warn_pinned_uncovered_queues(
+            &uncovered,
+            pin,
+            schedule.names().is_empty(),
+            &background_task_queues(state),
+        );
     }
     let pin_active = !pin.is_empty();
     // Per-queue caps / dedicated slots (#1623): the shared slot accounting core.
@@ -6630,11 +6635,19 @@ const fn should_warn_pin_coverage(run_workers: bool, pin: &[String]) -> bool {
 /// Startup zero-coverage guard for queue pinning (issue #1623, AC6). Emits a
 /// loud diagnostic when `jobs.pin` leaves configured/declared queues without a
 /// worker in this process, or matches nothing at all. No-op when `pin` is empty.
-fn warn_pinned_uncovered_queues(uncovered: &[String], pin: &[String], schedule_empty: bool) {
+///
+/// `task_queues` holds the queues of background tasks (#3545). A pin that
+/// names one of them matches work: the task drains it.
+fn warn_pinned_uncovered_queues(
+    uncovered: &[String],
+    pin: &[String],
+    schedule_empty: bool,
+    task_queues: &[String],
+) {
     if pin.is_empty() {
         return;
     }
-    if schedule_empty {
+    if pin_matches_no_work(pin, schedule_empty, task_queues) {
         tracing::error!(
             pin = ?pin,
             "jobs.pin {pin:?} matches none of the configured or declared job queues; \
@@ -6650,6 +6663,22 @@ fn warn_pinned_uncovered_queues(uncovered: &[String], pin: &[String], schedule_e
              (unpinned, or pinned to those queues) drains them.",
         );
     }
+}
+
+/// Whether `pin` matches no job queue and no background task queue.
+fn pin_matches_no_work(pin: &[String], schedule_empty: bool, task_queues: &[String]) -> bool {
+    schedule_empty
+        && !pin
+            .iter()
+            .any(|p| task_queues.contains(&normalize_queue_name(p)))
+}
+
+/// The queues of the background tasks of the app behind `state` (#3545).
+pub(crate) fn background_task_queues(state: &AppState) -> Vec<String> {
+    state
+        .extension::<crate::background::BackgroundQueues>()
+        .map(|queues| queues.0.clone())
+        .unwrap_or_default()
 }
 
 /// Distinct queue names declared by the given jobs, in first-seen order.
@@ -6697,19 +6726,31 @@ fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>)
 /// under `AUTUMN_DUMP_JOBS=1` and writes these names to the manifest path doctor
 /// consumes (via [`render_jobs_manifest`]); an app can also declare them inline
 /// under `[jobs.fleet]`.
+///
+/// `extra` holds the queues of background tasks (#3545). They follow the job
+/// queues.
 fn effective_drained_queues_from_jobs(
     cfg: &crate::config::JobQueuesConfig,
     jobs: &[JobInfo],
+    extra: &[String],
 ) -> Vec<String> {
-    QueueSchedule::effective(cfg, &collect_declared_queues_from_jobs(jobs))
-        .0
-        .names()
+    let mut declared = collect_declared_queues_from_jobs(jobs);
+    for queue in extra {
+        let queue = normalize_queue_name(queue);
+        if !declared.contains(&queue) {
+            declared.push(queue);
+        }
+    }
+    QueueSchedule::effective(cfg, &declared).0.names()
 }
 
 /// Serialize the ground-truth drained-queue set (#1756) as the TOML manifest
 /// `autumn doctor` consumes: a single top-level `queues = [...]` array, ordered
 /// highest priority first exactly as the runtime drains. Emitted to stdout by
 /// `AUTUMN_DUMP_JOBS=1` and read back by doctor's `resolve_declared_queues`.
+///
+/// `background_queues` holds the queues of background tasks (#3545), so the
+/// `autumn doctor` coverage check includes them.
 #[allow(
     clippy::expect_used,
     reason = "infallible: manifest is a plain string array; TOML serialization cannot fail"
@@ -6717,13 +6758,14 @@ fn effective_drained_queues_from_jobs(
 pub(crate) fn render_jobs_manifest(
     cfg: &crate::config::JobQueuesConfig,
     jobs: &[JobInfo],
+    background_queues: &[String],
 ) -> String {
     #[derive(serde::Serialize)]
     struct JobsManifest {
         queues: Vec<String>,
     }
     let manifest = JobsManifest {
-        queues: effective_drained_queues_from_jobs(cfg, jobs),
+        queues: effective_drained_queues_from_jobs(cfg, jobs, background_queues),
     };
     toml::to_string(&manifest)
         .expect("jobs manifest is a plain string array; serialization is infallible")
@@ -10498,7 +10540,12 @@ fn start_redis_runtime(
     // below): a web replica drains nothing by design and must not warn about
     // queues it will never claim (#1623).
     if should_warn_pin_coverage(run_workers, &config.pin) {
-        warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+        warn_pinned_uncovered_queues(
+            &uncovered,
+            &config.pin,
+            schedule.names().is_empty(),
+            &background_task_queues(state),
+        );
     }
     // Filter limits to the pinned subset so reservations/caps for queues served
     // by other replicas don't consume this process's shared slots (#1623).
@@ -13549,7 +13596,12 @@ fn start_postgres_runtime(
     // below): a web replica drains nothing by design and must not warn about
     // queues it will never claim (#1623).
     if should_warn_pin_coverage(run_workers, &config.pin) {
-        warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+        warn_pinned_uncovered_queues(
+            &uncovered,
+            &config.pin,
+            schedule.names().is_empty(),
+            &background_task_queues(state),
+        );
     }
     // Filter limits to the pinned subset so reservations/caps for queues served
     // by other replicas don't consume this process's shared slots (#1623).
@@ -26458,13 +26510,13 @@ mod queue_schedule_tests {
 
         // The computed set matches the runtime drain plan exactly.
         assert_eq!(
-            effective_drained_queues_from_jobs(&cfg, &jobs),
+            effective_drained_queues_from_jobs(&cfg, &jobs, &[]),
             vec!["critical".to_string(), "email".to_string()]
         );
 
         // And it serializes to the precise manifest shape doctor consumes,
         // highest-priority first with a trailing newline.
-        let manifest = render_jobs_manifest(&cfg, &jobs);
+        let manifest = render_jobs_manifest(&cfg, &jobs, &[]);
         assert_eq!(manifest, "queues = [\"critical\", \"email\"]\n");
     }
 
@@ -26558,6 +26610,26 @@ mod queue_schedule_tests {
         // An empty pin leaves nothing uncovered, so no role warns.
         assert!(!should_warn_pin_coverage(true, &[]));
         assert!(!should_warn_pin_coverage(false, &[]));
+    }
+
+    /// A pin that names only a background task queue matches work (#3545).
+    #[test]
+    fn pin_on_a_task_queue_matches_work() {
+        let pin = vec!["sync".to_owned()];
+        assert!(pin_matches_no_work(&pin, true, &[]));
+        assert!(!pin_matches_no_work(&pin, true, &["sync".to_owned()]));
+        assert!(!pin_matches_no_work(
+            &[" sync ".to_owned()],
+            true,
+            &["sync".to_owned()]
+        ));
+        assert!(pin_matches_no_work(&pin, true, &["other".to_owned()]));
+        // A pin that matches a job queue is fine either way.
+        assert!(!pin_matches_no_work(&pin, false, &[]));
+        let state = AppState::for_test();
+        assert!(background_task_queues(&state).is_empty());
+        state.insert_extension(crate::background::BackgroundQueues(vec!["sync".to_owned()]));
+        assert_eq!(background_task_queues(&state), ["sync"]);
     }
 
     #[test]

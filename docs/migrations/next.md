@@ -144,6 +144,42 @@ with `..Default::default()`. A codemod cannot know which ending the app wants.
 
 ---
 
+### Graph: `NodeKind`, `GraphNode` and `Completeness` have new members
+
+**Why:** role-aware background tasks (issue #3545) appear in the
+architecture graph. `NodeKind` has a new variant `BackgroundTask`. `GraphNode`
+has a new field `background`. `Completeness` has a new field
+`background_tasks`. `NodeKind` and `GraphNode` are not `#[non_exhaustive]`.
+
+**You are affected only if your code matches on `NodeKind` with no wildcard
+arm, or builds a `GraphNode { .. }` or `Completeness { .. }` literal.**
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+match node.kind {
+    NodeKind::Job | NodeKind::ScheduledTask | NodeKind::OneOffTask => "job",
+    // …
+}
+let node = GraphNode { /* … */ job: None };
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+match node.kind {
+    NodeKind::Job | NodeKind::ScheduledTask | NodeKind::OneOffTask => "job",
+    NodeKind::BackgroundTask => "background task",
+    // …
+}
+let node = GraphNode { /* … */ job: None, background: None };
+```
+
+`Completeness` derives `Default`. Use `..Default::default()` in a literal.
+
+**Automation:** `manual` — a new arm needs a label that only the caller can
+choose.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -161,9 +197,16 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
 - **Experimental surface changed:** {the API and what changed — or "none".
   Experimental surface may change in any release, so this is a courtesy, not a
   promise. Plugins that declared it with `uses_experimental` are the audience.}
-- **New stable surface:** {additive APIs plugin authors can now rely on — or
-  "none". These are not breaking; they are why a plugin author reads this
-  section for the good news too.}
+- **New stable surface (background tasks, #3545):**
+  `AppBuilder::background_task`, `AppBuilder::background`,
+  `AppBuilder::plugin_capability` and the `background` module
+  (`BackgroundTask`, `PluginCapability`, `BackgroundCapability`,
+  `Role::runs_plugin`). Move a loop that you `tokio::spawn` in `on_startup`
+  to `background_task`, so that `AUTUMN_ROLE=web` does not run it. A plugin
+  switch such as `worker_enabled` becomes `BackgroundTask::explicit`. A loop
+  in `on_startup` that you do not move behaves as before. See
+  [Background work in a plugin](../guide/extensibility.md#background-work-in-a-plugin)
+  and [Background tasks for plugins and apps](../guide/jobs.md#background-tasks-for-plugins-and-apps).
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in

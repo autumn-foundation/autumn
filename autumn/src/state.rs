@@ -153,9 +153,9 @@ pub struct AppState {
     /// Resolved process role for this replica, after config parsing and the
     /// `AUTUMN_ROLE` env override. This is the same value the framework uses to
     /// gate the job runtime, scheduler, and commit-hook worker, exposed here as
-    /// a first-class accessor ([`role`](Self::role)) so `on_startup`/`on_shutdown`
-    /// hooks, plugins, and handlers can self-gate app-owned background work
-    /// without re-reading `AUTUMN_ROLE` by hand.
+    /// a first-class accessor ([`role`](Self::role)) for hooks, plugins and
+    /// handlers. For a loop, use
+    /// [`AppBuilder::background_task`](crate::app::AppBuilder::background_task).
     ///
     /// It holds the capability set, resolved once at boot. Each framework
     /// subsystem reads its own field. A built-in role has no preset data, so
@@ -1004,17 +1004,18 @@ impl AppState {
     /// Returns the subsystems this process runs, resolved once at boot.
     ///
     /// The framework gates each of its subsystems on one field of this set.
-    /// Gate app-owned background work on the field that matches it:
-    /// `job_workers` for a queue consumer, `scheduler` for a periodic loop.
+    /// Gate app code that is not a loop on the field that matches it. For a
+    /// loop, use
+    /// [`AppBuilder::background_task`](crate::app::AppBuilder::background_task).
     ///
     /// ```rust
     /// # use autumn_web::{AppState, Capability};
     /// # fn example(state: &AppState) {
     /// if state.capabilities().job_workers {
-    ///     // start an embedded queue consumer only where job workers run
+    ///     // show the queue admin panel only where job workers run
     /// }
-    /// if state.capabilities().runs(Capability::Scheduler) {
-    ///     // start an app-owned periodic loop only where the scheduler runs
+    /// if state.capabilities().runs(Capability::ServesHttp) {
+    ///     // warm the render caches only where user routes are served
     /// }
     /// # }
     /// ```

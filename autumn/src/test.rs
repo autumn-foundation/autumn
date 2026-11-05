@@ -790,6 +790,8 @@ pub struct TestApp {
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
     tasks: Vec<crate::task::TaskInfo>,
+    /// Role-aware background tasks (#3545).
+    background: crate::background::Registry,
     listeners: Vec<crate::events::ListenerInfo>,
     #[cfg(feature = "db")]
     outbox_handlers: crate::outbox::OutboxHandlers,
@@ -900,6 +902,7 @@ impl TestApp {
             state_initializers: Vec::new(),
             jobs: Vec::new(),
             tasks: Vec::new(),
+            background: crate::background::Registry::default(),
             listeners: Vec::new(),
             #[cfg(feature = "db")]
             outbox_handlers: crate::outbox::OutboxHandlers::default(),
@@ -1254,6 +1257,7 @@ impl TestApp {
             state,
             _job_runtime: None,
             _task_scheduler: None,
+            _background: None,
             clock_as_any: None,
             #[cfg(feature = "mail")]
             mail_recorder: None,
@@ -1447,6 +1451,7 @@ impl TestApp {
             .extend(app_builder.static_gate_layers);
         self.jobs.extend(app_builder.jobs);
         self.tasks.extend(app_builder.tasks);
+        self.background.extend(app_builder.background);
         self.listeners.extend(app_builder.listeners);
         #[cfg(feature = "db")]
         self.outbox_handlers.extend(app_builder.outbox_handlers);
@@ -1669,6 +1674,46 @@ impl TestApp {
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
         self.tasks.extend(tasks);
+        self
+    }
+
+    /// Register a background task, as
+    /// [`AppBuilder::background_task`](crate::app::AppBuilder::background_task)
+    /// does (#3545).
+    ///
+    /// [`build`](Self::build) starts it when the test role runs its
+    /// capability. Dropping the [`TestClient`] cancels its shutdown token.
+    /// `build` panics on a `[roles] capabilities` key that `run()` refuses.
+    ///
+    /// # Panics
+    ///
+    /// As [`AppBuilder::background_task`](crate::app::AppBuilder::background_task).
+    #[track_caller]
+    #[must_use]
+    pub fn background_task<F, Fut>(
+        self,
+        name: impl Into<std::borrow::Cow<'static, str>>,
+        capability: impl Into<crate::background::BackgroundCapability>,
+        run: F,
+    ) -> Self
+    where
+        F: Fn(AppState, tokio_util::sync::CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.background(crate::background::BackgroundTask::new(
+            name, capability, run,
+        ))
+    }
+
+    /// Register a [`BackgroundTask`](crate::background::BackgroundTask), as
+    /// [`AppBuilder::background`](crate::app::AppBuilder::background) does.
+    ///
+    /// # Panics
+    ///
+    /// As [`AppBuilder::background_task`](crate::app::AppBuilder::background_task).
+    #[must_use]
+    pub fn background(mut self, task: crate::background::BackgroundTask) -> Self {
+        self.background.add_task(task);
         self
     }
 
@@ -2652,6 +2697,23 @@ impl TestApp {
             },
         );
 
+        // Check `[roles] capabilities` and publish the task queues before the
+        // job runtime starts, as `run()` does (#3545).
+        match self
+            .background
+            .validate_roles(&self.config, state.role().name())
+        {
+            Ok(warnings) => {
+                for warning in warnings {
+                    tracing::warn!(warning = %warning, "[roles] capabilities on another role");
+                }
+            }
+            Err(error) => panic!("{error}"),
+        }
+        state.insert_extension(crate::background::BackgroundQueues(
+            self.background.queues(),
+        ));
+
         let job_runtime = if self.jobs.is_empty() {
             None
         } else {
@@ -2682,6 +2744,17 @@ impl TestApp {
             )
             .expect("Failed to start scheduled tasks in test");
             Some(TestTaskScheduler { shutdown })
+        };
+
+        // Start the background tasks the test role places (#3545), after
+        // every state initializer and plugin startup hook, as `run()` does.
+        let background = if self.background.is_empty() {
+            None
+        } else {
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let _runtime =
+                crate::background::start(&self.background, &state, &shutdown, &self.config);
+            Some(TestBackground { shutdown })
         };
 
         // Retain the registered job metadata so `perform_enqueued_jobs` can look
@@ -2828,6 +2901,7 @@ impl TestApp {
             state,
             _job_runtime: job_runtime,
             _task_scheduler: task_scheduler,
+            _background: background,
             clock_as_any: self.clock_as_any,
             #[cfg(feature = "mail")]
             mail_recorder: Some(mail_recorder_for_client),
@@ -2892,6 +2966,8 @@ pub struct TestClient {
     _job_runtime: Option<TestJobRuntime>,
     /// Stops the `#[scheduled]` task loops [`TestApp::build`] started.
     _task_scheduler: Option<TestTaskScheduler>,
+    /// Cancels the background tasks [`TestApp::build`] started (#3545).
+    _background: Option<TestBackground>,
     /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// `None` when built via [`TestApp::from_router`], which bypasses recorder
@@ -2969,6 +3045,17 @@ struct TestTaskScheduler {
 }
 
 impl Drop for TestTaskScheduler {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+/// Cancels the background tasks of one [`TestClient`] when it drops.
+struct TestBackground {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for TestBackground {
     fn drop(&mut self) {
         self.shutdown.cancel();
     }

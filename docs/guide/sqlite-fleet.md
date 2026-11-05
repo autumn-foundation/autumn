@@ -432,8 +432,9 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   A write it committed after its last sync is not in the replica, even if the
   request already returned success. So a takeover after a crash loses the
   writes since the last sync: up to `rpo_secs` while replication keeps up
-  ([the RPO contract](sqlite-in-production.md#the-rpo-contract), and the
-  lag note below). Replication bounds that loss. It does not prevent it.
+  ([the RPO contract](sqlite-in-production.md#the-rpo-contract), and
+  [Replication lag](#replication-lag)). Replication bounds that loss. It does
+  not prevent it.
   This setting is only for a missing file. With ownership on, a host also
   restores a stale file (older than the replica) without `restore_missing`.
   See step 5 of [the failover procedure](#the-failover-procedure).
@@ -461,8 +462,7 @@ databases fits in `sync_interval_secs`. A pass ticks each open database once.
 It starts one interval after the last pass started, or at once if the last
 pass took longer. `replication_workers` threads (default `4`, `1` to `64`)
 ship databases at the same time. The database that shipped longest ago goes
-first. When a pass takes longer than `rpo_secs`, a crash can lose more than
-`rpo_secs` of writes.
+first.
 
 Many busy databases in one process make a pass long. Monitor these values in
 `replication:fleet`:
@@ -694,13 +694,6 @@ the first request.
    fail-back (step 5) replaces those files with the replica, so they do not
    come back. A planned move (step 2) loses nothing: the old host ships
    everything before it releases the ranges.
-   The first request to each database restores it from the replica, so the
-   first requests after a takeover are slow. A host that claims many
-   databases at once can use all its CPU for restores. Limit the number of
-   requests that open databases at the same time. Or open the claimed
-   databases in the background before traffic arrives.
-   A takeover loses the commits that the old host did not ship. See
-   [What a failover costs](#what-a-failover-costs).
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a

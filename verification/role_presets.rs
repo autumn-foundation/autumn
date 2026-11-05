@@ -30,6 +30,7 @@ pub struct Caps {
     pub fleet_relay: bool,
     pub restore_check: bool,
     pub retention: bool,
+    pub maintenance: bool,
 }
 
 /// The shadow of `RolePreset`. `pin_empty` is `pin = []`.
@@ -43,6 +44,7 @@ pub struct Preset {
     pub fleet_relay: Option<bool>,
     pub restore_check: Option<bool>,
     pub retention: Option<bool>,
+    pub maintenance: Option<bool>,
 }
 
 /// `ProcessRole::capabilities`.
@@ -58,6 +60,7 @@ pub open spec fn base_caps(b: Base) -> Caps {
         fleet_relay: background,
         restore_check: background,
         retention: background,
+        maintenance: background,
     }
 }
 
@@ -86,6 +89,7 @@ pub open spec fn resolve(p: Preset) -> Caps {
         fleet_relay: b.fleet_relay && or_true(p.fleet_relay),
         restore_check: b.restore_check && or_true(p.restore_check),
         retention: b.retention && or_true(p.retention),
+        maintenance: b.maintenance && or_true(p.maintenance),
     }
 }
 
@@ -97,6 +101,7 @@ pub open spec fn valid(p: Preset) -> bool {
         p.outbox_relay,
     ) && !above(b.commit_hooks, p.commit_hooks) && !above(b.fleet_relay, p.fleet_relay)
         && !above(b.restore_check, p.restore_check) && !above(b.retention, p.retention)
+        && !above(b.maintenance, p.maintenance)
         && !(p.pin_empty && p.job_workers == Some(true))
 }
 
@@ -106,6 +111,7 @@ pub open spec fn subset(a: Caps, b: Caps) -> bool {
         ==> b.scheduler) && (a.outbox_relay ==> b.outbox_relay) && (a.commit_hooks
         ==> b.commit_hooks) && (a.fleet_relay ==> b.fleet_relay) && (a.restore_check
         ==> b.restore_check) && (a.retention ==> b.retention)
+        && (a.maintenance ==> b.maintenance)
 }
 
 /// The executable shadow of one field: the base value and the override.
@@ -138,6 +144,7 @@ pub fn resolve_exec(p: &Preset) -> (c: Caps)
         fleet_relay: field(background, p.fleet_relay),
         restore_check: field(background, p.restore_check),
         retention: field(background, p.retention),
+        maintenance: field(background, p.maintenance),
     }
 }
 
@@ -167,6 +174,7 @@ pub proof fn empty_preset_is_its_base(p: Preset)
         p.fleet_relay is None,
         p.restore_check is None,
         p.retention is None,
+        p.maintenance is None,
     ensures
         resolve(p) == base_caps(p.base),
 {
@@ -189,6 +197,8 @@ pub proof fn valid_override_is_respected(p: Preset)
         p.restore_check == Some(false) ==> !resolve(p).restore_check,
         p.retention == Some(true) ==> resolve(p).retention,
         p.retention == Some(false) ==> !resolve(p).retention,
+        p.maintenance == Some(true) ==> resolve(p).maintenance,
+        p.maintenance == Some(false) ==> !resolve(p).maintenance,
         p.job_workers == Some(true) ==> resolve(p).job_workers,
         p.job_workers == Some(false) ==> !resolve(p).job_workers,
 {
@@ -216,6 +226,7 @@ pub proof fn web_base_runs_no_background_work(p: Preset)
         !resolve(p).fleet_relay,
         !resolve(p).restore_check,
         !resolve(p).retention,
+        !resolve(p).maintenance,
 {
 }
 

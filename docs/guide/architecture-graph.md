@@ -143,7 +143,7 @@ committed document does.
 
 ## What is in the graph
 
-**Nodes** — one per macro-declared element:
+**Nodes** — one per macro-declared element, and one per background task:
 
 | Node kind        | Declared by                        | Carries |
 |------------------|------------------------------------|---------|
@@ -154,6 +154,12 @@ committed document does.
 | `job`            | `#[job]`                           | the registered job name |
 | `scheduled_task` | `#[scheduled]`                     | the schedule as declared |
 | `one_off_task`   | `#[task]`                          | the registered task name |
+| `background_task` | `AppBuilder::background_task`     | its capability, queues and the roles that run it (#3545) |
+
+A `background_task` node has the id `background_task:<name>`. It comes from
+the builder, not from a macro, so it has no edges. Its `roles` list the roles
+of the loaded config that start it. `completeness.background_tasks` counts
+them. See [Background tasks](jobs.md#background-tasks-for-plugins-and-apps).
 
 A route is a node whether or not the app mounts it. One that no `routes![]`
 list mounts is reported in `completeness.unmounted_routes` — a route that
