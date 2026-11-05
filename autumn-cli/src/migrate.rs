@@ -290,24 +290,12 @@ pub fn run(
     //    resolve_startup_wait can reuse it without a second filesystem read.
     let (targets, config_table) = resolve_targets(target, profile, &env);
 
-    // 2. Resolve migrations directory. For `run`, a scope directory can
-    //    stand in for `migrations/` on a SQLite target. The Postgres path
-    //    runs the `diesel` CLI on `migrations/`, so it needs it.
-    let migrations_dir = resolve_migrations_dir_with(*action == MigrateAction::Run);
-    if !Path::new(&migrations_dir).is_dir() && !all_targets_sqlite(&targets) {
-        resolve_migrations_dir();
-    }
+    // 2. Resolve the migrations directory and the topology.
     let only_database = control_is_only_database(
         |key| autumn_web::config::Env::var(&env, key),
         config_table.as_ref(),
     );
-    if *action == MigrateAction::Run
-        && let Err(message) =
-            refuse_scope_dirs_on_postgres(&targets, migrations_base(&migrations_dir), only_database)
-    {
-        eprintln!("\u{2717} {message}");
-        std::process::exit(1);
-    }
+    let migrations_dir = resolve_run_migrations_dir(action, &targets, only_database);
 
     // 3. Check that diesel CLI is available — but only when a target actually
     //    needs the `diesel` subprocess. The SQLite apply path uses the in-process
@@ -638,6 +626,32 @@ fn existing_scope_dirs(
         }
     }
     found
+}
+
+/// The migrations directory of `run` and `status`. Exits when it is missing,
+/// or when a Postgres target would miss a scope directory.
+///
+/// For `run`, a scope directory can stand in for `migrations/` on a SQLite
+/// target. The Postgres path runs the `diesel` CLI on `migrations/`, so it
+/// needs it.
+fn resolve_run_migrations_dir(
+    action: &MigrateAction,
+    targets: &[(String, String)],
+    only_database: bool,
+) -> String {
+    let run = *action == MigrateAction::Run;
+    let migrations_dir = resolve_migrations_dir_with(run);
+    if !Path::new(&migrations_dir).is_dir() && !all_targets_sqlite(targets) {
+        resolve_migrations_dir();
+    }
+    if run
+        && let Err(message) =
+            refuse_scope_dirs_on_postgres(targets, migrations_base(&migrations_dir), only_database)
+    {
+        eprintln!("\u{2717} {message}");
+        std::process::exit(1);
+    }
+    migrations_dir
 }
 
 /// Stop before any apply when a Postgres target would miss a scope
@@ -2563,7 +2577,7 @@ fn resolve_migrations_dir_with(scope_dirs_count: bool) -> String {
         )
         .is_empty()
     };
-    if !dir.exists() && !(scope_dirs_count && scoped()) {
+    if !dir.exists() && (!scope_dirs_count || !scoped()) {
         eprintln!("\u{2717} Migrations directory not found: {DEFAULT_MIGRATIONS_DIR}/");
         eprintln!("  Create it with `diesel setup` or `diesel migration generate <name>`.");
         std::process::exit(1);
