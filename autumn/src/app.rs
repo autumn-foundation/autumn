@@ -16986,6 +16986,42 @@ mod fleet_boot_tests {
         );
     }
 
+    /// A set for a Postgres schema never reaches a SQLite fleet (#3550).
+    #[test]
+    fn a_schema_set_refuses_the_fleet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = AutumnConfig::default();
+        config.database.url = Some(format!(
+            "sqlite://{}",
+            tmp.path().join("control.db").display()
+        ));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: tmp.path().join("fleet").display().to_string(),
+            path: None,
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+        });
+        let all = Arc::new(vec![(
+            "app",
+            crate::version_history::VERSION_HISTORY_MIGRATIONS,
+            crate::migrate::MigrationScope::Everywhere,
+            Some("marketing"),
+        )]);
+        let Err(err) = crate::db::fleet::build_for_app(&config, None, &all, |_| true) else {
+            panic!("a schema set must not reach a fleet");
+        };
+        assert!(err.contains("schema `marketing`"), "{err}");
+    }
+
     /// A control database plus a slot fleet under `dir`, the way `run()` sees
     /// them: the config, the built fleet, and an `AppState` carrying it.
     #[allow(
