@@ -53,6 +53,8 @@ may_read = ["contacts"]
   table name in every schema, also in the schema of another boundary. Write
   `public.contacts` to match one table.
 * Schema names match without case.
+* `autumn graph check-boundaries` has no schemas. It reads the table part of
+  a pattern with a `.`, so `public.contacts` there means `contacts`.
 
 ## 2. Put the tables in the schema
 

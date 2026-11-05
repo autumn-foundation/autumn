@@ -1016,7 +1016,7 @@ impl<'a> Resolver<'a> {
         let mut candidates = Vec::new();
         for (name, b) in &self.config.boundaries {
             for p in &b.owns {
-                if glob(&p.to_ascii_lowercase(), &table) {
+                if glob(&table_pattern(p), &table) {
                     candidates.push((name.as_str(), specificity(p)));
                 }
             }
@@ -1086,7 +1086,7 @@ impl<'a> Resolver<'a> {
             return false;
         };
         let table = table.to_ascii_lowercase();
-        let hit = |list: &[String]| list.iter().any(|p| glob(&p.to_ascii_lowercase(), &table));
+        let hit = |list: &[String]| list.iter().any(|p| glob(&table_pattern(p), &table));
         hit(&b.may_write) || (access == Access::Read && hit(&b.may_read))
     }
 
@@ -1095,7 +1095,7 @@ impl<'a> Resolver<'a> {
     /// The pattern is matched against the tables in the graph, and read as a
     /// table name too. A tie between two boundaries counts for neither.
     fn exception_owners(&self, pattern: &str) -> BTreeSet<&'a str> {
-        let lower = pattern.to_ascii_lowercase();
+        let lower = table_pattern(pattern);
         self.tables
             .iter()
             .filter(|t| glob(&lower, t))
@@ -1142,6 +1142,17 @@ pub(super) fn pick<'a>(
             second: second.to_owned(),
         }),
         (first, _) => Ok(first),
+    }
+}
+
+/// A table pattern as the graph reads it: lower case, with no schema. The
+/// graph names a table without its Postgres schema, so `public.contacts`
+/// matches the table `contacts` here. The grant planner reads the schema.
+fn table_pattern(pattern: &str) -> String {
+    let lower = pattern.to_ascii_lowercase();
+    match lower.rsplit_once('.') {
+        Some((_, table)) => table.to_owned(),
+        None => lower,
     }
 }
 
@@ -1435,6 +1446,20 @@ schema_crates = ["billing-schema"]
     fn may_read_clears_a_read_violation() {
         let report = check(&config("may_read = [\"contacts\"]\n"), Some(&graph()), None)
             .expect("check runs");
+        assert!(table_violation(&report, "report").is_none());
+        assert!(table_violation(&report, "joined").is_none());
+    }
+
+    /// The grant planner reads `public.contacts` as one schema and table;
+    /// the graph has no schemas, so it reads the table part (#3550).
+    #[test]
+    fn a_schema_qualified_exception_clears_a_read_violation() {
+        let report = check(
+            &config("may_read = [\"public.contacts\"]\n"),
+            Some(&graph()),
+            None,
+        )
+        .expect("check runs");
         assert!(table_violation(&report, "report").is_none());
         assert!(table_violation(&report, "joined").is_none());
     }
