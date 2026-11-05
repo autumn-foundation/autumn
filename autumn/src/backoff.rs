@@ -69,8 +69,8 @@ pub fn full_jitter(entropy: &dyn Entropy, base: Duration, cap: Duration, retry: 
     ))
 }
 
-/// A decorrelated-jitter delay, in ms: a draw from `[base, prev * 3]`, capped
-/// at `cap_ms`.
+/// A decorrelated-jitter delay, in ms: `min(cap, draw)`, where `draw` is
+/// uniform in `[base, prev * 3]`.
 ///
 /// Pass the delay this function returned last time as `prev_ms` (start with
 /// `base_ms`). Each delay depends on the one before it, not on the retry
@@ -87,13 +87,15 @@ pub fn decorrelated_jitter_ms(
     cap_ms: u64,
     prev_ms: u64,
 ) -> u64 {
-    let low = base_ms.min(cap_ms);
-    let high = prev_ms.saturating_mul(3).max(base_ms).min(cap_ms);
+    let high = prev_ms.saturating_mul(3).max(base_ms);
     let draw = entropy.next_u64();
-    // `span` overflows only when `[low, high]` covers all of `u64`.
-    (high - low)
+    // `span` overflows only when `[base, high]` covers all of `u64`.
+    let uncapped = (high - base_ms)
         .checked_add(1)
-        .map_or(draw, |span| low + draw % span)
+        .map_or(draw, |span| base_ms + draw % span);
+    // Cap the drawn delay. Capping `high` first would squeeze the interval
+    // and lower the mean delay once `prev * 3` passes the cap.
+    uncapped.min(cap_ms)
 }
 
 /// A decorrelated-jitter delay as a [`Duration`], at millisecond resolution.
@@ -227,6 +229,12 @@ mod tests {
         assert_eq!(decorrelated_jitter_ms(&Fixed(501), 100, 10_000, 200), 100);
         // The cap bounds the top end.
         assert!(decorrelated_jitter_ms(&Fixed(u64::MAX), 100, 1_000, u64::MAX) <= 1_000);
+        // Capping applies to the draw, not to the interval: 3 * prev is past
+        // the cap, and a draw of 1_500 lands on the cap.
+        assert_eq!(
+            decorrelated_jitter_ms(&Fixed(1_500), 100, 1_000, 1_000),
+            1_000
+        );
         // A cap below the base wins.
         assert_eq!(decorrelated_jitter_ms(&Fixed(9), 100, 50, 100), 50);
     }
