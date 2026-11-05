@@ -3,7 +3,7 @@
 //! A boundary with a `role` gets access to its own tables and its
 //! `may_read` / `may_write` exceptions only. This module reads the live
 //! catalog, makes the plan with `autumn_web::graph::grants`, and prints the
-//! SQL or applies it. `autumn doctor` uses [`probe_role`] to check that each
+//! SQL or applies it. `autumn doctor` uses `probe_role` to check that each
 //! role really cannot read a table outside its grant.
 //!
 //! See `docs/guide/database-boundaries.md`.
