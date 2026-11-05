@@ -273,7 +273,7 @@ so a migration that locks a table does not stop doctor.
 
 | Result | Why |
 |--------|-----|
-| Fail | A role reads or changes a table outside its grant, or writes a `may_read` table. Doctor names the table. |
+| Fail | A role reads or changes a table outside its grant, writes a `may_read` table, or is a member of `pg_read_all_data` / `pg_write_all_data`. Doctor names the table or role. |
 | Warn | A role cannot connect, connects as another role, cannot read a table of its grant, can create objects in a schema, is a member of another role, or a table cannot be checked. |
 | Pass | Every role reads its grant and nothing else. |
 

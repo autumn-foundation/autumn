@@ -11495,6 +11495,21 @@ fn database_roles_verdict(probes: &[crate::db::grants::RoleProbe]) -> CheckResul
                 probe.creates_in.join(", ")
             ));
         }
+        // `pg_read_all_data` and `pg_write_all_data` reach every table, also
+        // through `SET ROLE` with no inherit: that is a leak.
+        let all_data: Vec<&str> = probe
+            .member_of
+            .iter()
+            .map(String::as_str)
+            .filter(|r| matches!(*r, "pg_read_all_data" | "pg_write_all_data"))
+            .collect();
+        if !all_data.is_empty() {
+            status = CheckStatus::Fail;
+            lines.push(format!(
+                "{name}: is a member of {}, which reaches every table",
+                all_data.join(", ")
+            ));
+        }
         if !probe.member_of.is_empty() {
             warn(&mut status);
             lines.push(format!(
@@ -24481,6 +24496,19 @@ mod database_roles_tests {
         );
         assert!(
             detail.contains("writes 1 `may_read` table(s): public.accounts"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_read_all_data_membership_fails() {
+        let mut p = probe();
+        p.member_of = vec!["pg_read_all_data".into()];
+        let result = database_roles_verdict(&[p]);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(
+            detail.contains("is a member of pg_read_all_data, which reaches every table"),
             "{detail}"
         );
     }

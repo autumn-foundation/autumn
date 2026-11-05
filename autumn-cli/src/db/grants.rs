@@ -505,7 +505,7 @@ pub async fn probe_role(url: &str, grants: &RoleGrants, schemas: &[String]) -> R
     if let Ok(rows) = client
         .query(
             "SELECT r.rolname::text FROM pg_roles r \
-             WHERE r.rolname <> current_user AND r.rolname NOT LIKE 'pg\\_%' \
+             WHERE r.rolname <> current_user \
              AND pg_has_role(current_user, r.oid, 'MEMBER') ORDER BY 1",
             &[],
         )
