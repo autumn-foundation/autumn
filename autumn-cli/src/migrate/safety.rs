@@ -1080,6 +1080,7 @@ fn string_escape_mode_finding(normalized: &str) -> Option<SafetyFinding> {
 /// - A `set_config` call, unless its first argument is a plain `'..'` name
 ///   of a different setting.
 /// - An `UPDATE` of `pg_settings`.
+/// - `RESET ALL` or `DISCARD ALL`. The reset value of the setting can be off.
 ///
 /// A `SET` to an explicit true value does not match. Dynamic SQL can build
 /// the name in other ways. The scanner does not find those.
@@ -1095,8 +1096,25 @@ fn changes_string_escape_mode(normalized: &str) -> bool {
             .match_indices("u&\"")
             .any(|(i, _)| ends_with_set_keyword(&lower[..i]))
         || set_config_can_change_it(&lower)
+        || resets_all(&lower)
         || lower.contains("update pg_settings")
         || lower.contains("update pg_catalog.pg_settings")
+}
+
+/// Whether `lower` holds `RESET ALL` or `DISCARD ALL`.
+fn resets_all(lower: &str) -> bool {
+    lower.match_indices("all").any(|(i, word)| {
+        let before = &lower[..i];
+        let word_end = lower[i + word.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_identifier_char(c));
+        word_end
+            && before.ends_with(char::is_whitespace)
+            && ["reset", "discard"]
+                .iter()
+                .any(|k| strip_word_suffix(before.trim_end(), k).is_some())
+    })
 }
 
 /// Whether `before` ends with `SET` or `RESET`, then an optional `SESSION`
@@ -1127,7 +1145,10 @@ fn strip_word_suffix<'a>(text: &'a str, word: &str) -> Option<&'a str> {
 /// only a plain `'..'` literal with a different name.
 fn set_config_can_change_it(lower: &str) -> bool {
     lower.match_indices("set_config").any(|(i, word)| {
-        let Some(args) = lower[i + word.len()..].trim_start().strip_prefix('(') else {
+        // A quoted name such as `"set_config"` is the same function.
+        let after = &lower[i + word.len()..];
+        let after = after.strip_prefix('"').unwrap_or(after);
+        let Some(args) = after.trim_start().strip_prefix('(') else {
             return false;
         };
         let Some(literal) = args.trim_start().strip_prefix('\'') else {
@@ -3182,6 +3203,11 @@ mod tests {
             "SELECT set_config('it''s', 'off', false);",
             "UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_' || 'conforming_strings';",
             "UPDATE pg_catalog.pg_settings SET setting = 'off';",
+            r#"SELECT pg_catalog."set_config"('standard_conforming_strings', 'off', false);"#,
+            // A reset value can be off.
+            "RESET ALL;",
+            "DISCARD ALL;",
+            "DO $$ BEGIN RESET ALL; END $$;",
         ] {
             let findings = classify_sql_for(pg, sql);
             assert!(
@@ -3204,6 +3230,8 @@ mod tests {
             "SHOW standard_conforming_strings;",
             "SELECT current_setting('standard_conforming_strings');",
             "CREATE TABLE settings (standard_conforming_strings boolean);",
+            "SELECT a FROM x UNION ALL SELECT a FROM y;",
+            "CREATE TABLE t (reset allowed);",
             "-- autumn-safety: reviewed\nSET standard_conforming_strings = off;",
         ] {
             assert_eq!(ops(pg, sql), Vec::<String>::new(), "{sql:?}");

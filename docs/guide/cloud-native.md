@@ -552,8 +552,9 @@ Example output:
 
 The check reads `'..'` text as Postgres does with
 `standard_conforming_strings = on`, the default. A statement that can change
-this setting is `manual-review` (#3528): `SET`, `RESET`, `set_config`, an
-`UPDATE` of `pg_settings`, also in a `DO` body. A `SET` to `on` is not
+this setting is `manual-review` (#3528): `SET`, `RESET`, `RESET ALL`,
+`DISCARD ALL`, `set_config`, an `UPDATE` of `pg_settings`, also in a `DO`
+body. A `SET` to `on` is not
 flagged. With the setting off, `\'` does not end `'..'` text. The check then
 possibly misses a later risky statement. Use `E'..'` text for backslash
 escapes. The check does not find a name that dynamic SQL builds.
