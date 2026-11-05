@@ -221,6 +221,8 @@ COMMIT;
 * A sequence of an own or `may_write` table gets `USAGE, SELECT`, so an
   insert can use it. This includes a sequence that a column default calls
   with `nextval`.
+* A role in a named schema gets that schema first on its `search_path`. A
+  role in `public` gets `RESET search_path`, so an old schema goes away.
 * A schema with no table gets no statement. A `REVOKE` on a missing schema
   would stop the transaction.
 * The `owns` globs resolve against the live tables, with the same rules as

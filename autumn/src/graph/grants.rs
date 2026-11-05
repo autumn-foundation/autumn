@@ -361,7 +361,11 @@ impl GrantPlan {
                     join(g.sequences.iter().map(QualifiedName::quoted))
                 );
             }
-            if g.schema != super::boundaries::DEFAULT_SCHEMA {
+            // A boundary in `public` resets the path, so a schema it had
+            // before does not stay on it.
+            if g.schema == super::boundaries::DEFAULT_SCHEMA {
+                let _ = writeln!(out, "ALTER ROLE {role} RESET search_path;");
+            } else {
                 let _ = writeln!(
                     out,
                     "ALTER ROLE {role} SET search_path = {}, {};",
@@ -608,6 +612,7 @@ REVOKE ALL ON SCHEMA "marketing", "public" FROM "core";
 GRANT USAGE ON SCHEMA "public" TO "core";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "public"."contacts", "public"."deals" TO "core";
 GRANT USAGE, SELECT ON SEQUENCE "public"."contacts_id_seq" TO "core";
+ALTER ROLE "core" RESET search_path;
 
 -- Boundary `marketing`: role "marketing", schema "marketing".
 REVOKE ALL ON ALL TABLES IN SCHEMA "marketing", "public" FROM "marketing";

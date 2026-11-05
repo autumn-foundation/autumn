@@ -126,20 +126,25 @@ fn with_user(
     }
     let mut url = url::Url::parse(primary).map_err(|_| not_url())?;
     // A `user` or `password` in the query wins over the user part of the
-    // URL, so the role would connect as the owner. Remove them.
-    let query: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(k, _)| !matches!(k.as_ref(), "user" | "password" | "passfile"))
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+    // URL, so the role would connect as the owner. Remove them. The other
+    // parameters stay byte for byte: Postgres does not read `+` as a space.
+    let query: Vec<&str> = url
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| {
+            let key = pair.split_once('=').map_or(*pair, |(k, _)| k);
+            !pair.is_empty() && !matches!(key, "user" | "password" | "passfile")
+        })
         .collect();
-    if query.is_empty() {
-        url.set_query(None);
-    } else {
-        url.query_pairs_mut().clear().extend_pairs(query);
-    }
-    url.set_username(user).map_err(|()| not_url())?;
-    let password = password.map(secrecy::ExposeSecret::expose_secret);
-    url.set_password(password).map_err(|()| not_url())?;
+    let query = query.join("&");
+    url.set_query((!query.is_empty()).then_some(query.as_str()));
+    // `Url` keeps a `%` as it is, and the driver decodes it: escape it first.
+    let escape = |text: &str| text.replace('%', "%25");
+    url.set_username(&escape(user)).map_err(|()| not_url())?;
+    let password = password.map(|p| escape(secrecy::ExposeSecret::expose_secret(p)));
+    url.set_password(password.as_deref())
+        .map_err(|()| not_url())?;
     Ok(url.to_string())
 }
 
@@ -358,6 +363,34 @@ mod tests {
                 .unwrap(),
             "postgres://marketing:pw@db/app"
         );
+    }
+
+    #[test]
+    fn other_query_parameters_stay_as_they_are() {
+        let r = role(r#"user = "m""#);
+        assert_eq!(
+            r.effective_url(Some(
+                "postgres://o@db/app?options=-c%20search_path%3Dapp&application_name=a+b"
+            ))
+            .unwrap(),
+            "postgres://m@db/app?options=-c%20search_path%3Dapp&application_name=a+b"
+        );
+    }
+
+    #[test]
+    fn a_literal_percent_sign_survives_the_round_trip() {
+        let r = role("user = \"m%x\"\npassword = \"secret%40suffix\"");
+        let url = r.effective_url(Some("postgres://o@h/app")).unwrap();
+        assert_eq!(url, "postgres://m%25x:secret%2540suffix@h/app");
+        let parsed = url::Url::parse(&url).unwrap();
+        let decode = |s: &str| {
+            percent_encoding::percent_decode_str(s)
+                .decode_utf8()
+                .unwrap()
+                .into_owned()
+        };
+        assert_eq!(decode(parsed.username()), "m%x");
+        assert_eq!(decode(parsed.password().unwrap()), "secret%40suffix");
     }
 
     #[test]
