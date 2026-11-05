@@ -63,7 +63,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -676,12 +676,27 @@ impl Instrument {
     ///
     /// No lock is held while `update` runs, and the no-label case touches no
     /// lock at all.
-    fn record(&self, labels: &[(String, String)], update: impl FnOnce(&Series)) {
+    fn record(
+        &self,
+        labels: &[(String, String)],
+        cache: &OnceLock<Arc<Series>>,
+        update: impl FnOnce(&Series),
+    ) {
         // ONE snapshot for both capped decisions below. Reading the label cap
         // and the series cap separately could straddle a `set_limits` and
         // admit a series that neither configuration would have produced — and
         // a retained series is never evicted, so it would stay wrong forever.
         let limits = limits();
+        // A handle's labels never change after it is built, so the series they
+        // name is resolved once. Valid only while no label is truncated: a
+        // lowered `max_labels_per_series` changes the key, so that case takes
+        // the full path (which also keeps its "too many labels" warning).
+        if labels.len() <= limits.max_labels_per_series
+            && let Some(series) = cache.get()
+        {
+            update(series);
+            return;
+        }
         let key = self.capped_key(labels, limits.max_labels_per_series);
         if key.is_empty() {
             // No labels, or every label was rejected as it was attached; the
@@ -691,6 +706,10 @@ impl Instrument {
         }
         if let Some(series) = self.series_for(key, limits.max_series_per_metric) {
             update(&series);
+            if key.len() == labels.len() {
+                // A dropped label set is not cached: it keeps counting drops.
+                let _ = cache.set(series);
+            }
         }
     }
 
@@ -1329,6 +1348,7 @@ pub fn counter(name: &str) -> Counter {
     Counter {
         instrument: instrument(name, InstrumentKind::Counter),
         labels: Vec::new(),
+        series: OnceLock::new(),
     }
 }
 
@@ -1340,6 +1360,7 @@ pub fn gauge(name: &str) -> Gauge {
     Gauge {
         instrument: instrument(name, InstrumentKind::Gauge),
         labels: Vec::new(),
+        series: OnceLock::new(),
     }
 }
 
@@ -1352,6 +1373,7 @@ pub fn histogram(name: &str) -> Histogram {
     Histogram {
         instrument: instrument(name, InstrumentKind::Histogram),
         labels: Vec::new(),
+        series: OnceLock::new(),
     }
 }
 
@@ -1636,6 +1658,8 @@ impl_wide_metric_value!(i64, u64, isize, usize);
 pub struct Counter {
     instrument: Option<Arc<Instrument>>,
     labels: Vec<(String, String)>,
+    /// The series `labels` names, resolved on first record.
+    series: OnceLock<Arc<Series>>,
 }
 
 impl Counter {
@@ -1653,6 +1677,7 @@ impl Counter {
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
         if let Some(instrument) = self.instrument.as_deref() {
             insert_label(instrument, &mut self.labels, key, value.into());
+            self.series = OnceLock::new();
         }
         self
     }
@@ -1664,7 +1689,7 @@ impl Counter {
     /// `PromQL`'s `rate()` an enormous phantom spike.
     pub fn increment(&self, amount: u64) {
         if let Some(instrument) = self.instrument.as_ref() {
-            instrument.record(&self.labels, |series| series.add(amount));
+            instrument.record(&self.labels, &self.series, |series| series.add(amount));
         }
     }
 }
@@ -1677,6 +1702,8 @@ impl Counter {
 pub struct Gauge {
     instrument: Option<Arc<Instrument>>,
     labels: Vec<(String, String)>,
+    /// The series `labels` names, resolved on first record.
+    series: OnceLock<Arc<Series>>,
 }
 
 impl Gauge {
@@ -1686,6 +1713,7 @@ impl Gauge {
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
         if let Some(instrument) = self.instrument.as_deref() {
             insert_label(instrument, &mut self.labels, key, value.into());
+            self.series = OnceLock::new();
         }
         self
     }
@@ -1715,7 +1743,7 @@ impl Gauge {
             instrument.warn_value(value, "a gauge value must be finite");
             return;
         }
-        instrument.record(&self.labels, |series| series.set(value));
+        instrument.record(&self.labels, &self.series, |series| series.set(value));
     }
 
     /// Add `delta` to this gauge's series.
@@ -1741,7 +1769,7 @@ impl Gauge {
             instrument.warn_value(delta, "a gauge delta must be finite");
             return;
         }
-        instrument.record(&self.labels, |series| series.adjust(delta));
+        instrument.record(&self.labels, &self.series, |series| series.adjust(delta));
     }
 }
 
@@ -1753,6 +1781,8 @@ impl Gauge {
 pub struct Histogram {
     instrument: Option<Arc<Instrument>>,
     labels: Vec<(String, String)>,
+    /// The series `labels` names, resolved on first record.
+    series: OnceLock<Arc<Series>>,
 }
 
 impl Histogram {
@@ -1762,6 +1792,7 @@ impl Histogram {
     pub fn with_label(mut self, key: &str, value: impl Into<String>) -> Self {
         if let Some(instrument) = self.instrument.as_deref() {
             insert_label(instrument, &mut self.labels, key, value.into());
+            self.series = OnceLock::new();
         }
         self
     }
@@ -1785,7 +1816,7 @@ impl Histogram {
             );
             return;
         }
-        instrument.record(&self.labels, |series| {
+        instrument.record(&self.labels, &self.series, |series| {
             series.observe(value, &instrument.bounds);
         });
     }
@@ -2747,6 +2778,94 @@ mod tests {
             instrument.dropped_series, 0,
             "nothing is dropped below the configured cap"
         );
+    }
+
+    #[test]
+    fn held_handle_follows_a_lowered_label_cap_like_a_fresh_one() {
+        // A held handle caches the series its labels name. Lowering
+        // `max_labels_per_series` below the handle's label count changes the
+        // key, so the cached series must not be reused.
+        let _limits = LimitsGuard::raised_to(Limits {
+            max_labels_per_series: DEFAULT_MAX_LABELS_PER_SERIES + 2,
+            ..Limits::default()
+        });
+        let name = unique_name("facade_held_label_cap");
+        let mut held = counter(&name);
+        for i in 0..DEFAULT_MAX_LABELS_PER_SERIES + 2 {
+            held = held.with_label(&format!("l{i}"), "v");
+        }
+        held.increment(1);
+        held.increment(1);
+        assert_eq!(expect_instrument(&name).series.len(), 1);
+
+        set_limits(Limits::default());
+        held.increment(1);
+
+        let instrument = expect_instrument(&name);
+        let mut widths: Vec<usize> = instrument.series.iter().map(|s| s.labels.len()).collect();
+        widths.sort_unstable();
+        assert_eq!(
+            widths,
+            vec![
+                DEFAULT_MAX_LABELS_PER_SERIES,
+                DEFAULT_MAX_LABELS_PER_SERIES + 2
+            ],
+            "the lowered cap must route the sample to the truncated series"
+        );
+    }
+
+    #[test]
+    fn held_gauge_and_histogram_reuse_their_series_and_stay_correct() {
+        let _limits = LimitsGuard::pinned();
+        let gauge_name = unique_name("facade_held_gauge");
+        let gauge_handle = gauge(&gauge_name).with_label("pool", "a");
+        gauge_handle.set(2.0);
+        gauge_handle.increment(3_u32);
+        gauge_handle.decrement(1_u32);
+        let hist_name = unique_name("facade_held_histogram");
+        let hist_handle = histogram(&hist_name).with_label("route", "/x");
+        hist_handle.record(0.5);
+        hist_handle.record(1.5);
+
+        let g = expect_instrument(&gauge_name);
+        assert_eq!(g.series.len(), 1);
+        assert!(matches!(
+            g.series[0].value,
+            SeriesValue::Gauge { value } if (value - 4.0).abs() < f64::EPSILON
+        ));
+        let h = expect_instrument(&hist_name);
+        assert_eq!(h.series.len(), 1);
+        assert!(matches!(
+            h.series[0].value,
+            SeriesValue::Histogram { count: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn held_handle_over_the_series_cap_keeps_counting_drops() {
+        let _limits = LimitsGuard::pinned();
+        let name = unique_name("facade_held_over_cap");
+        for i in 0..DEFAULT_MAX_SERIES_PER_METRIC {
+            counter(&name)
+                .with_label("shard", i.to_string())
+                .increment(1);
+        }
+        let over = counter(&name).with_label("shard", "over");
+        over.increment(1);
+        over.increment(1);
+        assert_eq!(expect_instrument(&name).dropped_series, 2);
+    }
+
+    #[test]
+    fn extending_a_handle_after_recording_resolves_a_new_series() {
+        let name = unique_name("facade_held_extended");
+        let base = counter(&name).with_label("a", "1");
+        base.increment(1);
+        let extended = base.clone().with_label("b", "2");
+        extended.increment(1);
+        base.increment(1);
+        let instrument = expect_instrument(&name);
+        assert_eq!(instrument.series.len(), 2);
     }
 
     #[test]

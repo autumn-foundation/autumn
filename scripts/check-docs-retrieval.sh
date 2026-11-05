@@ -8,7 +8,7 @@
 # (`check-docs-config.sh`), the `autumn.toml` keys it tells them to WRITE
 # (`check-docs-toml.sh`), the `autumn_web::…` paths they IMPORT
 # (`check-docs-symbols.sh`), the `/actuator/…` URLs they CURL
-# (`check-docs-routes.sh`), the macro arguments they copy
+# (`xtask/src/docs/routes.rs`), the macro arguments they copy
 # (`check-docs-macro-args.sh`), the Cargo feature a gated snippet needs
 # (`check-docs-features.sh`), the dependency pin all of it is relative to
 # (`check-docs-versions.sh`), and the agreement between those corpora

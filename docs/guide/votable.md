@@ -56,7 +56,7 @@ already has. Nothing extra to enable:
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.9", features = ["widgets-social"] }
+autumn-web = { version = "0.10", features = ["widgets-social"] }
 ```
 
 The `widgets-social` feature (a default; it turns on `maud`) is only needed

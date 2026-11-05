@@ -79,6 +79,47 @@ pub fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
 }
 
+/// `text` as an ASCII pattern sees it under Python's `re` rules.
+///
+/// Rust's `\b` counts a combining mark as a word character and Python's does
+/// not, and Python counts `²` (category `No`) where Rust does not. Mapping
+/// every non-ASCII character to an ASCII stand-in, one for one, makes the two
+/// engines agree for a pattern written in ASCII: Python whitespace becomes
+/// `\x1c` (which a pattern's `\s` must then include), a Python word
+/// character (category `L` or `N`) becomes `_`, and anything else becomes
+/// `\x01`. With `fold`, the four characters Python's `re.IGNORECASE` folds
+/// onto an ASCII letter (`İ`, `ı`, `ſ`, the Kelvin sign) become that letter.
+#[must_use]
+pub fn py_ascii_view(text: &str, fold: bool) -> String {
+    text.chars()
+        .map(|c| match c {
+            _ if c.is_ascii() => c,
+            '\u{130}' | '\u{131}' if fold => 'i',
+            '\u{17f}' if fold => 's',
+            '\u{212a}' if fold => 'k',
+            _ if is_py_space(c) => '\x1c',
+            _ if is_py_word(c) => '_',
+            _ => '\x01',
+        })
+        .collect()
+}
+
+/// Python's `\w` for a non-ASCII character: a letter or a number.
+fn is_py_word(c: char) -> bool {
+    use unicode_general_category::GeneralCategory as G;
+    matches!(
+        unicode_general_category::get_general_category(c),
+        G::UppercaseLetter
+            | G::LowercaseLetter
+            | G::TitlecaseLetter
+            | G::ModifierLetter
+            | G::OtherLetter
+            | G::DecimalNumber
+            | G::LetterNumber
+            | G::OtherNumber
+    )
+}
+
 /// Python's `str.strip()`.
 #[must_use]
 pub fn py_strip(s: &str) -> &str {
@@ -199,6 +240,13 @@ mod tests {
         assert_eq!(py_splitlines("a\r\nb\r\n"), ["a", "b"]);
         assert_eq!(py_splitlines("a\rb\x0cc\u{2028}d"), ["a", "b", "c", "d"]);
         assert_eq!(py_splitlines("a\n\nb"), ["a", "", "b"]);
+    }
+
+    #[test]
+    fn the_ascii_view_keeps_python_word_classes() {
+        assert_eq!(py_ascii_view("a\u{301}\u{b2}\u{a0}é", false), "a\x01_\x1c_");
+        assert_eq!(py_ascii_view("\u{17f}\u{130}", true), "si");
+        assert_eq!(py_ascii_view("\u{17f}\u{130}", false), "__");
     }
 
     #[test]

@@ -75,6 +75,7 @@ Ported so far:
 | Markdown links and anchors | `scripts/check-docs-links.sh` | `xtask/src/docs/links.rs` (`cargo xtask check docs-links`) |
 | Guide index completeness | `scripts/check-docs-guide-index.sh` | `xtask/src/docs/guide_index.rs` (`cargo xtask check docs-guide-index`) |
 | Reader vocabulary | `scripts/check-docs-aliases.sh` | `xtask/src/docs/aliases.rs` (`cargo xtask check docs-aliases`) |
+| Actuator paths | `scripts/check-docs-routes.sh` | `xtask/src/docs/routes.rs` (`cargo xtask check docs-routes`) |
 
 The per-line markdown shapes (block quote, fence, list item, heading) are
 matched by hand rather than by regex. A regex there made the first port ten
@@ -93,13 +94,25 @@ captured mechanically, one `#[test]` each. The port matched the script on
 without lookahead matched Python's on 260,000 fuzzed inputs.
 
 The reader-vocabulary gate (`xtask/src/docs/aliases.rs`) matches its terms
-on an ASCII view of the visible text, in which every non-ASCII letter or
-number becomes `_` and every other non-ASCII character `\x01`. Rust's `\b`
-treats combining marks as word characters and Python's does not, and the
-reverse holds for `²`; the view makes the two agree. Its visible-text
+on an ASCII view of the visible text (`py_ascii_view` in
+`xtask/src/docs/re.rs`), in which non-ASCII whitespace becomes `\x1c`, every
+non-ASCII letter or number `_` and every other non-ASCII character `\x01`.
+Rust's `\b` treats combining marks as word characters and Python's does not,
+and the reverse holds for `²`; the view makes the two agree. Its visible-text
 reduction matched the Python on 60,000 fuzzed inputs, term matching on
 80,000, and the whole gate matched the script on 1,200 mutated copies of
 its pages.
+
+The actuator-path gate (`xtask/src/docs/routes.rs`) reads every published
+crate's `readme` from its `Cargo.toml`, so xtask parses TOML (`toml`, parse
+and `serde` only), and its `did you mean` hint reproduces Python's
+`difflib.get_close_matches` so a defect line reads as it did. It answers
+`--corpus` for `scripts/check-docs-scope.sh` and `--list` for its truth
+set. Its extraction, resolution, waivers and hints matched the Python on
+40,000 fuzzed inputs, and the gate matched the script on 705 mutated copies
+of the tree (documented paths, waivers, request lines, the actuator mounts
+in the Rust source and crate manifests), compared on the check, `--list`
+and `--corpus`.
 
 The `migration-guides` job installs a toolchain for the ported gates, after
 its bash gates, so those still report in seconds.
