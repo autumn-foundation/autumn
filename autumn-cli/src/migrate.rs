@@ -640,18 +640,51 @@ fn resolve_run_migrations_dir(
     only_database: bool,
 ) -> String {
     let run = *action == MigrateAction::Run;
-    let migrations_dir = resolve_migrations_dir_with(run);
-    if !Path::new(&migrations_dir).is_dir() && !all_targets_sqlite(targets) {
-        resolve_migrations_dir();
-    }
-    if run
-        && let Err(message) =
-            refuse_scope_dirs_on_postgres(targets, migrations_base(&migrations_dir), only_database)
-    {
+    if let Some(message) = migrations_dir_problem(Path::new(""), run, targets, only_database) {
         eprintln!("\u{2717} {message}");
         std::process::exit(1);
     }
-    migrations_dir
+    DEFAULT_MIGRATIONS_DIR.to_string()
+}
+
+/// Why `run` or `status` cannot use the migrations under `base`, or `None`.
+///
+/// `migrations/` must exist. For `run` on SQLite targets only, a scope
+/// directory can stand in for it. For `run`, a Postgres target must not take
+/// a scope directory (see [`refuse_scope_dirs_on_postgres`]).
+fn migrations_dir_problem(
+    base: &Path,
+    run: bool,
+    targets: &[(String, String)],
+    only_database: bool,
+) -> Option<String> {
+    let scoped_stands_in = run && all_targets_sqlite(targets);
+    if !migrations_dir_found(base, scoped_stands_in) {
+        return Some(migrations_dir_not_found());
+    }
+    if run {
+        return refuse_scope_dirs_on_postgres(targets, base, only_database).err();
+    }
+    None
+}
+
+/// Whether `base` holds `migrations/`, or, with `scope_dirs_count`, a scope
+/// directory (`migrations-control/`, `migrations-shards/`).
+fn migrations_dir_found(base: &Path, scope_dirs_count: bool) -> bool {
+    use autumn_web::migrate::MigrationScope;
+
+    base.join(DEFAULT_MIGRATIONS_DIR).exists()
+        || (scope_dirs_count
+            && !existing_scope_dirs(base, [MigrationScope::Control, MigrationScope::Shards])
+                .is_empty())
+}
+
+/// The message for a missing `migrations/` directory.
+fn migrations_dir_not_found() -> String {
+    format!(
+        "Migrations directory not found: {DEFAULT_MIGRATIONS_DIR}/\n  Create it with `diesel \
+         setup` or `diesel migration generate <name>`."
+    )
 }
 
 /// Stop before any apply when a Postgres target would miss a scope
@@ -1130,22 +1163,14 @@ fn run_safety_check(migrations_dir: &str, profile: Option<&str>) {
     // honors `--profile`, reads no `.env`, and never exits, so `check` stays the
     // offline, URL-free preflight documented above.
     let backend = crate::generate::detect_backend_offline(Path::new("."), profile);
-    let dirs = safety_check_dirs(migrations_base(migrations_dir));
-    let mut reports = Vec::new();
-    for dir in &dirs {
-        match check_migrations_in_dir_for(backend, dir) {
-            Ok(r) => reports.extend(r),
+    let (reports, scanned) =
+        match safety_reports(backend, &safety_check_dirs(migrations_base(migrations_dir))) {
+            Ok(found) => found,
             Err(e) => {
                 eprintln!("\u{2717} Migration safety check failed: {e}");
                 std::process::exit(1);
             }
-        }
-    }
-    let scanned = dirs
-        .iter()
-        .map(|dir| format!("{}/", dir.display()))
-        .collect::<Vec<_>>()
-        .join(", ");
+        };
 
     if reports.is_empty() {
         eprintln!("\u{2713} No migrations found in {scanned}");
@@ -1182,6 +1207,24 @@ fn run_safety_check(migrations_dir: &str, profile: Option<&str>) {
              (reported above). These only run on `autumn migrate down`, not on deploy."
         );
     }
+}
+
+/// The safety reports of every migration in `dirs`, and the scanned
+/// directories as `"a/, b/"`.
+fn safety_reports(
+    backend: autumn_web::config::DatabaseBackend,
+    dirs: &[std::path::PathBuf],
+) -> Result<(Vec<MigrationSafetyReport>, String), String> {
+    let mut reports = Vec::new();
+    for dir in dirs {
+        reports.extend(check_migrations_in_dir_for(backend, dir)?);
+    }
+    let scanned = dirs
+        .iter()
+        .map(|dir| format!("{}/", dir.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok((reports, scanned))
 }
 
 /// Whether any migration is unsafe for a forward rolling deploy.
@@ -2566,20 +2609,8 @@ fn resolve_migrations_dir() -> String {
 /// `scope_dirs_count` is true. An app can keep all its sets in scope
 /// directories.
 fn resolve_migrations_dir_with(scope_dirs_count: bool) -> String {
-    let dir = Path::new(DEFAULT_MIGRATIONS_DIR);
-    let scoped = || {
-        !existing_scope_dirs(
-            migrations_base(DEFAULT_MIGRATIONS_DIR),
-            [
-                autumn_web::migrate::MigrationScope::Control,
-                autumn_web::migrate::MigrationScope::Shards,
-            ],
-        )
-        .is_empty()
-    };
-    if !dir.exists() && (!scope_dirs_count || !scoped()) {
-        eprintln!("\u{2717} Migrations directory not found: {DEFAULT_MIGRATIONS_DIR}/");
-        eprintln!("  Create it with `diesel setup` or `diesel migration generate <name>`.");
+    if !migrations_dir_found(Path::new(""), scope_dirs_count) {
+        eprintln!("\u{2717} {}", migrations_dir_not_found());
         std::process::exit(1);
     }
     DEFAULT_MIGRATIONS_DIR.to_string()
@@ -4016,6 +4047,37 @@ mod tests {
         assert!(!err.contains("migrations-shards/"), "{err}");
     }
 
+    /// `run` and `status` need `migrations/`. A scope directory stands in for
+    /// it only for `run` on SQLite targets. `run` on Postgres refuses a scope
+    /// directory that a target takes.
+    #[test]
+    fn migrations_dir_problem_covers_each_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let sqlite = [("control".to_owned(), "sqlite://app.db".to_owned())];
+        let postgres = [("control".to_owned(), "postgres://db/app".to_owned())];
+        let not_found = |problem: Option<String>| {
+            problem.is_some_and(|message| message.contains("Migrations directory not found"))
+        };
+
+        assert!(not_found(migrations_dir_problem(base, true, &sqlite, true)));
+        std::fs::create_dir(base.join("migrations-shards")).unwrap();
+        assert_eq!(migrations_dir_problem(base, true, &sqlite, true), None);
+        assert!(not_found(migrations_dir_problem(
+            base, true, &postgres, true
+        )));
+        assert!(not_found(migrations_dir_problem(
+            base, false, &sqlite, true
+        )));
+
+        std::fs::create_dir(base.join("migrations")).unwrap();
+        assert_eq!(migrations_dir_problem(base, false, &postgres, true), None);
+        let refused = migrations_dir_problem(base, true, &postgres, true).unwrap();
+        assert!(refused.contains("AUTUMN_MIGRATE=1"), "{refused}");
+        assert_eq!(migrations_dir_problem(base, true, &postgres, false), None);
+        assert!(migrations_dir_found(base, false));
+    }
+
     /// `down` reads `migrations/` only, so a scope directory stops it.
     #[test]
     fn down_refuses_a_scope_directory() {
@@ -4027,6 +4089,42 @@ mod tests {
         let err = refuse_scope_dirs_for_down(base).unwrap_err();
         assert!(err.contains("migrations-control/"), "{err}");
         assert!(err.contains("by hand"), "{err}");
+    }
+
+    /// `check` reads the migrations of each scope directory, and names each
+    /// directory it scanned.
+    #[test]
+    fn safety_reports_read_every_scope_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        for (dir, name) in [
+            ("migrations", "20990101000000_create_posts"),
+            ("migrations-control", "20990102000000_create_tenants"),
+        ] {
+            let migration = base.join(dir).join(name);
+            std::fs::create_dir_all(&migration).unwrap();
+            std::fs::write(migration.join("up.sql"), "CREATE TABLE t (id INTEGER);").unwrap();
+        }
+        let (reports, scanned) = safety_reports(
+            autumn_web::config::DatabaseBackend::Postgres,
+            &safety_check_dirs(base),
+        )
+        .unwrap();
+        let names: Vec<&str> = reports.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"20990101000000_create_posts"), "{names:?}");
+        assert!(
+            names.contains(&"20990102000000_create_tenants"),
+            "{names:?}"
+        );
+        assert!(scanned.contains("migrations-control/"), "{scanned}");
+
+        assert!(
+            safety_reports(
+                autumn_web::config::DatabaseBackend::Postgres,
+                &[base.join("missing")]
+            )
+            .is_err()
+        );
     }
 
     /// `check` scans every scope directory that exists.
