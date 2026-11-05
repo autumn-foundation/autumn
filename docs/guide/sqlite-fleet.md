@@ -434,6 +434,14 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   writes since the last sync: up to `rpo_secs` while replication keeps up
   ([the RPO contract](sqlite-in-production.md#the-rpo-contract), and the
   lag note below). Replication bounds that loss. It does not prevent it.
+  This setting is only for a missing file. With ownership on, a host also
+  restores a stale file (older than the replica) without `restore_missing`.
+  See step 5 of [the failover procedure](#the-failover-procedure).
+
+**Replication is asynchronous.** A host acknowledges a write when the write
+is on its own volume. The next pass ships it to the replica. So a failover
+to another volume can lose an acknowledged write. See
+[What a failover costs](#what-a-failover-costs).
 
 **Processes can share a replicated fleet root.** Only one process replicates a
 database. It holds the lock file `<db>.replicator.lock`. The other processes
@@ -446,13 +454,31 @@ file systems.
 replicating, the number this process does not own (`unowned`), the worst lag
 and which database has it.
 
-**Watch the lag on a busy fleet.** One thread per process ships the fleet's
-databases, one after another, and then waits `sync_interval_secs`. A database
-ships once per pass, and a pass takes longer the more open databases have new
-writes. When a pass takes longer than `rpo_secs`, a crash can lose more than
-`rpo_secs` of writes. `worst_lag_seconds` in `replication:fleet` shows it, and
-the indicator is `Down` once the lag passes three times `rpo_secs`. Keep fewer
-busy databases open per process (`max_open`), or run more processes.
+### Replication lag
+
+The `[replication] rpo_secs` bound holds while one pass over the open
+databases fits in `sync_interval_secs`. A pass ticks each open database once.
+It starts one interval after the last pass started, or at once if the last
+pass took longer. `replication_workers` threads (default `4`, `1` to `64`)
+ship databases at the same time. The database that shipped longest ago goes
+first. When a pass takes longer than `rpo_secs`, a crash can lose more than
+`rpo_secs` of writes.
+
+Many busy databases in one process make a pass long. Monitor these values in
+`replication:fleet`:
+
+- `worst_lag_seconds`: the longest time since a database was last caught
+  up. A takeover can lose this much of that database. The indicator is
+  `DOWN` above three times `rpo_secs`.
+- `last_pass_ms`: the time of the last pass. If it is near
+  `sync_interval_secs × 1000`, increase `replication_workers`, or put fewer
+  busy databases on each host.
+- `ship_workers`: the threads that ship.
+
+`unowned` counts open databases that this process does not replicate.
+Usually another process on the same root holds their lock. A database that
+closes and opens again during a pass can show as `unowned` for some
+milliseconds. The next pass claims it.
 
 ### Deleting a database's replica
 
@@ -668,6 +694,13 @@ the first request.
    fail-back (step 5) replaces those files with the replica, so they do not
    come back. A planned move (step 2) loses nothing: the old host ships
    everything before it releases the ranges.
+   The first request to each database restores it from the replica, so the
+   first requests after a takeover are slow. A host that claims many
+   databases at once can use all its CPU for restores. Limit the number of
+   requests that open databases at the same time. Or open the claimed
+   databases in the background before traffic arrives.
+   A takeover loses the commits that the old host did not ship. See
+   [What a failover costs](#what-a-failover-costs).
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a
@@ -699,7 +732,7 @@ costs data and time:
 
 | Cost | Bound | Default |
 | --- | --- | --- |
-| Data | The writes that the old host did not ship. In steady state, at most `rpo_secs` (see [the lag note](#replication-object-storage-between-volumes)). At worst, the last `worst_lag_seconds` in `replication:fleet` before the failover. | 10 s (`rpo_secs`) |
+| Data | The writes that the old host did not ship. In steady state, at most `rpo_secs` (see [Replication lag](#replication-lag)). At worst, the last `worst_lag_seconds` in `replication:fleet` before the failover. | 10 s (`rpo_secs`) |
 | Time, old host crashed | At most `lease_secs + lease_secs / 3` after the last renew of the old host, plus the clock skew and the first restore. The lease ends, then the waiting host claims at its next renew interval (every `lease_secs / 3`). | 40 s |
 | Time, old lease already ended | At most `lease_secs / 3`: the next renew interval of the waiting host. | 10 s |
 
