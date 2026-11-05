@@ -550,6 +550,12 @@ Example output:
 | `manual-review` | Autumn cannot auto-classify this statement; operator review required. |
 | `unsupported` | The backend has no syntax for this statement; it fails at apply time. SQLite only (#1906). |
 
+The check reads `'..'` text as Postgres does with
+`standard_conforming_strings = on`, the default. A statement that can change
+this setting (`SET`, `RESET`, `set_config`) is `manual-review`. When the
+setting is off, `\'` is a quote, and the check can read the statements after
+it incorrectly (#3528). Use `E'..'` text for backslash escapes.
+
 ### Adding `autumn migrate check` to CI
 
 ```yaml

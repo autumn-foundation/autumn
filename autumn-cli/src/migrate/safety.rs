@@ -23,7 +23,9 @@
 //! # Known limitations
 //!
 //! - In a plain `'..'` literal, `\` does not escape a quote. This is Postgres
-//!   with `standard_conforming_strings = on`, the default since 9.1.
+//!   with `standard_conforming_strings = on`, the default since 9.1. The
+//!   scanner does not model the setting. A statement that can change it is
+//!   [`RiskLevel::ManualReview`] (#3528).
 
 use std::fmt;
 
@@ -375,6 +377,8 @@ const CREATE_INDEX_PG_OP: &str = "CREATE INDEX (non-concurrent)";
 /// Operation label for a `SQLite` index build. `SQLite` has no `CONCURRENTLY`,
 /// so "non-concurrent" would be a meaningless qualifier there.
 const CREATE_INDEX_SQLITE_OP: &str = "CREATE INDEX";
+/// Operation label for a change to `standard_conforming_strings` (#3528).
+const STRING_ESCAPE_MODE_OP: &str = "standard_conforming_strings change";
 
 /// The value of an `add column` subcommand's `DEFAULT` clause, lowercased, or
 /// `None` when the subcommand carries no default.
@@ -1018,6 +1022,52 @@ pub fn contains_concurrent_index(sql: &str) -> bool {
     })
 }
 
+/// The Postgres setting that sets how `\` works in `'..'` text.
+const STANDARD_CONFORMING_STRINGS: &str = "standard_conforming_strings";
+
+/// Whether a Postgres statement can change `standard_conforming_strings`
+/// (#3528). The scanner reads `'..'` text with the setting on. It does not
+/// model a change.
+///
+/// The search includes quoted spans, thus `set_config('..')` and a `DO` body
+/// also match. A `SET` to an explicit true value does not match.
+fn changes_string_escape_mode(normalized: &str) -> bool {
+    normalized
+        .to_ascii_lowercase()
+        .contains(STANDARD_CONFORMING_STRINGS)
+        && !sets_standard_conforming_strings_on(normalized)
+}
+
+/// Whether `normalized` is `SET [SESSION | LOCAL] standard_conforming_strings`
+/// to an explicit true value, for example `= on` or `TO 'true'`.
+fn sets_standard_conforming_strings_on(normalized: &str) -> bool {
+    let Some(rest) = normalized.strip_prefix("set ") else {
+        return false;
+    };
+    let rest = ["session ", "local "]
+        .iter()
+        .find_map(|p| rest.strip_prefix(p))
+        .unwrap_or(rest);
+    let Some(rest) = rest
+        .strip_prefix(STANDARD_CONFORMING_STRINGS)
+        .or_else(|| rest.strip_prefix("\"standard_conforming_strings\""))
+    else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(value) = rest.strip_prefix('=').or_else(|| rest.strip_prefix("to ")) else {
+        return false;
+    };
+    let value = value.trim();
+    let value = value
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .unwrap_or(value);
+    ["on", "true", "yes", "1"]
+        .iter()
+        .any(|v| value.eq_ignore_ascii_case(v))
+}
+
 /// `PostgreSQL` STABLE/IMMUTABLE function prefixes that are safe as NOT NULL column
 /// defaults: Postgres evaluates them once at statement time and stores the result as
 /// a constant, so the PG 11+ fast-default path applies — no table rewrite needed.
@@ -1077,6 +1127,18 @@ fn classify_statement(
     }
 
     let mut findings = Vec::new();
+    if !sqlite && changes_string_escape_mode(normalized) {
+        findings.push(SafetyFinding {
+            operation: STRING_ESCAPE_MODE_OP.to_owned(),
+            risk: RiskLevel::ManualReview,
+            why: "When standard_conforming_strings is off, `\\'` is a quote in '..' text. \
+                  Autumn reads '..' text with the setting on. Thus Autumn can read the \
+                  statements after this one incorrectly and not find a risky statement.",
+            next_action: "Remove this setting. Use E'..' text for backslash escapes. If you \
+                          must keep the setting, examine all statements in this file manually. \
+                          Then add `-- autumn-safety: reviewed` above this statement.",
+        });
+    }
     // Some SQLite ADD COLUMN restrictions apply only to a table that already has
     // rows: NOT NULL without a usable default, a non-constant default, and a
     // STORED generated column. A table this same migration creates has none, so
@@ -2921,6 +2983,97 @@ mod tests {
         assert_eq!(texts, ["a", "$", "b", "("]);
     }
 
+    #[test]
+    fn issue_3528_repros_hide_no_statement() {
+        // Issue #3528. Each text ends before the `;`.
+        let pg = DatabaseBackend::Postgres;
+        for sql in [
+            r"ALTER TABLE t ADD COLUMN a text DEFAULT e'\''; DROP TABLE users;",
+            "ALTER TABLE t ADD COLUMN a$$ int; DROP TABLE users; -- $$",
+            r#"ALTER TABLE t ADD COLUMN "a'b" int; DROP TABLE users; -- '"#,
+        ] {
+            let stmts = split_statements(pg, &strip_block_comments(pg, sql));
+            assert_eq!(stmts[1], "DROP TABLE users", "{sql}: {stmts:?}");
+            assert_eq!(ops(pg, sql), ["DROP TABLE"], "{sql}");
+        }
+        // The same text does not merge two ALTER TABLE subcommands.
+        for (backend, sql) in [
+            (
+                pg,
+                r"ALTER TABLE t ADD COLUMN a text DEFAULT e'\'', ADD COLUMN z int NOT NULL;",
+            ),
+            (
+                pg,
+                "ALTER TABLE t ADD COLUMN a$$ int, ADD COLUMN z int NOT NULL; -- $$",
+            ),
+            (
+                pg,
+                r#"ALTER TABLE t ADD COLUMN "a'b" int, ADD COLUMN z int NOT NULL; -- '"#,
+            ),
+            (
+                DatabaseBackend::Sqlite,
+                r#"ALTER TABLE t ADD COLUMN "a'b" int; DROP TABLE users; -- '"#,
+            ),
+            (
+                DatabaseBackend::Sqlite,
+                "ALTER TABLE t ADD COLUMN a$$ int; DROP TABLE users; -- $$",
+            ),
+        ] {
+            let want = if sql.contains("DROP TABLE") {
+                "DROP TABLE"
+            } else {
+                "ADD COLUMN NOT NULL (no default)"
+            };
+            assert_eq!(ops(backend, sql), [want], "{backend:?} {sql}");
+        }
+    }
+
+    #[test]
+    fn string_escape_mode_change_requires_manual_review() {
+        // Issue #3528. With the setting off, `'\''` is one quote, so the
+        // scanner can read the later statements wrongly.
+        let pg = DatabaseBackend::Postgres;
+        for sql in [
+            "SET standard_conforming_strings = off;",
+            "set standard_conforming_strings to 'off';",
+            "SET LOCAL standard_conforming_strings = false;",
+            "SET SESSION \"standard_conforming_strings\" TO 0;",
+            "SET standard_conforming_strings=off;",
+            "SET standard_conforming_strings TO DEFAULT;",
+            "RESET standard_conforming_strings;",
+            "SELECT set_config('standard_conforming_strings', 'off', false);",
+            "SELECT set_config('Standard_Conforming_Strings', 'off', true);",
+            "DO $$ BEGIN EXECUTE 'SET standard_conforming_strings = off'; END $$;",
+            "SET standard_conforming_strings = on, off;",
+        ] {
+            let findings = classify_sql_for(pg, sql);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.operation == STRING_ESCAPE_MODE_OP
+                        && f.risk == RiskLevel::ManualReview),
+                "{sql}: {findings:?}"
+            );
+            assert!(has_unsafe_findings(&findings), "{sql}");
+        }
+        // The default value changes nothing.
+        for sql in [
+            "SET standard_conforming_strings = on;",
+            "SET LOCAL standard_conforming_strings TO 'ON';",
+            "set standard_conforming_strings=true;",
+            "SET statement_timeout = 0;",
+            "-- autumn-safety: reviewed\nSET standard_conforming_strings = off;",
+        ] {
+            assert_eq!(ops(pg, sql), Vec::<String>::new(), "{sql:?}");
+        }
+        // `SQLite` has no such setting.
+        let sql = "SET standard_conforming_strings = off;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), Vec::<String>::new());
+        // The finding stays when the later text hides a statement.
+        let sql = r"SET standard_conforming_strings = off; SELECT 'a\''; DROP TABLE users; --';";
+        assert_eq!(ops(pg, sql), [STRING_ESCAPE_MODE_OP]);
+    }
+
     mod quoted_identifier_proptest {
         use super::*;
         use proptest::prelude::*;
@@ -2940,6 +3093,18 @@ mod tests {
                 };
                 let sql = format!("CREATE TABLE {ident} (id int); DROP TABLE x;");
                 prop_assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{}", sql);
+            }
+
+            /// Issue #3528. No `E'..'` text hides a later statement.
+            #[test]
+            fn escape_string_hides_no_statement(
+                body in "[a-z;'\\\\$/*\\- \n]{0,12}",
+                doubled in any::<bool>(),
+            ) {
+                let quote = if doubled { "''" } else { "\\'" };
+                let lit = format!("E'{}'", body.replace('\\', "\\\\").replace('\'', quote));
+                let sql = format!("SELECT {lit}; DROP TABLE x;");
+                prop_assert_eq!(ops(DatabaseBackend::Postgres, &sql), ["DROP TABLE"], "{}", sql);
             }
 
             /// The token texts join back to the input.
