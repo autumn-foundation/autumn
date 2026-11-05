@@ -13,6 +13,11 @@ new in this one?" and does not want 145 changelog entries.
 
 ## Index
 
+- [`0.10.0.md`](0.10.0.md) — *Pay for what you use, run it in more shapes*:
+  module and widget-family features, optional `jwt` and `push`; named role
+  presets, capabilities and route groups mounted per role; design tokens v2
+  with dark mode, a keyboard core, popovers, drawers, tooltips and widget
+  packs; SQLite fleet replica deletes, restore checks and lake queries.
 - [`0.9.0.md`](0.9.0.md) — *Stay up under load*: load shedding,
   retry budgets and deadlines on by default, adaptive admission control and
   per-tenant bulkheads; a

@@ -9,6 +9,985 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.10.0] - 2026-11-04
+
+For a narrative tour of this release, see the
+[0.10.0 release walkthrough](docs/releases/0.10.0.md); for the upgrade path from
+0.9.x, see the [migration guide](docs/migrations/0.10.0.md).
+
+### Breaking Changes
+
+- **Breaking:** `jsonwebtoken` and `p256` are optional, behind the default-on
+  `jwt` and `push` features. `jwt` covers the `jwt` tenancy source and the
+  OIDC `id_token` check, and `oauth2` turns it on. `push` covers
+  `autumn_web::push`, `[push]`, `with_web_push` and
+  `with_push_subscription_store`. A default build does not change. An app with
+  `default-features = false` that uses JWT tenancy, OIDC or Web Push must name
+  the feature ([migration guide](docs/migrations/0.10.0.md)).
+
+- **msrv:** **Breaking:** the MSRV is now Rust 1.97.0 (was 1.88.0). The
+  maintainers set it. Dependencies need 1.95. 1.97.0 is less than 6 months
+  old, so this is outside the STABILITY.md window
+  ([migration guide](docs/migrations/0.10.0.md)).
+- **http:** **Breaking:** `autumn-web` and `autumn-media-plugin` use `reqwest`
+  0.13. Its types are in `http::ClientError`, `HttpShadowTransport::new`, the
+  `oauth2` API and `recording_available`. `autumn-web` turns on
+  `rustls-no-provider`, so an app's own `reqwest` client needs a TLS feature
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** `DatabaseFleetConfig` has the public field
+  `replication_workers`. A struct literal must set it
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** 16 modules of `autumn-web` now sit behind default-on features
+  (issue #2795, ADR 0027): `alerts`, `custom-domains`, `data-retention`,
+  `experiments`, `feature-flags`, `gdpr`, `graph`, `idempotency`,
+  `job-tracking`, `ledger`, `money`, `nested-form`, `slo`, `upgrade`,
+  `version-history` and `wizard`. A default build does not change. An app with
+  `default-features = false` must name the features it uses
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** `EventClaim::Duplicate` is split into `Applied` and `InFlight`
+  (issue #3097). `EventClaim` is `#[non_exhaustive]`, and `ReconcileOutcome`
+  has an `InFlight` variant ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** `DatabaseFleetConfig` has the public field `min_residency`.
+  A struct literal must set it
+  ([migration guide](docs/migrations/0.10.0.md)).
+- **Breaking:** the `FromRequestParts` rejection of `CsrfToken`,
+  `CsrfFormField` and `CsrfTokenHeader` is now `Infallible`. Code that names
+  the old `(StatusCode, &str)` rejection does not compile
+  ([migration guide](docs/migrations/0.10.0.md)).
+- **Breaking:** a SQLite build defines `Sqlite<Trait>` beside each generated
+  `Pg<Trait>`. A type of your own with that name in the same module conflicts
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** `Route` has a new public field `group`, and `AutumnConfig`
+  has a new field `route_groups` (issue #3544). A `Route { .. }` literal
+  needs `group: None`. The route macros set it. A top-level `[route_groups]`
+  table now belongs to the framework
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** `state.role()` returns `&Role`, not `ProcessRole`, and
+  `AutumnConfig::role` is a `RoleName` (issue #3543). `serves_http()` and
+  `runs_workers()` still work on the result. Use `state.role().base()` for the
+  `ProcessRole`. A top-level `[roles]` table now belongs to the framework
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** an unknown `AUTUMN_ROLE` value stops the boot (issue #3541).
+  Before, the app printed a warning and booted as `combined`, with user
+  routes, all `#[job]` queues and the cron scheduler. The error names the
+  value and lists the accepted values. An empty `AUTUMN_ROLE=` is still unset
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** **widgets:** `AutocompleteConfig` has the public fields
+  `multiple`, `selected`, `remove_label`, `added_message` and
+  `removed_message` (issue #3410). A struct literal must set
+  them. `AutocompleteConfig::new` sets them
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** the widgets are in feature-gated families (issue #3408,
+  ADR 0034). `widgets-search` (active search, autocomplete),
+  `widgets-social` (reaction controls, comment thread, infinite feed),
+  `widgets-workflow` (transition controls, bulk actions) and
+  `widgets-charts` (sparkline, bar chart, line chart) are default-on. A
+  default build does not change, and every `autumn_web::widgets::*` path
+  stays the same. An app with `default-features = false` must name the
+  families it uses. The `#[commentable]` router needs `widgets-social`
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** **widgets:** a `NavMenu` is a popover menu (issue #3402).
+  With JS off, the menu starts closed, not open. The trigger has no
+  `data-nav-menu-toggle`, and `.autumn-nav__menu[hidden]` is gone
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** **widgets:** the alert, badge and wizard stepper classes have
+  the `autumn-` prefix (issue #3396). `alert alert-error` is now
+  `autumn-alert autumn-alert--error`. `badge badge--success` is now
+  `autumn-badge autumn-badge--success`. `wizard-*` is now `autumn-wizard-*`
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** `DatabaseFleetConfig` has the public fields
+  `replica_retention_after_delete` and `restore_check_sample` (issue #3235).
+  A struct literal must set them
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** **jobs:** `JobTrackingStore` has a new required method,
+  `update_record` (issue #3208). `mark_running`, `set_progress`, `complete`,
+  `fail` and `get` now have default bodies. A custom store implements only
+  `update_record`. The trait applies the status rules
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+- **Breaking:** the `Service::Future` types of `LogContextService`,
+  `SessionService`, `MethodOverrideService`, `IdempotencyReplayService`, and
+  the services of `TrustedProxiesLayer` and `SubmitTokenLayer` are no longer
+  `Pin<Box<dyn Future>>`. The futures of `LogContextService` and
+  `SessionService` can be `!Unpin`
+  ([migration guide](docs/migrations/0.10.0.md)).
+
+### Added
+
+- **form:** `otp_input`, `required_otp_input` and `otp_input_with` (issue
+  #3412). One `<input autocomplete="one-time-code" inputmode="numeric">` over
+  a row of boxes, so SMS autofill and paste work. `OtpFormat::digits(n)`
+  sets the length (4 to 10). `.group(g)` shows the digits in groups.
+  `FieldControl::Otp` renders it in `form_for`.
+- **form:** password options on `FieldOptions`: `current_password()`,
+  `new_password()`, `reveal()` (a "Show password" button with
+  `aria-pressed`), `strength_hint()` (a live region in `aria-describedby`),
+  and `reveal_label` and `strength_labels` for translations.
+- **form:** `FieldOptions::minlength` and `maxlength`.
+- **system tests:** `Page::paste(text)` pastes into the focused element.
+- **generate:** `autumn generate auth` renders each password field with a
+  reveal button and an `autocomplete` token. Signup, reset and the new
+  password get a strength hint. The two 6-digit fields on `/account/2fa` use
+  `otp_input_with`. In a new scaffold, a field id is its field name (for
+  example `current_password`, not `current-password`).
+
+- **plugin_conformance:** `ConformanceConfig::no_routes()`, the library
+  counterpart of `autumn plugin-check --no-routes`. A plugin that mounts no
+  routes (a cache, a background runtime) can now pass `run_conformance` in
+  `cargo test`. No route under a name of the plugin (the config name, or the
+  contract's `plugin` or `registered_as`) skips `route-attribution`, and such
+  a route fails it. With no `registered_as` (pass the contract from
+  `AppBuilder::plugin_contracts()`), every plugin route fails it. A `prefix` together with `no_routes` fails `route-prefix`.
+  The default stays fail-closed.
+
+- **ledger-capture [no-plugin]:** a new off-by-default cargo feature for
+  framework contributors. With
+  `AUTUMN_LEDGER_CAPTURE_DIR` set, it records every SQL statement the
+  framework issues, with its production call site and two generic plans
+  (`EXPLAIN (GENERIC_PLAN)` as planned, and with `enable_seqscan = off`).
+  Postgres 16 or later is needed for the plans. See `docs/perf/README.md`.
+
+- **hedge:** `autumn_web::hedge::hedged` races a second copy of a slow call
+  after a delay and returns the first answer, with an `allow` hook so a retry
+  budget or load check can veto extra copies.
+
+- **format:** `number_to_human_size(bytes)` renders a byte count as `512 Bytes`,
+  `1.5 KB` or `3 MB` (binary units, one decimal), and `human_size` returns the
+  plain `String`. [no-plugin]
+
+- **fleet:** `database.fleet.replication_workers` (default `4`) sets the
+  number of threads that ship fleet databases. A pass starts every
+  `sync_interval_secs`. The database that shipped longest ago goes first.
+  `replication:fleet` reports `ship_workers` and `last_pass_ms`. API:
+  `FleetReplication::with_ship_workers`, `FleetReplication::ship_workers`
+  and `DEFAULT_SHIP_WORKERS` in `autumn_web::db::fleet_replication`.
+- **replication:** `ReplicationError::is_transient`. Only a blocked
+  checkpoint is transient.
+
+- **cli:** `autumn schema width` reports every Diesel `table!` and `#[model]`
+  wider than 32 columns, and every migration table wider than 32 that no
+  declaration maps, plus whether `diesel` resolves with `64-column-tables` or
+  `128-column-tables`. The cap is per declaration: a wide table declared in
+  halves (the second with `#[sql_name = "<table>"]`) passes. It exits non-zero
+  on a finding, for use as a CI gate; `--max <N>` raises the limit, `--all`
+  lists every table.
+- **cli:** `autumn build` warns, without failing, on the same findings. A
+  wider tuple cap makes every crate that depends on diesel slower and hungrier
+  to compile (measured on one crate: 1.16 GB / 1m18s at 32, 2.92 GB / 2m04s at
+  64, 9.95 GB / 8m16s at 128). See `docs/guide/table-width.md`.
+
+- **custom domains:** `CustomDomainRegistry::with_hostname` and `exclusive` run
+  code inside a hostname's write gate, or alone. `Gated` is the handle for
+  registry writes inside the gate. [no-plugin]
+
+- **custom domains:** `/actuator/health` now shows the issuance budget under
+  `custom_domains.issuance_budget`: orders used this hour, the caps, when room
+  returns, and the domains at their daily cap. A spent budget does not make
+  health `Down` (issue #2644).
+
+- **db:** `database.fleet.min_residency` (default `"2s"`, env
+  `AUTUMN_DATABASE__FLEET__MIN_RESIDENCY`). The `max_open` sweep does not close
+  a database used within this time. Before, only `DatabaseFleet::builder` could
+  set it. `DatabaseFleet::min_residency` reads it.
+- **db:** `AppBuilder::migrations_for(MigrationScope, set)` keeps a migration
+  set on the control database only (`MigrationScope::Control`) or on the
+  shards and fleet databases only (`MigrationScope::Shards`). Boot and
+  `AUTUMN_MIGRATE=1` obey the scope.
+- **db:** `DatabaseFleet::import(key, src)`, `DatabaseFleet::import_file` and
+  `autumn fleet import <key> <src>` copy a database file into the fleet, for
+  example a backup. The import copies `src` with `VACUUM INTO`, checks its
+  integrity and identity row, applies the migrations, and publishes the file
+  in one step. It never replaces a file. A refused source answers `422`
+  (`FleetError::InvalidSource`), and keeps a deleted key's retained replica.
+- **db:** `autumn_web::db::prelude`: Diesel's prelude with the `diesel_async`
+  `RunQueryDsl` and `SaveChangesDsl`. Use it in place of `diesel::prelude::*`
+  in a module with `#[model]` or `#[repository]`, where Diesel's prelude gives
+  E0034.
+- **repository:** a SQLite build also names the generated repository
+  `Sqlite<Trait>` (a type alias of `Pg<Trait>`). `#[cached]` accepts both
+  names.
+
+- **graph:** `autumn graph check-boundaries` checks the table-ownership
+  boundaries in `boundaries.toml` (issue #3549).
+  - The graph rule fails when a route, job or repository in one boundary
+    reaches a table that another boundary owns. It finds the Diesel DSL, a
+    repository and a raw-SQL `JOIN`.
+  - The crate rule reads `cargo metadata`. It fails when a crate in one
+    boundary depends on the schema crate of another boundary.
+  - A baseline file holds the violations of today. A new violation fails. A
+    fixed violation must leave the baseline.
+  - `autumn doctor` runs the check on a committed graph. `--strict` fails on a
+    violation.
+  - A plugin declares its tables in `[package.metadata.autumn.boundary]`.
+  - See `docs/guide/table-ownership.md`.
+
+- **routing:** route groups (issue #3544). A route gets its group from
+  `#[get("/x", group = "marketing")]` or `Route::in_group`, then
+  `AppBuilder::routes_in("marketing", ...)`, then `Plugin::route_group()`
+  (default `Plugin::name()`), then `app`.
+- **roles:** `[roles.<name>] mount = ["marketing"]` serves only those
+  groups. A role without `mount` serves every group. Probes, the actuator,
+  assets and `/_autumn/*` stay on every role. A route in another group gets `404`. A
+  `mount` entry that names no group stops the boot. `/actuator/info` shows
+  the list as `role.mount`.
+- **graph:** `autumn graph`, `/actuator/graph`, `autumn openapi export` and
+  `/openapi.json` show only the routes of the role. The new
+  `completeness.mounted_elsewhere` lists routes that another declared role
+  mounts. The graph does not report these routes as drift. Pre-rendered pages
+  and sitemap entries follow the mount too.
+- **doctor:** the `route_group_mounts` row warns, and `--strict` fails, when
+  no `[roles.<name>]` preset mounts a group in `[route_groups]` (`manifest`
+  or `declared`).
+- **routes:** `autumn routes --format json` shows the `group` of each route.
+
+- **roles:** named role presets, `[roles.<name>]` (issue #3543). A preset is
+  a built-in `base` (`combined`, `web` or `worker`) plus `pin`, `workers` and
+  capability overrides. Select it with `AUTUMN_ROLE=<name>`,
+  `role = "<name>"` or `autumn serve --role <name>`. An override can only turn
+  a capability off. The durable-backend and file-backed SQLite checks read the
+  base. Built-in names are reserved. An undeclared name stops the boot.
+- **roles:** `state.role().name()` gives the role name in handlers,
+  `on_startup` hooks and plugins. `/actuator/info` and `/actuator/jobs` show
+  the name and the base. A preset adds a `role` label to the framework
+  metrics and prefixes the default scheduler `replica_id` with its name.
+- **doctor:** `autumn doctor` derives `[jobs.fleet] tiers` from `[roles.*]`
+  when `tiers` is not set, so `--strict` checks queue coverage with no second
+  declaration.
+
+- **roles:** `RoleCapabilities` and `Capability` (issue #3542). A process
+  resolves one capability set at boot from its role. Each background
+  subsystem reads its own field: `job_workers`, `scheduler`, `outbox_relay`,
+  `commit_hooks`, `fleet_relay`, `restore_check` and `retention`.
+  `serves_http` is the HTTP field. Read the set with `state.capabilities()`,
+  and ask about one subsystem with
+  `state.capabilities().runs(Capability::Scheduler)`. `combined`, `web` and
+  `worker` resolve to the same subsystems as before. No app changes are
+  necessary.
+- **actuator:** `/actuator/info` shows the process role and its resolved
+  capabilities under a new `role` key.
+
+- **markdown:** `render_user_content_html_bounded` fails when the HTML
+  before sanitizing exceeds a byte limit (issue #3446). The Constela
+  `markdown` node uses it with the remaining output budget. [no-plugin]
+
+- **constela:** a render or a dispatch now has a fuel limit for its work
+  (issue #3445). It is 320 units for each node that `RenderLimits::max_nodes`
+  allows. One unit pays for a node, an expression, or 64 bytes that a
+  comparison, a string index, a path lookup, a `markdown` source or a list
+  update reads. A document that spends all the fuel fails with
+  `constela.render_limit`.
+
+- **storage:** `autumn-widgets.js` now drives `direct_upload_input` (issue
+  #3411). It gets a presigned URL and sends the file with a progress bar. It
+  accepts dropped files and adds a hidden field with the blob key. A running
+  upload holds the form.
+- **storage:** `direct_upload_field(name, presign_url, &DirectUploadConfig)`
+  sets the label, `id`, `accept` and `multiple`.
+
+- **widgets:** tags mode for `autocomplete_input` (issue #3410).
+  `AutocompleteConfig::multiple()` shows each pick as a removable chip.
+  Each chip submits one hidden `name=value` input, so the repeated keys
+  decode into a `Vec<T>`. Backspace in an empty input removes the last
+  chip. The arrow keys move between chips, and Delete removes one. With
+  `free_text()`, Enter adds the typed text. The no-JS fallback is a
+  `<select multiple>`.
+- **widgets:** `autocomplete_input_for(changeset, …)` pre-fills the chips
+  (or the single value) and the field errors from a `Changeset`.
+  `AutocompleteConfig::selected` sets the first chips. `remove_label`,
+  `added_message` and `removed_message` translate the remove buttons and
+  the status text.
+- **widgets:** `autocomplete_create_option(value, label)` renders a
+  "create new" entry for tags. A "Tags input" story shows the mode.
+
+- **forms:** select with `<optgroup>`, `multiple` and an opt-in style
+  (issue #3409). See `docs/guide/forms.md#select-groups-multiple-and-style`.
+  - `grouped_select_input`, `grouped_select_input_with` and
+    `required_grouped_select_input`: top-level options, then one
+    `<optgroup>` for each group. `FieldControl::GroupedSelect` renders the
+    same select in `form_for`.
+  - `FieldOptions::multiple()`: `multiple` on a `<select>` or a file input.
+    A multiple select marks each option whose value is in
+    `Changeset::field_values`. Bind it to a `#[serde(default)] Vec<T>`. In
+    `form_for`, the model `required` flag does not make it required. A
+    widget-pack control gets `multiple` from `FieldContext::control`.
+  - `FieldOptions::styled_select()`: the `autumn-select` class. A browser
+    that supports `appearance: base-select` draws the select from the design
+    tokens. Other browsers keep the native control. There is no JavaScript.
+
+- **widgets:** the small display set (issue #3406). See
+  `docs/guide/display-widgets.md`.
+  - `button` with `ButtonVariant` (primary, secondary, ghost, destructive,
+    link), `ButtonSize`, an icon slot, icon-only, `disabled`, and two
+    loading states. `.loading()` renders `aria-busy="true"`. With
+    `.loading_on_request()`, the button is busy during an htmx request.
+  - `button_group`: a named `role="group"` of buttons that touch.
+  - `spinner`: `role="status"` with a visually hidden label. With reduced
+    motion, it fades and does not turn.
+  - `skeleton`: line, block or circle placeholders.
+  - `.indicator(id)` on a spinner or a skeleton makes it an htmx
+    `hx-indicator`. The `autumn-indicator` class hides it until the
+    request runs.
+  - `progress` and `meter` on the native elements, with clamped values and
+    an optional visible label.
+  - `separator`, `kbd`, `kbd_combo`, `empty_state` and `avatar_group`
+    (`+N` overflow with a translatable name).
+- **forms:** `FieldOptions::auto_grow()` and `a11y::TextArea::auto_grow()`:
+  a textarea that grows with its text (`field-sizing: content`).
+- **widgets:** `data-autumn-busy`: during the element's own htmx request,
+  `autumn-widgets.js` sets `aria-busy` on it and on the swap target. The
+  request is its own when the element sends it, submits the form, or
+  `hx-indicator` names it.
+
+- **form:** native input helpers (issue #3405). `switch_input`,
+  `range_input`, `radio_group`, `checkbox_group`, `segmented_control`,
+  `email_input`, `tel_input`, `url_input`, `time_input`, `month_input`,
+  `color_input` and `hidden_input`, each with a `*_with` variant, and
+  `required_*` variants where HTML allows `required`. `FieldControl` has a
+  variant for each one, and `form_for` renders them. A group is a
+  `<fieldset>` with a `<legend>`. A `#[model]` `NaiveTime` column renders
+  `<input type="time">`.
+- **generate:** the field DSL has `time` (`chrono::NaiveTime`, `TIME`),
+  `phone` (alias `tel`), `color` and `money` (alias of `decimal{12,2}`). The
+  scaffold form renders the matching native control.
+
+- **widgets:** `tooltip` / `tooltip_with`, an accessible tooltip (issue
+  #3404). The text is a `role="tooltip"` element linked by
+  `aria-describedby`. CSS shows it on hover and keyboard focus, and places
+  it with anchor positioning. Escape hides it through the keyboard core. A
+  hover bridge keeps it open (WCAG 1.4.13). On Chromium, the runtime adds
+  `interestfor` and `popover="hint"`.
+- **widgets:** `data-autumn-dismiss="escape"`: a keyboard core layer that
+  only Escape closes.
+- **system tests:** `Page::move_mouse(x, y)` moves the pointer to a point.
+- **ui:** the `--z-tooltip` token.
+
+- **widgets:** `drawer(id, title, body, &DrawerConfig)` (issue #3403). A
+  native `<dialog>` on the left, right, top or bottom edge. It is modal by
+  default. `DrawerConfig::modal(false)` makes a non-modal panel. It reuses
+  the modal invoker command and the `closedby` fallback. Open it with
+  `modal_trigger` or `drawer_trigger`.
+- **widgets:** `ModalConfig::size` and `DrawerConfig::size` take a
+  `DialogSize` (`Sm`, `Md`, `Lg`, `Full`).
+- **widgets:** `ModalConfig::close_button(label)` and
+  `DrawerConfig::close_button(label)` add a × button. `label` is its
+  accessible name.
+- **testing:** `Page::click_at(x, y)` sends a real mouse click at a point,
+  for example on a dialog backdrop.
+
+- **widgets:** `popover(trigger, content, &PopoverConfig)` and
+  `dropdown_menu(trigger, items, &PopoverConfig)` (issue #3402). They use
+  a native `popover`, `command`/`commandfor` and CSS anchor positioning,
+  with side, align and flip. `dropdown_menu` is an APG menu button with
+  `role="menu"`, link and `button_to` items, separators, groups and a
+  destructive variant. `autumn-widgets.js` adds the arrow keys, typeahead
+  and focus return. See `docs/guide/popover-and-menu.md`.
+
+- **widgets:** `accordion` and `collapsible` on native `<details>`, no
+  JavaScript (issue #3401). Exclusive mode shares a `name`; `multiple()`
+  lets items open on their own. Options: default-open item, heading level,
+  `class` and `attrs`. Has a story and a stylesheet that respects
+  `prefers-reduced-motion`.
+
+- **widgets:** widget packs (issue #3400). A plugin crate puts widgets in a
+  `WidgetPack`: a name, stories and a `PluginAssets` bundle.
+  `AppBuilder::widget_pack` serves the assets and adds the stories to the
+  `/_stories` gallery. `WidgetPack::head` links the CSS and JS with SRI. See
+  `docs/guide/widget-packs.md`. `widget_pack::element` writes the root of
+  a widget that is not a form input, with the `data-*`/`hx-*` passthrough.
+- **forms:** `FieldControl::Custom` and the `FieldRenderer` trait. A plugin
+  input binds to `Changeset<T>` with `custom_input_with` and to `form_for`
+  with `FieldControl::custom`. The framework writes the wrapper, label,
+  hint, errors, `aria-*` links and passthrough. A grouped control gets a
+  `<fieldset>`, and `FieldContext::group_item` writes each input.
+  `FieldOptions` has `is_required`, `is_disabled`, `is_readonly` and
+  `hint_text`.
+- **plugin conformance:** `plugin_conformance::widgets` checks a pack: name,
+  stories, class names, CSP-safe markup, tokens-only CSS and scripts. With
+  `system-tests`, `browser::run_widget_browser_conformance` runs the core
+  axe gate, a console check and a keyboard check in Chromium.
+- **system tests:** `Page::axe_violations(axe_source)` runs axe-core and
+  returns the serious and critical violations. `SystemTest::plugin_assets`
+  serves a `PluginAssets` bundle.
+- **stories:** `StoryGallery::stylesheet`, `StoryGallery::script` and
+  `StoryGallery::merge`. Each gallery page links the extra assets.
+- **widgets:** `autumn-widgets.js` fires `autumn:init` on the page and on
+  each htmx swap, before roving set-up. Plugin JS uses it for set-up.
+
+- **widgets:** `toast_with(message, variant, &ToastConfig)` (issue #3399).
+  `ToastConfig` sets the region, the `duration`, `persistent` (no timer)
+  and the close label. `DEFAULT_TOAST_DURATION` is 5 s.
+- **system tests:** `Page::hover(selector)` moves the mouse over an
+  element, so CSS `:hover` applies. `Page::expect_on_top(selector)`
+  asserts that no other element covers the element at its center. It also
+  sees content that a modal makes inert.
+
+- **wizard:** `wizard_progress_from_steps(&[WizardProgressStep])` renders the
+  step progress from steps you already have, with no session (issue #3398).
+  `wizard_progress` now calls it.
+- **stories:** the `/_stories` gallery has stories for pagination, flash
+  messages, wizard progress and the `a11y` primitives.
+
+- **widgets:** a keyboard core in `autumn-widgets.js` (issue #3397). It
+  gives roving tabindex, `aria-activedescendant`, Home/End, wrapping,
+  typeahead and dismiss (Escape, click outside, focus out). Bind it with
+  `data-autumn-roving`, `data-autumn-activedescendant` and
+  `data-autumn-dismiss`. Plugin widgets can use the same contract. See
+  `docs/guide/keyboard.md`.
+- **system tests:** `Page::press(key)` sends a real key event.
+  `Page::set_javascript_enabled(false)` loads a page with JavaScript off.
+
+- **ui:** design tokens v2 (issue #3396). Each color token is
+  `light-dark(<light>, <dark>)`, so the widgets, the admin plugin, the
+  actuator dashboard and the error pages follow the OS dark mode with no JS.
+  `data-theme="light|dark"` overrides the scheme on any element. New scales:
+  `--space-*`, `--font-size-*`, `--font-weight-*`, `--line-height-*`,
+  `--radius-*`, `--z-*` and `--breakpoint-*`. New role tokens:
+  `--on-primary`, `--on-danger`, `--surface-muted`, `--info`, `--info-light`,
+  `--success-text`, `--warning-text` and `--control-border` (the 3:1 border
+  of a text input; the inputs use it).
+- **ui:** `data-density="compact|comfortable|spacious"` scales the space
+  tokens on any element.
+- **widgets:** `theme_toggle` — a System / Light / Dark switch that works
+  without JS. The `ui::theme::Theme` extractor reads the `autumn.theme`
+  cookie. Read it in your layout and render `data-theme` on `<html>`. Merge
+  `ui::theme::router()` for the no-JS `POST /_autumn/theme` route.
+  `autumn-widgets.js` applies the theme in place. The admin plugin reads the
+  same cookie.
+- **stories:** the gallery has a theme switcher (System / Light / Dark) and a
+  density switcher. They replace the four color presets.
+
+- **money:** `ledger::balance_drift(conn)` returns each account whose stored
+  balance is not the sum of its postings (issue #3339). The list must be
+  empty. Set `balance_minor` to `NULL` to repair an account: the next `post`
+  sums the postings and stores the result.
+
+- **db:** query the lake of a SQLite fleet (issue #3236, ADR 0032).
+  `fleet.lake()?.materialize().await?.query(sql)` restores each live tenant
+  from its `[replication]` replica into a scratch SQLite file and runs one
+  `SELECT` across all tenants. Each table gets an `_autumn_tenant` column.
+  The lake never opens the fleet root, so it runs on a host with no volume.
+  Deleted tenants are skipped. See "Query the lake" in the SQLite fleet
+  guide.
+- **cli:** `autumn fleet lake <sql> [--out F] [--keep F] [--timestamp T]`
+  runs one query over the replicas and writes CSV.
+
+- **db:** with `[replication]` on, a SQLite fleet delete also purges the
+  database's replica in object storage (issue #3235). `DatabaseFleet::delete`
+  and `autumn fleet delete` write a tombstone row on the control database
+  first. If the row cannot be written, the delete fails and removes nothing.
+- **db:** a failed replica purge does not roll back the local delete. The
+  tombstone stays, and the maintenance task tries the purge again with a
+  backoff (`DatabaseFleet::purge_deleted_replicas`).
+- **db:** `restore_missing` does not restore a deleted database. A marker
+  object in the replica stops the restore on hosts that do not share the
+  control database. `fleet.restore` and `autumn fleet restore` still restore
+  it, and drop the tombstone.
+- **db:** `database.fleet.replica_retention_after_delete` (for example
+  `"30d"`) keeps the replica for an undo window, then purges it. During the
+  window, a create on demand answers `410`; `provision` ends the window.
+  Duration strings accept a `d` (days) suffix.
+- **db:** a restore check. Every `[replication] verify_interval_secs`, each
+  worker-role process restores `database.fleet.restore_check_sample` random
+  databases (default `1`) into scratch files. It checks
+  `PRAGMA integrity_check` and the identity row. `/actuator/health` reports
+  the check and the purges under `replication:fleet`.
+- **db:** new API: `autumn_web::db::fleet_tombstones`,
+  `DatabaseFleet::check_replica_sample`, `FleetReplication::with_tombstones`,
+  `FleetReplication::with_retention_after_delete`,
+  `FleetReplication::with_restore_check`, `FleetReplication::with_entropy`,
+  `FleetReplication::purge_replica` and `FleetReplication::marker`. See
+  "Deleting a database's replica" in the SQLite fleet guide.
+
+- **model:** `#[model]` accepts a primary key column that is not `id`
+  (issue #3033). Upserts, list sort and filter, and the `has_many` and
+  `has_one` preload loaders use the key column. `#[belongs_to(Post,
+  references = "post_uuid")]` names the parent key once. The preload loader,
+  `counter_cache` and `#[derivation]` on that leg inherit it.
+
+- **plugins:** `plugin_conformance::is_sensitive_path`,
+  `normalize_path_for_collision` and `is_plugin_asset_path` are public.
+  `autumn plugin-check` now uses them, so the CLI and the library share
+  one rule (issue #2828). [no-plugin]
+
+### Changed
+
+- **deps:** every dependency that can move is raised: `webauthn-rs` 0.6,
+  `p256` 0.14, `sha2` 0.11, `hmac` 0.13, `aes-gcm` 0.11, `lru` 0.19,
+  `rustyline` 19, `sysinfo` 0.40, `serde-saphyr` 2,
+  `postgresql_embedded` 0.22 and `aws-sdk-s3` 1.157. `autumn generate auth`
+  stamps `sha2` 0.11, `rand` 0.10, `base64` 0.23, `aes-gcm` 0.11 and
+  `webauthn-rs` 0.6, and warns when the app pins an older `rand` or
+  `webauthn-rs`.
+- **http:** `autumn-web` `reqwest` clients use `ring` and the Mozilla roots
+  (`webpki-roots`), as before. They do not need a process-wide crypto
+  provider. `autumn-media-plugin` clients use `aws-lc-rs` and the
+  operating-system root store.
+- **openapi:** `serde-saphyr` 2 no longer quotes a string with an inline `#`,
+  so `openapi.yaml` can change by a few bytes.
+
+- **config:** the dev profile sets `session.secure = false`. Most clients do
+  not return a `Secure` cookie over plain http, so session sign-in failed
+  under `cargo run`.
+- **security:** a required `CsrfToken`, `CsrfFormField` or `CsrfTokenHeader`
+  no longer answers `500` when CSRF is off. The token is empty, and the names
+  are the defaults. `Option<CsrfToken>` is still `None` with CSRF off.
+
+- **config:** `role` in `autumn.toml` and `AUTUMN_ROLE` use one parser, so
+  they give the same result. `role` now ignores case and leading or trailing
+  spaces, as `AUTUMN_ROLE` did. New API: `FromStr` for `ProcessRole`,
+  `ProcessRole::ACCEPTED_VALUES`, `ProcessRole::parse_env_override` and
+  `config::ParseProcessRoleError`.
+- **config:** `AutumnConfig::apply_env_overrides` and
+  `apply_env_overrides_with_env` do not fail. For an unknown `AUTUMN_ROLE`
+  they print a warning and leave `role` as it is. The loaders reject it.
+- **doctor:** `autumn doctor` fails the `process_role_backend` row on an
+  unknown `AUTUMN_ROLE` or `role`, with the boot error text. It reads
+  `AUTUMN_ROLE` and `AUTUMN_JOBS__BACKEND` from `.env` too, as the app does.
+
+- **a11y:** `autumn a11y verify` prints a warning when a `--features` name is
+  declared by no scanned crate (issue #3458). [no-plugin]
+
+- **a11y:** `autumn a11y verify` solves features as `cargo build --workspace`
+  solves them (issue #3458). A `--features` name is on only in the crates
+  that declare it. A crate turns on the features that it asks for in a path
+  dependency of the same workspace. A target table counts only when its `cfg`
+  or its triple matches the host. Only the route attribution changes. [no-plugin]
+
+- **storage:** `direct_upload_input` has a visible `<label>`, not an
+  `aria-label`. Live regions announce the status and the errors.
+- **storage:** without JS, the field is a plain file input. Use a
+  `multipart/form-data` form.
+- **storage:** the presign response must include `key`. See
+  `docs/guide/storage.md`. The old `data-controller` attributes stay for
+  custom controllers.
+
+- **widgets:** the `autumn-widgets.js` size budget is now 61 KiB raw and
+  18 KiB gzip (from 54 KiB and 16 KiB), for the tags runtime.
+
+- **generators:** `autumn generate scaffold` adds `widgets-workflow` to
+  `autumn-web`'s features for an HTML resource (bulk actions, state-machine
+  transitions), and `widgets-search` for a searchable one (issue #3408). A
+  regenerate without search releases `widgets-search` again.
+
+- **widgets:** a `NavMenu` is a popover menu. The server now sends
+  `role="menu"`, `role="menuitem"` and `aria-haspopup`. With JS off, the
+  menu starts closed and opens with the trigger. The trigger no longer has
+  `data-nav-menu-toggle`.
+
+- **stories:** `AppBuilder::with_story_gallery` adds to the gallery. Before,
+  a second call replaced it. Duplicate slugs still panic at startup.
+- **widgets:** a deferred `autumn-widgets.js` starts on `DOMContentLoaded`,
+  after all deferred scripts.
+
+- **widgets:** a toast has a close button with an accessible name
+  (issue #3399). `autumn-widgets.js` shows it. After a keyboard close,
+  focus goes to the next toast. After the last toast, or a mouse close,
+  focus goes back to the element that had focus before. Without JS, the
+  button stays hidden.
+- **widgets:** hover or focus on a toast pauses the timer of all toasts in
+  its region (WCAG 2.2.1). Hover also works without JS.
+- **widgets:** `toast_region` is `popover="manual"`. The runtime opens it
+  in the top layer, so a modal `<dialog>` does not cover toasts. In the
+  top layer, `--z-toast` does not apply. The runtime also removes a toast
+  from the DOM when its fade ends.
+- **widgets:** an `Error` toast has `role="alert"` on its message, not on
+  the toast, so the close label is not announced.
+
+- **widgets:** `tabs` has APG arrow keys with JS. `aria-selected` now
+  follows the shown tab, also for a deep link. The `:target` CSS still
+  switches tabs with JS off. The runtime adds `autumn-tabs--enhanced` and
+  moves the `--active` classes.
+- **widgets:** `autocomplete_input` has ArrowUp/ArrowDown,
+  `aria-activedescendant`, Enter to select and Escape to close.
+  `aria-expanded` is `"true"` only while the popup shows an option.
+  `autocomplete_option` now renders `tabindex="-1"`. Focus stays on the
+  input.
+- **widgets:** a `NavMenu` dropdown is an APG menu button with JS. It has
+  arrow keys, Home/End, typeahead, Escape and Tab to close. Its toggle
+  has the id `{menu-id}-toggle`. With JS off, the menu stays an open
+  list of links.
+
+- **ui:** the widgets follow the OS dark mode. A page with light-only colors
+  can pin the light scheme with `data-theme="light"` on `<html>`
+  ([migration guide](docs/migrations/0.10.0.md)). The example apps do this.
+- **ui:** the alert icon, the modal, the card and the stat card use the
+  token colors, so they are correct in both schemes. The flash text uses
+  the `-text` tokens and passes WCAG AA.
+
+- **ui:** the light `--text-muted` is `#666e7b` (was `#6b7280`), so muted text
+  passes WCAG AA on `--surface-muted`.
+- **admin:** the plugin embeds the core tokens. Its private `tokens.css` is
+  gone.
+
+### Removed
+
+- **passkeys:** a new passkey app does not need OpenSSL. `webauthn-rs` 0.6
+  uses pure-Rust crypto, so `autumn doctor` no longer asks Windows users for
+  vcpkg.
+
+### Fixed
+
+- **upgrade:** `autumn upgrade` no longer reports a scaffold file as a
+  conflict ("unreadable") when its planning read lands while another upgrade
+  is renaming that file back into place. On Windows such a read fails instead
+  of finding nothing; it now waits out the swap like a missing file does. A
+  file that cannot be read, with no swap in flight, is still a conflict.
+
+- **todo-app:** `POST /api/todos` and the `create_json` MCP tool now reject
+  titles over 255 characters with `422`, like the HTML form (issue #2972).
+  A blank title now returns the standard field-error body, not the old
+  "Title must not be empty" message.
+
+- **db (SQLite):** a connection setup that passes the pool's create limit
+  (`connect_timeout_secs`) now gives a pool timeout error. Before, on a
+  current-thread Tokio runtime, it panicked with "can call blocking only when
+  running on the multi-threaded runtime", and a fleet `open` failed with that
+  panic text. The setup now runs to the end on one blocking thread, so the
+  timeout drops only the task handle. A startup hook that opens the first
+  SQLite connection under `Handle::block_on` (as `TestApp` runs it) also
+  works on a current-thread runtime.
+
+- **build scripts:** a relative `CARGO_TARGET_DIR` no longer makes the
+  Tailwind lookup use a stale binary in the crate directory (issue #3108).
+  The scaffolded `build.rs`, the examples, and the starters now skip a
+  relative value. They use the `OUT_DIR` ancestors instead.
+
+- **plugin-check:** `autumn plugin-check --no-routes --prefix <p>` now fails
+  `route-prefix` instead of skipping it. `--no-routes` and `--prefix` are a
+  contradiction — a plugin cannot both mount no routes and have all of them
+  live under a prefix — and the CLI now reports it the same way the library's
+  `ConformanceConfig::no_routes` already does (issue #2828).
+
+- **db:** a `Db` held past `database.slow_query_threshold` no longer logs
+  `slow database query` with `sql: "SELECT ?"`. It logs `database connection
+  held past slow_query_threshold` with `route` and `held_ms`, inside the
+  connection span. A log filter on `slow database query` no longer sees
+  these holds.
+- **db:** the boot connection warning on SQLite gives the open-file count:
+  `2 × connections + databases` (database and `-wal` per connection, one
+  `-shm` per database). A fleet counts `max_open` databases. The warning
+  also says that `database.fleet.max_open` is a soft limit.
+- **db:** on Unix, a SQLite app also warns at boot when its open files at
+  `max_open` reach 80 % of the process open-file limit (`ulimit -n`), at any
+  connection count. Before, 99 connections (about 297 files) passed a limit
+  of 256 with no warning. `database.max_connections_warn_threshold = 0`
+  silences it.
+- **db:** on a SQLite build, the `db.connection` and `db.transaction` spans
+  set `db.system = "sqlite"`, not `"postgresql"`. The `db.connection` span
+  also records `db.pool`.
+
+- **tls:** Startup now refuses a `[server.tls.client_auth]` `required_paths`
+  entry that can never match a request path, such as `/users/{id}` or
+  `/internal%2F` (issue #2706).
+- **cli:** With `mode = "required"`, the posture manifest now shows
+  `mtls_required: true` for every route (issue #2706). The posture diff no longer reports a
+  `required_paths` change as widening when the new mode is `required`.
+- **cli:** `autumn doctor` now fails on a `required_paths`, `crl_path` or
+  `reload_interval_secs` value of the wrong type, and on a `required_paths`
+  entry that startup would refuse (issue #2706).
+
+- **mail:** `DbSuppressionStore` now reads `unsubscribed_at` as
+  `TimestamptzSqlite` when the runtime is SQLite. This holds when the
+  `postgres` feature is also on (issue #2697).
+
+- **fleet:** one thread shipped every open fleet database, so with many busy
+  databases the replication lag went above `rpo_secs` (3 to 14 s against 2 s
+  with 150 to 230 databases per host).
+- **fleet:** `replication:fleet` reported `unowned` for a database that closed
+  and opened again during a pass. The pass kept the old replicator lock until
+  it ended.
+- **db:** the boot warning for a high connection count spoke of Postgres to a
+  SQLite app. It now names `database.fleet.max_open` and the open-file limit.
+- **replication:** a blocked checkpoint logs at `debug` the first time. When
+  the next tick is also blocked, it logs a warning.
+
+- **custom domains:** One tenant's slow DNS no longer delays other tenants'
+  issuance and renewal. Verification stops after half of `poll_interval_secs`.
+  A check over 20 seconds fails and backs off. A renewal DNS check over
+  10 seconds is treated as a DNS error, and the renewal goes ahead
+  (issue #2650).
+
+- **custom domains:** A hostname's write gate now also covers its certificate
+  and cache writes. An offboard, a prune or a cache refill can no longer delete
+  or overwrite a successor's or a renewed certificate. A handshake that loads a
+  stale certificate no longer replaces a renewed one in the cache (issue #2649).
+
+- **cli:** `autumn generate scaffold|model … comments:commentable` now stops
+  with an error when the project has a `comments` table that is not the shared
+  one (issue #2283). A `Comment` scaffold makes such a table. Before, the
+  generator wrote a second `CREATE TABLE comments`, and `autumn migrate`
+  stopped on "already exists". The error names the missing columns and tells
+  you to rename or drop the existing table. The generator writes no files. A `Comment` model
+  generated after the shared table exists is refused for the same reason.
+  `autumn destroy` keeps a `*_create_comments` migration that the shared table
+  of another `#[commentable]` model still needs, and warns.
+- **cli:** `autumn generate scaffold … comments:commentable` now plans the
+  shared `comments` migration once and prints its notes once.
+
+- **billing:** a webhook redelivery that arrives while the first attempt is
+  still being applied now gets `503`, not `200` (issue #3097). Before, a
+  failed first attempt could lose the event.
+
+- **billing:** a store error no longer leaves a dunning row stuck (issue #3090).
+  The retry job now writes the mirror first and settles the row last. After
+  an error, the next job repeats the write. If a payment event settles the
+  row first, the job undoes the `Unpaid` status.
+
+- **billing:** two checkout POSTs for one user no longer create two provider
+  sessions (issue #3091). While one checkout runs, a second POST for the same
+  user gets `409`. The guard is per process. Replicas do not share it. A retry after the first finishes
+  works.
+
+- **auth scaffold:** The session device-label input now has a visible label.
+  The TOTP code fields keep their hint in visible text that
+  `aria-describedby` links. The placeholder no longer holds the instruction
+  (issue #3106).
+
+- **cli:** `autumn migrate check` no longer loses a finding when a Postgres
+  `ALTER TABLE` literal holds `(` or `)`. Before,
+  `ADD COLUMN a text DEFAULT '(', ADD COLUMN b int NOT NULL` merged into one
+  action, and the `NOT NULL` finding was lost. The check now skips `'..'`,
+  `E'..'` and dollar-quoted text.
+
+- **cli:** `autumn migrate check` no longer misses statements after a quoted
+  identifier that holds `/*`, `--`, `;` or `'`, such as `"a/*b"` (issue
+  #3518). The scanner now uses the lexer rules of the app's backend:
+  Postgres `".."`, `E'..'`, case-sensitive `$tag$..$tag$` and nested
+  `/* */` comments; SQLite `".."`, `` `..` ``, `[..]` and `$name(..)`
+  variables. A `,` in a Postgres literal or quoted identifier no longer splits
+  an `ALTER TABLE` into a false "Unclassified ALTER TABLE" finding.
+
+- **db (fleet):** two processes that share a fleet root and a control
+  database no longer lose a replica tombstone (issue #3516). A create on
+  demand now answers `410` while the delete is still pending, not only
+  during the retention. This is also true with no retention: when the
+  delete cannot read the replica, the create waits up to about 10 minutes
+  for the retry task. Only `provision` ends the undo window early. Two
+  deletes of one file at the same time now keep its tombstone.
+- **db (fleet):** new API in `autumn_web::db::fleet_tombstones`:
+  `create_on_demand_allowed`, `FleetTombstones::checkout`,
+  `FleetTombstones::record_on` and `ControlConnection`.
+
+- **autumn-edge:** the reference host now charges fuel for each `kv_get`
+  answer, by value size (issue #3502). It also caps unread host answers at
+  64 MiB. A capsule that loops on a large value now falls through to the
+  origin.
+
+- **a11y:** `autumn a11y verify` now reads `#[cfg_attr(…, cfg(…))]` on
+  statements, match arms and fields (issue #3458). It also finds the end of a
+  gated arm or statement that uses a block as an `if`, `while` or `match`
+  condition. Findings and the exit code do not change. Only the route
+  attribution changes.
+
+- **a11y:** `autumn a11y verify` reads `#[cfg]` from a `syn` AST (issue
+  #3458). A gated node ends where the Rust grammar ends it. The scan reads a
+  macro body as Rust when the body parses as Rust. In `cfg_if!`, it keeps
+  only the branch that builds. A `#![cfg(…)]` or a gated `mod name;` that is
+  off takes out its code. Only the route attribution changes.
+
+- **a11y:** two `RadioGroup`s never give the same choice id (issue #3454).
+  Before, group `a-` with choice `b`, and group `a` with choice `-b`, both
+  gave `a---b`. Now each byte other than a letter, digit or `_` is written
+  `--HH`. An id with other bytes has a new value. So has the second of two
+  equal values. See the [migration guide](docs/migrations/0.10.0.md).
+
+- **markdown:** `render_user_content_html` reads at most 1,048,576 parser
+  events (issue #3446). Later events are dropped.
+
+- **constela:** a document path is now built only when a diagnostic is made. A
+  long component name or key no longer costs time or memory on each node
+  (issue #3445).
+
+- **cli:** `autumn migrate check` no longer misses statements after a `--`
+  comment that contains `/*` (issue #3437). A `--` inside a quoted string,
+  such as `DEFAULT '--'`, no longer hides a later `DROP COLUMN`.
+  `autumn migrate down` no longer treats such a `down.sql` as empty.
+
+- **format:** `CurrencyOptions::precision(n)` no longer panics on large values
+  (issue #3432). A `precision` above 28 is now treated as 28.
+
+- **openapi:** `New*` and `Update*` request schemas now accept a `Decimal` as a
+  string or a JSON number (issue #3427). The handler already read both. The
+  read schema stays `string`/`decimal`.
+
+- **forms:** a single select marks only the first option that matches. Two
+  options with the same value no longer get two `selected` attributes.
+
+- **stories:** the `/_stories/demo/save` route is in the route listing and in
+  the OpenAPI/MCP path check. One list now drives the gallery's demo routes.
+
+- **stories:** the code blocks in the Source and Rendered HTML panes take
+  keyboard focus, so a keyboard user can scroll a wide snippet. The gallery
+  links the flash stylesheet. The Avatar story no longer shows a broken
+  image.
+
+- **destroy:** on a case-insensitive file system (macOS, Windows), a template
+  can change only the case of a file or directory name (issue #3382).
+  `autumn destroy` removes an untouched `Foo.rs` when the template now names
+  it `foo.rs`. It no longer reports the file as diverged, and it drops the
+  manifest entry. It sweeps an orphan in `src/widgets` when the plan writes
+  to `src/Widgets`.
+
+- **fleet:** a slot claim that ends after its time limit is kept, not
+  dropped (issue #3379). Shutdown now releases that range, so a planned
+  handoff does not wait for the lease to end.
+
+- **db scrub:** on SQLite, the row key is now unique for text keys with NUL
+  bytes and for tables with a column named `rowid` (issue #3378). A table that
+  shadows `rowid`, `_rowid_` and `oid` is refused with a clear error. Tokens
+  for SQLite rows change once, so a scrub gives new fake values after upgrade.
+
+- **version history:** `update_many` on a repository with `hooks = ...` and
+  `versioned = true` now writes a history row for each row (issue #3345).
+  Before, it wrote none, and on a `ledgered = true` repository it appended no
+  revision, so the ledger did not show the change.
+
+- **posture diff:** a CSRF exemption acknowledgment now binds to a route that
+  a request reaches through `..`, `.` or `%2e` segments (issue #3344). Before,
+  such a route could change without a new acknowledgment.
+
+- **data:** `import_csv` now reports the true line of a row that follows blank
+  lines (issue #3328). Before, the line was too small by the number of blank
+  lines. This also holds for blank lines before the header.
+
+- **autumn-edge:** the reference host now charges fuel for host work in
+  `fd_write`, `fd_read` and `random_get` (issue #3323). A capsule can no
+  longer force unmetered host work with padded stdout lines, a large `iovs_len`
+  or a large `random_get`. Stderr past its cap is no longer copied.
+
+- **jobs:** a Postgres worker with two or more `[jobs] queues` no longer locks
+  the first job of a lower-priority queue during a claim (issue #3182). Before
+  this fix, a second worker could skip that job and take a job of lower
+  priority.
+
+- **cms:** a refused timezone or date format now redisplays the Settings form at
+  422. The other fields keep their input, and the reason shows beside the bad
+  field (issue #3098).
+
+- **cli:** the `comments:commentable` migration scan (issue #3035) now reads
+  `archive . comments` as table `comments` in schema `archive`.
+- **cli:** the scan now reads each `ALTER TABLE` action alone.
+  `ADD COLUMN author_id … REFERENCES users(id)` adds `author_id`, not `id`.
+  `ADD CONSTRAINT`, `ADD PRIMARY KEY` and `ALTER COLUMN` add no column.
+  Before, a table that lacked a required column could look like the shared
+  `comments` table, and the generator skipped the migration it needs.
+
+- **custom domains:** a load that skips an unreadable record no longer lets
+  `register` accept a new hostname (issue #2654). It returns
+  `RegisterError::Incomplete` and names the files. Loaded domains keep
+  routing and renewing. The retention prune also refuses to run.
+
+### Security
+
+- **deps:** an app that leaves out `jwt` (and `oauth2`) no longer compiles
+  `rsa` 0.9 (RUSTSEC-2023-0071) or `crypto-bigint` 0.5 (RUSTSEC-2026-0387), and
+  can drop both waivers from its `deny.toml`. A build without a feature refuses
+  `[push]`, any `AUTUMN_PUSH__*` variable, or `tenancy.source = "jwt"` at boot,
+  and a router built without `run` fails closed on `jwt` tenancy with a 500.
+
+- **push:** Web Push uses `p256` 0.14. Its `crypto-bigint` 0.7 fixes
+  RUSTSEC-2026-0387 on the Web Push path. The `jsonwebtoken` ES256/ES384 path
+  still has the advisory, so its waiver stays.
+- **deps:** the waivers for `instant` (RUSTSEC-2024-0384) and `lru` 0.16
+  (RUSTSEC-2026-0253) are gone, because neither is in the dependency graph
+  now.
+
+### Performance
+
+- **build:** the no-DB starter no longer builds these modules, the `psl`
+  crate, or the route graph descriptors that `#[get]` and `#[job]` emitted.
+
+- **widgets:** an app without a family does not compile its code, and
+  `/static/css/autumn-widgets.css` and `/static/js/autumn-widgets.js` do not
+  include its CSS or script. With no family, the stylesheet is 14% smaller
+  and the script is 13% smaller.
+
+- **ledger:** `save_many`, `save_many_skip_invalid`, `update_many`,
+  `delete_many` and `upsert_many` on a `ledgered = true` repository write the
+  version history and the ledger in batches (issue #3345). Before, each row
+  sent 5 statements. Now each chunk of 1,000 rows or fewer sends 5: one
+  history `INSERT`, one reload, one chain-state read, one revision `INSERT`
+  and one high-water upsert. The chains and the #2323 guards do not change. A
+  record that occurs two times in one batch has one chain, in input order. See
+  [ADR 0029](docs/adr/0029-ledger-batched-bulk-append.md).
+
+- **money:** `ledger::post` no longer reads the posting history, except one
+  time for each account after the migration (issue #3339).
+  Each account row now stores its balance (`balance_minor`), and a trigger on
+  the postings table keeps it. The cost of a post no longer increases with the
+  history. On the `ledger_post` bench, 900 payouts went from 47.5G to 4.1G
+  instructions. `ledger::balance` reads the stored balance too. Run
+  `autumn migrate` before you deploy: the new framework migration
+  `20261029183512_add_money_account_balance` adds the column. See
+  [the guide](docs/guide/money.md#the-stored-balance).
+
+- **outbox:** on SQLite, the relay's claim no longer reads every sent row that
+  the purge has not deleted yet (issue #3203). The SQLite schema now has the
+  partial index `idx_autumn_outbox_claim`, which Postgres has had since 0.9.0.
+  `outbox::ensure_schema` adds the index to existing tables. This occurs at
+  the next boot, or at the first open of each fleet database. The build runs
+  one time per database. On a large table, it holds the SQLite write lock
+  while it runs.
+
+- **router:** a request through the default ingress stack allocates less: 98
+  heap blocks and 15,666 bytes, not 133 blocks and 28,270 bytes (issue #2830).
+  The clone that each outer `Route` level makes for each request now stops at
+  a shared pointer, above the operator layers and the inner layer group. The
+  log context, trusted-proxy, idempotency-replay and transaction-timeout
+  layers no longer box a future. The method-override,
+  submit-token and error-page layers box a future only for a form body that
+  they must read first. The session layer boxes only to load a session from a
+  cookie or to save a changed session.
+
+### Documentation
+
+- **db:** the SQLite fleet guide says that a slot fleet takes any routing
+  key, so a move from tenant to slot mode loses the id check. Check ids with
+  `TenantDbId::parse`. It also says what a held connection logs, and to take
+  `LazyDb` for a fan-out.
+
+- **fleet:** "Replication lag" in the fleet guide tells when the RPO holds
+  and what to monitor. The failover procedure gives the cost of restores and
+  the loss at a takeover.
+
+- **db:** the SQLite fleet guide has a new section, "What a failover costs".
+  Replication is asynchronous, so a failover to another volume can lose
+  acknowledged writes: at most `rpo_secs` in steady state. After a crash,
+  another host serves the range at most `lease_secs + lease_secs / 3` after
+  the last renew. A fail-back restores a stale file without
+  `restore_missing`. The rustdoc of `rpo_secs`, `restore_missing` and
+  `lease_secs` says the same.
+
+- **db:** the `max_open` docs say that the limit is soft under a burst, and
+  give the file-descriptor budget for the peak open count. The SQLite fleet
+  guide documents `FleetLifecycle::restore_missing` and the shared
+  `libsqlite3-sys` with `autumn-harvest-sqlite`.
+
+### Testing
+
+- Every bench target now has a committed Bolt profile (callgrind + dhat) in
+  `docs/perf/bolt/`, and every statement the Docker sweep issues has a Ledger
+  profile in `docs/perf/ledger/queries/`. CI fails a new workload or query
+  that has none: `scripts/check-perf-profiles.py`.
+
+- **ci:** the `lint` job runs `autumn schema width .` over the repository, so
+  no framework, plugin, starter or example ships a Diesel declaration wider
+  than 32 columns or an undeclared migration table wider than 32, and no
+  workspace crate turns on a wide diesel feature.
+
 ## [0.9.0] - 2026-10-28
 
 For a narrative tour of this release, see the
