@@ -1,4 +1,4 @@
-//! `autumn db grants` and the doctor role check on a real database (#3550).
+//! `autumn db grants` and the doctor role check on a real database.
 //!
 //! **Requires Docker.** Postgres 16 gets three tables in two schemas and two
 //! boundary roles. The test prints and applies the grants, connects as each

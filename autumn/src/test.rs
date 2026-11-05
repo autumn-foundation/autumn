@@ -2428,7 +2428,7 @@ impl TestApp {
         crate::app::install_webhook_registry(&state, &self.config);
 
         // `[database.roles]` in the test config: build its role pools, so a
-        // `BoundaryDb` connects as the role, as in production (#3550).
+        // `BoundaryDb` connects as the role, as in production.
         #[cfg(feature = "db")]
         if !self.config.database.roles.is_empty() {
             state.insert_extension(

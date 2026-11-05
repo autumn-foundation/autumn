@@ -1,4 +1,4 @@
-//! A Postgres schema and a role per boundary (#3550), on a real database.
+//! A Postgres schema and a role per boundary, on a real database.
 //!
 //! **Requires Docker.** The test migrates three sets: core into `public`,
 //! marketing into the `marketing` schema, and a plugin set into the `admin`

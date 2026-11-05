@@ -620,7 +620,7 @@ pub fn is_in_comment_or_string(text: &str, at: usize) -> bool {
 /// The table name of the `table!` block whose body opens at `open`: the
 /// first code word after attributes (`#[...]`). Doc comments are not code.
 /// In a schema-qualified header (`marketing.campaigns (id) {`), the name is
-/// the word after the `.` (#3550).
+/// the word after the `.`.
 fn block_table_name(text: &str, open: usize) -> Option<String> {
     let (first, end) = block_first_word(text, open)?;
     let rest = text[end..].trim_start();

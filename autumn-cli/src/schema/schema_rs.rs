@@ -61,7 +61,7 @@ pub struct SchemaRsCheck {
 }
 
 /// Render the `diesel::table!` block for `table`. With a Postgres schema,
-/// the header is `schema.table (key) {` (#3550).
+/// the header is `schema.table (key) {`.
 ///
 /// # Errors
 ///
@@ -137,7 +137,7 @@ pub fn validate(text: &str) -> Result<(), String> {
         }
         // The table name is the first word of the body after `use ...;`
         // declarations. Attributes are groups. In `schema.table`, it is the
-        // word after the `.` (#3550).
+        // word after the `.`.
         let tokens: Vec<proc_macro2::TokenTree> = call.mac.tokens.clone().into_iter().collect();
         let mut in_use = false;
         let mut name = None;
@@ -230,7 +230,7 @@ fn sync(existing: &str, desired: &ParsedSchema, edits: &PlanEdits) -> SchemaRsSy
         let token = ident_token(&table.name).unwrap_or_else(|| table.name.clone());
         let range = schema_block_range(&out.text, &token);
         let shape = range.map(|(start, end)| block_shape(&out.text[start..end]));
-        // A block in a Postgres schema keeps its schema (#3550).
+        // A block in a Postgres schema keeps its schema.
         let schema = shape.as_ref().and_then(|s| s.as_ref()?.schema.clone());
         let block = match render_block_in(table, schema.as_deref()) {
             Ok(block) => block,
@@ -609,7 +609,7 @@ fn rename_header(text: &str, old: &str, new: &str) -> Option<String> {
     let mut at = None;
     for line in block.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        // A schema-qualified header keeps its `schema.` prefix (#3550).
+        // A schema-qualified header keeps its `schema.` prefix.
         let prefix = trimmed
             .split_once('.')
             .filter(|(schema, rest)| {
@@ -1408,7 +1408,7 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         );
     }
 
-    /// A schema-qualified block is the block of its table (#3550): the sync
+    /// A schema-qualified block is the block of its table: the sync
     /// keeps it and adds no second block.
     #[test]
     fn sync_keeps_a_schema_qualified_block() {
@@ -1810,7 +1810,7 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         let twice = format!("{POSTS_BLOCK}\n{POSTS_BLOCK}");
         assert!(validate(&twice).unwrap_err().contains("posts"));
         assert!(validate("diesel::table! {").is_err());
-        // Two tables in one schema are two tables (#3550).
+        // Two tables in one schema are two tables.
         let two = "diesel::table! { marketing.campaigns (id) { id -> Int8, } }\n\
                    diesel::table! { marketing.drafts (id) { id -> Int8, } }\n";
         assert!(validate(two).is_ok());

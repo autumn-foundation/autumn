@@ -3155,7 +3155,7 @@ enum DbCommands {
     ///   autumn db replica status
     #[command(subcommand, verbatim_doc_comment)]
     Replica(ReplicaCommands),
-    /// Print or apply the database grants of each boundary role (#3550).
+    /// Print or apply the database grants of each boundary role.
     ///
     /// Reads `boundaries.toml` and the live catalog. A boundary with a
     /// `role` gets its own tables and its `may_read` / `may_write`

@@ -50,7 +50,7 @@ pub mod sqlite_snapshot;
 pub mod retention;
 
 /// `autumn db grants` — `GRANT` / `REVOKE` statements for the database role
-/// of each boundary in `boundaries.toml` (issue #3550).
+/// of each boundary in `boundaries.toml`.
 pub mod grants;
 
 /// The lifecycle subcommands of `autumn db`.

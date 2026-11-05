@@ -1,4 +1,4 @@
-//! One database role per boundary (#3550).
+//! One database role per boundary.
 //!
 //! A boundary in `boundaries.toml` can have its own Postgres role. The app
 //! connects as that role with `[database.roles.<boundary>]`:

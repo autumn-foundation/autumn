@@ -1,4 +1,4 @@
-//! Database grants for table-ownership boundaries (#3550).
+//! Database grants for table-ownership boundaries.
 //!
 //! A boundary with a `role` in `boundaries.toml` gets a Postgres role. That
 //! role can use its own tables and its `may_read` / `may_write` exceptions.

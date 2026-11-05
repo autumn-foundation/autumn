@@ -484,7 +484,7 @@ impl AppState {
         self.pool.as_ref()
     }
 
-    /// Returns the pool of the database role of boundary `B` (#3550).
+    /// Returns the pool of the database role of boundary `B`.
     ///
     /// * No `[database.roles]` in the config: the primary pool. The app has
     ///   one role.

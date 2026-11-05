@@ -1,4 +1,4 @@
-//! `autumn db grants`: database grants from `boundaries.toml` (#3550).
+//! `autumn db grants`: database grants from `boundaries.toml`.
 //!
 //! A boundary with a `role` gets access to its own tables and its
 //! `may_read` / `may_write` exceptions only. This module reads the live

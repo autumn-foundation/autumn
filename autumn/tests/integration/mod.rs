@@ -373,7 +373,7 @@ mod raw_router_escape_hatch;
 mod read_your_writes_routing;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod ready_db_ping;
-// A Postgres schema and a role per boundary (#3550). Docker.
+// A Postgres schema and a role per boundary. Docker.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod boundary_roles_pg;
 mod route_groups;

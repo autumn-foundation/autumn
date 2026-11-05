@@ -454,10 +454,11 @@ JWT tenancy nor OIDC can set `default-features = false`, leave out `jwt` (and
 reaches `rsa` through `webauthn-rs`. cargo-deny's "this waiver is unused"
 warning tells you when one of *your* waivers has gone stale.
 
-A third waiver, `RUSTSEC-2026-0441` (`pin-utils`), is not a vulnerability. The
-crate is unmaintained. It reaches the graph through `loom`, which `autumn-web`
-names only for its own `cfg(loom_models)` model checks. A normal build never
-compiles it, but cargo-deny audits every target.
+A third waiver, `RUSTSEC-2026-0441`, is for `pin-utils`, which is
+unmaintained: no one fixes a new bug in it. It reaches the graph through
+`loom`, which `autumn-web` names only for its own `cfg(loom_models)` model
+checks. A normal build never compiles it, but cargo-deny audits every target.
+No `loom` release drops it yet.
 
 Those waivers are why a freshly scaffolded app's CI is green on day one instead
 of red on the first push. Autumn's CI generates each app flavor and audits it with

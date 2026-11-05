@@ -1451,7 +1451,7 @@ schema_crates = ["billing-schema"]
     }
 
     /// The grant planner reads `public.contacts` as one schema and table;
-    /// the graph has no schemas, so it reads the table part (#3550).
+    /// the graph has no schemas, so it reads the table part.
     #[test]
     fn a_schema_qualified_exception_clears_a_read_violation() {
         let report = check(

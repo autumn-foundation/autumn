@@ -4049,8 +4049,7 @@ impl AppBuilder {
         self
     }
 
-    /// Register the app's embedded migrations into one Postgres schema
-    /// (#3550).
+    /// Register the app's embedded migrations into one Postgres schema.
     ///
     /// Each migration runs with `schema` first on the `search_path`. The
     /// schema is made when it does not exist. So an unqualified
@@ -4087,8 +4086,7 @@ impl AppBuilder {
         self
     }
 
-    /// Register a plugin's embedded migrations into one Postgres schema
-    /// (#3550).
+    /// Register a plugin's embedded migrations into one Postgres schema.
     ///
     /// The same as [`Self::plugin_migrations`], with the schema rule of
     /// [`Self::migrations_in_schema`]. Use it to put a plugin's tables into
@@ -4804,7 +4802,7 @@ impl AppBuilder {
             // Pool sizes multiply across shards: surface the total so
             // N-shard deployments notice the aggregate connection count.
             let mut budget = connection_budget(pool.as_ref(), shards.as_ref());
-            // Each `[database.roles]` pool opens its own connections (#3550).
+            // Each `[database.roles]` pool opens its own connections.
             budget.total += crate::db_roles::max_connections(&config.database);
             tracing::info!(
                 primary_max_connections = config.database.effective_primary_pool_size(),
@@ -15310,7 +15308,7 @@ mod sqlite_sharding_unsupported_guard_tests {
 /// `keep` selects one side by [`MigrationScope`](crate::migrate::MigrationScope):
 /// the control map and the shard map each read only the sets of their side.
 /// With no scoped set, both maps equal the map over every set.
-/// Build one pool per `[database.roles.<boundary>]` (#3550). With no roles,
+/// Build one pool per `[database.roles.<boundary>]`. With no roles,
 /// no extension: `pool_for` then gives the primary pool. A role that cannot
 /// get a pool stops the boot.
 #[cfg(feature = "db")]
@@ -17133,7 +17131,7 @@ mod fleet_boot_tests {
         );
     }
 
-    /// A set for a Postgres schema never reaches a SQLite fleet (#3550).
+    /// A set for a Postgres schema never reaches a SQLite fleet.
     #[test]
     fn a_schema_set_refuses_the_fleet() {
         let tmp = tempfile::tempdir().unwrap();

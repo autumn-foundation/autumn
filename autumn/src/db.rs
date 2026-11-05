@@ -1066,7 +1066,7 @@ pub trait DbState {
         None
     }
 
-    /// Returns the pool of the database role of boundary `name` (#3550).
+    /// Returns the pool of the database role of boundary `name`.
     ///
     /// Defaults to the primary pool, so a state with no roles needs no
     /// changes. [`AppState`](crate::state::AppState) gives the pool of
@@ -1565,7 +1565,7 @@ pub enum PoolError {
     #[error("{0}")]
     UnsupportedBackend(String),
 
-    /// A `[database.roles.<name>]` entry has no usable URL (#3550).
+    /// A `[database.roles.<name>]` entry has no usable URL.
     #[error("database.roles.{name}: {message}")]
     Role {
         /// The role name.
@@ -2387,7 +2387,7 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     Ok(Some(pool))
 }
 
-/// Build one pool for each `[database.roles.<name>]` entry (#3550).
+/// Build one pool for each `[database.roles.<name>]` entry.
 ///
 /// A role pool has `pool_size` connections, or `database.pool_size`. Each
 /// connection uses the URL of
@@ -4583,7 +4583,7 @@ where
 #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
 const BOUNDARY_CAPTURE_GAP: &str = "a [database.roles] pool does not record capture traffic";
 
-/// A [`Db`] connection as the database role of boundary `B` (#3550).
+/// A [`Db`] connection as the database role of boundary `B`.
 ///
 /// The connection comes from
 /// [`AppState::pool_for::<B>()`](crate::state::AppState::pool_for). With

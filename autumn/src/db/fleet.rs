@@ -4928,7 +4928,7 @@ pub(crate) fn build_for_app(
         config.database.auto_migrate_in_production,
     );
     // SQLite has no schemas: a set for a Postgres schema must not reach a
-    // fleet file, where it would run in the default namespace (#3550).
+    // fleet file, where it would run in the default namespace.
     if let Some((label, _, _, Some(schema))) = all
         .iter()
         .find(|(_, set, scope, schema)| schema.is_some() && scope.reaches_shards() && keep(set))

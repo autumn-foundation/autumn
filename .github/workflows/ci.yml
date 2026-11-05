@@ -2946,10 +2946,8 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- table_boundaries_cli \
             | tee "$RUNNER_TEMP/cli-boundaries-e2e-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-boundaries-e2e-cov.log"
-          # Issue #3550: same gap for `autumn db grants` and the doctor role
-          # check. The unit tests are in the `autumn` bin. The Docker tests run
-          # the real binary against Postgres, so the catalog reads and the
-          # role probe are instrumented too. Check each count.
+          # No other coverage lane runs the grants and database-role tests.
+          # `grep` fails the step when a filter matches no test.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::grants:: \
             database_roles_tests:: tests::parse_db_grants \
             | tee "$RUNNER_TEMP/cli-grants-cov.log"
@@ -2958,8 +2956,6 @@ jobs:
             --test-threads=1 boundary_grants_cli:: \
             | tee "$RUNNER_TEMP/cli-grants-e2e-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-grants-e2e-cov.log"
-          # The role pools, `BoundaryDb` and migrations into a schema run on
-          # Postgres only in this Docker test. Check the count.
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test integration_tests -- --ignored boundary_roles_pg:: \
             | tee "$RUNNER_TEMP/boundary-roles-pg-cov.log"

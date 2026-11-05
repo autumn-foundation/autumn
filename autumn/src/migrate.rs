@@ -89,7 +89,7 @@ pub(crate) type RegisteredMigrations = (
     Option<&'static str>,
 );
 
-/// The SQL that runs before a migration of a set in `schema` (#3550).
+/// The SQL that runs before a migration of a set in `schema`.
 ///
 /// It makes the schema and puts it first on the `search_path`, so an
 /// unqualified `CREATE TABLE campaigns` makes `<schema>.campaigns`. The rest
@@ -114,7 +114,7 @@ fn schema_enter_sql(schema: &str, run_in_transaction: bool) -> String {
 }
 
 /// The first migration that is registered both in a schema and without one,
-/// as an error message (#3550).
+/// as an error message.
 ///
 /// A plugin that registers its own migrations, and the same set again with
 /// [`AppBuilder::plugin_migrations_in_schema`](crate::app::AppBuilder::plugin_migrations_in_schema),
@@ -153,7 +153,7 @@ pub(crate) fn schema_registration_conflict(sets: &[RegisteredMigrations]) -> Opt
 /// The SQL that runs after a non-transactional migration in a schema.
 const SCHEMA_EXIT_SQL: &str = "RESET search_path";
 
-/// A [`MigrationSource`] whose migrations run in one Postgres schema (#3550).
+/// A [`MigrationSource`] whose migrations run in one Postgres schema.
 /// With no schema, it gives the inner migrations unchanged.
 ///
 /// [`AppBuilder::migrations_in_schema`](crate::app::AppBuilder::migrations_in_schema)

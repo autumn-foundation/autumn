@@ -11236,7 +11236,7 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || check_table_boundaries(boundaries_path)));
     }
 
-    // 21. The database role of each boundary (#3550). It connects to the
+    // 21. The database role of each boundary. It connects to the
     //     database, so it runs with `--strict` or `--online` only.
     if boundaries_path.exists() && (opts.strict || opts.online) {
         let primary = db_topology.primary_url;
@@ -11371,7 +11371,7 @@ const fn table_boundaries_result(status: CheckStatus, detail: String) -> CheckRe
     }
 }
 
-/// Check the database role of each boundary (#3550).
+/// Check the database role of each boundary.
 ///
 /// Doctor reads the catalog with the primary URL and makes the grant plan.
 /// Then it connects as each role. Each table in the grant must open. Each

@@ -3712,7 +3712,7 @@ autumn graph show --manifest architecture-graph.json --check architecture-graph.
 # `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 autumn graph check-boundaries    # fail when one boundary queries a table another boundary owns (0.10.0, #3549)
-autumn db grants --apply         # GRANT/REVOKE so each boundary `role` reads only its own tables and exceptions; `autumn doctor --strict` checks it as each role (#3550)
+autumn db grants --apply         # GRANT/REVOKE so each boundary `role` reads only its own tables and exceptions; `autumn doctor --strict` checks it as each role
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
 autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
