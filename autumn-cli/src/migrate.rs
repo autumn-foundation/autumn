@@ -264,7 +264,7 @@ pub fn run(
             // let a malformed/unreadable local `.env` abort the check (breaking
             // offline / CI safety checks), so the `.env` overlay is built lazily
             // only in the database-backed paths below.
-            let migrations_dir = resolve_migrations_dir();
+            let migrations_dir = resolve_migrations_dir_with(true);
             run_safety_check(&migrations_dir, profile);
             return;
         }
@@ -290,8 +290,13 @@ pub fn run(
     //    resolve_startup_wait can reuse it without a second filesystem read.
     let (targets, config_table) = resolve_targets(target, profile, &env);
 
-    // 2. Resolve migrations directory
-    let migrations_dir = resolve_migrations_dir();
+    // 2. Resolve migrations directory. For `run`, a scope directory can
+    //    stand in for `migrations/` on a SQLite target. The Postgres path
+    //    runs the `diesel` CLI on `migrations/`, so it needs it.
+    let migrations_dir = resolve_migrations_dir_with(*action == MigrateAction::Run);
+    if !Path::new(&migrations_dir).is_dir() && !all_targets_sqlite(&targets) {
+        resolve_migrations_dir();
+    }
     let only_database = control_is_only_database(
         |key| autumn_web::config::Env::var(&env, key),
         config_table.as_ref(),
@@ -600,16 +605,16 @@ where
 /// The migration directories of the control database, in apply order, as
 /// boot applies the registered sets: `migrations/`, then
 /// `migrations-control/`. With `only_database`, also `migrations-shards/`.
-/// A scope directory that does not exist is skipped.
+/// A directory that does not exist is skipped.
 fn control_migration_dirs(base: &Path, only_database: bool) -> Vec<std::path::PathBuf> {
     use autumn_web::migrate::MigrationScope;
 
-    let mut dirs = vec![base.join(MigrationScope::Everywhere.directory())];
-    let mut scoped = vec![MigrationScope::Control];
+    let mut scopes = vec![MigrationScope::Everywhere, MigrationScope::Control];
     if only_database {
-        scoped.push(MigrationScope::Shards);
+        scopes.push(MigrationScope::Shards);
     }
-    for scope in scoped {
+    let mut dirs = Vec::new();
+    for scope in scopes {
         let dir = base.join(scope.directory());
         if dir.is_dir() {
             dirs.push(dir);
@@ -690,13 +695,17 @@ fn refuse_scope_dirs_for_down(base: &Path) -> Result<(), String> {
     ))
 }
 
-/// The directories `autumn migrate check` scans: `migrations/` and each
-/// scope directory that exists.
+/// The directories `autumn migrate check` scans: each of `migrations/`,
+/// `migrations-control/` and `migrations-shards/` that exists.
 fn safety_check_dirs(base: &Path) -> Vec<std::path::PathBuf> {
     use autumn_web::migrate::MigrationScope;
 
-    let mut dirs = vec![base.join(MigrationScope::Everywhere.directory())];
-    for scope in [MigrationScope::Control, MigrationScope::Shards] {
+    let mut dirs = Vec::new();
+    for scope in [
+        MigrationScope::Everywhere,
+        MigrationScope::Control,
+        MigrationScope::Shards,
+    ] {
         let dir = base.join(scope.directory());
         if dir.is_dir() {
             dirs.push(dir);
@@ -2535,8 +2544,26 @@ fn resolve_startup_wait(
 
 /// Resolve the migrations directory (default: `./migrations/`).
 fn resolve_migrations_dir() -> String {
+    resolve_migrations_dir_with(false)
+}
+
+/// [`resolve_migrations_dir`], but a scope directory (`migrations-control/`,
+/// `migrations-shards/`) can stand in for `migrations/` when
+/// `scope_dirs_count` is true. An app can keep all its sets in scope
+/// directories.
+fn resolve_migrations_dir_with(scope_dirs_count: bool) -> String {
     let dir = Path::new(DEFAULT_MIGRATIONS_DIR);
-    if !dir.exists() {
+    let scoped = || {
+        !existing_scope_dirs(
+            migrations_base(DEFAULT_MIGRATIONS_DIR),
+            [
+                autumn_web::migrate::MigrationScope::Control,
+                autumn_web::migrate::MigrationScope::Shards,
+            ],
+        )
+        .is_empty()
+    };
+    if !dir.exists() && !(scope_dirs_count && scoped()) {
         eprintln!("\u{2717} Migrations directory not found: {DEFAULT_MIGRATIONS_DIR}/");
         eprintln!("  Create it with `diesel setup` or `diesel migration generate <name>`.");
         std::process::exit(1);
@@ -3943,6 +3970,10 @@ mod tests {
         std::fs::remove_dir(base.join("migrations-control")).unwrap();
         assert_eq!(names(true), ["migrations", "migrations-shards"]);
         assert_eq!(names(false), ["migrations"]);
+        // An app can keep every set in scope directories.
+        std::fs::remove_dir(base.join("migrations")).unwrap();
+        assert_eq!(names(true), ["migrations-shards"]);
+        assert!(names(false).is_empty());
     }
 
     /// A Postgres target reads `migrations/` only, so a scope directory
@@ -3995,10 +4026,12 @@ mod tests {
                 .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
                 .collect()
         };
-        assert_eq!(names(), ["migrations"]);
+        assert!(names().is_empty());
         for dir in ["migrations-control", "migrations-shards"] {
             std::fs::create_dir(base.join(dir)).unwrap();
         }
+        assert_eq!(names(), ["migrations-control", "migrations-shards"]);
+        std::fs::create_dir(base.join("migrations")).unwrap();
         assert_eq!(
             names(),
             ["migrations", "migrations-control", "migrations-shards"]

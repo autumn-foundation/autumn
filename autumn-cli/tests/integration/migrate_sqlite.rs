@@ -382,3 +382,34 @@ fn migrate_down_refuses_a_scope_directory() {
         assert!(table_exists(&db_path, table), "nothing reverted: {table}");
     }
 }
+
+/// An app can keep every set in scope directories, with no `migrations/`.
+#[test]
+fn migrate_applies_scope_directories_with_no_migrations_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_migration(
+        root,
+        "migrations-control",
+        "20990102000000_create_tenants",
+        "tenants",
+    );
+    write_migration(
+        root,
+        "migrations-shards",
+        "20990103000000_create_orders",
+        "orders",
+    );
+
+    let db_path = root.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(code, Some(0), "migrate failed: {err}");
+    for table in ["tenants", "orders"] {
+        assert!(table_exists(&db_path, table), "{table}: {err}");
+    }
+    let (_out, err, code) = run_autumn(root, &["migrate", "check"], &[]);
+    assert_eq!(code, Some(0), "check failed: {err}");
+    assert!(err.contains("migrations-control/"), "{err}");
+}
