@@ -3733,6 +3733,26 @@ To keep one module out of another module's tables, declare boundaries in
 today's violations, so an existing app can adopt it. See
 `docs/guide/table-ownership.md`.
 
+To make Postgres enforce a boundary, give it a `schema` (and an optional
+`role`) in `boundaries.toml` (#3550):
+
+- Put its tables in the schema. Write `marketing.campaigns` in the SQL, or
+  register the set with `.migrations_in_schema("marketing", SET)` or
+  `.plugin_migrations_in_schema("plugin", "marketing", SET)`.
+  `autumn db pull --schema marketing` writes `marketing.campaigns` in
+  `schema.rs`.
+- Run `autumn db grants --apply` after `autumn migrate`. It revokes, then
+  grants each role its own schema and its `may_read`/`may_write` tables.
+- Connect as the role: `[database.roles.marketing] user = "marketing"` (or
+  `url`), then `state.pool_for::<Marketing>()`, where
+  `impl autumn_web::db_boundary::DbBoundary for Marketing { const NAME: &'static str = "marketing"; }`.
+  With no role, `pool_for` returns the primary pool.
+- `autumn doctor --strict` connects as each role and fails when a role can
+  read a table outside its grant.
+
+See `docs/guide/database-boundaries.md`, which also covers one role per
+boundary behind PgBouncer.
+
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 
 **Reach for this before hand-editing call sites out of a migration guide, or
