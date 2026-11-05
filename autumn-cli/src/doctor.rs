@@ -11448,6 +11448,68 @@ fn check_database_roles(
     }
 }
 
+/// The findings of one role that show a right it must not have: a table
+/// outside its grant, a write on a `may_read` table, a schema it can create
+/// in, or a role it can switch to. They add to `status` and `lines`.
+fn privilege_findings(
+    probe: &crate::db::grants::RoleProbe,
+    status: &mut CheckStatus,
+    lines: &mut Vec<String>,
+) {
+    let name = &probe.boundary;
+    let warn = |status: &mut CheckStatus| {
+        if *status == CheckStatus::Pass {
+            *status = CheckStatus::Warn;
+        }
+    };
+    let leaks = probe.leaks();
+    if !leaks.is_empty() {
+        *status = CheckStatus::Fail;
+        lines.push(format!(
+            "{name}: reads or changes {} table(s) outside its grant: {}",
+            leaks.len(),
+            join_names(leaks.into_iter())
+        ));
+    }
+    if !probe.writes_read_only.is_empty() {
+        *status = CheckStatus::Fail;
+        lines.push(format!(
+            "{name}: writes {} `may_read` table(s): {}",
+            probe.writes_read_only.len(),
+            join_names(probe.writes_read_only.iter())
+        ));
+    }
+    if !probe.creates_in.is_empty() {
+        warn(status);
+        lines.push(format!(
+            "{name}: can create objects in schema(s): {}",
+            probe.creates_in.join(", ")
+        ));
+    }
+    // `pg_read_all_data` and `pg_write_all_data` reach every table, also
+    // through `SET ROLE` with no inherit: that is a leak.
+    let all_data: Vec<&str> = probe
+        .member_of
+        .iter()
+        .map(String::as_str)
+        .filter(|r| matches!(*r, "pg_read_all_data" | "pg_write_all_data"))
+        .collect();
+    if !all_data.is_empty() {
+        *status = CheckStatus::Fail;
+        lines.push(format!(
+            "{name}: is a member of {}, which reaches every table",
+            all_data.join(", ")
+        ));
+    }
+    if !probe.member_of.is_empty() {
+        warn(status);
+        lines.push(format!(
+            "{name}: is a member of role(s) {}; `SET ROLE` gives their rights",
+            probe.member_of.join(", ")
+        ));
+    }
+}
+
 /// The verdict of [`check_database_roles`], from the probes.
 ///
 /// A table outside a grant that a role can read fails. A role that cannot
@@ -11478,52 +11540,7 @@ fn database_roles_verdict(probes: &[crate::db::grants::RoleProbe]) -> CheckResul
             }
             Ok(_) => {}
         }
-        let leaks = probe.leaks();
-        if !leaks.is_empty() {
-            status = CheckStatus::Fail;
-            lines.push(format!(
-                "{name}: reads or changes {} table(s) outside its grant: {}",
-                leaks.len(),
-                join_names(leaks.into_iter())
-            ));
-        }
-        if !probe.writes_read_only.is_empty() {
-            status = CheckStatus::Fail;
-            lines.push(format!(
-                "{name}: writes {} `may_read` table(s): {}",
-                probe.writes_read_only.len(),
-                join_names(probe.writes_read_only.iter())
-            ));
-        }
-        if !probe.creates_in.is_empty() {
-            warn(&mut status);
-            lines.push(format!(
-                "{name}: can create objects in schema(s): {}",
-                probe.creates_in.join(", ")
-            ));
-        }
-        // `pg_read_all_data` and `pg_write_all_data` reach every table, also
-        // through `SET ROLE` with no inherit: that is a leak.
-        let all_data: Vec<&str> = probe
-            .member_of
-            .iter()
-            .map(String::as_str)
-            .filter(|r| matches!(*r, "pg_read_all_data" | "pg_write_all_data"))
-            .collect();
-        if !all_data.is_empty() {
-            status = CheckStatus::Fail;
-            lines.push(format!(
-                "{name}: is a member of {}, which reaches every table",
-                all_data.join(", ")
-            ));
-        }
-        if !probe.member_of.is_empty() {
-            warn(&mut status);
-            lines.push(format!(
-                "{name}: is a member of role(s) {}; `SET ROLE` gives their rights",
-                probe.member_of.join(", ")
-            ));
-        }
+        privilege_findings(probe, &mut status, &mut lines);
         let closed: Vec<_> = probe
             .allowed
             .iter()
