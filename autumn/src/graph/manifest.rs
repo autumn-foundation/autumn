@@ -674,7 +674,7 @@ impl NodeIds {
 /// crate-relative tail is the part that identifies anything. For git, the
 /// `-<hash>` suffix and the `<rev>` are dropped too: the rev changes at every
 /// dependency update.
-fn location(file: &str, line: u32) -> String {
+pub(crate) fn location(file: &str, line: u32) -> String {
     // Separators first: on Windows `file!()` yields backslashes, so a graph
     // committed from Linux would otherwise read as drift on every node, and the
     // registry shortening below would not match at all.

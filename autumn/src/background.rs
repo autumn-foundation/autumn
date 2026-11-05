@@ -273,10 +273,23 @@ impl BackgroundTask {
         self.registered_by.as_deref()
     }
 
-    /// `file:line` of the registration.
+    /// `file:line` of the registration, with `/` separators. A path in a
+    /// registry or git checkout is shortened to its crate-relative tail, as in
+    /// `autumn graph`.
     #[must_use]
     pub fn location(&self) -> String {
-        format!("{}:{}", self.location.file(), self.location.line())
+        #[cfg(feature = "graph")]
+        {
+            crate::graph::manifest::location(self.location.file(), self.location.line())
+        }
+        #[cfg(not(feature = "graph"))]
+        {
+            format!(
+                "{}:{}",
+                self.location.file().replace('\\', "/"),
+                self.location.line()
+            )
+        }
     }
 }
 
@@ -1299,6 +1312,8 @@ base = "web"
     #[test]
     fn task_records_its_source_location() {
         let task = task(SYNC);
+        // `/` on every OS, so a graph committed on Linux matches Windows.
+        assert!(!task.location().contains('\\'), "{}", task.location());
         assert!(
             task.location().starts_with("autumn/src/background.rs:"),
             "{}",
