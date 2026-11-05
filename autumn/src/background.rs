@@ -645,7 +645,7 @@ pub(crate) struct BackgroundRuntime {
     registry: Option<crate::actuator::TaskRegistry>,
 }
 
-/// How long the drain waits for an aborted task to stop.
+/// The longest part of the drain budget kept for the abort waits.
 const ABORT_WAIT: Duration = Duration::from_secs(1);
 
 /// The part of the remaining shutdown budget that the background drain can
@@ -769,40 +769,45 @@ impl BackgroundRuntime {
         self.tasks.len()
     }
 
-    /// Wait for every task to return, up to `budget`. Abort the tasks that
-    /// are still running after it, and wait up to one second for each to
-    /// stop. The caller cancels the shutdown token before this call.
+    /// Wait for every task to return. Abort the tasks that are still running
+    /// near the end of `budget`, and wait for them to stop. The whole drain
+    /// stays inside `budget`. The caller cancels the shutdown token before
+    /// this call.
     ///
     /// Returns the number of aborted tasks.
     pub(crate) async fn drain(self, budget: Duration) -> usize {
-        let deadline = tokio::time::Instant::now() + budget;
-        let mut aborted = 0;
+        let start = tokio::time::Instant::now();
+        // The last part of the budget is for the abort waits. All waits
+        // share the two deadlines, so the drain never runs past `budget`.
+        let reserve = (budget / 4).min(ABORT_WAIT);
+        let soft = start + budget.saturating_sub(reserve);
+        let hard = start + budget;
+        let mut overdue = Vec::new();
         for (name, mut handle) in self.tasks {
-            if tokio::time::timeout_at(deadline, &mut handle)
-                .await
-                .is_err()
-            {
-                // `abort` only asks. Wait for the task to stop, so the later
-                // phases do not run beside it. A task that never yields does
-                // not stop: the wait has a limit.
+            if tokio::time::timeout_at(soft, &mut handle).await.is_err() {
+                // `abort` only asks. Abort every overdue task first, then
+                // wait for them together.
                 handle.abort();
-                if tokio::time::timeout(ABORT_WAIT, handle).await.is_err() {
-                    tracing::error!(
-                        task = %name,
-                        "shutdown: background task did not stop after abort; it does not yield"
-                    );
-                }
-                aborted += 1;
-                if let Some(registry) = &self.registry {
-                    registry.record_background_end(
-                        &name,
-                        BackgroundTaskState::Aborted,
-                        Some("the task did not stop within the shutdown budget".to_owned()),
-                    );
-                }
-                tracing::warn!(
+                overdue.push((name, handle));
+            }
+        }
+        let aborted = overdue.len();
+        for (name, handle) in overdue {
+            if let Some(registry) = &self.registry {
+                registry.record_background_end(
+                    &name,
+                    BackgroundTaskState::Aborted,
+                    Some("the task did not stop within the shutdown budget".to_owned()),
+                );
+            }
+            tracing::warn!(
+                task = %name,
+                "shutdown: background task did not stop within the budget; aborted"
+            );
+            if tokio::time::timeout_at(hard, handle).await.is_err() {
+                tracing::error!(
                     task = %name,
-                    "shutdown: background task did not stop within the budget; aborted"
+                    "shutdown: background task did not stop after abort; it does not yield"
                 );
             }
         }
@@ -1359,6 +1364,37 @@ base = "web"
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "the aborted task still runs after drain"
+        );
+    }
+
+    /// Tasks that do not yield cannot make the drain run past its budget:
+    /// the abort waits share one deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+    async fn drain_stays_within_its_budget_for_tasks_that_do_not_yield() {
+        let tasks = (0..3)
+            .map(|i| {
+                (
+                    format!("blocking-{i}"),
+                    tokio::spawn(async {
+                        loop {
+                            // A poll that holds the thread for 2s.
+                            std::thread::sleep(Duration::from_secs(2));
+                            tokio::task::yield_now().await;
+                        }
+                    }),
+                )
+            })
+            .collect();
+        let runtime = BackgroundRuntime {
+            registry: None,
+            tasks,
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(runtime.drain(Duration::from_millis(400)).await, 3);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1_200),
+            "the drain took {elapsed:?}"
         );
     }
 
