@@ -254,6 +254,7 @@ framework subsystem reads its own capability:
 | `fleet_relay` | SQLite fleet sweeper: open closed databases, relay, backfill | Yes | No | Yes |
 | `restore_check` | Fleet replication restore check | Yes | No | Yes |
 | `retention` | Retention sweeps (`#[repository(retention(...))]`, `[retention]`) | Yes | No | Yes |
+| `maintenance` | Plugin and app housekeeping [background tasks](#background-tasks-for-plugins-and-apps) | Yes | No | Yes |
 
 Read the set with `state.capabilities()`. Read one field, or ask about one
 subsystem with `state.capabilities().runs(Capability::Scheduler)`.
@@ -272,7 +273,8 @@ subsystem with `state.capabilities().runs(Capability::Scheduler)`.
     "commit_hooks": true,
     "fleet_relay": true,
     "restore_check": true,
-    "retention": true
+    "retention": true,
+    "maintenance": true
   }
 }
 ```
@@ -281,51 +283,128 @@ subsystem with `state.capabilities().runs(Capability::Scheduler)`.
 does not use `runs_workers()` as a gate: a test fails on a new gate in
 `autumn/src/app.rs`, so a new subsystem must name its capability.
 
-### Self-gating app-owned background work
+### Background tasks for plugins and apps
 
 The framework gates each subsystem in the [capability table](#role-capabilities)
-on its own capability. That gate covers only **framework-managed** work. If
-your app wires its own background loop in an `on_startup` hook (a poller, a
-warm-cache refresher, a queue consumer you manage yourself), that loop runs on
-**every** replica unless you gate it too.
-
-The resolved role is available as a first-class accessor on `AppState`, so you
-can self-gate without re-reading `AUTUMN_ROLE` by hand. It is the same value the
-framework resolved (config + `AUTUMN_ROLE` env override + `--role` flag) — one
-source of truth, no second parse:
+on its own capability. A loop that a plugin or an app starts itself, with
+`tokio::spawn` in `on_startup`, runs on **every** replica. Do not do that.
+Declare the loop. The framework then places it (#3545):
 
 ```rust
-use autumn_web::{AppState, Capability};
+use autumn_web::Capability;
 
-// In an on_startup hook, plugin, state_initializer, or handler:
-fn start_background_work(state: &AppState) {
-    if state.capabilities().job_workers {
-        // Only replicas that run job workers (combined or worker) start the loop.
-        tokio::spawn(my_embedded_worker(state.clone()));
+app.background_task("media.room_reaper", Capability::Maintenance, |state, shutdown| async move {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => reap(&state).await?,
+        }
     }
-
-    if state.capabilities().runs(Capability::ServesHttp) {
-        // Web-facing warmups belong on replicas that serve user routes.
-        warm_render_caches(state);
-    }
-}
+})
 ```
+
+- The framework starts the task after the startup hooks, only on a role that
+  runs its capability. `maintenance` runs on `combined` and `worker`, and not
+  on `web`.
+- The task gets a child of the server shutdown token. The graceful drain
+  waits for the tasks for at most half of the remaining
+  `server.shutdown_timeout_secs`. If a task does not stop in that time, the
+  framework aborts it. The fleet close and the `on_shutdown` hooks keep the
+  other half.
+- The framework does not restart a task that returns or panics.
+  `/actuator/tasks` shows its status.
+- `autumn task` (one-off tasks) starts no background tasks.
+
+Use the capability that matches the work: `job_workers` for a queue
+consumer, `scheduler` for a periodic loop, `maintenance` for housekeeping.
+
+#### Plugin capabilities
+
+A plugin can declare its own capability. Its parent, a built-in capability,
+gives the default:
+
+```rust
+use autumn_web::Capability;
+use autumn_web::background::PluginCapability;
+
+pub const WORKER: PluginCapability = PluginCapability::new("harvest.worker", Capability::JobWorkers);
+
+app.background_task("harvest.dispatch", WORKER, |state, shutdown| async move { /* ... */ Ok(()) })
+```
+
+A named role can set it:
+
+```toml
+[roles.cron]
+base = "worker"
+pin = []                                     # no job workers: harvest.worker is off
+capabilities = { "harvest.worker" = true }  # turn it on for this role
+```
+
+- A plugin capability name is `<plugin>.<name>`.
+- A role cannot turn on a plugin capability that its base does not run, as
+  for the built-in keys. `true` is valid only when the base runs the parent.
+- A built-in name in `capabilities` fails the load. Use its top-level key.
+- `true` above the base fails the boot, on every declared preset.
+- A key that no plugin declares fails the boot of that role. On another
+  preset, the boot logs a warning: that binary may not link the plugin.
+  `autumn graph` prints the same warnings.
+- Code that is not a task reads the same value with
+  `state.role().runs_plugin(WORKER)`. Declare such a capability with
+  `app.plugin_capability(WORKER)`.
+
+#### Queues and explicit switches
+
+`app.background(BackgroundTask)` is the full form:
+
+```rust
+use autumn_web::background::BackgroundTask;
+
+app.background(
+    BackgroundTask::new("harvest.dispatch", WORKER, dispatch)
+        .queues(["harvest"])                  // the role must drain one
+        .explicit(config.worker_enabled),     // Option<bool> from the plugin config
+)
+```
+
+- **Queues.** The task runs only on a role that runs job workers and drains
+  one of its queues. The role `pin` (or `jobs.pin`) applies, as for `#[job]`
+  queues. `autumn jobs manifest` lists the queues, so the `autumn doctor`
+  coverage check includes them. A pin that names only a task queue is not an
+  error.
+- **Explicit switch.** The plugin config wins. `Some(true)` runs the task on
+  every role. The boot logs a warning on a role that does not place it.
+  `Some(false)` never runs the task, and its queues leave the manifest.
+  `None` lets the role decide.
+- The boot logs a warning for a task that no role of the config runs.
+
+#### Where to see them
+
+- `GET /actuator/tasks` has `background_tasks`, a map from task name to:
+
+  | Key | Value |
+  |---|---|
+  | `capability` | The capability name, built-in or plugin |
+  | `parent` | The built-in parent of a plugin capability |
+  | `queues` | The queues of the task |
+  | `explicit` | The explicit switch, when set |
+  | `registered_by` | The plugin that registered the task. Not set for the app |
+  | `location` | `file:line` of the registration |
+  | `roles` | The roles of the loaded config that run the task |
+  | `runs_here` | Whether this process runs the task |
+  | `status` | `running`, `not_placed`, `disabled`, `stopped`, `exited`, `failed`, `panicked` or `aborted` |
+  | `last_error` | The error or panic message |
+
+  `/actuator/tasks` is mounted only with `[actuator] sensitive = true`.
+- `autumn graph` has one `background_task` node for each task, with the same
+  roles.
+- `roles` uses the loaded config, with its env overrides. For example, a
+  process with `AUTUMN_JOBS__PIN=critical` gives each built-in role that pin.
 
 `state.role()` returns a `&Role` (exported at `autumn_web::Role`).
 `role.name()` is the role name, for example `"critical"` or `"worker"`.
 `role.base()` is the built-in `ProcessRole`. `state.capabilities()` returns its
-`RoleCapabilities`, one field for each row of the capability table above. The
-value is reachable from `state_initializer`, `on_startup`/`on_shutdown` hooks,
-plugins, and request handlers.
-
-> **Footgun: `AUTUMN_ROLE` alone does not gate app-owned background work.**
-> Setting `AUTUMN_ROLE=web` stops the framework's `#[job]`/`#[scheduled]`
-> workers, but a background task you `tokio::spawn` yourself in `on_startup` has
-> nothing to do with that gate — it will still run on your web replicas and
-> double-process work alongside the worker tier. Wrap app-owned loops in
-> the capability that matches the work: `job_workers` for a queue consumer,
-> `scheduler` for a periodic loop. For example,
-> `if state.capabilities().job_workers { … }`.
+`RoleCapabilities`, one field for each row of the capability table above.
 
 ### Named roles
 
@@ -357,7 +436,8 @@ Select a preset with `AUTUMN_ROLE=critical`, `role = "critical"` or
 | `base` | `combined`, `web` or `worker`. Required. | — |
 | `pin` | Queues this role drains. `[]` = no job workers. | `jobs.pin` |
 | `workers` | Concurrent worker loops. 1 or more. | `jobs.workers` |
-| `job_workers`, `scheduler`, `outbox_relay`, `commit_hooks`, `fleet_relay`, `restore_check`, `retention` | `true` or `false` | the base default |
+| `job_workers`, `scheduler`, `outbox_relay`, `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `maintenance` | `true` or `false` | the base default |
+| `capabilities` | Plugin capability values, for example `{ "harvest.worker" = false }`. See [Plugin capabilities](#plugin-capabilities). | the parent value |
 | `mount` | Route groups this role serves. Needs a `web` or `combined` base. See [Route groups](route-groups.md). | every group |
 
 Rules:

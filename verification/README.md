@@ -475,3 +475,22 @@ HTTP mounts no group, that a valid `mount` list is exact, that a framework
 route is served on every HTTP role, and that a group another fleet role mounts
 is not drift. The test `mount_matches_the_model` in `autumn/src/config.rs`
 checks the runtime against the same rules.
+
+## Background tasks
+
+`background_tasks.rs` models `background::place` in
+`autumn/src/background.rs`: whether a process starts a background task
+(issue #3545, ADR 0039). The role facts are two booleans for the task
+capability: the base runs it, and the role runs it. Verify it with:
+
+```sh
+verus verification/background_tasks.rs
+```
+
+It proves that a task with no explicit switch runs only where the base runs
+its capability, that an explicit switch wins, that a task with no override
+follows its capability, that a valid plugin override gets its value, and that
+a task with queues runs only where the role runs job workers and its pin
+admits one of the queues. The test
+`place_matches_the_model` in `autumn/src/background.rs` checks the runtime
+against the same rules.

@@ -1626,6 +1626,7 @@ fn queue_topology(
     config: &crate::config::JobConfig,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     run_workers: bool,
+    task_queues: &[String],
 ) -> (QueueSchedule, Arc<QueueSlots>) {
     let (mut schedule, unconfigured) =
         QueueSchedule::effective(&config.queues, &collect_declared_queues(jobs_by_name));
@@ -1640,7 +1641,12 @@ fn queue_topology(
     // Only worker roles claim queues, so a web replica must not warn about
     // queues it will never drain.
     if should_warn_pin_coverage(run_workers, &config.pin) {
-        warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+        warn_pinned_uncovered_queues(
+            &uncovered,
+            &config.pin,
+            schedule.names().is_empty(),
+            task_queues,
+        );
     }
     let mut limits = QueueLimits::from_config(&config.queues);
     limits.retain_queues(&schedule.names());
@@ -1698,7 +1704,12 @@ pub(super) fn start_runtime(
         })));
     }
 
-    let (schedule, slots) = queue_topology(config, &jobs_by_name, run_workers);
+    let (schedule, slots) = queue_topology(
+        config,
+        &jobs_by_name,
+        run_workers,
+        &super::background_task_queues(state),
+    );
 
     install_enqueue_client(state, &queue_handle, &job_admin, per_job_settings, config);
 

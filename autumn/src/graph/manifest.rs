@@ -68,6 +68,9 @@ pub const LIMITS: &[&str] = &[
      so the route node of each version shows the mounts of both versions. An auto-API route \
      links to the repository of each version. Two copies of one version (from two sources) \
      still share one node.",
+    "A background task node comes from `AppBuilder::background_task`, not from a macro. The \
+     graph does not read its body, so it has no edges. Its `roles` list the roles of the \
+     loaded config that start it.",
 ];
 
 /// Whether a schedule is a fixed delay such as `15m`, `1h30m` or `1h 30m`.
@@ -146,6 +149,39 @@ pub struct RepositoryFacts {
     pub api: Option<String>,
 }
 
+/// Facts carried by a background task node (#3545).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BackgroundFacts {
+    /// The capability name, built-in or plugin.
+    pub capability: String,
+    /// The built-in parent of a plugin capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The job queues the task drains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queues: Vec<String>,
+    /// The explicit switch of the plugin config, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<bool>,
+    /// The roles of the config that start the task.
+    pub roles: Vec<String>,
+}
+
+/// One registered background task, for
+/// [`ArchitectureGraph::with_background_tasks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundTaskEntry {
+    /// The task name.
+    pub name: String,
+    /// The plugin that registered it, or `"app"`.
+    pub module: String,
+    /// `file:line` of the registration.
+    pub location: String,
+    /// The node facts.
+    pub facts: BackgroundFacts,
+}
+
 /// Facts carried by a job, scheduled-task or one-off-task node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobFacts {
@@ -186,6 +222,9 @@ pub struct GraphNode {
     /// Job facts, for job, scheduled-task and one-off-task nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobFacts>,
+    /// Background task facts, for background task nodes (#3545).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundFacts>,
 }
 
 impl GraphNode {
@@ -221,6 +260,14 @@ impl GraphNode {
     }
 
     fn unversioned_label(&self) -> String {
+        if let Some(b) = &self.background {
+            let roles = if b.roles.is_empty() {
+                "no role".to_owned()
+            } else {
+                b.roles.join(", ")
+            };
+            return format!("{} ({}; runs on {roles})", self.name, b.capability);
+        }
         match (&self.route, &self.model, &self.repository, &self.job) {
             (Some(r), ..) => format!("{} {}", r.method, r.path),
             (_, Some(m), ..) => format!("{} (table {})", self.name, m.table),
@@ -271,6 +318,9 @@ pub struct Completeness {
     pub repositories: usize,
     /// Declared jobs, scheduled tasks and one-off tasks.
     pub jobs: usize,
+    /// Registered background tasks (#3545).
+    #[serde(default)]
+    pub background_tasks: usize,
     /// Mounted routes attributed to a `#[repository]` auto-API rather than to
     /// a `#[route]` declaration.
     #[serde(default)]
@@ -355,6 +405,37 @@ impl ArchitectureGraph {
         self.nodes.iter().find(|n| n.id == id)
     }
 
+    /// Add one `background_task` node for each entry (#3545).
+    ///
+    /// The id is `background_task:<name>`: a task name is unique in an app.
+    /// The graph does not derive the edges of a task.
+    #[must_use]
+    pub(crate) fn with_background_tasks(mut self, tasks: Vec<BackgroundTaskEntry>) -> Self {
+        for task in tasks {
+            let id = format!("{}:{}", NodeKind::BackgroundTask.id_prefix(), task.name);
+            self.nodes.retain(|node| node.id != id);
+            self.nodes.push(GraphNode {
+                id,
+                kind: NodeKind::BackgroundTask,
+                name: task.name,
+                module: task.module,
+                location: task.location,
+                route: None,
+                model: None,
+                repository: None,
+                job: None,
+                background: Some(task.facts),
+            });
+        }
+        self.nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        self.completeness.background_tasks = self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::BackgroundTask)
+            .count();
+        self
+    }
+
     /// The human report.
     #[must_use]
     #[allow(
@@ -383,6 +464,9 @@ impl ArchitectureGraph {
         if c.generated_routes > 0 {
             let _ = writeln!(out, "  {} repository auto-API route(s)", c.generated_routes);
         }
+        if c.background_tasks > 0 {
+            let _ = writeln!(out, "  {} background task(s)", c.background_tasks);
+        }
         if c.opaque_mounted_routers > 0 {
             let _ = writeln!(
                 out,
@@ -399,6 +483,7 @@ impl ArchitectureGraph {
             NodeKind::Job,
             NodeKind::ScheduledTask,
             NodeKind::OneOffTask,
+            NodeKind::BackgroundTask,
         ] {
             let nodes: Vec<&GraphNode> = self.nodes.iter().filter(|n| n.kind == kind).collect();
             if nodes.is_empty() {
@@ -850,6 +935,7 @@ pub fn build_for_fleet(
             models: models.len(),
             repositories: repositories.len(),
             jobs: jobs.len(),
+            background_tasks: 0,
             generated_routes: surface.generated,
             opaque_mounted_routers,
             unmounted_routes: unmounted,
@@ -885,6 +971,7 @@ fn add_model_nodes(
                     relations: model.relations.iter().map(|t| (*t).to_owned()).collect(),
                 }),
                 repository: None,
+                background: None,
                 job: None,
             },
         );
@@ -917,6 +1004,7 @@ fn add_repository_nodes<'a>(
                     table: repo.table.to_owned(),
                     api: (!repo.api.is_empty()).then(|| repo.api.to_owned()),
                 }),
+                background: None,
                 job: None,
             },
         );
@@ -1086,6 +1174,7 @@ fn add_route_nodes(
                 }),
                 model: None,
                 repository: None,
+                background: None,
                 job: None,
             },
         );
@@ -1161,6 +1250,7 @@ fn add_job_nodes(
                 route: None,
                 model: None,
                 repository: None,
+                background: None,
                 job: Some(JobFacts {
                     kind: job.kind,
                     schedule: (!job.schedule.is_empty()).then(|| job.schedule.to_owned()),
@@ -1275,6 +1365,7 @@ fn add_auto_api_nodes(
                 }),
                 model: None,
                 repository: None,
+                background: None,
                 job: None,
             },
         );
@@ -3007,6 +3098,7 @@ mod tests {
             route: None,
             model: None,
             repository: None,
+            background: None,
             job: Some(JobFacts {
                 kind: JobKind::Scheduled,
                 schedule: Some(schedule.to_owned()),

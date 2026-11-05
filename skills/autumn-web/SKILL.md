@@ -109,7 +109,7 @@ the framework almost certainly already generates or ships it:
 | A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (0.6.0, issue #1350, see `docs/guide/rate-limiting.md`) |
 | Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (0.6.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (0.6.0). For a hint, `required`, `placeholder`/`autocomplete`/`data-*`/`hx-*`, use the `*_with` helper + `FieldOptions` (or `FormFor::field_options`) — never hand-write the input to add one attribute |
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
-| Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
+| Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work, `app.background_task(name, capability, ..)` for a long-running loop placed by role (#3545) |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. Sweeps run on Postgres and SQLite. See `docs/guide/data-retention.md` |
 | A hand-written script that copies production data and masks PII for staging, on Postgres or SQLite | `autumn db scrub` (`--check`, `--dry-run`, `--artifact`, `--output`). A `sqlite://` target or `.sqlite` backup scrubs in one transaction, then `VACUUM`s. An unclassified column aborts the run; declare columns in `scrub.toml`. `--sample` is Postgres-only. See `docs/guide/data-scrubbing.md` |
@@ -2601,16 +2601,29 @@ subset of queues — all config-only, no app-code change:
   backend keeps the in-process mark path. See `docs/guide/jobs.md`.
 - **`Role` on `AppState`** — `state.role()` returns the resolved
   `Role` (exported at `autumn_web::Role`) with `serves_http()` /
-  `runs_workers()` predicates, so app-owned background loops in `on_startup`
-  self-gate to the right tier instead of re-reading `AUTUMN_ROLE` (issue #1726).
+  `runs_workers()` predicates (issue #1726).
   `state.capabilities()` returns the `RoleCapabilities` resolved at boot: one
   field for each subsystem (`job_workers`, `scheduler`, `outbox_relay`,
-  `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `serves_http`).
+  `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `maintenance`,
+  `serves_http`).
   Gate on the field that matches the work. `/actuator/info` shows the set
   (issue #3542). See `docs/guide/jobs.md#role-capabilities`.
+- **Background tasks (issue #3545)** — do not `tokio::spawn` a loop in
+  `on_startup`: every role runs it. Use
+  `app.background_task("media.reaper", Capability::Maintenance, |state, shutdown| async move { .. })`.
+  The framework starts it only where the role runs the capability and waits
+  for it in the drain. `PluginCapability::new("harvest.worker",
+  Capability::JobWorkers)` follows its parent; a preset sets it with
+  `capabilities = { "harvest.worker" = false }` (the base must run the parent
+  for `true`; an unknown key stops the boot of that role). `app.background(BackgroundTask::new(..)
+  .queues([..]).explicit(cfg))` adds queues (job workers and the pin apply) and the plugin
+  switch (wins, with a warning). `/actuator/tasks` (`background_tasks`) and
+  `autumn graph` (`background_task` nodes) list the roles that run each task.
+  See `docs/guide/jobs.md#background-tasks-for-plugins-and-apps`.
 - **Named roles (`[roles.<name>]`, issue #3543)** — declare a tier once as a
   preset: `base` (`combined`/`web`/`worker`), `pin`, `workers` and capability
-  overrides that can only turn a capability off. Select it with
+  overrides that can only turn a built-in capability off (a plugin capability
+  in `capabilities` can be `true` where the base runs its parent). Select it with
   `AUTUMN_ROLE=<name>`. `state.role()` returns `&Role`: `.name()` is the
   preset name, `.base()` the `ProcessRole`. Guards read the base; an
   undeclared name stops the boot. `autumn doctor --strict` derives
