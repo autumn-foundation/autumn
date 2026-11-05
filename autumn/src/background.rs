@@ -645,6 +645,9 @@ pub(crate) struct BackgroundRuntime {
     registry: Option<crate::actuator::TaskRegistry>,
 }
 
+/// How long the drain waits for an aborted task to stop.
+const ABORT_WAIT: Duration = Duration::from_secs(1);
+
 /// The part of the remaining shutdown budget that the background drain can
 /// use: half. The fleet close, the replication flush and the `on_shutdown`
 /// hooks keep the rest.
@@ -767,17 +770,28 @@ impl BackgroundRuntime {
     }
 
     /// Wait for every task to return, up to `budget`. Abort the tasks that
-    /// are still running after it. The caller cancels the shutdown token
-    /// before this call.
+    /// are still running after it, and wait up to one second for each to
+    /// stop. The caller cancels the shutdown token before this call.
     ///
     /// Returns the number of aborted tasks.
     pub(crate) async fn drain(self, budget: Duration) -> usize {
         let deadline = tokio::time::Instant::now() + budget;
         let mut aborted = 0;
-        for (name, handle) in self.tasks {
-            let abort = handle.abort_handle();
-            if tokio::time::timeout_at(deadline, handle).await.is_err() {
-                abort.abort();
+        for (name, mut handle) in self.tasks {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                // `abort` only asks. Wait for the task to stop, so the later
+                // phases do not run beside it. A task that never yields does
+                // not stop: the wait has a limit.
+                handle.abort();
+                if tokio::time::timeout(ABORT_WAIT, handle).await.is_err() {
+                    tracing::error!(
+                        task = %name,
+                        "shutdown: background task did not stop after abort; it does not yield"
+                    );
+                }
                 aborted += 1;
                 if let Some(registry) = &self.registry {
                     registry.record_background_end(
@@ -1312,6 +1326,40 @@ base = "web"
         assert!(skipped.parent.is_none());
         let disabled = initial_status(&task(SYNC), Placement::Skip(Skip::Disabled), Vec::new());
         assert_eq!(disabled.status, BackgroundTaskState::Disabled);
+    }
+
+    /// Sets its flag when the future that owns it is dropped.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// `drain` returns only after an aborted task has stopped, so the later
+    /// shutdown phases do not run beside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_returns_after_an_aborted_task_stops() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let runtime = BackgroundRuntime {
+            registry: None,
+            tasks: vec![(
+                "stuck".to_owned(),
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }),
+            )],
+        };
+        assert_eq!(runtime.drain(Duration::from_millis(20)).await, 1);
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the aborted task still runs after drain"
+        );
     }
 
     #[tokio::test]
