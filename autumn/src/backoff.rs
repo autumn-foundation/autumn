@@ -69,6 +69,51 @@ pub fn full_jitter(entropy: &dyn Entropy, base: Duration, cap: Duration, retry: 
     ))
 }
 
+/// A decorrelated-jitter delay, in ms: a draw from `[base, prev * 3]`, capped
+/// at `cap_ms`.
+///
+/// Pass the delay this function returned last time as `prev_ms` (start with
+/// `base_ms`). Each delay depends on the one before it, not on the retry
+/// number, so clients that fail together drift apart faster than with
+/// [`full_jitter_ms`], and the delay never falls below `base_ms` (unless
+/// `cap_ms` is lower). See the "Decorrelated Jitter" variant in
+/// <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>.
+///
+/// The result is in `[min(base, cap), cap]`. The math saturates.
+#[must_use]
+pub fn decorrelated_jitter_ms(
+    entropy: &dyn Entropy,
+    base_ms: u64,
+    cap_ms: u64,
+    prev_ms: u64,
+) -> u64 {
+    let low = base_ms.min(cap_ms);
+    let high = prev_ms.saturating_mul(3).max(base_ms).min(cap_ms);
+    let draw = entropy.next_u64();
+    // `span` overflows only when `[low, high]` covers all of `u64`.
+    (high - low)
+        .checked_add(1)
+        .map_or(draw, |span| low + draw % span)
+}
+
+/// A decorrelated-jitter delay as a [`Duration`], at millisecond resolution.
+///
+/// See [`decorrelated_jitter_ms`].
+#[must_use]
+pub fn decorrelated_jitter(
+    entropy: &dyn Entropy,
+    base: Duration,
+    cap: Duration,
+    prev: Duration,
+) -> Duration {
+    Duration::from_millis(decorrelated_jitter_ms(
+        entropy,
+        duration_ms(base),
+        duration_ms(cap),
+        duration_ms(prev),
+    ))
+}
+
 /// The wait for a server `Retry-After` hint: `backoff + min(hint, 5 s)`.
 ///
 /// The wait is in `[backoff, backoff + 5 s]`. It is never shorter than the
@@ -176,6 +221,41 @@ mod tests {
     }
 
     #[test]
+    fn decorrelated_jitter_spans_base_to_triple_prev() {
+        assert_eq!(decorrelated_jitter_ms(&Fixed(0), 100, 10_000, 200), 100);
+        assert_eq!(decorrelated_jitter_ms(&Fixed(500), 100, 10_000, 200), 600);
+        assert_eq!(decorrelated_jitter_ms(&Fixed(501), 100, 10_000, 200), 100);
+        // The cap bounds the top end.
+        assert!(decorrelated_jitter_ms(&Fixed(u64::MAX), 100, 1_000, u64::MAX) <= 1_000);
+        // A cap below the base wins.
+        assert_eq!(decorrelated_jitter_ms(&Fixed(9), 100, 50, 100), 50);
+    }
+
+    #[test]
+    fn decorrelated_jitter_walk_stays_in_bounds_and_replays() {
+        let a = SeededEntropy::new(0xDEC0);
+        let b = SeededEntropy::new(0xDEC0);
+        let (mut pa, mut pb) = (100, 100);
+        for _ in 0..64 {
+            pa = decorrelated_jitter_ms(&a, 100, 30_000, pa);
+            pb = decorrelated_jitter_ms(&b, 100, 30_000, pb);
+            assert_eq!(pa, pb);
+            assert!((100..=30_000).contains(&pa));
+        }
+    }
+
+    #[test]
+    fn decorrelated_jitter_duration_matches_ms() {
+        let d = decorrelated_jitter(
+            &Fixed(5),
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        );
+        assert_eq!(d, Duration::from_millis(105));
+    }
+
+    #[test]
     fn retry_after_wait_adds_the_hint_to_the_backoff() {
         let backoff = Duration::from_millis(80);
         assert_eq!(retry_after_wait(Duration::ZERO, backoff), backoff);
@@ -207,6 +287,20 @@ mod tests {
             let delay = full_jitter_ms(&entropy, base, cap, retry);
             prop_assert!(delay <= cap);
             prop_assert!(delay <= ceiling_ms(base, cap, retry));
+        }
+
+        /// The decorrelated delay is in `[min(base, cap), cap]` for any input.
+        #[test]
+        fn decorrelated_delay_is_bounded(
+            seed in any::<u64>(),
+            base in any::<u64>(),
+            cap in any::<u64>(),
+            prev in any::<u64>(),
+        ) {
+            let entropy = SeededEntropy::new(seed);
+            let delay = decorrelated_jitter_ms(&entropy, base, cap, prev);
+            prop_assert!(delay <= cap);
+            prop_assert!(delay >= base.min(cap));
         }
 
         /// The ceiling never decreases as the retry number grows.
