@@ -10917,6 +10917,7 @@ dependencies = [
  "clap",
  "regex",
  "smop",
+ "toml 1.1.8+spec-1.1.0",
  "unicase",
  "unicode-general-category",
 ]

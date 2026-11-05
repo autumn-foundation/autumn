@@ -87,6 +87,12 @@ enum Command {
         /// Check this checkout instead of the one xtask was built from.
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
+        /// Print the pages the gate reads, one per line, instead of checking.
+        #[arg(long, conflicts_with = "list")]
+        corpus: bool,
+        /// Print the truth set the gate checks against, one per line.
+        #[arg(long)]
+        list: bool,
     },
 }
 
@@ -174,7 +180,12 @@ fn dispatch(cli: Cli, out: &mut impl Write) -> Result<ExitCode> {
             }
             run_script(root, &format!("check-{name}"), &args)
         }
-        Command::Docs { gate, root: dir } => {
+        Command::Docs {
+            gate,
+            root: dir,
+            corpus,
+            list,
+        } => {
             let name = if gate.starts_with("docs-") {
                 gate.clone()
             } else {
@@ -184,7 +195,24 @@ fn dispatch(cli: Cli, out: &mut impl Write) -> Result<ExitCode> {
                 let known: Vec<_> = docs::GATES.iter().map(|g| g.name).collect();
                 bail!("no docs gate `{gate}`; known: {}", known.join(", "));
             };
-            run_gate(found, dir.as_deref().unwrap_or(root), out)
+            let root = dir.as_deref().unwrap_or(root);
+            let listing = if corpus {
+                Some((found.corpus(root), "--corpus"))
+            } else if list {
+                Some((found.list(root), "--list"))
+            } else {
+                None
+            };
+            match listing {
+                None => run_gate(found, root, out),
+                Some((None, flag)) => bail!("`{}` has no `{flag}`", found.name),
+                Some((Some(lines), _)) => {
+                    for line in lines? {
+                        writeln!(out, "{line}")?;
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
         }
     }
 }
@@ -381,6 +409,17 @@ mod tests {
             .is_err()
         );
         assert!(dispatch(parse(&["docs", "nope"]), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_gate_answers_corpus_and_list_when_it_has_them() {
+        let (code, out) = output(&["docs", "routes", "--corpus"]);
+        assert_eq!(code, ExitCode::SUCCESS, "{out}");
+        assert!(out.lines().any(|l| l == "README.md"), "{out}");
+        let (code, out) = output(&["docs", "routes", "--list"]);
+        assert_eq!(code, ExitCode::SUCCESS, "{out}");
+        assert!(out.lines().any(|l| l == "/actuator/health"), "{out}");
+        assert!(dispatch(parse(&["docs", "links", "--corpus"]), &mut Vec::new()).is_err());
     }
 
     /// Every `cargo xtask check <name>` a workflow runs must name a docs
