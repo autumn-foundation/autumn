@@ -136,21 +136,30 @@ pub fn validate(text: &str) -> Result<(), String> {
             continue;
         }
         // The table name is the first word of the body after `use ...;`
-        // declarations. Attributes are groups.
+        // declarations. Attributes are groups. In `schema.table`, it is the
+        // word after the `.` (#3550).
+        let tokens: Vec<proc_macro2::TokenTree> = call.mac.tokens.clone().into_iter().collect();
         let mut in_use = false;
-        let name = call.mac.tokens.clone().into_iter().find_map(|t| match t {
-            proc_macro2::TokenTree::Punct(p) if in_use && p.as_char() == ';' => {
-                in_use = false;
-                None
+        let mut name = None;
+        for (i, t) in tokens.iter().enumerate() {
+            match t {
+                proc_macro2::TokenTree::Punct(p) if in_use && p.as_char() == ';' => in_use = false,
+                _ if in_use => {}
+                proc_macro2::TokenTree::Ident(ident) if ident == "use" => in_use = true,
+                proc_macro2::TokenTree::Ident(ident) => {
+                    let table = match (tokens.get(i + 1), tokens.get(i + 2)) {
+                        (
+                            Some(proc_macro2::TokenTree::Punct(dot)),
+                            Some(proc_macro2::TokenTree::Ident(table)),
+                        ) if dot.as_char() == '.' => table,
+                        _ => ident,
+                    };
+                    name = Some(unraw(&table.to_string()).to_owned());
+                    break;
+                }
+                _ => {}
             }
-            _ if in_use => None,
-            proc_macro2::TokenTree::Ident(ident) if ident == "use" => {
-                in_use = true;
-                None
-            }
-            proc_macro2::TokenTree::Ident(ident) => Some(unraw(&ident.to_string()).to_owned()),
-            _ => None,
-        });
+        }
         if let Some(name) = name
             && !seen.insert(name.clone())
         {
@@ -1801,6 +1810,12 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         let twice = format!("{POSTS_BLOCK}\n{POSTS_BLOCK}");
         assert!(validate(&twice).unwrap_err().contains("posts"));
         assert!(validate("diesel::table! {").is_err());
+        // Two tables in one schema are two tables (#3550).
+        let two = "diesel::table! { marketing.campaigns (id) { id -> Int8, } }\n\
+                   diesel::table! { marketing.drafts (id) { id -> Int8, } }\n";
+        assert!(validate(two).is_ok());
+        let again = format!("{two}diesel::table! {{ campaigns (id) {{ id -> Int8, }} }}\n");
+        assert!(validate(&again).unwrap_err().contains("campaigns"));
     }
 
     /// A space before `;` and a bracket in an attribute string do not leave

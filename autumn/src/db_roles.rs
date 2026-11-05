@@ -177,7 +177,8 @@ pub fn apply_env_overrides(roles: &mut BTreeMap<String, DatabaseRoleConfig>, env
         if let Some(v) = read(&format!("AUTUMN_DATABASE__ROLES__{upper}__USER")) {
             role.user = (!v.is_empty()).then_some(v);
         }
-        if let Some(v) = read(&format!("AUTUMN_DATABASE__ROLES__{upper}__PASSWORD")) {
+        // A password keeps its spaces: they can be part of it.
+        if let Ok(v) = env.var(&format!("AUTUMN_DATABASE__ROLES__{upper}__PASSWORD")) {
             role.password = (!v.is_empty()).then(|| secrecy::SecretString::from(v));
         }
         let pool_key = format!("AUTUMN_DATABASE__ROLES__{upper}__POOL_SIZE");
@@ -465,7 +466,7 @@ mod tests {
         roles.insert("core".to_owned(), role(r#"user = "core""#));
         let env = MapEnv(BTreeMap::from([
             ("AUTUMN_DATABASE__ROLES", "marketing, ad-sync"),
-            ("AUTUMN_DATABASE__ROLES__CORE__PASSWORD", "corepw"),
+            ("AUTUMN_DATABASE__ROLES__CORE__PASSWORD", " core pw "),
             ("AUTUMN_DATABASE__ROLES__MARKETING__USER", "marketing"),
             ("AUTUMN_DATABASE__ROLES__MARKETING__POOL_SIZE", "3"),
             (
@@ -480,7 +481,7 @@ mod tests {
         );
         assert_eq!(
             roles["core"].password.as_ref().unwrap().expose_secret(),
-            "corepw"
+            " core pw "
         );
         assert_eq!(roles["marketing"].user.as_deref(), Some("marketing"));
         assert_eq!(roles["marketing"].pool_size, Some(3));
