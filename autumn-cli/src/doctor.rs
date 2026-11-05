@@ -11416,24 +11416,31 @@ fn check_database_roles(
             );
         }
     }
+    // One time limit for the whole check, so a database that stalls cannot
+    // hold up doctor.
     let probes = crate::pg::block_on(async {
-        let client = crate::pg::connect("doctor", primary)
-            .await
-            .map_err(|_| "cannot connect with the primary URL".to_owned())?;
-        let catalog = read_catalog(&client).await?;
-        let plan = autumn_web::graph::grants::plan(&config, &catalog).map_err(|e| e.to_string())?;
-        let mut probes = Vec::new();
-        for grants in &plan.roles {
-            probes.push(match roles.get(&grants.boundary) {
-                None => RoleProbe::unreachable(
-                    grants,
-                    format!("no [database.roles.{}] in autumn.toml", grants.boundary),
-                ),
-                Some(Err(e)) => RoleProbe::unreachable(grants, e.clone()),
-                Some(Ok(url)) => probe_role(url, grants, &plan.schemas).await,
-            });
-        }
-        Ok::<_, String>(probes)
+        tokio::time::timeout(crate::db::grants::DOCTOR_ROLES_BUDGET, async {
+            let client = crate::db::grants::connect(primary)
+                .await
+                .map_err(|e| format!("cannot connect with the primary URL: {e}"))?;
+            let catalog = read_catalog(&client).await?;
+            let plan =
+                autumn_web::graph::grants::plan(&config, &catalog).map_err(|e| e.to_string())?;
+            let mut probes = Vec::new();
+            for grants in &plan.roles {
+                probes.push(match roles.get(&grants.boundary) {
+                    None => RoleProbe::unreachable(
+                        grants,
+                        format!("no [database.roles.{}] in autumn.toml", grants.boundary),
+                    ),
+                    Some(Err(e)) => RoleProbe::unreachable(grants, e.clone()),
+                    Some(Ok(url)) => probe_role(url, grants, &plan.schemas).await,
+                });
+            }
+            Ok::<_, String>(probes)
+        })
+        .await
+        .unwrap_or_else(|_| Err("the database did not answer in time".to_owned()))
     });
     match probes {
         Ok(probes) => database_roles_verdict(&probes),

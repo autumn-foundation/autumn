@@ -22,6 +22,10 @@ use crate::pg::{self, CommandError};
 /// How long one connection may take to open.
 pub const CONNECT_BUDGET: Duration = Duration::from_secs(10);
 
+/// How long the whole doctor role check may take: the catalog read and every
+/// role probe together.
+pub const DOCTOR_ROLES_BUDGET: Duration = Duration::from_mins(1);
+
 /// The SQLSTATE of `permission denied`.
 const INSUFFICIENT_PRIVILEGE: &str = "42501";
 
@@ -163,7 +167,12 @@ fn role_list(plan: &GrantPlan) -> String {
 }
 
 /// Connect, with [`CONNECT_BUDGET`].
-async fn connect(url: &str) -> Result<tokio_postgres::Client, String> {
+///
+/// # Errors
+///
+/// Returns the connect error, or a message when the database does not answer
+/// in time.
+pub async fn connect(url: &str) -> Result<tokio_postgres::Client, String> {
     match tokio::time::timeout(CONNECT_BUDGET, pg::connect("db grants", url)).await {
         Err(_) => Err("the database did not answer in time".to_owned()),
         Ok(Err(CommandError::Connect(m) | CommandError::Other(m))) => Err(m),
