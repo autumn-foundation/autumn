@@ -11449,7 +11449,7 @@ fn database_roles_verdict(probes: &[crate::db::grants::RoleProbe]) -> CheckResul
     use crate::db::grants::Access;
     let mut status = CheckStatus::Pass;
     let mut lines = Vec::new();
-    let mut warn = |status: &mut CheckStatus| {
+    let warn = |status: &mut CheckStatus| {
         if *status == CheckStatus::Pass {
             *status = CheckStatus::Warn;
         }
