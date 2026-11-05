@@ -578,6 +578,8 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 
 | API | Tier | Notes |
 |-----|------|-------|
+| `AppBuilder::background` | stable | Register a `BackgroundTask`: the full form of `background_task`, with queues and an explicit switch. |
+| `AppBuilder::background_task` | stable | Register a loop that runs until shutdown. The framework starts it only on the roles that run its capability. |
 | `AppBuilder::config_section` | stable | Declare a plugin-owned top-level config root so `server.strict_config` treats it as known-and-opaque. |
 | `AppBuilder::declare_plugin_routes` | stable | Make routes mounted through an opaque `nest`/`merge` router visible to `autumn routes` and the conformance harness. |
 | `AppBuilder::error_pages` | stable | Replace the rendered error pages — a tier-1 subsystem seam (requires the `maud` feature). The plugin crate needs its own `maud` dependency: `html!` expands to absolute `::maud::` paths, which no re-export can satisfy. |
@@ -587,6 +589,7 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `AppBuilder::on_startup` | stable | Register an async startup hook that runs once before the server binds. |
 | `AppBuilder::plugin` | stable | Mount a plugin. Also the seam a cooperative plugin uses to mount a plugin of its own. |
 | `AppBuilder::plugin_assets` | stable | Serve a `PluginAssets` bundle of files compiled into the plugin crate under `/static/_plugins/<namespace>/`, at content-hashed `immutable` URLs with SRI hashes, and declare its routes. Build the bundle with `plugin_assets!` (requires the `embed-assets` feature) or `PluginAssets::from_files`. |
+| `AppBuilder::plugin_capability` | stable | Declare a plugin capability that no background task uses, so a `[roles.<name>] capabilities` key can name it. |
 | `AppBuilder::plugin_contracts` | stable | Read the contracts declared by the plugins mounted on a builder — what the route dump and `autumn plugin-check` are built on. |
 | `AppBuilder::plugin_migrations` | stable | Contribute embedded database migrations tagged with the plugin's own name. Needs `reexports::diesel_migrations` in scope, because `embed_migrations!` expands to unqualified paths (requires the `db` feature). |
 | `AppBuilder::plugins` | stable | Mount a tuple of up to eight plugins in declaration order. |
@@ -603,6 +606,7 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `Plugin::contract` | stable | Declare the `autumn-web` range this plugin supports and any experimental surface it uses. |
 | `Plugin::name` | stable | Stable identifier used for duplicate-registration detection and route attribution. |
 | `autumn_edge::host` | experimental | Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790). |
+| `background` | stable | `BackgroundTask`, `PluginCapability`, `BackgroundCapability` and `Role::runs_plugin`: role-aware background work. |
 | `db::Pool` | stable | The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature). |
 | `form::FieldRenderer` | stable | Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature). |
 | `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack. |

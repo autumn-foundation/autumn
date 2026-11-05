@@ -3663,6 +3663,7 @@ impl ProcessRole {
             fleet_relay: background,
             restore_check: background,
             retention: background,
+            maintenance: background,
         }
     }
 
@@ -3696,6 +3697,9 @@ pub enum Capability {
     /// Run the retention sweeps: `#[repository(..., retention(...))]` and
     /// `[retention]`.
     Retention,
+    /// Run housekeeping background tasks of plugins and apps: reapers,
+    /// cleanup loops. See [`crate::background`].
+    Maintenance,
 }
 
 impl Capability {
@@ -3710,6 +3714,7 @@ impl Capability {
         Self::FleetRelay,
         Self::RestoreCheck,
         Self::Retention,
+        Self::Maintenance,
     ];
 
     /// The stable `snake_case` name. It is also the [`RoleCapabilities`] field
@@ -3725,6 +3730,7 @@ impl Capability {
             Self::FleetRelay => "fleet_relay",
             Self::RestoreCheck => "restore_check",
             Self::Retention => "retention",
+            Self::Maintenance => "maintenance",
         }
     }
 }
@@ -3763,6 +3769,8 @@ pub struct RoleCapabilities {
     pub restore_check: bool,
     /// See [`Capability::Retention`].
     pub retention: bool,
+    /// See [`Capability::Maintenance`].
+    pub maintenance: bool,
 }
 
 impl RoleCapabilities {
@@ -3778,6 +3786,7 @@ impl RoleCapabilities {
             Capability::FleetRelay => self.fleet_relay,
             Capability::RestoreCheck => self.restore_check,
             Capability::Retention => self.retention,
+            Capability::Maintenance => self.maintenance,
         }
     }
 
@@ -3796,6 +3805,23 @@ const ROLE_NAME_MAX_LEN: usize = 63;
 /// The grammar of a role name, for error messages.
 const ROLE_NAME_RULE: &str = "a role name starts with a lowercase letter, has only a-z, 0-9, \
                               '_' and '-', and has at most 63 characters";
+
+/// The grammar of a plugin capability name, for error messages.
+const CAPABILITY_NAME_RULE: &str = "a plugin capability name is `<plugin>.<name>`: it starts with a \
+                                    lowercase letter, has at least one '.', has only a-z, 0-9, \
+                                    '_', '-' and '.', and has at most 63 characters";
+
+/// Whether `name` is a valid plugin capability name (#3545). The `.` keeps
+/// it apart from every built-in [`Capability`] name, now and later.
+pub(crate) fn is_valid_capability_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= ROLE_NAME_MAX_LEN
+        && name.contains('.')
+        && !name.ends_with('.')
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+}
 
 /// Whether `name` is a valid `[roles.<name>]` name. The name is also a
 /// metric label value and a `replica_id` prefix, so the grammar is narrow.
@@ -4020,6 +4046,13 @@ pub struct RolePreset {
     /// Override for [`Capability::Retention`].
     #[serde(default)]
     pub retention: Option<bool>,
+    /// Override for [`Capability::Maintenance`].
+    #[serde(default)]
+    pub maintenance: Option<bool>,
+    /// Values for plugin capabilities (#3545), by name. A plugin declares
+    /// each one. See [`crate::background::PluginCapability`].
+    #[serde(default)]
+    pub capabilities: BTreeMap<String, bool>,
     /// The route groups this role serves (#3544). Unset: every group.
     /// Framework routes (probes, actuator, assets) are always served.
     #[serde(default)]
@@ -4120,6 +4153,28 @@ pub enum RoleError {
         /// The declared name.
         name: String,
     },
+    /// A `capabilities` key names a built-in capability.
+    #[error(
+        "[roles.{name}]: capabilities has the built-in capability {capability:?}; set it with \
+         the top-level key `{capability} = ...`"
+    )]
+    BuiltinInCapabilities {
+        /// The declared name.
+        name: String,
+        /// The key.
+        capability: String,
+    },
+    /// A `capabilities` key is not a valid plugin capability name.
+    #[error(
+        "[roles.{name}]: capabilities has an invalid key {capability:?}; {}",
+        CAPABILITY_NAME_RULE
+    )]
+    InvalidCapabilityName {
+        /// The declared name.
+        name: String,
+        /// The key.
+        capability: String,
+    },
     /// `role` names no built-in role and no declared preset.
     #[error("{builtin}, and no [roles.{name}] is declared ({})", declared_roles_text(.declared))]
     Undeclared {
@@ -4155,6 +4210,8 @@ impl RolePreset {
             fleet_relay: None,
             restore_check: None,
             retention: None,
+            maintenance: None,
+            capabilities: BTreeMap::new(),
             mount: None,
         }
     }
@@ -4177,6 +4234,7 @@ impl RolePreset {
             Capability::FleetRelay => self.fleet_relay,
             Capability::RestoreCheck => self.restore_check,
             Capability::Retention => self.retention,
+            Capability::Maintenance => self.maintenance,
         }
     }
 
@@ -4199,6 +4257,7 @@ impl RolePreset {
             fleet_relay: on(Capability::FleetRelay),
             restore_check: on(Capability::RestoreCheck),
             retention: on(Capability::Retention),
+            maintenance: on(Capability::Maintenance),
         }
     }
 
@@ -4248,6 +4307,26 @@ impl RolePreset {
             }
             _ => {}
         }
+        if let Some(capability) = self.capabilities.keys().find(|key| {
+            Capability::ALL
+                .iter()
+                .any(|c| c.as_str() == key.trim().to_ascii_lowercase())
+        }) {
+            return Err(RoleError::BuiltinInCapabilities {
+                name: named(),
+                capability: capability.clone(),
+            });
+        }
+        if let Some(capability) = self
+            .capabilities
+            .keys()
+            .find(|key| !is_valid_capability_name(key))
+        {
+            return Err(RoleError::InvalidCapabilityName {
+                name: named(),
+                capability: capability.clone(),
+            });
+        }
         match self.mount.as_deref() {
             Some(_) if !self.base.serves_http() => Err(RoleError::MountWithoutHttp {
                 name: named(),
@@ -4281,6 +4360,7 @@ struct PresetRole {
     pin: Option<Vec<String>>,
     workers: Option<usize>,
     mount: Option<Vec<String>>,
+    capabilities: BTreeMap<String, bool>,
 }
 
 /// Whether a role with `serves_http` and `mount` serves the routes of
@@ -4380,6 +4460,49 @@ impl Role {
         mount_admits(self.serves_http(), self.mount(), group)
     }
 
+    /// The value the preset sets for the plugin capability `name`, if any
+    /// (#3545).
+    #[must_use]
+    pub fn plugin_capability_override(&self, name: &str) -> Option<bool> {
+        self.preset
+            .as_ref()
+            .and_then(|preset| preset.capabilities.get(name).copied())
+    }
+
+    /// The plugin capability values the preset sets, by name (#3545).
+    pub fn plugin_capabilities(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.preset
+            .iter()
+            .flat_map(|preset| preset.capabilities.iter())
+            .map(|(name, value)| (name.as_str(), *value))
+    }
+
+    /// Whether this role runs the plugin capability `capability` (#3545).
+    ///
+    /// A value from `[roles.<name>] capabilities` wins. A role cannot turn on
+    /// a plugin capability that its base does not run. With no value, the
+    /// role runs it when it runs the parent.
+    #[must_use]
+    pub fn runs_plugin(&self, capability: crate::background::PluginCapability) -> bool {
+        let parent = capability.parent();
+        self.plugin_capability_override(capability.name())
+            .map_or_else(
+                || self.runs(parent),
+                |value| value && self.base.runs(parent),
+            )
+    }
+
+    /// Whether this role runs `capability`, built-in or plugin (#3545).
+    #[must_use]
+    pub fn runs_background(&self, capability: crate::background::BackgroundCapability) -> bool {
+        match capability {
+            crate::background::BackgroundCapability::Builtin(capability) => self.runs(capability),
+            crate::background::BackgroundCapability::Plugin(capability) => {
+                self.runs_plugin(capability)
+            }
+        }
+    }
+
     /// `jobs` with the preset `pin` and `workers` applied. A role without
     /// them borrows `jobs` as it is.
     #[must_use]
@@ -4409,6 +4532,7 @@ impl Role {
                 pin: preset.pin.clone().filter(|pin| !pin.is_empty()),
                 workers: preset.workers,
                 mount: preset.mount.clone(),
+                capabilities: preset.capabilities.clone(),
             })),
         }
     }
@@ -24758,11 +24882,13 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     /// The subsystems each role ran before #3542, written out by hand.
     /// The order is the field order of `RoleCapabilities`.
-    fn legacy_subsystems(role: ProcessRole) -> [bool; 8] {
+    /// `maintenance` (#3545) is new. It takes the value of the other
+    /// background capabilities.
+    fn legacy_subsystems(role: ProcessRole) -> [bool; 9] {
         match role {
-            ProcessRole::Combined => [true; 8],
-            ProcessRole::Web => [true, false, false, false, false, false, false, false],
-            ProcessRole::Worker => [false, true, true, true, true, true, true, true],
+            ProcessRole::Combined => [true; 9],
+            ProcessRole::Web => [true, false, false, false, false, false, false, false, false],
+            ProcessRole::Worker => [false, true, true, true, true, true, true, true, true],
         }
     }
 
@@ -24779,6 +24905,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
                 caps.fleet_relay,
                 caps.restore_check,
                 caps.retention,
+                caps.maintenance,
             ];
             assert_eq!(actual, legacy_subsystems(role), "role {}", role.as_str());
         }
@@ -24816,6 +24943,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             Capability::FleetRelay => 5,
             Capability::RestoreCheck => 6,
             Capability::Retention => 7,
+            Capability::Maintenance => 8,
         };
         let order: Vec<usize> = Capability::ALL.iter().map(|c| field(*c)).collect();
         assert_eq!(order, (0..Capability::ALL.len()).collect::<Vec<_>>());
@@ -24835,6 +24963,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
                 "fleet_relay",
                 "restore_check",
                 "retention",
+                "maintenance",
             ]
         );
         for &capability in Capability::ALL {
@@ -25729,6 +25858,7 @@ workers = 2
                             Capability::FleetRelay => preset.fleet_relay = state,
                             Capability::RestoreCheck => preset.restore_check = state,
                             Capability::Retention => preset.retention = state,
+                            Capability::Maintenance => preset.maintenance = state,
                             Capability::ServesHttp => unreachable!("not a background capability"),
                         }
                     }
@@ -25779,7 +25909,108 @@ workers = 2
                 }
             }
         }
-        assert_eq!(checked, 3 * 3_usize.pow(7) * 3);
+        assert_eq!(checked, 3 * 3_usize.pow(8) * 3);
+    }
+
+    // ── Plugin capabilities: `[roles.<name>] capabilities` (#3545) ───────
+
+    fn preset_from(toml_text: &str) -> RolePreset {
+        toml::from_str(toml_text).expect("preset parses")
+    }
+
+    #[test]
+    fn preset_capabilities_parse_and_reach_the_role() {
+        let preset = preset_from(
+            "base = \"worker\"\ncapabilities = { \"harvest.worker\" = false, \"media.reaper\" = true }",
+        );
+        assert_eq!(preset.validate("cron"), Ok(()));
+        let role = Role::from_preset("cron", &preset);
+        assert_eq!(
+            role.plugin_capability_override("harvest.worker"),
+            Some(false)
+        );
+        assert_eq!(role.plugin_capability_override("media.reaper"), Some(true));
+        assert_eq!(role.plugin_capability_override("other.thing"), None);
+        assert_eq!(
+            role.plugin_capabilities().collect::<Vec<_>>(),
+            [("harvest.worker", false), ("media.reaper", true)]
+        );
+        // A built-in role sets no plugin capability.
+        assert_eq!(
+            Role::from(ProcessRole::Worker)
+                .plugin_capabilities()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn preset_capabilities_refuse_a_built_in_name() {
+        let preset = preset_from("base = \"worker\"\ncapabilities = { scheduler = false }");
+        let error = preset.validate("cron").expect_err("built-in key");
+        assert!(
+            matches!(error, RoleError::BuiltinInCapabilities { ref capability, .. } if capability == "scheduler"),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("top-level key `scheduler"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn preset_capabilities_refuse_an_invalid_name() {
+        for key in [
+            "harvest",
+            "Harvest.worker",
+            "harvest.",
+            "1harvest.worker",
+            "harvest worker",
+        ] {
+            let preset = preset_from(&format!(
+                "base = \"worker\"\ncapabilities = {{ \"{key}\" = false }}"
+            ));
+            let error = preset.validate("cron").expect_err(key);
+            assert!(
+                matches!(error, RoleError::InvalidCapabilityName { .. }),
+                "{key}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_name_grammar() {
+        for name in [
+            "harvest.worker",
+            "media.room_reaper",
+            "a.b",
+            "my-plugin.loop-2",
+        ] {
+            assert!(is_valid_capability_name(name), "{name}");
+        }
+        let long = format!("a.{}", "b".repeat(62));
+        for name in [
+            "",
+            "harvest",
+            ".worker",
+            "harvest.",
+            "Harvest.worker",
+            "h w.x",
+            long.as_str(),
+        ] {
+            assert!(!is_valid_capability_name(name), "{name}");
+        }
+        // No built-in capability name is a valid plugin capability name.
+        for capability in Capability::ALL {
+            assert!(!is_valid_capability_name(capability.as_str()));
+        }
+    }
+
+    #[test]
+    fn unknown_preset_key_still_fails_the_load() {
+        let error = toml::from_str::<RolePreset>("base = \"worker\"\nharvest_worker = false")
+            .expect_err("unknown key");
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     // ── Route groups: `[roles.<name>] mount` (#3544) ──────────────────────

@@ -1514,7 +1514,9 @@ double-submits and replays.
 | `merge(router)`, `nest(path, router)` | Raw Axum composition |
 | `declare_plugin_routes(...)` | Plugin route declarations |
 | `plugin_assets(&'static PluginAssets)` | Serve a plugin's compiled-in assets under `/static/_plugins/<ns>/`: hashed URL `immutable`, plain URL `must-revalidate`, ETag/304/Range, routes declared public. Build the bundle with `plugin_assets!("ns")` (embeds `assets/`, `embed-assets`) or `PluginAssets::from_files(ns, &[(path, bytes)])`; emit tags with `ASSETS.script_tag(path)` / `deferred_script_tag` / `stylesheet_tag` (hashed URL + `integrity`). A second, different bundle with the same namespace panics. Guide: `docs/guide/plugin-assets.md` |
-| `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks |
+| `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks. Every role runs them: use `background_task` for a loop |
+| `background_task(name, capability, run)`, `background(BackgroundTask)` | A loop that runs until shutdown, only on the roles that run `capability` (a `Capability` or a `PluginCapability`). `BackgroundTask::queues` and `::explicit` add queues and the plugin switch. Listed in `/actuator/tasks` and `autumn graph` (#3545) |
+| `plugin_capability(PluginCapability)` | Declare a plugin capability that no task uses, so `[roles.<name>] capabilities` can name it |
 | `with_extension(value)`, `update_extension(...)`, `extension<T>()` | Typed state extensions |
 | `i18n(bundle)`, `i18n_auto()` | I18n bundle setup |
 | `with_config_loader(loader)` | Replace config loading |
