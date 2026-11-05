@@ -121,60 +121,71 @@ fn with_user(
 ) -> Result<String, String> {
     let primary = primary.ok_or("`user` needs a Postgres `database.url`; set `url` instead")?;
     let not_url = || "`user` needs a postgres:// `database.url`; set `url` instead".to_owned();
-    if !(primary.starts_with("postgres://") || primary.starts_with("postgresql://")) {
-        return Err(not_url());
-    }
-    let mut url = url::Url::parse(primary).map_err(|_| not_url())?;
+    // A Postgres URI, read by hand: a generic URL parser refuses a host list
+    // (`db1:5432,db2:5432`) and a URI with no host.
+    let (scheme, rest) = ["postgres://", "postgresql://"]
+        .into_iter()
+        .find_map(|scheme| primary.strip_prefix(scheme).map(|rest| (scheme, rest)))
+        .ok_or_else(not_url)?;
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let (userinfo, hosts) = authority.rsplit_once('@').unwrap_or(("", authority));
+    let (path, query) = tail.split_once('?').unwrap_or((tail, ""));
     let decode = |text: &str| {
         percent_encoding::percent_decode_str(text)
             .decode_utf8_lossy()
             .into_owned()
     };
-    // A `user` or `password` in the query wins over the user part of the
-    // URL, so the role would connect as the owner. Remove them. The other
-    // parameters stay byte for byte: Postgres does not read `+` as a space.
-    // The driver decodes a name, so `%75ser` is `user`.
-    let mut owner = decode(url.username());
-    let mut query: Vec<String> = Vec::new();
-    for pair in url.query().unwrap_or_default().split('&') {
+    // A `user` or `password` in the query wins over the user part, so the
+    // role would connect as the owner. Remove them. The other parameters
+    // stay byte for byte: Postgres does not read `+` as a space. The driver
+    // decodes a name, so `%75ser` is `user`.
+    let mut owner = decode(userinfo.split_once(':').map_or(userinfo, |(u, _)| u));
+    let mut pairs: Vec<String> = Vec::new();
+    for pair in query.split('&') {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match decode(key).as_str() {
             "" | "password" | "passfile" => {}
             "user" => owner = decode(value),
-            _ => query.push(pair.to_owned()),
+            _ => pairs.push(pair.to_owned()),
         }
     }
-    // With no database in the URL, Postgres uses the user name. Keep the
-    // database of the primary URL when the user changes.
-    let has_dbname = query
+    // With no database, Postgres uses the user name. Keep the database of
+    // the primary URL when the user changes.
+    let has_dbname = pairs
         .iter()
         .any(|pair| decode(pair.split_once('=').map_or(pair, |(k, _)| k)) == "dbname");
-    let pin_database = matches!(url.path(), "" | "/") && !has_dbname && !owner.is_empty();
+    let pin_database = matches!(path, "" | "/") && !has_dbname && !owner.is_empty();
     let password = password.map(secrecy::ExposeSecret::expose_secret);
-    if url.host_str().is_some_and(|host| !host.is_empty()) {
-        if pin_database {
-            url.set_path(&format!("/{}", encode(&owner)));
-        }
-        let query = query.join("&");
-        url.set_query((!query.is_empty()).then_some(query.as_str()));
-        // `Url` keeps a `%` as it is, and the driver decodes it: escape it.
-        let escape = |text: &str| text.replace('%', "%25");
-        url.set_username(&escape(user)).map_err(|()| not_url())?;
-        url.set_password(password.map(escape).as_deref())
-            .map_err(|()| not_url())?;
-    } else {
-        // A socket URL (`postgres:///app?host=/run/postgresql`) has no user
+    let mut path = path.to_owned();
+    let authority = if hosts.is_empty() {
+        // A socket URI (`postgres:///app?host=/run/postgresql`) has no user
         // part: the credentials go in the query.
         if pin_database {
-            query.push(format!("dbname={}", encode(&owner)));
+            pairs.push(format!("dbname={}", encode(&owner)));
         }
-        query.push(format!("user={}", encode(user)));
+        pairs.push(format!("user={}", encode(user)));
         if let Some(password) = password {
-            query.push(format!("password={}", encode(password)));
+            pairs.push(format!("password={}", encode(password)));
         }
-        url.set_query(Some(&query.join("&")));
-    }
-    Ok(url.to_string())
+        String::new()
+    } else {
+        if pin_database {
+            path = format!("/{}", encode(&owner));
+        }
+        let credentials = password.map_or_else(
+            || encode(user),
+            |password| format!("{}:{}", encode(user), encode(password)),
+        );
+        format!("{credentials}@{hosts}")
+    };
+    let query = pairs.join("&");
+    let query = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{query}")
+    };
+    Ok(format!("{scheme}{authority}{path}{query}"))
 }
 
 /// Percent-encode a URL part. Letters, digits and `-._~` stay.
@@ -439,6 +450,21 @@ mod tests {
             r.effective_url(Some("postgres://?host=/run/postgresql&user=owner"))
                 .unwrap(),
             "postgres://?host=/run/postgresql&dbname=owner&user=marketing&password=p%20w%26"
+        );
+    }
+
+    #[test]
+    fn a_host_list_stays() {
+        let r = role("user = \"marketing\"\npassword = \"pw\"");
+        assert_eq!(
+            r.effective_url(Some("postgres://owner:opw@db1:5432,db2:5432/app"))
+                .unwrap(),
+            "postgres://marketing:pw@db1:5432,db2:5432/app"
+        );
+        assert_eq!(
+            r.effective_url(Some("postgresql://o@[::1]:5432/app"))
+                .unwrap(),
+            "postgresql://marketing:pw@[::1]:5432/app"
         );
     }
 
