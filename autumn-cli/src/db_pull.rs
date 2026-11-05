@@ -1,8 +1,8 @@
 //! `autumn db pull` — scaffold Autumn models from an existing Postgres database.
 //!
 //! Read-only introspection: connect to the resolved primary/write database the
-//! same way `autumn migrate` / `autumn db` do, read the `public` schema's tables
-//! and columns from the catalog, map each column back to the generator's
+//! same way `autumn migrate` / `autumn db` do, read the tables and columns of
+//! one schema (`public`, or the one `--schema` names) from the catalog, map each column back to the generator's
 //! [`FieldKind`](crate::generate::dsl::FieldKind) (the inverse of the documented
 //! field-type DSL), and emit `#[model]` structs + `schema.rs` blocks (and
 //! optionally `#[repository]` traits) through the shared generator plan engine.
@@ -16,7 +16,7 @@ use diesel::{Connection as _, PgConnection, QueryableByName, RunQueryDsl as _, s
 
 use crate::generate::Flags;
 use crate::generate::dsl::{SQL_SUPPORTED_TYPES, sql_type_to_field_kind};
-use crate::generate::introspect::{Column, PullOptions, TableSchema, plan_pull};
+use crate::generate::introspect::{Column, PullOptions, TableSchema, plan_pull_in_schema};
 use crate::migrate;
 
 /// Parsed `autumn db pull` arguments.
@@ -32,6 +32,9 @@ pub struct PullArgs {
     pub dry_run: bool,
     /// Overwrite existing files instead of erroring on collision.
     pub force: bool,
+    /// The Postgres schema to read (#3550). `None` reads `public` and writes
+    /// unqualified `table!` blocks.
+    pub schema: Option<String>,
 }
 
 /// Failure modes for `db pull`. `Display` is credential-safe by construction.
@@ -45,10 +48,10 @@ enum PullError {
     Connection { host: String, port: u16 },
     /// A catalog query failed (message comes from the server, not the URL).
     Sql(String),
-    /// A requested table does not exist in the `public` schema.
-    UnknownTable { table: String },
+    /// A requested table does not exist in the schema.
+    UnknownTable { table: String, schema: String },
     /// No tables were found to pull.
-    NoTables,
+    NoTables { schema: String },
     /// A column has a SQL type outside the documented surface.
     UnsupportedType {
         table: String,
@@ -75,10 +78,12 @@ impl std::fmt::Display for PullError {
                 "Could not connect to Postgres at {host}:{port}.\n  Is the server running and reachable?"
             ),
             Self::Sql(message) => write!(f, "{message}"),
-            Self::UnknownTable { table } => {
-                write!(f, "Table {table:?} was not found in the public schema.")
+            Self::UnknownTable { table, schema } => {
+                write!(f, "Table {table:?} was not found in the {schema} schema.")
             }
-            Self::NoTables => write!(f, "No tables found to pull in the public schema."),
+            Self::NoTables { schema } => {
+                write!(f, "No tables found to pull in the {schema} schema.")
+            }
             Self::UnsupportedType { table, column, udt } => write!(
                 f,
                 "Column {table}.{column} has unsupported SQL type {udt:?}.\n  Supported: {SQL_SUPPORTED_TYPES}"
@@ -112,16 +117,19 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         PullError::Connection { host, port }
     })?;
 
-    let table_names = list_tables(&mut conn, &args.tables)?;
+    let db_schema = args.schema.as_deref().unwrap_or("public");
+    let table_names = list_tables(&mut conn, db_schema, &args.tables)?;
     if table_names.is_empty() {
-        return Err(PullError::NoTables);
+        return Err(PullError::NoTables {
+            schema: db_schema.to_owned(),
+        });
     }
 
     // Fetch every target table's columns and primary keys in two batched
     // queries (not two per table), then assemble each `TableSchema` with no
     // further I/O.
-    let columns_by_table = fetch_columns(&mut conn, &table_names)?;
-    let pks_by_table = fetch_primary_keys(&mut conn, &table_names)?;
+    let columns_by_table = fetch_columns(&mut conn, db_schema, &table_names)?;
+    let pks_by_table = fetch_primary_keys(&mut conn, db_schema, &table_names)?;
 
     let explicit = !args.tables.is_empty();
     let mut tables = Vec::with_capacity(table_names.len());
@@ -139,7 +147,7 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         }
     }
 
-    let plan = plan_pull(
+    let plan = plan_pull_in_schema(
         &std::env::current_dir().unwrap_or_default(),
         &tables,
         PullOptions {
@@ -147,6 +155,7 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
             force: args.force,
             explicit,
         },
+        args.schema.as_deref(),
     )
     .map_err(PullError::Generate)?;
 
@@ -203,13 +212,20 @@ struct TablePkRow {
     name: String,
 }
 
-/// List the base tables in `public`, excluding Diesel's bookkeeping table.
+/// List the base tables in `db_schema`, excluding Diesel's bookkeeping table.
 /// When `requested` is non-empty, restrict to those (erroring on any absent).
-fn list_tables(conn: &mut PgConnection, requested: &[String]) -> Result<Vec<String>, PullError> {
-    let query = "SELECT table_name AS name FROM information_schema.tables \
-         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+fn list_tables(
+    conn: &mut PgConnection,
+    db_schema: &str,
+    requested: &[String],
+) -> Result<Vec<String>, PullError> {
+    let query = format!(
+        "SELECT table_name AS name FROM information_schema.tables \
+         WHERE table_schema = {} AND table_type = 'BASE TABLE' \
          AND table_name <> '__diesel_schema_migrations' \
-         ORDER BY table_name";
+         ORDER BY table_name",
+        crate::db::quote_literal(db_schema)
+    );
     let rows: Vec<NameRow> = sql_query(query)
         .load(conn)
         .map_err(|e| PullError::Sql(e.to_string()))?;
@@ -225,6 +241,7 @@ fn list_tables(conn: &mut PgConnection, requested: &[String]) -> Result<Vec<Stri
         if !all.iter().any(|t| t == want) {
             return Err(PullError::UnknownTable {
                 table: want.clone(),
+                schema: db_schema.to_owned(),
             });
         }
     }
@@ -258,13 +275,15 @@ fn quoted_in_list(tables: &[String]) -> String {
 /// by table name.
 fn fetch_columns(
     conn: &mut PgConnection,
+    db_schema: &str,
     tables: &[String],
 ) -> Result<BTreeMap<String, Vec<ColumnRow>>, PullError> {
     let query = format!(
         "SELECT table_name, column_name, udt_name, is_nullable, column_default, is_generated, \
          is_identity FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name IN ({}) \
+         WHERE table_schema = {} AND table_name IN ({}) \
          ORDER BY table_name, ordinal_position",
+        crate::db::quote_literal(db_schema),
         quoted_in_list(tables)
     );
     let rows: Vec<ColumnRow> = sql_query(query)
@@ -282,9 +301,10 @@ fn fetch_columns(
 
 /// Fetch the primary-key column set for all `tables` in one query, grouped by
 /// table name. Joins through `pg_class`/`pg_namespace` so the index is matched
-/// in the `public` schema and tagged with its table.
+/// in the requested schema and tagged with its table.
 fn fetch_primary_keys(
     conn: &mut PgConnection,
+    db_schema: &str,
     tables: &[String],
 ) -> Result<BTreeMap<String, Vec<String>>, PullError> {
     let query = format!(
@@ -293,7 +313,8 @@ fn fetch_primary_keys(
          JOIN pg_class c ON c.oid = i.indrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-         WHERE n.nspname = 'public' AND i.indisprimary AND c.relname IN ({})",
+         WHERE n.nspname = {} AND i.indisprimary AND c.relname IN ({})",
+        crate::db::quote_literal(db_schema),
         quoted_in_list(tables)
     );
     let rows: Vec<TablePkRow> = sql_query(query)

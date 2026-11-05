@@ -189,6 +189,8 @@ pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
 #[cfg(feature = "db")]
+pub mod db_boundary;
+#[cfg(feature = "db")]
 pub(crate) mod db_ping;
 pub(crate) mod db_url;
 pub mod fleet_layout;

@@ -234,5 +234,7 @@ apply. These matter most here:
 
 ## Related
 
+* [Database Boundaries](database-boundaries.md) — a Postgres schema and role
+  per boundary. The database then refuses the queries this check cannot see.
 * [The Architecture Graph](architecture-graph.md) — the graph this check reads.
 * [Table width](table-width.md) — another schema rule that CI checks.

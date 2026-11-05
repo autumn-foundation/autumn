@@ -582,7 +582,7 @@ impl FleetMigrations {
         let sets = all
             .iter()
             .enumerate()
-            .filter(|(_, (_, set, scope))| scope.reaches_shards() && keep(set))
+            .filter(|(_, (_, set, scope, _))| scope.reaches_shards() && keep(set))
             .map(|(idx, _)| {
                 FleetSet(Arc::new(SharedEmbedded {
                     all: Arc::clone(all),
@@ -6236,16 +6236,19 @@ mod tests {
                 "repository-commit-hooks",
                 crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             ),
             (
                 "version-history",
                 crate::version_history::VERSION_HISTORY_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             ),
             (
                 "derivations",
                 crate::derivation::DERIVATION_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             ),
         ]);
         let boot = DatabaseFleet::from_parts(

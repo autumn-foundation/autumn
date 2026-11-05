@@ -11236,8 +11236,51 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || check_table_boundaries(boundaries_path)));
     }
 
+    // 21. Boundary roles (#3550). Only when a boundary sets `schema`: connect
+    //     as each role and check that it cannot read another boundary's
+    //     tables.
+    #[cfg(not(feature = "sqlite"))]
+    if let Some(boundaries) = crate::boundaries::load_config(boundaries_path)
+        .ok()
+        .filter(crate::db_grants::has_database_boundaries)
+    {
+        tasks.push(Box::new(move || check_database_roles(&boundaries)));
+    }
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     run_doctor_tasks(tasks, opts);
+}
+
+/// Check the boundary roles (#3550). See [`crate::db_grants::check_roles`].
+#[cfg(not(feature = "sqlite"))]
+fn check_database_roles(boundaries: &autumn_web::graph::boundaries::BoundaryConfig) -> CheckResult {
+    let verdict = match crate::db_grants::resolve_database(None) {
+        Ok(database) => {
+            crate::db_grants::grade(&crate::db_grants::check_roles(boundaries, &database))
+        }
+        Err(e) => crate::db_grants::Verdict::Fail(e),
+    };
+    database_roles_result(verdict)
+}
+
+/// The `database_roles` result for a verdict.
+#[cfg(not(feature = "sqlite"))]
+fn database_roles_result(verdict: crate::db_grants::Verdict) -> CheckResult {
+    let (status, detail) = match verdict {
+        crate::db_grants::Verdict::Pass(d) => (CheckStatus::Pass, d),
+        crate::db_grants::Verdict::Warn(d) => (CheckStatus::Warn, d),
+        crate::db_grants::Verdict::Fail(d) => (CheckStatus::Fail, d),
+    };
+    let failed = status != CheckStatus::Pass;
+    CheckResult {
+        name: "database_roles",
+        status,
+        detail: Some(detail),
+        hint: failed.then_some(
+            "Run `autumn db grants --apply` after `autumn migrate`. \
+             See docs/guide/database-boundaries.md.",
+        ),
+    }
 }
 
 /// Check the table-ownership boundaries (#3549).
@@ -24387,5 +24430,20 @@ mod table_boundaries_tests {
         .expect("valid");
         let result = check_table_boundaries_impl(config, Some(Ok(graph())), Ok(facts()), Ok(None));
         assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn database_roles_maps_each_verdict() {
+        use crate::db_grants::Verdict;
+        let pass = super::database_roles_result(Verdict::Pass("2 role(s)".into()));
+        assert_eq!(pass.name, "database_roles");
+        assert_eq!(pass.status, CheckStatus::Pass);
+        assert!(pass.hint.is_none());
+        let warn = super::database_roles_result(Verdict::Warn("CAN READ core.notes".into()));
+        assert_eq!(warn.status, CheckStatus::Warn);
+        assert!(warn.hint.is_some_and(|h| h.contains("autumn db grants")));
+        let fail = super::database_roles_result(Verdict::Fail("shared schema".into()));
+        assert_eq!(fail.status, CheckStatus::Fail);
     }
 }

@@ -8075,6 +8075,7 @@ impl AutumnConfig {
             &mut self.database.migration_lock_retries,
         );
         self.apply_shard_env_overrides(env);
+        self.apply_role_env_overrides(env);
         self.apply_fleet_env_overrides(env);
     }
 
@@ -8182,6 +8183,37 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS",
             &mut ownership.lease_secs,
         );
+    }
+
+    /// Apply `AUTUMN_DATABASE__ROLES__{NAME}__*` environment overrides (#3550).
+    ///
+    /// [`Env`] reads only known keys, so only a role that the TOML declares is
+    /// read. `{NAME}` is the boundary name in upper case. A boundary name with
+    /// `-` has no environment override. A `__URL` override removes the TOML
+    /// `user` and `password`. A `__USER` override removes the TOML `url`.
+    fn apply_role_env_overrides(&mut self, env: &dyn Env) {
+        for (name, role) in &mut self.database.roles {
+            let upper = name.to_ascii_uppercase();
+            if let Ok(url) = env.var(&format!("AUTUMN_DATABASE__ROLES__{upper}__URL")) {
+                role.url = Some(url);
+                role.user = None;
+                role.password = None;
+            }
+            if let Ok(user) = env.var(&format!("AUTUMN_DATABASE__ROLES__{upper}__USER")) {
+                role.user = Some(user);
+                role.url = None;
+            }
+            parse_env_option_string(
+                env,
+                &format!("AUTUMN_DATABASE__ROLES__{upper}__PASSWORD"),
+                &mut role.password,
+            );
+            parse_env_option(
+                env,
+                &format!("AUTUMN_DATABASE__ROLES__{upper}__POOL_SIZE"),
+                &mut role.pool_size,
+            );
+        }
     }
 
     /// Apply `AUTUMN_DATABASE__SHARDS__{i}__*` environment overrides.
@@ -11655,6 +11687,146 @@ pub struct DatabaseConfig {
     /// [`shards`](Self::shards). See [`DatabaseFleetConfig`].
     #[serde(default)]
     pub fleet: Option<DatabaseFleetConfig>,
+
+    /// One Postgres role per table-ownership boundary (#3550), by boundary
+    /// name. Empty (the default) means one role for the whole app.
+    ///
+    /// Code in a boundary gets the role's pool with
+    /// [`AppState::pool_for`](crate::AppState::pool_for). See
+    /// [`DatabaseRoleConfig`] and `docs/guide/database-boundaries.md`.
+    #[serde(default)]
+    pub roles: BTreeMap<String, DatabaseRoleConfig>,
+}
+
+/// `[database.roles.<boundary>]`: the connection of one boundary role
+/// (#3550).
+///
+/// Set `url`, or set `user` (and `password`) to use the primary URL with
+/// another login:
+///
+/// ```toml
+/// [database.roles.marketing]
+/// user = "marketing"
+/// # password: set AUTUMN_DATABASE__ROLES__MARKETING__PASSWORD
+///
+/// [database.roles.core]
+/// url = "postgres://core@db:5432/crm"
+/// pool_size = 5
+/// ```
+///
+/// Each field has an environment override,
+/// `AUTUMN_DATABASE__ROLES__<NAME>__URL` (and `__USER`, `__PASSWORD`,
+/// `__POOL_SIZE`), for a role that the TOML declares. `<NAME>` is the
+/// boundary name in upper case.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseRoleConfig {
+    /// The full Postgres URL of the role.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The login user. Replaces the user of the primary URL.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// The password of `user`. Prefer the environment override.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// The pool size. Default: the primary pool size.
+    #[serde(default)]
+    pub pool_size: Option<usize>,
+}
+
+impl std::fmt::Debug for DatabaseRoleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseRoleConfig")
+            .field(
+                "url",
+                &self.url.as_deref().map(crate::db_url::redact_target),
+            )
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("pool_size", &self.pool_size)
+            .finish()
+    }
+}
+
+/// `base` with its login replaced by `user` and `password` (#3550).
+///
+/// `base` is a `postgres://` URL or a libpq keyword/value string. A
+/// `password` of `None` removes the password of `base`.
+fn url_with_login(base: &str, user: &str, password: Option<&str>) -> Result<String, String> {
+    if base.starts_with("postgres://") || base.starts_with("postgresql://") {
+        let mut url = url::Url::parse(base).map_err(|e| format!("the primary URL: {e}"))?;
+        url.set_username(user)
+            .map_err(|()| "the primary URL cannot hold a user".to_owned())?;
+        url.set_password(password)
+            .map_err(|()| "the primary URL cannot hold a password".to_owned())?;
+        // A login in the query wins over the user info, so remove it.
+        let query: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(key, _)| key != "user" && key != "password")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        if query.is_empty() {
+            url.set_query(None);
+        } else {
+            url.query_pairs_mut().clear().extend_pairs(query);
+        }
+        return Ok(url.to_string());
+    }
+    let mut pairs = libpq_pairs(base)?;
+    pairs.retain(|(key, _)| key != "user" && key != "password");
+    let quote = |v: &str| format!("'{}'", v.replace('\\', "\\\\").replace('\'', "\\'"));
+    let mut out: Vec<String> = pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+    out.push(format!("user={}", quote(user)));
+    if let Some(password) = password {
+        out.push(format!("password={}", quote(password)));
+    }
+    Ok(out.join(" "))
+}
+
+/// Split a libpq keyword/value string into `(key, raw value)` pairs. A raw
+/// value keeps its quotes, so it can be written back as it was.
+fn libpq_pairs(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut pairs = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.peek().is_none() {
+            return Ok(pairs);
+        }
+        let mut key = String::new();
+        while let Some(c) = chars.next_if(|c| *c != '=' && !c.is_whitespace()) {
+            key.push(c);
+        }
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.next() != Some('=') {
+            return Err("the primary URL: a keyword has no `=`".to_owned());
+        }
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut value = String::new();
+        if chars.peek() == Some(&'\'') {
+            value.push(chars.next().unwrap_or('\''));
+            loop {
+                match chars.next() {
+                    Some('\\') => {
+                        value.push('\\');
+                        value.extend(chars.next());
+                    }
+                    Some('\'') => {
+                        value.push('\'');
+                        break;
+                    }
+                    Some(c) => value.push(c),
+                    None => return Err("the primary URL: a quote is not closed".to_owned()),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                value.push(c);
+            }
+        }
+        pairs.push((key, value));
+    }
 }
 
 /// `[database.fleet]`: one `SQLite` database per tenant or per routing slot.
@@ -12262,6 +12434,77 @@ pub fn database_backend_consistency(
 }
 
 impl DatabaseConfig {
+    /// The connection URL of the boundary role `name` (#3550). `None` when
+    /// `[database.roles.<name>]` is not set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the role sets neither `url` nor
+    /// `user`, or when `user` needs a primary URL that is not there.
+    pub fn role_url(&self, name: &str) -> Result<Option<String>, ConfigError> {
+        let Some(role) = self.roles.get(name) else {
+            return Ok(None);
+        };
+        let err =
+            |reason: String| ConfigError::Validation(format!("database.roles.{name}: {reason}"));
+        if let Some(url) = &role.url {
+            return Ok(Some(url.clone()));
+        }
+        let Some(user) = &role.user else {
+            return Err(err("set `url` or `user`".to_owned()));
+        };
+        let Some(primary) = self.effective_primary_url() else {
+            return Err(err(
+                "`user` needs a primary URL (database.url or database.primary_url)".to_owned(),
+            ));
+        };
+        if DatabaseBackend::detect(primary) != Some(DatabaseBackend::Postgres) {
+            return Err(err(
+                "`user` needs a Postgres primary URL; schemas and roles are Postgres only"
+                    .to_owned(),
+            ));
+        }
+        url_with_login(primary, user, role.password.as_deref())
+            .map(Some)
+            .map_err(err)
+    }
+
+    /// The pool size of the boundary role `name`. Default: the primary pool
+    /// size.
+    #[must_use]
+    pub fn role_pool_size(&self, name: &str) -> usize {
+        self.roles
+            .get(name)
+            .and_then(|role| role.pool_size)
+            .unwrap_or_else(|| self.effective_primary_pool_size())
+    }
+
+    /// Check each `[database.roles.<name>]`.
+    fn validate_roles(&self) -> Result<(), ConfigError> {
+        for (name, role) in &self.roles {
+            let err =
+                |reason: &str| ConfigError::Validation(format!("database.roles.{name}: {reason}"));
+            if role.url.is_some() && role.user.is_some() {
+                return Err(err("set `url` or `user`, not both"));
+            }
+            if role.password.is_some() && role.user.is_none() {
+                return Err(err(
+                    "`password` needs `user`; put a password for `url` in the URL",
+                ));
+            }
+            if role.pool_size == Some(0) {
+                return Err(err("pool_size must be at least 1"));
+            }
+            let url = self.role_url(name)?.unwrap_or_default();
+            if DatabaseBackend::detect(&url) != Some(DatabaseBackend::Postgres) {
+                return Err(err(
+                    "a boundary role needs a Postgres URL; schemas and roles are Postgres only",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolved primary/write database URL.
     #[must_use]
     pub fn effective_primary_url(&self) -> Option<&str> {
@@ -12459,6 +12702,7 @@ impl DatabaseConfig {
     /// Returns a validation error if a connection string is malformed or a
     /// shard declaration is malformed.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_roles()?;
         for (field, url) in [
             ("database.url", self.url.as_deref()),
             ("database.primary_url", self.primary_url.as_deref()),
@@ -13959,6 +14203,7 @@ impl Default for DatabaseConfig {
             directory_shard_router: false,
             max_connections_warn_threshold: default_max_connections_warn_threshold(),
             fleet: None,
+            roles: BTreeMap::new(),
         }
     }
 }
@@ -17701,6 +17946,175 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pin_after_write_secs, 10);
+    }
+
+    // ── Boundary roles (#3550) ────────────────────────────────────────
+
+    fn roles_config(text: &str) -> AutumnConfig {
+        toml::from_str(text).expect("config parses")
+    }
+
+    #[test]
+    fn no_roles_by_default() {
+        let config = AutumnConfig::default();
+        assert!(config.database.roles.is_empty());
+        assert_eq!(config.database.role_url("marketing").unwrap(), None);
+    }
+
+    #[test]
+    fn role_user_replaces_the_user_of_the_primary_url() {
+        let config = roles_config(
+            "[database]\nurl = \"postgres://app:secret@db:5432/crm\"\n\
+             [database.roles.marketing]\nuser = \"marketing\"\npassword = \"p@ss\"\n",
+        );
+        config.database.validate().expect("valid");
+        assert_eq!(
+            config.database.role_url("marketing").unwrap().as_deref(),
+            Some("postgres://marketing:p%40ss@db:5432/crm")
+        );
+        let no_password = roles_config(
+            "[database]\nurl = \"postgresql://app:secret@db/crm?sslmode=require\"\n\
+             [database.roles.core]\nuser = \"core\"\n",
+        );
+        assert_eq!(
+            no_password.database.role_url("core").unwrap().as_deref(),
+            Some("postgresql://core@db/crm?sslmode=require")
+        );
+    }
+
+    #[test]
+    fn role_user_on_a_keyword_value_url() {
+        let config = roles_config(
+            "[database]\nurl = \"host=db user=app password='a b' dbname=crm\"\n\
+             [database.roles.marketing]\nuser = \"mark'eting\"\npassword = \"x\"\n",
+        );
+        assert_eq!(
+            config.database.role_url("marketing").unwrap().as_deref(),
+            Some("host=db dbname=crm user='mark\\'eting' password='x'")
+        );
+    }
+
+    #[test]
+    fn role_user_removes_the_login_from_the_url_query() {
+        let config = roles_config(
+            "[database]\nurl = \"postgres://app:pw@db/crm?user=app&password=pw&sslmode=require\"\n\
+             [database.roles.marketing]\nuser = \"marketing\"\n",
+        );
+        assert_eq!(
+            config.database.role_url("marketing").unwrap().as_deref(),
+            Some("postgres://marketing@db/crm?sslmode=require")
+        );
+    }
+
+    #[test]
+    fn role_url_is_used_as_is() {
+        let config = roles_config(
+            "[database]\nurl = \"postgres://app@db/crm\"\n\
+             [database.roles.marketing]\nurl = \"postgres://marketing@pooler:6432/crm\"\n\
+             pool_size = 3\n",
+        );
+        config.database.validate().expect("valid");
+        assert_eq!(
+            config.database.role_url("marketing").unwrap().as_deref(),
+            Some("postgres://marketing@pooler:6432/crm")
+        );
+        assert_eq!(config.database.role_pool_size("marketing"), 3);
+        assert_eq!(
+            config.database.role_pool_size("other"),
+            config.database.effective_primary_pool_size()
+        );
+    }
+
+    #[test]
+    fn bad_roles_fail_validation() {
+        for (text, needle) in [
+            (
+                "[database.roles.m]\nurl = \"postgres://m@db/x\"\nuser = \"m\"\n",
+                "not both",
+            ),
+            ("[database.roles.m]\npool_size = 2\n", "`url` or `user`"),
+            (
+                "[database.roles.m]\nurl = \"postgres://m@db/x\"\npassword = \"p\"\n",
+                "`password` needs `user`",
+            ),
+            (
+                "[database]\nurl = \"postgres://a@db/x\"\n[database.roles.m]\nuser = \"m\"\npool_size = 0\n",
+                "pool_size",
+            ),
+            ("[database.roles.m]\nurl = \"sqlite://m.db\"\n", "Postgres"),
+            (
+                "[database]\nurl = \"sqlite://app.db\"\n[database.roles.m]\nuser = \"m\"\n",
+                "Postgres",
+            ),
+            ("[database.roles.m]\nuser = \"m\"\n", "primary"),
+        ] {
+            let config = roles_config(text);
+            let err = config.database.validate().expect_err(text).to_string();
+            assert!(err.contains("database.roles.m"), "{text}: {err}");
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn role_debug_hides_secrets() {
+        let config = roles_config(
+            "[database.roles.m]\nurl = \"postgres://m:topsecret@db/x\"\n\
+             [database.roles.n]\nuser = \"n\"\npassword = \"hunter2\"\n",
+        );
+        let debug = format!("{:?}", config.database.roles);
+        assert!(
+            !debug.contains("topsecret") && !debug.contains("hunter2"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn role_env_overrides() {
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__ROLES__MARKETING__PASSWORD", "from-env")
+            .with("AUTUMN_DATABASE__ROLES__MARKETING__POOL_SIZE", "4")
+            .with("AUTUMN_DATABASE__ROLES__CORE__URL", "postgres://core@db/x");
+        let mut config = roles_config(
+            "[database]\nurl = \"postgres://app@db/x\"\n\
+             [database.roles.marketing]\nuser = \"marketing\"\n\
+             [database.roles.core]\nuser = \"core\"\npassword = \"toml\"\n",
+        );
+        config.apply_env_overrides_with_env(&env);
+        let marketing = &config.database.roles["marketing"];
+        assert_eq!(marketing.password.as_deref(), Some("from-env"));
+        assert_eq!(marketing.pool_size, Some(4));
+        // An env URL replaces the TOML `user` and `password`.
+        let core = &config.database.roles["core"];
+        assert_eq!(core.url.as_deref(), Some("postgres://core@db/x"));
+        assert_eq!(core.user, None);
+        assert_eq!(core.password, None);
+        config.database.validate().expect("valid");
+
+        // An env user replaces the TOML `url`.
+        let env = MockEnv::new().with("AUTUMN_DATABASE__ROLES__ADMIN__USER", "admin");
+        let mut config = roles_config(
+            "[database]\nurl = \"postgres://app@db/x\"\n\
+             [database.roles.admin]\nurl = \"postgres://old@db/x\"\n",
+        );
+        config.apply_env_overrides_with_env(&env);
+        let admin = &config.database.roles["admin"];
+        assert_eq!(
+            (admin.url.as_deref(), admin.user.as_deref()),
+            (None, Some("admin"))
+        );
+    }
+
+    #[test]
+    fn roles_table_passes_strict_validation() {
+        let schema = AutumnConfig::get_schema_keys();
+        let errors = AutumnConfig::validate_toml(
+            "[database.roles.marketing]\nuser = \"marketing\"\npool_size = 2\n",
+            &schema,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let leaves = AutumnConfig::schema_leaf_paths();
+        assert!(leaves.contains("database.roles"));
+        assert!(!leaves.iter().any(|l| l.starts_with("database.roles.")));
     }
 
     #[test]

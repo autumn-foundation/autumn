@@ -1759,7 +1759,7 @@ fn pg_manager_config(
     config
 }
 
-fn build_pool(
+pub(crate) fn build_pool(
     url: &str,
     pool_size: usize,
     connect_timeout_secs: u64,

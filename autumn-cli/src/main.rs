@@ -28,6 +28,7 @@ mod data;
 mod data_capsule;
 mod data_flow;
 mod db;
+mod db_grants;
 mod db_pull;
 mod deploy;
 mod deps;
@@ -2874,6 +2875,26 @@ enum DbCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Write the GRANT and REVOKE statements for the boundary roles.
+    ///
+    /// Reads `boundaries.toml`. Each boundary with a `schema` gets a role
+    /// (`role`, default the boundary name) that may use its own schema and
+    /// the tables of its `may_read` and `may_write` lists only. The command
+    /// reads the live catalog, so run it after `autumn migrate`. It prints the
+    /// SQL; `--apply` runs it in one transaction. The roles must exist.
+    /// See docs/guide/database-boundaries.md.
+    #[command(verbatim_doc_comment)]
+    Grants {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The boundaries file.
+        #[arg(long, value_name = "PATH", default_value = "boundaries.toml")]
+        config: std::path::PathBuf,
+        /// Run the SQL against the database instead of printing it.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Scaffold Autumn models from an existing database (read-only introspection).
     ///
     /// Connects to the resolved primary database (the same way `autumn migrate`
@@ -2906,6 +2927,10 @@ enum DbCommands {
         /// Overwrite existing model/repository files instead of erroring.
         #[arg(long)]
         force: bool,
+        /// Read tables of this Postgres schema. Each `table!` block then
+        /// names it (`marketing.campaigns`). Default: `public`, unqualified.
+        #[arg(long, value_name = "SCHEMA")]
+        schema: Option<String>,
     },
     /// Back up the configured database(s) to a timestamped, compressed artifact.
     ///
@@ -3253,6 +3278,7 @@ impl DbCommands {
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
             Self::Pull { .. }
+            | Self::Grants { .. }
             | Self::Backup { .. }
             | Self::Restore { .. }
             | Self::Scrub { .. }
@@ -3260,7 +3286,7 @@ impl DbCommands {
             | Self::Offsite(_)
             | Self::Replica(_) => {
                 unreachable!(
-                    "db pull/backup/restore/scrub/retention/offsite/replica are dispatched \
+                    "db pull/grants/backup/restore/scrub/retention/offsite/replica are dispatched \
                      before into_command"
                 )
             }
@@ -5491,18 +5517,29 @@ fn run_command(command: Commands) {
             migrate::run(&action, with_maintenance, &target, profile.as_deref(), wait);
         }
         Commands::Db(cmd) => match cmd {
+            DbCommands::Grants {
+                profile,
+                config,
+                apply,
+            } => db_grants::run(&db_grants::GrantsArgs {
+                profile,
+                config,
+                apply,
+            }),
             DbCommands::Pull {
                 tables,
                 profile,
                 with_repository,
                 dry_run,
                 force,
+                schema,
             } => db_pull::run(&db_pull::PullArgs {
                 profile,
                 tables,
                 with_repository,
                 dry_run,
                 force,
+                schema,
             }),
             DbCommands::Backup {
                 profile,
@@ -9313,6 +9350,7 @@ mod tests {
             with_repository,
             dry_run,
             force,
+            ..
         }) = cli.command
         else {
             panic!("expected db pull");
@@ -9345,6 +9383,7 @@ mod tests {
             with_repository,
             dry_run,
             force,
+            ..
         }) = cli.command
         else {
             panic!("expected db pull");
@@ -9354,6 +9393,53 @@ mod tests {
         assert!(with_repository);
         assert!(dry_run);
         assert!(force);
+    }
+
+    #[test]
+    fn parse_db_pull_schema() {
+        let cli = Cli::try_parse_from(["autumn", "db", "pull", "--schema", "marketing"]).unwrap();
+        let Commands::Db(DbCommands::Pull { schema, .. }) = cli.command else {
+            panic!("expected db pull");
+        };
+        assert_eq!(schema.as_deref(), Some("marketing"));
+    }
+
+    #[test]
+    fn parse_db_grants() {
+        let cli = Cli::try_parse_from(["autumn", "db", "grants"]).unwrap();
+        let Commands::Db(DbCommands::Grants {
+            profile,
+            config,
+            apply,
+        }) = cli.command
+        else {
+            panic!("expected db grants");
+        };
+        assert!(profile.is_none());
+        assert_eq!(config, std::path::PathBuf::from("boundaries.toml"));
+        assert!(!apply);
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "grants",
+            "--apply",
+            "--config",
+            "crm/boundaries.toml",
+            "--profile",
+            "prod",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Grants {
+            profile,
+            config,
+            apply,
+        }) = cli.command
+        else {
+            panic!("expected db grants");
+        };
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(config, std::path::PathBuf::from("crm/boundaries.toml"));
+        assert!(apply);
     }
 
     #[test]

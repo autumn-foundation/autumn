@@ -130,22 +130,46 @@ pub struct PullOptions {
     pub explicit: bool,
 }
 
+/// [`plan_pull_in_schema`] with no schema, for tests.
+#[cfg(test)]
+pub fn plan_pull(
+    project_root: &Path,
+    tables: &[TableSchema],
+    options: PullOptions,
+) -> Result<Plan, GenerateError> {
+    plan_pull_in_schema(project_root, tables, options, None)
+}
+
 /// Compute every filesystem action an `autumn db pull` would perform.
 ///
 /// Pure planning step — no I/O. The live introspection in [`crate::db_pull`]
 /// builds the `tables` and then calls this. Unlike the greenfield generators,
 /// **no migration is emitted**: the tables already exist in the database.
 ///
+/// `db_schema` is the Postgres schema of the tables (#3550). Each `table!`
+/// block then names it (`marketing.campaigns`). `None` writes unqualified
+/// blocks.
+///
 /// # Errors
 /// Returns [`GenerateError::NotInProject`] when `project_root` is not an Autumn
 /// project, or surfaces collisions when the model/repository files already exist
 /// and `--force` was not given (during [`Plan::execute`]).
-pub fn plan_pull(
+#[allow(clippy::too_many_lines)] // one pass per table; the steps share the folded files
+pub fn plan_pull_in_schema(
     project_root: &Path,
     tables: &[TableSchema],
     options: PullOptions,
+    db_schema: Option<&str>,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    if let Some(name) = db_schema
+        && (!super::dsl::is_valid_ident(name) || super::dsl::is_rust_keyword(name))
+    {
+        return Err(GenerateError::Config(format!(
+            "the schema name '{name}' is not a valid snake_case Rust identifier \
+             (or is a reserved keyword); a diesel `table!` cannot name it"
+        )));
+    }
 
     let mut plan = Plan::new(project_root);
 
@@ -222,7 +246,13 @@ pub fn plan_pull(
         // (b) src/models/mod.rs aggregator line
         models_mod = add_mod_declaration(&models_mod, &snake_name);
         // (c) src/schema.rs table! block
-        schema = upsert_schema_block(&schema, &table.table, &table.columns, options.force)?;
+        schema = upsert_schema_block(
+            &schema,
+            db_schema,
+            &table.table,
+            &table.columns,
+            options.force,
+        )?;
 
         // (d) optional repository. `unsupported_reason` already guaranteed the
         // Autumn `id`/`i64` PK convention the repository macro assumes, so the
@@ -424,9 +454,17 @@ fn is_lock_version_column(col: &Column) -> bool {
         && col.default_is_integer_literal
 }
 
-/// Build a `diesel::table!` block from introspected columns.
+/// Build a `diesel::table!` block from introspected columns, for tests.
 #[must_use]
+#[cfg(test)]
 pub fn render_schema_block(table: &str, columns: &[Column]) -> String {
+    render_schema_block_in(None, table, columns)
+}
+
+/// Build a `diesel::table!` block for a table in the Postgres schema
+/// `db_schema`. Diesel writes it as `schema.table`.
+#[must_use]
+pub fn render_schema_block_in(db_schema: Option<&str>, table: &str, columns: &[Column]) -> String {
     let pk: Vec<&str> = columns
         .iter()
         .filter(|c| c.is_pk)
@@ -442,7 +480,8 @@ pub fn render_schema_block(table: &str, columns: &[Column]) -> String {
     };
     let mut out = String::new();
     out.push_str("diesel::table! {\n");
-    let _ = writeln!(out, "    {table} ({pk_clause}) {{");
+    let qualified = db_schema.map_or_else(|| table.to_owned(), |s| format!("{s}.{table}"));
+    let _ = writeln!(out, "    {qualified} ({pk_clause}) {{");
     for col in columns {
         let _ = writeln!(out, "        {} -> {},", col.name, col.schema_type());
     }
@@ -463,11 +502,12 @@ pub fn render_schema_block(table: &str, columns: &[Column]) -> String {
 ///   compile.
 fn upsert_schema_block(
     existing: &str,
+    db_schema: Option<&str>,
     table: &str,
     columns: &[Column],
     force: bool,
 ) -> Result<String, GenerateError> {
-    let block = render_schema_block(table, columns);
+    let block = render_schema_block_in(db_schema, table, columns);
     // Locate any existing block once and branch on the result, rather than
     // re-scanning the (growing) schema for has/matches/replace separately.
     match schema_block_range(existing, table) {
@@ -619,6 +659,7 @@ pub fn is_in_comment_or_string(text: &str, at: usize) -> bool {
 
 /// The table name of the `table!` block whose body opens at `open`: the
 /// first code word after attributes (`#[...]`). Doc comments are not code.
+/// In `schema.table`, the name is the part after the dot.
 fn block_table_name(text: &str, open: usize) -> Option<String> {
     let mut name: Vec<u8> = Vec::new();
     let mut brackets = 0usize;
@@ -645,6 +686,11 @@ fn block_table_name(text: &str, open: usize) -> Option<String> {
         }
         if name.is_empty() {
             return !c.is_ascii_whitespace();
+        }
+        // `marketing.campaigns`: the schema comes first.
+        if c == b'.' && name != b"use" {
+            name.clear();
+            return false;
         }
         if name == b"use" {
             name.clear();
@@ -1675,6 +1721,72 @@ mod tests {
             err.to_string().contains("differs from the live database"),
             "stale schema block must be reported: {err}"
         );
+    }
+
+    #[test]
+    fn schema_block_names_the_postgres_schema() {
+        let block = render_schema_block_in(Some("marketing"), "posts", &post_table().columns);
+        assert!(block.contains("    marketing.posts (id) {"), "{block}");
+        let plain = render_schema_block_in(None, "posts", &post_table().columns);
+        assert_eq!(plain, render_schema_block("posts", &post_table().columns));
+    }
+
+    #[test]
+    fn plan_pull_in_schema_rejects_a_schema_that_is_not_an_ident() {
+        let tmp = project();
+        for bad in ["we-ird", "Marketing", "type"] {
+            let err = plan_pull_in_schema(
+                tmp.path(),
+                &[post_table()],
+                PullOptions::default(),
+                Some(bad),
+            )
+            .expect_err(bad);
+            assert!(err.to_string().contains("schema name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn schema_block_range_finds_a_qualified_block() {
+        let text = "diesel::table! {\n    marketing.posts (id) {\n        id -> Int8,\n    }\n}\n";
+        assert_eq!(
+            schema_block_range(text, "posts"),
+            Some((0, text.trim_end().len()))
+        );
+        assert_eq!(schema_block_range(text, "marketing"), None);
+    }
+
+    #[test]
+    fn plan_pull_in_schema_writes_a_qualified_block() {
+        let tmp = project();
+        let plan = plan_pull_in_schema(
+            tmp.path(),
+            &[post_table()],
+            PullOptions::default(),
+            Some("marketing"),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(schema.contains("marketing.posts (id) {"), "{schema}");
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(model.contains("use crate::schema::posts;"), "{model}");
+        // A second pull finds the qualified block and does not add another.
+        let again = plan_pull_in_schema(
+            tmp.path(),
+            &[post_table()],
+            PullOptions::default(),
+            Some("marketing"),
+        )
+        .unwrap();
+        again
+            .execute(Flags {
+                force: true,
+                dry_run: false,
+            })
+            .unwrap();
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert_eq!(schema.matches("posts (id)").count(), 1, "{schema}");
     }
 
     #[test]

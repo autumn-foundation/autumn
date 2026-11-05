@@ -80,8 +80,14 @@ impl MigrationScope {
     }
 }
 
-/// One registered migration set: its label, the set, and its scope.
-pub(crate) type RegisteredMigrations = (&'static str, EmbeddedMigrations, MigrationScope);
+/// One registered migration set: its label, the set, its scope, and the
+/// Postgres schema it goes into (`None`: the default `search_path`).
+pub(crate) type RegisteredMigrations = (
+    &'static str,
+    EmbeddedMigrations,
+    MigrationScope,
+    Option<&'static str>,
+);
 
 /// Embedded Autumn framework migrations.
 ///
@@ -1760,6 +1766,156 @@ where
                 }
             })
             .collect())
+    }
+}
+
+// ── Migrations into a named schema (#3550) ────────────────────────────
+
+/// Check a schema name for [`SchemaMigrations`].
+///
+/// # Errors
+///
+/// Returns the reason when the name is empty, holds a control character, is
+/// longer than 63 bytes or has the reserved `pg_` prefix.
+pub fn validate_schema_name(schema: &str) -> Result<(), String> {
+    if schema.is_empty() {
+        Err("the schema name is empty".to_owned())
+    } else if schema.chars().any(char::is_control) {
+        Err(format!(
+            "the schema name {schema:?} holds a control character"
+        ))
+    } else if schema.len() > 63 {
+        Err(format!(
+            "the schema name `{schema}` is longer than 63 bytes"
+        ))
+    } else if schema.to_ascii_lowercase().starts_with("pg_") {
+        Err(format!(
+            "the schema name `{schema}` has the reserved `pg_` prefix"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The SQL that a migration in `schema` runs first.
+///
+/// It creates the schema and puts it first on `search_path`, so an
+/// unqualified `CREATE TABLE` goes into it. The old path stays after it, so
+/// diesel still finds `__diesel_schema_migrations`. `local` is true in a
+/// transaction: the change then ends with the transaction. If not, the old
+/// path is saved in `autumn.search_path_before` for [`SCHEMA_LEAVE_SQL`].
+fn schema_enter_sql(schema: &str, local: bool) -> String {
+    let ident = format!("\"{}\"", schema.replace('"', "\"\""));
+    let literal = ident.replace('\'', "''");
+    format!(
+        "CREATE SCHEMA IF NOT EXISTS {ident};\n\
+         SELECT set_config('autumn.search_path_before', current_setting('search_path'), {local});\n\
+         SELECT set_config('search_path', CASE WHEN current_setting('search_path') = '' \
+         THEN '{literal}' ELSE '{literal}, ' || current_setting('search_path') END, {local});"
+    )
+}
+
+/// Put back the `search_path` that [`schema_enter_sql`] saved. Only for a
+/// migration that runs outside a transaction.
+const SCHEMA_LEAVE_SQL: &str =
+    "SELECT set_config('search_path', current_setting('autumn.search_path_before'), false);";
+
+/// A migration source that runs every migration of `inner` in a named
+/// Postgres schema (#3550). With no schema it changes nothing.
+///
+/// Each migration first runs `CREATE SCHEMA IF NOT EXISTS` and puts the schema
+/// first on `search_path`. An unqualified table name in the migration then
+/// means a table in that schema. The change ends with the migration.
+/// The app wraps each registered set in it; a set with no schema passes
+/// through.
+pub struct SchemaMigrations<S> {
+    inner: S,
+    schema: Option<&'static str>,
+}
+
+impl<S> SchemaMigrations<S> {
+    /// Run `inner` in `schema`; `None` runs it as it is.
+    pub const fn new(inner: S, schema: Option<&'static str>) -> Self {
+        Self { inner, schema }
+    }
+}
+
+impl<DB, S> MigrationSource<DB> for SchemaMigrations<S>
+where
+    DB: diesel::backend::Backend + 'static,
+    S: MigrationSource<DB>,
+{
+    fn migrations(&self) -> diesel::migration::Result<Vec<Box<dyn Migration<DB>>>> {
+        let migrations = self.inner.migrations()?;
+        let Some(schema) = self.schema else {
+            return Ok(migrations);
+        };
+        validate_schema_name(schema)?;
+        Ok(migrations
+            .into_iter()
+            .map(|inner| Box::new(SchemaMigration { inner, schema }) as Box<dyn Migration<DB>>)
+            .collect())
+    }
+}
+
+/// One migration of a [`SchemaMigrations`] source.
+struct SchemaMigration<DB: diesel::backend::Backend + 'static> {
+    inner: Box<dyn Migration<DB>>,
+    schema: &'static str,
+}
+
+impl<DB: diesel::backend::Backend + 'static> SchemaMigration<DB> {
+    /// Run `step` with the schema first on `search_path`.
+    fn in_schema(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+        step: impl FnOnce(
+            &mut dyn diesel::connection::BoxableConnection<DB>,
+        ) -> diesel::migration::Result<()>,
+    ) -> diesel::migration::Result<()> {
+        let local = self.inner.metadata().run_in_transaction();
+        conn.batch_execute(&schema_enter_sql(self.schema, local))
+            .map_err(|e| {
+                format!(
+                    "migration {} could not enter schema `{}` (schemas need Postgres): {e}",
+                    self.inner.name(),
+                    self.schema
+                )
+            })?;
+        let outcome = step(conn);
+        if !local {
+            let left = conn.batch_execute(SCHEMA_LEAVE_SQL);
+            // A failed migration keeps its own error. The connection is not
+            // used again after it.
+            if outcome.is_ok() {
+                left?;
+            }
+        }
+        outcome
+    }
+}
+
+impl<DB: diesel::backend::Backend + 'static> Migration<DB> for SchemaMigration<DB> {
+    fn run(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.in_schema(conn, |conn| self.inner.run(conn))
+    }
+
+    fn revert(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.in_schema(conn, |conn| self.inner.revert(conn))
+    }
+
+    fn metadata(&self) -> &dyn diesel::migration::MigrationMetadata {
+        self.inner.metadata()
+    }
+
+    fn name(&self) -> &dyn diesel::migration::MigrationName {
+        self.inner.name()
     }
 }
 
@@ -5272,6 +5428,69 @@ mod tests {
                 "`{required}` must reach every shard target: {names:?}"
             );
         }
+    }
+
+    // ── Migrations into a named schema (#3550) ────────────────────────────
+
+    #[test]
+    fn schema_name_validation() {
+        assert!(validate_schema_name("marketing").is_ok());
+        assert!(validate_schema_name("We\"ird").is_ok());
+        for bad in ["", "pg_x", "PG_x", "a\0b", "a\nb", "a\rb"] {
+            assert!(validate_schema_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_schema_name(&"s".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn schema_enter_sql_puts_the_schema_first_and_keeps_the_old_path() {
+        let sql = schema_enter_sql("marketing", true);
+        assert!(
+            sql.starts_with("CREATE SCHEMA IF NOT EXISTS \"marketing\";"),
+            "{sql}"
+        );
+        assert!(sql.contains("'\"marketing\", ' || current_setting('search_path')"));
+        assert!(sql.contains("'autumn.search_path_before', current_setting('search_path'), true"));
+        assert!(schema_enter_sql("m", false).contains(", false);"));
+    }
+
+    #[test]
+    fn schema_enter_sql_escapes_quotes() {
+        let sql = schema_enter_sql("a\"b'c", true);
+        assert!(
+            sql.contains("CREATE SCHEMA IF NOT EXISTS \"a\"\"b'c\";"),
+            "{sql}"
+        );
+        assert!(sql.contains("'\"a\"\"b''c\", '"), "{sql}");
+    }
+
+    #[test]
+    fn schema_migrations_keep_names_and_order() {
+        const SET: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/boundary_marketing_migrations");
+        let names = |source: &dyn MigrationSource<Pg>| -> Vec<String> {
+            source
+                .migrations()
+                .expect("migrations")
+                .iter()
+                .map(|m| m.name().to_string())
+                .collect()
+        };
+        let plain = names(&SET);
+        assert_eq!(plain.len(), 2);
+        assert_eq!(names(&SchemaMigrations::new(SET, None)), plain);
+        assert_eq!(names(&SchemaMigrations::new(SET, Some("admin"))), plain);
+    }
+
+    #[test]
+    fn schema_migrations_reject_a_bad_schema() {
+        const SET: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        let source = SchemaMigrations::new(SET, Some("pg_bad"));
+        let Err(err) = MigrationSource::<Pg>::migrations(&source) else {
+            panic!("a bad schema must fail");
+        };
+        assert!(err.to_string().contains("pg_"), "{err}");
     }
 
     // ── Migration-version collision auto-resolution (plugin/app/framework) ─

@@ -99,6 +99,8 @@ mod data_capsule;
 mod data_capsule_pg;
 #[cfg(feature = "db")]
 mod data_classification;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod db_boundary_roles;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;

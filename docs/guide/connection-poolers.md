@@ -73,8 +73,16 @@ warn_on_pooler = false
 
 The environment variable is `AUTUMN_DATABASE__WARN_ON_POOLER=false`.
 
+## One role per boundary
+
+[Database boundaries](database-boundaries.md#connection-poolers) give each
+boundary its own login role. A pooler keeps a pool per (database, user) pair,
+so each role adds server connections. Transaction mode works, because the role
+is the login and not session state.
+
 ## Related
 
+- [Database boundaries](database-boundaries.md)
 - [Distributed locks](distributed-locks.md)
 - [Scheduled tasks across replicas](scheduled-multi-replica.md)
 - [Cloud-native Autumn](cloud-native.md#replication-lag-and-read-your-own-writes)

@@ -77,6 +77,15 @@ pub struct Boundary {
     /// that declare the models of the owned tables are used.
     #[serde(default)]
     pub schema_crates: Vec<String>,
+    /// The Postgres schema of this boundary (#3550). When set, the database
+    /// enforces the boundary: `autumn db grants` gives its role access to
+    /// this schema and to its exceptions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// The Postgres role of this boundary. Default: the boundary name. Needs
+    /// `schema`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl BoundaryConfig {
@@ -1135,7 +1144,7 @@ fn base_id(id: &str) -> &str {
 }
 
 /// Whether `text` matches `pattern`, where `*` matches any run.
-fn glob(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob(pattern: &str, text: &str) -> bool {
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or_default();
     let Some(mut rest) = text.strip_prefix(first) else {
