@@ -4236,14 +4236,7 @@ mod tests {
     fn default_call_name_may_end_in_any_name_character() {
         let pg = DatabaseBackend::Postgres;
         // `\u{a0}(0)` calls a function with the name U+00A0.
-        let calls = [
-            "f$()",
-            "fa\u{301}()",
-            "f\u{a0}()",
-            "\u{a0}(0)",
-            "\"F\"()",
-            "s.\"f\"()",
-        ];
+        let calls = ["f$()", "fa\u{301}()", "f\u{a0}()", "\u{a0}(0)"];
         for call in calls {
             let sql = format!("ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT {call};");
             assert_eq!(
@@ -4278,6 +4271,94 @@ mod tests {
         assert_eq!(sqlite_variable_len("$a(x\u{a0}y) z"), Some(8));
         let sql = "SELECT $a(x\u{a0}'y); DROP TABLE t; -- '";
         assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+    }
+
+    #[test]
+    fn quoted_name_before_parenthesis_is_not_a_call() {
+        // The `(` can start a column list (`REFERENCES "u"("id")`).
+        let pg = DatabaseBackend::Postgres;
+        for tail in [
+            "0 REFERENCES \"u\"(\"id\")",
+            "0::\"numeric\"(10,2)",
+            "\"now\"()",
+        ] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT {tail};");
+            assert!(
+                !ops(pg, &sql).iter().any(|op| op.contains("volatile")),
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_before_non_ascii_space_is_a_type_name() {
+        // `set<U+00A0>` is a type name, so this `DEFAULT` is not `SET DEFAULT`.
+        let sql = "ALTER TABLE t ADD COLUMN b set\u{a0} DEFAULT 1 NOT NULL;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), Vec::<String>::new());
+    }
+
+    #[test]
+    fn e_string_continues_after_a_newline() {
+        // Postgres joins `'..'` after white space with a newline to the
+        // literal before it. The joined part keeps the `E` escape rules.
+        let pg = DatabaseBackend::Postgres;
+        assert_eq!(quoted_len(pg, "E'a'\n'b'x", None), Some(8));
+        assert_eq!(quoted_len(pg, "E'a' -- c\n 'b'x", None), Some(14));
+        assert_eq!(quoted_len(pg, "E'a' 'b'", None), Some(4));
+        for gap in ["\n", " -- c\n", "\r\n\t"] {
+            let sql = format!("SELECT E''{gap}'\\''; DROP TABLE t; --'");
+            assert_eq!(ops(pg, &sql), ["DROP TABLE"], "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn sqlite_variable_name_may_hold_a_double_colon() {
+        assert_eq!(sqlite_variable_len("$a::b(x) y"), Some(8));
+        assert_eq!(sqlite_variable_len("$::(x)"), None);
+        for sql in [
+            "SELECT $a::(x'); DROP TABLE t; --'",
+            "SELECT :a::(x'); DROP TABLE t; --'",
+        ] {
+            assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"], "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn sqlite_variable_may_follow_a_word() {
+        // Only `$` is a name character, so `@`, `:` and `#` start a variable
+        // also right after a word.
+        for sigil in ['@', ':', '#'] {
+            let sql = format!("SELECT{sigil}a(x');DROP TABLE t;--'");
+            assert_eq!(
+                ops(DatabaseBackend::Sqlite, &sql),
+                ["DROP TABLE"],
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_default_is_constant_only_when_it_is_one_value() {
+        let lite = DatabaseBackend::Sqlite;
+        for default in ["('a' || random())", "(')' || random())", "(\u{a0}-1)"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b text DEFAULT {default};");
+            assert_eq!(
+                ops(lite, &sql),
+                ["ADD COLUMN (non-constant default)"],
+                "{sql:?}"
+            );
+        }
+        for default in ["('a')", "(')')", "x'00'", "('a''b')", "(-1)"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b text DEFAULT {default};");
+            assert_eq!(ops(lite, &sql), Vec::<String>::new(), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn review_marker_in_a_literal_suppresses_nothing() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT 'x\n-- autumn-safety: reviewed\n', \
+                   DROP COLUMN c;";
+        assert_eq!(ops(DatabaseBackend::Postgres, sql), ["DROP COLUMN"]);
     }
 
     /// The quoted spans in `sql`, in order.
