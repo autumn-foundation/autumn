@@ -40,7 +40,7 @@ idle_close_secs = 300           # close a database idle this long
 # restore_missing = false       # see "Replication" below
 # replica_retention_after_delete = "0s"  # see "Deleting a database's replica"
 # restore_check_sample = 1      # see "Restore check"
-# replication_workers = 4       # see "Replication lag"
+# replication_workers = 4       # see "Replication" below
 
 # [database.fleet.ownership]    # see "Failover: slot ownership" below
 # owner = "host-a"
@@ -699,7 +699,7 @@ costs data and time:
 
 | Cost | Bound | Default |
 | --- | --- | --- |
-| Data | The writes that the old host did not ship. In steady state, at most `rpo_secs` (see [Replication lag](#replication-lag)). At worst, the last `worst_lag_seconds` in `replication:fleet` before the failover. | 10 s (`rpo_secs`) |
+| Data | The writes that the old host did not ship. In steady state, at most `rpo_secs` (see [Replication](#replication-object-storage-between-volumes)). At worst, the last `worst_lag_seconds` in `replication:fleet` before the failover. | 10 s (`rpo_secs`) |
 | Time, old host crashed | At most `lease_secs + lease_secs / 3` after the last renew of the old host, plus the clock skew and the first restore. The lease ends, then the waiting host claims at its next renew interval (every `lease_secs / 3`). | 40 s |
 | Time, old lease already ended | At most `lease_secs / 3`: the next renew interval of the waiting host. | 10 s |
 

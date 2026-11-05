@@ -575,7 +575,7 @@ bound holds while one pass over these databases fits in
 `sync_interval_secs`. With many busy databases in one process, the bound can
 fail. Monitor `worst_lag_seconds` in `replication:fleet`. Set
 `database.fleet.replication_workers`. See
-[Replication lag](sqlite-fleet.md#replication-lag).
+[Replication](sqlite-fleet.md#replication-object-storage-between-volumes).
 
 That bound covers the machine *disappearing*. A **planned** stop — a deploy, a
 restart, a `SIGTERM` — loses nothing: once in-flight requests have drained, the
