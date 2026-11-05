@@ -24,8 +24,8 @@
 //!
 //! - In a plain `'..'` literal, `\` does not escape a quote. This is Postgres
 //!   with `standard_conforming_strings = on`, the default since 9.1. The
-//!   scanner does not model the setting. A statement that can change it is
-//!   [`RiskLevel::ManualReview`] (#3528).
+//!   scanner does not track changes to the setting. A statement that can
+//!   change it is [`RiskLevel::ManualReview`] (#3528).
 
 use std::fmt;
 
@@ -808,8 +808,9 @@ fn token_at(
 /// | `$tag$..$tag$` block | none | yes | no |
 ///
 /// `E'` and `$` start a span only at the start of a word: in `xe'..'` and
-/// `a$b$`, Postgres reads them as part of the identifier. An unclosed span
-/// runs to the end of `rest`.
+/// `a$b$`, Postgres reads them as part of the identifier. An `E'..'` span
+/// includes its continuations (see [`string_continuation_len`]). An unclosed
+/// span runs to the end of `rest`.
 fn quoted_len(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Option<usize> {
     let postgres = backend == DatabaseBackend::Postgres;
     let word_start = prev.is_none_or(|c| !is_identifier_char(c));
@@ -819,11 +820,40 @@ fn quoted_len(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Optio
         b'`' if !postgres => Some(doubled_quote_len(rest, '`')),
         b'[' if !postgres => Some(rest[1..].find(']').map_or(rest.len(), |p| p + 2)),
         b'e' | b'E' if postgres && word_start && rest[1..].starts_with('\'') => {
-            Some(1 + escape_string_len(&rest[1..]))
+            let mut len = 1 + escape_string_len(&rest[1..]);
+            // A continuation keeps the `E'..'` rules.
+            while let Some(gap) = string_continuation_len(&rest[len..]) {
+                len += gap + escape_string_len(&rest[len + gap..]);
+            }
+            Some(len)
         }
         b'$' if postgres && word_start => dollar_quote_len(rest),
         _ => None,
     }
+}
+
+/// Byte length of the gap before a string continuation at the start of
+/// `rest`, or `None` (#3528). Postgres joins two `'..'` strings when spaces
+/// and `--` comments with at least one line end separate them. Before the
+/// first line end, only a space, tab, form feed or comment can occur.
+fn string_continuation_len(rest: &str) -> Option<usize> {
+    let mut i = 0;
+    let mut newline = false;
+    while let Some(c) = rest[i..].chars().next() {
+        match c {
+            '\'' if newline => return Some(i),
+            '-' if rest[i..].starts_with("--") => {
+                i += line_comment_len(DatabaseBackend::Postgres, &rest[i..])?;
+                continue;
+            }
+            '\n' | '\r' => newline = true,
+            ' ' | '\t' | '\x0c' => {}
+            '\x0b' if newline => {}
+            _ => return None,
+        }
+        i += 1; // Each character above is one byte.
+    }
+    None
 }
 
 /// Whether `c` can be part of an identifier. Postgres and `SQLite` agree.
@@ -1022,26 +1052,99 @@ pub fn contains_concurrent_index(sql: &str) -> bool {
     })
 }
 
-/// The Postgres setting that sets how `\` works in `'..'` text.
+/// The Postgres setting that controls how `\` works in `'..'` text.
 const STANDARD_CONFORMING_STRINGS: &str = "standard_conforming_strings";
 
-/// Whether a Postgres statement can change `standard_conforming_strings`
-/// (#3528). The scanner reads `'..'` text with the setting on. It does not
-/// model a change.
-///
-/// The search includes quoted spans, thus `set_config('..')` and a `DO` body
-/// also match. A `SET` to an explicit true value does not match.
-fn changes_string_escape_mode(normalized: &str) -> bool {
-    normalized
-        .to_ascii_lowercase()
-        .contains(STANDARD_CONFORMING_STRINGS)
-        && !sets_standard_conforming_strings_on(normalized)
+/// A [`RiskLevel::ManualReview`] finding when a Postgres statement can change
+/// `standard_conforming_strings` (#3528).
+fn string_escape_mode_finding(normalized: &str) -> Option<SafetyFinding> {
+    changes_string_escape_mode(normalized).then(|| SafetyFinding {
+        operation: STRING_ESCAPE_MODE_OP.to_owned(),
+        risk: RiskLevel::ManualReview,
+        why: "With standard_conforming_strings off, `\\'` does not end '..' text. Autumn \
+              reads '..' text with the setting on. Autumn possibly misses a risky statement \
+              after this one.",
+        next_action: "Remove this statement. Use E'..' text for backslash escapes. If you must \
+                      keep it, examine the statements after it manually, also in later \
+                      migrations. Then add `-- autumn-safety: reviewed` above this statement.",
+    })
 }
 
-/// Whether `normalized` is `SET [SESSION | LOCAL] standard_conforming_strings`
-/// to an explicit true value, for example `= on` or `TO 'true'`.
-fn sets_standard_conforming_strings_on(normalized: &str) -> bool {
-    let Some(rest) = normalized.strip_prefix("set ") else {
+/// Whether a Postgres statement can change `standard_conforming_strings`.
+/// The scanner reads `'..'` text with the setting on.
+///
+/// These forms match, also in quoted text such as a `DO` body:
+///
+/// - `SET` or `RESET` before the name, as in `ALTER ROLE r SET ..`.
+/// - A `SET` or `RESET` of a `U&".."` name.
+/// - A `set_config` call, unless its first argument is a plain `'..'` name
+///   of a different setting.
+/// - An `UPDATE` of `pg_settings`.
+///
+/// A `SET` to an explicit true value does not match. Dynamic SQL can build
+/// the name in other ways. The scanner does not find those.
+fn changes_string_escape_mode(normalized: &str) -> bool {
+    let lower = normalized.to_ascii_lowercase();
+    if sets_standard_conforming_strings_on(&lower) {
+        return false;
+    }
+    lower
+        .match_indices(STANDARD_CONFORMING_STRINGS)
+        .any(|(i, _)| ends_with_set_keyword(&lower[..i]))
+        || lower
+            .match_indices("u&\"")
+            .any(|(i, _)| ends_with_set_keyword(&lower[..i]))
+        || set_config_can_change_it(&lower)
+        || lower.contains("update pg_settings")
+        || lower.contains("update pg_catalog.pg_settings")
+}
+
+/// Whether `before` ends with `SET` or `RESET`, then an optional `SESSION`
+/// or `LOCAL`, then an optional `"`. `before` is lowercase.
+fn ends_with_set_keyword(before: &str) -> bool {
+    let rest = before.trim_end().trim_end_matches('"').trim_end();
+    let rest = ["session", "local"]
+        .iter()
+        .find_map(|w| strip_word_suffix(rest, w))
+        .map_or(rest, str::trim_end);
+    ["set", "reset"]
+        .iter()
+        .any(|w| strip_word_suffix(rest, w).is_some())
+}
+
+/// `text` without the word `word` at its end, or `None`. The character
+/// before `word` must not be an identifier character.
+fn strip_word_suffix<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.strip_suffix(word)?;
+    rest.chars()
+        .next_back()
+        .is_none_or(|c| !is_identifier_char(c))
+        .then_some(rest)
+}
+
+/// Whether a `set_config` call in `lower` can name
+/// `standard_conforming_strings`. A call does not when its first argument is
+/// only a plain `'..'` literal with a different name.
+fn set_config_can_change_it(lower: &str) -> bool {
+    lower.match_indices("set_config").any(|(i, word)| {
+        let Some(args) = lower[i + word.len()..].trim_start().strip_prefix('(') else {
+            return false;
+        };
+        let Some(literal) = args.trim_start().strip_prefix('\'') else {
+            return true;
+        };
+        // Only `'name' ,` is a known name: not `'a''b'` or `'a' || 'b'`.
+        literal.find('\'').is_none_or(|end| {
+            !literal[end + 1..].trim_start().starts_with(',')
+                || &literal[..end] == STANDARD_CONFORMING_STRINGS
+        })
+    })
+}
+
+/// Whether `lower` is `SET [SESSION | LOCAL] standard_conforming_strings` to
+/// an explicit true value, for example `= on` or `TO 'true'`.
+fn sets_standard_conforming_strings_on(lower: &str) -> bool {
+    let Some(rest) = lower.strip_prefix("set ") else {
         return false;
     };
     let rest = ["session ", "local "]
@@ -1063,9 +1166,7 @@ fn sets_standard_conforming_strings_on(normalized: &str) -> bool {
         .strip_prefix('\'')
         .and_then(|v| v.strip_suffix('\''))
         .unwrap_or(value);
-    ["on", "true", "yes", "1"]
-        .iter()
-        .any(|v| value.eq_ignore_ascii_case(v))
+    ["on", "true", "yes", "1"].contains(&value)
 }
 
 /// `PostgreSQL` STABLE/IMMUTABLE function prefixes that are safe as NOT NULL column
@@ -1127,17 +1228,8 @@ fn classify_statement(
     }
 
     let mut findings = Vec::new();
-    if !sqlite && changes_string_escape_mode(normalized) {
-        findings.push(SafetyFinding {
-            operation: STRING_ESCAPE_MODE_OP.to_owned(),
-            risk: RiskLevel::ManualReview,
-            why: "When standard_conforming_strings is off, `\\'` is a quote in '..' text. \
-                  Autumn reads '..' text with the setting on. Thus Autumn can read the \
-                  statements after this one incorrectly and not find a risky statement.",
-            next_action: "Remove this setting. Use E'..' text for backslash escapes. If you \
-                          must keep the setting, examine all statements in this file manually. \
-                          Then add `-- autumn-safety: reviewed` above this statement.",
-        });
+    if !sqlite && let Some(f) = string_escape_mode_finding(normalized) {
+        findings.push(f);
     }
     // Some SQLite ADD COLUMN restrictions apply only to a table that already has
     // rows: NOT NULL without a usable default, a non-constant default, and a
@@ -2993,7 +3085,11 @@ mod tests {
             r#"ALTER TABLE t ADD COLUMN "a'b" int; DROP TABLE users; -- '"#,
         ] {
             let stmts = split_statements(pg, &strip_block_comments(pg, sql));
-            assert_eq!(stmts[1], "DROP TABLE users", "{sql}: {stmts:?}");
+            assert_eq!(
+                stmts.get(1).map(String::as_str),
+                Some("DROP TABLE users"),
+                "{sql}: {stmts:?}"
+            );
             assert_eq!(ops(pg, sql), ["DROP TABLE"], "{sql}");
         }
         // The same text does not merge two ALTER TABLE subcommands.
@@ -3029,9 +3125,37 @@ mod tests {
     }
 
     #[test]
+    fn escape_string_continuation_hides_no_statement() {
+        // Issue #3528. Postgres joins two `'..'` strings when a line end
+        // separates them. The second part keeps the `E'..'` escape rules.
+        let pg = DatabaseBackend::Postgres;
+        for gap in ["\n", " \t\n  ", "\r\n", " -- c\n", "\n-- c\n\x0b"] {
+            let sql = format!("SELECT E'a'{gap}'\\''; DROP TABLE users; --';");
+            assert_eq!(ops(pg, &sql), ["DROP TABLE"], "{sql:?}");
+        }
+        // The gap is part of the quoted span.
+        let lit = "E'a'\n-- c\n'\\'b'";
+        let texts: Vec<_> = tokens(pg, lit).collect();
+        assert_eq!(texts, [(TokenKind::Quoted, lit)]);
+        // A gap needs a line end, and holds only spaces and `--` comments.
+        assert_eq!(string_continuation_len(" '"), None);
+        assert_eq!(string_continuation_len("\x0b\n'"), None);
+        assert_eq!(string_continuation_len("\n/* c */\n'"), None);
+        assert_eq!(string_continuation_len("\n x'"), None);
+        assert_eq!(string_continuation_len("\n"), None);
+        assert_eq!(string_continuation_len("\n '"), Some(2));
+        // A plain first part keeps the plain rules.
+        let sql = "SELECT 'a'\n'\\'; DROP TABLE users; --';";
+        assert_eq!(ops(pg, sql), ["DROP TABLE"]);
+        // `SQLite` has no `E'..'` strings.
+        let sql = "SELECT E'a'\n'\\'; DROP TABLE users; --';";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+    }
+
+    #[test]
     fn string_escape_mode_change_requires_manual_review() {
-        // Issue #3528. With the setting off, `'\''` is one quote, so the
-        // scanner can read the later statements wrongly.
+        // Issue #3528. With the setting off, `\'` does not end `'..'` text.
+        // The scanner then possibly misreads later statements.
         let pg = DatabaseBackend::Postgres;
         for sql in [
             "SET standard_conforming_strings = off;",
@@ -3044,7 +3168,20 @@ mod tests {
             "SELECT set_config('standard_conforming_strings', 'off', false);",
             "SELECT set_config('Standard_Conforming_Strings', 'off', true);",
             "DO $$ BEGIN EXECUTE 'SET standard_conforming_strings = off'; END $$;",
+            "DO $$ BEGIN PERFORM SET_CONFIG('standard_conforming_strings', 'off', false); END $$;",
             "SET standard_conforming_strings = on, off;",
+            "SET standard_conforming_strings = 't';",
+            "ALTER ROLE app SET standard_conforming_strings = off;",
+            "ALTER DATABASE d RESET standard_conforming_strings;",
+            // Indirect spellings of the name.
+            r#"SET U&"\0073tandard_conforming_strings" = off;"#,
+            r"SELECT set_config(U&'standard\005fconforming_strings', 'off', false);",
+            r"SELECT set_config(E'standard\_conforming_strings', 'off', false);",
+            "SELECT set_config('standard_' || 'conforming_strings', 'off', false);",
+            "SELECT pg_catalog.set_config ( $n$standard_conforming_strings$n$, 'off', false);",
+            "SELECT set_config('it''s', 'off', false);",
+            "UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_' || 'conforming_strings';",
+            "UPDATE pg_catalog.pg_settings SET setting = 'off';",
         ] {
             let findings = classify_sql_for(pg, sql);
             assert!(
@@ -3056,12 +3193,17 @@ mod tests {
             );
             assert!(has_unsafe_findings(&findings), "{sql}");
         }
-        // The default value changes nothing.
+        // These statements make no finding.
         for sql in [
             "SET standard_conforming_strings = on;",
             "SET LOCAL standard_conforming_strings TO 'ON';",
             "set standard_conforming_strings=true;",
+            "SET \"standard_conforming_strings\" = on;",
             "SET statement_timeout = 0;",
+            "SELECT set_config('search_path', 'app', false);",
+            "SHOW standard_conforming_strings;",
+            "SELECT current_setting('standard_conforming_strings');",
+            "CREATE TABLE settings (standard_conforming_strings boolean);",
             "-- autumn-safety: reviewed\nSET standard_conforming_strings = off;",
         ] {
             assert_eq!(ops(pg, sql), Vec::<String>::new(), "{sql:?}");
@@ -3074,7 +3216,7 @@ mod tests {
         assert_eq!(ops(pg, sql), [STRING_ESCAPE_MODE_OP]);
     }
 
-    mod quoted_identifier_proptest {
+    mod scanner_proptest {
         use super::*;
         use proptest::prelude::*;
 
@@ -3095,16 +3237,26 @@ mod tests {
                 prop_assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{}", sql);
             }
 
-            /// Issue #3528. No `E'..'` text hides a later statement.
+            /// Issue #3528. No `E'..'` text hides a later statement. The
+            /// text is one quoted token, also when it continues on a new line.
             #[test]
             fn escape_string_hides_no_statement(
                 body in "[a-z;'\\\\$/*\\- \n]{0,12}",
                 doubled in any::<bool>(),
+                continued in any::<bool>(),
             ) {
+                let pg = DatabaseBackend::Postgres;
                 let quote = if doubled { "''" } else { "\\'" };
-                let lit = format!("E'{}'", body.replace('\\', "\\\\").replace('\'', quote));
+                let body = body.replace('\\', "\\\\").replace('\'', quote);
+                let lit = if continued {
+                    format!("E'x'\n'{body}'")
+                } else {
+                    format!("E'{body}'")
+                };
+                let texts: Vec<_> = tokens(pg, &lit).collect();
+                prop_assert_eq!(texts, vec![(TokenKind::Quoted, lit.as_str())]);
                 let sql = format!("SELECT {lit}; DROP TABLE x;");
-                prop_assert_eq!(ops(DatabaseBackend::Postgres, &sql), ["DROP TABLE"], "{}", sql);
+                prop_assert_eq!(ops(pg, &sql), ["DROP TABLE"], "{}", sql);
             }
 
             /// The token texts join back to the input.
