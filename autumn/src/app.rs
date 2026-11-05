@@ -17231,7 +17231,7 @@ mod fleet_boot_tests {
             crate::migrate::MigrationScope::Everywhere,
             Some("marketing"),
         )]);
-        let Err(err) = crate::db::fleet::build_for_app(&config, None, &all, |_| true) else {
+        let Err(err) = crate::db::fleet::build_for_app(&config, None, &all) else {
             panic!("a schema set must not reach a fleet");
         };
         assert!(err.contains("schema `marketing`"), "{err}");
