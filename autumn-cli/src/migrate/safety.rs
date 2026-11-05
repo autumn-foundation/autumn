@@ -382,13 +382,13 @@ const CREATE_INDEX_PG_OP: &str = "CREATE INDEX (non-concurrent)";
 /// so "non-concurrent" would be a meaningless qualifier there.
 const CREATE_INDEX_SQLITE_OP: &str = "CREATE INDEX";
 
-/// The value of an `add column` subcommand's `DEFAULT` clause, lowercased, or
-/// `None` when the subcommand carries no default.
+/// The value of an `add column` subcommand's `DEFAULT` clause, or `None` when
+/// the subcommand carries no default. The subcommand is normalized text.
 ///
 /// The keyword is matched at a word boundary, so `DEFAULT(0)` — valid SQL with
 /// no space — is read, while a column named `defaulted` is not.
 ///
-/// Three shapes are read whole rather than split on whitespace: a parenthesized
+/// Three shapes are read whole rather than split on white space: a parenthesized
 /// expression (`(lower(x))`), a quoted literal including one with spaces
 /// (`'a b'`, with `''` as the escaped quote), and a signed number (`-1`).
 /// A `DEFAULT` inside a foreign-key action (`ON UPDATE SET DEFAULT`) is not a
@@ -843,7 +843,8 @@ fn quoted_len(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Optio
 }
 
 /// Whether `c` can be part of an identifier. Postgres and `SQLite` agree.
-/// Each non-ASCII character is a name character, also a Unicode space.
+/// Each non-ASCII character is a name character. This includes Unicode spaces
+/// such as U+00A0.
 const fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii()
 }
@@ -1055,7 +1056,7 @@ pub fn normalize_statement(backend: DatabaseBackend, stmt: &str) -> String {
 /// Returns `true` when `sql` contains an executable concurrent index operation
 /// (`CREATE [UNIQUE] INDEX CONCURRENTLY` or `DROP INDEX CONCURRENTLY`).
 ///
-/// Uses the same comment-stripping and whitespace-normalization pipeline as
+/// Uses the same comment-stripping and white-space normalization pipeline as
 /// [`classify_sql_for`] so that concurrent index keywords mentioned only inside a
 /// SQL comment (e.g. `-- CREATE INDEX CONCURRENTLY ...`) are not counted.
 /// `CONCURRENTLY` is Postgres only, so the scan uses the Postgres dialect.
@@ -1077,9 +1078,9 @@ const STABLE_FN_PREFIXES: &[&str] = &["now(", "current_timestamp(", "localtimest
 /// Returns `true` when `default_expr` is a volatile function call that `PostgreSQL`
 /// cannot optimise via the PG 11+ fast-constant-default path.
 ///
-/// Only VOLATILE function calls are flagged.  Grouped constant expressions such as
-/// `(0)` or `('draft')` have `(` as the first non-space character (no identifier
-/// before the parenthesis) and are treated as constants — they use the fast path.
+/// Only VOLATILE function calls are flagged. A call has a name character just
+/// before its first `(`. A `(` in a quoted span is text. A grouped constant such
+/// as `(0)` has nothing or white space before the `(`, so it uses the fast path.
 /// STABLE/IMMUTABLE functions (e.g. `now()`) are also exempt via `STABLE_FN_PREFIXES`.
 fn is_volatile_function_default(backend: DatabaseBackend, default_expr: &str) -> bool {
     // A `(` in a quoted span is text: `'a(b'` is a constant.
@@ -4219,8 +4220,9 @@ mod tests {
 
     // ── Non-ASCII text (issue #3530) ─────────────────────────────────────────
     //
-    // Postgres and `SQLite` read each non-ASCII character as a name character,
-    // also a space or a combining mark. They fold the case of ASCII letters only.
+    // Postgres and `SQLite` read each non-ASCII character as a name character.
+    // This includes Unicode spaces and combining marks. They fold the case of
+    // ASCII letters only.
 
     /// Non-ASCII characters that are a space, a combining mark or a case
     /// variant in Unicode.
@@ -4230,7 +4232,8 @@ mod tests {
 
     #[test]
     fn non_ascii_case_variant_does_not_close_dollar_quote() {
-        // U+212A (Kelvin sign) lowercases to `k`. Postgres does not match it to `k`.
+        // The repro from issue #3530. U+212A (Kelvin sign) lowercases to `k`.
+        // Postgres does not match it to `k`.
         let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT $k$ $\u{212a}$ $k$, \
                    ADD COLUMN b int NOT NULL;";
         assert_eq!(
@@ -4265,8 +4268,14 @@ mod tests {
         ] {
             assert_eq!(ops(backend, new_table), Vec::<String>::new());
             assert_eq!(ops(backend, old_table), [op]);
+        }
+    }
+
+    #[test]
+    fn normalize_folds_ascii_case_and_ascii_space_only() {
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
             assert_eq!(
-                normalize_statement(backend, "SELECT \u{c9}\u{a0}A"),
+                normalize_statement(backend, "SELECT\t\u{c9}\u{a0}A\n"),
                 "select \u{c9}\u{a0}a"
             );
         }
@@ -4300,8 +4309,10 @@ mod tests {
         let pg = DatabaseBackend::Postgres;
         for literal in ["'a(b'", "$$(x)$$", "$t$f()$t$", "e'f()'"] {
             let sql = format!("ALTER TABLE t ADD COLUMN b text NOT NULL DEFAULT {literal};");
-            assert_eq!(ops(pg, &sql), Vec::<String>::new(), "{sql}");
+            assert_eq!(ops(pg, &sql), Vec::<String>::new(), "{sql:?}");
         }
+        let sql = "ALTER TABLE t ADD COLUMN b text NOT NULL DEFAULT 'a(b';";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), Vec::<String>::new());
     }
 
     #[test]
@@ -4401,27 +4412,31 @@ mod tests {
         assert_eq!(ops(DatabaseBackend::Postgres, sql), ["DROP COLUMN"]);
     }
 
-    /// The quoted spans in `sql`, in order.
-    fn quoted_spans(backend: DatabaseBackend, sql: &str) -> Vec<String> {
+    /// The quoted spans and the other tokens that are not white space in
+    /// `sql`, in order. Text out of a quoted span is lowercased (ASCII).
+    fn non_space_tokens(backend: DatabaseBackend, sql: &str) -> Vec<String> {
         tokens(backend, sql)
-            .filter(|(kind, _)| *kind == TokenKind::Quoted)
-            .map(|(_, text)| text.to_owned())
+            .filter(|(_, text)| !text.starts_with(is_sql_space))
+            .map(|(kind, text)| match kind {
+                TokenKind::Quoted => text.to_owned(),
+                _ => text.to_ascii_lowercase(),
+            })
             .collect()
     }
 
     proptest::proptest! {
-        /// A scan of a normalized statement reads the same quoted spans as a
-        /// scan of the statement. A second normalization changes nothing.
+        /// A scan of a normalized statement reads the same tokens as a scan of
+        /// the statement. A second normalization changes nothing.
         #[test]
         fn normalize_keeps_quoted_spans(
-            sql in r#"[aeEkxK\x{212a}\x{130}\x{a0}\x{301}\x{2028} \t\n\r$'"`\[\]\\;,()/*@:#\-]{0,24}"#,
+            sql in r#"[aeEkxK\x{212a}\x{130}\x{a0}\x{301}\x{2028} \t\n\r\x0b\x0c$'"`\[\]\\;,()/*@:#\-]{0,24}"#,
         ) {
             for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
                 let stripped = strip_line_comments(backend, &strip_block_comments(backend, &sql));
                 let normalized = normalize_statement(backend, &sql);
                 proptest::prop_assert_eq!(
-                    quoted_spans(backend, &stripped),
-                    quoted_spans(backend, &normalized)
+                    non_space_tokens(backend, &stripped),
+                    non_space_tokens(backend, &normalized)
                 );
                 proptest::prop_assert_eq!(normalize_statement(backend, &normalized), normalized);
             }
