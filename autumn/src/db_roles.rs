@@ -134,7 +134,9 @@ fn with_user(
         .split('&')
         .filter(|pair| {
             let key = pair.split_once('=').map_or(*pair, |(k, _)| k);
-            !pair.is_empty() && !matches!(key, "user" | "password" | "passfile")
+            // The driver decodes the name, so `%75ser` is `user`.
+            let key = percent_encoding::percent_decode_str(key).decode_utf8_lossy();
+            !pair.is_empty() && !matches!(key.as_ref(), "user" | "password" | "passfile")
         })
         .collect();
     let query = query.join("&");
@@ -362,6 +364,13 @@ mod tests {
             r.effective_url(Some("postgres://db/app?user=owner"))
                 .unwrap(),
             "postgres://marketing:pw@db/app"
+        );
+        assert_eq!(
+            r.effective_url(Some(
+                "postgres://db/app?%75ser=owner&%70assword=opw&sslmode=require"
+            ))
+            .unwrap(),
+            "postgres://marketing:pw@db/app?sslmode=require"
         );
     }
 

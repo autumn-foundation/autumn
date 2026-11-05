@@ -431,6 +431,12 @@ const ANY_TABLE_PRIVILEGE: &str = "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REF
 /// The privileges that a `may_read` table must not have.
 const WRITE_PRIVILEGE: &str = "INSERT, UPDATE, DELETE, TRUNCATE";
 
+/// The column privileges that a table outside the grant must not have.
+const ANY_COLUMN_PRIVILEGE: &str = "SELECT, INSERT, UPDATE, REFERENCES";
+
+/// The column privileges that a `may_read` table must not have.
+const WRITE_COLUMN_PRIVILEGE: &str = "INSERT, UPDATE";
+
 /// Connect as one role and check each table: its own tables and exceptions
 /// must open, and every other table must give `permission denied`.
 ///
@@ -465,14 +471,18 @@ pub async fn probe_role(url: &str, grants: &RoleGrants, schemas: &[String]) -> R
             .push((table.clone(), read(&client, table).await));
     }
     for table in &grants.read {
-        if has_privilege(&client, table, WRITE_PRIVILEGE).await == Some(true) {
+        if has_privilege(&client, table, WRITE_PRIVILEGE, WRITE_COLUMN_PRIVILEGE).await
+            == Some(true)
+        {
             probe.writes_read_only.push(table.clone());
         }
     }
     for table in &grants.denied {
         let access = match read(&client, table).await {
             Access::Denied
-                if has_privilege(&client, table, ANY_TABLE_PRIVILEGE).await == Some(true) =>
+                if has_privilege(&client, table, ANY_TABLE_PRIVILEGE, ANY_COLUMN_PRIVILEGE)
+                    .await
+                    == Some(true) =>
             {
                 Access::Writable
             }
@@ -520,16 +530,20 @@ async fn read(client: &tokio_postgres::Client, table: &QualifiedName) -> Access 
     }
 }
 
-/// Whether the role has any of `privileges` on `table`. `None` on an error.
+/// Whether the role has any of the table `privileges` on `table`, or any of
+/// the `column` privileges on one of its columns. `None` on an error.
 async fn has_privilege(
     client: &tokio_postgres::Client,
     table: &QualifiedName,
     privileges: &str,
+    column: &str,
 ) -> Option<bool> {
+    // A column grant does not show in `has_table_privilege`.
     client
         .query_one(
-            "SELECT has_table_privilege(current_user, $1::text::regclass, $2)",
-            &[&table.quoted(), &privileges],
+            "SELECT has_table_privilege(current_user, $1::text::regclass, $2) \
+             OR has_any_column_privilege(current_user, $1::text::regclass, $3)",
+            &[&table.quoted(), &privileges, &column],
         )
         .await
         .ok()

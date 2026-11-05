@@ -242,6 +242,20 @@ async fn grants_are_generated_applied_and_checked_by_doctor() {
     apply(root, &url);
     assert_eq!(doctor_roles(root, &url)["status"], "pass");
 
+    // A column grant: `has_table_privilege` does not show it. An apply
+    // removes it.
+    owner
+        .batch_execute("GRANT UPDATE (email) ON contacts TO mkt")
+        .await
+        .expect("column grant");
+    let check = doctor_roles(root, &url);
+    assert!(
+        detail(&check).contains("writes 1 `may_read` table(s): public.contacts"),
+        "{check}"
+    );
+    apply(root, &url);
+    assert_eq!(doctor_roles(root, &url)["status"], "pass");
+
     // A grant to PUBLIC: the REVOKE of a role cannot remove it. Doctor still
     // finds it after an apply.
     owner
