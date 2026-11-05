@@ -46,7 +46,7 @@ To compile and ship only the core, turn default features off and name the
 families you use:
 
 ```toml
-autumn-web = { version = "0.9", default-features = false, features = ["maud", "htmx", "widgets-search"] }
+autumn-web = { version = "0.10", default-features = false, features = ["maud", "htmx", "widgets-search"] }
 ```
 
 The `#[commentable]` router renders `comment_thread`, so it needs
@@ -227,7 +227,7 @@ alert, the badge and the wizard stepper:
 | `badge`, `badge--neutral` … `badge--danger` | `autumn-badge`, `autumn-badge--neutral` … `autumn-badge--danger` |
 | `wizard-progress`, `wizard-step`, `wizard-step--current`, … | `autumn-wizard-progress`, `autumn-wizard-step`, `autumn-wizard-step--current`, … |
 
-See the [migration guide](../migrations/next.md) for the full map.
+See the [migration guide](../migrations/0.10.0.md) for the full map.
 
 ## Coverage
 
