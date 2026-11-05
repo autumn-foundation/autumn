@@ -11742,9 +11742,9 @@ pub struct DatabaseFleetConfig {
     /// Turn on [`ownership`](Self::ownership) too, so the old owner is fenced
     /// first (ADR 0019 §7).
     ///
-    /// This setting is only for a missing file. With ownership and
-    /// `[replication]` on, a host that gets a range back restores a stale
-    /// file without this setting.
+    /// The restored database holds what the old owner shipped. After a crash,
+    /// up to `[replication] rpo_secs` of its committed writes are missing,
+    /// including writes whose requests already returned success.
     #[serde(default)]
     pub restore_missing: bool,
 
