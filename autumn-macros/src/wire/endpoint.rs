@@ -163,8 +163,11 @@ fn expand(attr: TokenStream, item: &TokenStream) -> Result<TokenStream, syn::Err
         args.service, name
     );
     let service = &args.service;
+    let track = store::track_contract_dir();
 
     Ok(quote! {
+        #track
+
         #[doc = #doc]
         #[allow(non_camel_case_types)]
         #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
@@ -456,5 +459,15 @@ mod tests {
             out.contains("const PATH : & 'static str = \"/items\""),
             "{out}"
         );
+    }
+
+    #[test]
+    fn the_expansion_tracks_the_contract_dir_variable() {
+        let out = expand_str(
+            "service = \"catalog\"",
+            "#[get(\"/items/{id}\")] pub async fn get_item(id: Path<String>) -> Json<Item> { todo!() }",
+        );
+        assert!(out.contains("option_env"), "{out}");
+        assert!(out.contains("AUTUMN_CONTRACT_DIR"), "{out}");
     }
 }

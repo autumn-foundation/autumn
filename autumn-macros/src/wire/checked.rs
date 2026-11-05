@@ -28,6 +28,7 @@ use syn::{Expr, Ident, ItemFn, LitStr, Path, Stmt, Token};
 
 use crate::wire::check::{self, CallSite, ViolationKind};
 use crate::wire::client::endpoint_table_ident;
+use crate::wire::ir::{CallerCall, CallerDescriptor, stable_key};
 use crate::wire::store;
 
 /// Parsed `#[contract_checked(...)]` arguments.
@@ -109,7 +110,40 @@ fn expand(attr: TokenStream, item: &TokenStream) -> Result<TokenStream, syn::Err
         .iter()
         .flat_map(|call| assertions_for(call, &args.clients[call.client], &caller))
         .collect();
-    Ok(quote! { #(#assertions)* #func })
+    if let Some(dir) = store::contract_dir() {
+        let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+        let descriptor = caller_descriptor(&krate, &caller, &calls, &args.clients);
+        store::write_caller(&dir, &descriptor, &stable_key(&item.to_string()));
+    }
+    let track = store::track_contract_dir();
+    Ok(quote! { #track #(#assertions)* #func })
+}
+
+/// The JSON descriptor for one checked function: what each call reads and
+/// writes. `autumn contracts export` uses it as the caller's read-set.
+fn caller_descriptor(
+    krate: &str,
+    caller: &str,
+    calls: &[Call],
+    clients: &[Path],
+) -> CallerDescriptor {
+    CallerDescriptor {
+        krate: krate.to_owned(),
+        function: caller.to_owned(),
+        calls: calls
+            .iter()
+            .map(|call| CallerCall {
+                client: last_ident(&clients[call.client]).to_string(),
+                method: call.method.to_string(),
+                reads: call.reads.clone(),
+                writes: call.writes.clone().map(|mut writes| {
+                    writes.sort();
+                    writes.dedup();
+                    writes
+                }),
+            })
+            .collect(),
+    }
 }
 
 /// The last segment of a path — a client's or marker's own name.
@@ -1212,5 +1246,39 @@ mod tests {
             "async fn page(catalog: CatalogClient) { let item = catalog.get_item(&id, NoBody).await.unwrap(); item.name }",
         );
         assert!(out.contains("item . name"), "{out}");
+    }
+
+    #[test]
+    fn the_caller_descriptor_holds_each_calls_read_and_write_sets() {
+        let func: ItemFn = syn::parse_str(
+            "async fn page(catalog: CatalogClient) { \
+               let item = catalog.get_item(&id, NoBody).await.unwrap(); let _ = (item.price, item.name); \
+               catalog.create_item(NewItem { price: 1, name: x, ..Default::default() }).await.unwrap(); }",
+        )
+        .expect("fixture parses");
+        let clients: Vec<Path> = vec![syn::parse_str("crate::CatalogClient").expect("client path")];
+        let calls = Analyzer::new(&clients).run(&func);
+        let got = caller_descriptor("storefront", "page", &calls, &clients);
+        assert_eq!(got.function, "page");
+        assert_eq!(got.calls.len(), 2);
+        assert_eq!(got.calls[0].client, "CatalogClient");
+        assert_eq!(got.calls[0].method, "get_item");
+        assert_eq!(got.calls[0].reads, ["name", "price"]);
+        assert_eq!(got.calls[0].writes, None);
+        assert_eq!(got.calls[1].method, "create_item");
+        assert_eq!(
+            got.calls[1].writes.as_deref(),
+            Some(["name".to_owned(), "price".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn the_expansion_tracks_the_contract_dir_variable() {
+        let out = expand_str(
+            "client = CatalogClient",
+            "async fn page(catalog: CatalogClient) { let _ = catalog.get_item(&id, NoBody).await.unwrap().name; }",
+        );
+        assert!(out.contains("option_env"), "{out}");
+        assert!(out.contains("AUTUMN_CONTRACT_DIR"), "{out}");
     }
 }

@@ -1,28 +1,42 @@
 #!/usr/bin/env python3
 """Seeded-mutation sweep for Autumn's wire contracts (issue #1755).
 
-Applies each mutation to `mesh-catalog`, rebuilds `mesh-storefront`, and reports
-how many wire-breaking changes turned the build red and how many compatible
-changes were falsely rejected. Restores the file when it finishes.
+Part 1 applies each mutation to `mesh-catalog`, rebuilds `mesh-storefront`, and
+reports how many wire-breaking changes turned the build red and how many
+compatible changes were falsely rejected.
+
+Part 2 is the two-release scenario. Release 1 is the committed bundle
+`examples/mesh-storefront/contracts/release-1.json`. Each case edits both
+services into a release 2 and runs `autumn contracts check` against release 1.
+The exit code and the named deploy order must match. Part 2 also exports the
+unchanged tree twice and requires the same bytes as the committed bundle.
+
+The script restores every file when it finishes.
 
 Run from the workspace root:
 
-    python3 examples/mesh-storefront/contract-sweep.py
+    python3 scripts/wire-contract-sweep.py
 
-Exits non-zero when a wire-breaking change builds green, or a compatible change
-does not.
+Set AUTUMN_BIN to use a built `autumn` binary. Otherwise the script builds one.
+Exits non-zero when any case does not give the expected result.
 """
 
+import os
 import subprocess
 import sys
+import tempfile
 
 LIB = 'examples/mesh-catalog/src/lib.rs'
+MAIN = 'examples/mesh-storefront/src/main.rs'
+RELEASE_1 = 'examples/mesh-storefront/contracts/release-1.json'
 BASE = open(LIB).read()
+BASE_MAIN = open(MAIN).read()
+PACKAGES = ['-p', 'mesh-catalog', '-p', 'mesh-storefront']
 
 WIRE_BREAKING = [
  ("response field removed", [("    /// Price in cents.\n    pub price_cents: u32,\n}", "}"),
-                             ("fn sample(id: String, name: String, price_cents: u32) -> Self {\n        Self {\n            id,\n            name,\n            price_cents,\n        }",
-                              "fn sample(id: String, name: String, _price_cents: u32) -> Self {\n        Self { id, name }")]),
+                             ("fn sample(id: String, name: String, price_cents: u32) -> Self {\n        Self {\n            subtitle: None,\n            id,\n            name,\n            price_cents,\n        }",
+                              "fn sample(id: String, name: String, _price_cents: u32) -> Self {\n        Self { subtitle: None, id, name }")]),
  ("response field renamed", [("    /// Display name.\n    pub name: String,\n    /// Price in cents.", "    /// Display name.\n    pub title: String,\n    /// Price in cents."),
                              ("            id,\n            name,\n            price_cents,", "            id,\n            title: name,\n            price_cents,")]),
  ("response field serde(skip)", [("    /// Display name.\n    pub name: String,\n    /// Price in cents.", "    /// Display name.\n    #[serde(skip)]\n    pub name: String,\n    /// Price in cents.")]),
@@ -62,6 +76,52 @@ COMPATIBLE = [
  ("a new endpoint added", [("/// The catalog service's routes.", '/// Count items.\n#[endpoint(service = "catalog")]\n#[get("/items")]\n#[public]\npub async fn count_items() -> AutumnResult<Json<Item>> {\n    Ok(Json(Item::sample("n".to_owned(), "n".to_owned(), 0)))\n}\n\n/// The catalog service\'s routes.')]),
 ]
 
+# Release 2 cases: (label, [(file, old, new)], exit code, text the report
+# must hold). Exit 0 is safe in any order, 1 is safe in no order, 2 is safe
+# only in the order the report names.
+DEPLOY_CALLERS_FIRST = 'Deploy mesh-storefront before catalog'
+DEPLOY_CALLEES_FIRST = 'Deploy catalog before mesh-storefront'
+CROSS_RELEASE = [
+ ("unchanged release", [], 0, 'safe in any deploy order'),
+ ("unread optional response field removed", [
+    (LIB, "    /// Shelf label. Optional, and no caller reads it, so a later release may\n    /// remove it.\n    pub subtitle: Option<String>,\n", ""),
+    (LIB, "            subtitle: None,\n", ""),
+ ], 0, 'safe in any deploy order'),
+ ("read response field removed, storefront stops reading it", [
+    (LIB, "    /// Price in cents.\n    pub price_cents: u32,\n}", "}"),
+    (LIB, "            name,\n            price_cents,\n        }", "            name,\n        }"),
+    (LIB, "fn sample(id: String, name: String, price_cents: u32)", "fn sample(id: String, name: String, _price_cents: u32)"),
+    (MAIN, '        p { "$" (item.price_cents / 100) }\n', ""),
+ ], 2, DEPLOY_CALLERS_FIRST),
+ ("new required request field", [
+    (LIB, "    /// Optional note. Absent from a request body is fine.", "    /// Stock code. Required.\n    pub sku: String,\n    /// Optional note. Absent from a request body is fine."),
+ ], 2, DEPLOY_CALLERS_FIRST),
+ ("new optional request field", [
+    (LIB, "    /// Optional note. Absent from a request body is fine.", "    /// Coupon code. Optional.\n    pub coupon: Option<String>,\n    /// Optional note. Absent from a request body is fine."),
+ ], 0, 'safe in any deploy order'),
+ ("new response field the new storefront reads", [
+    (LIB, "    /// Price in cents.\n    pub price_cents: u32,\n}", "    /// Price in cents.\n    pub price_cents: u32,\n    /// Promotion badge. Optional.\n    pub badge: Option<String>,\n}"),
+    (LIB, "            price_cents,\n        }", "            price_cents,\n            badge: None,\n        }"),
+    (MAIN, '        h1 { (item.name) }\n', '        h1 { (item.name) }\n        p { (item.badge.clone().unwrap_or_default()) }\n'),
+ ], 2, DEPLOY_CALLEES_FIRST),
+ ("path changed", [
+    (LIB, '#[get("/items/{id}")]', '#[get("/catalog/items/{id}")]'),
+ ], 1, 'not safe in any deploy order'),
+ ("path changed, old route kept", [
+    (LIB, '#[get("/items/{id}")]', '#[get("/catalog/items/{id}")]'),
+    (LIB, "/// The catalog service's routes.", '/// The old route of `get_item`, kept for deployed callers.\n#[endpoint(service = "catalog")]\n#[get("/items/{id}")]\n#[public]\npub async fn get_item_legacy(id: Path<String>) -> AutumnResult<Json<Item>> {\n    Ok(Json(Item::sample(id.to_string(), format!(\"Item {}\", *id), 1299)))\n}\n\n/// The catalog service\'s routes.'),
+    (LIB, "routes![get_item, create_item]", "routes![get_item, get_item_legacy, create_item]"),
+ ], 2, DEPLOY_CALLEES_FIRST),
+ ("method changed", [
+    (LIB, '#[get("/items/{id}")]', '#[post("/items/{id}")]'),
+ ], 1, 'not safe in any deploy order'),
+ ("path parameter renamed", [
+    (LIB, '#[get("/items/{id}")]\n#[public]\npub async fn get_item(id: Path<String>)', '#[get("/items/{item_id}")]\n#[public]\npub async fn get_item(item_id: Path<String>)'),
+    (LIB, "        id.to_string(),\n        format!(\"Item {}\", *id),", "        item_id.to_string(),\n        format!(\"Item {}\", *item_id),"),
+    (MAIN, "mesh_catalog::get_item_endpoint(id),", "mesh_catalog::get_item_endpoint(item_id),"),
+ ], 0, 'safe in any deploy order'),
+]
+
 def build():
     out = subprocess.run(['cargo','build','-p','mesh-storefront'], capture_output=True, text=True)
     text = out.stdout + out.stderr
@@ -76,13 +136,56 @@ def apply(edits):
         s = s.replace(old, new, 1)
     open(LIB,'w').write(s)
 
+def apply_release(edits):
+    files = {LIB: BASE, MAIN: BASE_MAIN}
+    for path, old, new in edits:
+        assert old in files[path], f'mutation text not found in {path}: {old!r}'
+        files[path] = files[path].replace(old, new, 1)
+    for path, text in files.items():
+        open(path, 'w').write(text)
 
-results = []
-for label, edits in WIRE_BREAKING:
-    apply(edits); results.append((label, 'red', build()))
-for label, edits in COMPATIBLE:
-    apply(edits); results.append((label, 'green', build()))
-open(LIB,'w').write(BASE)
+def restore():
+    open(LIB, 'w').write(BASE)
+    open(MAIN, 'w').write(BASE_MAIN)
+
+def autumn_bin():
+    explicit = os.environ.get('AUTUMN_BIN')
+    if explicit:
+        return explicit
+    subprocess.run(['cargo', 'build', '-q', '-p', 'autumn-cli'], check=True)
+    return os.path.join('target', 'debug', 'autumn')
+
+def contracts(binary, *args):
+    out = subprocess.run([binary, 'contracts', *args, *PACKAGES], capture_output=True, text=True)
+    return out.returncode, out.stdout, out.stderr
+
+try:
+    results = []
+    for label, edits in WIRE_BREAKING:
+        apply(edits); results.append((label, 'red', build()))
+    for label, edits in COMPATIBLE:
+        apply(edits); results.append((label, 'green', build()))
+    restore()
+
+    binary = autumn_bin()
+    stable = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for n in (1, 2):
+            out = os.path.join(scratch, f'export-{n}.json')
+            code, _, err = contracts(binary, 'export', '--out', out)
+            assert code == 0, err
+            stable.append(open(out, 'rb').read())
+    stable_ok = stable[0] == stable[1] == open(RELEASE_1, 'rb').read()
+
+    cross = []
+    for label, edits, want_code, want_text in CROSS_RELEASE:
+        apply_release(edits)
+        code, out, err = contracts(binary, 'check', '--against', RELEASE_1)
+        ok = code == want_code and want_text in out
+        cross.append((label, want_code, code, ok, out + err))
+    restore()
+finally:
+    restore()
 
 breaking = [r for r in results if r[1]=='red']
 compatible = [r for r in results if r[1]=='green']
@@ -95,7 +198,14 @@ print('---')
 print(f'wire-breaking: {len(breaking)}  turned the build red: {len(red)} ({100*len(red)//len(breaking)}%)  '
       f'named by the contract check: {len(caught)} ({100*len(caught)//len(breaking)}%)')
 print(f'compatible:    {len(compatible)}  falsely rejected: {len(false_pos)}')
+print('--- two releases: release 2 checked against release 1')
+for label, want, got, ok, text in cross:
+    print(f'{label:<56} want=exit {want} got=exit {got} {"ok" if ok else "WRONG"}')
+    if not ok:
+        print(text)
+cross_wrong = [c for c in cross if not c[3]]
+print(f'bundle byte-stable across two exports and equal to {RELEASE_1}: {stable_ok}')
 
 # The acceptance criterion is a CALLER-NAMED error, not merely a red build, so
 # the exit code gates on `caught` rather than on `red`.
-sys.exit(1 if false_pos or len(caught) < len(breaking) else 0)
+sys.exit(1 if false_pos or len(caught) < len(breaking) or cross_wrong or not stable_ok else 0)

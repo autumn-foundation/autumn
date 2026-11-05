@@ -149,14 +149,153 @@ literal) cannot compute for itself. Every assertion is emitted either way, so a
 descriptor that is missing, stale or wrong can mislabel a failure but can never
 cause or hide one.
 
-Two things follow from these being proc-macro side effects rather than declared
-build outputs. Cargo does not track them, so a callee restored from a build
-cache writes nothing and the enriched message quietly degrades to the plain one.
-And nothing deletes them, so a renamed endpoint leaves an orphan behind; when
-two descriptors claim one marker name, enrichment switches off rather than
-guessing.
+`wire_client!` writes a `client.*.json` file: the endpoint marker behind each
+method. `#[contract_checked]` writes a `caller.*.json` file: the read-set and
+write-set of each call. `autumn contracts export` uses these two to find what
+each deployed caller reads and sends.
+
+The descriptors are proc-macro side effects, not declared build outputs. A
+normal build writes nothing for a crate that cargo finds fresh, and the
+enriched message then falls back to the plain one. Nothing deletes old files,
+so a renamed endpoint leaves an orphan; when two descriptors claim one marker
+name, enrichment switches off rather than guessing. The export pass below does
+not have these problems.
 
 Set `AUTUMN_CONTRACT_DIR` to write them elsewhere, or to `""` to turn them off.
+The macros read this variable through `option_env!`, so cargo rebuilds a crate
+that uses them when the value changes.
+
+## Across releases
+
+`#[contract_checked]` proves that caller and callee agree at one commit. In a
+rolling deploy, two releases run at the same time. `autumn contracts` checks
+that they agree.
+
+### Publish the contract
+
+```bash
+autumn contracts export --out target/contracts.json
+```
+
+The export runs a dedicated `cargo check` pass with a new, empty
+`AUTUMN_CONTRACT_DIR`. Cargo sees a new value and runs every wire macro again,
+so a cached build cannot leave a descriptor out. The pass also turns off a
+rustc wrapper, such as `sccache`, for the same reason. The bundle is sorted
+JSON with no paths and no times. Two exports of the same source give the same
+bytes. Store the bundle with each release.
+
+Use `-p` to export some packages only. The default is the whole workspace.
+
+### Check against what is deployed
+
+```bash
+autumn contracts check --against <bundle | URL | git-ref>
+```
+
+`--against` takes a bundle file, an `http(s)` URL, or a git ref. For a git ref,
+the check exports that commit in a temporary worktree.
+
+The check looks at two deploy windows:
+
+| Window | Who runs together |
+|---|---|
+| callees ship first | new callees, deployed callers |
+| callers ship first | new callers, deployed callees |
+
+In each window, each caller uses the types of its own release. The callee
+serves with the types of its release. The rules:
+
+* **Route.** The callee must serve the caller's method and path. A deployed
+  route that no endpoint serves is a break, also with no known caller.
+  Path parameter names do not count: `/items/{id}` and `/items/{item_id}` are
+  the same route.
+* **Response read.** The callee must produce each field the caller reads.
+* **Response decode.** The callee must always produce each field the caller's
+  type needs to decode, also when the caller does not read it.
+* **Request required.** The caller must always send each field the callee
+  requires. A field is sent when the caller's type always serializes it, or
+  when the call site sets it.
+* **Request dropped.** The callee must accept each field the call site sets.
+* **Closed objects.** With `#[serde(deny_unknown_fields)]`, the other side must
+  not send an unknown key.
+* **Field types.** A field's Rust type must not change. Path prefixes do not
+  count: `std::string::String` is `String`.
+
+Fields match by JSON key and alias, not by Rust name. So a `#[serde(rename)]`
+that keeps the key is not a break, and a key rename with `#[serde(alias)]` is
+safe for requests that deployed callers send.
+
+So the callee may add an optional request field and may add a response field.
+It may not remove a response field a deployed caller reads, make a request
+field required that a deployed caller does not send, or change a path or method
+without keeping the old route.
+
+### Deploy order
+
+| Exit | Verdict |
+|---|---|
+| 0 | Safe in any order. |
+| 1 | Safe in no order. |
+| 2 | Safe in one order only. The report names it. |
+
+Some changes are safe in one order only. Remove a response field: the callers
+must first stop reading it, so they ship first. Read a new response field: the
+callee must first produce it, so it ships first. The report says which:
+
+```
+Verdict: safe only if the callers ship first.
+  Deploy mesh-storefront before catalog.
+  To declare this order, run with --order caller-first.
+```
+
+`--order callee-first` or `--order caller-first` declares the order you plan.
+The check then passes when that window is safe.
+
+### CI recipe
+
+Publish the bundle with each release, and check every pull request against it:
+
+```yaml
+# .github/workflows/contracts.yml
+name: Wire contracts
+on:
+  release:
+    types: [published]
+  pull_request:
+
+jobs:
+  publish:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install autumn-cli --locked
+      - run: autumn contracts export --out contracts.json
+      - run: gh release upload "${{ github.event.release.tag_name }}" contracts.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install autumn-cli --locked
+      - name: Fetch the deployed contract
+        run: gh release download --pattern contracts.json --output deployed.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: autumn contracts check --against deployed.json
+```
+
+`gh release download` with no tag gets the latest release. Put the tag of the
+deployed release there if it is not the latest. If a pull request needs a
+deploy order, the check exits 2; add `--order` to that step for the release
+that ships in that order.
 
 ## Refusals
 
@@ -197,11 +336,17 @@ initialised from the client's own constructor.
 * A field's recorded `ty` is the Rust type, not the wire type, so a
   `#[serde(with)]` representation change does not show up in the descriptor.
 * `Option<T>` is recognised by name, so a type alias for one reads as required.
-* No cross-version proof. Whether the set of versions live during a rolling
-  deploy is mutually compatible is the next slice, not this one.
+* The cross-release check compares two releases: the deployed one and the
+  current one. More than two live releases need one check per pair.
+* The cross-release check knows only the callers in the bundle. It cannot see
+  a client outside the workspace, so it keeps every deployed route.
+* The field type check compares Rust spellings. A type alias change reads as a
+  type change, and a `#[serde(with)]` wire change does not show.
 
 ## Worked example
 
 `examples/mesh-catalog` and `examples/mesh-storefront`. The storefront's README
-walks through a seeded breaking change and its fix, and
-`scripts/wire-contract-sweep.py` runs the whole mutation set.
+walks through a seeded breaking change and its fix, and a two-release scenario
+against the committed `contracts/release-1.json`.
+`scripts/wire-contract-sweep.py` runs the whole mutation set and the
+two-release cases.

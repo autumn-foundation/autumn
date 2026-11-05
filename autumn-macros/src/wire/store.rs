@@ -16,7 +16,29 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::wire::ir::{EndpointDescriptor, ResolvedEndpoint, TypeDescriptor, WireTypeDescriptor};
+use proc_macro2::TokenStream;
+use quote::quote;
+
+use crate::wire::ir::{
+    CallerDescriptor, ClientDescriptor, EndpointDescriptor, ResolvedEndpoint, TypeDescriptor,
+    WireTypeDescriptor,
+};
+
+/// The environment variable that names the contract directory.
+pub const CONTRACT_DIR_ENV: &str = "AUTUMN_CONTRACT_DIR";
+
+/// A const item that reads `AUTUMN_CONTRACT_DIR` through `option_env!`.
+///
+/// rustc then records the variable in the crate's dep-info, and cargo rebuilds
+/// the crate when the value changes. `autumn contracts export` sets a new
+/// directory for each pass, so every wire macro runs again and writes its
+/// descriptor. A crate restored from a build cache cannot skip the write.
+#[must_use]
+pub fn track_contract_dir() -> TokenStream {
+    quote! {
+        const _: ::core::option::Option<&str> = ::core::option_env!("AUTUMN_CONTRACT_DIR");
+    }
+}
 
 /// Resolve the contract directory from the given environment.
 ///
@@ -45,7 +67,7 @@ pub fn contract_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    let explicit = std::env::var_os("AUTUMN_CONTRACT_DIR");
+    let explicit = std::env::var_os(CONTRACT_DIR_ENV);
     if explicit.as_ref().is_some_and(|dir| dir.is_empty()) {
         return None;
     }
@@ -87,6 +109,18 @@ pub fn write_endpoint(dir: &Path, descriptor: &EndpointDescriptor) {
 /// Write one DTO's descriptor. Best effort — errors are swallowed.
 pub fn write_type(dir: &Path, descriptor: &TypeDescriptor) {
     write_json(dir, &descriptor.artifact_file_name(), descriptor);
+}
+
+/// Write one client's descriptor. Best effort — errors are swallowed.
+pub fn write_client(dir: &Path, descriptor: &ClientDescriptor) {
+    write_json(dir, &descriptor.artifact_file_name(), descriptor);
+}
+
+/// Write one caller's descriptor. Best effort — errors are swallowed.
+///
+/// `key` keeps two same-named functions in one crate apart.
+pub fn write_caller(dir: &Path, descriptor: &CallerDescriptor, key: &str) {
+    write_json(dir, &descriptor.artifact_file_name(key), descriptor);
 }
 
 /// Whether `file_name` is a plain file name that cannot escape its directory.

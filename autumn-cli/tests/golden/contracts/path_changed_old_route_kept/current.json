@@ -1,0 +1,289 @@
+{
+  "format": 1,
+  "endpoints": [
+    {
+      "service": "catalog",
+      "name": "create_item",
+      "krate": "mesh-catalog",
+      "method": "POST",
+      "path": "/items",
+      "request": {
+        "name": "NewItem",
+        "serialized": [
+          {
+            "rust_name": "name",
+            "wire_name": "name",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "note",
+            "wire_name": "note",
+            "ty": "Option<String>",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          },
+          {
+            "rust_name": "request_id",
+            "wire_name": "request_id",
+            "ty": "String",
+            "required": false
+          }
+        ],
+        "deserialized": [
+          {
+            "rust_name": "name",
+            "wire_name": "name",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "note",
+            "wire_name": "note",
+            "ty": "Option<String>",
+            "required": false
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          },
+          {
+            "rust_name": "request_id",
+            "wire_name": "request_id",
+            "ty": "String",
+            "required": true
+          }
+        ],
+        "closed": false
+      },
+      "response": {
+        "name": "Item",
+        "serialized": [
+          {
+            "rust_name": "id",
+            "wire_name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "name",
+            "wire_name": "name",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          },
+          {
+            "rust_name": "subtitle",
+            "wire_name": "subtitle",
+            "ty": "Option<String>",
+            "required": true
+          }
+        ],
+        "deserialized": [
+          {
+            "rust_name": "id",
+            "wire_name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "name",
+            "wire_name": "name",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          },
+          {
+            "rust_name": "subtitle",
+            "wire_name": "subtitle",
+            "ty": "Option<String>",
+            "required": false
+          }
+        ],
+        "closed": false
+      }
+    },
+    {
+      "service": "catalog",
+      "name": "get_item",
+      "krate": "mesh-catalog",
+      "method": "GET",
+      "path": "/catalog/items/{id}",
+      "request": {
+        "name": "NoBody",
+        "serialized": [],
+        "deserialized": [],
+        "closed": false
+      },
+      "response": {
+        "name": "Item",
+        "serialized": [
+          {
+            "rust_name": "id",
+            "wire_name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "name",
+            "wire_name": "name",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          },
+          {
+            "rust_name": "subtitle",
+            "wire_name": "subtitle",
+            "ty": "Option<String>",
+            "required": true
+          }
+        ],
+        "deserialized": [
+          {
+            "rust_name": "id",
+            "wire_name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "name",
+            "wire_name": "name",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          },
+          {
+            "rust_name": "subtitle",
+            "wire_name": "subtitle",
+            "ty": "Option<String>",
+            "required": false
+          }
+        ],
+        "closed": false
+      }
+    },
+    {
+      "service": "catalog",
+      "name": "get_item_legacy",
+      "krate": "mesh-catalog",
+      "method": "GET",
+      "path": "/items/{id}",
+      "request": {
+        "name": "NoBody",
+        "serialized": [],
+        "deserialized": [],
+        "closed": false
+      },
+      "response": {
+        "name": "Item",
+        "serialized": [
+          {
+            "rust_name": "id",
+            "wire_name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "name",
+            "wire_name": "name",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          },
+          {
+            "rust_name": "subtitle",
+            "wire_name": "subtitle",
+            "ty": "Option<String>",
+            "required": true
+          }
+        ],
+        "deserialized": [
+          {
+            "rust_name": "id",
+            "wire_name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "name",
+            "wire_name": "name",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          },
+          {
+            "rust_name": "subtitle",
+            "wire_name": "subtitle",
+            "ty": "Option<String>",
+            "required": false
+          }
+        ],
+        "closed": false
+      }
+    }
+  ],
+  "callers": [
+    {
+      "krate": "mesh-storefront",
+      "function": "add_item",
+      "service": "catalog",
+      "endpoint": "create_item",
+      "reads": [
+        "id"
+      ],
+      "writes": [
+        "name",
+        "price_cents",
+        "request_id"
+      ]
+    },
+    {
+      "krate": "mesh-storefront",
+      "function": "show_item",
+      "service": "catalog",
+      "endpoint": "get_item",
+      "reads": [
+        "name",
+        "price_cents"
+      ],
+      "writes": null
+    }
+  ]
+}
