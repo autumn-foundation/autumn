@@ -1,0 +1,93 @@
+=== recipient 1
+Aggregate  (cost=86.39..86.40 rows=1 width=8) (actual rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=6
+  ->  Index Only Scan using idx_notifications_unread on public.notifications  (cost=0.29..79.49 rows=2760 width=0) (actual rows=2461 loops=1)
+        Output: tenant_id, recipient_id
+        Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '1'::bigint))
+        Heap Fetches: 0
+        Buffers: shared hit=6
+Query Identifier: -7205966525969651028
+Planning:
+  Buffers: shared hit=118
+Planning Time: 0.397 ms
+Execution Time: 0.300 ms
+Limit  (cost=4852.81..4852.86 rows=20 width=120) (actual rows=20 loops=1)
+  Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+  Buffers: shared hit=2399
+  ->  Sort  (cost=4852.81..4859.71 rows=2760 width=120) (actual rows=20 loops=1)
+        Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+        Sort Key: notifications.created_at DESC, notifications.id DESC
+        Sort Method: top-N heapsort  Memory: 30kB
+        Buffers: shared hit=2399
+        ->  Index Scan using idx_notifications_unread on public.notifications  (cost=0.29..4779.37 rows=2760 width=120) (actual rows=2461 loops=1)
+              Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+              Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '1'::bigint))
+              Buffers: shared hit=2393
+Query Identifier: 6908552937042743349
+Planning:
+  Buffers: shared hit=30
+Planning Time: 0.150 ms
+Execution Time: 3.904 ms
+=== recipient 126
+Aggregate  (cost=4.33..4.34 rows=1 width=8) (actual rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=4
+  ->  Index Only Scan using idx_notifications_unread on public.notifications  (cost=0.29..4.33 rows=2 width=0) (actual rows=15 loops=1)
+        Output: tenant_id, recipient_id
+        Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '126'::bigint))
+        Heap Fetches: 0
+        Buffers: shared hit=4
+Query Identifier: -7205966525969651028
+Planning:
+  Buffers: shared hit=118
+Planning Time: 0.465 ms
+Execution Time: 0.078 ms
+Limit  (cost=10.09..10.09 rows=2 width=120) (actual rows=15 loops=1)
+  Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+  Buffers: shared hit=23
+  ->  Sort  (cost=10.09..10.09 rows=2 width=120) (actual rows=15 loops=1)
+        Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+        Sort Key: notifications.created_at DESC, notifications.id DESC
+        Sort Method: quicksort  Memory: 28kB
+        Buffers: shared hit=23
+        ->  Index Scan using idx_notifications_unread on public.notifications  (cost=0.29..10.08 rows=2 width=120) (actual rows=15 loops=1)
+              Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+              Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '126'::bigint))
+              Buffers: shared hit=17
+Query Identifier: 6908552937042743349
+Planning:
+  Buffers: shared hit=30
+Planning Time: 0.144 ms
+Execution Time: 0.117 ms
+=== recipient 3926
+Aggregate  (cost=4.33..4.34 rows=1 width=8) (actual rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=3
+  ->  Index Only Scan using idx_notifications_unread on public.notifications  (cost=0.29..4.33 rows=2 width=0) (actual rows=2 loops=1)
+        Output: tenant_id, recipient_id
+        Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '3926'::bigint))
+        Heap Fetches: 0
+        Buffers: shared hit=3
+Query Identifier: -7205966525969651028
+Planning:
+  Buffers: shared hit=118
+Planning Time: 0.505 ms
+Execution Time: 0.075 ms
+Limit  (cost=10.09..10.09 rows=2 width=120) (actual rows=2 loops=1)
+  Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+  Buffers: shared hit=10
+  ->  Sort  (cost=10.09..10.09 rows=2 width=120) (actual rows=2 loops=1)
+        Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+        Sort Key: notifications.created_at DESC, notifications.id DESC
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=10
+        ->  Index Scan using idx_notifications_unread on public.notifications  (cost=0.29..10.08 rows=2 width=120) (actual rows=2 loops=1)
+              Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+              Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '3926'::bigint))
+              Buffers: shared hit=4
+Query Identifier: 6908552937042743349
+Planning:
+  Buffers: shared hit=30
+Planning Time: 0.119 ms
+Execution Time: 0.044 ms

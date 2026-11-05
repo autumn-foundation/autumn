@@ -105,6 +105,15 @@ ignore = [
     # leaves out autumn-web's `jwt` feature (and `oauth2`, which turns it on).
     # Review-by: 2026-11-08.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x via jsonwebtoken ES256/ES384 (autumn-web `jwt` feature, default-on) -> p256/p384 -> elliptic-curve 0.13; fix needs crypto-bigint >=0.7.6; review-by 2026-11-08" },
+    # RUSTSEC-2026-0441 — `pin-utils` is unmaintained (upstream archived
+    # 2026-10-01).
+    # https://rustsec.org/advisories/RUSTSEC-2026-0441
+    #
+    # Ships pre-waived because no safe upgrade exists. It reaches an Autumn app
+    # through `loom`, which autumn-web depends on. It holds no unsound code;
+    # `core::pin::pin!` replaces its macros. Drop this waiver when `loom` stops
+    # depending on it. Review-by: 2026-12-05.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained, no safe upgrade; transitive via loom (autumn-web), no unsound code; review-by 2026-12-05" },
 ]
 
 # ── Licenses (optional) ─────────────────────────────────────────────────────

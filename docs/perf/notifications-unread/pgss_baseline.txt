@@ -1,0 +1,15 @@
+Output format is unaligned.
+n
+rows_read_by_filter_note
+(1 row)
+relname|seq_scan|seq_tup_read|idx_scan|idx_tup_fetch
+notifications|0|0|30|1695330
+(1 row)
+indexrelname|idx_scan|bytes
+notifications_pkey|0|44941312
+idx_notifications_tenant_recipient|30|19177472
+(2 rows)
+calls|buffers|shared_blks_hit|shared_blks_read|temp_blks_written|wal_bytes|q
+15|201710|5907|195803|0|0|SELECT id FROM notifications WHERE tenant_id = $1 AND recipient_id = $2 AND read_at IS NUL
+15|201545|5724|195821|0|0|SELECT COUNT(*) FROM notifications WHERE tenant_id = $1 AND recipient_id = $2 AND read_at 
+(2 rows)

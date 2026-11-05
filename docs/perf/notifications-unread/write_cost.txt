@@ -1,0 +1,12 @@
+ wal_bytes_insert_200k_all_unread 
+                         64716456
+ wal_bytes_mark_100k_read 
+                 42850728
+ index_bytes 
+ 12 MB
+ wal_bytes_insert_200k_all_unread 
+                         80873376
+ wal_bytes_mark_100k_read 
+                 42850744
+ index_bytes 
+ 14 MB

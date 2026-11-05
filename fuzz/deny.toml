@@ -42,6 +42,10 @@ ignore = [
     # it. One copy is left: 0.5.5 via elliptic-curve 0.13 <- p256/p384 0.13 <-
     # jsonwebtoken (ES256/ES384 JWT), same as root deny.toml. Review-by: 2026-11-08.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only, via jsonwebtoken ES256/ES384 -> p256/p384 0.13 -> elliptic-curve 0.13; no patched 0.5.x; review-by 2026-11-08" },
+    # RUSTSEC-2026-0441 — pin-utils unmaintained (upstream archived 2026-10-01).
+    # No safe upgrade exists. Transitive only; it holds no unsound code. Same
+    # entry as the root deny.toml. Review-by: 2026-12-05.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained, no safe upgrade; transitive only, no unsound code; same as root deny.toml; review-by 2026-12-05" },
 ]
 
 [sources]
