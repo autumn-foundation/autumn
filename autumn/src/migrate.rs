@@ -130,14 +130,14 @@ pub(crate) fn schema_registration_conflict(sets: &[RegisteredMigrations]) -> Opt
             let name = m.name().to_string();
             match seen.get(&name) {
                 Some(other) if other != schema => {
-                    let show = |s: &Option<&str>| {
+                    let show = |s: Option<&str>| {
                         s.map_or_else(|| "no schema".to_owned(), |s| format!("schema `{s}`"))
                     };
                     return Some(format!(
                         "migration `{name}` (set `{label}`) is registered with {} and with {}; \
                          register the set once",
-                        show(other),
-                        show(schema)
+                        show(*other),
+                        show(*schema)
                     ));
                 }
                 Some(_) => {}

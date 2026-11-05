@@ -15163,6 +15163,23 @@ mod sqlite_sharding_unsupported_guard_tests {
 /// `keep` selects one side by [`MigrationScope`](crate::migrate::MigrationScope):
 /// the control map and the shard map each read only the sets of their side.
 /// With no scoped set, both maps equal the map over every set.
+/// Build one pool per `[database.roles.<boundary>]` (#3550). With no roles,
+/// no extension: `pool_for` then gives the primary pool. A role that cannot
+/// get a pool stops the boot.
+#[cfg(feature = "db")]
+fn install_role_pools(state: &AppState, config: &AutumnConfig) {
+    if config.database.roles.is_empty() {
+        return;
+    }
+    match crate::db::create_role_pools(&config.database) {
+        Ok(pools) => state.insert_extension(pools),
+        Err(error) => {
+            tracing::error!(error = %error, "Failed to build the database role pools");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(feature = "db")]
 fn migration_sets_for_disambiguation(
     migrations: &[crate::migrate::RegisteredMigrations],
@@ -17735,18 +17752,8 @@ fn build_state(
             config.health.ping_timeout(),
         );
     }
-    // One pool per `[database.roles.<boundary>]` (#3550). With no roles, no
-    // extension: `pool_for` then gives the primary pool.
     #[cfg(feature = "db")]
-    if !config.database.roles.is_empty() {
-        match crate::db::create_role_pools(&config.database) {
-            Ok(pools) => state.insert_extension(pools),
-            Err(error) => {
-                tracing::error!(error = %error, "Failed to build the database role pools");
-                std::process::exit(1);
-            }
-        }
-    }
+    install_role_pools(&state, config);
     state.insert_extension(config.clone());
     state.insert_extension(crate::step_up::StepUpGlobalConfig {
         default_max_age_secs: config.auth.step_up.default_max_age_secs,
