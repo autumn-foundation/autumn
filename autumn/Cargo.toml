@@ -728,6 +728,11 @@ harness = false
 name = "metrics_record"
 harness = false
 
+# Fixed-iteration held-handle recording workload (profilers).
+[[bench]]
+name = "metrics_held"
+harness = false
+
 [[bench]]
 name = "form_render"
 harness = false
