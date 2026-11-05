@@ -16,3 +16,9 @@
 # pre-push gate alike — so the suite cannot pass on one machine and abort on
 # another. Raise it further if the CLI grows enough to overflow 16 MiB again.
 RUST_MIN_STACK = "16777216"
+
+[alias]
+# `cargo xtask <task>` runs the maintainer task runner in `xtask/`. Every CI
+# lint check and the pre-push gate are defined there; `cargo xtask list` shows
+# what it can run. See xtask/README.md.
+xtask = "run --package xtask --"

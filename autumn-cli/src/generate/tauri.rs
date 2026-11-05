@@ -712,7 +712,7 @@ tauri-build = {{ version = "2", features = [] }}
 [dependencies]
 tauri = {{ version = "2", features = [] }}
 tauri-plugin-shell = "2"
-getrandom = {{ version = "0.2", features = ["std"] }}
+getrandom = {{ version = "0.4", features = ["std"] }}
 
 [profile.release]
 panic = "abort"
@@ -1136,7 +1136,7 @@ fn load_or_generate_signing_secret(
     }}
     let mut bytes = [0u8; 32];
     // Propagate RNG failure — an all-zero secret would be trivially guessable.
-    getrandom::getrandom(&mut bytes)?;
+    getrandom::fill(&mut bytes)?;
     let hex: String = bytes.iter().map(|b| format!("{{b:02x}}")).collect();
     // Write with restricted permissions: signing secrets must not be world-readable.
     // On Unix create the file with mode 0600; on other platforms use the default ACLs.
@@ -3804,7 +3804,7 @@ mod tests {
              fail_fast_on_invalid_signing_secret and aborts before binding the HTTP port"
         );
         assert!(
-            lib.contains("getrandom::getrandom"),
+            lib.contains("getrandom::fill"),
             "load_or_generate_signing_secret must use getrandom to produce cryptographic \
              randomness; a weak source would allow signing secret prediction"
         );

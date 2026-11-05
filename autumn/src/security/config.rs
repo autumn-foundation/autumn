@@ -68,7 +68,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 
@@ -329,7 +329,7 @@ fn mac_hex(mac: &Hmac<Sha256>, message: &[u8]) -> String {
 }
 
 fn keyed_mac(key: &[u8]) -> Hmac<Sha256> {
-    <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length")
+    <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length")
 }
 
 impl ResolvedSigningKeys {
@@ -1565,11 +1565,11 @@ pub fn default_content_security_policy() -> String {
         .to_owned()
 }
 
-fn default_csrf_header() -> String {
+pub(super) fn default_csrf_header() -> String {
     "X-CSRF-Token".to_owned()
 }
 
-fn default_csrf_field() -> String {
+pub(super) fn default_csrf_field() -> String {
     "_csrf".to_owned()
 }
 

@@ -6,6 +6,34 @@ covers the advisory-lock serialisation that prevents schema divergence during
 rolling deploys, how to monitor contention, and what to expect on non-Postgres
 backends.
 
+Keep each Diesel `table!` at 32 columns or fewer. A wider declaration forces
+diesel's `64-column-tables` feature, which makes every crate that uses diesel
+slower to compile. A wide table is fine when Rust declares it in halves with
+`#[sql_name]`. `autumn build` warns when a migration widens a table past 32
+columns and no declaration splits it. See [Table width](./table-width.md).
+
+---
+
+## Scope: control only, or shards only
+
+`AppBuilder::migrations` sends a set to the control database and to every
+shard (`[[database.shards]]`, or each `[database.fleet]` file). Use
+`migrations_for` to keep a set on one side:
+
+```rust
+use autumn_web::migrate::MigrationScope;
+
+autumn_web::app()
+    .migrations_for(MigrationScope::Control, CONTROL_MIGRATIONS)
+    .migrations_for(MigrationScope::Shards, TENANT_MIGRATIONS)
+```
+
+Boot and `AUTUMN_MIGRATE=1` obey the scope. The `autumn migrate` and
+`autumn fleet migrate` commands read `migrations/` and do not know a scope.
+Do not run `autumn migrate` on an app with a scoped set: use
+`AUTUMN_MIGRATE=1`.
+See [SQLite fleet: migrations](sqlite-fleet.md#control-only-and-tenant-only-sets).
+
 ---
 
 ## Advisory lock serialisation

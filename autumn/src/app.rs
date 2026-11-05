@@ -83,6 +83,7 @@ pub fn app() -> AppBuilder {
         api_versions: Vec::new(),
         route_sources: Vec::new(),
         current_plugin: None,
+        current_group: None,
         tasks: Vec::new(),
         one_off_tasks: Vec::new(),
         jobs: Vec::new(),
@@ -93,7 +94,9 @@ pub fn app() -> AppBuilder {
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
+        merge_router_groups: Vec::new(),
         nest_routers: Vec::new(),
+        nest_router_groups: Vec::new(),
         custom_layers: Vec::new(),
         static_gate_layers: Vec::new(),
         startup_hooks: Vec::new(),
@@ -434,6 +437,9 @@ pub struct AppBuilder {
     /// Non-None while a plugin's `build()` is executing; routes and scoped
     /// groups added during that window are attributed to this plugin.
     current_plugin: Option<String>,
+    /// The route group of the plugin whose `build()` runs (#3544). `None`:
+    /// [`RouteGroup::DEFAULT`](crate::RouteGroup::DEFAULT).
+    current_group: Option<crate::route::RouteGroup>,
     pub(crate) tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
     pub(crate) jobs: Vec<crate::job::JobInfo>,
@@ -447,7 +453,12 @@ pub struct AppBuilder {
     pub(crate) exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     pub(crate) scoped_groups: Vec<ScopedGroup>,
     pub(crate) merge_routers: Vec<axum::Router<AppState>>,
+    /// Parallel to `merge_routers`: the route group of each router. `None`:
+    /// shared, mounted on every role (#3544).
+    pub(crate) merge_router_groups: Vec<Option<crate::route::RouteGroup>>,
     pub(crate) nest_routers: Vec<(String, axum::Router<AppState>)>,
+    /// Parallel to `nest_routers`. See `merge_router_groups`.
+    pub(crate) nest_router_groups: Vec<Option<crate::route::RouteGroup>>,
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
     pub(crate) custom_layers: Vec<CustomLayerRegistration>,
@@ -480,7 +491,7 @@ pub struct AppBuilder {
     /// `"app"`) or [`Self::plugin_migrations`] (tagged with the caller's
     /// `name`) — see [`Self::plugin_migrations`] for why the name matters.
     #[cfg(feature = "db")]
-    migrations: Vec<(&'static str, migrate::EmbeddedMigrations)>,
+    migrations: Vec<migrate::RegisteredMigrations>,
     /// Custom config loader (tier-1 subsystem replacement). When `None`, the
     /// default [`TomlEnvConfigLoader`](crate::config::TomlEnvConfigLoader) runs.
     config_loader_factory: Option<ConfigLoaderFactory>,
@@ -838,8 +849,81 @@ impl AppBuilder {
         for _ in &routes {
             self.route_sources.push(source.clone());
         }
+        let routes = self.stamp_group(routes);
         self.routes.extend(routes);
         self
+    }
+
+    /// Register routes in the route group `group` (#3544).
+    ///
+    /// A `[roles.<name>] mount = [...]` list selects groups. A route that
+    /// names its own group (`#[get("/x", group = "...")]`) keeps it.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_web::prelude::*;
+    /// # #[get("/")] async fn landing() -> &'static str { "" }
+    /// # #[get("/desk")] async fn desk() -> &'static str { "" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes_in("marketing", routes![landing])
+    ///     .routes_in("service", routes![desk])
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `group` is blank.
+    #[must_use]
+    #[track_caller]
+    pub fn routes_in(self, group: impl Into<crate::route::RouteGroup>, routes: Vec<Route>) -> Self {
+        let routes = crate::route_group::put_in_group(&group.into(), routes);
+        self.routes(routes)
+    }
+
+    /// Give each route without a group the group of the running plugin.
+    fn stamp_group(&self, routes: Vec<Route>) -> Vec<Route> {
+        match self.current_group.as_ref() {
+            Some(group) => crate::route_group::put_in_group(group, routes),
+            None => routes,
+        }
+    }
+
+    /// The route group of a raw router added now: the running plugin's
+    /// group, else [`RouteGroup::DEFAULT`](crate::RouteGroup::DEFAULT).
+    fn current_route_group(&self) -> crate::route::RouteGroup {
+        self.current_group.clone().unwrap_or_default()
+    }
+
+    /// Keep only the routes of the groups `role` mounts (#3544).
+    ///
+    /// Framework routes are not in these lists, so every role keeps them.
+    /// Plugin asset routers are shared too. A role without `mount`, or a role
+    /// that serves no HTTP, keeps everything: a worker builds the probe-only
+    /// router anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownMountGroup`](crate::route_group::UnknownMountGroup)
+    /// when `mount` names a group that no route is in.
+    #[cfg(any(test, feature = "graph"))]
+    pub(crate) fn retain_mounted_groups(
+        &mut self,
+        role: &crate::config::Role,
+    ) -> Result<(), crate::route_group::UnknownMountGroup> {
+        crate::route_group::MountTargets {
+            routes: &mut self.routes,
+            route_sources: &mut self.route_sources,
+            scoped_groups: &mut self.scoped_groups,
+            merge_routers: &mut self.merge_routers,
+            merge_router_groups: &mut self.merge_router_groups,
+            nest_routers: &mut self.nest_routers,
+            nest_router_groups: &mut self.nest_router_groups,
+            declared_routes: &mut self.declared_routes,
+        }
+        .retain(role)
     }
 
     /// Register scheduled background tasks with the application.
@@ -1439,6 +1523,7 @@ impl AppBuilder {
             .map_or(crate::route_listing::RouteSource::User, |name| {
                 crate::route_listing::RouteSource::Plugin(name.clone())
             });
+        let routes = self.stamp_group(routes);
         self.scoped_groups.push(ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
@@ -1762,7 +1847,9 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn merge(mut self, router: axum::Router<AppState>) -> Self {
+        let group = self.current_route_group();
         self.merge_routers.push(router);
+        self.merge_router_groups.push(Some(group));
         self
     }
 
@@ -1803,8 +1890,21 @@ impl AppBuilder {
     /// }
     /// ```
     #[must_use]
-    pub fn nest(mut self, path: &str, router: axum::Router<AppState>) -> Self {
+    pub fn nest(self, path: &str, router: axum::Router<AppState>) -> Self {
+        let group = self.current_route_group();
+        self.nest_in(path, router, Some(group))
+    }
+
+    /// [`nest`](Self::nest) with an explicit route group. `None`: shared,
+    /// mounted on every role.
+    fn nest_in(
+        mut self,
+        path: &str,
+        router: axum::Router<AppState>,
+        group: Option<crate::route::RouteGroup>,
+    ) -> Self {
         self.nest_routers.push((path.to_owned(), router));
+        self.nest_router_groups.push(group);
         self
     }
 
@@ -1817,6 +1917,8 @@ impl AppBuilder {
     /// Routes are automatically attributed to the current plugin when called from
     /// within a plugin's `build()` method. The `source` field of each supplied
     /// `RouteInfo` is overwritten with that attribution.
+    /// A `RouteInfo` without a `group` gets the plugin route group, else
+    /// `app` (#3544). A role mount filters declared routes by that group.
     ///
     /// Declaring routes also makes a [`nest`](Self::nest) mount *coverage-clean*
     /// for `autumn routes audit`: a nested router is normally opaque and counts
@@ -1833,8 +1935,10 @@ impl AppBuilder {
         routes: impl IntoIterator<Item = crate::route_listing::RouteInfo>,
     ) -> Self {
         let source = self.current_route_source();
+        let group = self.current_route_group();
         for mut route in routes {
             route.source = source.clone();
+            route.group.get_or_insert_with(|| group.as_str().to_owned());
             // The asset-bundle marker is the framework's to set: only routes
             // `plugin_assets` generated may carry it, because the conformance
             // checks exempt a route that does.
@@ -1915,10 +2019,12 @@ impl AppBuilder {
         let source = self.current_route_source();
         for mut route in assets.route_infos() {
             route.source = source.clone();
+            // Shared: a page in any group can load these files.
+            route.group = None;
             self.declared_routes.push(route);
         }
         let mount = assets.mount_path();
-        self.nest(&mount, assets.nested_router())
+        self.nest_in(&mount, assets.nested_router(), None)
     }
 
     /// The route manifest this builder would dump for `autumn routes` —
@@ -2978,6 +3084,7 @@ impl AppBuilder {
     /// ```
     ///
     /// [`WebPush`]: crate::push::WebPush
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_push_subscription_store<S>(self, store: S) -> Self
     where
@@ -3018,6 +3125,7 @@ impl AppBuilder {
     ///
     /// [`WebPush`]: crate::push::WebPush
     /// [`PushTransport`]: crate::push::PushTransport
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_web_push(self, push: crate::push::WebPush) -> Self {
         self.state_initializer(move |state| {
@@ -3366,6 +3474,11 @@ impl AppBuilder {
     /// [`name`](crate::plugin::Plugin::name) is a no-op after the first: the
     /// duplicate emits a `tracing::warn!` and the builder is returned
     /// unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the plugin contract excludes this framework version, or if
+    /// [`route_group`](crate::plugin::Plugin::route_group) is blank.
     #[must_use]
     #[track_caller]
     pub fn plugin<P>(mut self, plugin: P) -> Self
@@ -3390,13 +3503,22 @@ impl AppBuilder {
             contract.registered_as = Some(name.as_ref().to_owned());
             self.plugin_contracts.push(contract);
         }
+        let group = plugin.route_group();
+        assert!(
+            !group.trim().is_empty(),
+            "plugin `{name}`: route_group() must not be blank"
+        );
         let name_str = name.into_owned();
         self.registered_plugins.insert(name_str.clone());
         // Save outer plugin context so nested plugin() calls don't permanently
         // clear it; restore it after this plugin's build() returns.
         let outer_plugin = self.current_plugin.replace(name_str);
+        let outer_group = self
+            .current_group
+            .replace(crate::route::RouteGroup::new(group));
         let mut result = plugin.build(self);
         result.current_plugin = outer_plugin;
+        result.current_group = outer_group;
         result
     }
 
@@ -3690,7 +3812,52 @@ impl AppBuilder {
     #[cfg(feature = "db")]
     #[must_use]
     pub fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
-        self.migrations.push(("app", migrations));
+        self.migrations
+            .push(("app", migrations, migrate::MigrationScope::Everywhere));
+        self
+    }
+
+    /// Register embedded migrations for some of the databases only.
+    ///
+    /// [`Self::migrations`] sends a set to the control database and to every
+    /// shard (`[[database.shards]]`, or each `[database.fleet]` file). Use
+    /// this method to keep a set on one side:
+    ///
+    /// - [`MigrationScope::Control`](migrate::MigrationScope::Control): the
+    ///   control database only. For control-plane tables, such as a table
+    ///   that records the state of each tenant.
+    /// - [`MigrationScope::Shards`](migrate::MigrationScope::Shards): every
+    ///   shard only. For tenant data.
+    ///
+    /// The set runs at the same points as [`Self::migrations`], with the
+    /// same auto-apply policy. `autumn migrate` and `autumn fleet migrate`
+    /// read the `migrations/` directory and do not know a scope. Keep the
+    /// control set out of `migrations/`. Do not run `autumn migrate` on the
+    /// app: it applies `migrations/` to the control database. Use
+    /// `AUTUMN_MIGRATE=1`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::migrate::{EmbeddedMigrations, MigrationScope, embed_migrations};
+    ///
+    /// const CONTROL: EmbeddedMigrations = embed_migrations!("migrations-control");
+    /// const TENANT: EmbeddedMigrations = embed_migrations!("migrations");
+    ///
+    /// autumn_web::app()
+    ///     .migrations_for(MigrationScope::Control, CONTROL)
+    ///     .migrations_for(MigrationScope::Shards, TENANT)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn migrations_for(
+        mut self,
+        scope: migrate::MigrationScope,
+        migrations: migrate::EmbeddedMigrations,
+    ) -> Self {
+        self.migrations.push(("app", migrations, scope));
         self
     }
 
@@ -3798,7 +3965,8 @@ impl AppBuilder {
         name: &'static str,
         migrations: migrate::EmbeddedMigrations,
     ) -> Self {
-        self.migrations.push((name, migrations));
+        self.migrations
+            .push((name, migrations, migrate::MigrationScope::Everywhere));
         self
     }
 
@@ -4119,19 +4287,22 @@ impl AppBuilder {
         let Self {
             routes,
             api_versions,
-            route_sources: _,
+            mut route_sources,
             current_plugin: _,
+            current_group: _,
             mut tasks,
             one_off_tasks: _,
             mut jobs,
             listeners,
             #[cfg(feature = "db")]
             outbox_handlers,
-            static_metas,
+            mut static_metas,
             exception_filters,
-            scoped_groups,
-            merge_routers,
-            nest_routers,
+            mut scoped_groups,
+            mut merge_routers,
+            mut merge_router_groups,
+            mut nest_routers,
+            mut nest_router_groups,
             custom_layers,
             static_gate_layers,
             startup_hooks,
@@ -4195,7 +4366,7 @@ impl AppBuilder {
             story_gallery,
             #[cfg(feature = "maud")]
                 widget_packs: _,
-            declared_routes,
+            mut declared_routes,
             plugin_asset_bundles: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
@@ -4216,12 +4387,25 @@ impl AppBuilder {
             inbound_mail_router,
         } = self;
 
+        // Names of the retention sweeps in `tasks`. The `retention`
+        // capability gates them, not `scheduler`. Names are unique (checked
+        // below), so a name identifies one task.
+        #[cfg_attr(
+            not(any(feature = "db", feature = "data-retention")),
+            allow(unused_mut)
+        )]
+        let mut retention_task_names: Vec<String> = Vec::new();
+
         // #1342: every `#[repository(..., retention(...))]` policy compiled
         // into this binary auto-registers here — no `tasks![...]` entry
         // required. `inventory`-collected, so this is a no-op allocation
         // when no model declares a policy.
         #[cfg(feature = "db")]
-        tasks.extend(crate::retention::collect_retention_tasks());
+        append_retention_tasks(
+            &mut tasks,
+            &mut retention_task_names,
+            crate::retention::collect_retention_tasks(),
+        );
 
         // `collect_retention_tasks()` catches collisions only among
         // retention-generated names; it cannot see hand-declared `tasks![...]`
@@ -4234,7 +4418,7 @@ impl AppBuilder {
             panic!("{error}");
         }
 
-        let all_routes = routes;
+        let mut all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
         let (mut config, telemetry_guard) = load_config_and_telemetry(
@@ -4255,7 +4439,7 @@ impl AppBuilder {
         let retention_tasks = crate::data_retention::framework_retention_tasks(&config.retention);
         #[cfg(feature = "data-retention")]
         if !retention_tasks.is_empty() {
-            tasks.extend(retention_tasks);
+            append_retention_tasks(&mut tasks, &mut retention_task_names, retention_tasks);
             // Re-validate: the merged-name check above ran before this task
             // existed, and an app is free to declare a `#[scheduled]` fn
             // named `autumn-retention-sweep`, which would otherwise spawn two
@@ -4272,8 +4456,7 @@ impl AppBuilder {
         // enqueues into an in-memory queue no worker can drain, and a worker
         // replica's queue starts empty. Reject it here, before any boot work,
         // rather than in `validate()`, so the doctor can still load the config.
-        // A combined role is always fine.
-        let role = config.role;
+        // A combined role is always fine. A named role is checked on its base.
         // Both config-only preconditions, through the same helper the no-boot
         // export calls — the split-role/durable-backend rule and the merged
         // scheduled-task-name check. The helper returns the message rather than
@@ -4281,28 +4464,6 @@ impl AppBuilder {
         // and the export has none.
         if let Err(message) = validate_config_preconditions(&config, &tasks) {
             tracing::error!("{message}");
-            #[cfg(feature = "managed-pg")]
-            crate::managed_pg::emergency_stop_async().await;
-            std::process::exit(1);
-        }
-
-        // The sqlite queue backs a split role only because both processes open
-        // the same file. Against an in-memory target each gets its own private
-        // database, so the web replica would enqueue where no worker can ever
-        // look — the same silent stranding, one step further in (issue #1907).
-        if crate::config::split_role_requires_file_backed_sqlite(
-            role,
-            &config.jobs.backend,
-            config.database.effective_primary_url(),
-        ) {
-            tracing::error!(
-                role = role.as_str(),
-                "process role '{}' with jobs.backend = \"sqlite\" requires a FILE-backed \
-                 database: an in-memory SQLite target is private to each process, so the web \
-                 replica would enqueue into a queue no worker process can see. Point \
-                 database.url at a sqlite:// file, or run the combined role.",
-                role.as_str(),
-            );
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
@@ -4352,6 +4513,52 @@ impl AppBuilder {
         {
             panic!("{message}");
         }
+
+        // 3b. Keep only the route groups this role mounts (#3544). The graph,
+        // the router, `OpenAPI` and MCP read the filtered lists. The check above
+        // ran on every route, so a narrow role does not fail it.
+        // `validate_config_preconditions` already resolved the role.
+        let mount_role = config
+            .resolve_role()
+            .unwrap_or_else(|_| crate::config::Role::from(crate::config::ProcessRole::Combined));
+        #[cfg(feature = "graph")]
+        let graph_elsewhere = graph_fleet_routes(
+            &all_routes,
+            &scoped_groups,
+            &declared_routes,
+            &config,
+            &mount_role,
+        );
+        let mount_targets = crate::route_group::MountTargets {
+            routes: &mut all_routes,
+            route_sources: &mut route_sources,
+            scoped_groups: &mut scoped_groups,
+            merge_routers: &mut merge_routers,
+            merge_router_groups: &mut merge_router_groups,
+            nest_routers: &mut nest_routers,
+            nest_router_groups: &mut nest_router_groups,
+            declared_routes: &mut declared_routes,
+        };
+        warn_on_groups_mounted_by_no_preset(&config, &mount_targets.groups());
+        let routes_before = static_route_keys(mount_targets.routes, mount_targets.scoped_groups);
+        if let Err(error) = mount_targets.retain(&mount_role) {
+            tracing::error!("{error}");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+        // A pre-rendered page of an unmounted route leaves the sitemap and
+        // the static layer too.
+        let dropped_pages = drop_unmounted_static_routes(
+            &mut static_metas,
+            &routes_before,
+            &static_route_keys(&all_routes, &scoped_groups),
+        );
+        let keep_page = |path: &str| {
+            !dropped_pages
+                .iter()
+                .any(|pattern| crate::route_group::path_matches(pattern, path))
+        };
 
         // 4. Log banner with profile info
         let profile_display = config.profile.as_deref().unwrap_or("none");
@@ -4448,38 +4655,21 @@ impl AppBuilder {
         if pool.is_some() || shards.is_some() {
             // Pool sizes multiply across shards: surface the total so
             // N-shard deployments notice the aggregate connection count.
-            let shard_max_connections = shards
-                .as_ref()
-                .map_or(0, crate::sharding::ShardSet::total_max_connections);
-            let control_max_connections = pool.as_ref().map_or(0, |topology| {
-                topology.primary().status().max_size
-                    + topology.replica().map_or(0, |p| p.status().max_size)
-            });
-            let total_max_connections = control_max_connections + shard_max_connections;
+            let budget = connection_budget(pool.as_ref(), shards.as_ref());
             tracing::info!(
                 primary_max_connections = config.database.effective_primary_pool_size(),
                 replica_configured = config.database.replica_url.is_some(),
                 replica_max_connections = config.database.effective_replica_pool_size(),
                 shard_count = shards.as_ref().map_or(0, crate::sharding::ShardSet::len),
-                total_max_connections,
+                total_max_connections = budget.total,
                 "Database topology configured"
             );
-            // Pool sizes multiply across shards; warn before the aggregate
-            // silently exhausts Postgres's server-side `max_connections`.
-            let warn_threshold = config.database.max_connections_warn_threshold;
-            if crate::config::should_warn_total_connections(total_max_connections, warn_threshold) {
-                tracing::warn!(
-                    total_max_connections,
-                    warn_threshold,
-                    "Aggregate database connection count is high: the control \
-                     topology and all shard pools together may open \
-                     {total_max_connections} connections (warn threshold \
-                     {warn_threshold}). Ensure each Postgres server's \
-                     max_connections (plus headroom for migrations and \
-                     psql) exceeds the pools that target it, or lower \
-                     database.pool_size. Set \
-                     database.max_connections_warn_threshold = 0 to silence."
-                );
+            for warning in connection_budget_warnings(
+                &budget,
+                config.database.max_connections_warn_threshold,
+                crate::config::open_file_limit(),
+            ) {
+                tracing::warn!(total_max_connections = budget.total, "{warning}");
             }
             // A transaction-mode pooler breaks session state (issue #3065).
             for warning in crate::db::pooler::pooler_warnings(&config.database) {
@@ -4529,6 +4719,14 @@ impl AppBuilder {
             shards,
             #[cfg(feature = "ws")]
             channels_backend,
+        );
+        // Resolved once. Each subsystem below reads its own field (#3542).
+        let capabilities = state.capabilities();
+        tracing::info!(
+            role = state.role().name(),
+            base = state.role().base().as_str(),
+            capabilities = ?capabilities.enabled().map(crate::config::Capability::as_str).collect::<Vec<_>>(),
+            "process role resolved"
         );
 
         // Tee clock reads into the capsule of whatever request took them, so a
@@ -4998,7 +5196,8 @@ impl AppBuilder {
             if jobs.is_empty() {
                 unused_redis_subsystems.push("jobs");
             }
-            unused_redis_subsystems.extend(crate::redis_health::unused_for_role(role));
+            unused_redis_subsystems
+                .extend(crate::redis_health::unused_for_role(state.role().base()));
             crate::redis_health::register_redis_health_indicators(
                 &config,
                 &state.health_indicator_registry,
@@ -5184,7 +5383,7 @@ impl AppBuilder {
         // completeness section names them, which is the honest answer to "what
         // does this process serve".
         #[cfg(feature = "graph")]
-        let (graph_mounted, graph_opaque) = if role.serves_http() {
+        let (graph_mounted, graph_opaque) = if capabilities.serves_http {
             (
                 graph_mounted_routes(
                     &all_routes,
@@ -5206,11 +5405,11 @@ impl AppBuilder {
         #[cfg(feature = "graph")]
         crate::graph::install(
             &state,
-            crate::graph::manifest::audit(&graph_mounted, graph_opaque),
+            crate::graph::manifest::audit_for_fleet(&graph_mounted, &graph_elsewhere, graph_opaque),
         );
 
-        let router_build = if role.serves_http() {
-            crate::router::try_build_router_with_static_inner(
+        let router_build = if capabilities.serves_http {
+            crate::router::try_build_router_with_static_pages(
                 all_routes,
                 &config,
                 state.clone(),
@@ -5243,6 +5442,7 @@ impl AppBuilder {
                     #[cfg(feature = "webmcp")]
                     webmcp,
                 },
+                Some(&keep_page),
             )
         } else {
             crate::router::try_build_probe_only_router(&config, state.clone())
@@ -5267,7 +5467,8 @@ impl AppBuilder {
         // mismatched public/private pair — is a hard boot failure rather than a
         // quiet fallback to "push disabled". The failure this guards is an app
         // that starts cleanly, records subscriptions, and silently delivers
-        // nothing (#1392). An app with no `[push]` block is unaffected.
+        // nothing (#1392). An app with no `[push]` block is unaffected. A build
+        // without the `push` feature refuses any `[push]` block here.
         if let Err(e) = config.validate_push() {
             tracing::error!("Invalid [push] configuration: {e}");
             #[cfg(feature = "managed-pg")]
@@ -5568,12 +5769,14 @@ impl AppBuilder {
         }
         let prestop_grace = config.server.prestop_grace_secs;
 
+        // A preset `pin` and `workers` replace `jobs.pin` and `jobs.workers`.
+        let role_jobs = role_job_config(state.role(), &config.jobs);
         if let Err(error) = initialize_job_runtime(
             jobs,
             &state,
             &server_shutdown,
-            &config.jobs,
-            role.runs_workers(),
+            &role_jobs,
+            capabilities.job_workers,
         ) {
             tracing::error!(error = %error, "job runtime initialization failed");
             // Post-DB failure: `process::exit` skips `on_shutdown`, so stop any
@@ -5615,14 +5818,14 @@ impl AppBuilder {
         }
 
         // Draining durable after-commit hook rows is background execution, so gate
-        // it on the process role exactly like the `#[job]` runtime above: a `web`
-        // replica must not claim or execute hook rows, while `worker` and
-        // `combined` replicas keep running it. The worker drains rows through a
+        // it on the `commit_hooks` capability: a `web` replica must not claim or
+        // execute hook rows, while `worker` and `combined` replicas keep running
+        // it. The worker drains rows through a
         // Postgres queue (in-process kick, polling and row-locked claiming). Under the
         // `sqlite` feature the runtime pool is a SQLite pool the Postgres worker
         // cannot drive, so the worker is not spawned.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
-        if role.runs_workers()
+        if capabilities.commit_hooks
             && let Some(pool) = state.pool().cloned()
         {
             #[cfg(feature = "ws")]
@@ -5640,10 +5843,10 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             );
         }
-        // The outbox relay is background work too: only roles that run
-        // workers send messages (issue #3062).
+        // The outbox relay is background work too: only a process with the
+        // `outbox_relay` capability sends messages (issue #3062).
         #[cfg(feature = "db")]
-        if role.runs_workers() {
+        if capabilities.outbox_relay {
             drop(crate::outbox::start_relay_worker(
                 state.clone(),
                 server_shutdown.child_token(),
@@ -5651,10 +5854,10 @@ impl AppBuilder {
         }
         // Repositories built over a shard pool (`with_pool`) enqueue durable
         // commit hooks into that shard's queue table; drain each one too — again
-        // only on a role that runs workers, so a web replica leaves shard hook
-        // rows for the worker tier.
+        // only with the `commit_hooks` capability, so a web replica leaves shard
+        // hook rows for the worker tier.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
-        if role.runs_workers()
+        if capabilities.commit_hooks
             && let Some(shards) = state.shards()
         {
             for shard in shards.iter() {
@@ -5674,10 +5877,10 @@ impl AppBuilder {
         // SQLite durable commit-hook worker (#1996 item 5): the runtime pool is a
         // single-node SQLite pool the Postgres queue worker cannot drive, so the
         // SQLite worker (BEGIN IMMEDIATE claim + in-process Notify kick + poll
-        // fallback) is spawned instead — same `role.runs_workers()` gate and same
+        // fallback) is spawned instead — same `commit_hooks` gate and same
         // `server_shutdown.child_token()` graceful-drain wiring as the Postgres tier.
         #[cfg(all(feature = "db", feature = "sqlite"))]
-        if role.runs_workers()
+        if capabilities.commit_hooks
             && let Some(pool) = state.pool().cloned()
         {
             #[cfg(feature = "ws")]
@@ -5953,7 +6156,7 @@ impl AppBuilder {
                         );
                         leadership_degraded = config.scheduler.backend.is_fleet_distributed();
                         std::sync::Arc::new(crate::scheduler::InProcessSchedulerCoordinator::new(
-                            config.scheduler.resolved_replica_id(),
+                            config.scheduler.resolved_replica_id_for(state.role()),
                         ))
                     }
                 };
@@ -6425,10 +6628,13 @@ impl AppBuilder {
             };
 
         if !state.probes().is_shutting_down() {
-            // Web role runs no cron scheduler (workers/combined only). Skipping
-            // the scheduler must not regress readiness: mark_startup_complete and
-            // signal_serve_ready below still run.
-            if role.runs_workers() && !tasks.is_empty() {
+            // The `scheduler` capability gates app tasks and the `retention`
+            // capability gates retention sweeps. Skipping the scheduler must not
+            // regress readiness: mark_startup_complete and signal_serve_ready
+            // below still run.
+            let tasks =
+                scheduled_tasks_for_capabilities(tasks, &retention_task_names, capabilities);
+            if !tasks.is_empty() {
                 if let Some(warning) =
                     in_process_fleet_warning(&config, &tasks, &crate::config::OsEnv)
                 {
@@ -6700,6 +6906,7 @@ impl AppBuilder {
             api_versions,
             route_sources: _,
             current_plugin: _,
+            current_group: _,
             tasks: _,
             one_off_tasks: _,
             jobs: _,
@@ -6710,7 +6917,9 @@ impl AppBuilder {
             exception_filters: _,
             scoped_groups,
             merge_routers: _,
+            merge_router_groups: _,
             nest_routers: _,
+            nest_router_groups: _,
             custom_layers,
             static_gate_layers: _,
             startup_hooks: _,
@@ -7359,9 +7568,11 @@ impl AppBuilder {
     /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
     /// Does not connect to a database or bind a TCP port.
     async fn run_dump_graph_mode(self) {
-        let (mounted, opaque) = self.dump_graph_surface().await;
-        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit(
-            &mounted, opaque,
+        let surface = self.dump_graph_surface().await;
+        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit_for_fleet(
+            &surface.mounted,
+            &surface.elsewhere,
+            surface.opaque,
         ));
     }
 
@@ -7372,21 +7583,44 @@ impl AppBuilder {
     /// own config through the builder's loader and plugin roots, as normal
     /// startup does. It starts no telemetry and opens no database. A config
     /// that fails to load falls back to defaults, so the graph still dumps.
-    /// A worker role gets the worker census, as at runtime.
-    async fn dump_graph_surface(self) -> (Vec<crate::graph::MountedRoute>, usize) {
-        let opaque = self.graph_opaque_router_count();
-        let config =
-            match try_load_config(self.config_loader_factory, self.plugin_config_roots).await {
-                Ok(config) => config,
-                Err(error) => {
-                    // Stdout carries the graph, so the warning goes to stderr.
-                    eprintln!("warning: config failed to load, graph uses defaults: {error}");
-                    crate::config::AutumnConfig::default()
-                }
+    /// A worker role gets the worker census, as at runtime. A role with
+    /// `mount` gets only its route groups (#3544).
+    async fn dump_graph_surface(mut self) -> GraphSurface {
+        let config = match try_load_config(
+            self.config_loader_factory.take(),
+            std::mem::take(&mut self.plugin_config_roots),
+        )
+        .await
+        {
+            Ok(config) => config,
+            Err(error) => {
+                // Stdout carries the graph, so the warning goes to stderr.
+                eprintln!("warning: config failed to load, graph uses defaults: {error}");
+                crate::config::AutumnConfig::default()
+            }
+        };
+        let role = config
+            .resolve_role()
+            .unwrap_or_else(|_| crate::config::Role::from(crate::config::ProcessRole::Combined));
+        let elsewhere = graph_fleet_routes(
+            &self.routes,
+            &self.scoped_groups,
+            &self.declared_routes,
+            &config,
+            &role,
+        );
+        if !role.serves_http() {
+            return GraphSurface {
+                mounted: graph_worker_mounted_routes(&config),
+                elsewhere,
+                opaque: 0,
             };
-        if !config.role.serves_http() {
-            return (graph_worker_mounted_routes(&config), 0);
         }
+        if let Err(error) = self.retain_mounted_groups(&role) {
+            eprintln!("\u{2717} Cannot dump the graph for an app that cannot start: {error}");
+            std::process::exit(1);
+        }
+        let opaque = self.graph_opaque_router_count();
         let mounted = graph_mounted_routes(
             &self.routes,
             &self.scoped_groups,
@@ -7395,7 +7629,11 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
             self.openapi.as_ref(),
         );
-        (mounted, opaque)
+        GraphSurface {
+            mounted,
+            elsewhere,
+            opaque,
+        }
     }
 
     #[cfg(feature = "graph")]
@@ -7637,16 +7875,39 @@ impl AppBuilder {
     /// protocol).
     #[cfg(feature = "openapi")]
     async fn run_dump_openapi_mode(self) {
+        match self.openapi_export().await {
+            Ok(json) => {
+                println!("{json}");
+                std::process::exit(0);
+            }
+            Err((code, message)) => {
+                eprintln!("{message}");
+                std::process::exit(code);
+            }
+        }
+    }
+
+    /// The `OpenAPI` document [`run_dump_openapi_mode`](Self::run_dump_openapi_mode)
+    /// prints, or the exit code and message it stops with.
+    #[cfg(feature = "openapi")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the export runs the serving path's checks in its order; splitting it hides the order"
+    )]
+    async fn openapi_export(self) -> Result<String, (i32, String)> {
         let Self {
-            routes,
-            scoped_groups,
+            mut routes,
+            mut route_sources,
+            mut scoped_groups,
             api_versions,
             openapi,
             config_loader_factory,
             plugin_config_roots,
-            merge_routers,
-            nest_routers,
-            declared_routes,
+            mut merge_routers,
+            mut merge_router_groups,
+            mut nest_routers,
+            mut nest_router_groups,
+            mut declared_routes,
             #[cfg(feature = "mcp")]
             mcp,
             #[cfg(feature = "mail")]
@@ -7657,12 +7918,14 @@ impl AppBuilder {
         } = self;
 
         let Some(openapi_config) = openapi else {
-            eprintln!(
-                "{marker}{reason}",
-                marker = crate::openapi::OPENAPI_UNAVAILABLE_MARKER,
-                reason = crate::openapi::OPENAPI_UNAVAILABLE_UNCONFIGURED,
-            );
-            std::process::exit(2);
+            return Err((
+                2,
+                format!(
+                    "{marker}{reason}",
+                    marker = crate::openapi::OPENAPI_UNAVAILABLE_MARKER,
+                    reason = crate::openapi::OPENAPI_UNAVAILABLE_UNCONFIGURED,
+                ),
+            ));
         };
 
         // Config only: `TelemetryProvider::init` can reach a collector or read
@@ -7702,8 +7965,42 @@ impl AppBuilder {
         // stops startup before anything route-shaped is even looked at.
         let tasks = merge_framework_scheduled_tasks(tasks, &config);
         if let Err(message) = validate_config_preconditions(&config, &tasks) {
-            eprintln!("\u{2717} Cannot export a spec for an app that cannot start: {message}");
-            std::process::exit(1);
+            return Err((
+                1,
+                format!("\u{2717} Cannot export a spec for an app that cannot start: {message}"),
+            ));
+        }
+
+        // `run()`'s own pre-router checks, in its order and on every route: an
+        // app with no routes, or with an unguarded mutating repository API under
+        // a production profile, never reaches router construction at all.
+        if let Err(message) = validate_pre_router_preconditions(&routes, &scoped_groups, &config) {
+            return Err((
+                1,
+                format!("\u{2717} Cannot export a spec for an app that cannot start: {message}"),
+            ));
+        }
+
+        // The document of a role lists only the route groups it mounts
+        // (#3544), as the served `/openapi.json` does.
+        if let Ok(role) = config.resolve_role() {
+            let retained = crate::route_group::MountTargets {
+                routes: &mut routes,
+                route_sources: &mut route_sources,
+                scoped_groups: &mut scoped_groups,
+                merge_routers: &mut merge_routers,
+                merge_router_groups: &mut merge_router_groups,
+                nest_routers: &mut nest_routers,
+                nest_router_groups: &mut nest_router_groups,
+                declared_routes: &mut declared_routes,
+            }
+            .retain(&role);
+            if let Err(error) = retained {
+                return Err((
+                    1,
+                    format!("\u{2717} Cannot export a spec for an app that cannot start: {error}"),
+                ));
+            }
         }
 
         // `.policy::<R, _>(...)` / `.scope::<R, _>(...)` are DEFERRED closures the
@@ -7744,8 +8041,10 @@ impl AppBuilder {
             config: &config,
             mcp_mount_path,
         }) {
-            eprintln!("\u{2717} Cannot export a spec for a router that cannot be built: {error}");
-            std::process::exit(1);
+            return Err((
+                1,
+                format!("\u{2717} Cannot export a spec for a router that cannot be built: {error}"),
+            ));
         }
 
         let mut openapi_config = openapi_config;
@@ -7756,12 +8055,8 @@ impl AppBuilder {
         let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
         let spec = crate::openapi::generate_spec(&openapi_config, &refs);
 
-        let json = crate::aeo::commerce::spec_json_with_mpp(&spec, &config).unwrap_or_else(|e| {
-            eprintln!("Failed to serialize OpenAPI spec: {e}");
-            std::process::exit(1);
-        });
-        println!("{json}");
-        std::process::exit(0);
+        crate::aeo::commerce::spec_json_with_mpp(&spec, &config)
+            .map_err(|e| (1, format!("Failed to serialize OpenAPI spec: {e}")))
     }
 
     /// Dump the effective drained-queue manifest as TOML and exit.
@@ -7917,9 +8212,20 @@ impl AppBuilder {
         // folds in the two standalone shard control sets too, matching
         // `run_startup_migrations`, so both paths reach the same decision
         // regardless of which runs first.
-        let disambiguation_sets =
-            migration_sets_for_disambiguation(&migrations, config.database.has_shards());
+        // One map per side: a control-only set and a shard-only set never
+        // share a database, so they never rename each other's versions.
+        let disambiguation_sets = migration_sets_for_disambiguation(
+            &migrations,
+            config.database.has_shards(),
+            crate::migrate::MigrationScope::reaches_control,
+        );
         let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
+        let shard_disambiguated =
+            crate::migrate::compute_migration_disambiguation(&migration_sets_for_disambiguation(
+                &migrations,
+                config.database.has_shards(),
+                crate::migrate::MigrationScope::reaches_shards,
+            ));
         #[cfg(feature = "sqlite")]
         let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
 
@@ -7956,7 +8262,7 @@ impl AppBuilder {
                         std::process::exit(1);
                     }
                     #[cfg(feature = "sqlite")]
-                    for (_, mig) in migrations.iter() {
+                    for mig in control_sets(&migrations) {
                         total += apply_pending_sqlite_or_exit(
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
@@ -7964,7 +8270,7 @@ impl AppBuilder {
                         );
                     }
                 } else {
-                    for (_, mig) in migrations.iter() {
+                    for mig in control_sets(&migrations) {
                         total += apply_pending_or_exit(
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
@@ -7979,13 +8285,10 @@ impl AppBuilder {
             // A `sqlite:` shard is rejected by the guard above, so every shard here
             // is Postgres.
             for (label, url) in &shard_targets {
-                for (_, mig) in migrations
-                    .iter()
-                    .filter(|(_, mig)| !migration_set_is_control_framework(mig))
-                {
+                for mig in shard_sets(&migrations) {
                     total += apply_pending_or_exit(
                         url,
-                        crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                        crate::migrate::DisambiguatedMigrations::new(mig, &shard_disambiguated),
                         label,
                         lock_policy,
                     );
@@ -8990,20 +9293,22 @@ impl AppBuilder {
     #[allow(clippy::too_many_lines)]
     async fn run_replay_mode(self, capsule_path: String) {
         let Self {
-            routes,
+            mut routes,
             api_versions,
             listeners,
             exception_filters,
-            scoped_groups,
-            merge_routers,
-            nest_routers,
+            mut scoped_groups,
+            mut merge_routers,
+            mut merge_router_groups,
+            mut nest_routers,
+            mut nest_router_groups,
             // Bound rather than dropped with the rest: a nested router is
             // opaque, so these declarations are the ONLY thing that lets the
             // collision preflight see inside a sandboxed plugin's mount.
             // Replaying with the nests but without them would skip the checks
             // and reach the axum mount panic the preflight exists to replace
             // with a refusal.
-            declared_routes,
+            mut declared_routes,
             custom_layers,
             state_initializers,
             config_loader_factory,
@@ -9219,6 +9524,29 @@ impl AppBuilder {
         // comment in `run()`.
         state.insert_extension(config.clone());
 
+        // Rebuild the router of the recorded role: only the route groups it
+        // mounts (#3544), as `run()` does. Two groups can own one path, so the
+        // unfiltered lists can fail the duplicate-route check.
+        if let Ok(role) = config.resolve_role() {
+            let retained = crate::route_group::MountTargets {
+                routes: &mut routes,
+                route_sources: &mut Vec::new(),
+                scoped_groups: &mut scoped_groups,
+                merge_routers: &mut merge_routers,
+                merge_router_groups: &mut merge_router_groups,
+                nest_routers: &mut nest_routers,
+                nest_router_groups: &mut nest_router_groups,
+                declared_routes: &mut declared_routes,
+            }
+            .retain(&role);
+            if let Err(error) = retained {
+                std::process::exit(crate::capsule::print_refusal(
+                    &format!("the application's router could not be rebuilt: {error}"),
+                    &path,
+                ));
+            }
+        }
+
         // Cloned before the builder consumes it, so a job capsule can dispatch
         // its handler against the same rebuilt state the router serves from.
         let router_state = state.clone();
@@ -9383,6 +9711,125 @@ pub(crate) fn is_dump_security_mode() -> bool {
 
 pub(crate) fn is_dump_jobs_mode() -> bool {
     std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
+}
+
+/// The `(name, mounted path)` of each top-level and scoped route. A static
+/// route meta matches its route by this key (#3544).
+fn static_route_keys(routes: &[Route], scoped_groups: &[ScopedGroup]) -> Vec<(String, String)> {
+    routes
+        .iter()
+        .map(|r| (r.name.to_owned(), r.path.to_owned()))
+        .chain(scoped_groups.iter().flat_map(|group| {
+            group.routes.iter().map(|r| {
+                (
+                    r.name.to_owned(),
+                    crate::router::join_nested_path(&group.prefix, r.path),
+                )
+            })
+        }))
+        .collect()
+}
+
+/// Drop the static route metas whose route the role mount removed (#3544).
+/// Returns their path patterns, so the static layer drops their pages too.
+///
+/// `before` and `after` are the [`static_route_keys`] before and after the
+/// filter. A meta with no route in `before` stays: no group owns it.
+fn drop_unmounted_static_routes(
+    static_metas: &mut Vec<crate::static_gen::StaticRouteMeta>,
+    before: &[(String, String)],
+    after: &[(String, String)],
+) -> Vec<&'static str> {
+    let mut dropped = Vec::new();
+    static_metas.retain(|meta| {
+        let owned = |keys: &[(String, String)]| {
+            keys.iter()
+                .any(|(name, path)| name == meta.name && path == meta.path)
+        };
+        let removed = owned(before) && !owned(after);
+        if removed {
+            dropped.push(meta.path);
+        }
+        !removed
+    });
+    dropped
+}
+
+/// Log a warning for each route group that no `[roles.<name>]` preset mounts
+/// (#3544).
+fn warn_on_groups_mounted_by_no_preset(
+    config: &crate::config::AutumnConfig,
+    groups: &std::collections::BTreeSet<String>,
+) {
+    for group in groups_to_warn_about(config, groups) {
+        tracing::warn!(
+            group = %group,
+            "route group \"{group}\" is mounted by no [roles.<name>] preset; add it to a \
+             mount list, or no process serves its routes"
+        );
+    }
+}
+
+/// The groups the boot warns about: none when no preset sets `mount`, else
+/// the groups that no preset mounts.
+fn groups_to_warn_about(
+    config: &crate::config::AutumnConfig,
+    groups: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    if !config.roles.values().any(|preset| preset.mount.is_some()) {
+        return Vec::new();
+    }
+    let groups: Vec<String> = groups.iter().cloned().collect();
+    crate::config::groups_mounted_by_no_preset(&config.roles, &groups)
+}
+
+#[cfg(feature = "graph")]
+/// The graph census of a role and of its fleet (#3544).
+pub(crate) struct GraphSurface {
+    /// The routes this role serves, framework routes included.
+    pub(crate) mounted: Vec<crate::graph::MountedRoute>,
+    /// The routes that another declared role serves and this role does not.
+    pub(crate) elsewhere: Vec<crate::graph::MountedRoute>,
+    /// Raw routers the graph cannot enumerate.
+    pub(crate) opaque: usize,
+}
+
+#[cfg(feature = "graph")]
+/// The routes another declared `[roles.<name>]` role mounts and `role` does
+/// not (#3544). The graph lists them in `completeness.mounted_elsewhere`, not
+/// as drift.
+fn graph_fleet_routes(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    declared_routes: &[crate::route_listing::RouteInfo],
+    config: &crate::config::AutumnConfig,
+    role: &crate::config::Role,
+) -> Vec<crate::graph::MountedRoute> {
+    let elsewhere = |group: &str| {
+        !role.mounts_group(group)
+            && config
+                .roles
+                .values()
+                .any(|preset| preset.mounts_group(group))
+    };
+    routes
+        .iter()
+        .filter(|route| elsewhere(route.group_name()))
+        .map(|route| graph_route_summary(route, None))
+        .chain(scoped_groups.iter().flat_map(|group| {
+            group
+                .routes
+                .iter()
+                .filter(|route| elsewhere(route.group_name()))
+                .map(move |route| graph_route_summary(route, Some(&group.prefix)))
+        }))
+        .chain(
+            declared_routes
+                .iter()
+                .filter(|route| route.group.as_deref().is_some_and(elsewhere))
+                .map(graph_declared_route_summary),
+        )
+        .collect()
 }
 
 #[cfg(feature = "graph")]
@@ -9680,8 +10127,9 @@ pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMo
             // Warn and fall through to a normal boot rather than exiting.
             // This var is read on *every* start, so exiting here would let a
             // stray value in a wrapping script or a shared environment take a
-            // production app down at boot. Mirrors `AUTUMN_ROLE`'s handling
-            // of an unrecognized value.
+            // production app down at boot. `AUTUMN_ROLE` is different: an
+            // unknown role stops the boot (#3541), because a wrong role runs
+            // the wrong work.
             eprintln!(
                 "Warning: {FRAMEWORK_RETENTION_ENV}={other:?} is not valid (expected \"report\" \
                  or \"purge\"), ignoring"
@@ -10207,6 +10655,39 @@ fn print_available_one_off_tasks(tasks: &[crate::task::OneOffTaskInfo]) {
             eprintln!("  {:<24} {}", task.name, task.description);
         }
     }
+}
+
+/// Append `retention_tasks` to `tasks`, and record each name in
+/// `retention_task_names` for [`scheduled_tasks_for_capabilities`].
+#[cfg_attr(not(any(feature = "db", feature = "data-retention")), allow(dead_code))]
+fn append_retention_tasks(
+    tasks: &mut Vec<crate::task::TaskInfo>,
+    retention_task_names: &mut Vec<String>,
+    retention_tasks: Vec<crate::task::TaskInfo>,
+) {
+    retention_task_names.extend(retention_tasks.iter().map(|task| task.name.clone()));
+    tasks.extend(retention_tasks);
+}
+
+/// The scheduled tasks that `capabilities` lets this process run, in order.
+///
+/// A task named in `retention_task_names` runs with the `retention`
+/// capability. Every other task runs with the `scheduler` capability.
+fn scheduled_tasks_for_capabilities(
+    tasks: Vec<crate::task::TaskInfo>,
+    retention_task_names: &[String],
+    capabilities: crate::config::RoleCapabilities,
+) -> Vec<crate::task::TaskInfo> {
+    tasks
+        .into_iter()
+        .filter(|task| {
+            if retention_task_names.contains(&task.name) {
+                capabilities.retention
+            } else {
+                capabilities.scheduler
+            }
+        })
+        .collect()
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -11237,6 +11718,28 @@ fn dump_jobs_manifest(
 ) -> String {
     synthesize_durable_listener_jobs(listeners, &mut jobs);
     crate::job::render_jobs_manifest(cfg, &jobs)
+}
+
+/// `jobs` with the `pin` and `workers` of a `[roles.<name>]` preset applied
+/// (#3543). Logs a warning when the preset `pin` replaces a different
+/// `jobs.pin`, for example one from `AUTUMN_JOBS__PIN` or `autumn serve --pin`.
+fn role_job_config(
+    role: &crate::config::Role,
+    jobs: &crate::config::JobConfig,
+) -> crate::config::JobConfig {
+    if let Some(pin) = role.pin()
+        && !jobs.pin.is_empty()
+        && jobs.pin != pin
+    {
+        tracing::warn!(
+            role = role.name(),
+            preset_pin = ?pin,
+            ignored_pin = ?jobs.pin,
+            "the [roles.{}] pin replaces jobs.pin",
+            role.name()
+        );
+    }
+    role.jobs_config(jobs).into_owned()
 }
 
 fn initialize_job_runtime(
@@ -12958,6 +13461,11 @@ async fn try_load_config(
         }
     }?;
 
+    // A build without the `jwt` feature cannot verify a tenant token. This
+    // runs for every loader, and only on the app's own boot path: a tool built
+    // with other features (the CLI) loads the same config without it.
+    config.validate_tenancy_source()?;
+
     // `autumn serve --daemon` binds the app on a private Unix socket and then
     // discovers/health-probes it by path. A custom `with_config_loader` can
     // construct its `ServerConfig` from scratch and silently drop the
@@ -13345,7 +13853,7 @@ async fn resolve_shard_set(
 #[allow(clippy::too_many_lines)]
 async fn setup_database(
     config: &AutumnConfig,
-    migrations: Vec<(&'static str, crate::migrate::EmbeddedMigrations)>,
+    migrations: Vec<crate::migrate::RegisteredMigrations>,
     pool_provider: Option<PoolProviderFactory>,
     shard_provider: Option<ShardProviderFactory>,
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
@@ -13378,6 +13886,9 @@ async fn setup_database(
     // (or warn about a pending directory migration) for a table it won't use.
     let use_directory_router = shard_router.is_none()
         && (directory_shard_router || config.database.directory_shard_router);
+    if let Some(warning) = unreachable_shard_sets_warning(config, &migrations) {
+        tracing::warn!("{warning}");
+    }
     // A fleet routes by its mode and path template, never by a router.
     #[cfg(feature = "sqlite")]
     if config.database.fleet.is_some() && shard_router.is_some() {
@@ -14051,9 +14562,9 @@ async fn start_fleet_ownership(
 ///
 /// The pending-work sweeper is installed in every role, so enqueue code marks
 /// its database. A failed install stops the process. Its loop runs only with
-/// `sweep` (a server, not a one-off task). A role that runs workers opens
-/// closed databases and relays their outbox; a `web` role drains the hooks of
-/// the databases it has open.
+/// `sweep` (a server, not a one-off task). A process with the `fleet_relay`
+/// capability opens closed databases and relays their outbox. Without it, the
+/// process drains the hooks of the databases it has open.
 #[cfg(feature = "sqlite")]
 async fn start_fleet_runtime(
     state: &AppState,
@@ -14076,7 +14587,7 @@ async fn start_fleet_runtime(
         channels: state.channels().clone(),
     }));
     let options = crate::db::fleet_sweeper::FleetSweeperOptions {
-        relay: state.role().runs_workers(),
+        relay: state.capabilities().fleet_relay,
         ..crate::db::fleet_sweeper::FleetSweeperOptions::default()
     };
     // Fatal: without the sweeper, enqueue code marks nothing, and work in a
@@ -14147,16 +14658,21 @@ fn start_fleet_replication(
     .with_retention_after_delete(fleet_config.map_or(std::time::Duration::ZERO, |f| {
         f.replica_retention_after_delete
     }))
-    // Worker roles only: the check downloads whole databases.
+    // The check downloads whole databases, so it needs its own capability.
     .with_restore_check(
         runtime.settings.verify_interval,
-        if state.role().runs_workers() {
+        if state.capabilities().restore_check {
             fleet_config.map_or(0, |f| f.restore_check_sample)
         } else {
             0
         },
     )
-    .with_entropy(state.entropy_arc());
+    .with_entropy(state.entropy_arc())
+    .with_ship_workers(
+        fleet_config.map_or(crate::db::fleet_replication::DEFAULT_SHIP_WORKERS, |f| {
+            f.replication_workers
+        }),
+    );
     if let Some(control) = state.pool() {
         replication = replication.with_tombstones(Arc::new(
             crate::db::fleet_tombstones::FleetTombstones::new(control.clone(), state.clock_arc()),
@@ -14269,7 +14785,7 @@ fn fleet_control_target_identified(
 #[cfg(feature = "sqlite")]
 async fn migrate_fleet_or_exit(
     config: &AutumnConfig,
-    migrations: Arc<Vec<(&'static str, crate::migrate::EmbeddedMigrations)>>,
+    migrations: Arc<Vec<crate::migrate::RegisteredMigrations>>,
 ) -> usize {
     let fleet = match crate::db::fleet::build_for_app(config, None, &migrations, |set| {
         !migration_set_is_control_framework(set)
@@ -14553,12 +15069,20 @@ mod sqlite_sharding_unsupported_guard_tests {
 /// avoid. The residual narrow case (a sharded app using an explicit custom
 /// router) may see a harmless, unnecessary disambiguation entry for a shard
 /// version it will never apply; that is safe, just imprecise.
+///
+/// `keep` selects one side by [`MigrationScope`](crate::migrate::MigrationScope):
+/// the control map and the shard map each read only the sets of their side.
+/// With no scoped set, both maps equal the map over every set.
 #[cfg(feature = "db")]
-fn migration_sets_for_disambiguation<'a>(
-    migrations: &'a [(&'static str, crate::migrate::EmbeddedMigrations)],
+fn migration_sets_for_disambiguation(
+    migrations: &[crate::migrate::RegisteredMigrations],
     shards_configured: bool,
-) -> Vec<(&'a str, &'a crate::migrate::EmbeddedMigrations)> {
-    let owned = migrations.iter().map(|(name, set)| (*name, set));
+    keep: impl Fn(crate::migrate::MigrationScope) -> bool,
+) -> Vec<(&str, &crate::migrate::EmbeddedMigrations)> {
+    let owned = migrations
+        .iter()
+        .filter(move |(_, _, scope)| keep(*scope))
+        .map(|(name, set, _)| (*name, set));
     if shards_configured {
         owned
             .chain([
@@ -14585,7 +15109,7 @@ async fn run_startup_migrations(
     control_configured: bool,
     shards_configured: bool,
     provider_migration_url: Option<String>,
-    migrations: Arc<Vec<(&'static str, crate::migrate::EmbeddedMigrations)>>,
+    migrations: Arc<Vec<crate::migrate::RegisteredMigrations>>,
     directory_migration_required: bool,
     shard_map_migration_required: bool,
 ) {
@@ -14619,9 +15143,20 @@ async fn run_startup_migrations(
     // two registered sources is resolved automatically rather than causing
     // one migration to be silently skipped — see
     // `compute_migration_disambiguation` and `migration_sets_for_disambiguation`.
-    let disambiguation_sets =
-        migration_sets_for_disambiguation(&migrations, config.database.has_shards());
+    // One map per side: a control-only set and a shard-only set never share
+    // a database, so they never rename each other's versions.
+    let disambiguation_sets = migration_sets_for_disambiguation(
+        &migrations,
+        config.database.has_shards(),
+        crate::migrate::MigrationScope::reaches_control,
+    );
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
+    let shard_disambiguated =
+        crate::migrate::compute_migration_disambiguation(&migration_sets_for_disambiguation(
+            &migrations,
+            config.database.has_shards(),
+            crate::migrate::MigrationScope::reaches_shards,
+        ));
     #[cfg(feature = "sqlite")]
     let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
     let migration_result = crate::time::spawn_blocking(move || {
@@ -14656,7 +15191,7 @@ async fn run_startup_migrations(
                 );
                 std::process::exit(1);
             }
-            for (_, mig) in migrations.iter() {
+            for mig in control_sets(&migrations) {
                 crate::migrate::auto_migrate_sqlite(
                     url,
                     profile.as_deref(),
@@ -14670,7 +15205,7 @@ async fn run_startup_migrations(
         }
 
         if let Some(url) = control_url {
-            for (_, mig) in migrations.iter() {
+            for mig in control_sets(&migrations) {
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
@@ -14726,16 +15261,13 @@ async fn run_startup_migrations(
         // keep reporting them as pending, even though `autumn migrate --shard`
         // applies only the shard-required framework migrations.
         for (target, url) in &shard_targets {
-            for (_, mig) in migrations
-                .iter()
-                .filter(|(_, mig)| !migration_set_is_control_framework(mig))
-            {
+            for mig in shard_sets(&migrations) {
                 crate::migrate::auto_migrate(
                     url,
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                    crate::migrate::DisambiguatedMigrations::new(mig, &shard_disambiguated),
                     target,
                     lock_policy,
                 );
@@ -14996,12 +15528,12 @@ enum RepositoryCommitHookQueueMigrationMode {
 
 #[cfg(feature = "db")]
 fn migrations_with_repository_framework_migrations(
-    mut migrations: Vec<(&'static str, crate::migrate::EmbeddedMigrations)>,
+    mut migrations: Vec<crate::migrate::RegisteredMigrations>,
     hook_queue_required: bool,
     version_history_required: bool,
     derivations_required: bool,
     mode: RepositoryCommitHookQueueMigrationMode,
-) -> Vec<(&'static str, crate::migrate::EmbeddedMigrations)> {
+) -> Vec<crate::migrate::RegisteredMigrations> {
     if hook_queue_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
         && !shard_applied_sets_include(&migrations, REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
@@ -15009,6 +15541,7 @@ fn migrations_with_repository_framework_migrations(
         migrations.push((
             "repository-commit-hooks",
             crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+            crate::migrate::MigrationScope::Everywhere,
         ));
     }
     if version_history_required
@@ -15018,6 +15551,7 @@ fn migrations_with_repository_framework_migrations(
         migrations.push((
             "version-history",
             crate::version_history::VERSION_HISTORY_MIGRATIONS,
+            crate::migrate::MigrationScope::Everywhere,
         ));
     }
     // The derivation state table follows the same rule as the two above: it is a
@@ -15028,7 +15562,11 @@ fn migrations_with_repository_framework_migrations(
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
         && !shard_applied_sets_include(&migrations, DERIVATION_MIGRATION)
     {
-        migrations.push(("derivations", crate::derivation::DERIVATION_MIGRATIONS));
+        migrations.push((
+            "derivations",
+            crate::derivation::DERIVATION_MIGRATIONS,
+            crate::migrate::MigrationScope::Everywhere,
+        ));
     }
     migrations
 }
@@ -15047,9 +15585,12 @@ fn migrations_with_repository_framework_migrations(
 /// whenever the shards would otherwise be missing it. Re-applying it to the
 /// control target is harmless: it shares the migration version already recorded
 /// by the control framework set, so Diesel skips it there.
+///
+/// A scoped set ([`MigrationScope`](crate::migrate::MigrationScope)) does not
+/// count: it misses the control database or the shards.
 #[cfg(feature = "db")]
 fn shard_applied_sets_include(
-    migrations: &[(&'static str, crate::migrate::EmbeddedMigrations)],
+    migrations: &[crate::migrate::RegisteredMigrations],
     migration_name: &str,
 ) -> bool {
     use crate::db::RuntimeBackend;
@@ -15057,8 +15598,11 @@ fn shard_applied_sets_include(
 
     migrations
         .iter()
-        .filter(|(_, set)| !migration_set_is_control_framework(set))
-        .any(|(_, source)| {
+        .filter(|(_, set, scope)| {
+            *scope == crate::migrate::MigrationScope::Everywhere
+                && !migration_set_is_control_framework(set)
+        })
+        .any(|(_, source, _)| {
             let Ok(source_migrations): Result<Vec<Box<dyn Migration<RuntimeBackend>>>, _> =
                 source.migrations()
             else {
@@ -15069,6 +15613,47 @@ fn shard_applied_sets_include(
                 .iter()
                 .any(|migration| migration.name().to_string() == migration_name)
         })
+}
+
+/// The boot warning for a shard-only set when no database takes it: no
+/// `[[database.shards]]` and no `[database.fleet]`.
+#[cfg(feature = "db")]
+fn unreachable_shard_sets_warning(
+    config: &AutumnConfig,
+    migrations: &[crate::migrate::RegisteredMigrations],
+) -> Option<&'static str> {
+    let shard_only = migrations
+        .iter()
+        .any(|(_, _, scope)| *scope == crate::migrate::MigrationScope::Shards);
+    (shard_only && !config.database.has_shards() && config.database.fleet.is_none()).then_some(
+        "A migration set has MigrationScope::Shards, but this profile has no \
+         [[database.shards]] and no [database.fleet]: no database gets it.",
+    )
+}
+
+/// The registered sets that go to the control database.
+#[cfg(feature = "db")]
+fn control_sets(
+    migrations: &[crate::migrate::RegisteredMigrations],
+) -> impl Iterator<Item = &crate::migrate::EmbeddedMigrations> {
+    migrations
+        .iter()
+        .filter(|(_, _, scope)| scope.reaches_control())
+        .map(|(_, set, _)| set)
+}
+
+/// The registered sets that go to each shard: not a control-scoped set, and
+/// not the control-plane framework set.
+#[cfg(feature = "db")]
+fn shard_sets(
+    migrations: &[crate::migrate::RegisteredMigrations],
+) -> impl Iterator<Item = &crate::migrate::EmbeddedMigrations> {
+    migrations
+        .iter()
+        .filter(|(_, set, scope)| {
+            scope.reaches_shards() && !migration_set_is_control_framework(set)
+        })
+        .map(|(_, set, _)| set)
 }
 
 /// Whether a migration set is the control-plane
@@ -15258,11 +15843,9 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
         mcp_mount_path,
     } = ctx;
 
-    // `run()`'s OWN pre-router checks first, in its order: an app with no
-    // routes, or with an unguarded mutating repository API under a
-    // production profile, never reaches router construction at all. These hold
-    // for EVERY role — `run()` performs them before it branches on one.
-    validate_pre_router_preconditions(routes, scoped_groups, config)?;
+    // `run()`'s own pre-router checks (no routes, an unguarded repository API)
+    // run in the caller, on every route, before the role mount filters the
+    // lists. `run()` runs them there too.
 
     // Everything below describes the application router, and a `worker` (or any
     // other non-HTTP) role never builds one: `run()` takes the probe-only branch
@@ -15272,10 +15855,10 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
     // disagreement with the serving path as being too lax, pointing the other
     // way, and the more expensive of the two because it blocks correct work.
     //
-    // The document itself is still exported: it is built from the routes and the
-    // `OpenApiConfig`, neither of which depends on the role, so the contract a
-    // worker-profile export writes down is the same one the web role serves.
-    if !config.role.serves_http() {
+    // The document itself is still exported. A worker mounts no route group, so
+    // the caller does not filter its routes: the document is the one a role
+    // without `mount` serves.
+    if config.resolve_role().is_ok_and(|role| !role.serves_http()) {
         return Ok(());
     }
 
@@ -15400,10 +15983,15 @@ fn merge_framework_scheduled_tasks(
 /// faithfully still approved a spec for an app that refuses to start (issue
 /// #802):
 ///
+/// * a `role` that names no built-in role and no `[roles.<name>]` preset;
 /// * a `web`/`worker` process role on a non-durable jobs backend — the web
 ///   replica would enqueue into an in-memory queue no worker can drain;
+/// * a `web`/`worker` process role on the `sqlite` jobs backend with an
+///   in-memory database, which no other process can open;
 /// * a duplicate `#[scheduled]` task name, which spawns two loops competing for
 ///   one coordination lock.
+///
+/// A named role is checked on its base.
 ///
 /// `tasks` must ALREADY be the fully merged list — hand-declared entries plus
 /// the `#[repository(..., retention(...))]` sweeps plus the framework's
@@ -15421,14 +16009,41 @@ fn validate_config_preconditions(
     config: &AutumnConfig,
     tasks: &[crate::task::TaskInfo],
 ) -> Result<(), String> {
-    if crate::config::split_role_requires_durable_backend(config.role, &config.jobs.backend) {
+    let role = config
+        .resolve_role()
+        .map_err(|err| format!("role: {err}"))?;
+    // The checks read the base of a named role (#3543). A `combined` preset
+    // that runs no job workers counts as `web`: it enqueues and does not drain.
+    let base = role.guard_base();
+    let role_label = if role.is_preset() {
+        format!("{} (base {})", role.name(), role.base().as_str())
+    } else {
+        role.name().to_owned()
+    };
+    if crate::config::split_role_requires_durable_backend(base, &config.jobs.backend) {
         return Err(format!(
-            "process role '{role}' requires a durable jobs backend: backend '{backend}' is not \
-             a recognized durable backend and falls through to the in-process 'local' runtime, \
-             which cannot be shared across a split web/worker topology. Set jobs.backend = \
-             \"postgres\" or \"redis\", or run the combined role.",
-            role = config.role.as_str(),
+            "process role '{role_label}' requires a durable jobs backend: backend '{backend}' is \
+             not a recognized durable backend and falls through to the in-process 'local' \
+             runtime, which cannot be shared across a split web/worker topology. Set \
+             jobs.backend = \"postgres\" or \"redis\", or run the combined role.",
             backend = config.jobs.backend,
+        ));
+    }
+
+    // The sqlite queue backs a split role only because both processes open
+    // the same file. Against an in-memory target each gets its own private
+    // database, so the web replica would enqueue where no worker can ever
+    // look — the same silent stranding, one step further in (issue #1907).
+    if crate::config::split_role_requires_file_backed_sqlite(
+        base,
+        &config.jobs.backend,
+        config.database.effective_primary_url(),
+    ) {
+        return Err(format!(
+            "process role '{role_label}' with jobs.backend = \"sqlite\" requires a FILE-backed \
+             database: an in-memory SQLite target is private to each process, so the web \
+             replica would enqueue into a queue no worker process can see. Point database.url \
+             at a sqlite:// file, or run the combined role."
         ));
     }
 
@@ -15700,6 +16315,7 @@ mod agent_authority_route_summary_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -15807,9 +16423,154 @@ mod agent_authority_route_summary_tests {
     }
 }
 
+/// The connections that the control topology and the shard pools may open,
+/// and the backend that selects the boot advice.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectionBudget {
+    /// All pools together, at their maximum size.
+    pub total: usize,
+    /// The backend, with the database count on `SQLite`.
+    pub backend: crate::config::ConnectionBackend,
+}
+
+/// The connection budget of the control topology and the shard set.
+#[cfg(feature = "db")]
+pub(crate) fn connection_budget(
+    topology: Option<&crate::db::DatabaseTopology>,
+    shards: Option<&crate::sharding::ShardSet>,
+) -> ConnectionBudget {
+    let control = topology.map_or(0, |topology| {
+        topology.primary().status().max_size
+            + topology.replica().map_or(0, |pool| pool.status().max_size)
+    });
+    let total = control + shards.map_or(0, crate::sharding::ShardSet::total_max_connections);
+    let backend = if cfg!(feature = "sqlite") {
+        let control_databases =
+            topology.map_or(0, |topology| 1 + usize::from(topology.replica().is_some()));
+        let shard_databases = shards.map_or(0, crate::sharding::ShardSet::total_databases);
+        crate::config::ConnectionBackend::Sqlite {
+            databases: control_databases + shard_databases,
+        }
+    } else {
+        crate::config::ConnectionBackend::Postgres
+    };
+    ConnectionBudget { total, backend }
+}
+
+/// The boot warnings for `budget`: a high connection count and, on `SQLite`,
+/// open files near `open_file_limit`. A `threshold` of `0` silences both.
+#[cfg(feature = "db")]
+pub(crate) fn connection_budget_warnings(
+    budget: &ConnectionBudget,
+    threshold: usize,
+    open_file_limit: Option<u64>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    warnings.extend(crate::config::total_connections_warning(
+        budget.total,
+        threshold,
+        budget.backend,
+    ));
+    // On SQLite the open files can pass the process limit at any connection
+    // count.
+    if let crate::config::ConnectionBackend::Sqlite { databases } = budget.backend {
+        let files = crate::config::sqlite_open_files(budget.total, databases);
+        warnings.extend(crate::config::open_files_warning(
+            files,
+            open_file_limit,
+            threshold,
+        ));
+    }
+    warnings
+}
+
+#[cfg(all(test, feature = "db", not(feature = "sqlite")))]
+mod connection_budget_tests {
+    use super::*;
+
+    #[test]
+    fn a_large_postgres_pool_gets_the_postgres_warning() {
+        let topology = crate::db::create_topology(&crate::config::DatabaseConfig {
+            primary_url: Some("postgres://127.0.0.1:1/budget".to_owned()),
+            pool_size: 120,
+            ..Default::default()
+        })
+        .expect("a lazy topology builds")
+        .expect("a URL is set");
+        let budget = connection_budget(Some(&topology), None);
+        assert_eq!(budget.total, 120);
+        assert_eq!(budget.backend, crate::config::ConnectionBackend::Postgres);
+        let warnings = connection_budget_warnings(&budget, 100, Some(256));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Postgres"), "{warnings:?}");
+        assert!(connection_budget_warnings(&budget, 0, Some(256)).is_empty());
+    }
+}
+
 #[cfg(all(test, feature = "sqlite"))]
 mod fleet_boot_tests {
     use super::*;
+
+    /// A slot fleet at `max_open = 64`, `pool_size = 2`, beside a control
+    /// database with 10 connections: 138 connections, 65 databases.
+    fn sqlite_budget_fixture(tmp: &std::path::Path) -> ConnectionBudget {
+        let fleet = crate::db::fleet::DatabaseFleet::builder(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: tmp.join("fleet").display().to_string(),
+            path: None,
+            max_open: 64,
+            pool_size: 2,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+        })
+        .build()
+        .expect("fleet builds");
+        let control = crate::config::DatabaseConfig {
+            primary_url: Some(format!("sqlite://{}", tmp.join("control.db").display())),
+            pool_size: 10,
+            ..Default::default()
+        };
+        let topology = crate::db::create_topology(&control)
+            .expect("topology builds")
+            .expect("url configured");
+        let shards = crate::sharding::ShardSet::from_fleet(fleet, topology.primary().clone());
+        connection_budget(Some(&topology), Some(&shards))
+    }
+
+    #[test]
+    fn sqlite_boot_budget_counts_the_fleet_and_the_control_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget = sqlite_budget_fixture(tmp.path());
+        let control = budget.total - 128;
+        assert_eq!(
+            budget.backend,
+            crate::config::ConnectionBackend::Sqlite { databases: 65 }
+        );
+        assert!(control >= 1, "the control pool counts: {budget:?}");
+    }
+
+    #[test]
+    fn sqlite_boot_warns_on_connections_and_on_open_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget = sqlite_budget_fixture(tmp.path());
+        let warnings = connection_budget_warnings(&budget, 100, Some(256));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("connections"), "{warnings:?}");
+        assert!(warnings[1].contains("limit of 256"), "{warnings:?}");
+        // A high limit leaves only the connection warning; 0 silences both.
+        assert_eq!(
+            connection_budget_warnings(&budget, 100, Some(100_000)).len(),
+            1
+        );
+        assert!(connection_budget_warnings(&budget, 0, Some(256)).is_empty());
+    }
 
     async fn table_exists(db: &crate::db::fleet::FleetDatabase, table: &str) -> bool {
         use diesel_async::RunQueryDsl as _;
@@ -15861,6 +16622,8 @@ mod fleet_boot_tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
         });
         config
             .database
@@ -15907,6 +16670,8 @@ mod fleet_boot_tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
         });
         let resolved = format!("sqlite://{}", root.join("control.db").display());
         let Err(err) = crate::db::fleet::build_for_app(
@@ -15920,6 +16685,92 @@ mod fleet_boot_tests {
         assert!(err.contains("control database"), "{err}");
         crate::db::fleet::build_for_app(&config, None, &Arc::new(Vec::new()), |_| true)
             .expect("the configured control database is outside the root");
+    }
+
+    /// A scoped set reaches only its databases: a control set never reaches
+    /// a fleet file, and a shard set never reaches the control database.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "fleet path templates use {placeholders}"
+    )]
+    async fn scoped_migration_sets_reach_only_their_databases() {
+        use crate::migrate::MigrationScope;
+        const CONTROL: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_control_migrations");
+        const SHARDS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
+
+        fn tables(path: &std::path::Path) -> Vec<String> {
+            use diesel::{Connection as _, RunQueryDsl as _};
+            #[derive(diesel::QueryableByName)]
+            struct Name {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                name: String,
+            }
+            let mut conn =
+                diesel::SqliteConnection::establish(&path.display().to_string()).unwrap();
+            diesel::sql_query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .load::<Name>(&mut conn)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let control = tmp.path().join("control.db");
+        let mut config = AutumnConfig {
+            profile: Some("dev".into()),
+            ..AutumnConfig::default()
+        };
+        config.database.url = Some(format!("sqlite://{}", control.display()));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Tenant,
+            root: tmp.path().join("fleet").display().to_string(),
+            path: Some("{tenant}.db".to_owned()),
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+        });
+        let database = setup_database(
+            &config,
+            vec![
+                ("app", CONTROL, MigrationScope::Control),
+                ("app", SHARDS, MigrationScope::Shards),
+            ],
+            None,
+            None,
+            None,
+            false,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .expect("the database sets up");
+        let fleet = database
+            .shards
+            .as_ref()
+            .and_then(|shards| shards.fleet())
+            .expect("a fleet")
+            .clone();
+        let key = fleet.key_for("acme").unwrap();
+        fleet.provision(&key).await.unwrap();
+
+        let control_tables = tables(&control);
+        assert!(control_tables.contains(&"scope_control_rows".to_owned()));
+        assert!(!control_tables.contains(&"scope_shard_rows".to_owned()));
+        let tenant_tables = tables(&fleet.path_of(&key));
+        assert!(tenant_tables.contains(&"scope_shard_rows".to_owned()));
+        assert!(!tenant_tables.contains(&"scope_control_rows".to_owned()));
+        fleet.close_all().await;
     }
 
     /// A custom pool provider must say which file its control pool opens
@@ -15970,12 +16821,19 @@ mod fleet_boot_tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
         });
         let all = Arc::new(vec![
-            ("framework", crate::migrate::FRAMEWORK_MIGRATIONS),
+            (
+                "framework",
+                crate::migrate::FRAMEWORK_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
+            ),
             (
                 "version-history",
                 crate::version_history::VERSION_HISTORY_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
             ),
         ]);
         let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {
@@ -16020,8 +16878,14 @@ mod fleet_boot_tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
         });
-        let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
+        let all = Arc::new(vec![(
+            "framework",
+            crate::migrate::FRAMEWORK_MIGRATIONS,
+            crate::migrate::MigrationScope::Everywhere,
+        )]);
         let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {
             !migration_set_is_control_framework(set)
         })
@@ -16215,7 +17079,11 @@ mod fleet_boot_tests {
             fleet.open_for(tenant).await.unwrap();
         }
         fleet.close_all().await;
-        let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
+        let all = Arc::new(vec![(
+            "framework",
+            crate::migrate::FRAMEWORK_MIGRATIONS,
+            crate::migrate::MigrationScope::Everywhere,
+        )]);
         // Created databases are migrated already: nothing is pending.
         assert_eq!(migrate_fleet_or_exit(&config, Arc::clone(&all)).await, 0);
         config.database.fleet = None;
@@ -16246,6 +17114,7 @@ mod validate_repository_api_policies_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -16695,7 +17564,12 @@ fn build_state(
         db_capture_gap: database_topology
             .and_then(|topology| topology.capture_gap().map(std::sync::Arc::from)),
         profile: config.profile.as_deref().map(Arc::from),
-        role: config.role,
+        // The loaders reject an undeclared role. Only a hand-built config gets
+        // here with one, and it must not boot as another role.
+        role: config.resolve_role().unwrap_or_else(|error| {
+            tracing::error!(error = %error, "refusing to start: the process role does not resolve");
+            std::process::exit(1);
+        }),
         started_at: crate::time::monotonic_now(),
         health_detailed: config.health.detailed,
         probes,
@@ -18213,13 +19087,13 @@ mod tests {
             #[cfg(feature = "ws")]
             None,
         );
-        assert_eq!(state.role(), ProcessRole::Combined);
-        assert!(state.role().serves_http());
-        assert!(state.role().runs_workers());
+        assert_eq!(state.role().base(), ProcessRole::Combined);
+        assert_eq!(state.role().name(), "combined");
+        assert_eq!(state.capabilities(), ProcessRole::Combined.capabilities());
 
         // A worker-role config flows through the exact same resolution the
         // framework uses to gate the job runtime, reachable via `state.role()`.
-        config.role = ProcessRole::Worker;
+        config.role = ProcessRole::Worker.into();
         let state = build_state(
             &config,
             #[cfg(feature = "db")]
@@ -18229,9 +19103,129 @@ mod tests {
             #[cfg(feature = "ws")]
             None,
         );
-        assert_eq!(state.role(), ProcessRole::Worker);
-        assert!(state.role().runs_workers());
-        assert!(!state.role().serves_http());
+        assert_eq!(state.role().base(), ProcessRole::Worker);
+        assert_eq!(
+            state.capabilities(),
+            config.resolve_role().expect("worker").capabilities()
+        );
+        assert!(state.capabilities().job_workers);
+        assert!(!state.capabilities().serves_http);
+    }
+
+    /// A config with `[roles.<name>]` presets and the given role and jobs backend.
+    fn named_role_config_3543(role: &str, backend: &str) -> AutumnConfig {
+        let toml = format!(
+            "role = \"{role}\"\n[jobs]\nbackend = \"{backend}\"\n\
+             [roles.critical]\nbase = \"worker\"\npin = [\"critical\"]\nscheduler = false\n\
+             [roles.api]\nbase = \"web\"\n\
+             [roles.marketing]\nbase = \"combined\"\n"
+        );
+        toml::from_str(&toml).expect("named role config")
+    }
+
+    #[test]
+    fn build_state_exposes_named_role() {
+        let config = named_role_config_3543("critical", "postgres");
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        assert_eq!(state.role().name(), "critical");
+        assert_eq!(state.role().base(), crate::config::ProcessRole::Worker);
+        assert!(state.capabilities().job_workers);
+        assert!(!state.capabilities().scheduler);
+        assert!(!state.capabilities().serves_http);
+    }
+
+    /// The durable-backend guard reads the base of a named role.
+    #[test]
+    fn durable_backend_guard_fires_for_named_split_roles_on_local() {
+        for role in ["critical", "api"] {
+            let config = named_role_config_3543(role, "local");
+            let err = validate_config_preconditions(&config, &[])
+                .expect_err("a named web/worker role on local must not boot");
+            assert!(err.contains(role), "{role}: {err}");
+            assert!(err.contains("durable jobs backend"), "{role}: {err}");
+            for backend in ["postgres", "redis", "sqlite"] {
+                let config = named_role_config_3543(role, backend);
+                validate_config_preconditions(&config, &[])
+                    .unwrap_or_else(|err| panic!("{role} on {backend}: {err}"));
+            }
+        }
+        // A combined base enqueues and drains in one process.
+        let config = named_role_config_3543("marketing", "local");
+        validate_config_preconditions(&config, &[]).expect("combined base on local");
+    }
+
+    /// A `combined` preset with no job workers counts as split: it enqueues
+    /// into a queue that it does not drain.
+    #[test]
+    fn durable_backend_guard_fires_for_a_non_draining_combined_preset() {
+        for body in ["job_workers = false", "pin = []"] {
+            let toml = format!(
+                "role = \"api\"\n[jobs]\nbackend = \"local\"\n[roles.api]\nbase = \"combined\"\n{body}\n"
+            );
+            let config: AutumnConfig = toml::from_str(&toml).expect("config");
+            let err = validate_config_preconditions(&config, &[]).expect_err(body);
+            assert!(err.contains("api (base combined)"), "{body}: {err}");
+        }
+    }
+
+    /// The job runtime gets the preset `pin` and `workers`.
+    #[test]
+    fn role_job_config_applies_the_preset() {
+        let config = named_role_config_3543("critical", "postgres");
+        let role = config.resolve_role().expect("critical");
+        let mut jobs = config.jobs;
+        jobs.pin = vec!["bulk".to_owned()];
+        assert_eq!(
+            role_job_config(&role, &jobs).pin,
+            vec!["critical".to_owned()]
+        );
+        let builtin = crate::config::Role::from(crate::config::ProcessRole::Worker);
+        assert_eq!(
+            role_job_config(&builtin, &jobs).pin,
+            vec!["bulk".to_owned()]
+        );
+
+        // The server boot passes that config to the job runtime.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let boot = "let role_jobs = role_job_config(state.role(), &config.jobs);\n        \
+                    if let Err(error) = initialize_job_runtime(\n            jobs,\n            \
+                    &state,\n            &server_shutdown,\n            &role_jobs,";
+        assert!(
+            source.contains(boot),
+            "the server boot must pass the preset job config"
+        );
+    }
+
+    /// The file-backed `SQLite` guard reads the base of a named role.
+    #[test]
+    fn file_backed_sqlite_guard_fires_for_named_split_roles() {
+        for role in ["critical", "api"] {
+            let mut config = named_role_config_3543(role, "sqlite");
+            config.database.url = Some("sqlite::memory:".to_owned());
+            let err = validate_config_preconditions(&config, &[])
+                .expect_err("an in-memory SQLite split role must not boot");
+            assert!(err.contains(role), "{role}: {err}");
+            assert!(err.contains("FILE-backed"), "{role}: {err}");
+        }
+        let mut config = named_role_config_3543("marketing", "sqlite");
+        config.database.url = Some("sqlite::memory:".to_owned());
+        validate_config_preconditions(&config, &[]).expect("combined base");
+    }
+
+    /// An undeclared role stops the boot, as an unknown built-in does.
+    #[test]
+    fn undeclared_named_role_fails_preconditions() {
+        let config = named_role_config_3543("critcal", "postgres");
+        let err = validate_config_preconditions(&config, &[]).expect_err("typo");
+        assert!(err.contains("critcal"), "{err}");
     }
 
     // Postgres-only fixture: it configures a distinct `replica_url`, which
@@ -18313,22 +19307,23 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // Finding 2 (Codex P2), corrected: the fail-closed `statement_timeout` guard
-    // must fire once a custom provider has actually established a pool. A custom
-    // provider can build its own SQLite pool without the built-in
-    // `create_topology`/`create_pool` factories — the default `create_topology`
-    // only delegates to `create_pool`, and both are overridable — so
-    // `setup_database` enforces the guard at dispatch. It must run only for an
-    // established pool (`Some(..)`), not before the provider returns: a provider
-    // returning `Ok(None)` opts into the supported no-database mode and must still
-    // boot even with a nonzero `statement_timeout`, matching the built-in path.
+    // The fail-closed `statement_timeout` guard must fire once a custom
+    // provider has actually established a pool. A custom provider can build
+    // its own SQLite pool without the built-in `create_topology`/`create_pool`
+    // factories — the default `create_topology` only delegates to
+    // `create_pool`, and both are overridable — so `setup_database` enforces
+    // the guard at dispatch. It must run only for an established pool
+    // (`Some(..)`), not before the provider returns: a provider returning
+    // `Ok(None)` opts into the supported no-database mode and must still boot
+    // even with a nonzero `statement_timeout`, matching the built-in path.
     // CI's sqlite job runs the named integration targets, not `--lib`, and
-    // `setup_database` and the shared guard are crate-private, so this boundary is
-    // reachable only from a unit test.
+    // `setup_database` and the shared guard are crate-private, so this
+    // boundary is reachable only from a unit test.
     //
-    // Case (a): a custom provider that establishes a real in-memory SQLite pool
-    // (`Ok(Some(..))`) under a nonzero `statement_timeout` must fail closed with
-    // the actionable error, keeping the original F2 bypass closed.
+    // Case (a): a custom provider that establishes a real in-memory SQLite
+    // pool (`Ok(Some(..))`) under a nonzero `statement_timeout` must fail
+    // closed with the actionable error. A custom provider must not bypass the
+    // guard.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn custom_pool_provider_with_established_sqlite_pool_fails_closed_on_statement_timeout() {
@@ -18632,22 +19627,240 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn repository_commit_hook_workers_are_gated_on_worker_role() {
-        // Draining durable after-commit hook rows is background execution, so the
-        // primary-pool and shard commit-hook worker starts on the normal server
-        // path must both be guarded by `role.runs_workers()` — a web-role replica
-        // must not claim/execute hook rows (that work belongs to the worker tier).
+        // A web replica must not claim or run hook rows. The primary-pool and
+        // shard workers both read the `commit_hooks` capability.
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let primary_gate =
-            "if role.runs_workers()\n            && let Some(pool) = state.pool().cloned()";
-        let shard_gate = "if role.runs_workers()\n            && let Some(shards) = state.shards()";
-        assert!(
-            source.contains(primary_gate),
-            "primary-pool commit-hook worker must be gated on role.runs_workers()"
+            "if capabilities.commit_hooks\n            && let Some(pool) = state.pool().cloned()";
+        let shard_gate =
+            "if capabilities.commit_hooks\n            && let Some(shards) = state.shards()";
+        assert_eq!(
+            source.matches(primary_gate).count(),
+            2,
+            "the Postgres and SQLite primary-pool hook workers must read capabilities.commit_hooks"
         );
         assert!(
             source.contains(shard_gate),
-            "shard commit-hook workers must be gated on role.runs_workers()"
+            "shard commit-hook workers must read capabilities.commit_hooks"
         );
+    }
+
+    /// The legacy all-in-one predicate. Built at run time so that this test
+    /// does not match itself.
+    fn legacy_worker_predicate() -> String {
+        ["runs", "_workers"].concat()
+    }
+
+    /// Each line of `source` that names the legacy predicate, as
+    /// `(line number, trimmed line)`.
+    fn legacy_worker_predicate_lines(source: &str) -> Vec<(usize, String)> {
+        let legacy = legacy_worker_predicate();
+        source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(legacy.as_str()))
+            .map(|(index, line)| (index + 1, line.trim().to_owned()))
+            .collect()
+    }
+
+    /// Issue #3542: each subsystem names its own capability. A new gate on the
+    /// legacy predicate fails here. Use a field of `RoleCapabilities`.
+    #[test]
+    fn app_rs_has_no_gate_on_the_legacy_worker_predicate() {
+        let hits = legacy_worker_predicate_lines(include_str!("app.rs"));
+        assert!(
+            hits.is_empty(),
+            "app.rs must not read `{}`. Gate on a `RoleCapabilities` field \
+             (`state.capabilities().<field>`) instead. Found: {hits:?}",
+            legacy_worker_predicate()
+        );
+    }
+
+    /// The guard above finds a gate in each form a new one can take.
+    #[test]
+    fn legacy_worker_predicate_guard_finds_an_injected_gate() {
+        let legacy = legacy_worker_predicate();
+        let source = format!(
+            "fn boot() {{\n    if role.{legacy}() {{}}\n    let on = \
+             state.role().{legacy}();\n    let f = ProcessRole::{legacy};\n}}\n"
+        );
+        let hits = legacy_worker_predicate_lines(&source);
+        assert_eq!(
+            hits.iter().map(|(line, _)| *line).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        assert!(legacy_worker_predicate_lines("if caps.job_workers {}").is_empty());
+    }
+
+    /// Issue #3542: each background subsystem reads its own field. Each gate
+    /// is joined from two parts at run time, so it does not match this test.
+    #[test]
+    fn each_background_subsystem_reads_its_own_capability() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let gates: [(&str, [&str; 2], usize); 7] = [
+            (
+                "job workers",
+                ["capabilities.", "job_workers,\n        ) {"],
+                1,
+            ),
+            ("outbox relay", ["if capabilities.", "outbox_relay {"], 1),
+            (
+                "scheduler and retention",
+                [
+                    "scheduled_tasks_for_capabilities(",
+                    "tasks, &retention_task_names, capabilities)",
+                ],
+                1,
+            ),
+            (
+                "repository retention names",
+                [
+                    "append_retention_tasks(\n            &mut tasks,\n            &mut ",
+                    "retention_task_names,\n            crate::retention::collect_retention_tasks(),",
+                ],
+                1,
+            ),
+            (
+                "framework retention names",
+                [
+                    "append_retention_tasks(&mut tasks, &mut ",
+                    "retention_task_names, retention_tasks);",
+                ],
+                1,
+            ),
+            (
+                "fleet sweeper relay",
+                ["relay: state.capabilities().", "fleet_relay,"],
+                1,
+            ),
+            (
+                "restore check",
+                ["if state.capabilities().", "restore_check {"],
+                1,
+            ),
+        ];
+        for (subsystem, [head, tail], expected) in gates {
+            let gate = [head, tail].concat();
+            assert_eq!(
+                source.matches(gate.as_str()).count(),
+                expected,
+                "the {subsystem} gate must read its own capability: `{gate}`"
+            );
+        }
+    }
+
+    // The boot records the name of each framework retention sweep, so the
+    // `retention` capability gates it.
+    #[cfg(feature = "data-retention")]
+    #[test]
+    fn append_retention_tasks_records_each_framework_sweep() {
+        let config = crate::config::RetentionConfig {
+            job_history: Some("90d".to_owned()),
+            audit_archives: Some("400d".to_owned()),
+            ..Default::default()
+        };
+        let sweeps = crate::data_retention::framework_retention_tasks(&config);
+        assert_eq!(sweeps.len(), 2);
+
+        let mut tasks = vec![named_task("nightly-report")];
+        let mut names = Vec::new();
+        super::append_retention_tasks(&mut tasks, &mut names, sweeps);
+        assert_eq!(
+            names,
+            [
+                crate::data_retention::RETENTION_SWEEP_TASK_NAME,
+                crate::data_retention::RETENTION_ARCHIVE_TASK_NAME,
+            ]
+        );
+        assert_eq!(task_names(&tasks)[1..], names);
+
+        let mut scheduler_only = crate::config::ProcessRole::Worker.capabilities();
+        scheduler_only.retention = false;
+        let kept = super::scheduled_tasks_for_capabilities(tasks, &names, scheduler_only);
+        assert_eq!(task_names(&kept), ["nightly-report"]);
+    }
+
+    fn named_task(name: &str) -> crate::task::TaskInfo {
+        crate::task::TaskInfo {
+            name: name.to_owned(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination: crate::task::TaskCoordination::Fleet,
+            handler: |_| Box::pin(async { Ok(()) }),
+        }
+    }
+
+    fn task_names(tasks: &[crate::task::TaskInfo]) -> Vec<&str> {
+        tasks.iter().map(|task| task.name.as_str()).collect()
+    }
+
+    fn mixed_tasks() -> Vec<crate::task::TaskInfo> {
+        vec![
+            named_task("nightly-report"),
+            named_task("retention-sweep-posts"),
+            named_task("autumn-retention-sweep"),
+            named_task("cache-warm"),
+        ]
+    }
+
+    fn retention_names() -> Vec<String> {
+        vec![
+            "retention-sweep-posts".to_owned(),
+            "autumn-retention-sweep".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn scheduled_tasks_for_built_in_roles_match_the_legacy_gate() {
+        use crate::config::ProcessRole;
+        for role in [ProcessRole::Combined, ProcessRole::Worker] {
+            let caps = role.capabilities();
+            let kept =
+                super::scheduled_tasks_for_capabilities(mixed_tasks(), &retention_names(), caps);
+            assert_eq!(
+                task_names(&kept),
+                task_names(&mixed_tasks()),
+                "role {} keeps every task, in order",
+                role.as_str()
+            );
+        }
+        let kept = super::scheduled_tasks_for_capabilities(
+            mixed_tasks(),
+            &retention_names(),
+            ProcessRole::Web.capabilities(),
+        );
+        assert!(kept.is_empty(), "the web role runs no scheduled task");
+    }
+
+    #[test]
+    fn scheduled_tasks_split_retention_from_the_scheduler() {
+        let mut scheduler_only = crate::config::ProcessRole::Combined.capabilities();
+        scheduler_only.retention = false;
+        let kept = super::scheduled_tasks_for_capabilities(
+            mixed_tasks(),
+            &retention_names(),
+            scheduler_only,
+        );
+        assert_eq!(task_names(&kept), ["nightly-report", "cache-warm"]);
+
+        let mut retention_only = crate::config::ProcessRole::Combined.capabilities();
+        retention_only.scheduler = false;
+        let kept = super::scheduled_tasks_for_capabilities(
+            mixed_tasks(),
+            &retention_names(),
+            retention_only,
+        );
+        assert_eq!(
+            task_names(&kept),
+            ["retention-sweep-posts", "autumn-retention-sweep"]
+        );
+    }
+
+    #[test]
+    fn scheduled_tasks_without_retention_names_treat_every_task_as_scheduled() {
+        let mut scheduler_only = crate::config::ProcessRole::Worker.capabilities();
+        scheduler_only.retention = false;
+        let kept = super::scheduled_tasks_for_capabilities(mixed_tasks(), &[], scheduler_only);
+        assert_eq!(task_names(&kept), task_names(&mixed_tasks()));
     }
 
     /// The replication loop's final flush must be *triggered* after the drain.
@@ -19109,7 +20322,9 @@ mod tests {
             .filter(|i| source[*i..].starts_with("crate::router::try_build_router"))
             .filter(|i| {
                 let tail = &source[*i..*i + 80];
-                tail.contains("_inner(") || tail.contains("_with_static_inner(")
+                tail.contains("_inner(")
+                    || tail.contains("_with_static_inner(")
+                    || tail.contains("_with_static_pages(")
             })
             .collect();
         assert!(
@@ -19211,7 +20426,7 @@ mod tests {
     #[test]
     fn graph_worker_census_is_probes_and_actuator_only() {
         let mut config = AutumnConfig::default();
-        config.role = crate::config::ProcessRole::Worker;
+        config.role = crate::config::ProcessRole::Worker.into();
         config.actuator.sensitive = true;
         let mounted = graph_worker_mounted_routes(&config);
         let paths = census_paths(&mounted);
@@ -19274,14 +20489,14 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut config = AutumnConfig::default();
-        config.role = crate::config::ProcessRole::Worker;
+        config.role = crate::config::ProcessRole::Worker.into();
         config.health.live_path = "/custom-live".to_owned();
         let builder = app().with_config_loader(CensusLoader(Ok(config)));
-        let (mounted, opaque) = builder.dump_graph_surface().await;
-        let paths = census_paths(&mounted);
+        let surface = builder.dump_graph_surface().await;
+        let paths = census_paths(&surface.mounted);
         assert!(paths.contains(&"/custom-live"), "{paths:?}");
         assert!(!paths.contains(&"/static/{*path}"), "{paths:?}");
-        assert_eq!(opaque, 0);
+        assert_eq!(surface.opaque, 0);
     }
 
     #[tokio::test]
@@ -19296,12 +20511,324 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let builder = app().with_config_loader(CensusLoader(Err("boom".to_owned())));
-        let (mounted, _) = builder.dump_graph_surface().await;
+        let surface = builder.dump_graph_surface().await;
         assert!(
-            census_paths(&mounted).contains(&"/static/{*path}"),
+            census_paths(&surface.mounted).contains(&"/static/{*path}"),
             "{:?}",
-            census_paths(&mounted)
+            census_paths(&surface.mounted)
         );
+    }
+
+    /// The boot's config load refuses jwt tenancy in a build that cannot
+    /// verify the token, whichever loader supplied the config.
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard spans the config load, which resets the global metric limits"
+    )]
+    async fn boot_config_load_checks_the_jwt_tenancy_source() {
+        // `try_load_config` resets the process-global metric limits. See
+        // `metrics::LIMITS_TEST_LOCK`.
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut config = AutumnConfig::default();
+        config.tenancy.enabled = true;
+        "jwt".clone_into(&mut config.tenancy.source);
+        let builder = app().with_config_loader(CensusLoader(Ok(config)));
+        let result = try_load_config(builder.config_loader_factory, BTreeSet::new()).await;
+        if cfg!(feature = "jwt") {
+            assert!(result.is_ok(), "jwt build: {:?}", result.err());
+        } else {
+            let message = result
+                .expect_err("jwt tenancy must stop the boot")
+                .to_string();
+            assert!(message.contains("--features jwt"), "{message}");
+        }
+    }
+
+    const FLEET_3544: &str = r#"
+[jobs]
+backend = "postgres"
+
+[roles.marketing]
+base = "web"
+mount = ["marketing"]
+
+[roles.service]
+base = "web"
+mount = ["service"]
+"#;
+
+    fn fleet_builder_3544(role: &str) -> AppBuilder {
+        let config: AutumnConfig =
+            toml::from_str(&format!("role = \"{role}\"\n{FLEET_3544}")).expect("fleet parses");
+        app()
+            .with_config_loader(CensusLoader(Ok(config)))
+            .routes(vec![
+                test_get_route("/landing", "landing").in_group("marketing"),
+            ])
+            .routes_in("service", vec![test_get_route("/desk", "desk")])
+            .routes(vec![test_get_route("/orphan", "orphan")])
+    }
+
+    /// The graph census of a role lists only the groups it mounts. A route
+    /// that another declared role mounts is in the fleet census (#3544).
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard spans the config load, which resets the global metric limits"
+    )]
+    async fn dump_graph_surface_follows_the_role_mount() {
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let surface = fleet_builder_3544("marketing").dump_graph_surface().await;
+        let mounted = census_paths(&surface.mounted);
+        assert!(mounted.contains(&"/landing"), "{mounted:?}");
+        assert!(!mounted.contains(&"/desk"), "{mounted:?}");
+        assert!(!mounted.contains(&"/orphan"), "{mounted:?}");
+        // Framework routes stay on every role.
+        assert!(mounted.contains(&"/live"), "{mounted:?}");
+        let elsewhere = census_paths(&surface.elsewhere);
+        assert!(elsewhere.contains(&"/desk"), "{elsewhere:?}");
+        assert!(!elsewhere.contains(&"/orphan"), "{elsewhere:?}");
+    }
+
+    /// `autumn openapi export` writes the document of the role (#3544).
+    #[cfg(feature = "openapi")]
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard spans the config load, which resets the global metric limits"
+    )]
+    async fn openapi_export_follows_the_role_mount() {
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let export = |role: &'static str| async move {
+            let json = fleet_builder_3544(role)
+                .openapi(crate::openapi::OpenApiConfig::new("Fleet", "1.0.0"))
+                .openapi_export()
+                .await
+                .expect("the document exports");
+            serde_json::from_str::<serde_json::Value>(&json).expect("json")
+        };
+        let marketing = export("marketing").await;
+        assert!(marketing["paths"]["/landing"].is_object(), "{marketing}");
+        assert!(marketing["paths"]["/desk"].is_null(), "{marketing}");
+        assert!(marketing["paths"]["/orphan"].is_null(), "{marketing}");
+        let full = export("combined").await;
+        for path in ["/landing", "/desk", "/orphan"] {
+            assert!(full["paths"][path].is_object(), "{path}: {full}");
+        }
+    }
+
+    /// The framework rows of a narrow role equal those of a full role. This
+    /// pins the shared list: the mount filter never removes one.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard spans the config load, which resets the global metric limits"
+    )]
+    async fn framework_routes_are_shared_by_every_role() {
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let framework = |surface: &GraphSurface| -> Vec<(String, String)> {
+            let mut rows: Vec<(String, String)> = surface
+                .mounted
+                .iter()
+                .filter(|m| !["landing", "desk", "orphan"].contains(&m.handler.as_str()))
+                .map(|m| (m.method.clone(), m.path.clone()))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let full = fleet_builder_3544("combined").dump_graph_surface().await;
+        let narrow = fleet_builder_3544("marketing").dump_graph_surface().await;
+        assert_eq!(framework(&narrow), framework(&full));
+        let shared = framework(&narrow);
+        for (method, path) in [
+            ("GET", "/live"),
+            ("GET", "/ready"),
+            ("GET", "/startup"),
+            ("GET", "/health"),
+            ("GET", "/actuator/health"),
+            ("GET", "/actuator/info"),
+            ("GET", "/static/{*path}"),
+        ] {
+            assert!(
+                shared.contains(&(method.to_owned(), path.to_owned())),
+                "{method} {path} missing from {shared:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retain_mounted_groups_filters_routes_scopes_and_raw_routers() {
+        let role = toml::from_str::<AutumnConfig>(&format!("role = \"marketing\"\n{FLEET_3544}"))
+            .expect("parses")
+            .resolve_role()
+            .expect("resolves");
+        let mut builder = app()
+            .routes(vec![
+                test_get_route("/landing", "landing").in_group("marketing"),
+            ])
+            .routes_in("service", vec![test_get_route("/desk", "desk")])
+            .scoped(
+                "/m",
+                tower::layer::util::Identity::new(),
+                vec![test_get_route("/promo", "promo").in_group("marketing")],
+            )
+            .scoped(
+                "/s",
+                tower::layer::util::Identity::new(),
+                vec![test_get_route("/ticket", "ticket")],
+            )
+            .merge(axum::Router::new())
+            .nest("/app-only", axum::Router::new());
+        builder
+            .retain_mounted_groups(&role)
+            .expect("marketing is a group");
+        let names: Vec<&str> = builder.routes.iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["landing"]);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(builder.scoped_groups.len(), 1);
+        assert_eq!(builder.scoped_groups[0].prefix, "/m");
+        assert!(builder.merge_routers.is_empty(), "app merge dropped");
+        assert!(builder.nest_routers.is_empty(), "app nest dropped");
+    }
+
+    #[test]
+    fn the_boot_warns_only_about_groups_no_preset_mounts() {
+        let groups: std::collections::BTreeSet<String> =
+            ["app", "marketing", "service"].map(str::to_owned).into();
+        let narrow: AutumnConfig =
+            toml::from_str(&format!("role = \"marketing\"\n{FLEET_3544}")).expect("parses");
+        assert_eq!(
+            groups_to_warn_about(&narrow, &groups),
+            vec!["app".to_owned()]
+        );
+        // No preset sets `mount`: nothing to warn about.
+        let plain: AutumnConfig = toml::from_str("[roles.api]\nbase = \"web\"\n").expect("parses");
+        assert!(groups_to_warn_about(&plain, &groups).is_empty());
+    }
+
+    /// A pre-rendered page of an unmounted route leaves the static metas, so
+    /// the sitemap and the static layer drop it (#3544).
+    #[test]
+    fn drop_unmounted_static_routes_keeps_mounted_and_unowned_pages() {
+        let meta = |name: &'static str, path: &'static str| crate::static_gen::StaticRouteMeta {
+            path,
+            name,
+            revalidate: None,
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
+        };
+        let mut metas = vec![
+            meta("landing", "/"),
+            meta("about", "/about"),
+            meta("posts", "/posts/{slug}"),
+            meta("promo", "/m/promo"),
+            meta("unowned", "/legal"),
+        ];
+        let scoped = |routes: Vec<Route>| ScopedGroup {
+            prefix: "/m".to_owned(),
+            routes,
+            source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
+            apply_layer: Box::new(|router| router),
+        };
+        let before = static_route_keys(
+            &[
+                test_get_route("/", "landing"),
+                test_get_route("/about", "about"),
+                test_get_route("/posts/{slug}", "posts"),
+            ],
+            &[scoped(vec![test_get_route("/promo", "promo")])],
+        );
+        let after = static_route_keys(&[test_get_route("/", "landing")], &[]);
+        let dropped = drop_unmounted_static_routes(&mut metas, &before, &after);
+        assert_eq!(dropped, vec!["/about", "/posts/{slug}", "/m/promo"]);
+        let kept: Vec<&str> = metas.iter().map(|m| m.path).collect();
+        assert_eq!(kept, vec!["/", "/legal"]);
+    }
+
+    #[test]
+    fn retain_mounted_groups_rejects_an_unknown_group() {
+        let role = toml::from_str::<AutumnConfig>(
+            "role = \"typo\"\n[roles.typo]\nbase = \"web\"\nmount = [\"markting\"]\n",
+        )
+        .expect("parses")
+        .resolve_role()
+        .expect("resolves");
+        let mut builder = app().routes(vec![
+            test_get_route("/landing", "landing").in_group("marketing"),
+        ]);
+        let err = builder
+            .retain_mounted_groups(&role)
+            .expect_err("no route is in group markting");
+        let text = err.to_string();
+        assert!(
+            text.contains("markting") && text.contains("marketing"),
+            "{text}"
+        );
+    }
+
+    /// Plugin assets stay mounted on every role: a narrow role still serves
+    /// the CSS and JS its pages load.
+    #[test]
+    fn plugin_assets_are_shared() {
+        static ASSETS: crate::assets::PluginAssets =
+            crate::assets::PluginAssets::from_files("sharedassets3544", &[("x.css", b"")]);
+        let role = toml::from_str::<AutumnConfig>(&format!("role = \"marketing\"\n{FLEET_3544}"))
+            .expect("parses")
+            .resolve_role()
+            .expect("resolves");
+        let mut builder = app()
+            .routes(vec![
+                test_get_route("/landing", "landing").in_group("marketing"),
+            ])
+            .plugin_assets(&ASSETS);
+        let nests = builder.nest_routers.len();
+        assert!(nests > 0, "plugin_assets nests a router");
+        builder.retain_mounted_groups(&role).expect("ok");
+        assert_eq!(builder.nest_routers.len(), nests);
+    }
+
+    /// Every path that feeds the graph, the `OpenAPI` document or the router
+    /// applies the role mount first.
+    #[test]
+    fn every_route_consumer_applies_the_role_mount() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        for (start, end) in [
+            ("pub async fn run(self)", "async fn run_build_mode(self)"),
+            (
+                "async fn dump_graph_surface(mut self)",
+                "fn graph_opaque_router_count(&self)",
+            ),
+            (
+                "async fn run_dump_openapi_mode(self)",
+                "/// Dump the effective drained-queue manifest",
+            ),
+            (
+                "async fn run_replay_mode(self, capsule_path: String)",
+                "// A job capsule has no request to drive",
+            ),
+        ] {
+            let from = source.find(start).expect(start);
+            let to = from + source[from..].find(end).expect(end);
+            let body = &source[from..to];
+            assert!(
+                body.contains("retain_mounted_groups")
+                    || body.contains("route_group::MountTargets {"),
+                "{start} does not apply the role mount"
+            );
+        }
     }
 
     #[test]
@@ -19779,7 +21306,11 @@ mod tests {
     #[test]
     fn hooked_repository_apps_include_hook_queue_framework_migration() {
         let migrations = migrations_with_repository_framework_migrations(
-            vec![("app", APP_TEST_MIGRATIONS)],
+            vec![(
+                "app",
+                APP_TEST_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
+            )],
             true,
             false,
             false,
@@ -19823,7 +21354,11 @@ mod tests {
     #[test]
     fn versioned_repository_apps_include_version_history_framework_migration() {
         let migrations = migrations_with_repository_framework_migrations(
-            vec![("app", APP_TEST_MIGRATIONS)],
+            vec![(
+                "app",
+                APP_TEST_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
+            )],
             false,
             true,
             false,
@@ -19930,7 +21465,11 @@ mod tests {
     #[test]
     fn apps_with_a_derivation_include_the_derivation_state_migration() {
         let migrations = migrations_with_repository_framework_migrations(
-            vec![("app", APP_TEST_MIGRATIONS)],
+            vec![(
+                "app",
+                APP_TEST_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
+            )],
             false,
             false,
             true,
@@ -19955,7 +21494,11 @@ mod tests {
         // The whole feature is gated on a linked descriptor, so an app that
         // declares none pays for none of it, not even an empty table.
         let migrations = migrations_with_repository_framework_migrations(
-            vec![("app", APP_TEST_MIGRATIONS)],
+            vec![(
+                "app",
+                APP_TEST_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
+            )],
             false,
             false,
             false,
@@ -19969,13 +21512,32 @@ mod tests {
     }
 
     #[cfg(feature = "db")]
-    fn migration_names(migrations: &[(&str, crate::migrate::EmbeddedMigrations)]) -> Vec<String> {
+    fn migration_names_where(
+        migrations: &[crate::migrate::RegisteredMigrations],
+        keep: impl Fn(crate::migrate::MigrationScope) -> bool,
+    ) -> Vec<String> {
         use diesel::migration::{Migration, MigrationSource as _};
         use diesel::pg::Pg;
 
         migrations
             .iter()
-            .flat_map(|(_, source)| {
+            .filter(|(_, _, scope)| keep(*scope))
+            .flat_map(|(_, source, _)| {
+                let migrations: Vec<Box<dyn Migration<Pg>>> = source.migrations().unwrap();
+                migrations
+            })
+            .map(|migration| migration.name().to_string())
+            .collect()
+    }
+
+    #[cfg(feature = "db")]
+    fn migration_names(migrations: &[crate::migrate::RegisteredMigrations]) -> Vec<String> {
+        use diesel::migration::{Migration, MigrationSource as _};
+        use diesel::pg::Pg;
+
+        migrations
+            .iter()
+            .flat_map(|(_, source, _)| {
                 let migrations: Vec<Box<dyn Migration<Pg>>> = source.migrations().unwrap();
                 migrations
             })
@@ -20017,7 +21579,11 @@ mod tests {
         // the standalone shard-required sets must still be appended — otherwise
         // shards never get those tables.
         let migrations = migrations_with_repository_framework_migrations(
-            vec![("app", crate::migrate::FRAMEWORK_MIGRATIONS)],
+            vec![(
+                "app",
+                crate::migrate::FRAMEWORK_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
+            )],
             true,
             true,
             true,
@@ -20028,8 +21594,8 @@ mod tests {
         // that is not the control framework set (which gets stripped on shards).
         let shard_names: Vec<String> = migrations
             .iter()
-            .filter(|(_, set)| !migration_set_is_control_framework(set))
-            .flat_map(|(_, set)| {
+            .filter(|(_, set, _)| !migration_set_is_control_framework(set))
+            .flat_map(|(_, set, _)| {
                 let ms: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
                 ms.into_iter()
                     .map(|m| m.name().to_string())
@@ -20079,6 +21645,93 @@ mod tests {
             names.iter().any(|n| n == "20260101000000_create_gizmos"),
             "plugin-registered migrations must be applied too: {names:?}"
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn migrations_for_records_the_scope_of_each_set() {
+        use crate::migrate::MigrationScope;
+        const CONTROL: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_control_migrations");
+        const SHARDS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
+        const EVERYWHERE: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+
+        let builder = app()
+            .migrations(EVERYWHERE)
+            .migrations_for(MigrationScope::Control, CONTROL)
+            .migrations_for(MigrationScope::Shards, SHARDS);
+
+        let scopes: Vec<MigrationScope> = builder.migrations.iter().map(|m| m.2).collect();
+        assert_eq!(
+            scopes,
+            [
+                MigrationScope::Everywhere,
+                MigrationScope::Control,
+                MigrationScope::Shards
+            ]
+        );
+        let control = migration_names_where(&builder.migrations, MigrationScope::reaches_control);
+        let shards = migration_names_where(&builder.migrations, MigrationScope::reaches_shards);
+        assert!(control.contains(&"20261101000000_create_scope_control_rows".to_owned()));
+        assert!(!control.contains(&"20261101000001_create_scope_shard_rows".to_owned()));
+        assert!(shards.contains(&"20261101000001_create_scope_shard_rows".to_owned()));
+        assert!(!shards.contains(&"20261101000000_create_scope_control_rows".to_owned()));
+        for names in [&control, &shards] {
+            assert!(names.contains(&"20260101000000_create_gizmos".to_owned()));
+        }
+    }
+
+    /// A control-only set and a shard-only set that share a version never
+    /// share a database: neither side renames the other's migration.
+    #[cfg(feature = "db")]
+    #[test]
+    fn scoped_sets_get_one_collision_map_per_side() {
+        use crate::migrate::{MigrationScope, compute_migration_disambiguation};
+        const CONTROL: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_control_collide_migrations");
+        const SHARDS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
+
+        let scoped = vec![
+            ("app", CONTROL, MigrationScope::Control),
+            ("app", SHARDS, MigrationScope::Shards),
+        ];
+        for side in [
+            MigrationScope::reaches_control,
+            MigrationScope::reaches_shards,
+        ] {
+            let sets = migration_sets_for_disambiguation(&scoped, false, side);
+            assert_eq!(sets.len(), 1);
+            assert!(compute_migration_disambiguation(&sets).is_empty());
+        }
+        let control: Vec<_> = control_sets(&scoped).collect();
+        let shards: Vec<_> = shard_sets(&scoped).collect();
+        assert!(std::ptr::eq(control[0], std::ptr::from_ref(&scoped[0].1)) && control.len() == 1);
+        assert!(std::ptr::eq(shards[0], std::ptr::from_ref(&scoped[1].1)) && shards.len() == 1);
+
+        // The same two sets for every database collide, as before.
+        let everywhere = vec![
+            ("app", CONTROL, MigrationScope::Everywhere),
+            ("app", SHARDS, MigrationScope::Everywhere),
+        ];
+        let sets =
+            migration_sets_for_disambiguation(&everywhere, false, MigrationScope::reaches_control);
+        assert_eq!(compute_migration_disambiguation(&sets).len(), 1);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_shard_only_set_with_no_shard_warns() {
+        use crate::migrate::MigrationScope;
+        const SHARDS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
+        let config = AutumnConfig::default();
+        let only = vec![("app", SHARDS, MigrationScope::Shards)];
+        assert!(unreachable_shard_sets_warning(&config, &only).is_some());
+        let everywhere = vec![("app", SHARDS, MigrationScope::Everywhere)];
+        assert!(unreachable_shard_sets_warning(&config, &everywhere).is_none());
     }
 
     #[cfg(feature = "db")]
@@ -20289,6 +21942,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -20620,6 +22274,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }],
             &config,
             state,
@@ -20707,6 +22362,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }],
             &AutumnConfig::default(),
             AppState::for_test(),
@@ -20884,6 +22540,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }],
             &config,
             state,
@@ -20996,6 +22653,7 @@ mod tests {
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
+                    group: None,
                 }],
                 &config,
                 state,
@@ -21107,6 +22765,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }],
             &config,
             state,
@@ -21689,6 +23348,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }];
         let router = test_router(post_routes);
 
@@ -21728,6 +23388,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             },
             Route {
                 method: http::Method::POST,
@@ -21748,6 +23409,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             },
         ];
         let config = AutumnConfig::default();
@@ -22140,6 +23802,7 @@ mod tests {
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
+                    group: None,
                 }],
                 &config,
                 state,
@@ -22202,6 +23865,7 @@ mod tests {
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
+                    group: None,
                 }]);
 
                 let response = router
@@ -23768,7 +25432,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::cron_occurrence_window(&daily, &at),
-            std::time::Duration::from_secs(24 * 60 * 60)
+            std::time::Duration::from_hours(24)
         );
         let every_ten = "*/10 * * * * *".parse::<croner::Cron>().expect("parse");
         let at = chrono_tz::UTC
@@ -23796,7 +25460,7 @@ mod tests {
             std::time::Duration::from_secs(300),
             super::CronTick {
                 unix_secs: 1_700_000_000,
-                window: std::time::Duration::from_secs(86_400),
+                window: std::time::Duration::from_hours(24),
             },
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
@@ -23808,7 +25472,7 @@ mod tests {
 
         assert_eq!(
             *coordinator.period.lock().unwrap(),
-            Some(std::time::Duration::from_secs(86_400))
+            Some(std::time::Duration::from_hours(24))
         );
     }
 

@@ -36,7 +36,7 @@ src/bin/edge-capsule.rs   the capsule: mounts handlers.rs only
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - The WASI target, for building or testing the capsule:
 
   ```bash

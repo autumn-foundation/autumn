@@ -3954,7 +3954,7 @@ path = "/shop/panel"
 
     #[test]
     fn a_dropped_call_keeps_its_own_time_not_the_time_of_ingest() {
-        // #2523 finding 18. The log ingests a request when it ends. A slow
+        // #2523. The log ingests a request when it ends. A slow
         // request must not make its old drops look recent.
         use chrono::TimeZone as _;
 

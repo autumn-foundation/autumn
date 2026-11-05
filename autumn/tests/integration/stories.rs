@@ -1,7 +1,7 @@
 //! CI anti-rot harness for the widget story gallery (issue #1526).
 //!
 //! Renders every built-in story (no panic, non-empty, balanced HTML, unique
-//! slugs), enforces the story coverage gate against `src/widgets.rs`, and
+//! slugs), enforces the story coverage gate against `src/widgets/`, and
 //! pins the `story!` macro's source-fidelity and zero-arg purity contracts.
 //!
 //! Run with `cargo test -p autumn-web --test integration_tests stories`.
@@ -216,44 +216,57 @@ fn builtin_slugs_unique_groups_and_names_nonempty() {
 // ── T10 (AC9): coverage gate part 1 — inventory diffed both directions ───
 
 /// Expected slugs: one story per gallery-visible widget in
-/// `autumn/src/widgets.rs` (plan D7). Adding a widget without a story fails
+/// `autumn/src/widgets/` (plan D7). Adding a widget without a story fails
 /// this gate; removing a widget without pruning its story fails the reverse
 /// direction.
 const EXPECTED_STORY_SLUGS: &[&str] = &[
-    "active-search",
     "alert",
-    "autocomplete",
     "avatar",
     "badge",
     "breadcrumb",
-    "bulk-actions",
     "card",
-    "charts",
-    "comment-thread",
+    // Native choice inputs (`autumn_web::form`, #3405).
+    "choice-controls",
     "confirm-action",
     "data-table",
     "drawer",
-    // Form field wrapper (`autumn_web::form`, #3395), not a `widgets.rs` fn.
+    "dropdown-menu",
+    // Form field wrapper (`autumn_web::form`, #3395), not a widget fn.
     "field",
     // `autumn_web::a11y` primitives (#3398).
     "accessible-primitives",
     "accordion",
     "hero",
-    "infinite-feed",
     "locale-switcher",
     "modal",
+    // Native inputs (`autumn_web::form`, #3405).
+    "native-inputs",
     "nav-bar",
     "nav-link",
     // `ui::pagination` (#3398).
     "pagination",
+    "popover",
     "property-list",
-    "reaction-controls",
+    // Select with optgroup, multiple and the opt-in style (#3409).
+    "select",
     "stat-card",
     "tabs",
     "theme-toggle",
     "toast",
-    "transition-controls",
-    "translated-transition-controls",
+    "tooltip",
+    // The small display set (#3406).
+    "avatar-group",
+    "button",
+    "button-group",
+    "empty-state",
+    "kbd",
+    "meter",
+    "progress",
+    "separator",
+    "skeleton",
+    "spinner",
+    // Password and one-time code (`autumn_web::form`, #3412).
+    "sign-in-inputs",
 ];
 
 /// Slugs of stories for feature-gated modules (#3398).
@@ -264,6 +277,22 @@ fn expected_story_slugs() -> Vec<&'static str> {
     slugs.push("flash");
     #[cfg(feature = "wizard")]
     slugs.push("wizard-progress");
+    // `storage::form_helper` (#3411).
+    #[cfg(feature = "storage")]
+    slugs.push("direct-upload");
+    // Widget families (#3408).
+    #[cfg(feature = "widgets-search")]
+    slugs.extend(["active-search", "autocomplete", "tags-input"]);
+    #[cfg(feature = "widgets-social")]
+    slugs.extend(["comment-thread", "infinite-feed", "reaction-controls"]);
+    #[cfg(feature = "widgets-workflow")]
+    slugs.extend([
+        "bulk-actions",
+        "transition-controls",
+        "translated-transition-controls",
+    ]);
+    #[cfg(feature = "widgets-charts")]
+    slugs.push("charts");
     slugs
 }
 
@@ -290,7 +319,7 @@ fn story_coverage_inventory_matches_registry() {
     }
 }
 
-// ── T11 (AC9, R1): coverage gate part 2 — fn-name scan of widgets.rs ─────
+// ── T11 (AC9, R1): coverage gate part 2 — fn-name scan of src/widgets/ ──
 
 /// True when `needle` occurs in `haystack` as a standalone identifier — i.e.
 /// not merely as a substring of a longer identifier (`card` inside
@@ -374,40 +403,108 @@ fn all_story_sources() -> String {
 }
 
 /// Source files whose top-level `pub fn`s each need a story.
-fn render_fn_sources() -> Vec<&'static str> {
+fn render_fn_sources() -> Vec<String> {
     // `ui::pagination`, `flash` and `wizard` joined in #3398.
-    #[allow(unused_mut)]
-    let mut files = vec!["src/widgets.rs", "src/ui/pagination.rs"];
+    let mut files = widget_module_files();
+    files.push("src/ui/pagination.rs".to_owned());
     #[cfg(feature = "flash")]
-    files.push("src/flash.rs");
+    files.push("src/flash.rs".to_owned());
     #[cfg(feature = "wizard")]
-    files.push("src/wizard.rs");
+    files.push("src/wizard.rs".to_owned());
     files
+}
+
+/// Every `.rs` file in `src/widgets/` (#3408). The gate lists the directory,
+/// so a new module is scanned without an edit here.
+fn widget_module_files() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/widgets");
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("file name");
+            format!("src/widgets/{name}")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The family feature (`widgets-*`) that gates `src/widgets/<module>.rs`,
+/// read from the `#[cfg(feature = "...")]` line above `mod <module>;` in
+/// `mod.rs`. A core module has only the `maud` gate, so it has none.
+fn widget_module_feature(module: &str) -> Option<String> {
+    let mod_rs = read_crate_file("src/widgets/mod.rs");
+    let lines: Vec<&str> = mod_rs.lines().collect();
+    let decl = format!("mod {module};");
+    let at = lines.iter().position(|l| l.trim() == decl)?;
+    lines[..at]
+        .iter()
+        .rev()
+        .take_while(|l| l.trim_start().starts_with("#["))
+        .find_map(|l| {
+            let rest = l.split("feature = \"").nth(1)?;
+            let feature = rest.split('"').next()?;
+            feature.starts_with("widgets-").then(|| feature.to_owned())
+        })
+}
+
+/// True when this test build has the widget family `feature` on.
+fn widget_family_enabled(feature: &str) -> bool {
+    match feature {
+        "widgets-search" => cfg!(feature = "widgets-search"),
+        "widgets-social" => cfg!(feature = "widgets-social"),
+        "widgets-workflow" => cfg!(feature = "widgets-workflow"),
+        "widgets-charts" => cfg!(feature = "widgets-charts"),
+        other => panic!("unknown widget feature `{other}`: add it to `widget_family_enabled`"),
+    }
 }
 
 #[test]
 fn every_public_widget_fn_is_exercised_by_a_story() {
     let all_sources = all_story_sources();
+    // A story for a feature-off family is not in the registry. Its source
+    // text is still in builtin.rs, so the gate checks that text instead.
+    let builtin_source = read_crate_file("src/stories/builtin.rs");
+    let mut widget_fns = 0;
     for file in render_fn_sources() {
-        let fns = top_level_items(&read_crate_file(file), "pub fn ");
-        let minimum = if file == "src/widgets.rs" { 20 } else { 1 };
-        assert!(
-            fns.len() >= minimum,
-            "{file} scan looks broken; found only {fns:?}"
-        );
+        let fns = top_level_items(&read_crate_file(&file), "pub fn ");
+        let module = file
+            .strip_prefix("src/widgets/")
+            .and_then(|f| f.strip_suffix(".rs"));
+        if module.is_some() {
+            widget_fns += fns.len();
+        }
+        let feature = module.and_then(widget_module_feature);
+        let (stories, place) = match &feature {
+            Some(f) if !widget_family_enabled(f) => (&builtin_source, "builtin.rs source"),
+            _ => (&all_sources, "registered stories"),
+        };
+        if module.is_none() {
+            assert!(!fns.is_empty(), "{file} scan looks broken; found no pub fn");
+        }
 
         let missing: Vec<&String> = fns
             .iter()
-            .filter(|name| !contains_identifier(&all_sources, name))
+            .filter(|name| !contains_identifier(stories, name))
             .collect();
         assert!(
             missing.is_empty(),
-            "{file}: fn(s) with no story mentioning them: {missing:?}\n\
+            "{file}: fn(s) with no story mentioning them in the {place}: {missing:?}\n\
              Add a story!{{}} block that calls them in autumn/src/stories/builtin.rs and, for a \
              new top-level widget, add its slug to EXPECTED_STORY_SLUGS in \
              autumn/tests/integration/stories.rs."
         );
     }
+    // 79 widget fns when the split landed (#3408).
+    assert!(
+        widget_fns >= 79,
+        "src/widgets/ scan looks broken; found only {widget_fns} pub fns"
+    );
 }
 
 /// Type-state markers in `a11y.rs`. They have no markup of their own.
@@ -443,7 +540,7 @@ const INTERACTIVE_MARKERS: &[&str] = &[
     "data-autumn-",
     "data-modal-open",
     "data-drawer-open",
-    "data-nav-menu-toggle",
+    "data-popover-toggle",
     "autumn-flash__dismiss-toggle",
 ];
 
@@ -454,14 +551,36 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "accordion",
     "active-search",
     "autocomplete",
+    // `data-autumn-busy` (#3406).
+    "button",
+    "choice-controls",
     "confirm-action",
+    "direct-upload",
     "drawer",
+    "dropdown-menu",
     "flash",
     "modal",
     "nav-bar",
+    "popover",
+    "select",
+    // Paste into the OTP field and the reveal toggle (#3412).
+    "sign-in-inputs",
     "tabs",
+    // Tags mode of the combobox (#3410).
+    "tags-input",
     "theme-toggle",
     "toast",
+    "tooltip",
+];
+
+/// Keyboard stories that a feature can turn off: `flash`, the
+/// `widgets-search` stories (#3408), and `direct-upload` (`storage`).
+const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] = &[
+    "flash",
+    "active-search",
+    "autocomplete",
+    "tags-input",
+    "direct-upload",
 ];
 
 /// The browser test fn name for `slug`.
@@ -493,9 +612,9 @@ fn every_interactive_story_has_a_keyboard_test() {
 
     for slug in KEYBOARD_STORY_SLUGS {
         if !registry.stories().iter().any(|s| s.slug() == *slug) {
-            // `flash` is absent when its feature is off.
-            assert_eq!(
-                *slug, "flash",
+            // A story is absent when its feature is off.
+            assert!(
+                FEATURE_GATED_KEYBOARD_SLUGS.contains(slug),
                 "KEYBOARD_STORY_SLUGS names unknown story `{slug}`"
             );
             continue;
@@ -514,13 +633,16 @@ fn every_interactive_story_has_a_keyboard_test() {
 
 /// Paths that must start the widget browser workflow (issue #3398).
 const BROWSER_GATE_PATHS: &[&str] = &[
-    "autumn/src/widgets.rs",
+    "autumn/src/widgets/**",
     "autumn/src/ui/**",
     "autumn/vendor/autumn-widgets.js",
+    "autumn/vendor/autumn-widgets-search.js",
     "autumn/src/stories/**",
     "autumn/src/htmx.rs",
     "autumn/vendor/htmx.min.js",
     "autumn/tests/integration/widgets_toast_browser.rs",
+    "autumn/tests/integration/widgets_popover_browser.rs",
+    "autumn/tests/integration/widgets_tooltip_browser.rs",
     "autumn/tests/integration/widgets_drawer_browser.rs",
     "autumn/src/widget_pack.rs",
     "autumn/src/plugin_conformance/**",
@@ -547,6 +669,8 @@ fn widget_browser_workflow_runs_on_widget_changes() {
         "stories_browser",
         "widgets_keyboard_browser",
         "widgets_toast_browser",
+        "widgets_popover_browser",
+        "widgets_tooltip_browser",
         "widgets_drawer_browser",
         "widget_pack_browser",
     ] {
@@ -557,13 +681,18 @@ fn widget_browser_workflow_runs_on_widget_changes() {
             "widgets-browser.yml does not run the `{suite}` browser suite"
         );
     }
+    let publish = read_crate_file("../.github/workflows/publish-gate.yml");
+    assert!(
+        publish.contains("widgets_popover_browser -- --include-ignored"),
+        "publish-gate.yml does not run the popover browser suite (#3402)"
+    );
     // A filter that matches nothing exits 0. Each suite needs a count check.
     assert!(
         workflow.contains("the_swatch_pack_passes_widget_browser_conformance -- --include-ignored"),
         "widgets-browser.yml does not run the reference widget pack (#3400)"
     );
     assert!(
-        workflow.matches("passed' ").count() >= 5,
+        workflow.matches("passed' ").count() >= 8,
         "widgets-browser.yml must check a non-zero pass count for each suite"
     );
 }

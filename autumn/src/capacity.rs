@@ -645,7 +645,7 @@ pub fn route_graph_digest(routes: &[RouteShape]) -> String {
         hasher.update(line.as_bytes());
         hasher.update(b"\n");
     }
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 /// Where a load-shedding admission ceiling came from.

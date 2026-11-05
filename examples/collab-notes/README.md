@@ -6,7 +6,7 @@ caret is. No external real-time service.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 
 No database and no container: the notes live in memory so the example starts
 with one command. See [Persisting the document](#persisting-the-document) for

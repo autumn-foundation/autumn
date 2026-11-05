@@ -42,7 +42,7 @@ async fn strict_wall_clock_passes_on_clean_virtual_run(mut sim: Sim) {
     let wall_start = Instant::now();
 
     // Jump a full day of virtual time, then drain — no real sleeping anywhere.
-    sim.advance(Duration::from_secs(24 * 3600)).await;
+    sim.advance(Duration::from_hours(24)).await;
     sim.run_to_idle().await;
     let wall_elapsed = wall_start.elapsed();
 

@@ -1453,7 +1453,7 @@ fn exempt_servers<'a>(prefix: &str, routes: &[&'a RouteKey]) -> Vec<&'a RouteKey
     } else {
         vec![base.to_owned(), below]
     };
-    subjects
+    let mut served: Vec<&RouteKey> = subjects
         .iter()
         .flat_map(|subject| {
             let overlapping: Vec<&RouteKey> = routes
@@ -1463,7 +1463,93 @@ fn exempt_servers<'a>(prefix: &str, routes: &[&'a RouteKey]) -> Vec<&'a RouteKey
                 .collect();
             undominated(subject, &overlapping)
         })
-        .collect()
+        .collect();
+    // A request can also reach the prefix through dot segments.
+    served.extend(
+        routes
+            .iter()
+            .filter(|(path, _)| reaches_through_dots(path, &subjects))
+            .copied(),
+    );
+    served
+}
+
+/// Maximum number of cleaned shapes to track for one route. A route over this
+/// cap is bound without further checks.
+const MAX_DOT_STATES: usize = 1024;
+
+/// Segment spellings that `clean_path` resolves as `..`.
+const POP_FORMS: [&str; 4] = ["..", "%2e%2e", ".%2e", "%2e."];
+
+/// Segment spellings that `clean_path` resolves as `.`.
+const SKIP_FORMS: [&str; 2] = [".", "%2e"];
+
+/// Whether a request to `route` can clean into one of the `subjects`, by
+/// way of a dot segment.
+///
+/// The router sees the raw path. `CsrfService` sees the cleaned path. A
+/// capture can hold a whole dot segment. A catch-all can hold `../` parts.
+/// The code walks the route as a stack of segment patterns. A capture that can
+/// be `.` pushes nothing. A capture that can be `..` pops one segment. A
+/// catch-all pops any number of segments. `..` at the root does nothing.
+///
+/// Limits, stated in the posture guide: a `%2f` inside a capture is not
+/// modeled, and the code does not rank routes by router precedence.
+fn reaches_through_dots(route: &str, subjects: &[String]) -> bool {
+    // Each state holds a cleaned prefix and a flag. The flag is true when a dot
+    // segment produced the prefix.
+    let mut states: BTreeSet<(Vec<&str>, bool)> = BTreeSet::from([(Vec::new(), false)]);
+    for segment in route.split('/').filter(|s| !s.is_empty()) {
+        let mut next = BTreeSet::new();
+        for (stack, dotted) in &states {
+            if segment.contains(CATCH_ALL) {
+                for keep in 0..=stack.len() {
+                    let mut cleaned = stack[..keep].to_vec();
+                    cleaned.push(segment);
+                    next.insert((cleaned, *dotted || keep < stack.len()));
+                }
+                continue;
+            }
+            let mut push = stack.clone();
+            push.push(segment);
+            next.insert((push, *dotted));
+            if is_dot_form(segment, &SKIP_FORMS) {
+                next.insert((stack.clone(), true));
+            }
+            if is_dot_form(segment, &POP_FORMS) {
+                let mut popped = stack.clone();
+                popped.pop();
+                next.insert((popped, true));
+            }
+        }
+        if next.len() > MAX_DOT_STATES {
+            return true;
+        }
+        states = next;
+    }
+    states.iter().any(|(stack, dotted)| {
+        // A trailing slash on the route is kept by `clean_path`.
+        let slash = if route.ends_with('/') && !stack.is_empty() {
+            "/"
+        } else {
+            ""
+        };
+        let cleaned = format!("/{}{slash}", stack.join("/"));
+        *dotted && subjects.iter().any(|s| intersect(&cleaned, s).is_some())
+    })
+}
+
+/// Whether `segment` can be, or hold, one of the dot `forms`.
+fn is_dot_form(segment: &str, forms: &[&str]) -> bool {
+    // `clean_path` reads `%2E` and `%2e` alike.
+    let segment = segment.to_ascii_lowercase();
+    forms.iter().any(|form| {
+        if segment.contains(CAPTURE) {
+            segments_overlap(&segment, form)
+        } else {
+            segment == *form
+        }
+    })
 }
 
 /// Configured exemption prefixes, which the per-route rows cannot show.
@@ -4986,6 +5072,112 @@ mod tests {
         .find(|f| f.kind == "csrf_exemption_added")
         .expect("a new exemption is a widening")
         .canonical()
+    }
+
+    /// Digest of one `POST` route under `prefix`, with `scopes` on the route.
+    /// A change in the digest means the exemption binds to the route.
+    fn binds(route_path: &str, prefix: &str) -> bool {
+        let digest = |scopes: &[&str]| exemption_digest(&[(route_path, "POST", scopes)], &[prefix]);
+        digest(&["mfa"]) != digest(&[])
+    }
+
+    /// `..` in a capture moves the cleaned path out of `/other`, into `/api`.
+    #[test]
+    fn an_exemption_binds_a_route_reached_through_dot_dot() {
+        assert!(binds("/other/{id}/api", "/api"));
+        assert!(binds("/other/{id}/api/{x}", "/api"));
+    }
+
+    /// `.` in a capture leaves the cleaned path one segment shorter.
+    #[test]
+    fn an_exemption_binds_a_route_reached_through_a_single_dot() {
+        assert!(binds("/api/{a}/x/z", "/api/x/z"));
+    }
+
+    /// `%2e` spellings reach the prefix the same way.
+    #[test]
+    fn an_exemption_binds_a_route_reached_through_encoded_dots() {
+        assert!(binds("/other/%2e{a}/api", "/api"));
+        assert!(binds("/other/.{a}/api", "/api"));
+    }
+
+    /// A catch-all holds whole `../` segments.
+    #[test]
+    fn an_exemption_binds_a_catch_all_that_can_climb_out() {
+        assert!(binds("/files/{*path}", "/api"));
+    }
+
+    /// A segment with a fixed edge that is not a dot cannot be a dot segment.
+    #[test]
+    fn an_exemption_ignores_a_segment_that_cannot_be_a_dot_segment() {
+        assert!(!binds("/other/v{id}/api", "/api"));
+        assert!(!binds("/other/{id}x/api", "/api"));
+    }
+
+    /// A literal route never has a dot to resolve.
+    #[test]
+    fn an_exemption_ignores_a_literal_route_outside_the_prefix() {
+        assert!(!binds("/other/api", "/api"));
+        assert!(!binds("/other/x/api", "/api"));
+    }
+
+    /// `..` cannot climb above the root, so one capture cannot reach a prefix
+    /// that sits behind two literal segments it must keep.
+    #[test]
+    fn an_exemption_ignores_a_route_whose_literals_keep_it_outside() {
+        assert!(!binds("/a/b/{id}/c", "/api"));
+    }
+
+    /// `%2E` reads as `%2e`.
+    #[test]
+    fn an_exemption_binds_a_route_reached_through_upper_case_dots() {
+        assert!(binds("/other/%2E{a}/api", "/api"));
+        assert!(binds("/other/%2E%2E/api", "/api"));
+    }
+
+    /// `..` at the root does nothing, so the route still ends at `/api`.
+    #[test]
+    fn an_exemption_binds_a_route_that_pops_at_the_root() {
+        assert!(binds("/{a}/{b}/api", "/api"));
+    }
+
+    /// A catch-all below a deep stack pops back to the prefix.
+    #[test]
+    fn an_exemption_binds_a_deep_catch_all() {
+        assert!(binds("/a/b/{*rest}", "/api"));
+    }
+
+    /// A trailing slash prefix covers what is below it, not the prefix itself.
+    #[test]
+    fn a_trailing_slash_prefix_binds_a_dot_route_below_it() {
+        assert!(binds("/other/{id}/api/x", "/api/"));
+        assert!(!binds("/other/{id}/api", "/api/"));
+    }
+
+    /// A trailing slash on the route survives cleaning.
+    #[test]
+    fn a_trailing_slash_route_binds_under_a_trailing_slash_prefix() {
+        assert!(binds("/zzz/{x}/api/", "/api/"));
+    }
+
+    /// The root prefix exempts every URL.
+    #[test]
+    fn the_root_prefix_binds_a_dot_route() {
+        assert!(binds("/other/{id}/api", "/"));
+    }
+
+    /// Past `MAX_DOT_STATES` the route is bound whatever it reaches.
+    #[test]
+    fn an_exemption_binds_a_route_over_the_state_cap() {
+        let route = |pairs: usize| {
+            let mut path = String::from("/x");
+            for i in 0..pairs {
+                let _ = write!(path, "/{{c{i}}}/l{i}");
+            }
+            path + "/zzz"
+        };
+        assert!(!binds(&route(2), "/api"), "a short route stays unbound");
+        assert!(binds(&route(14), "/api"), "a route over the cap binds");
     }
 
     /// A node answers every method, so a static node without `POST` still

@@ -71,7 +71,7 @@ one. **Draw the material first, store it, and adopt it second:**
 // First run: the client draws 32 bytes and puts them somewhere it trusts —
 // an OS keychain, a hardware token, a passphrase-derived wrapper.
 let mut material = [0u8; 32];
-getrandom::getrandom(&mut material)?;
+getrandom::fill(&mut material)?;
 keystore.write("autumn.root_key", &hex::encode(material))?;
 
 // Every run, including the first: adopt the stored material.

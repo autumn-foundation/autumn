@@ -8,7 +8,7 @@
 //! capture compiles.
 //!
 //! The CI coverage gate (`autumn/tests/integration/stories.rs`) enforces that
-//! every public render fn in `src/widgets.rs`, `src/ui/pagination.rs`,
+//! every public render fn in `src/widgets/`, `src/ui/pagination.rs`,
 //! `src/flash.rs` and `src/wizard.rs`, and every `src/a11y.rs` primitive, is
 //! used by at least one story's source. When you add a widget, add (or extend)
 //! a story here and add the new top-level widget's slug to
@@ -18,7 +18,18 @@ use super::{Story, story};
 
 /// Every built-in story: the ungated set, then the feature-gated set.
 pub(super) fn all_stories() -> Vec<Story> {
-    let mut stories = builtin_stories();
+    #[allow(unused_mut, reason = "each family extend has its own #[cfg]")]
+    let mut stories = Vec::new();
+    // Widget families (#3408). Search comes first, as before the split.
+    #[cfg(feature = "widgets-search")]
+    stories.extend(search_stories());
+    stories.extend(builtin_stories());
+    #[cfg(feature = "widgets-charts")]
+    stories.extend(charts_stories());
+    #[cfg(feature = "widgets-social")]
+    stories.extend(social_stories());
+    #[cfg(feature = "widgets-workflow")]
+    stories.extend(workflow_stories());
     stories.extend(gated_stories());
     stories
 }
@@ -29,92 +40,11 @@ fn builtin_stories() -> Vec<Story> {
     vec![
         story! {
             "Forms",
-            "Active search",
-            {
-                use autumn_web::widgets::{
-                    ActiveSearchConfig, active_search, active_search_empty_state,
-                    active_search_input, active_search_results,
-                };
-
-                // A real, live-wired demo — unlike most story action URLs,
-                // which stay synthetic 404s on purpose (see e.g. the Confirm
-                // action or Bulk actions stories): a search box that visibly
-                // does nothing while typing reads as broken. The gallery
-                // itself serves this path (see `stories::demo_search`).
-                let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
-                    .placeholder("Search posts…");
-                maud::html! {
-                    // The claim below only holds when htmx is actually on
-                    // the page — story_page only loads it under the `htmx`
-                    // feature (review follow-up: a maud-only, no-htmx build
-                    // still compiles this story, and its hx-* attributes
-                    // stay inert without htmx there to process them).
-                    @if cfg!(feature = "htmx") {
-                        p { em { "Try it — this box is live, searching a small demo post list." } }
-                    } @else {
-                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
-                    }
-                    (active_search("post-search", "Search posts", &config))
-                    p { em { "For reference — not live — what your handler returns when nothing matches:" } }
-                    (active_search_empty_state("No posts matched your search."))
-                    // Compose the pieces yourself when you need custom layout
-                    // between the input and the results container: this needs
-                    // its own config, targeting its own results container —
-                    // reusing `config` above would target
-                    // "#post-search-results" (the first demo's), leaving this
-                    // one empty on a successful response (review follow-up).
-                    div {
-                        (active_search_input(
-                            "post-search-split",
-                            "Search posts",
-                            &ActiveSearchConfig::new("/_stories/demo/search", "#post-search-split-results")
-                                .placeholder("Search posts…"),
-                        ))
-                        (active_search_results("post-search-split-results"))
-                    }
-                }
-            }
-        },
-        story! {
-            "Forms",
-            "Autocomplete",
-            {
-                use autumn_web::widgets::{
-                    AutocompleteConfig, autocomplete_empty_state, autocomplete_input,
-                    autocomplete_option,
-                };
-
-                // Real, live-wired demo — see the Active search story above
-                // for why (and `stories::demo_tag_search` for the handler).
-                let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
-                    .placeholder("Start typing a tag…");
-                maud::html! {
-                    // See the Active search story above for why this is
-                    // conditional (review follow-up).
-                    @if cfg!(feature = "htmx") {
-                        p { em { "Try it — this box is live, matching against a small demo tag list." } }
-                    } @else {
-                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
-                    }
-                    (autocomplete_input("tag-picker", "Tag", &config))
-                    p { em { "For reference — not live — the two shapes your handler returns:" } }
-                    // One matching option, as your handler would render it. An
-                    // option needs a listbox parent; the live box above has one.
-                    div role="listbox" aria-label="Example options" {
-                        (autocomplete_option("42", "rust"))
-                    }
-                    // And the empty state when nothing matches:
-                    (autocomplete_empty_state("No matching tags."))
-                }
-            }
-        },
-        story! {
-            "Forms",
             "Field",
             {
                 use autumn_web::form::{
                     Changeset, FieldOptions, checkbox_input_with, required_password_input,
-                    select_input_with, text_input_with,
+                    select_input_with, text_input_with, textarea_input_with,
                 };
 
                 // Field wrapper v2 (#3395): hint, required marker, typed
@@ -128,6 +58,7 @@ fn builtin_stories() -> Vec<Story> {
                         "password": "",
                         "plan": "pro",
                         "terms": false,
+                        "about": "Type more lines. The box grows.",
                     }),
                     errors,
                 );
@@ -152,6 +83,187 @@ fn builtin_stories() -> Vec<Story> {
                         &FieldOptions::new().disabled().hint("Change your plan in billing."),
                     ))
                     (checkbox_input_with(&changeset, "terms", "I accept the terms", &FieldOptions::new().required()))
+                    // `field-sizing: content` grows the textarea (#3406).
+                    (textarea_input_with(&changeset, "about", "About you", &FieldOptions::new()
+                        .auto_grow()
+                        .hint("The box grows with the text.")))
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Sign-in inputs",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, OtpFormat, otp_input_with, password_input_with,
+                    required_otp_input,
+                };
+
+                // Password and one-time code (#3412). The reveal button and
+                // the strength hint need autumn-widgets.js.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("backup".to_string(), vec!["The code is not correct.".to_string()]);
+                let changeset = Changeset::from_errors(serde_json::json!({}), errors);
+
+                maud::html! {
+                    (password_input_with(&changeset, "current", "Current password", &FieldOptions::new()
+                        .current_password()
+                        .reveal()))
+                    (password_input_with(&changeset, "fresh", "New password", &FieldOptions::new()
+                        .new_password()
+                        .minlength(12)
+                        .hint("Use 12 or more characters.")
+                        .reveal()
+                        .strength_hint()))
+                    // One input: paste and SMS autofill fill all the boxes.
+                    (required_otp_input(&changeset, "code", "Authenticator code"))
+                    // A group needs autumn-widgets.js. The server gets the digits only.
+                    (otp_input_with(&changeset, "backup", "Backup code", OtpFormat::digits(8).group(4), &FieldOptions::new()
+                        .hint("Type the 8 digits from your backup sheet.")))
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Native inputs",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, color_input, email_input_with, hidden_input,
+                    month_input, range_input_with, required_time_input, tel_input_with, url_input,
+                };
+
+                // Native inputs (#3405). Each helper reads its value from the
+                // changeset and has the field wrapper: hint, marker, errors.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("site".to_string(), vec!["Start the address with https://".to_string()]);
+                let changeset = Changeset::from_errors(
+                    serde_json::json!({
+                        "email": "ada@example.com",
+                        "phone": "",
+                        "site": "example.com",
+                        "opens": "09:30:00",
+                        "period": "2026-03-15",
+                        "accent": "#7C3AED",
+                        "volume": 40,
+                        "token": "abc123",
+                    }),
+                    errors,
+                );
+
+                maud::html! {
+                    (email_input_with(&changeset, "email", "Email", &FieldOptions::new()
+                        .autocomplete("email")))
+                    (tel_input_with(&changeset, "phone", "Phone", &FieldOptions::new()
+                        .autocomplete("tel")
+                        .hint("Include the country code.")))
+                    (url_input(&changeset, "site", "Website"))
+                    // `09:30:00` renders as `09:30`.
+                    (required_time_input(&changeset, "opens", "Opens at"))
+                    // A date renders as its month: `2026-03`.
+                    (month_input(&changeset, "period", "Billing month"))
+                    // The browser posts a lowercase `#rrggbb`.
+                    (color_input(&changeset, "accent", "Accent color"))
+                    (range_input_with(&changeset, "volume", "Volume", Some("10"), &FieldOptions::new()
+                        .min("0")
+                        .max("100")))
+                    // A hidden input has no label and is not visible.
+                    (hidden_input(&changeset, "token"))
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Choice controls",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, checkbox_group_with, radio_group,
+                    required_segmented_control, switch_input_with,
+                };
+
+                // Choice controls (#3405). A group is a <fieldset> with a
+                // <legend>. All of them work with JavaScript off: the native
+                // radio arrow keys move a selection, Space toggles a box.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("topics".to_string(), vec!["Choose one or more topics.".to_string()]);
+                let changeset = Changeset::from_errors(
+                    serde_json::json!({
+                        "alerts": true,
+                        "plan": "pro",
+                        "topics": ["rust"],
+                        "view": "grid",
+                    }),
+                    errors,
+                );
+
+                maud::html! {
+                    // A checkbox with role="switch". A screen reader says "on".
+                    (switch_input_with(&changeset, "alerts", "Email alerts", &FieldOptions::new()
+                        .hint("At most one email a day.")))
+                    (radio_group(&changeset, "plan", "Plan", &[
+                        ("free", "Free"),
+                        ("pro", "Pro"),
+                        ("team", "Team"),
+                    ]))
+                    // Bind to a `#[serde(default)] Vec<String>`. `required` shows
+                    // the marker only: validate "one or more" on the server.
+                    (checkbox_group_with(&changeset, "topics", "Topics", &[
+                        ("rust", "Rust"),
+                        ("web", "Web"),
+                        ("db", "Databases"),
+                    ], &FieldOptions::new().required()))
+                    // Radios that look like a row of buttons.
+                    (required_segmented_control(&changeset, "view", "View", &[
+                        ("list", "List"),
+                        ("grid", "Grid"),
+                        ("board", "Board"),
+                    ]))
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Select",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, grouped_select_input_with, select_input,
+                    select_input_with,
+                };
+
+                // Select (#3409). The element is a native <select>, so the
+                // keyboard and the screen reader work as usual, with no JS.
+                let changeset = Changeset::new(serde_json::json!({
+                    "plan": "pro",
+                    "plan_native": "pro",
+                    "city": "lyon",
+                    "tags": ["rust", "db"],
+                }));
+                let plans = [("free", "Free"), ("pro", "Pro"), ("team", "Team")];
+
+                maud::html! {
+                    // Styled: `appearance: base-select` where the browser
+                    // supports it. Other browsers show the native control.
+                    (select_input_with(&changeset, "plan", "Plan (styled)", &plans,
+                        &FieldOptions::new().styled_select()))
+                    // Fallback: the same select with no opt-in.
+                    (select_input(&changeset, "plan_native", "Plan (native fallback)", &plans))
+                    // Top-level options first, then one <optgroup> per group.
+                    (grouped_select_input_with(&changeset, "city", "City",
+                        &[("", "Choose a city")],
+                        &[
+                            ("France", &[("paris", "Paris"), ("lyon", "Lyon")]),
+                            ("Japan", &[("tokyo", "Tokyo"), ("osaka", "Osaka")]),
+                        ],
+                        &FieldOptions::new().required().styled_select()))
+                    // Bind to a `#[serde(default)] Vec<String>`. A multiple
+                    // select keeps the native list box.
+                    (select_input_with(&changeset, "tags", "Topics", &[
+                        ("rust", "Rust"),
+                        ("web", "Web"),
+                        ("db", "Databases"),
+                    ], &FieldOptions::new()
+                        .multiple()
+                        .styled_select()
+                        .hint("Choose one or more.")))
                 }
             }
         },
@@ -219,48 +331,6 @@ fn builtin_stories() -> Vec<Story> {
                     .title("Release notes")
                     .footer(maud::html! { a href="/changelog" { "Read the changelog" } });
                 card(&body, &config)
-            }
-        },
-        story! {
-            "Display",
-            "Charts",
-            {
-                use autumn_web::widgets::{
-                    ChartConfig, bar_chart, bar_chart_with, line_chart, line_chart_with,
-                    sparkline, sparkline_with,
-                };
-
-                // A 30-point trend series, built with a loop (no env capture).
-                let owned: Vec<(String, f64)> = (0..30)
-                    .map(|day| {
-                        let label = format!("Day {}", day + 1);
-                        let swing = (f64::from(day) * 0.4).sin() * 10.0;
-                        let value = 20.0 + swing;
-                        (label, value)
-                    })
-                    .collect();
-                let trend: Vec<(&str, f64)> =
-                    owned.iter().map(|(l, v)| (l.as_str(), *v)).collect();
-
-                let weekly = [
-                    ("Mon", 3.0), ("Tue", 5.0), ("Wed", 4.0),
-                    ("Thu", 7.0), ("Fri", 6.0),
-                ];
-
-                maud::html! {
-                    // Compact inline trend — plain and configured variants:
-                    (sparkline(&weekly))
-                    (sparkline_with(&weekly, &ChartConfig::new().title("Weekly visits")))
-                    // Bars, with a caller axis override + table fallback:
-                    (bar_chart(&weekly))
-                    (bar_chart_with(
-                        &weekly,
-                        &ChartConfig::new().min(0.0).max(10.0).with_table(),
-                    ))
-                    // A 30-point line chart, auto-scaled and configured:
-                    (line_chart(&trend))
-                    (line_chart_with(&trend, &ChartConfig::new().title("30-day trend")))
-                }
             }
         },
         story! {
@@ -404,6 +474,58 @@ fn builtin_stories() -> Vec<Story> {
         },
         story! {
             "Overlays",
+            "Popover",
+            {
+                use autumn_web::widgets::{PopoverAlign, PopoverConfig, PopoverSide, popover};
+
+                // `command`/`commandfor` open the panel with no JavaScript.
+                // The browser gives light dismiss and Escape.
+                maud::html! {
+                    (popover(
+                        "Help",
+                        &maud::html! { p { "Press ? to see the keyboard shortcuts." } },
+                        &PopoverConfig::new("help-popover"),
+                    ))
+                    (popover(
+                        "Above, centered",
+                        &maud::html! { p { "Opens above the trigger." } },
+                        &PopoverConfig::new("tip-popover")
+                            .side(PopoverSide::Top)
+                            .align(PopoverAlign::Center),
+                    ))
+                }
+            }
+        },
+        story! {
+            "Overlays",
+            "Dropdown menu",
+            {
+                use autumn_web::widgets::{MenuEntry, PopoverConfig, dropdown_menu};
+                use http::Method;
+
+                // An APG menu button. Items are links or CSRF forms, so they
+                // work with JavaScript off. Only the arrow keys need it.
+                dropdown_menu(
+                    "Actions",
+                    &[
+                        MenuEntry::link("Edit", "/posts/1/edit"),
+                        MenuEntry::group(
+                            "Share",
+                            vec![
+                                MenuEntry::link("Copy link", "/posts/1/link"),
+                                MenuEntry::link("Email", "/posts/1/email"),
+                            ],
+                        ),
+                        MenuEntry::separator(),
+                        MenuEntry::action("Delete", "/posts/1", Method::DELETE, "demo-token")
+                            .destructive(),
+                    ],
+                    &PopoverConfig::new("post-actions"),
+                )
+            }
+        },
+        story! {
+            "Overlays",
             "Modal",
             {
                 use autumn_web::widgets::{
@@ -489,6 +611,43 @@ fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Overlays",
+            "Tooltip",
+            {
+                use autumn_web::widgets::{TooltipConfig, TooltipPlacement, tooltip, tooltip_with};
+
+                maud::html! {
+                    p {
+                        // The closure gets the text's id. Hover or keyboard
+                        // focus shows the text. Escape hides it.
+                        (tooltip("copy-tip", "Copy the link to the clipboard", |tip| maud::html! {
+                            button type="button" aria-describedby=(tip) { "Copy link" }
+                        }))
+                        " "
+                        // A link trigger, with the text below it.
+                        (tooltip_with(
+                            "docs-tip",
+                            "Opens the tooltip guide",
+                            &TooltipConfig::new().placement(TooltipPlacement::Bottom),
+                            |tip| maud::html! { a href="#docs" aria-describedby=(tip) { "Docs" } },
+                        ))
+                        " "
+                        // An icon-only trigger: the text is its name.
+                        (tooltip_with(
+                            "delete-tip",
+                            "Delete",
+                            &TooltipConfig::new().placement(TooltipPlacement::End),
+                            |tip| maud::html! {
+                                button type="button" aria-labelledby=(tip) {
+                                    span aria-hidden="true" { "×" }
+                                }
+                            },
+                        ))
+                    }
+                }
+            }
+        },
+        story! {
             "Display",
             "Badge",
             {
@@ -526,6 +685,308 @@ fn builtin_stories() -> Vec<Story> {
                     // Deterministic colored-initials fallback, no image:
                     (avatar("Ada Lovelace", &AvatarConfig::new()))
                     (avatar("Grace Hopper", &AvatarConfig::new().size(AvatarSize::Small)))
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Avatar group",
+            {
+                use autumn_web::widgets::{
+                    AvatarConfig, AvatarGroupConfig, AvatarSize, avatar, avatar_group,
+                    avatar_group_with,
+                };
+
+                let names = [
+                    "Ada Lovelace",
+                    "Grace Hopper",
+                    "Linus Torvalds",
+                    "Margaret Hamilton",
+                    "Barbara Liskov",
+                    "Edsger Dijkstra",
+                ];
+                let members: Vec<maud::Markup> =
+                    names.iter().map(|n| avatar(n, &AvatarConfig::new())).collect();
+                let small = AvatarConfig::new().size(AvatarSize::Small);
+                let likes: Vec<maud::Markup> =
+                    names.iter().take(3).map(|n| avatar(n, &small)).collect();
+                maud::html! {
+                    // Six avatars: four show, and "+2" names the rest.
+                    div { (avatar_group("Project members", &members)) }
+                    // 120 people, 3 avatars: the total sets the count.
+                    div {
+                        (avatar_group_with("Liked by", &likes, &AvatarGroupConfig::new()
+                            .size(AvatarSize::Small)
+                            .max(3)
+                            .total(120)))
+                    }
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Separator",
+            {
+                use autumn_web::widgets::{SeparatorConfig, separator, separator_with};
+
+                maud::html! {
+                    p { "Account settings" }
+                    (separator())
+                    p { "Billing settings" }
+                    // Vertical separators in a row of links.
+                    div {
+                        a href="#docs" { "Docs" }
+                        (separator_with(&SeparatorConfig::new().vertical()))
+                        a href="#api" { "API" }
+                        // For looks only: screen readers skip it.
+                        (separator_with(&SeparatorConfig::new().vertical().decorative()))
+                        a href="#blog" { "Blog" }
+                    }
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Kbd",
+            {
+                use autumn_web::widgets::{kbd, kbd_combo};
+
+                maud::html! {
+                    p { "Press " (kbd("Esc")) " to close the dialog." }
+                    p { "Press " (kbd_combo(&["Ctrl", "K"])) " to search." }
+                }
+            }
+        },
+        story! {
+            "Actions",
+            "Button",
+            {
+                use autumn_web::links::{LinkToOptions, link_to_with};
+                use autumn_web::widgets::{ButtonConfig, ButtonSize, ButtonVariant, button};
+
+                let pencil = maud::html! {
+                    svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" {
+                        path d="M11.5 1.5a1.4 1.4 0 0 1 2 2L5 12l-3 1 1-3z" {}
+                    }
+                };
+                let secondary = ButtonConfig::new().variant(ButtonVariant::Secondary);
+                maud::html! {
+                    p {
+                        (button("Primary", &ButtonConfig::new())) " "
+                        (button("Secondary", &secondary)) " "
+                        (button("Ghost", &ButtonConfig::new().variant(ButtonVariant::Ghost))) " "
+                        (button("Delete", &ButtonConfig::new().variant(ButtonVariant::Destructive))) " "
+                        (button("Link", &ButtonConfig::new().variant(ButtonVariant::Link)))
+                    }
+                    p {
+                        (button("Small", &ButtonConfig::new().size(ButtonSize::Small))) " "
+                        (button("Medium", &ButtonConfig::new())) " "
+                        (button("Large", &ButtonConfig::new().size(ButtonSize::Large)))
+                    }
+                    p {
+                        // An icon before the label.
+                        (button("Edit", &secondary.clone().icon(pencil.clone()))) " "
+                        // Icon only: the label is the hidden name.
+                        (button("Edit post", &ButtonConfig::new()
+                            .variant(ButtonVariant::Ghost)
+                            .icon(pencil)
+                            .icon_only())) " "
+                        (button("Disabled", &ButtonConfig::new().disabled())) " "
+                        // The server knows that work is in progress.
+                        (button("Exporting", &ButtonConfig::new().loading()))
+                    }
+                    p {
+                        // Live: the demo answers after a short wait. The
+                        // button is busy while the request runs.
+                        (button("Save", &ButtonConfig::new()
+                            .id("story-save")
+                            .loading_on_request()
+                            .attrs(&[
+                                ("hx-get", "/_stories/demo/save"),
+                                ("hx-target", "#story-save-status"),
+                            ])))
+                        " "
+                        span id="story-save-status" role="status" {}
+                    }
+                    // The submit button of an htmx form is busy too.
+                    form hx-get="/_stories/demo/save" hx-target="#story-publish-status" {
+                        (button("Publish", &ButtonConfig::new()
+                            .submit()
+                            .id("story-publish")
+                            .loading_on_request()))
+                        " "
+                        span id="story-publish-status" role="status" {}
+                    }
+                    // The classes also style a link.
+                    p {
+                        (link_to_with("Read the docs", "#docs", &LinkToOptions::new()
+                            .class("autumn-button autumn-button--secondary autumn-button--md")))
+                    }
+                }
+            }
+        },
+        story! {
+            "Actions",
+            "Button group",
+            {
+                use autumn_web::widgets::{
+                    ButtonConfig, ButtonGroupConfig, ButtonVariant, button, button_group,
+                    button_group_with,
+                };
+
+                let secondary = ButtonConfig::new().variant(ButtonVariant::Secondary);
+                maud::html! {
+                    div {
+                        (button_group("Text alignment", &[
+                            button("Left", &secondary),
+                            button("Center", &secondary),
+                            button("Right", &secondary),
+                        ]))
+                    }
+                    div {
+                        (button_group_with(
+                            "Zoom",
+                            &[button("Zoom in", &secondary), button("Zoom out", &secondary)],
+                            &ButtonGroupConfig::new().vertical(),
+                        ))
+                    }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Spinner",
+            {
+                use autumn_web::widgets::{
+                    ButtonConfig, ButtonVariant, SpinnerConfig, SpinnerSize, button, spinner,
+                    spinner_with,
+                };
+
+                maud::html! {
+                    p {
+                        (spinner_with("Loading", &SpinnerConfig::new().size(SpinnerSize::Small))) " "
+                        (spinner("Loading")) " "
+                        (spinner_with("Loading", &SpinnerConfig::new().size(SpinnerSize::Large)))
+                    }
+                    p {
+                        // An htmx indicator: hidden until the request runs.
+                        (button("Load", &ButtonConfig::new()
+                            .variant(ButtonVariant::Secondary)
+                            .attrs(&[
+                                ("hx-get", "/_stories/demo/save"),
+                                ("hx-target", "#story-spinner-status"),
+                                ("hx-indicator", "#story-spinner"),
+                            ])))
+                        " "
+                        (spinner_with("Loading", &SpinnerConfig::new()
+                            .size(SpinnerSize::Small)
+                            .indicator("story-spinner")))
+                        " "
+                        span id="story-spinner-status" {}
+                    }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Skeleton",
+            {
+                use autumn_web::widgets::{
+                    ButtonConfig, ButtonVariant, SkeletonConfig, SkeletonShape, button, skeleton,
+                    skeleton_with,
+                };
+
+                maud::html! {
+                    // Three lines. The last one is shorter.
+                    div { (skeleton_with(SkeletonShape::Line, &SkeletonConfig::new().count(3))) }
+                    p {}
+                    div { (skeleton(SkeletonShape::Block)) }
+                    p {}
+                    div { (skeleton_with(SkeletonShape::Circle, &SkeletonConfig::new().count(3))) }
+                    p {}
+                    // An htmx indicator: hidden until the request runs.
+                    div {
+                        (button("Reload", &ButtonConfig::new()
+                            .variant(ButtonVariant::Secondary)
+                            .attrs(&[
+                                ("hx-get", "/_stories/demo/save"),
+                                ("hx-target", "#story-skeleton-result"),
+                                ("hx-indicator", "#story-skeleton"),
+                            ])))
+                        (skeleton_with(SkeletonShape::Line, &SkeletonConfig::new()
+                            .count(2)
+                            .indicator("story-skeleton")))
+                        div id="story-skeleton-result" {}
+                    }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Progress",
+            {
+                use autumn_web::widgets::{ProgressConfig, progress, progress_with};
+
+                maud::html! {
+                    p { (progress("Upload", Some(40.0), 100.0)) }
+                    (progress_with("Upload report.pdf", Some(0.65), 1.0, &ProgressConfig::new()
+                        .visible_label()))
+                    p {}
+                    (progress_with("Import", Some(3.0), 8.0, &ProgressConfig::new()
+                        .visible_label()
+                        .value_text("3 of 8 files")))
+                    // No known end: an indeterminate bar.
+                    p { (progress("Loading", None, 1.0)) }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Meter",
+            {
+                use autumn_web::widgets::{MeterConfig, meter, meter_with};
+
+                maud::html! {
+                    p { (meter("Disk use", 0.4, 0.0..=1.0)) }
+                    // 7 is above `low` and below `high`: an average value.
+                    (meter_with("Disk use", 7.0, 0.0..=10.0, &MeterConfig::new()
+                        .low(5.0)
+                        .high(8.0)
+                        .optimum(0.0)
+                        .visible_label()
+                        .value_text("7 GB of 10 GB")))
+                    p {}
+                    // 15 is below `low`, and the best is high: a bad value.
+                    (meter_with("Battery", 15.0, 0.0..=100.0, &MeterConfig::new()
+                        .low(20.0)
+                        .high(80.0)
+                        .optimum(100.0)
+                        .visible_label()))
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Empty state",
+            {
+                use autumn_web::links::{LinkToOptions, link_to_with};
+                use autumn_web::widgets::{EmptyStateConfig, HeadingLevel, empty_state, empty_state_with};
+
+                let new_post = link_to_with("New post", "#new-post", &LinkToOptions::new()
+                    .class("autumn-button autumn-button--primary autumn-button--md"));
+                let icon = maud::html! {
+                    svg viewBox="0 0 16 16" width="32" height="32" fill="currentColor" {
+                        path d="M2 3h12v10H2zM3 4v8h10V4z" {}
+                    }
+                };
+                maud::html! {
+                    (empty_state("No posts yet", "Write your first post. It shows here.", Some(&new_post)))
+                    (empty_state_with(
+                        "No results",
+                        "Try a different search.",
+                        None,
+                        &EmptyStateConfig::new().icon(icon).level(HeadingLevel::H3),
+                    ))
                 }
             }
         },
@@ -604,6 +1065,262 @@ fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Navigation",
+            "Pagination",
+            {
+                use autumn_web::pagination::{CursorPage, CursorRequest, Page, PageRequest};
+                use autumn_web::ui::pagination::{
+                    PagerOptions, cursor_pagination_nav, pagination_nav,
+                };
+
+                // Page 5 of 20. The pager keeps the `q` filter on every link.
+                let page: Page<u32> = Page::new((41..=50).collect(), 200, &PageRequest::new(5, 10));
+                let offset = PagerOptions::new("/posts").query("q=rust");
+
+                // A cursor page has no total: only Previous and Next.
+                let request = CursorRequest::new(None, 20);
+                let feed: CursorPage<u32> =
+                    CursorPage::from_overfetched((1..=21).collect(), &request, |n| *n);
+                let cursor = PagerOptions::new("/feed").aria_label("Feed pages");
+
+                maud::html! {
+                    (pagination_nav(&page, &offset))
+                    (cursor_pagination_nav(&feed, &cursor))
+                }
+            }
+        },
+        story! {
+            "Primitives",
+            "Accessible primitives",
+            {
+                use autumn_web::a11y::{
+                    Button, Checkbox, FileField, Img, Link, MenuItem, RadioGroup, RadioOption,
+                    Select, SelectOption, TextArea, TextField,
+                };
+
+                // Each primitive needs an accessible name before it renders.
+                let icon = maud::html! { span aria-hidden="true" { "✎" } };
+                maud::html! {
+                    (Img::new(
+                        "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3Crect width='1' height='1' fill='%23c2410c'/%3E%3C/svg%3E",
+                        "Orange square",
+                    )
+                    .width(32)
+                    .height(32))
+                    (Img::decorative("data:image/gif;base64,R0lGODlhAQABAAAAACw="))
+                    p {
+                        (Button::new("Save").submit())
+                        " "
+                        (Button::icon(icon.clone(), "Edit post"))
+                    }
+                    p {
+                        (Link::new("/posts", "All posts"))
+                        " "
+                        (Link::icon("/posts/1/edit", icon, "Edit post 1"))
+                    }
+                    // A menu item needs a `role="menu"` parent. The data-autumn-*
+                    // attributes give the menu its arrow keys (autumn-widgets.js).
+                    ul role="menu" aria-label="Post actions" data-autumn-roving
+                        data-autumn-orientation="vertical" data-autumn-typeahead {
+                        li role="none" { (MenuItem::new("Archive")) }
+                        li role="none" { (MenuItem::new("View").href("/posts/1")) }
+                    }
+                    (TextField::new("email").input_type("email").label("Email address").required())
+                    // The text area grows with its text (#3406).
+                    (TextArea::new("bio").label("Bio").rows(3).auto_grow())
+                    (Select::new("plan").label("Plan")
+                        .options([SelectOption::new("free", "Free"), SelectOption::new("pro", "Pro")])
+                        .selected_value("pro"))
+                    (Checkbox::new("terms").label("I accept the terms"))
+                    (FileField::new("avatar").label("Avatar").accept("image/*"))
+                    (RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+                        .option(RadioOption::new("express", "Express"))
+                        .label("Delivery speed"))
+                }
+            }
+        },
+    ]
+}
+
+/// Stories for the `widgets-search` family (#3408).
+#[cfg(feature = "widgets-search")]
+fn search_stories() -> Vec<Story> {
+    vec![
+        story! {
+            "Forms",
+            "Active search",
+            {
+                use autumn_web::widgets::{
+                    ActiveSearchConfig, active_search, active_search_empty_state,
+                    active_search_input, active_search_results,
+                };
+
+                // A real, live-wired demo — unlike most story action URLs,
+                // which stay synthetic 404s on purpose (see e.g. the Confirm
+                // action or Bulk actions stories): a search box that visibly
+                // does nothing while typing reads as broken. The gallery
+                // itself serves this path (see `stories::demo_search`).
+                let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
+                    .placeholder("Search posts…");
+                maud::html! {
+                    // The claim below only holds when htmx is actually on
+                    // the page — story_page only loads it under the `htmx`
+                    // feature. A maud-only, no-htmx build still compiles this
+                    // story, and its hx-* attributes stay inert there.
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, searching a small demo post list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
+                    (active_search("post-search", "Search posts", &config))
+                    p { em { "For reference — not live — what your handler returns when nothing matches:" } }
+                    (active_search_empty_state("No posts matched your search."))
+                    // Compose the pieces yourself when you need custom layout
+                    // between the input and the results container: this needs
+                    // its own config, targeting its own results container —
+                    // reusing `config` above would target
+                    // "#post-search-results" (the first demo's), leaving this
+                    // one empty on a successful response.
+                    div {
+                        (active_search_input(
+                            "post-search-split",
+                            "Search posts",
+                            &ActiveSearchConfig::new("/_stories/demo/search", "#post-search-split-results")
+                                .placeholder("Search posts…"),
+                        ))
+                        (active_search_results("post-search-split-results"))
+                    }
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Autocomplete",
+            {
+                use autumn_web::widgets::{
+                    AutocompleteConfig, autocomplete_empty_state, autocomplete_input,
+                    autocomplete_option,
+                };
+
+                // Real, live-wired demo — see the Active search story above
+                // for why (and `stories::demo_tag_search` for the handler).
+                let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
+                    .placeholder("Start typing a tag…");
+                maud::html! {
+                    // See the Active search story above for why this is
+                    // conditional.
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, matching against a small demo tag list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
+                    (autocomplete_input("tag-picker", "Tag", &config))
+                    p { em { "For reference — not live — the two shapes your handler returns:" } }
+                    // One matching option, as your handler would render it. An
+                    // option needs a listbox parent; the live box above has one.
+                    div role="listbox" aria-label="Example options" {
+                        (autocomplete_option("42", "rust"))
+                    }
+                    // And the empty state when nothing matches:
+                    (autocomplete_empty_state("No matching tags."))
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Tags input",
+            {
+                use autumn_web::form::Changeset;
+                use autumn_web::widgets::{
+                    AutocompleteConfig, autocomplete_create_option, autocomplete_input_for,
+                    autocomplete_option,
+                };
+
+                // Tags mode (#3410). Each chip submits one `tags=…` input.
+                // See `stories::demo_tag_suggest` for the handler.
+                #[derive(serde::Serialize)]
+                struct PostForm {
+                    tags: Vec<String>,
+                }
+                // On a 422 re-render, this is the submitted form.
+                let changeset = Changeset::new(PostForm {
+                    tags: vec!["rust".to_owned()],
+                });
+                let config = AutocompleteConfig::new("/_stories/demo/tags/suggest", "tags")
+                    .multiple()
+                    .free_text()
+                    .placeholder("Add a tag…");
+                maud::html! {
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it. Type, then press Enter. Backspace removes the last tag." } }
+                    } @else {
+                        p { em { "This box is live only with the htmx feature." } }
+                    }
+                    (autocomplete_input_for(&changeset, "tag-list", "Tags", &config))
+                    p { em { "For reference, not live: what your handler returns." } }
+                    div role="listbox" aria-label="Example tag options" {
+                        (autocomplete_option("web", "web"))
+                        (autocomplete_create_option("zig", "Create “zig”"))
+                    }
+                }
+            }
+        },
+    ]
+}
+
+/// Stories for the `widgets-charts` family (#3408).
+#[cfg(feature = "widgets-charts")]
+fn charts_stories() -> Vec<Story> {
+    vec![story! {
+        "Display",
+        "Charts",
+        {
+            use autumn_web::widgets::{
+                ChartConfig, bar_chart, bar_chart_with, line_chart, line_chart_with,
+                sparkline, sparkline_with,
+            };
+
+            // A 30-point trend series, built with a loop (no env capture).
+            let owned: Vec<(String, f64)> = (0..30)
+                .map(|day| {
+                    let label = format!("Day {}", day + 1);
+                    let swing = (f64::from(day) * 0.4).sin() * 10.0;
+                    let value = 20.0 + swing;
+                    (label, value)
+                })
+                .collect();
+            let trend: Vec<(&str, f64)> =
+                owned.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+
+            let weekly = [
+                ("Mon", 3.0), ("Tue", 5.0), ("Wed", 4.0),
+                ("Thu", 7.0), ("Fri", 6.0),
+            ];
+
+            maud::html! {
+                // Compact inline trend — plain and configured variants:
+                (sparkline(&weekly))
+                (sparkline_with(&weekly, &ChartConfig::new().title("Weekly visits")))
+                // Bars, with a caller axis override + table fallback:
+                (bar_chart(&weekly))
+                (bar_chart_with(
+                    &weekly,
+                    &ChartConfig::new().min(0.0).max(10.0).with_table(),
+                ))
+                // A 30-point line chart, auto-scaled and configured:
+                (line_chart(&trend))
+                (line_chart_with(&trend, &ChartConfig::new().title("30-day trend")))
+            }
+        }
+    }]
+}
+
+/// Stories for the `widgets-social` family (#3408).
+#[cfg(feature = "widgets-social")]
+#[allow(clippy::too_many_lines)]
+fn social_stories() -> Vec<Story> {
+    vec![
+        story! {
             "Feedback",
             "Infinite feed",
             {
@@ -630,62 +1347,6 @@ fn builtin_stories() -> Vec<Story> {
                     // last page, so no further sentinel is emitted):
                     (feed_page(next, None, &FeedConfig::new("/_stories/demo/posts/feed").button()))
                 }
-            }
-        },
-        story! {
-            "Forms",
-            "Transition controls",
-            {
-                use autumn_web::widgets::transition_controls;
-
-                // A `#[state_machine]` field emits a `(from, to, Option<guard>)`
-                // transitions constant and a `can_transition_<field>_to`
-                // predicate; pass those two straight through. Here they are
-                // inlined so the story is self-contained.
-                let transitions: &[(&str, &str, Option<&str>)] = &[
-                    ("draft", "published", None),
-                    ("published", "archived", None),
-                ];
-                // Only edges leaving `current` ("draft") render, so this shows
-                // the single `draft -> published` action button.
-                transition_controls(
-                    "/orders/1/transitions/status",
-                    "status",
-                    "draft",
-                    transitions,
-                    |_to| true, // |to| order.can_transition_status_to(to)
-                    None,
-                    None,
-                )
-            }
-        },
-        story! {
-            "Forms",
-            "Translated transition controls",
-            {
-                use autumn_web::widgets::{TransitionLabels, transition_controls_with_labels};
-
-                // Same shape as "Transition controls", with the group label and
-                // one button text overridden. A target state left out of
-                // `.buttons(...)` keeps the default "Mark as {state}" text —
-                // here that is the untranslated "archived" edge.
-                let transitions: &[(&str, &str, Option<&str>)] = &[
-                    ("draft", "published", None),
-                    ("published", "archived", None),
-                ];
-                let labels = TransitionLabels::new()
-                    .group("Estado del pedido")
-                    .buttons(&[("published", "Publicar")]);
-                transition_controls_with_labels(
-                    "/orders/1/transitions/status",
-                    "status",
-                    "draft",
-                    transitions,
-                    |_to| true, // |to| order.can_transition_status_to(to)
-                    None,
-                    None,
-                    &labels,
-                )
             }
         },
         story! {
@@ -795,6 +1456,69 @@ fn builtin_stories() -> Vec<Story> {
                 }
             }
         },
+    ]
+}
+
+/// Stories for the `widgets-workflow` family (#3408).
+#[cfg(feature = "widgets-workflow")]
+fn workflow_stories() -> Vec<Story> {
+    vec![
+        story! {
+            "Forms",
+            "Transition controls",
+            {
+                use autumn_web::widgets::transition_controls;
+
+                // A `#[state_machine]` field emits a `(from, to, Option<guard>)`
+                // transitions constant and a `can_transition_<field>_to`
+                // predicate; pass those two straight through. Here they are
+                // inlined so the story is self-contained.
+                let transitions: &[(&str, &str, Option<&str>)] = &[
+                    ("draft", "published", None),
+                    ("published", "archived", None),
+                ];
+                // Only edges leaving `current` ("draft") render, so this shows
+                // the single `draft -> published` action button.
+                transition_controls(
+                    "/orders/1/transitions/status",
+                    "status",
+                    "draft",
+                    transitions,
+                    |_to| true, // |to| order.can_transition_status_to(to)
+                    None,
+                    None,
+                )
+            }
+        },
+        story! {
+            "Forms",
+            "Translated transition controls",
+            {
+                use autumn_web::widgets::{TransitionLabels, transition_controls_with_labels};
+
+                // Same shape as "Transition controls", with the group label and
+                // one button text overridden. A target state left out of
+                // `.buttons(...)` keeps the default "Mark as {state}" text —
+                // here that is the untranslated "archived" edge.
+                let transitions: &[(&str, &str, Option<&str>)] = &[
+                    ("draft", "published", None),
+                    ("published", "archived", None),
+                ];
+                let labels = TransitionLabels::new()
+                    .group("Estado del pedido")
+                    .buttons(&[("published", "Publicar")]);
+                transition_controls_with_labels(
+                    "/orders/1/transitions/status",
+                    "status",
+                    "draft",
+                    transitions,
+                    |_to| true, // |to| order.can_transition_status_to(to)
+                    None,
+                    None,
+                    &labels,
+                )
+            }
+        },
         story! {
             "Display",
             "Bulk actions",
@@ -869,80 +1593,6 @@ fn builtin_stories() -> Vec<Story> {
                 }
             }
         },
-        story! {
-            "Navigation",
-            "Pagination",
-            {
-                use autumn_web::pagination::{CursorPage, CursorRequest, Page, PageRequest};
-                use autumn_web::ui::pagination::{
-                    PagerOptions, cursor_pagination_nav, pagination_nav,
-                };
-
-                // Page 5 of 20. The pager keeps the `q` filter on every link.
-                let page: Page<u32> = Page::new((41..=50).collect(), 200, &PageRequest::new(5, 10));
-                let offset = PagerOptions::new("/posts").query("q=rust");
-
-                // A cursor page has no total: only Previous and Next.
-                let request = CursorRequest::new(None, 20);
-                let feed: CursorPage<u32> =
-                    CursorPage::from_overfetched((1..=21).collect(), &request, |n| *n);
-                let cursor = PagerOptions::new("/feed").aria_label("Feed pages");
-
-                maud::html! {
-                    (pagination_nav(&page, &offset))
-                    (cursor_pagination_nav(&feed, &cursor))
-                }
-            }
-        },
-        story! {
-            "Primitives",
-            "Accessible primitives",
-            {
-                use autumn_web::a11y::{
-                    Button, Checkbox, FileField, Img, Link, MenuItem, RadioGroup, RadioOption,
-                    Select, SelectOption, TextArea, TextField,
-                };
-
-                // Each primitive needs an accessible name before it renders.
-                let icon = maud::html! { span aria-hidden="true" { "✎" } };
-                maud::html! {
-                    (Img::new(
-                        "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3Crect width='1' height='1' fill='%23c2410c'/%3E%3C/svg%3E",
-                        "Orange square",
-                    )
-                    .width(32)
-                    .height(32))
-                    (Img::decorative("data:image/gif;base64,R0lGODlhAQABAAAAACw="))
-                    p {
-                        (Button::new("Save").submit())
-                        " "
-                        (Button::icon(icon.clone(), "Edit post"))
-                    }
-                    p {
-                        (Link::new("/posts", "All posts"))
-                        " "
-                        (Link::icon("/posts/1/edit", icon, "Edit post 1"))
-                    }
-                    // A menu item needs a `role="menu"` parent. The data-autumn-*
-                    // attributes give the menu its arrow keys (autumn-widgets.js).
-                    ul role="menu" aria-label="Post actions" data-autumn-roving
-                        data-autumn-orientation="vertical" data-autumn-typeahead {
-                        li role="none" { (MenuItem::new("Archive")) }
-                        li role="none" { (MenuItem::new("View").href("/posts/1")) }
-                    }
-                    (TextField::new("email").input_type("email").label("Email address").required())
-                    (TextArea::new("bio").label("Bio").rows(3))
-                    (Select::new("plan").label("Plan")
-                        .options([SelectOption::new("free", "Free"), SelectOption::new("pro", "Pro")])
-                        .selected_value("pro"))
-                    (Checkbox::new("terms").label("I accept the terms"))
-                    (FileField::new("avatar").label("Avatar").accept("image/*"))
-                    (RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
-                        .option(RadioOption::new("express", "Express"))
-                        .label("Delivery speed"))
-                }
-            }
-        },
     ]
 }
 
@@ -977,6 +1627,35 @@ fn gated_stories() -> Vec<Story> {
                 (flash_messages_with(&messages, &FlashMessagesConfig::new().dismissible(true)))
                 p { em { "The markup inside Flash::render:" } }
                 (flash_message_divs(&messages[..1]))
+            }
+        }
+    });
+    #[cfg(feature = "storage")]
+    stories.push(story! {
+        "Forms",
+        "Direct upload",
+        {
+            use autumn_web::storage::form_helper::{
+                DirectUploadConfig, direct_upload_field, direct_upload_input,
+            };
+
+            maud::html! {
+                // Without JS the file goes with the form. With
+                // `autumn-widgets.js` it goes to storage, and a hidden field
+                // holds its key.
+                form method="post" action="/posts" enctype="multipart/form-data" {
+                    (direct_upload_input("cover_image", "/uploads/presign", Some("image/*")))
+                    // Set the label, allow many files, filter by type.
+                    (direct_upload_field(
+                        "attachments",
+                        "/uploads/presign",
+                        &DirectUploadConfig::new()
+                            .label("Attachments")
+                            .accept(".pdf,image/*")
+                            .multiple(true),
+                    ))
+                    button type="submit" { "Save" }
+                }
             }
         }
     });

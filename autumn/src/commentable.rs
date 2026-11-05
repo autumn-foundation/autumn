@@ -1916,7 +1916,7 @@ mod tests {
     /// carries a tab happily — so a CR/LF-only check would let
     /// `/\t/evil.example` through to the browser, which then reads it as
     /// `//evil.example`.
-    #[cfg(all(feature = "db", feature = "maud"))]
+    #[cfg(all(feature = "db", feature = "widgets-social"))]
     #[test]
     fn only_a_relative_single_slash_path_is_a_safe_return_target() {
         for safe in [
@@ -2083,7 +2083,7 @@ mod tests {
     /// refused by `validate`, in release builds too. A `debug_assert` here
     /// would be erased in exactly the build where it matters.
     /// A draft may only be pinned to a form that will actually be rendered.
-    #[cfg(all(feature = "db", feature = "maud"))]
+    #[cfg(all(feature = "db", feature = "widgets-social"))]
     #[test]
     fn a_reply_form_exists_only_while_the_target_can_still_be_replied_to() {
         fn node(id: i64, depth: usize, replies: Vec<CommentNode>) -> CommentNode {
@@ -2289,7 +2289,7 @@ mod tests {
 /// pair of routes, dispatching on the `{commentable_type}` path segment through
 /// the [`inventory`] registry. That is what makes adding comments to a second
 /// model zero new routes and zero new queries.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct CommentsConfig {
@@ -2342,18 +2342,18 @@ pub struct CommentsConfig {
 /// Async because the interesting answers need the database: "is the viewer a
 /// member of this ticket's project" is not a decision a synchronous predicate
 /// over the request can make.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 pub type CommentAuthorizer = std::sync::Arc<
     dyn Fn(CommentAccess) -> futures::future::BoxFuture<'static, bool> + Send + Sync,
 >;
 
 /// The post-create callback for [`CommentsConfig::on_comment`].
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 pub type CommentCreatedHook =
     std::sync::Arc<dyn Fn(CommentCreated) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// The comment [`CommentsConfig::on_comment`] is told about.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CommentCreated {
@@ -2376,7 +2376,7 @@ pub struct CommentCreated {
 }
 
 /// What [`CommentsConfig::authorize`] is asked about.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CommentAccess {
@@ -2392,7 +2392,7 @@ pub struct CommentAccess {
     pub write: bool,
 }
 
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 impl std::fmt::Debug for CommentsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CommentsConfig")
@@ -2406,7 +2406,7 @@ impl std::fmt::Debug for CommentsConfig {
     }
 }
 
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 impl CommentsConfig {
     /// Gate both handlers on a record-level check.
     ///
@@ -2440,7 +2440,7 @@ impl CommentsConfig {
     }
 }
 
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 impl Default for CommentsConfig {
     fn default() -> Self {
         Self {
@@ -2486,7 +2486,7 @@ impl Default for CommentsConfig {
 /// key named in [`CommentsConfig::session_author_key`] and trusts it; it does
 /// not itself authenticate, and it does not itself verify a CSRF token (autumn's
 /// CSRF layer does, and the widget renders the hidden field for it).
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 pub fn router<S>(config: CommentsConfig) -> axum::Router<S>
 where
     S: crate::db::DbState + Clone + Send + Sync + 'static,
@@ -2551,7 +2551,7 @@ where
 ///   [`session_author_key`](CommentsConfig::session_author_key). That check
 ///   lives in the handler body, not in a `#[secured]` attribute, so the audit
 ///   records the claim and does not prove it.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[must_use]
 pub fn route_infos(prefix: &str) -> Vec<crate::route_listing::RouteInfo> {
     use crate::route_listing::{RouteClassification, RouteInfo};
@@ -2578,7 +2578,7 @@ pub fn route_infos(prefix: &str) -> Vec<crate::route_listing::RouteInfo> {
     ]
 }
 
-#[cfg(all(test, feature = "db", feature = "maud"))]
+#[cfg(all(test, feature = "db", feature = "widgets-social"))]
 mod route_infos_tests {
     use super::route_infos;
     use crate::route_listing::RouteClassification;
@@ -2623,7 +2623,7 @@ mod route_infos_tests {
 /// types because a browser submits an *empty* hidden input as `reply_to=`, and
 /// `Option<i64>` would reject that outright rather than reading it as "not a
 /// reply".
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[derive(Debug, serde::Deserialize)]
 struct CommentSubmission {
     body: String,
@@ -2646,7 +2646,7 @@ struct CommentSubmission {
 /// [`AutumnError::internal_server_error_msg`] when the model is tenant-scoped
 /// and no tenant is in scope: that is a middleware wiring mistake, not
 /// something the caller can fix.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 fn request_tenant(spec: &CommentableSpec) -> AutumnResult<Option<String>> {
     // A model with no tenant column emits no tenant predicate at all, so
     // reading the task-local would only ever produce a value nothing uses —
@@ -2673,7 +2673,7 @@ fn request_tenant(spec: &CommentableSpec) -> AutumnResult<Option<String>> {
 ///
 /// A refusal is `404` for the same reason a foreign-tenant parent is: a `403`
 /// would confirm the record exists.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 async fn authorize(
     config: &CommentsConfig,
     commentable_type: &str,
@@ -2712,14 +2712,14 @@ async fn authorize(
 /// axum runs extractors in argument order, so declaring this one **before**
 /// `Db` makes "authorize, then check out" a property of the signature rather
 /// than of a comment somebody could later reorder.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 struct AuthorizedComment {
     /// The signed-in author, if any. `None` is allowed for a read and refused
     /// for a write.
     author_id: Option<i64>,
 }
 
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 impl<S> axum::extract::FromRequestParts<S> for AuthorizedComment
 where
     S: Send + Sync,
@@ -2764,7 +2764,7 @@ where
 }
 
 /// Render the thread for one record.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 async fn show_thread(
     axum::Extension(config): axum::Extension<std::sync::Arc<CommentsConfig>>,
     axum::extract::Path((commentable_type, parent_id)): axum::extract::Path<(String, i64)>,
@@ -2809,7 +2809,7 @@ async fn show_thread(
 
 /// `?return_to=` on the `GET` fragment, so a thread served by the router can
 /// round-trip a no-JS submit back to the page that embedded it.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[derive(Debug, Default, serde::Deserialize)]
 struct ThreadQuery {
     #[serde(default)]
@@ -2817,7 +2817,7 @@ struct ThreadQuery {
 }
 
 /// Post a comment (or a reply) and re-render the thread.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[allow(clippy::too_many_arguments)] // Every argument is a distinct axum
 // extractor -- config, path, session, CSRF token, CSRF field name, htmx
 // detection, the connection, and the form body. An axum handler's arguments
@@ -2996,7 +2996,7 @@ async fn post_comment(
 /// comment's depth is still under [`CommentableSpec::max_depth`], because the
 /// write path refuses a deeper reply. A draft pinned to a comment with no form
 /// would be dropped silently by the `outerHTML` swap.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 fn reply_form_exists(nodes: &[CommentNode], target: i64, max_depth: u32) -> bool {
     nodes.iter().any(|node| {
         (node.comment.id == target && node.depth < max_depth as usize)
@@ -3016,7 +3016,7 @@ fn reply_form_exists(nodes: &[CommentNode], target: i64, max_depth: u32) -> bool
 /// `//evil.example`. The same blanket check keeps `DEL` and the other control
 /// characters from reaching `HeaderValue::try_from`, which would otherwise turn
 /// a bad request into a `500`.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 fn is_safe_return_path(path: &str) -> bool {
     path.starts_with('/')
         && !path.starts_with("//")
@@ -3025,14 +3025,14 @@ fn is_safe_return_path(path: &str) -> bool {
 }
 
 /// Look a `commentable_type` up in the registry.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 fn resolve_spec(commentable_type: &str) -> AutumnResult<&'static CommentableSpec> {
     commentable_spec_for(commentable_type)
         .ok_or_else(|| AutumnError::not_found_msg("Unknown commentable type"))
 }
 
 /// The signed-in author's id, when the session carries one.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 async fn session_author(session: &crate::session::Session, config: &CommentsConfig) -> Option<i64> {
     session
         .get(&config.session_author_key)
@@ -3041,7 +3041,7 @@ async fn session_author(session: &crate::session::Session, config: &CommentsConf
 }
 
 /// Build the widget markup for one thread.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[allow(clippy::too_many_arguments)] // Straight-line assembly of the widget's
 // own configuration; every argument is a distinct piece of request state.
 fn render(
@@ -3099,7 +3099,7 @@ fn render(
 /// first htmx swap replaces its region with one carrying a different id and
 /// every later swap misses. [`crate::widgets::CommentThread::from_spec`] and
 /// this function together are what keep the two renders identical.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[must_use]
 pub fn thread_dom_id(commentable_type: &str, parent_id: i64) -> String {
     format!("autumn-comments-{commentable_type}-{parent_id}")
@@ -3107,7 +3107,7 @@ pub fn thread_dom_id(commentable_type: &str, parent_id: i64) -> String {
 
 /// The form action the router serves, for a host page rendering its own
 /// thread.
-#[cfg(all(feature = "db", feature = "maud"))]
+#[cfg(all(feature = "db", feature = "widgets-social"))]
 #[must_use]
 pub fn thread_action(config: &CommentsConfig, commentable_type: &str, parent_id: i64) -> String {
     format!(

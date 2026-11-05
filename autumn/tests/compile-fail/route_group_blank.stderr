@@ -1,0 +1,5 @@
+error: route `group` must not be blank. Name the group, e.g. `group = "marketing"`.
+ --> tests/compile-fail/route_group_blank.rs:3:27
+  |
+3 | #[get("/landing", group = " ")]
+  |                           ^^^

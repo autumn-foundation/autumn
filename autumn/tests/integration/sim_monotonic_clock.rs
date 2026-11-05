@@ -35,7 +35,7 @@ use autumn_web::time::Clock;
 /// 24 hours — the virtual advance under test. Chosen to be enormous relative to
 /// any real elapsed time the test could accrue, so the assertion cannot pass by
 /// accident on a slow runner.
-const TWENTY_FOUR_HOURS: Duration = Duration::from_secs(24 * 3600);
+const TWENTY_FOUR_HOURS: Duration = Duration::from_hours(24);
 
 /// Reads the injected (virtual) wall clock, so the test can prove it advanced.
 #[get("/now")]

@@ -1,4 +1,4 @@
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use reqwest::blocking::Client;
 use sha2::Sha256;
 use std::time::Duration;

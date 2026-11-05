@@ -1004,6 +1004,26 @@ fn run_stoppable(
     })
 }
 
+/// Run `command` to completion, or stop it after `budget`.
+///
+/// It uses the same process group, Ctrl+C registry and pipe drain as the
+/// audit. A stop returns an `Interrupted` error.
+pub fn run_bounded(
+    command: &mut Command,
+    budget: Option<Duration>,
+) -> std::io::Result<std::process::Output> {
+    let stop = StopHandle::default();
+    ACTIVE.register(&stop);
+    if let Some(budget) = budget {
+        let timer = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(budget);
+            timer.stop();
+        });
+    }
+    run_stoppable(command, &stop)
+}
+
 /// The directory holding the app's policy file, searching upward from `start`.
 ///
 /// The CI gate runs at the repository root, so the outermost policy wins over
@@ -1247,6 +1267,28 @@ fn first_error(stream: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_returns_the_output_of_a_fast_command() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo bounded"]);
+        let output = run_bounded(&mut command, Some(Duration::from_secs(30))).expect("runs");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "bounded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_stops_a_command_past_its_budget() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let started = std::time::Instant::now();
+        let err = run_bounded(&mut command, Some(Duration::from_millis(100)))
+            .expect_err("the budget stops it");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
 
     /// One `vulnerability` diagnostic plus the summary that proves the run
     /// finished. Shaped after real `cargo deny 0.20.2 --format json` output.
@@ -2241,7 +2283,7 @@ mod tests {
 
     #[test]
     fn age_is_whole_days_and_never_negative() {
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(90 * 86_400);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(90 * 24);
         let then = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(88 * 86_400 + 100);
         assert_eq!(age_days(then, now), 1);
         // A clock that moved backwards reads as fresh, never as a huge age.

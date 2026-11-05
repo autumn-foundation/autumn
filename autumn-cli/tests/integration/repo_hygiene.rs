@@ -192,6 +192,24 @@ fn workspace_test_profile_keeps_ci_artifacts_bounded() {
     );
 }
 
+/// Old release and MSRV text that must not come back to the first-run docs.
+const STALE_FIRST_RUN_TEXT: &[&str] = &[
+    "Rust 1.85",
+    "Rust 1.86",
+    "rustc 1.85",
+    "rustc 1.86",
+    "rust:1.86",
+    "Rust 1.88",
+    "rustc 1.88",
+    "rust:1.88",
+    "rust-1.88",
+    "autumn-web = \"0.1.0\"",
+    "version=\"0.1.0\"",
+    "\"version\": \"0.1.0\"",
+    "v0.1.0",
+    "crates.io publication is not yet available",
+];
+
 #[test]
 fn first_run_docs_match_current_release_line() {
     let root = workspace_root();
@@ -231,18 +249,7 @@ fn first_run_docs_match_current_release_line() {
         format!(r#"{{ "status": "ok", "version": "{published_version}" }}"#);
 
     for (doc, content) in &docs {
-        for stale in [
-            "Rust 1.85",
-            "Rust 1.86",
-            "rustc 1.85",
-            "rustc 1.86",
-            "rust:1.86",
-            "autumn-web = \"0.1.0\"",
-            "version=\"0.1.0\"",
-            "\"version\": \"0.1.0\"",
-            "v0.1.0",
-            "crates.io publication is not yet available",
-        ] {
+        for stale in STALE_FIRST_RUN_TEXT {
             assert!(
                 !content.contains(stale),
                 "{doc} still references stale first-run release/MSRV text: {stale}"
@@ -561,9 +568,27 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
     let script = std::fs::read_to_string(&script_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
 
+    // Cargo does not build a crate on a toolchain below its `rust-version`.
+    // So the semver toolchain must be at or above the workspace MSRV.
+    let semver_toolchain = script
+        .lines()
+        .find_map(|line| line.strip_prefix(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-"#))
+        .and_then(|rest| rest.strip_suffix(r#"}""#))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} must pin a default semver toolchain",
+                script_path.display()
+            )
+        })
+        .to_owned();
+    let msrv = workspace_package_value(&read_workspace_manifest(&root), "rust-version");
+    let semver_triple = parse_semver_triple(&semver_toolchain)
+        .unwrap_or_else(|| panic!("semver toolchain `{semver_toolchain}` must be x.y.z"));
+    let msrv_triple =
+        parse_semver_triple(&msrv).unwrap_or_else(|| panic!("MSRV `{msrv}` must be x.y.z"));
     assert!(
-        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.94.1}""#),
-        "{} must pin the semver rustdoc toolchain to Rust 1.94.1 by default",
+        semver_triple >= msrv_triple,
+        "{} semver toolchain {semver_toolchain} is below the MSRV {msrv}",
         script_path.display(),
     );
     assert!(
@@ -591,8 +616,8 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
         .and_then(|job| job.split("\n  # ---").next())
         .unwrap_or_else(|| panic!("{} must define a semver job", workflow_path.display()));
     assert!(
-        semver_job.contains("dtolnay/rust-toolchain@1.94.1"),
-        "{} semver job must install the pinned Rust 1.94.1 toolchain",
+        semver_job.contains(&format!("dtolnay/rust-toolchain@{semver_toolchain}")),
+        "{} semver job must install the script's Rust {semver_toolchain} toolchain",
         workflow_path.display(),
     );
     assert!(
@@ -602,17 +627,18 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
     );
 }
 
+/// `webauthn-rs` 0.6 uses pure-Rust crypto. The guide must not send a
+/// developer to install OpenSSL for `--passkeys`.
 #[test]
-fn webauthn_docs_explain_native_openssl_vcpkg_prerequisite() {
+fn webauthn_docs_do_not_require_openssl() {
     let root = workspace_root();
     let guide_path = root.join("docs/guide/generators.md");
     let guide = std::fs::read_to_string(&guide_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", guide_path.display()));
-
-    for required in ["WebAuthn", "OpenSSL", "vcpkg", "VCPKG_ROOT"] {
+    for stale in ["vcpkg", "VCPKG_ROOT", "openssl-sys"] {
         assert!(
-            guide.contains(required),
-            "{} must document the WebAuthn/OpenSSL native dependency prerequisite `{required}`",
+            !guide.contains(stale),
+            "{} must not ask for `{stale}`: webauthn-rs needs no OpenSSL",
             guide_path.display(),
         );
     }
@@ -863,6 +889,265 @@ fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
             .any(|l| l.trim_start().starts_with("needs:") && l.contains("test-docker-deploy")),
         "`test-gate` must need `test-docker-deploy`"
     );
+}
+
+/// The `trybuild` shards run from one `cargo nextest archive --workspace`
+/// build instead of each compiling the workspace.
+///
+/// Each piece guards a failure that would otherwise be quiet:
+/// - the archive must be a `--workspace` build, or the unified feature set
+///   that decides which gated fixtures exist changes, and it must hold only
+///   `integration_tests`, or the other test binaries fill the shard's disk
+///   (#3534);
+/// - a shard must extract into its own checkout, or the archive's
+///   compile-time `env!` paths point nowhere;
+/// - a shard on another checkout path must build locally instead;
+/// - a shard filter that matches nothing must fail;
+/// - a shard must fetch the locked dependencies, because trybuild builds its
+///   fixtures `--offline` and the archive carries no registry;
+/// - the archive must carry `target/debug/.fingerprint`, or trybuild builds
+///   every fixture with default features only.
+#[test]
+fn trybuild_shards_run_from_the_workspace_nextest_archive() {
+    let root = workspace_root();
+    // A Windows checkout can turn LF into CRLF.
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
+
+    let build = ci_job(&ci, "test-build");
+    assert!(
+        build.contains("cargo nextest archive --workspace --test integration_tests"),
+        "`test-build` must archive a workspace build of `integration_tests` only"
+    );
+    assert!(
+        build.contains("workspace: ${{ steps.workspace.outputs.path }}")
+            && build.contains("path=${GITHUB_WORKSPACE}"),
+        "`test-build` must publish the checkout path it compiled at"
+    );
+    assert!(
+        build.contains("name: trybuild-tests-linux"),
+        "`test-build` must upload the archive the trybuild shards download"
+    );
+
+    let shards = ci_job(&ci, "trybuild");
+    assert!(
+        shards
+            .lines()
+            .any(|l| l.trim_start().starts_with("needs:") && l.contains("test-build")),
+        "`trybuild` must need `test-build`"
+    );
+    assert!(
+        shards.contains("needs.test-build.outputs.workspace == github.workspace"),
+        "`trybuild` must compare its checkout path with the archive's"
+    );
+    for needle in [
+        "name: trybuild-tests-linux",
+        "--workspace-remap . --extract-to . --extract-overwrite",
+        "source=(--workspace --test integration_tests)",
+        // trybuild builds its fixtures `--offline`; the archive brings no
+        // registry with it.
+        "run: cargo fetch --locked",
+        "--no-tests=fail",
+        "binary_id(autumn-web::integration_tests)",
+    ] {
+        assert!(
+            shards.contains(needle),
+            "`trybuild` must contain `{needle}`"
+        );
+    }
+
+    let gate = ci_job(&ci, "test-gate");
+    assert!(
+        gate.lines()
+            .any(|l| l.trim_start().starts_with("needs:") && l.contains("test-build")),
+        "`test-gate` must need `test-build`"
+    );
+
+    let config_path = root.join(".config/nextest.toml");
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", config_path.display())),
+    )
+    .expect(".config/nextest.toml parses");
+    let includes = config
+        .get("profile")
+        .and_then(|p| p.get("default"))
+        .and_then(|p| p.get("archive"))
+        .and_then(|a| a.get("include"))
+        .and_then(toml::Value::as_array)
+        .expect("`[[profile.default.archive.include]]` must exist");
+    let field = |entry: &toml::Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    assert!(
+        includes.iter().any(|entry| {
+            field(entry, "path").as_deref() == Some("debug/.fingerprint")
+                && field(entry, "relative-to").as_deref() == Some("target")
+                && field(entry, "on-missing").as_deref() == Some("error")
+        }),
+        "every nextest archive must carry `target/debug/.fingerprint` and fail without it; \
+         got {includes:?}"
+    );
+}
+
+/// The `{ os, shard }` entries of the `test` job's matrix, grouped by OS.
+/// Each entry is one line: `- { os: <os>, shard: "k/N" }` or `shard: sim`.
+fn test_matrix_shards(job: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut shards: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for line in job.lines().map(str::trim) {
+        let Some(entry) = line
+            .strip_prefix("- {")
+            .and_then(|rest| rest.strip_suffix('}'))
+        else {
+            continue;
+        };
+        let mut os = None;
+        let mut shard = None;
+        for field in entry.split(',') {
+            let (key, value) = field
+                .split_once(':')
+                .unwrap_or_else(|| panic!("malformed matrix entry `{line}`"));
+            let value = value.trim().trim_matches('"').to_owned();
+            match key.trim() {
+                "os" => os = Some(value),
+                "shard" => shard = Some(value),
+                other => panic!("unexpected key `{other}` in `{line}`"),
+            }
+        }
+        shards
+            .entry(os.unwrap_or_else(|| panic!("no os in `{line}`")))
+            .or_default()
+            .push(shard.unwrap_or_else(|| panic!("no shard in `{line}`")));
+    }
+    shards
+}
+
+/// One OS's `test` shards: exactly one `sim`, and `k/N` slices that are
+/// exactly `1/N..N/N` for a single `N`.
+fn assert_partitions_complete(os: &str, list: &[String]) {
+    assert_eq!(
+        list.iter().filter(|s| *s == "sim").count(),
+        1,
+        "{os} must have exactly one `sim` shard; got {list:?}"
+    );
+    let mut slices: Vec<(u32, u32)> = list
+        .iter()
+        .filter(|s| *s != "sim")
+        .map(|s| {
+            let (k, n) = s
+                .split_once('/')
+                .unwrap_or_else(|| panic!("{os}: shard `{s}` is not `k/N` or `sim`"));
+            (
+                k.parse().unwrap_or_else(|_| panic!("{os}: bad k in `{s}`")),
+                n.parse().unwrap_or_else(|_| panic!("{os}: bad N in `{s}`")),
+            )
+        })
+        .collect();
+    slices.sort_unstable();
+    let total = slices.first().map_or(0, |&(_, n)| n);
+    let expected: Vec<(u32, u32)> = (1..=total).map(|k| (k, total)).collect();
+    assert!(
+        total > 0 && slices == expected,
+        "{os}: partitions must be exactly 1/N..N/N for one N; got {slices:?}"
+    );
+}
+
+/// The `test` job runs the default lane as `--partition count:k/N` slices of
+/// one `cargo nextest archive --workspace` build per OS, plus a `sim` shard.
+///
+/// Each piece guards a failure that would otherwise be quiet:
+/// - every OS's `k/N` slices must cover `1..=N` exactly, with one `N`: a
+///   missing or duplicated slice leaves part of the suite running nowhere,
+///   and every shard still reports green;
+/// - every OS needs a `sim` shard, or the `sim_` lane runs nowhere;
+/// - the archives must be `--workspace` builds, so the unified feature set
+///   that decides which gated tests exist does not change;
+/// - the default lane must exclude exactly `compile_fail::` and `sim_`, the
+///   two lanes that run elsewhere;
+/// - doctests do not run under nextest, so `doctest` must run them on every
+///   OS;
+/// - `test-gate` must need every new job.
+#[test]
+fn test_shards_partition_the_workspace_nextest_archive() {
+    let root = workspace_root();
+    // A Windows checkout can turn LF into CRLF.
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
+
+    let job = ci_job(&ci, "test");
+    let shards = test_matrix_shards(job);
+    assert_eq!(
+        shards.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["macos-latest", "ubuntu-latest", "windows-latest"],
+        "`test` must shard every OS; got {shards:?}"
+    );
+    for (os, list) in &shards {
+        assert_partitions_complete(os, list);
+    }
+    for needle in [
+        r#"--partition "count:${{ matrix.shard }}""#,
+        "-E 'not (test(compile_fail::) | test(sim_))'",
+        "-E 'test(sim_)' --test-threads 1",
+        "export AUTUMN_SIM_LIVENESS_BUDGET_SECS=",
+        "--workspace-remap . --extract-to . --extract-overwrite",
+        "name: workspace-tests-${{ runner.os }}",
+        "needs.test-build.outputs.workspace == github.workspace",
+        "run: cargo fetch --locked",
+        "--no-tests=fail",
+    ] {
+        assert!(job.contains(needle), "`test` must contain `{needle}`");
+    }
+    assert!(
+        job.lines().any(|l| {
+            l.trim_start().starts_with("needs:")
+                && l.contains("test-build")
+                && l.contains("test-archive")
+        }),
+        "`test` must need both archive jobs"
+    );
+
+    for name in ["test-build", "test-archive"] {
+        let build = ci_job(&ci, name);
+        assert!(
+            build.contains("cargo nextest archive --workspace \\\n"),
+            "`{name}` must archive every workspace test binary"
+        );
+        assert!(
+            build.contains("name: workspace-tests-${{ runner.os }}"),
+            "`{name}` must upload the archive the `test` shards download"
+        );
+    }
+    assert!(
+        ci_job(&ci, "test-archive").contains("os: [macos-latest, windows-latest]"),
+        "`test-archive` must build macOS and Windows"
+    );
+
+    let doctest = ci_job(&ci, "doctest");
+    assert!(
+        doctest.contains("os: [ubuntu-latest, macos-latest, windows-latest]")
+            && doctest.contains("run: cargo test --workspace --doc"),
+        "`doctest` must run the workspace doctests on every OS"
+    );
+
+    let gate = ci_job(&ci, "test-gate");
+    let needs = gate
+        .lines()
+        .find(|l| l.trim_start().starts_with("needs:"))
+        .expect("`test-gate` must have `needs:`");
+    for name in ["test", "test-build", "test-archive", "doctest", "trybuild"] {
+        assert!(
+            needs
+                .split(|c: char| !(c.is_alphanumeric() || c == '-'))
+                .any(|word| word == name),
+            "`test-gate` must need `{name}`; got `{needs}`"
+        );
+    }
 }
 
 #[test]
@@ -9869,4 +10154,165 @@ fn posture_script_passes_both_ack_forms_and_never_unprompted() {
         !calls.contains("--ack"),
         "an empty directory variable must not acknowledge anything: {calls}"
     );
+}
+
+/// Resolved `(member, name, version)` triples: one for each dependency of each
+/// workspace member.
+fn workspace_member_dependencies(root: &Path) -> Vec<(String, String, String)> {
+    let lock_path = root.join("Cargo.lock");
+    let lock = std::fs::read_to_string(&lock_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", lock_path.display()));
+    let lock: toml::Value = toml::from_str(&lock).expect("Cargo.lock should parse as TOML");
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock should list packages");
+    let field = |package: &toml::Value, key: &str| {
+        package
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // Cargo writes `name` alone when one version is locked, else `name version`.
+    let only_version = |name: &str| {
+        let versions: Vec<String> = packages
+            .iter()
+            .filter(|package| field(package, "name") == name)
+            .map(|package| field(package, "version"))
+            .collect();
+        assert_eq!(versions.len(), 1, "{name} must have one locked version");
+        versions[0].clone()
+    };
+    let mut resolved = Vec::new();
+    for member in packages
+        .iter()
+        .filter(|package| package.get("source").is_none())
+    {
+        let member_name = field(member, "name");
+        for dependency in member
+            .get("dependencies")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+        {
+            let mut parts = dependency.split(' ');
+            let name = parts.next().unwrap_or_default().to_owned();
+            let version = parts
+                .next()
+                .map_or_else(|| only_version(&name), str::to_owned);
+            resolved.push((member_name.clone(), name, version));
+        }
+    }
+    resolved
+}
+
+/// True when `version` is at or above the `major.minor` floor.
+fn version_at_least(version: &str, floor: (u64, u64)) -> bool {
+    let mut parts = version.split(['.', '-', '+']);
+    let major: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let minor: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (major, minor) >= floor
+}
+
+/// Each raised dependency stays at its new major. See
+/// `docs/plans/2026-11-03-msrv-1.97-dependency-raise.md` for the holds.
+#[test]
+fn workspace_members_resolve_raised_dependency_majors() {
+    const FLOORS: &[(&str, (u64, u64))] = &[
+        ("reqwest", (0, 13)),
+        ("sha2", (0, 11)),
+        ("hmac", (0, 13)),
+        ("aes-gcm", (0, 11)),
+        ("lru", (0, 19)),
+        ("rustyline", (19, 0)),
+        ("sysinfo", (0, 40)),
+        ("serde-saphyr", (2, 0)),
+        ("postgresql_embedded", (0, 22)),
+        ("aws-sdk-s3", (1, 157)),
+        ("webauthn-rs", (0, 6)),
+        ("p256", (0, 14)),
+    ];
+    let resolved = workspace_member_dependencies(&workspace_root());
+    let mut stale = Vec::new();
+    for (crate_name, floor) in FLOORS {
+        let mut seen = false;
+        for (member, name, version) in &resolved {
+            if name == crate_name {
+                seen = true;
+                if !version_at_least(version, *floor) {
+                    stale.push(format!("{member} -> {name} {version}"));
+                }
+            }
+        }
+        assert!(seen, "no workspace member depends on {crate_name}");
+    }
+    assert!(stale.is_empty(), "stale dependency majors: {stale:#?}");
+}
+
+/// One `reqwest` major in the lock file. Two majors double the HTTP client
+/// build and split the types that the `oauth2` API exposes.
+#[test]
+fn lockfile_resolves_one_reqwest_major() {
+    let root = workspace_root();
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
+    let lock: toml::Value = toml::from_str(&lock).expect("Cargo.lock should parse as TOML");
+    let versions: Vec<&str> = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock should list packages")
+        .iter()
+        .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some("reqwest"))
+        .filter_map(|package| package.get("version").and_then(toml::Value::as_str))
+        .collect();
+    assert_eq!(versions.len(), 1, "Cargo.lock has reqwest {versions:?}");
+}
+
+/// `autumn-storage-s3` and `autumn-media-plugin` resolve one AWS SDK graph.
+/// Their AWS pins must agree. No pin may carry an upper cap. The old caps held
+/// the old MSRV or worked around compile errors that current AWS SDK releases
+/// do not have.
+#[test]
+fn s3_crates_share_uncapped_aws_pins() {
+    let root = workspace_root();
+    let aws_pins = |manifest: &str| {
+        let path = root.join(manifest);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let parsed: toml::Value = toml::from_str(&text).expect("manifest should parse");
+        let mut pins: Vec<(String, String)> = parsed
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .expect("manifest should have dependencies")
+            .iter()
+            .filter(|(name, _)| name.starts_with("aws-"))
+            .map(|(name, spec)| {
+                let version = spec
+                    .as_str()
+                    .or_else(|| spec.get("version").and_then(toml::Value::as_str))
+                    .unwrap_or_default()
+                    .to_owned();
+                (name.clone(), version)
+            })
+            .collect();
+        pins.sort();
+        pins
+    };
+    let storage = aws_pins("autumn-storage-s3/Cargo.toml");
+    let media = aws_pins("autumn-media-plugin/Cargo.toml");
+    assert!(
+        !storage.is_empty(),
+        "autumn-storage-s3 must depend on the AWS SDK"
+    );
+    assert_eq!(
+        storage, media,
+        "the two S3 crates must pin the same AWS versions"
+    );
+    for (name, version) in &storage {
+        assert!(
+            !version.contains('<'),
+            "{name} = \"{version}\" must not carry an upper cap"
+        );
+    }
 }

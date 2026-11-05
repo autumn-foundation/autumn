@@ -31,7 +31,7 @@ twice.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - PostgreSQL (via Docker Compose below)
 
 ## Quick start

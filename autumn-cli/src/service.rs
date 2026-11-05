@@ -61,7 +61,7 @@ const RESTART_DELAYS_SECS: [u64; 3] = [5, 15, 60];
 
 /// How long with no failure before the failure count resets. A day, so three
 /// crashes spread over a week are not treated as an escalating series.
-const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+const FAILURE_RESET_PERIOD: Duration = Duration::from_hours(24);
 
 /// Headroom added to the app's own drain budget when telling the Service
 /// Control Manager how long a stop will take.
@@ -80,7 +80,7 @@ const STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
 /// from user config, so an absurd `shutdown_timeout_secs` would otherwise take
 /// down the service host mid-stop — leaving the service stuck in `StopPending`
 /// until the SCM gives up. A day is far beyond any real drain.
-pub const MAX_WAIT_HINT: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_WAIT_HINT: Duration = Duration::from_hours(24);
 
 /// How often the service host checks on its app child and for a stop request.
 ///
@@ -1678,7 +1678,7 @@ mod tests {
     fn failure_count_resets_after_a_quiet_day() {
         // Without a reset window, three crashes spread over a week would be
         // treated as an escalating series and hit the longest delay.
-        assert_eq!(failure_reset_period(), Duration::from_secs(86_400));
+        assert_eq!(failure_reset_period(), Duration::from_hours(24));
     }
 
     fn sample_record() -> ServiceRecord {

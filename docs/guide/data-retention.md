@@ -515,8 +515,8 @@ the same guarantee across the processes on one host. The archive is a file on
 each replica's own disk, so every replica purges its own copy. Each task is
 registered only when one of its datasets has a window.
 
-Both tasks run in the `worker` and `combined` process roles, not `web`, like
-every other scheduled task. A `web` replica never purges its own archive. Run
+Both tasks run where the `retention` capability is on: the `worker` and
+`combined` roles, not `web`. A `web` replica never purges its own archive. Run
 the archive on a role that runs tasks, or rotate that file with external
 tooling.
 

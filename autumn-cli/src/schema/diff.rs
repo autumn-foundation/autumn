@@ -5444,7 +5444,7 @@ mod tests {
 
     #[test]
     fn add_fk_to_preexisting_column_is_refused() {
-        // Finding 902: a PRE-EXISTING generated association column (`author_id`,
+        // A PRE-EXISTING generated association column (`author_id`,
         // present in the baseline with `references: None` because the parser cannot
         // see the `#[belongs_to(...)]` association FK) is changed to an explicit
         // `#[references]`. The DB may already carry the inline `posts_author_id_fkey`
@@ -5493,7 +5493,7 @@ mod tests {
 
     #[test]
     fn add_fk_on_new_column_is_allowed() {
-        // Control for finding 902: a BRAND-NEW FK column (absent from the baseline)
+        // Control for the case above: a BRAND-NEW FK column (absent from the baseline)
         // is safe — there is no pre-existing constraint to collide with. It arrives
         // as an `AddColumn` whose `REFERENCES` renders inline in the `ADD COLUMN`
         // (never as a separate `AddForeignKey`), so it is neither refused nor a
@@ -5523,7 +5523,7 @@ mod tests {
 
     #[test]
     fn fk_retarget_is_a_refused_marker_not_a_duplicate_add() {
-        // Regression (finding 1): baseline `author_id` already has an explicit FK
+        // Regression: baseline `author_id` already has an explicit FK
         // to users(id); desired retargets it to accounts(id). Emitting a plain
         // `AddForeignKey` would `ADD CONSTRAINT posts_author_id_fkey` a second
         // time and collide with the baseline constraint of the same name. The diff
@@ -6826,7 +6826,7 @@ mod tests {
 
     #[test]
     fn add_reference_column_emits_index_exactly_once() {
-        // Regression (finding 2): the slice-2 parser folds `idx_<t>_<c>` into
+        // Regression: the slice-2 parser folds `idx_<t>_<c>` into
         // `table.indexes` AND the column carries `references`. Diffing a new
         // reference column onto an existing table therefore yields both an
         // `AddColumn` and an `AddIndex` for that index — the emitted up.sql must
@@ -6970,7 +6970,7 @@ mod tests {
 
     #[test]
     fn replaced_index_drops_before_add_in_up_and_inverts_in_down() {
-        // Regression (finding 3): a same-named index whose shape changed becomes a
+        // Regression: a same-named index whose shape changed becomes a
         // DropIndex(old) + AddIndex(new). In up.sql the DROP must precede the
         // CREATE (same name) or PG rejects the create; in down.sql the inverse
         // must drop the new before recreating the old.
@@ -7070,7 +7070,7 @@ mod tests {
 
     #[test]
     fn create_tables_topologically_ordered_by_fk() {
-        // Regression (finding 4): two new managed tables where `comments`
+        // Regression: two new managed tables where `comments`
         // references `posts`. Lexically `comments` < `posts`, so a naive sort
         // would CREATE comments (REFERENCES posts) before posts exists → invalid.
         // The referenced table must be created first, and dropped last.
@@ -8569,7 +8569,7 @@ PRAGMA foreign_keys=ON;
         );
     }
 
-    /// Finding 667 (documented limitation): the slice-2 parser cannot see a
+    /// Documented limitation: the slice-2 parser cannot see a
     /// generated `#[belongs_to(...)]` association FK — a `<name>_id: i64` column is
     /// lifted as a plain `Int64` with `references: None` and NO diagnostic — so an
     /// invisible inbound association FK on a *retained* table cannot be detected

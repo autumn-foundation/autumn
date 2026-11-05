@@ -41,7 +41,7 @@ fn blob_state(bytes: usize) -> (Map<String, Value>, usize) {
     (state, bytes)
 }
 
-/// Finding 1: `set t_i = state(blob)`, `n` times.
+/// `set t_i = state(blob)`, `n` times.
 fn read_fan_out(n: usize, blob: usize) -> Case {
     let fields: Vec<String> = (0..n)
         .map(|i| format!(r#""t{i}":{{"type":"string","initial":""}}"#))
@@ -67,7 +67,7 @@ fn read_fan_out(n: usize, blob: usize) -> Case {
     }
 }
 
-/// Finding 2: an `each` of `n` empty portals, each with a long target. A
+/// An `each` of `n` empty portals, each with a long target. A
 /// target over 256 bytes fails validation; a shorter one reaches the render.
 fn portal_targets(n: usize, target: usize) -> Case {
     let source = format!(
@@ -86,7 +86,7 @@ fn portal_targets(n: usize, target: usize) -> Case {
     }
 }
 
-/// Finding 3: one call that omits `n` required props of a long-named
+/// One call that omits `n` required props of a long-named
 /// component.
 fn missing_props(n: usize, name: usize) -> Case {
     let name = "C".repeat(name);

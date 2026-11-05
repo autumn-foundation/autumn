@@ -43,13 +43,57 @@ pub const STORIES_PATH: &str = "/_stories";
 const STORY_DETAIL_PATH: &str = "/_stories/{slug}";
 
 /// Demo backend for the "Active search" story. See [`demo_search`].
+#[cfg(feature = "widgets-search")]
 const STORIES_DEMO_SEARCH_PATH: &str = "/_stories/demo/search";
 
+/// Demo backend for the busy states in the "Button", "Spinner" and
+/// "Skeleton" stories (#3406). See [`demo_save`].
+const STORIES_DEMO_SAVE_PATH: &str = "/_stories/demo/save";
+
+/// How long [`demo_save`] waits, so the busy state is visible.
+const STORIES_DEMO_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// Demo backend for the "Autocomplete" story. See [`demo_tag_search`].
+#[cfg(feature = "widgets-search")]
 const STORIES_DEMO_TAG_SEARCH_PATH: &str = "/_stories/demo/tags/search";
+/// Demo backend for the "Tags input" story (#3410). See [`demo_tag_suggest`].
+#[cfg(feature = "widgets-search")]
+const STORIES_DEMO_TAG_SUGGEST_PATH: &str = "/_stories/demo/tags/suggest";
+
+/// Demo backend for the "Tags input" story (#3410), mounted at
+/// [`STORIES_DEMO_TAG_SUGGEST_PATH`]. It returns the tags that contain `q`.
+/// The value of each option is its name. When no tag has the exact name,
+/// it adds a [`autocomplete_create_option`](crate::widgets::autocomplete_create_option).
+#[cfg(feature = "widgets-search")]
+async fn demo_tag_suggest(
+    crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
+) -> Html<String> {
+    const TAGS: &[&str] = &["rust", "web", "axum", "htmx"];
+    let typed = q.trim();
+    let query = typed.to_lowercase();
+    let matches: Vec<&str> = TAGS
+        .iter()
+        .copied()
+        .filter(|tag| !query.is_empty() && tag.contains(&query))
+        .collect();
+    let exact = matches.contains(&query.as_str());
+    let markup = maud::html! {
+        @for tag in &matches {
+            (crate::widgets::autocomplete_option(tag, tag))
+        }
+        @if !typed.is_empty() && !exact {
+            (crate::widgets::autocomplete_create_option(
+                typed,
+                &format!("Create \u{201c}{typed}\u{201d}"),
+            ))
+        }
+    };
+    Html(markup.into_string())
+}
 
 /// Demo backend for the "Infinite feed" story's sentinel. See
 /// [`demo_infinite_feed`].
+#[cfg(feature = "widgets-social")]
 const STORIES_DEMO_FEED_PATH: &str = "/_stories/demo/posts/feed";
 
 /// Derive a URL slug from a story name: lowercase, alphanumeric runs joined
@@ -417,6 +461,30 @@ pub struct StoriesConfig {
     pub enabled: bool,
 }
 
+/// Path and handler name of each demo backend that [`story_router`] mounts.
+/// The route listing and the router's path reservation read this list. A
+/// router test checks that each path in it is mounted. A family's demo routes
+/// exist only when its feature is on (#3408).
+pub(crate) fn demo_routes() -> Vec<(&'static str, &'static str)> {
+    #[allow(unused_mut, reason = "each family extend has its own #[cfg]")]
+    let mut routes = vec![(STORIES_DEMO_SAVE_PATH, "story_gallery_demo_save")];
+    #[cfg(feature = "widgets-search")]
+    routes.extend([
+        (STORIES_DEMO_SEARCH_PATH, "story_gallery_demo_search"),
+        (
+            STORIES_DEMO_TAG_SEARCH_PATH,
+            "story_gallery_demo_tag_search",
+        ),
+        (
+            STORIES_DEMO_TAG_SUGGEST_PATH,
+            "story_gallery_demo_tag_suggest",
+        ),
+    ]);
+    #[cfg(feature = "widgets-social")]
+    routes.push((STORIES_DEMO_FEED_PATH, "story_gallery_demo_infinite_feed"));
+    routes
+}
+
 /// Build the gallery sub-router. Mounted by `build_router` when
 /// `config.stories.enabled` is true; handlers read the [`StoryRegistry`]
 /// from the `AppState` extension (mail-preview precedent).
@@ -425,7 +493,7 @@ where
     S: Clone + Send + Sync + 'static,
     AppState: axum::extract::FromRef<S>,
 {
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(
             STORIES_PATH,
             axum::routing::get(
@@ -445,23 +513,42 @@ where
                 },
             ),
         )
-        // Demo backends for the two typeahead stories (Active search,
-        // Autocomplete) — see `demo_search`/`demo_tag_search` below for why
-        // these two specifically get real handlers where every other
-        // story's action URL stays a synthetic 404-on-submit (already the
-        // documented pattern for e.g. Confirm action / Avatar). Namespaced
-        // under `/_stories/demo/*`, the same convention `confirm_action`'s
-        // story already uses (`/_stories/demo/delete-post`), so a real app's
-        // own routes can never collide with these.
+        .route(STORIES_DEMO_SAVE_PATH, axum::routing::get(demo_save));
+    // Demo backends for the two typeahead stories (Active search,
+    // Autocomplete) — see `demo_search`/`demo_tag_search` below for why
+    // these two specifically get real handlers where every other
+    // story's action URL stays a synthetic 404-on-submit (already the
+    // documented pattern for e.g. Confirm action / Avatar). Namespaced
+    // under `/_stories/demo/*`, the same convention `confirm_action`'s
+    // story already uses (`/_stories/demo/delete-post`), so a real app's
+    // own routes can never collide with these. A family's demo routes
+    // exist only when its feature is on (#3408).
+    #[cfg(feature = "widgets-search")]
+    let router = router
         .route(STORIES_DEMO_SEARCH_PATH, axum::routing::get(demo_search))
         .route(
             STORIES_DEMO_TAG_SEARCH_PATH,
             axum::routing::get(demo_tag_search),
         )
         .route(
-            STORIES_DEMO_FEED_PATH,
-            axum::routing::get(demo_infinite_feed),
-        )
+            STORIES_DEMO_TAG_SUGGEST_PATH,
+            axum::routing::get(demo_tag_suggest),
+        );
+    #[cfg(feature = "widgets-social")]
+    let router = router.route(
+        STORIES_DEMO_FEED_PATH,
+        axum::routing::get(demo_infinite_feed),
+    );
+    router
+}
+
+/// The backend of the busy-state demos (#3406): it waits, then answers
+/// "Saved.". The wait lets a visitor see `aria-busy`, the button spinner
+/// and the `hx-indicator` skeleton. It is a GET, so it needs no CSRF token
+/// and changes nothing.
+async fn demo_save() -> Html<&'static str> {
+    tokio::time::sleep(STORIES_DEMO_SAVE_DELAY).await;
+    Html("Saved.")
 }
 
 /// Query params `demo_search` and `demo_tag_search` both accept — the `q`
@@ -469,6 +556,7 @@ where
 /// [`AutocompleteConfig`](crate::widgets::AutocompleteConfig) both default
 /// `param_name`/`query_param` to.
 #[derive(serde::Deserialize)]
+#[cfg(feature = "widgets-search")]
 struct DemoQuery {
     #[serde(default)]
     q: String,
@@ -479,6 +567,7 @@ struct DemoQuery {
 /// case-insensitively by `q`, returning the same
 /// [`active_search_empty_state`](crate::widgets::active_search_empty_state)
 /// the story documents for the no-matches case.
+#[cfg(feature = "widgets-search")]
 async fn demo_search(
     crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
 ) -> Html<String> {
@@ -514,6 +603,7 @@ async fn demo_search(
 /// the same [`autocomplete_option`](crate::widgets::autocomplete_option) /
 /// [`autocomplete_empty_state`](crate::widgets::autocomplete_empty_state)
 /// the story's source already documents.
+#[cfg(feature = "widgets-search")]
 async fn demo_tag_search(
     crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
 ) -> Html<String> {
@@ -548,6 +638,7 @@ async fn demo_tag_search(
 /// alone would have 404-swapped it without the visitor doing anything. This
 /// always returns a terminal page (no further cursor), matching what the
 /// story's own `feed_page` snippet already documents as "the last page".
+#[cfg(feature = "widgets-social")]
 async fn demo_infinite_feed() -> Html<String> {
     let markup = crate::widgets::feed_page(
         maud::html! {
@@ -1560,6 +1651,7 @@ mod tests {
     // story's own source — not a reference to the route const, which would
     // show up literally in the public "Source" tab — nothing else catches
     // the two drifting apart. Guard it here instead.
+    #[cfg(feature = "widgets-search")]
     #[test]
     fn typeahead_stories_point_at_their_registered_demo_routes() {
         let registry = builtin();
@@ -1582,7 +1674,12 @@ mod tests {
              ({STORIES_DEMO_TAG_SEARCH_PATH}): {}",
             autocomplete.source()
         );
+    }
 
+    #[cfg(feature = "widgets-social")]
+    #[test]
+    fn feed_story_points_at_its_registered_demo_route() {
+        let registry = builtin();
         let feed = registry
             .find("infinite-feed")
             .expect("infinite-feed story exists");
@@ -1598,6 +1695,7 @@ mod tests {
     // U14 (interactivity follow-up): the demo handlers backing those routes
     // actually filter, case-insensitively, and fall back to the same empty
     // states the stories document.
+    #[cfg(feature = "widgets-search")]
     #[tokio::test]
     async fn demo_search_filters_case_insensitively_with_empty_state_fallback() {
         let hit = demo_search(crate::extract::Query(DemoQuery {
@@ -1620,6 +1718,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "widgets-search")]
     #[tokio::test]
     async fn demo_tag_search_filters_case_insensitively_with_empty_state_fallback() {
         let hit = demo_tag_search(crate::extract::Query(DemoQuery { q: "RU".to_owned() }))
@@ -1639,8 +1738,69 @@ mod tests {
         );
     }
 
+    // The "Tags input" demo (#3410): the value of each option is its name,
+    // and a "create" entry follows when no tag has the exact name.
+    #[cfg(feature = "widgets-search")]
+    #[tokio::test]
+    async fn demo_tag_suggest_lists_matches_then_a_create_entry() {
+        let some = demo_tag_suggest(crate::extract::Query(DemoQuery { q: "A".to_owned() }))
+            .await
+            .0;
+        assert!(some.contains(r#"data-value="axum""#), "{some}");
+        assert!(!some.contains(r#"data-value="rust""#), "{some}");
+        assert!(some.contains("data-ac-create"), "{some}");
+        assert!(some.contains(r#"data-label="A""#), "the typed text: {some}");
+
+        let new_tag = demo_tag_suggest(crate::extract::Query(DemoQuery {
+            q: " zig ".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(!new_tag.contains(r#"data-value="rust""#), "{new_tag}");
+        assert!(new_tag.contains(r#"data-value="zig""#), "{new_tag}");
+        assert!(new_tag.contains("Create \u{201c}zig\u{201d}"), "{new_tag}");
+    }
+
+    #[cfg(feature = "widgets-search")]
+    #[tokio::test]
+    async fn demo_tag_suggest_has_no_create_entry_for_an_exact_or_empty_query() {
+        let exact = demo_tag_suggest(crate::extract::Query(DemoQuery {
+            q: "Web".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(exact.contains(r#"data-value="web""#), "{exact}");
+        assert!(!exact.contains("data-ac-create"), "{exact}");
+
+        let empty = demo_tag_suggest(crate::extract::Query(DemoQuery { q: "  ".to_owned() }))
+            .await
+            .0;
+        assert!(empty.is_empty(), "{empty}");
+    }
+
+    #[cfg(feature = "widgets-search")]
+    #[test]
+    fn tags_input_story_points_at_its_registered_demo_route() {
+        let registry = builtin();
+        let tags = registry
+            .find("tags-input")
+            .expect("tags-input story exists");
+        assert!(
+            tags.source().contains(STORIES_DEMO_TAG_SUGGEST_PATH),
+            "Tags input story must point at {STORIES_DEMO_TAG_SUGGEST_PATH}: {}",
+            tags.source()
+        );
+        assert!(
+            demo_routes()
+                .iter()
+                .any(|(path, _)| *path == STORIES_DEMO_TAG_SUGGEST_PATH),
+            "the demo route is listed"
+        );
+    }
+
     // U15 (interactivity follow-up): the feed demo must terminate (no
     // further sentinel) — otherwise it would just keep auto-firing.
+    #[cfg(feature = "widgets-social")]
     #[tokio::test]
     async fn demo_infinite_feed_returns_a_terminal_page_with_no_further_sentinel() {
         let body = demo_infinite_feed().await.0;

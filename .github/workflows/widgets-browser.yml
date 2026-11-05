@@ -9,6 +9,10 @@ name: Widget browser gate
 #   * Each interactive story has a keyboard test.
 #   * The #3397 keyboard suite runs on its own fixture page.
 #   * The #3399 toast suite checks pause, close, focus and the top layer.
+#   * The #3402 popover suite checks the menu button keys, focus return,
+#     anchor positioning and the no-JS fallback.
+#   * The #3404 tooltip suite checks focus, Escape and the hover bridge, in
+#     the CSS mode and the `interestfor` mode.
 #   * Widget pack conformance (#3400): the canary packs, `autumn:init`, and
 #     the reference `swatch` pack through the same axe gate.
 #
@@ -24,9 +28,10 @@ on:
   pull_request:
     branches: [trunk, trunk-dev]
     paths:
-      - "autumn/src/widgets.rs"
+      - "autumn/src/widgets/**"
       - "autumn/src/ui/**"
       - "autumn/vendor/autumn-widgets.js"
+      - "autumn/vendor/autumn-widgets-search.js"
       - "autumn/src/stories/**"
       - "autumn/src/htmx.rs"
       - "autumn/vendor/htmx.min.js"
@@ -42,6 +47,10 @@ on:
       - "autumn/tests/integration/stories_browser.rs"
       - "autumn/tests/integration/widgets_keyboard_browser.rs"
       - "autumn/tests/integration/widgets_toast_browser.rs"
+      - "autumn/tests/integration/widgets_direct_upload_browser.rs"
+      - "autumn/src/storage/form_helper.rs"
+      - "autumn/tests/integration/widgets_popover_browser.rs"
+      - "autumn/tests/integration/widgets_tooltip_browser.rs"
       - "autumn/tests/integration/widgets_drawer_browser.rs"
       - "autumn/tests/fixtures/axe-core/**"
       - "autumn/src/widget_pack.rs"
@@ -54,9 +63,10 @@ on:
   push:
     branches: [trunk, trunk-dev]
     paths:
-      - "autumn/src/widgets.rs"
+      - "autumn/src/widgets/**"
       - "autumn/src/ui/**"
       - "autumn/vendor/autumn-widgets.js"
+      - "autumn/vendor/autumn-widgets-search.js"
       - "autumn/src/stories/**"
       - "autumn/src/htmx.rs"
       - "autumn/vendor/htmx.min.js"
@@ -72,6 +82,10 @@ on:
       - "autumn/tests/integration/stories_browser.rs"
       - "autumn/tests/integration/widgets_keyboard_browser.rs"
       - "autumn/tests/integration/widgets_toast_browser.rs"
+      - "autumn/tests/integration/widgets_direct_upload_browser.rs"
+      - "autumn/src/storage/form_helper.rs"
+      - "autumn/tests/integration/widgets_popover_browser.rs"
+      - "autumn/tests/integration/widgets_tooltip_browser.rs"
       - "autumn/tests/integration/widgets_drawer_browser.rs"
       - "autumn/tests/fixtures/axe-core/**"
       - "autumn/src/widget_pack.rs"
@@ -96,6 +110,16 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # kache S3 remote (.github/actions/kache). Unset variables keep the GitHub
+  # Actions cache. The write token is mapped only on a protected ref, so only
+  # pushes to trunk and trunk-dev (and scheduled runs) add to the store.
+  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET }}
+  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT }}
+  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION }}
+  AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID: ${{ secrets.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
+  AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY: ${{ secrets.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY }}
+  AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || '' }}
+  AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || '' }}
 
 jobs:
   widgets-browser:
@@ -119,7 +143,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
         with:
           key: widgets-browser
@@ -137,7 +161,7 @@ jobs:
           AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: |
           set -euo pipefail
-          cargo test -p autumn-web --features system-tests \
+          cargo test -p autumn-web --features "system-tests,storage" \
             --test integration_tests stories_browser -- --include-ignored \
             | tee "${RUNNER_TEMP}/stories-browser.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/stories-browser.log" \
@@ -164,6 +188,39 @@ jobs:
             | tee "${RUNNER_TEMP}/widgets-toast-browser.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-toast-browser.log" \
             || { echo "::error::no toast browser tests ran"; exit 1; }
+
+      - name: Run the direct upload suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features "system-tests,storage" \
+            --test integration_tests widgets_direct_upload_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-direct-upload-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-direct-upload-browser.log" \
+            || { echo "::error::no direct upload browser tests ran"; exit 1; }
+
+      - name: Run the popover and menu suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_popover_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-popover-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-popover-browser.log" \
+            || { echo "::error::no popover browser tests ran"; exit 1; }
+
+      - name: Run the tooltip behaviour suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_tooltip_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-tooltip-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-tooltip-browser.log" \
+            || { echo "::error::no tooltip browser tests ran"; exit 1; }
 
       - name: Run the drawer and modal suite
         env:

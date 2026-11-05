@@ -50,7 +50,7 @@ pub const ORIGIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the node waits for the next bytes from the origin. A stalled
 /// origin then gives a 502 (before the response head) or a cut body.
-pub const ORIGIN_READ_TIMEOUT: Duration = Duration::from_secs(60);
+pub const ORIGIN_READ_TIMEOUT: Duration = Duration::from_mins(1);
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");

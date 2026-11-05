@@ -1436,7 +1436,7 @@ mod primitive_surface_tests {
         std::fs::File::options()
             .write(true)
             .open(&old)
-            .and_then(|file| file.set_modified(SystemTime::now() - Duration::from_secs(3 * 86_400)))
+            .and_then(|file| file.set_modified(SystemTime::now() - Duration::from_hours(72)))
             .expect("set_modified");
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

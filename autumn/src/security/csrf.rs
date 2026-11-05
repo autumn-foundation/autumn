@@ -126,6 +126,11 @@ pub struct CsrfNotApplicable;
 /// in HTML forms. The token is generated per-request and stored in
 /// request extensions by the [`CsrfLayer`].
 ///
+/// With CSRF off (`security.csrf.enabled = false`, the dev default), the
+/// token is empty and nothing checks it, so one handler works in every
+/// profile. To know whether CSRF is on, take `Option<CsrfToken>`: it is
+/// `None` with CSRF off.
+///
 /// ## Examples
 ///
 /// ```rust,ignore
@@ -168,16 +173,19 @@ impl<S> FromRequestParts<S> for CsrfToken
 where
     S: Send + Sync,
 {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = std::convert::Infallible;
 
+    /// The token from [`CsrfLayer`]. With CSRF off (no layer), an empty
+    /// token: nothing checks it.
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        parts.extensions.get::<Self>().cloned().ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CSRF token not found in request extensions. Is CsrfLayer enabled?",
-        ))
+        Ok(parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(|| Self(String::new())))
     }
 }
 
@@ -199,16 +207,19 @@ impl<S> FromRequestParts<S> for CsrfFormField
 where
     S: Send + Sync,
 {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = std::convert::Infallible;
 
+    /// The configured field name. With CSRF off (no layer), the default
+    /// `_csrf`: nothing checks it.
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        parts.extensions.get::<Self>().cloned().ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CSRF form field not found in request extensions. Is CsrfLayer enabled?",
-        ))
+        Ok(parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(|| Self(super::config::default_csrf_field())))
     }
 }
 
@@ -230,16 +241,19 @@ impl<S> FromRequestParts<S> for CsrfTokenHeader
 where
     S: Send + Sync,
 {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = std::convert::Infallible;
 
+    /// The configured header name. With CSRF off (no layer), the default
+    /// `X-CSRF-Token`: nothing checks it.
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        parts.extensions.get::<Self>().cloned().ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CSRF token header not found in request extensions. Is CsrfLayer enabled?",
-        ))
+        Ok(parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(|| Self(super::config::default_csrf_header())))
     }
 }
 
@@ -1134,6 +1148,33 @@ mod tests {
             .unwrap();
         let token_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(Uuid::parse_str(&token_str).is_ok());
+    }
+
+    /// With CSRF off there is no layer. The required extractors still work:
+    /// the token is empty and the names are the defaults. Nothing checks them.
+    #[tokio::test]
+    async fn csrf_extractors_work_when_csrf_is_off() {
+        async fn handler(
+            csrf: CsrfToken,
+            field: CsrfFormField,
+            header: CsrfTokenHeader,
+            maybe: Option<CsrfToken>,
+        ) -> String {
+            let off = if maybe.is_none() { "off" } else { "on" };
+            format!("[{}] {} {} {off}", csrf.token(), field.0, header.0)
+        }
+
+        let app = Router::new().route("/", get(handler));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"[] _csrf X-CSRF-Token off");
     }
 
     /// A safe request that already carries the CSRF cookie hands that exact

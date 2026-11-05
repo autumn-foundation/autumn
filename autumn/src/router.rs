@@ -1866,13 +1866,12 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     if config.stories.enabled {
         claimed.insert(crate::stories::STORIES_PATH.to_owned());
         claimed.insert("/_stories/{slug}".to_owned());
-        // The Active search / Autocomplete / Infinite feed stories' live
-        // demo backends (review follow-up — these three were missing from
-        // the preflight, so a colliding OpenAPI/MCP mount here would panic
-        // in `router.merge` instead of surfacing the typed collision error).
-        claimed.insert("/_stories/demo/search".to_owned());
-        claimed.insert("/_stories/demo/tags/search".to_owned());
-        claimed.insert("/_stories/demo/posts/feed".to_owned());
+        // The stories' live demo backends. Without them here, a colliding
+        // OpenAPI/MCP mount would panic in `router.merge` instead of
+        // surfacing the typed collision error.
+        for (path, _) in crate::stories::demo_routes() {
+            claimed.insert(path.to_owned());
+        }
     }
     // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
     // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
@@ -6879,13 +6878,26 @@ fn mounted_paths(path: &str, config: &AutumnConfig) -> Vec<String> {
     vec![path.to_owned()]
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
     dist_dir: Option<&std::path::Path>,
+    ctx: RouterContext,
+) -> Result<axum::Router, RouterBuildError> {
+    try_build_router_with_static_pages(route_list, config, state, dist_dir, ctx, None)
+}
+
+/// [`try_build_router_with_static_inner`] that serves only the pre-rendered
+/// pages whose URL path `keep_page` admits (#3544). `None` serves every page.
+#[allow(clippy::too_many_lines)]
+pub fn try_build_router_with_static_pages(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    dist_dir: Option<&std::path::Path>,
     mut ctx: RouterContext,
+    keep_page: Option<&dyn Fn(&str) -> bool>,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
 
@@ -6909,6 +6921,10 @@ pub fn try_build_router_with_static_inner(
             config,
             &startup_barrier_state,
         ));
+    };
+    let layer = match keep_page {
+        Some(keep) => layer.retain_routes(keep),
+        None => layer,
     };
 
     for (route, entry) in &layer.manifest().routes {
@@ -8312,6 +8328,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         // Before the fix this panicked inside `axum::Router::route`; now it
@@ -8863,6 +8880,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -9398,7 +9416,8 @@ mod tests {
     }
 
     /// #2353: an `hx-*` story page loads htmx, and loads it before the
-    /// widget runtime.
+    /// widget runtime. The core "Button" story uses `hx-get`, so this test
+    /// needs no widget family (#3408).
     #[cfg(all(feature = "maud", feature = "htmx"))]
     #[tokio::test]
     async fn story_detail_route_loads_htmx_for_hx_stories() {
@@ -9408,7 +9427,7 @@ mod tests {
             stories_state_with_builtin(),
         );
 
-        let response = get_with_host(router, "/_stories/active-search").await;
+        let response = get_with_host(router, "/_stories/button").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains("hx-get"), "story must use htmx: {body}");
@@ -9419,6 +9438,29 @@ mod tests {
             .find(crate::htmx::AUTUMN_WIDGETS_JS_PATH)
             .unwrap_or_else(|| panic!("page must load autumn-widgets.js: {body}"));
         assert!(htmx_at < widgets_at, "htmx must load first: {body}");
+    }
+
+    /// Each path in `stories::demo_routes()` is mounted. The route listing
+    /// and the path reservation read that list, so a path in it that the
+    /// gallery does not mount would be listed but answer 404 (#3408).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn every_listed_story_demo_route_is_mounted() {
+        let demos = crate::stories::demo_routes();
+        assert!(!demos.is_empty(), "the demo route list is empty");
+        for (path, handler) in demos {
+            let router = build_router(
+                Vec::new(),
+                &story_gallery_config(),
+                stories_state_with_builtin(),
+            );
+            let response = get_with_host(router, path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "listed demo route {path} ({handler}) is not mounted"
+            );
+        }
     }
 
     /// T3 (AC4): a mounted gallery 404s unknown slugs while the index stays up.
@@ -9498,6 +9540,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9587,6 +9630,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9610,6 +9654,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9633,6 +9678,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9993,6 +10039,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             };
 
             // Before the fix, the redirect's `any()` claimed GET at /health
@@ -10870,6 +10917,7 @@ enabled = true
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }],
             source: crate::route_listing::RouteSource::User,
             layer_guarded: false,
@@ -11088,6 +11136,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
@@ -11158,6 +11207,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let protected_routes = vec![route];
@@ -11333,6 +11383,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let ctx = RouterContext {
@@ -11419,6 +11470,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let ctx = RouterContext {
@@ -11644,15 +11696,15 @@ enabled = true
     #[cfg(all(feature = "openapi", feature = "maud"))]
     #[tokio::test]
     async fn try_build_router_rejects_openapi_path_on_story_gallery_demo_route() {
-        // Review follow-up: the Active search / Autocomplete / Infinite feed
-        // stories' live demo backends merge GETs the same way the index/detail
-        // routes above do, but were missing from the preflight reservation —
-        // an OpenAPI mount here would panic in `router.merge` instead of
-        // surfacing this typed collision.
+        // The stories' live demo backends merge GETs the same way the
+        // index/detail routes above do. Without the preflight reservation, an
+        // OpenAPI mount here would panic in `router.merge` instead of
+        // surfacing this typed collision. `demo/save` is mounted with no
+        // widget family (#3408).
         let mut config = AutumnConfig::default();
         config.stories.enabled = true;
         let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
-            .openapi_json_path("/_stories/demo/search");
+            .openapi_json_path("/_stories/demo/save");
         let ctx = RouterContext {
             exception_filters: Vec::new(),
             scoped_groups: Vec::new(),
@@ -11669,15 +11721,14 @@ enabled = true
             #[cfg(feature = "webmcp")]
             webmcp: None,
         };
-        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
-            "story gallery demo search path should be reserved while stories are enabled",
-        );
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("story gallery demo path should be reserved while stories are enabled");
         assert!(matches!(
             err,
             RouterBuildError::OpenApiPathCollision {
                 field: "openapi_json_path",
                 ref path,
-            } if path == "/_stories/demo/search"
+            } if path == "/_stories/demo/save"
         ));
     }
 
@@ -11771,6 +11822,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -12408,7 +12460,7 @@ enabled = true
             .expect("opaque nest routers must not fail the duplicate preflight");
     }
 
-    /// Finding 1 (issue #1012 review): two handlers that differ ONLY by capture
+    /// Issue #1012: two handlers that differ ONLY by capture
     /// name — `/users/{id}` vs `/users/{slug}` — key by literal template so they
     /// look distinct to a naive preflight, but axum's matcher (verified against
     /// axum 0.8.9: matchit reports a "conflict") rejects the second route shape
@@ -12445,7 +12497,7 @@ enabled = true
         );
     }
 
-    /// Finding 1, scoped-group variant: the capture-name normalization must run
+    /// Scoped-group variant of the test above: the capture-name normalization must run
     /// AFTER `join_nested_path` prefix resolution, so a scoped `/users/{slug}`
     /// under `/api` collides with a top-level `/api/users/{id}`.
     #[tokio::test]
@@ -12479,7 +12531,7 @@ enabled = true
         );
     }
 
-    /// Finding 1 NEGATIVE guard: normalization must not over-flag. Two genuinely
+    /// NEGATIVE guard: normalization must not over-flag. Two genuinely
     /// different shapes that axum's matcher accepts (verified: `/users/{id}` and
     /// `/users/{id}/posts` do NOT conflict) must still build cleanly.
     #[tokio::test]
@@ -12492,7 +12544,7 @@ enabled = true
                 .expect("distinct route shapes must not be flagged as duplicates");
     }
 
-    /// Finding 2 (issue #1012 review): `#[ws]` records the synthetic `WS` method
+    /// Issue #1012: `#[ws]` records the synthetic `WS` method
     /// but `group_and_mount_routes` mounts its handler via `axum::routing::get`,
     /// so `#[get("/live")]` + `#[ws("/live")]` produce two overlapping `GET`
     /// `MethodRouter`s that panic on merge. Normalizing `WS` to its effective
@@ -14154,6 +14206,7 @@ enabled = true
             timeout: crate::route::RouteTimeout::default(),
             criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         };
 
         let tmp = create_ssg_dist_with_types(&[(
@@ -14506,6 +14559,7 @@ enabled = true
             timeout: crate::route::RouteTimeout::default(),
             criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         };
 
         // Manifest does NOT contain /dynamic, so the request falls through to
@@ -15951,6 +16005,7 @@ mod trusted_host_tests {
             api_version: None,
             sunset_opt_out: false,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         }
     }
 
@@ -16324,6 +16379,46 @@ mod trusted_host_tests {
         }
     }
 
+    /// A role mount drops the pre-rendered pages of its unmounted routes
+    /// (#3544): the request falls through to the router, which 404s.
+    #[tokio::test]
+    async fn static_pages_follow_the_role_mount() {
+        let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
+        let config = AutumnConfig::default();
+        let get_root = |app: axum::Router| async move {
+            app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+        let empty_ctx = || RouterContext {
+            static_gate_layers: Vec::new(),
+            ..ctx_with_static_gate(redirect_gate_registration())
+        };
+
+        let served = super::try_build_router_with_static_pages(
+            Vec::new(),
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            empty_ctx(),
+            Some(&|_: &str| true),
+        )
+        .expect("router builds");
+        assert_eq!(get_root(served).await, StatusCode::OK);
+
+        let dropped = super::try_build_router_with_static_pages(
+            Vec::new(),
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            empty_ctx(),
+            Some(&|path: &str| path != "/"),
+        )
+        .expect("router builds");
+        assert_eq!(get_root(dropped).await, StatusCode::NOT_FOUND);
+    }
+
     /// #3071: on the SSG/ISG path the fault layers go outside the static
     /// cache, so a route fault reaches a cached page, and only once.
     #[tokio::test]
@@ -16448,6 +16543,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let config = AutumnConfig::default();
         let ctx = ctx_with_static_gate(redirect_gate_registration());
@@ -16603,6 +16699,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let mut config = AutumnConfig::default();
@@ -16763,6 +16860,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let mut config = AutumnConfig::default();
         config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
@@ -16887,6 +16985,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let config = AutumnConfig::default();
         let ctx = ctx_with_static_gate(redirect_gate_registration());

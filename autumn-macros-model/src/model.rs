@@ -7053,6 +7053,13 @@ fn fake_expr_core(
         }
         "NaiveDateTime" => Some(quote! { ::autumn_web::fake::recent_datetime().naive_utc() }),
         "NaiveDate" => Some(quote! { ::autumn_web::fake::recent_datetime().date_naive() }),
+        // Issue #3405: a scaffold `time` column. Whole seconds, so the edit
+        // form shows the stored value without a fraction.
+        "NaiveTime" => Some(quote! {{
+            let __autumn_time = ::autumn_web::fake::recent_datetime().time();
+            ::autumn_web::reexports::chrono::Timelike::with_nanosecond(&__autumn_time, 0)
+                .unwrap_or(__autumn_time)
+        }}),
         _ => None,
     }
 }
@@ -7219,6 +7226,8 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
         },
         "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
         "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
+        // `<input type="time">` posts `HH:MM`, which chrono reads (#3405).
+        "NaiveTime" => quote! { ::autumn_web::form::FieldControl::Time },
         // `<input type="datetime-local">` posts an offsetless wall-clock value, so only
         // zone parameters with a sound interpretation of that shape get the picker:
         // `Utc` and the server's `Local`, each wired to a matching tolerant deserializer
@@ -12224,6 +12233,20 @@ mod tests {
             .to_string();
         assert!(!untyped.contains("decimal_with"), "{untyped}");
         assert!(untyped.contains("decimal ()"), "{untyped}");
+    }
+
+    #[test]
+    fn naive_time_fake_expr_takes_the_time_of_a_recent_datetime() {
+        let ident: syn::Ident = syn::parse_quote!(opens);
+        for ty in [
+            syn::parse_quote!(chrono::NaiveTime),
+            syn::parse_quote!(Option<chrono::NaiveTime>),
+        ] {
+            let expr = fake_expr_for_field(&ident, &ty, None)
+                .expect("NaiveTime should infer a fake expr")
+                .to_string();
+            assert!(expr.contains("recent_datetime () . time ()"), "{expr}");
+        }
     }
 
     #[test]
@@ -20756,6 +20779,18 @@ mod tests {
         // A bare alias hides the zone from the derive — no picker either.
         let bare = control(syn::parse_quote!(DateTime));
         assert!(bare.contains("FieldControl :: Text"), "{bare}");
+    }
+
+    /// Issue #3405: a `NaiveTime` column renders the native time input.
+    #[test]
+    fn form_control_tokens_maps_naive_time_to_a_time_input() {
+        for ty in [
+            syn::parse_quote!(chrono::NaiveTime),
+            syn::parse_quote!(NaiveTime),
+        ] {
+            let control = form_control_tokens(&ty, false).to_string();
+            assert!(control.contains("FieldControl :: Time"), "{control}");
+        }
     }
 
     /// The deserializer wiring must stay in lockstep with the control choice

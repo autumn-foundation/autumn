@@ -46,6 +46,51 @@ It proves that tokens are unique and strictly increasing per lock name, and
 that a stale write is rejected. It does not prove that holders never overlap;
 the fencing token makes overlap safe.
 
+## Choice item ids
+
+`choice_item_id.rs` models the ids of a radio group, a checkbox group and a
+segmented control (`push_choice_items` in `autumn/src/form.rs`, issue #3405).
+Verify it with:
+
+```sh
+verus verification/choice_item_id.rs
+```
+
+The first item has the field id. Item 1 and up has `{field}-{index}`. It
+proves that two items never share an id, and that an item id is never a
+hint, error, wrapper, label or nested-subfield id, or a plain field id. The
+proptest `choice_item_ids_never_collide` checks the rendered markup.
+
+## One-time code format
+
+`otp_format.rs` models `OtpFormat` in `autumn/src/form.rs` (issue #3412).
+Verify it with:
+
+```sh
+verus verification/otp_format.rs
+```
+
+It proves that the digit count is 4 to 10, that a kept group splits the
+code, and that the cell count fits and is at most 14. It also proves that the
+grouped `pattern` from `autumn-widgets.js` has one group more than the
+separator cells. The proptests `otp_format_stays_in_bounds` and
+`otp_markup_matches_the_format` check the runtime.
+
+## Select marks
+
+`select_marks.rs` models which `<option>` a select marks `selected`
+(`push_select_options` in `autumn/src/form.rs`, issue #3409). Verify it
+with:
+
+```sh
+verus verification/select_marks.rs
+```
+
+It proves that a single select marks at most one option, and one option
+when a value matches. A match in an earlier group stops a mark in a later
+group. A multiple select marks each match, and a mark is always a match.
+The proptest `select_marks_follow_the_spec` checks the rendered markup.
+
 ## Fleet slot ownership
 
 `fleet_slot_ownership.rs` models the slot-ownership table of a SQLite fleet
@@ -88,14 +133,17 @@ It proves these properties:
   that is not newer than the delete. A newer generation restores.
 - A failed purge keeps the row, waits before the next try, and the wait is
   capped.
-- Only a purge, a restore that worked, a re-create that purged, a refused
-  delete of its own pending row, or a confirmed row next to a live file
-  (`Stale`) drops the row. A second delete of a missing file keeps the
+- Only a purge, a restore that worked, an allowed re-create that purged, a
+  refused delete of its own pending row, or a confirmed row next to a live
+  file (`Stale`) drops the row. A second delete of a missing file keeps the
   row. A delete of a present file resets a stale row.
 - A confirm never makes a row: after a re-create or a restore took the
   key, no cutoff covers the new database.
 - Two deletes at once: the one that found no file keeps the pending row of
-  the one that removed the file.
+  the one that removed the file. Without the path lock, the second delete
+  can drop that row (issue #3516).
+- A create on demand never drops a pending row, and never runs before the
+  retention ends. Only `provision` ends the window early (issue #3516).
 - A row is never due before the retention ends, and a pending row is never
   due. The cutoff is at or after both the removal and the newest generation.
 - A purge never deletes a generation newer than the cutoff. With no newer
@@ -371,3 +419,59 @@ It proves these properties:
 - Each retry makes the input shorter, so the loop stops.
 
 The unit tests and the proptest in `form.rs` check the runtime index choice.
+
+## Fleet lake
+
+`fleet_lake.rs` models the fleet lake (`autumn/src/db/fleet_lake.rs`, issue
+#3236, ADR 0032). Verify it with:
+
+```sh
+verus verification/fleet_lake.rs
+```
+
+It proves these properties:
+
+- A tombstone row, or a marker that covers the generation, keeps a tenant
+  out of the lake. A tenant with no replica stays out too.
+- When the replicas are caught up, the lake row count equals the row count
+  of the live databases on the volume. This is the AC test.
+- The total does not depend on the order in which tenants are loaded.
+- A file in a fresh scratch directory is never under the fleet root when the
+  scratch parent is not under it.
+
+It does not model the restore, the schema union or the query. Tests cover
+them.
+
+## Role presets
+
+`role_presets.rs` models `RolePreset::capabilities` and the capability
+checks of `RolePreset::validate` in `autumn/src/config.rs` (issue #3543, ADR
+0035). It does not model the name, `pin` and `workers` checks.
+Verify it with:
+
+```sh
+verus verification/role_presets.rs
+```
+
+It proves that a preset never runs a capability that its base does not run,
+that the base decides `serves_http`, that a preset with no overrides is its
+base, and that a valid preset gets each override it sets. The exhaustive
+test `preset_capabilities_match_the_model` in `autumn/src/config.rs` checks
+the runtime against the same rules.
+
+
+## Route groups
+
+`route_groups.rs` models the `mount` rules of `RolePreset` and `Role`, the
+route filter and the fleet drift check (issue #3544, ADR 0036). A group is an
+integer. Verify it with:
+
+```sh
+verus verification/route_groups.rs
+```
+
+It proves that a role without `mount` mounts every group, that a role with no
+HTTP mounts no group, that a valid `mount` list is exact, that a framework
+route is served on every HTTP role, and that a group another fleet role mounts
+is not drift. The test `mount_matches_the_model` in `autumn/src/config.rs`
+checks the runtime against the same rules.

@@ -156,7 +156,11 @@ pub struct AppState {
     /// a first-class accessor ([`role`](Self::role)) so `on_startup`/`on_shutdown`
     /// hooks, plugins, and handlers can self-gate app-owned background work
     /// without re-reading `AUTUMN_ROLE` by hand.
-    pub(crate) role: crate::config::ProcessRole,
+    ///
+    /// It holds the capability set, resolved once at boot. Each framework
+    /// subsystem reads its own field. A built-in role has no preset data, so
+    /// a clone of it costs no reference count.
+    pub(crate) role: crate::config::Role,
 
     /// When the application started, on the injected clock's monotonic
     /// timeline. Used for uptime calculation.
@@ -938,30 +942,57 @@ impl AppState {
         self.profile.as_deref().unwrap_or("default")
     }
 
-    /// Returns the resolved [`ProcessRole`](crate::config::ProcessRole) for this
-    /// replica.
+    /// Returns the resolved [`Role`](crate::config::Role) for this replica.
     ///
-    /// This is the role after config parsing and the `AUTUMN_ROLE` env override
-    /// — the exact same value the framework uses to gate the job runtime,
-    /// scheduler, and commit-hook worker. Use it from `state_initializer`,
-    /// `on_startup`/`on_shutdown` hooks, plugins, and request handlers to
-    /// self-gate app-owned background work:
+    /// This is the role after config parsing, the `AUTUMN_ROLE` env override
+    /// and `[roles.<name>]` resolution (#3543). The framework uses the same
+    /// value to gate the job runtime, the scheduler and the other subsystems.
+    /// Use it from `state_initializer`, `on_startup`/`on_shutdown` hooks,
+    /// plugins and request handlers to gate app-owned work:
     ///
     /// ```rust
-    /// # use autumn_web::AppState;
+    /// # use autumn_web::{AppState, ProcessRole};
     /// # fn example(state: &AppState) {
-    /// if state.role().runs_workers() {
-    ///     // start an embedded worker loop only on replicas that run workers
+    /// if state.role().serves_http() {
+    ///     // warm render caches only on replicas that serve user routes
+    /// }
+    /// if state.role().name() == "critical" {
+    ///     // work for the `[roles.critical]` tier only
+    /// }
+    /// if state.role().base() == ProcessRole::Worker {
+    ///     // work for every worker-based tier
     /// }
     /// # }
     /// ```
     ///
-    /// [`serves_http`](crate::config::ProcessRole::serves_http) and
-    /// [`runs_workers`](crate::config::ProcessRole::runs_workers) are reachable
-    /// on the returned value.
+    /// [`name`](crate::config::Role::name) is the preset name, or the built-in
+    /// name. [`base`](crate::config::Role::base) is the built-in role. To gate
+    /// one subsystem, use [`capabilities`](Self::capabilities).
     #[must_use]
-    pub const fn role(&self) -> crate::config::ProcessRole {
-        self.role
+    pub const fn role(&self) -> &crate::config::Role {
+        &self.role
+    }
+
+    /// Returns the subsystems this process runs, resolved once at boot.
+    ///
+    /// The framework gates each of its subsystems on one field of this set.
+    /// Gate app-owned background work on the field that matches it:
+    /// `job_workers` for a queue consumer, `scheduler` for a periodic loop.
+    ///
+    /// ```rust
+    /// # use autumn_web::{AppState, Capability};
+    /// # fn example(state: &AppState) {
+    /// if state.capabilities().job_workers {
+    ///     // start an embedded queue consumer only where job workers run
+    /// }
+    /// if state.capabilities().runs(Capability::Scheduler) {
+    ///     // start an app-owned periodic loop only where the scheduler runs
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn capabilities(&self) -> crate::config::RoleCapabilities {
+        self.role.capabilities()
     }
 
     /// Returns how long the application has been running.
@@ -1081,7 +1112,7 @@ impl AppState {
             #[cfg(all(feature = "db", feature = "reporting"))]
             db_capture_gap: None,
             profile: None,
-            role: crate::config::ProcessRole::Combined,
+            role: crate::config::ProcessRole::Combined.into(),
             started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: probe::ProbeState::ready_for_test(),
@@ -1246,6 +1277,10 @@ impl crate::actuator::ProvideActuatorState for AppState {
 
     fn uptime_display(&self) -> String {
         self.uptime_display()
+    }
+
+    fn process_role(&self) -> Option<crate::config::Role> {
+        Some(self.role.clone())
     }
 
     fn metrics_source_registry(&self) -> Option<&crate::actuator::MetricsSourceRegistry> {
@@ -1422,7 +1457,7 @@ impl AppState {
             #[cfg(all(feature = "db", feature = "reporting"))]
             db_capture_gap: None,
             profile: None,
-            role: crate::config::ProcessRole::Combined,
+            role: crate::config::ProcessRole::Combined.into(),
             started_at: crate::time::monotonic_now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -1452,6 +1487,26 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_states_run_every_capability_of_the_combined_role() {
+        let combined = crate::config::ProcessRole::Combined.capabilities();
+        assert_eq!(super::AppState::for_test().capabilities(), combined);
+        assert_eq!(super::AppState::detached().capabilities(), combined);
+    }
+
+    #[test]
+    fn provide_actuator_state_reports_the_role_and_capabilities() {
+        use crate::actuator::ProvideActuatorState as _;
+        let mut state = super::AppState::for_test();
+        state.role = crate::config::ProcessRole::Web.into();
+        let role = state.process_role().expect("AppState reports its role");
+        assert_eq!(role, crate::config::ProcessRole::Web);
+        assert_eq!(
+            role.capabilities(),
+            crate::config::ProcessRole::Web.capabilities()
+        );
+    }
+
     /// Counts checks of a health indicator.
     struct Counted(std::sync::atomic::AtomicUsize);
 

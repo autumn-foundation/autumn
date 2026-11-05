@@ -856,9 +856,10 @@ mod windows_impl {
     const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
     const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
-    /// Load just `pid`'s row, or every row when `pid` is `None`.
-    fn snapshot(pid: Option<u32>) -> System {
-        let mut system = System::new();
+    /// Load just `pid`'s row, or every row when `pid` is `None`. `None` when
+    /// `sysinfo` cannot start.
+    fn snapshot(pid: Option<u32>) -> Option<System> {
+        let mut system = System::new().ok()?;
         let refresh = ProcessRefreshKind::nothing();
         match pid {
             Some(pid) => {
@@ -873,7 +874,7 @@ mod windows_impl {
                 system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
             }
         }
-        system
+        Some(system)
     }
 
     /// Whether `pid` names a live process.
@@ -894,11 +895,14 @@ mod windows_impl {
         if pid == 0 {
             return false;
         }
-        if snapshot(Some(pid)).process(Pid::from_u32(pid)).is_some() {
+        if snapshot(Some(pid)).is_some_and(|system| system.process(Pid::from_u32(pid)).is_some()) {
             return true;
         }
-        let all = snapshot(None);
-        all.processes().is_empty() || all.process(Pid::from_u32(pid)).is_some()
+        // A snapshot that failed or came back empty proves nothing: answer
+        // "alive", the direction that never steals a lock.
+        snapshot(None).is_none_or(|all| {
+            all.processes().is_empty() || all.process(Pid::from_u32(pid)).is_some()
+        })
     }
 
     /// When `pid` started, in seconds since the Unix epoch.
@@ -912,7 +916,7 @@ mod windows_impl {
         if pid == 0 {
             return None;
         }
-        let system = snapshot(Some(pid));
+        let system = snapshot(Some(pid))?;
         let start = system.process(Pid::from_u32(pid))?.start_time();
         (start != 0).then_some(start)
     }
@@ -923,7 +927,7 @@ mod windows_impl {
         if pid == 0 {
             return None;
         }
-        let system = snapshot(Some(pid));
+        let system = snapshot(Some(pid))?;
         let process = system.process(Pid::from_u32(pid))?;
         let name = process
             .exe()
@@ -970,15 +974,17 @@ mod windows_impl {
     /// Every process on the machine, with its recorded parent and start time —
     /// the input [`super::descendants_of`] walks.
     pub(super) fn process_snapshot() -> Vec<ProcRow> {
-        snapshot(None)
-            .processes()
-            .values()
-            .map(|process| ProcRow {
-                pid: process.pid().as_u32(),
-                parent: process.parent().map_or(0, sysinfo::Pid::as_u32),
-                created: process.start_time(),
-            })
-            .collect()
+        snapshot(None).map_or_else(Vec::new, |system| {
+            system
+                .processes()
+                .values()
+                .map(|process| ProcRow {
+                    pid: process.pid().as_u32(),
+                    parent: process.parent().map_or(0, sysinfo::Pid::as_u32),
+                    created: process.start_time(),
+                })
+                .collect()
+        })
     }
 
     /// Deliver one emulated `PostgreSQL` signal byte to `pid`'s signal pipe.

@@ -265,6 +265,10 @@ pub fn route_macro(
         quote! { ::core::option::Option::None }
     };
     let seo_defaults = route_args.seo.emit();
+    let route_group = route_args.group.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |group| quote! { ::core::option::Option::Some(::autumn_web::RouteGroup::from_static(#group)) },
+    );
 
     // ── Architecture-graph node (#1747) ─────────────────────────
     // Gated off wasm32 with `#native_cfg` for the same reason the route-info
@@ -339,6 +343,7 @@ pub fn route_macro(
                 timeout: #route_timeout,
                 criticality: #route_criticality,
                 seo: #seo_defaults,
+                group: #route_group,
             }
         }
 
@@ -1636,6 +1641,51 @@ mod tests {
         assert!(
             generated.contains("SeoRouteDefaults :: EMPTY . with_title"),
             "unset seo keys must fall back to the empty defaults: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_emits_the_declared_group() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/landing", group = "marketing", name = "landing_page" },
+            quote! { async fn landing() -> &'static str { "landing" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("RouteGroup :: from_static (\"marketing\")"),
+            "group = ... must set Route::group: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_without_group_emits_none() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/landing" },
+            quote! { async fn landing() -> &'static str { "landing" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("group : :: core :: option :: Option :: None"),
+            "no group key must emit None: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_rejects_a_blank_group() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/landing", group = "" },
+            quote! { async fn landing() -> &'static str { "landing" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("route `group` must not be blank"),
+            "a blank group must be a compile error: {generated}"
         );
     }
 

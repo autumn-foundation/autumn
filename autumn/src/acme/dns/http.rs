@@ -133,7 +133,7 @@ impl ReqwestTransport {
         // A DNS provider API call must never park the renewal loop: without a
         // timeout a black-holed connection would hold the ACME order open until
         // the CA expired it, with nothing in the logs to say why.
-        let client = reqwest::Client::builder()
+        let client = crate::reqwest_tls::client_builder()
             .timeout(timeout)
             // Never follow a redirect. `reqwest` strips `Authorization` on a
             // cross-origin hop, but it does not know `x-amz-security-token` is a

@@ -20,9 +20,12 @@
   //   data-autumn-wrap="false"         stop at the first and last item
   //   data-autumn-typeahead            type a letter to move (roving only)
   //   data-autumn-dismiss              Escape, outside click or focus-out closes
+  //   data-autumn-dismiss="escape"     only Escape closes (a tooltip)
   //
   // The controller (or trigger) is the element whose aria-controls names the
-  // list (or layer). Events: `autumn:navigate` (detail.item), `autumn:dismiss`.
+  // list (or layer). A role="tooltip" layer's trigger names it in
+  // aria-describedby or aria-labelledby. Events: `autumn:navigate`
+  // (detail.item), `autumn:dismiss`.
   // `autumn:init` fires on each new root (the page, an htmx swap) before
   // roving init, so plugin JS can set roles that roving reads (#3400).
 
@@ -129,9 +132,26 @@
     emit(list, 'autumn:navigate', item);
   }
 
-  // aria-controls is a list of ids, so match one word of it.
+  function isTip(layer) {
+    return layer.getAttribute('role') === 'tooltip';
+  }
+
+  function escapeOnly(layer) {
+    return layer.getAttribute('data-autumn-dismiss') === 'escape';
+  }
+
+  // An id list attribute, so match one word of it. A tooltip's trigger can
+  // also use aria-controls (a plugin toggletip).
   function triggerOf(layer) {
-    return layer.id ? document.querySelector('[aria-controls~="' + CSS.escape(layer.id) + '"]') : null;
+    if (!layer.id) return null;
+    var id = '~="' + CSS.escape(layer.id) + '"]';
+    return (isTip(layer) && document.querySelector('[aria-describedby' + id + ',[aria-labelledby' + id)) ||
+      document.querySelector('[aria-controls' + id);
+  }
+
+  // True when `trigger` names `layer` in aria-controls.
+  function controls(trigger, layer) {
+    return (trigger.getAttribute('aria-controls') || '').split(/\s+/).indexOf(layer.id) >= 0;
   }
 
   // The data-autumn-activedescendant list that `el` controls, if any.
@@ -148,7 +168,7 @@
   function setOpen(layer, open) {
     var trigger = triggerOf(layer);
     layer.hidden = !open;
-    if (!trigger) return;
+    if (!trigger || !controls(trigger, layer)) return;
     trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
     if (!open && layer.hasAttribute('data-autumn-activedescendant')) setActive(trigger, layer, null);
   }
@@ -160,13 +180,22 @@
     emit(layer, 'autumn:dismiss', null);
   }
 
+  // A layer is open when it is not hidden, has content and shows (CSS can
+  // hide a tooltip). A
+  // tooltip's content can be text only.
+  function isOpen(layer) {
+    if (layer.hidden) return false;
+    if (!layer.childElementCount && !(isTip(layer) && layer.textContent.trim())) return false;
+    var style = getComputedStyle(layer);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  }
+
   // Calls `fn(layer, inside)` for each open layer. `inside` tells if `node`
-  // is in the layer or its trigger. Inner layers come first. An empty layer
-  // is not open.
+  // is in the layer or its trigger. Inner layers come first.
   function eachOpenLayer(node, fn) {
     var layers = document.querySelectorAll('[data-autumn-dismiss]:not([hidden])');
     for (var i = layers.length - 1; i >= 0; i--) {
-      if (!layers[i].childElementCount) continue;
+      if (!isOpen(layers[i])) continue;
       var trigger = triggerOf(layers[i]);
       var inside = !!node && (layers[i].contains(node) || (!!trigger && trigger.contains(node)));
       if (fn(layers[i], inside) === false) return;
@@ -238,7 +267,7 @@
   // A click outside a layer and its trigger closes the layer.
   document.addEventListener('click', function (e) {
     eachOpenLayer(e.target, function (layer, inside) {
-      if (!inside) dismiss(layer, false);
+      if (!inside && !escapeOnly(layer)) dismiss(layer, false);
     });
   });
 
@@ -249,33 +278,10 @@
     var to = e.relatedTarget;
     if (!to) return;
     eachOpenLayer(e.target, function (layer, inside) {
-      if (!inside) return;
+      if (!inside || escapeOnly(layer)) return;
       var trigger = triggerOf(layer);
       if (!layer.contains(to) && !(trigger && trigger.contains(to))) dismiss(layer, false);
     });
-  });
-
-  // ── Min-length enforcement ────────────────────────────────────────────────
-  // Cancel htmx requests from active-search or autocomplete inputs when the
-  // typed value is non-empty but shorter than data-ac-min-length.
-  // Empty inputs are NOT cancelled so the server can clear stale results.
-  // When a below-minimum request is cancelled, also clear the results container
-  // so results from a previous valid query don't remain visible.
-  document.addEventListener('htmx:configRequest', function (e) {
-    var elt = e.detail && e.detail.elt;
-    if (!elt || !elt.dataset) return;
-    var minLen = parseInt(elt.dataset.acMinLength || '0', 10);
-    var len = (elt.value || '').length;
-    if (minLen > 0 && len > 0 && len < minLen) {
-      e.preventDefault();
-      // Clear the htmx target so stale results from a previous valid query
-      // don't remain visible while the input is below the minimum length.
-      var targetSel = elt.getAttribute('hx-target');
-      if (targetSel) {
-        var target = document.querySelector(targetSel);
-        if (target) target.innerHTML = '';
-      }
-    }
   });
 
   // ── Tabs widget ───────────────────────────────────────────────────────────
@@ -372,128 +378,16 @@
     if (target) target.scrollIntoView();
   });
 
-  // ── Autocomplete widget ───────────────────────────────────────────────────
-  // The listbox uses the keyboard core (data-autumn-activedescendant and
-  // data-autumn-dismiss). This code selects options and keeps
-  // aria-expanded true only while the popup shows at least one option.
-
-  function initAutocomplete(wrapper) {
-    if (!once(wrapper)) return;
-
-    var queryInput = wrapper.querySelector('[data-ac-query]');
-    var valueId = wrapper.dataset.acValueId;
-    var valueName = wrapper.dataset.acValueName;
-    var freeText = 'acFreeText' in wrapper.dataset;
-    var listbox = wrapper.querySelector('[role="listbox"]');
-    if (!queryInput || !valueId || !valueName || !listbox) return;
-
-    function getHidden() { return document.getElementById(valueId); }
-
-    // Free-text mode: assign the name immediately so the field is always
-    // included in form submission even if the user never types in the input.
-    // This preserves any default value set on the hidden input in the HTML.
-    if (freeText) {
-      getHidden().name = valueName;
-    } else if (getHidden().value) {
-      // ID mode: a non-empty hidden value at init means a prior selection was
-      // seeded server-side (an edit-form GET, or a 422 re-render preserving a
-      // previous pick) — assign the name now so it round-trips on submit even
-      // if the user never touches this field again. The 'input' listener
-      // below still clears the name the moment the user edits the query,
-      // same as it already does for a live-session selection.
-      getHidden().name = valueName;
-    }
-
-    // A dismissal (Escape, Tab, a click outside) holds until the user types
-    // or presses ArrowDown/ArrowUp. Thus a late response stays closed.
-    var dismissed = false;
-    listbox.addEventListener('autumn:dismiss', function () { dismissed = true; });
-    queryInput.addEventListener('keydown', function (e) {
-      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') dismissed = false;
-    });
-
-    // New content (an htmx swap, or a clear) shows the popup again, unless
-    // the user dismissed it. An empty listbox stays in the accessibility
-    // tree, so its live region still speaks; the CSS gives it no size.
-    function sync() {
-      var options = listbox.querySelectorAll('[role="option"]');
-      options.forEach(function (o) { o.tabIndex = -1; });
-      listbox.hidden = dismissed;
-      queryInput.setAttribute('aria-expanded', !listbox.hidden && options.length ? 'true' : 'false');
-      queryInput.removeAttribute('aria-activedescendant');
-    }
-    // `subtree` also sees a morph swap that keeps the option count.
-    new MutationObserver(sync).observe(listbox, { childList: true, subtree: true });
-    sync();
-
-    function selectOption(opt) {
-      var hidden = getHidden();
-      hidden.name = valueName;
-      hidden.value = opt.dataset.value || '';
-      queryInput.value = opt.textContent.trim();
-      listbox.innerHTML = '';
-      sync();
-      queryInput.focus();
-    }
-
-    // A mouse press on an option must not take focus from the input.
-    listbox.addEventListener('mousedown', function (e) { e.preventDefault(); });
-
-    listbox.addEventListener('click', function (e) {
-      var opt = e.target.closest('[role="option"]');
-      if (opt) selectOption(opt);
-    });
-
-    listbox.addEventListener('keydown', function (e) {
-      var opt = e.target.closest('[role="option"]');
-      if (!opt || (e.key !== 'Enter' && e.key !== ' ')) return;
-      e.preventDefault();
-      selectOption(opt);
-    });
-
-    queryInput.addEventListener('input', function () {
-      var hidden = getHidden();
-      dismissed = false;
-      // The highlight belongs to the old query. Enter must not commit it.
-      setActive(queryInput, listbox, null);
-      var minLen = parseInt(queryInput.dataset.acMinLength || '0', 10);
-      if (freeText) {
-        // Free-text mode: keep the hidden field in sync with the typed query.
-        // Use this for tag-style fields where the submitted value is the text itself.
-        hidden.name = valueName;
-        hidden.value = queryInput.value;
-      } else {
-        // ID mode (default): a stale selection is invalid once the user edits
-        // the query. The hidden field gains its name only when an option is
-        // selected so no-JS forms are not broken by a phantom empty field.
-        hidden.name = '';
-        hidden.value = '';
-      }
-      // Clear stale options when the query drops below the minimum length.
-      if (minLen > 0 && queryInput.value.length < minLen) {
-        listbox.innerHTML = '';
-      }
-    });
-  }
-
   // ── nav_bar widget ──────────────────────────────────────────────────────
   // Progressive enhancement for autumn_web::widgets::nav_bar: before this
-  // runs, the hamburger toggle is hidden and every dropdown is rendered open
-  // so all links stay visible with JS off. Once it runs, the hamburger is
-  // revealed and each dropdown becomes an APG menu button. The keyboard core
-  // gives the menu its arrow keys, typeahead, Escape and click-outside.
+  // runs, the hamburger toggle is hidden. Once it runs, the hamburger is
+  // revealed. Dropdowns are popover menus (see below).
 
-  function openNavMenu(toggle, menu, focusAt) {
-    setOpen(menu, true);
-    var all = listItems(menu);
-    if (focusAt && all.length) focusItem(menu, focusAt === 'last' ? all[all.length - 1] : all[0]);
-  }
-
-  // initNav is guarded per-CONTROL (toggle / menu toggle), not once per nav
-  // element: when htmx swaps a <nav data-autumn-nav>'s innerHTML (the nav
-  // itself stays in the DOM, only its children are replaced), the swapped-in
-  // hamburger/dropdown buttons are brand-new nodes, so they need wiring again
-  // even though the nav was already initialized once.
+  // initNav is guarded per-CONTROL (the toggle), not once per nav element:
+  // when htmx swaps a <nav data-autumn-nav>'s innerHTML (the nav itself stays
+  // in the DOM, only its children are replaced), the swapped-in hamburger is
+  // a brand-new node, so it needs wiring again even though the nav was
+  // already initialized once.
   function initNav(nav) {
     nav.classList.add('autumn-nav--enhanced');
 
@@ -507,44 +401,120 @@
         collapse.classList.toggle('autumn-nav__collapse--open', !open);
       });
     }
-
-    nav.querySelectorAll('[data-nav-menu-toggle]').forEach(function (menuToggle) {
-      var menu = document.getElementById(menuToggle.getAttribute('aria-controls'));
-      if (!menu || !once(menuToggle)) return;
-      // These roles promise arrow keys, so only the runtime adds them.
-      menuToggle.setAttribute('aria-haspopup', 'menu');
-      menu.setAttribute('role', 'menu');
-      if (menuToggle.id) menu.setAttribute('aria-labelledby', menuToggle.id);
-      menu.querySelectorAll('li').forEach(function (li) { li.setAttribute('role', 'none'); });
-      menu.querySelectorAll('a').forEach(function (a) {
-        a.setAttribute('role', 'menuitem');
-        a.tabIndex = -1;
-      });
-      // Collapse the server-rendered "open" default.
-      setOpen(menu, false);
-
-      function closeOthers() {
-        nav.querySelectorAll('[data-nav-menu-toggle]').forEach(function (other) {
-          var m = document.getElementById(other.getAttribute('aria-controls'));
-          if (m && other !== menuToggle) setOpen(m, false);
-        });
-      }
-
-      // A keyboard click (Enter or Space) has detail 0 and focuses the
-      // first item. A mouse click keeps focus on the button.
-      menuToggle.addEventListener('click', function (e) {
-        closeOthers();
-        if (menu.hidden) openNavMenu(menuToggle, menu, e.detail === 0 ? 'first' : null);
-        else setOpen(menu, false);
-      });
-      menuToggle.addEventListener('keydown', function (e) {
-        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-        e.preventDefault();
-        closeOthers();
-        openNavMenu(menuToggle, menu, e.key === 'ArrowUp' ? 'last' : 'first');
-      });
-    });
   }
+
+  // ── popover menu (issue #3402) ────────────────────────────────────────────
+  // dropdown_menu and NavMenu are native popovers: the browser opens them from
+  // command/commandfor and gives light dismiss and Escape. This adds the rest
+  // of the APG menu button. The keyboard core gives arrows, Home/End, typeahead.
+
+  var MENU = '[data-autumn-menu]';
+  var MENU_BUTTON = '[aria-haspopup="menu"][commandfor]';
+  var menuAt = null; // { menu, at }: where focus goes when that menu opens
+
+  function menuOfButton(btn) {
+    var m = btn && document.getElementById(btn.getAttribute('commandfor'));
+    return m && m.matches(MENU) ? m : null;
+  }
+
+  // Old browsers throw on `:popover-open`: they have no open popover.
+  function popoverOpen(el) {
+    try { return el.matches(':popover-open'); } catch (_) { return false; }
+  }
+
+  // A popover and a menu both get aria-expanded. Only a menu moves focus.
+  var POPOVER = MENU + ',[data-autumn-popover]';
+
+  function initMenu(menu) {
+    var trigger = triggerOf(menu);
+    if (trigger) trigger.setAttribute('aria-expanded', popoverOpen(menu) ? 'true' : 'false');
+  }
+
+  document.addEventListener('toggle', function (e) {
+    var menu = e.target;
+    if (!menu.matches || !menu.matches(POPOVER)) return;
+    var open = e.newState === 'open';
+    var trigger = triggerOf(menu);
+    if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    // Only this menu's own event may use its request.
+    var req = menuAt;
+    if (!req || req.menu !== menu) return;
+    menuAt = null;
+    var all = open ? listItems(menu) : [];
+    if (all.length) focusItem(menu, req.at === 'last' ? all[all.length - 1] : all[0]);
+  }, true);
+
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest) return;
+    var button = e.target.closest(MENU_BUTTON);
+    if (button) {
+      // A keyboard click (Enter or Space) has detail 0 and focuses the first item.
+      var menu = menuOfButton(button);
+      menuAt = menu && e.detail === 0 ? { menu: menu, at: 'first' } : null;
+      return;
+    }
+    var item = e.target.closest(MENU + ' [role="menuitem"]');
+    var owner = item && item.closest(MENU);
+    // A script may cancel the click (htmx does for a boosted link). Still close.
+    if (!owner || item.getAttribute('aria-disabled') === 'true') return;
+    // Close after the item acts. Focus the trigger: some browsers do not
+    // focus a clicked button.
+    setTimeout(function () {
+      if (!popoverOpen(owner)) return;
+      var opener = triggerOf(owner);
+      if (opener) opener.focus();
+      owner.hidePopover();
+    }, 0);
+  });
+
+  // Focus that leaves a menu and its trigger closes the menu.
+  document.addEventListener('focusout', function (e) {
+    var to = e.relatedTarget;
+    var menu = e.target.closest && (e.target.closest(MENU) || menuOfButton(e.target.closest(MENU_BUTTON)));
+    if (!to || !menu || !popoverOpen(menu)) return;
+    var trigger = triggerOf(menu);
+    if (!menu.contains(to) && !(trigger && trigger.contains(to))) menu.hidePopover();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    var t = e.target;
+    if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || !t || !t.closest) return;
+    var menu = menuOfButton(t.closest(MENU_BUTTON));
+    if (menu && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      e.preventDefault();
+      menuAt = { menu: menu, at: e.key === 'ArrowUp' ? 'last' : 'first' };
+      if (popoverOpen(menu)) {
+        var all = listItems(menu);
+        menuAt = null;
+        if (all.length) focusItem(menu, e.key === 'ArrowUp' ? all[all.length - 1] : all[0]);
+      } else {
+        try {
+          // `source` anchors the panel to the button, as `commandfor` does.
+          menu.showPopover({ source: triggerOf(menu) });
+        } catch (_) {
+          menuAt = null;
+        }
+      }
+      return;
+    }
+    var inside = t.closest(MENU);
+    if (!inside) return;
+    // Escape and Tab: focus the trigger first. Tab then moves on from it.
+    if (e.key === 'Escape' && popoverOpen(inside)) {
+      var back = triggerOf(inside);
+      if (back) back.focus();
+    }
+    if (e.key === 'Tab' && popoverOpen(inside)) {
+      var opener = triggerOf(inside);
+      if (opener) opener.focus();
+      inside.hidePopover();
+    }
+    // Space activates a link item, as Enter does.
+    if (e.key === ' ' && t.matches('a[role="menuitem"]')) {
+      e.preventDefault();
+      if (!e.repeat) t.click();
+    }
+  });
 
   // ── modal / confirm_action ────────────────────────────────────────────────
   // autumn_web::widgets::modal / confirm_action open and close their
@@ -557,6 +527,12 @@
   // free from the browser in both paths.
   if (!('command' in HTMLButtonElement.prototype)) {
     document.addEventListener('click', function (e) {
+      var pop = e.target.closest('[data-popover-toggle]');
+      var panel = pop && document.getElementById(pop.getAttribute('data-popover-toggle'));
+      if (panel && panel.togglePopover) {
+        panel.togglePopover({ source: pop });
+        return;
+      }
       var opener = e.target.closest('[data-modal-open]');
       if (opener) {
         var toOpen = document.getElementById(opener.getAttribute('data-modal-open'));
@@ -786,6 +762,487 @@
     queueMicrotask(function () { toasts.forEach(initToast); });
   });
 
+  // ── tooltip (#3404) ───────────────────────────────────────────────────────
+  // CSS shows the text on hover and keyboard focus. The keyboard core hides
+  // it on Escape (data-autumn-dismiss="escape"). This code shows it again on
+  // the next hover or focus, hides a hover-only tooltip on Escape, and adds
+  // the Chromium enhancement.
+  var TIP = '[data-autumn-tooltip]';
+  // A browser without popovers throws on the `:popover-open` selector.
+  var HINTS = !!window.CSS && CSS.supports('selector(:popover-open)');
+
+  function tipIn(wrap) {
+    return wrap.querySelector(':scope > [role="tooltip"]');
+  }
+
+  // Chromium: `interestfor` on a button or link, `popover="hint"` on the
+  // text. The browser then shows, hides and dismisses it in the top layer.
+  // The server never sends these attributes, so other browsers keep CSS.
+  // A disabled button gets no interest, so it keeps CSS. A new trigger from
+  // an htmx swap gets `interestfor` again. A hint that is open for the old
+  // trigger closes.
+  function initTooltip(wrap) {
+    var tip = tipIn(wrap);
+    if (!tip) return;
+    var trigger = triggerOf(tip);
+    if (!trigger || !wrap.contains(trigger) || !trigger.matches('button:not(:disabled), a[href]') ||
+      !('interestForElement' in trigger)) {
+      // A new trigger that gets no interest: go back to the CSS mode.
+      if (tip.hasAttribute('popover')) {
+        if (tip.matches(':popover-open')) tip.hidePopover();
+        tip.removeAttribute('popover');
+        tip.setAttribute('data-autumn-dismiss', 'escape');
+      }
+      return;
+    }
+    if (tip.matches('[popover]:popover-open') && !trigger.hasAttribute('interestfor')) tip.hidePopover();
+    tip.removeAttribute('data-autumn-dismiss');
+    tip.hidden = false;
+    tip.setAttribute('popover', 'hint');
+    trigger.setAttribute('interestfor', tip.id);
+  }
+
+  // A dismissed tooltip shows again when hover or focus comes from outside.
+  function rearm(e) {
+    var wrap = e.target.closest && e.target.closest(TIP);
+    if (!wrap || (e.relatedTarget && wrap.contains(e.relatedTarget))) return;
+    var tip = tipIn(wrap);
+    if (tip && tip.hidden) tip.hidden = false;
+  }
+  document.addEventListener('mouseover', rearm);
+  document.addEventListener('focusin', rearm);
+
+  // Escape closes a shown tooltip first, and cancels the key: an open hint
+  // popover, or a CSS tooltip that shows for hover (WCAG 1.4.13). Without
+  // this, the core closes a layer around it, and the browser closes a modal
+  // around it. The capture phase runs before the core. The core closes a
+  // CSS tooltip whose trigger has focus.
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+    if (HINTS) document.querySelectorAll(TIP + ' > [popover]:popover-open').forEach(function (tip) {
+      e.preventDefault();
+      tip.hidePopover();
+    });
+    document.querySelectorAll(TIP + ':hover > [role="tooltip"]').forEach(function (tip) {
+      if (!isOpen(tip) || !escapeOnly(tip)) return;
+      e.preventDefault();
+      dismiss(tip, false);
+    });
+  }, true);
+
+  // ── password and one-time code (#3412) ────────────────────────────────────
+  // A reveal button has `hidden` in the server HTML. This code shows it and
+  // toggles its input between `password` and `text`. A submit, a page hide
+  // and an htmx history snapshot hide the password again, so the browser
+  // does not keep it as text. A strength hint shows a level as the user
+  // types. A one-time code keeps only digits. With a group, it writes a
+  // space between groups, and the `formdata` event removes the spaces.
+  var REVEAL = '[data-autumn-reveal]';
+  var OTP = 'input[data-autumn-otp]';
+
+  function revealed(btn) {
+    var input = document.getElementById(btn.getAttribute('aria-controls') || '');
+    return input && input.matches('input') ? input : null;
+  }
+
+  function setReveal(btn, on) {
+    var input = revealed(btn);
+    if (!input) return;
+    input.type = on ? 'text' : 'password';
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  function initReveal(btn) {
+    if (revealed(btn)) btn.hidden = false;
+  }
+
+  function hidePasswords() {
+    document.querySelectorAll(REVEAL + '[aria-pressed="true"]').forEach(function (btn) {
+      setReveal(btn, false);
+    });
+  }
+
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest && e.target.closest(REVEAL);
+    if (btn && !btn.disabled) setReveal(btn, btn.getAttribute('aria-pressed') !== 'true');
+  });
+  document.addEventListener('submit', hidePasswords, true);
+  window.addEventListener('pagehide', hidePasswords);
+  document.addEventListener('htmx:beforeHistorySave', hidePasswords);
+
+  // 0 to 3: one point each for 8, 12 and 16 characters, and one for three
+  // kinds of characters. One kind of character, or a character three times
+  // in a row, removes a point. A hint only: it does not know common
+  // passwords, and the server checks the policy.
+  function strength(value) {
+    var kinds = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^a-zA-Z0-9]/].filter(function (re) {
+      return re.test(value);
+    }).length;
+    var n = value.length;
+    var points = (n >= 8) + (n >= 12) + (n >= 16) + (kinds >= 3) - (kinds < 2) - /(.)\1\1/.test(value);
+    return Math.max(0, Math.min(3, points));
+  }
+
+  // The strength hint is the describedby element with the labels.
+  function showStrength(input) {
+    var ids = (input.getAttribute('aria-describedby') || '').split(/\s+/);
+    var out = null;
+    ids.forEach(function (id) {
+      var el = id && document.getElementById(id);
+      if (el && el.hasAttribute('data-autumn-strength')) out = el;
+    });
+    if (!out) return;
+    var level = input.value ? String(strength(input.value)) : '';
+    // Write only a new level, so the live region does not speak on each key.
+    if ((out.getAttribute('data-autumn-strength-level') || '') === level) return;
+    var labels;
+    try { labels = JSON.parse(out.getAttribute('data-autumn-strength')); } catch (err) { return; }
+    if (level) out.setAttribute('data-autumn-strength-level', level);
+    else out.removeAttribute('data-autumn-strength-level');
+    out.textContent = level && Array.isArray(labels) ? String(labels[+level] || '') : '';
+  }
+
+  // [length, group]. The group is 0 until `initOtp` turns it on.
+  function otpSize(input) {
+    return [parseInt(input.getAttribute('data-autumn-otp'), 10) || 6,
+      input.hasAttribute('data-autumn-otp-grouped')
+        ? parseInt(input.getAttribute('data-autumn-otp-group'), 10) || 0 : 0];
+  }
+
+  // Full-width digits (from CJK mail or an IME) become ASCII digits.
+  function asciiDigits(v) {
+    return v.replace(/[０-９]/g, function (c) {
+      return String.fromCharCode(c.charCodeAt(0) - 0xFEE0);
+    });
+  }
+
+  // The last value, so Backspace on a group space deletes the digit before
+  // it. `otpCollapsed` is true when the caret had no selection.
+  var otpLast = new WeakMap();
+  var otpCollapsed = new WeakMap();
+
+  // Keep the digits, up to the length. Put a space between groups. The caret
+  // stays after the same digit.
+  function formatOtp(input, type) {
+    var size = otpSize(input), n = size[0], g = size[1];
+    var raw = asciiDigits(input.value);
+    var at = input.selectionStart === null ? raw.length : input.selectionStart;
+    var before = raw.slice(0, at).replace(/\D/g, '').length;
+    var digits = raw.replace(/\D/g, '');
+    var last = otpLast.get(input);
+    if (g && last !== undefined && digits === last.replace(/\D/g, '') && otpCollapsed.get(input)) {
+      // Only a group space went away: delete the digit next to it.
+      if (type === 'deleteContentBackward' && before > 0) {
+        digits = digits.slice(0, before - 1) + digits.slice(before);
+        before--;
+      } else if (type === 'deleteContentForward') {
+        digits = digits.slice(0, before) + digits.slice(before + 1);
+      }
+    }
+    digits = digits.slice(0, n);
+    var value = g ? digits.replace(new RegExp('(\\d{' + g + '})(?=\\d)', 'g'), '$1 ') : digits;
+    otpLast.set(input, value);
+    if (value === input.value) return;
+    input.value = value;
+    before = Math.min(before, digits.length);
+    var pos = before + (g && before ? Math.floor((before - 1) / g) : 0);
+    if (document.activeElement === input) input.setSelectionRange(pos, pos);
+  }
+
+  // The server sends `maxlength` for a page with no JS. Remove it, so the
+  // browser does not cut a paste such as `123-456` before this code runs. A
+  // grouped code needs JS: the pattern allows the spaces, and the CSS shows
+  // the separator cells. An app pattern wins: the code stays ungrouped, so
+  // that pattern still checks it.
+  function initOtp(input) {
+    var n = otpSize(input)[0];
+    var g = parseInt(input.getAttribute('data-autumn-otp-group'), 10) || 0;
+    if (input.maxLength === n) input.removeAttribute('maxlength');
+    if (g && !input.hasAttribute('data-autumn-otp-grouped') &&
+        input.getAttribute('pattern') === '[0-9]{' + n + '}') {
+      var parts = [];
+      for (var i = 0; i < n; i += g) parts.push('[0-9]{' + Math.min(g, n - i) + '}');
+      input.pattern = parts.join(' ');
+      input.setAttribute('data-autumn-otp-grouped', '');
+    }
+    if (input.value) formatOtp(input);
+  }
+
+  document.addEventListener('beforeinput', function (e) {
+    var t = e.target;
+    if (t.matches && t.matches(OTP)) otpCollapsed.set(t, t.selectionStart === t.selectionEnd);
+  });
+
+  // The capture phase runs before the listeners on the input, so an htmx
+  // trigger on `input` reads the formatted code. An IME writes the value in
+  // steps. Format it once, at the end.
+  document.addEventListener('input', function (e) {
+    var t = e.target;
+    if (!t.matches || e.isComposing) return;
+    if (t.matches(OTP)) formatOtp(t, e.inputType);
+    else if (t.matches('input[aria-describedby]')) showStrength(t);
+  }, true);
+  document.addEventListener('compositionend', function (e) {
+    if (e.target.matches && e.target.matches(OTP)) formatOtp(e.target);
+  }, true);
+
+  // A form reset hides the passwords and clears the strength hints.
+  document.addEventListener('reset', function (e) {
+    hidePasswords();
+    setTimeout(function () {
+      if (e.target.querySelectorAll) e.target.querySelectorAll('input[aria-describedby]').forEach(showStrength);
+    });
+  }, true);
+
+  function grouped(el) {
+    return el.name && !el.disabled && el.matches && el.matches(OTP + '[data-autumn-otp-grouped]');
+  }
+
+  // The server gets the digits of a grouped code, with no spaces. `set`
+  // keeps the entry in its place.
+  document.addEventListener('formdata', function (e) {
+    Array.prototype.forEach.call(e.target.elements || [], function (el) {
+      if (!grouped(el)) return;
+      var all = e.formData.getAll(el.name);
+      if (all.length === 1 && all[0] === el.value) e.formData.set(el.name, el.value.replace(/\s/g, ''));
+    });
+  }, true);
+
+  // htmx reads the value itself when it sends an input with no form
+  // (`hx-include`, `hx-get` on the input). Remove the spaces there too.
+  document.addEventListener('htmx:configRequest', function (e) {
+    var params = e.detail && e.detail.parameters;
+    if (!params) return;
+    document.querySelectorAll(OTP + '[data-autumn-otp-grouped]').forEach(function (el) {
+      if (grouped(el) && params[el.name] === el.value) params[el.name] = el.value.replace(/\s/g, '');
+    });
+  });
+
+  // ── direct upload (#3411) ─────────────────────────────────────────────────
+  // fetch gets the presigned URL from the app. XHR sends the bytes, because
+  // fetch has no upload progress. The input loses its name, so the file goes
+  // only to storage. A hidden field holds each blob key. See
+  // `storage::form_helper::direct_upload_field`.
+  var UPLOAD = '[data-autumn-direct-upload]';
+  // Clears one field. Set by initUpload, used when the form resets.
+  var resetUpload = new WeakMap();
+
+  function csrfHeaders() {
+    var meta = document.querySelector('meta[name="csrf-token"],meta[name="autumn-csrf-token"]');
+    var h = {};
+    if (meta) h[meta.getAttribute('data-header') || 'x-csrf-token'] = meta.getAttribute('content') || '';
+    return h;
+  }
+
+  // Does `file` match an `accept` list (".pdf", "image/*", "text/plain")?
+  function accepted(file, accept) {
+    if (!accept) return true;
+    var name = file.name.toLowerCase();
+    var type = (file.type || '').toLowerCase();
+    return accept.split(',').some(function (t) {
+      t = t.trim().toLowerCase();
+      if (!t) return false;
+      if (t.charAt(0) === '.') return name.slice(-t.length) === t;
+      // The OS may report no type. The server checks the real type.
+      if (!type) return true;
+      if (t.slice(-2) === '/*') return type.indexOf(t.slice(0, -1)) === 0;
+      return type === t;
+    });
+  }
+
+  function presign(root, file, type) {
+    var h = csrfHeaders();
+    h['Content-Type'] = 'application/json';
+    h.Accept = 'application/json';
+    return fetch(root.getAttribute('data-autumn-upload-url'), {
+      method: 'POST', headers: h, credentials: 'same-origin',
+      body: JSON.stringify({ filename: file.name, content_type: type, size: file.size })
+    }).then(function (r) {
+      if (!r.ok) throw new Error('presign ' + r.status);
+      return r.json();
+    }).then(function (env) {
+      if (!env || !env.url || !env.key) throw new Error('presign envelope');
+      return env;
+    });
+  }
+
+  function put(env, file, type, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var headers = Object.assign({}, env.headers);
+      // The local store is on this origin, behind the CSRF check. A store on
+      // another origin never gets the token.
+      var same = false;
+      try { same = new URL(env.url, location.href).origin === location.origin; } catch (err) { /* bad URL */ }
+      if (same) headers = Object.assign(csrfHeaders(), headers);
+      var xhr = new XMLHttpRequest();
+      xhr.open(env.method || 'PUT', env.url);
+      Object.keys(headers).forEach(function (k) { xhr.setRequestHeader(k, headers[k]); });
+      if (!Object.keys(headers).some(function (k) { return k.toLowerCase() === 'content-type'; })) {
+        xhr.setRequestHeader('Content-Type', type);
+      }
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable) onProgress(Math.round(e.loaded * 100 / e.total));
+      };
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300) resolve(); else reject(new Error('put ' + xhr.status));
+      };
+      xhr.onerror = xhr.onabort = function () { reject(new Error('put failed')); };
+      xhr.send(file);
+    });
+  }
+
+  function initUpload(root) {
+    if (!once(root)) return;
+    var input = root.querySelector('input[type="file"]');
+    var field = root.getAttribute('data-autumn-upload-field');
+    var bar = root.querySelector('[role="progressbar"]');
+    var status = root.querySelector('[role="status"]');
+    var alertEl = root.querySelector('[role="alert"]');
+    var box = root.querySelector('[data-autumn-upload-fields]');
+    var hint = root.querySelector('[data-autumn-upload-hint]');
+    if (!input || !field || !bar || !status || !alertEl || !box) return;
+    var pending = 0;
+    var errors = [];
+    var latest = 0;
+    var epoch = 0;
+
+    // A restored htmx snapshot can hold the state of a run that ended.
+    root.removeAttribute('aria-busy');
+    root.removeAttribute('data-dragging');
+    bar.hidden = true;
+    status.textContent = '';
+
+    // The bytes go to storage. The form sends only the hidden keys.
+    input.removeAttribute('name');
+    if (hint) hint.hidden = false;
+
+    // The bar is not live: only the status and error lines are announced.
+    function showErrors() {
+      alertEl.textContent = errors.join(' ');
+      if (errors.length) input.setAttribute('aria-invalid', 'true');
+      else input.removeAttribute('aria-invalid');
+    }
+
+    function progress(n) {
+      bar.hidden = false;
+      bar.setAttribute('aria-valuenow', n);
+      // CSSOM, not a style attribute, so the CSP allows it.
+      bar.style.setProperty('--autumn-upload-percent', n + '%');
+    }
+
+    function upload(file) {
+      var type = file.type || 'application/octet-stream';
+      progress(0);
+      return presign(root, file, type).then(function (env) {
+        return put(env, file, type, progress).then(function () { return env.key; });
+      });
+    }
+
+    function addKey(key, file) {
+      if (!input.multiple) box.textContent = '';
+      var hid = document.createElement('input');
+      hid.type = 'hidden';
+      hid.name = field;
+      hid.value = key;
+      box.appendChild(hid);
+      root.dispatchEvent(new CustomEvent('autumn:upload', { bubbles: true, detail: { key: key, file: file } }));
+    }
+
+    function run(list) {
+      var files = Array.prototype.slice.call(list);
+      var accept = input.getAttribute('accept');
+      // The same file can then be chosen again.
+      input.value = '';
+      if (!pending) errors = [];
+      files = files.filter(function (f) {
+        if (accepted(f, accept)) return true;
+        errors.push(f.name + ' is not an accepted file type.');
+        return false;
+      });
+      if (!input.multiple) files = files.slice(0, 1);
+      showErrors();
+      if (!files.length) return;
+      var mine = ++latest;
+      var born = epoch;
+      // A failed replacement must not leave the old key in the form.
+      if (!input.multiple) box.textContent = '';
+      var done = [];
+      pending++;
+      root.setAttribute('aria-busy', 'true');
+      files.reduce(function (chain, file, i) {
+        return chain.then(function () {
+          status.textContent = 'Uploading ' + file.name + (files.length > 1 ? ' (' + (i + 1) + ' of ' + files.length + ')' : '') + '.';
+          return upload(file).then(function (key) {
+            // A newer pick replaces this one in a single-file field.
+            if (born !== epoch || (!input.multiple && mine !== latest)) return;
+            addKey(key, file);
+            done.push(file.name);
+          }, function () {
+            errors.push(file.name + ' did not upload.');
+            root.dispatchEvent(new CustomEvent('autumn:upload-error', { bubbles: true, detail: { file: file } }));
+          });
+        });
+      }, Promise.resolve()).then(function () {
+        // A later run still owns the bar and the lines.
+        if (--pending) return;
+        root.removeAttribute('aria-busy');
+        bar.hidden = true;
+        showErrors();
+        status.textContent = done.length === 1 ? done[0] + ' uploaded.' : done.length ? done.length + ' files uploaded.' : '';
+      });
+    }
+
+    // A form reset drops the keys. Uploads that still run must not add one.
+    resetUpload.set(root, function () {
+      epoch++;
+      errors = [];
+      box.textContent = '';
+      status.textContent = '';
+      showErrors();
+    });
+
+    input.addEventListener('change', function () { run(input.files); });
+
+    function hasFiles(e) {
+      var types = e.dataTransfer && e.dataTransfer.types;
+      return !!types && Array.prototype.indexOf.call(types, 'Files') >= 0;
+    }
+    function over(e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      root.setAttribute('data-dragging', '');
+    }
+    root.addEventListener('dragenter', over);
+    root.addEventListener('dragover', over);
+    root.addEventListener('dragleave', function (e) {
+      if (!root.contains(e.relatedTarget)) root.removeAttribute('data-dragging');
+    });
+    root.addEventListener('drop', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      root.removeAttribute('data-dragging');
+      run(e.dataTransfer.files);
+    });
+  }
+
+  document.addEventListener('reset', function (e) {
+    if (e.target.querySelectorAll) e.target.querySelectorAll(UPLOAD).forEach(function (root) {
+      var reset = resetUpload.get(root);
+      if (reset) reset();
+    });
+  }, true);
+
+  // A key is missing until its upload ends, so hold the form. One listener
+  // for the page, so a swap leaves no stale listener on the form.
+  document.addEventListener('submit', function (e) {
+    var root = e.target.querySelector && e.target.querySelector(UPLOAD + '[aria-busy]');
+    if (!root) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    root.querySelector('[role="alert"]').textContent = 'Wait for the upload to finish, then send the form again.';
+    root.querySelector('input[type="file"]').focus();
+  }, true);
+
   // Run `fn` on `root` (when it matches) and on each match inside it.
   function each(root, selector, fn) {
     if (root.matches && root.matches(selector)) fn(root);
@@ -795,12 +1252,19 @@
   // Widget init first: it sets the roles and selection that roving reads.
   function initAll(root) {
     each(root, '[data-autumn-tabs]', initTabs);
-    each(root, '[data-ac-value-id]', initAutocomplete);
     each(root, '[data-autumn-nav]', initNav);
+    each(root, POPOVER, initMenu);
     root.dispatchEvent(new CustomEvent('autumn:init', { bubbles: true }));
     each(root, '[data-autumn-roving]', initRoving);
     each(root, REGION, initRegion);
     each(root, TOAST, initToast);
+    each(root, TIP, initTooltip);
+    each(root, REVEAL, initReveal);
+    each(root, OTP, initOtp);
+    each(root, UPLOAD, initUpload);
+    // A swap inside a tooltip (a new trigger).
+    var outer = root.parentElement && root.parentElement.closest(TIP);
+    if (outer) initTooltip(outer);
     // The theme is page state, so only a whole-page init syncs it.
     if (root === document) syncTheme();
   }
@@ -831,6 +1295,48 @@
   });
   // A history restore (hx-boost, Back) brings back nodes without listeners.
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
+
+  // Busy state (#3406). Mark this request's [data-autumn-busy] requester,
+  // submitter and indicators, and its target. Indicators resolve as htmx
+  // does: the inherited hx-indicator, else the requester.
+  var busyCount = new WeakMap();
+  function indicatorsOf(elt) {
+    var host = elt.closest('[hx-indicator],[data-hx-indicator]');
+    if (!host) return [elt];
+    var sel = host.getAttribute('hx-indicator') || host.getAttribute('data-hx-indicator');
+    try {
+      // A plain CSS list stays whole: a comma can sit inside :is() or [a="b, c"].
+      if (!/(^|,)\s*(this|closest |find )/.test(sel)) return Array.from(document.querySelectorAll(sel));
+      return sel.split(',').reduce(function (all, s) {
+        s = s.trim();
+        var one = s === 'this' ? host : s.indexOf('closest ') === 0 ? elt.closest(s.slice(8))
+          : s.indexOf('find ') === 0 ? elt.querySelector(s.slice(5)) : null;
+        return all.concat(one ? [one] : /^(closest|find) /.test(s) ? [] : Array.from(document.querySelectorAll(s)));
+      }, []);
+    } catch (err) { return []; }
+  }
+  document.addEventListener('htmx:beforeSend', function (e) {
+    var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
+    var els = [e.target, ev && ev.submitter].filter(function (el) {
+      return el && el.matches && el.matches('[data-autumn-busy]');
+    }).concat(indicatorsOf(e.target).filter(function (el) { return el.matches('[data-autumn-busy]'); }));
+    if (els.length && d.target) els.push(d.target);
+    els = els.filter(function (el, i) {
+      return els.indexOf(el) === i && (busyCount.has(el) || !el.hasAttribute('aria-busy'));
+    });
+    els.forEach(function (el) {
+      busyCount.set(el, (busyCount.get(el) || 0) + 1);
+      el.setAttribute('aria-busy', 'true');
+    });
+    d.xhr.addEventListener('loadend', function () {
+      els.forEach(function (el) {
+        var n = busyCount.get(el) - 1;
+        if (n > 0) return busyCount.set(el, n);
+        busyCount.delete(el);
+        el.removeAttribute('aria-busy');
+      });
+    });
+  });
 
   // htmx puts the response's `class` back after afterSwap (its settle step).
   // That can drop the enhanced classes and move the tab highlight. Apply

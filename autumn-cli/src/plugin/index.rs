@@ -285,7 +285,7 @@ pub fn sanitize(text: &str) -> String {
 /// `is_display_reordering` (Unicode Cf, plus the full `Default_Ignorable_Code_Point`
 /// property), which autumn-web keeps private.
 #[must_use]
-pub fn is_unsafe_char(c: char) -> bool {
+pub const fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

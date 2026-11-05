@@ -2027,7 +2027,7 @@ mod tests {
     #[test]
     fn covering_window_anchors_on_first_mtime_at_or_after_anchor() {
         let dir = tempfile::tempdir().unwrap();
-        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000);
+        let base = SystemTime::UNIX_EPOCH + Duration::from_mins(50_000);
         // seg0@0, seg1@10, seg2@20, seg3@30
         touch_at(dir.path(), "seg0.mp4", base, 0);
         touch_at(dir.path(), "seg1.mp4", base, 10);

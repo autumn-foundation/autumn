@@ -1499,7 +1499,7 @@ pub mod unsubscribe {
         reason = "infallible: HMAC accepts any key length"
     )]
     fn derive_key(signing_key: &[u8]) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(signing_key)
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(signing_key)
             .expect("HMAC accepts any key length");
         mac.update(KEY_CONTEXT);
         let bytes = mac.finalize().into_bytes();
@@ -1576,7 +1576,8 @@ pub mod unsubscribe {
         if blob[0] != TOKEN_VERSION {
             return Err(TokenError::Malformed);
         }
-        let nonce = <&Nonce<_>>::from(&blob[1..=NONCE_LEN]);
+        let nonce =
+            <&Nonce<_>>::try_from(&blob[1..=NONCE_LEN]).map_err(|_| TokenError::Malformed)?;
         let ciphertext = &blob[1 + NONCE_LEN..];
         // Try the current key first, then any rotation-grace `previous` keys. A
         // wrong key (or any tampering) fails AES-GCM authentication.
@@ -5645,7 +5646,7 @@ mod tests {
         use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
         hasher.update(bytes);
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Extracts the random `multipart/mixed` boundary rendered by

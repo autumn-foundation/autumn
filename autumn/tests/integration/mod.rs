@@ -164,10 +164,17 @@ mod fake_generators;
 mod fault_injection;
 mod feature_flags_integration;
 mod feed;
+mod fleet_failover_guide;
+mod fleet_slot_guide;
 #[cfg(feature = "maud")]
 mod form_field_options;
 mod form_for_derive;
+mod form_native_inputs;
+#[cfg(feature = "maud")]
+mod form_otp_password;
+#[cfg(feature = "widgets-search")]
 mod form_search_widgets;
+mod form_select;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
 mod framework_retention;
@@ -274,6 +281,7 @@ mod model_field_attrs;
 mod model_votable;
 #[cfg(feature = "db")]
 mod money_ledger_postgres;
+mod named_roles;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -302,6 +310,8 @@ mod openapi;
 mod openapi_direction;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+// The `jwt` and `push` feature-off paths (default-on features).
+mod optional_jwt_and_push;
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 mod outbox_claim_profile;
 #[cfg(feature = "db")]
@@ -340,9 +350,11 @@ mod plugin_sandbox;
 // outbound HTTP, DB, jobs, render hooks, quotas and the audit surface.
 #[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
 mod plugin_sandbox_capabilities;
+#[cfg(feature = "push")]
 mod push_end_to_end;
+#[cfg(feature = "push")]
 mod push_router;
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "push"))]
 mod push_send_many_subscription_lookup_profile;
 mod query_count_asserts;
 mod query_structured;
@@ -360,6 +372,7 @@ mod raw_router_escape_hatch;
 mod read_your_writes_routing;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod ready_db_ping;
+mod route_groups;
 // `test-support` exposes the monitor-step hook the test drives; the Docker
 // sweep enables it, so the test still runs there.
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
@@ -408,6 +421,8 @@ mod ledger_postgres;
 // Ledger findings/fix harness for the generated `ledger_as_of`/`ledger_diff`
 // read path: profiles the unbounded full-chain read against a deep,
 // production-shaped chain and (after the fix) the bounded replacement.
+#[cfg(feature = "db")]
+mod db_prelude;
 #[cfg(feature = "db")]
 mod ledger_as_of_deep_chain_profile;
 #[cfg(feature = "db")]
@@ -552,6 +567,8 @@ mod stories_browser;
 #[cfg(feature = "system-tests")]
 mod system_test_api;
 #[cfg(feature = "db")]
+mod table_boundaries;
+#[cfg(feature = "db")]
 mod tenancy;
 mod tenancy_unit;
 mod tenant_bulkhead;
@@ -599,6 +616,8 @@ mod webmcp_browser;
 mod webmcp_shim;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
+#[cfg(feature = "maud")]
+mod widget_features;
 #[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
 mod widget_pack_browser;
 #[cfg(feature = "maud")]
@@ -609,18 +628,22 @@ mod widgets_alert;
 mod widgets_avatar;
 #[cfg(feature = "maud")]
 mod widgets_badge;
-#[cfg(feature = "maud")]
+#[cfg(feature = "widgets-charts")]
 mod widgets_charts;
+#[cfg(all(feature = "system-tests", feature = "maud", feature = "storage"))]
+mod widgets_direct_upload_browser;
 #[cfg(feature = "maud")]
 mod widgets_drawer;
 #[cfg(all(feature = "system-tests", feature = "maud"))]
 mod widgets_drawer_browser;
-#[cfg(feature = "maud")]
+#[cfg(feature = "widgets-social")]
 mod widgets_infinite_feed;
-#[cfg(all(feature = "system-tests", feature = "maud"))]
+#[cfg(all(feature = "system-tests", feature = "widgets-search"))]
 mod widgets_keyboard_browser;
 mod widgets_modal;
-#[cfg(feature = "maud")]
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_popover_browser;
+#[cfg(feature = "widgets-social")]
 mod widgets_reaction_controls;
 mod widgets_tabs;
 #[cfg(feature = "maud")]
@@ -629,6 +652,10 @@ mod widgets_theme_toggle;
 mod widgets_toast;
 #[cfg(all(feature = "system-tests", feature = "maud"))]
 mod widgets_toast_browser;
+#[cfg(feature = "maud")]
+mod widgets_tooltip;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_tooltip_browser;
 #[cfg(feature = "ws")]
 mod ws_integration;
 #[cfg(feature = "ws")]

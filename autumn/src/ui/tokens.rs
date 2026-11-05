@@ -346,6 +346,7 @@ mod tests {
             "--z-sticky",
             "--z-banner",
             "--z-toast",
+            "--z-tooltip",
             "--breakpoint-sm",
             "--breakpoint-md",
             "--breakpoint-lg",

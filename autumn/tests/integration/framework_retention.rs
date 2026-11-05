@@ -117,7 +117,7 @@ fn a_configured_window_is_used_when_no_subsystem_ttl_competes() {
     let mut config = AutumnConfig::default();
     config.retention.job_history = Some("90d".to_owned());
     let effective = effective_retention(&config, RetentionDataset::JobHistory);
-    assert_eq!(effective.window, Some(Duration::from_secs(90 * 86_400)));
+    assert_eq!(effective.window, Some(Duration::from_hours(90 * 24)));
     assert_eq!(effective.source, RetentionSource::RetentionSection);
 }
 
@@ -148,7 +148,7 @@ fn the_shorter_of_policy_and_job_tracking_ttl_wins() {
     let looser = effective_retention(&config, RetentionDataset::JobTracking);
     assert_eq!(
         looser.window,
-        Some(Duration::from_secs(86_400)),
+        Some(Duration::from_hours(24)),
         "a policy window longer than the subsystem TTL cannot extend retention"
     );
     assert_eq!(
@@ -169,7 +169,7 @@ fn the_shorter_of_policy_and_idempotency_ttl_wins() {
 
     config.retention.idempotency = Some("7d".to_owned());
     let looser = effective_retention(&config, RetentionDataset::Idempotency);
-    assert_eq!(looser.window, Some(Duration::from_secs(86_400)));
+    assert_eq!(looser.window, Some(Duration::from_hours(24)));
     assert_eq!(
         looser.source,
         RetentionSource::SubsystemTtl("idempotency.ttl_secs")
@@ -285,7 +285,7 @@ fn one_window_registers_a_fleet_coordinated_recurring_task() {
     );
     match task.schedule {
         autumn_web::task::Schedule::FixedDelay(delay) => {
-            assert_eq!(delay, Duration::from_secs(1_800));
+            assert_eq!(delay, Duration::from_mins(30));
         }
         autumn_web::task::Schedule::Cron { .. } => {
             panic!("the framework sweep runs on a fixed delay, not cron")

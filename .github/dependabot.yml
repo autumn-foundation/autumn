@@ -49,18 +49,22 @@ updates:
       - automated
 
   - package-ecosystem: github-actions
-    directory: /
+    # `/` covers .github/workflows. The local composite actions pin their own
+    # actions (kache-action in .github/actions/kache), so list them too.
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
       day: monday
     ignore:
       # dtolnay/rust-toolchain has no version tags of its own; its `@<ver>`
-      # ref picks which Rust toolchain CI installs. ci.yml's MSRV job and
-      # trybuild pre-install deliberately pin 1.88.0 (the workspace
-      # rust-version, checked by scripts/check-msrv.sh) and
-      # publish-gate.yml's SemVer check deliberately pins 1.94.1 (the
-      # aws-smithy MSRV floor; later toolchains ICE in cargo-semver-checks,
-      # per scripts/check-semver.sh). #2615 (1.88.0 -> 1.120.0) was
+      # ref picks which Rust toolchain CI installs. ci.yml's MSRV and
+      # windows-tier1 jobs pin the workspace rust-version (checked by
+      # scripts/check-msrv.sh). Other jobs pin .github/RUST_TOOLCHAIN.
+      # publish-gate.yml's SemVer check pins the toolchain that
+      # scripts/check-semver.sh names. That toolchain must not be below the
+      # MSRV. #2615 (1.88.0 -> 1.120.0) was
       # rehearsed on 2026-09-29/30: moving either pin breaks the lane it
       # exists to gate, not something a merge or a code fix can resolve.
       # CI's own stable toolchain is tracked separately by #3089's drift

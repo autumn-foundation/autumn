@@ -173,7 +173,14 @@ async fn focus(page: &Page, selector: &str) {
     );
 }
 
+/// The runtime reacts to the `toggle` event, which the browser queues as a
+/// task. Let it run before the test reads the page.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 async fn attr(page: &Page, selector: &str, name: &str) -> String {
+    settle().await;
     eval_string(
         page,
         &format!(
@@ -185,6 +192,7 @@ async fn attr(page: &Page, selector: &str, name: &str) -> String {
 }
 
 async fn active_id(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.id : ''",
@@ -193,6 +201,7 @@ async fn active_id(page: &Page) -> String {
 }
 
 async fn active_text(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.textContent.trim() : ''",
@@ -490,7 +499,82 @@ async fn keyboard_nav_bar() {
         press(&page, "Enter").await;
         wait_for(
             &page,
-            &format!("document.querySelector('{MENU}').offsetParent !== null"),
+            &format!("document.querySelector('{MENU}').matches(':popover-open')"),
+        )
+        .await;
+    })
+    .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_popover() {
+    const TRIGGER: &str = "#help-popover-trigger";
+    const PANEL: &str = "#help-popover";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/popover").await;
+
+    focus(&page, TRIGGER).await;
+    assert!(!shown(&page, PANEL).await, "closed at first");
+    press(&page, "Enter").await;
+    assert!(shown(&page, PANEL).await, "Enter opens the popover");
+    press(&page, "Escape").await;
+    assert!(!shown(&page, PANEL).await, "Escape closes the popover");
+    assert_eq!(
+        active_id(&page).await,
+        "help-popover-trigger",
+        "Escape returns focus to the trigger"
+    );
+
+    axe_in_both_schemes(&page, "open popover", || async {
+        focus(&page, TRIGGER).await;
+        press(&page, "Enter").await;
+        wait_for(
+            &page,
+            &format!("document.querySelector('{PANEL}').matches(':popover-open')"),
+        )
+        .await;
+    })
+    .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_dropdown_menu() {
+    const TRIGGER: &str = "#post-actions-trigger";
+    const MENU: &str = "#post-actions";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/dropdown-menu").await;
+
+    focus(&page, TRIGGER).await;
+    assert_eq!(attr(&page, TRIGGER, "aria-expanded").await, "false");
+    press(&page, "Enter").await;
+    assert_eq!(attr(&page, TRIGGER, "aria-expanded").await, "true");
+    assert_eq!(
+        active_text(&page).await,
+        "Edit",
+        "Enter focuses the first item"
+    );
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_text(&page).await, "Copy link");
+    press(&page, "End").await;
+    assert_eq!(active_text(&page).await, "Delete");
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_text(&page).await, "Edit", "ArrowDown wraps");
+    press(&page, "Escape").await;
+    assert!(!shown(&page, MENU).await, "Escape closes the menu");
+    assert_eq!(active_id(&page).await, "post-actions-trigger");
+
+    axe_in_both_schemes(&page, "open dropdown menu", || async {
+        focus(&page, TRIGGER).await;
+        press(&page, "Enter").await;
+        wait_for(
+            &page,
+            &format!("document.querySelector('{MENU}').matches(':popover-open')"),
         )
         .await;
     })
@@ -556,6 +640,98 @@ async fn keyboard_autocomplete() {
         .await;
     })
     .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_tags_input() {
+    const INPUT: &str = "#tag-list-query";
+    const VALUES: &str = "[...document.querySelectorAll('#tag-list-chips [data-ac-chip] \
+                          input[type=hidden]')].filter(i => !i.disabled).map(i => i.value).join()";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/tags-input").await;
+    assert_eq!(
+        eval_string(&page, VALUES).await,
+        "rust",
+        "the story pre-fills a chip"
+    );
+
+    // Pick an option with the keyboard.
+    page.fill(INPUT, "a").await.expect("type a query");
+    wait_for(
+        &page,
+        "document.querySelector('#tag-list-query').getAttribute('aria-expanded') === 'true'",
+    )
+    .await;
+    focus(&page, INPUT).await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    assert_eq!(eval_string(&page, VALUES).await, "rust,axum");
+    assert_eq!(active_id(&page).await, "tag-list-query");
+
+    // The "create" entry adds a new tag.
+    page.fill(INPUT, "zig").await.expect("type a new tag");
+    wait_for(
+        &page,
+        "document.querySelector('#tag-list-options [data-ac-create]') !== null",
+    )
+    .await;
+    focus(&page, INPUT).await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    assert_eq!(eval_string(&page, VALUES).await, "rust,axum,zig");
+
+    // Backspace removes the last chip. ArrowLeft goes to the chips.
+    press(&page, "Backspace").await;
+    assert_eq!(eval_string(&page, VALUES).await, "rust,axum");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.activeElement.getAttribute('aria-label') || ''"
+        )
+        .await,
+        "Remove axum"
+    );
+    press(&page, "Delete").await;
+    assert_eq!(eval_string(&page, VALUES).await, "rust");
+
+    // Pointer removal.
+    page.click("#tag-list-chips [data-ac-chip-remove]")
+        .await
+        .expect("click remove");
+    assert_eq!(eval_string(&page, VALUES).await, "");
+    assert_eq!(active_id(&page).await, "tag-list-query");
+
+    // A chip and a popup with options for the axe check.
+    page.fill(INPUT, "web").await.expect("type");
+    wait_for(
+        &page,
+        "document.querySelector('#tag-list-query').getAttribute('aria-expanded') === 'true'",
+    )
+    .await;
+    focus(&page, INPUT).await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    page.fill(INPUT, "r").await.expect("type");
+    wait_for(
+        &page,
+        "document.querySelectorAll('#tag-list-options [role=option]').length > 0",
+    )
+    .await;
+    axe_in_both_schemes(&page, "tags input with chips and an open popup", || async {
+        focus(&page, INPUT).await;
+        press(&page, "ArrowDown").await;
+        wait_for(
+            &page,
+            "document.querySelector('#tag-list-query').getAttribute('aria-expanded') === 'true'",
+        )
+        .await;
+    })
+    .await;
+    assert_eq!(eval_string(&page, VALUES).await, "web");
     page.expect_no_console_errors().await.expect("no errors");
 }
 
@@ -774,6 +950,379 @@ async fn keyboard_accordion() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
+/// Native choice controls (#3405): no script, only the browser keys.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_choice_controls() {
+    let checked = |sel: &str| format!("document.querySelector({sel:?}).checked");
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/choice-controls").await;
+
+    // Space toggles the switch.
+    assert!(
+        eval_bool(&page, &checked("#alerts")).await,
+        "the switch starts on"
+    );
+    focus(&page, "#alerts").await;
+    press(&page, " ").await;
+    settle().await;
+    assert!(
+        !eval_bool(&page, &checked("#alerts")).await,
+        "Space turns the switch off"
+    );
+
+    // The arrow keys move the radio selection.
+    focus(&page, "#plan-1").await;
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_id(&page).await, "plan-2");
+    assert!(
+        eval_bool(&page, &checked("#plan-2")).await,
+        "ArrowDown selects the next radio"
+    );
+
+    // A segment radio is visually hidden, but it takes focus and the arrow
+    // keys. Its label shows the focus ring.
+    focus(&page, "#view-1").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "view-2");
+    assert!(
+        eval_bool(&page, &checked("#view-2")).await,
+        "ArrowRight selects the next segment"
+    );
+    assert!(
+        eval_bool(
+            &page,
+            "document.querySelector('#view-2').matches(':focus-visible')"
+        )
+        .await,
+        "a keyboard move makes the segment radio :focus-visible"
+    );
+    assert_eq!(
+        eval_string(
+            &page,
+            "getComputedStyle(document.querySelector('label[for=view-2]')).outlineStyle",
+        )
+        .await,
+        "solid",
+        "the focused segment shows a focus ring"
+    );
+
+    // Space checks a box of the checkbox group.
+    focus(&page, "#topics-1").await;
+    press(&page, " ").await;
+    settle().await;
+    assert!(
+        eval_bool(&page, &checked("#topics-1")).await,
+        "Space checks a box"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// Password and one-time code (#3412): a paste fills the one OTP input,
+/// and the reveal button toggles the password from the keyboard.
+#[allow(clippy::too_many_lines, reason = "one flow over the story page")]
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_sign_in_inputs() {
+    const REVEAL: &str = "[data-autumn-reveal][aria-controls=current]";
+    let value = |sel: &str| format!("document.querySelector({sel:?}).value");
+    let prop = |sel: &str, name: &str| format!("String(document.querySelector({sel:?}).{name})");
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/sign-in-inputs").await;
+
+    // The runtime removes the no-JS `maxlength`, so a paste is not cut.
+    assert_eq!(attr(&page, "#code", "maxlength").await, "");
+    // A paste fills the one input. The runtime keeps only the digits. A
+    // listener on the input (an htmx trigger) already reads the digits.
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { const i = document.querySelector('#code'); \
+             i.addEventListener('input', () => { window.__seen = i.value; }); return true; })()",
+        )
+        .await
+    );
+    focus(&page, "#code").await;
+    page.paste("123-456").await.expect("paste");
+    assert_eq!(eval_string(&page, &value("#code")).await, "123456");
+    assert_eq!(eval_string(&page, "String(window.__seen)").await, "123456");
+    assert!(
+        eval_bool(&page, "document.querySelector('#code').validity.valid").await,
+        "the pasted code matches the pattern"
+    );
+    // A longer paste is cut to the length.
+    page.fill("#code", "").await.expect("clear");
+    page.paste("Your code is 987654 (valid 5 min)")
+        .await
+        .expect("paste");
+    assert_eq!(eval_string(&page, &value("#code")).await, "987654");
+    // Full-width digits become ASCII digits.
+    page.fill("#code", "").await.expect("clear");
+    page.paste("１２３４５６").await.expect("paste");
+    assert_eq!(eval_string(&page, &value("#code")).await, "123456");
+    // An IME entry is formatted once, when the composition ends.
+    assert_eq!(
+        eval_string(
+            &page,
+            "(() => { const i = document.querySelector('#code'); i.value = '12a'; \
+             i.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: true })); \
+             const during = i.value; \
+             i.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true })); \
+             return during + '|' + i.value; })()",
+        )
+        .await,
+        "12a|12"
+    );
+
+    // A grouped code shows a space between groups and the separator cell.
+    focus(&page, "#backup").await;
+    page.paste("1234 5678").await.expect("paste");
+    assert_eq!(eval_string(&page, &value("#backup")).await, "1234 5678");
+    assert_eq!(
+        eval_string(&page, &prop("#backup", "pattern")).await,
+        "[0-9]{4} [0-9]{4}"
+    );
+    assert!(
+        eval_bool(&page, "document.querySelector('#backup').validity.valid").await,
+        "the grouped code matches the grouped pattern"
+    );
+    assert!(
+        shown(&page, "#backup-field .autumn-otp__sep").await,
+        "the runtime shows the separator"
+    );
+    // The form data has the digits only.
+    assert_eq!(
+        eval_string(
+            &page,
+            "(() => { const f = document.createElement('form'); f.id = 'probe'; \
+             document.body.append(f); const i = document.querySelector('#backup'); \
+             i.setAttribute('form', 'probe'); const v = new FormData(f).get('backup'); \
+             i.removeAttribute('form'); f.remove(); return v; })()",
+        )
+        .await,
+        "12345678"
+    );
+    // An app pattern wins: the runtime does not group that code.
+    assert_eq!(
+        eval_string(
+            &page,
+            "(() => { const d = document.createElement('div'); \
+             d.innerHTML = '<input id=\"own\" data-autumn-otp=\"6\" data-autumn-otp-group=\"3\" pattern=\"[1-9][0-9]{5}\">'; \
+             document.body.append(d); \
+             d.dispatchEvent(new CustomEvent('htmx:afterSwap', { bubbles: true })); \
+             const i = d.querySelector('input'); i.value = '123456'; \
+             i.dispatchEvent(new InputEvent('input', { bubbles: true })); \
+             const out = i.pattern + '|' + i.value + '|' + i.hasAttribute('data-autumn-otp-grouped'); \
+             d.remove(); return out; })()",
+        )
+        .await,
+        "[1-9][0-9]{5}|123456|false"
+    );
+    // Backspace after a group space deletes the digit before the space.
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { const i = document.querySelector('#backup'); i.focus(); \
+             i.setSelectionRange(5, 5); return document.activeElement === i; })()",
+        )
+        .await
+    );
+    press(&page, "Backspace").await;
+    assert_eq!(eval_string(&page, &value("#backup")).await, "1235 678");
+
+    // The runtime shows the reveal button. It toggles the input type.
+    wait_for(
+        &page,
+        &format!("!document.querySelector({REVEAL:?}).hidden"),
+    )
+    .await;
+    assert_eq!(
+        eval_string(&page, &prop("#current", "type")).await,
+        "password"
+    );
+    focus(&page, REVEAL).await;
+    press(&page, "Enter").await;
+    assert_eq!(eval_string(&page, &prop("#current", "type")).await, "text");
+    assert_eq!(attr(&page, REVEAL, "aria-pressed").await, "true");
+    assert_eq!(
+        active_text(&page).await,
+        "Show password",
+        "focus stays on the button and its label does not change"
+    );
+    press(&page, " ").await;
+    assert_eq!(
+        eval_string(&page, &prop("#current", "type")).await,
+        "password"
+    );
+    assert_eq!(attr(&page, REVEAL, "aria-pressed").await, "false");
+
+    // A real submit of the form with the password, a reset, a page hide and
+    // an htmx history snapshot hide the password again.
+    let in_form = |run: &str| {
+        format!(
+            "(() => {{ const field = document.querySelector('#current-field'); \
+             const f = document.createElement('form'); \
+             f.addEventListener('submit', e => e.preventDefault()); \
+             field.before(f); f.append(field); f.{run}; \
+             f.before(field); f.remove(); }})()"
+        )
+    };
+    for event in [
+        in_form("requestSubmit()"),
+        in_form("reset()"),
+        "window.dispatchEvent(new Event('pagehide'))".to_owned(),
+        "document.dispatchEvent(new Event('htmx:beforeHistorySave'))".to_owned(),
+    ] {
+        // A moved field loses focus, so focus the button again.
+        focus(&page, REVEAL).await;
+        press(&page, "Enter").await;
+        assert_eq!(eval_string(&page, &prop("#current", "type")).await, "text");
+        page.evaluate(event.as_str()).await.expect("dispatch");
+        assert_eq!(
+            eval_string(&page, &prop("#current", "type")).await,
+            "password",
+            "after `{event}`"
+        );
+        assert_eq!(attr(&page, REVEAL, "aria-pressed").await, "false");
+    }
+
+    // The strength hint follows the typed password.
+    assert!(
+        attr(&page, "#fresh", "aria-describedby")
+            .await
+            .contains("fresh-strength")
+    );
+    page.fill("#fresh", "abc").await.expect("fill");
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#fresh-strength').textContent"
+        )
+        .await,
+        "Strength: weak"
+    );
+    // One kind of character does not score Strong.
+    page.fill("#fresh", "aaaaaaaaaaaaaaaa").await.expect("fill");
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#fresh-strength').textContent"
+        )
+        .await,
+        "Strength: fair"
+    );
+    page.fill("#fresh", "Correct-Horse-9").await.expect("fill");
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#fresh-strength').textContent"
+        )
+        .await,
+        "Strength: strong"
+    );
+    assert_eq!(
+        attr(&page, "#fresh-strength", "data-autumn-strength-level").await,
+        "3"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+
+    // Without the script, the reveal button stays hidden.
+    let plain = runner.page().await.expect("page");
+    plain.set_javascript_enabled(false).await.expect("no JS");
+    plain
+        .visit("/_stories/sign-in-inputs")
+        .await
+        .expect("visit");
+    wait_for(&plain, "document.readyState === 'complete'").await;
+    assert!(
+        eval_bool(
+            &plain,
+            &format!("document.querySelector({REVEAL:?}).hidden")
+        )
+        .await,
+        "the reveal button is hidden without JS"
+    );
+}
+
+/// Select (#3409): the native `<select>`, with no script. Only the
+/// opted-in single select gets `appearance: base-select`.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_select() {
+    const OPEN: &str = "document.querySelector('#plan').matches(':open')";
+    let appearance =
+        |sel: &str| format!("getComputedStyle(document.querySelector({sel:?})).appearance");
+    let value = |sel: &str| format!("document.querySelector({sel:?}).value");
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/select").await;
+
+    // The fallback and the multiple select keep the native control.
+    for sel in ["#plan_native", "#tags"] {
+        assert_ne!(
+            eval_string(&page, &appearance(sel)).await,
+            "base-select",
+            "{sel} keeps the native control"
+        );
+    }
+    let supported = eval_bool(&page, "CSS.supports('appearance', 'base-select')").await;
+    if !supported {
+        page.expect_no_console_errors().await.expect("no errors");
+        return;
+    }
+    for sel in ["#plan", "#city"] {
+        assert_eq!(
+            eval_string(&page, &appearance(sel)).await,
+            "base-select",
+            "{sel} is styled"
+        );
+    }
+
+    // Enter opens the picker on Linux and Windows. The browser gate runs
+    // on Linux. The open picker passes axe in both schemes.
+    axe_in_both_schemes(&page, "open select picker", || async {
+        focus(&page, "#plan").await;
+        press(&page, "Enter").await;
+        wait_for(&page, OPEN).await;
+    })
+    .await;
+
+    // Escape closes the picker and keeps the value.
+    focus(&page, "#plan").await;
+    press(&page, "Enter").await;
+    wait_for(&page, OPEN).await;
+    press(&page, "Escape").await;
+    wait_for(&page, &format!("!{OPEN}")).await;
+    assert_eq!(eval_string(&page, &value("#plan")).await, "pro");
+    assert_eq!(
+        active_id(&page).await,
+        "plan",
+        "focus goes back to the select"
+    );
+
+    // ArrowDown on the closed select opens the picker. The value stays.
+    press(&page, "ArrowDown").await;
+    wait_for(&page, OPEN).await;
+    assert_eq!(eval_string(&page, &value("#plan")).await, "pro");
+    press(&page, "Escape").await;
+    wait_for(&page, &format!("!{OPEN}")).await;
+
+    // In the picker, ArrowDown moves to the next option. Enter chooses it.
+    press(&page, "Enter").await;
+    wait_for(&page, OPEN).await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    wait_for(&page, &format!("!{OPEN}")).await;
+    assert_eq!(
+        eval_string(&page, &value("#plan")).await,
+        "team",
+        "the keyboard chooses the next option"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn keyboard_toast() {
@@ -820,5 +1369,240 @@ async fn keyboard_toast() {
         .await,
         "Report export started"
     );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// Focus the tab stop before `selector`, then press Tab: a keyboard focus.
+async fn tab_to(page: &Page, selector: &str) {
+    assert!(
+        eval_bool(
+            page,
+            &format!(
+                "(() => {{ const t = document.querySelector({selector:?}); \
+                 const all = [...document.querySelectorAll('a[href],button,input,select,textarea,[tabindex]')] \
+                   .filter(e => e.tabIndex >= 0 && !e.disabled && e.getClientRects().length); \
+                 const i = all.indexOf(t); if (i < 1) return false; \
+                 all[i - 1].focus(); return true; }})()"
+            ),
+        )
+        .await,
+        "no tab stop before {selector}"
+    );
+    press(page, "Tab").await;
+    assert!(
+        eval_bool(
+            page,
+            &format!("document.activeElement.matches({selector:?})")
+        )
+        .await,
+        "Tab does not reach {selector}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_tooltip() {
+    const TRIGGER: &str = "[data-autumn-tooltip] button[aria-describedby]";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/tooltip").await;
+
+    let tip = attr(&page, TRIGGER, "aria-describedby").await;
+    let bubble = format!("#{tip}");
+    let visible = format!(
+        "(() => {{ const s = getComputedStyle(document.getElementById({tip:?})); \
+         return s.display !== 'none' && s.visibility === 'visible'; }})()"
+    );
+    assert_eq!(attr(&page, &bubble, "role").await, "tooltip");
+    assert!(!eval_bool(&page, &visible).await, "hidden at rest");
+    tab_to(&page, TRIGGER).await;
+    wait_for(&page, &visible).await;
+    press(&page, "Escape").await;
+    wait_for(&page, &format!("!{visible}")).await;
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.activeElement.matches({TRIGGER:?})")
+        )
+        .await,
+        "focus stays on the trigger"
+    );
+
+    // A new focus shows the text again. axe checks it in both schemes.
+    axe_in_both_schemes(&page, "shown tooltip", || async {
+        tab_to(&page, TRIGGER).await;
+        wait_for(&page, &visible).await;
+        wait_for(&page, "document.getAnimations().length === 0").await;
+    })
+    .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// The file inputs are in the Tab order, and the script adds no trap. A
+/// visible label names each input. The hint shows because the script ran.
+#[cfg(feature = "storage")]
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_direct_upload() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/direct-upload").await;
+    wait_for(
+        &page,
+        "document.querySelector('[data-autumn-upload-hint]') && \
+         !document.querySelector('[data-autumn-upload-hint]').hidden",
+    )
+    .await;
+    focus(&page, "#upload-cover_image").await;
+    assert!(
+        eval_bool(
+            &page,
+            "document.activeElement.labels[0].textContent === 'Cover image'"
+        )
+        .await,
+        "a visible label names the input"
+    );
+    // Tab leaves the first field and reaches the second.
+    press(&page, "Tab").await;
+    assert!(
+        eval_bool(&page, "document.activeElement.id === 'upload-attachments'").await,
+        "Tab reaches the next upload field"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// The busy state (#3406). Enter sends the htmx request. While it runs, the
+/// button has `aria-busy="true"` and shows its spinner. The label is
+/// transparent, not removed, so it stays the name. After the response,
+/// `aria-busy` goes and focus stays on the button.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_button() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/button").await;
+    // The button sends the request, then it submits the form that sends it.
+    for (button, status) in [
+        ("story-save", "story-save-status"),
+        ("story-publish", "story-publish-status"),
+    ] {
+        check_busy_button(&page, button, status).await;
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// Press Enter on `#button` and check the busy state while the request
+/// runs: the button and the swap target have `aria-busy="true"`, the
+/// spinner shows, and the label is transparent but keeps its text. After
+/// the response, `aria-busy` goes and focus stays on the button.
+///
+/// `Page::press` waits for htmx to settle, so the test cannot read the page
+/// during the request. A `MutationObserver` in the page records the busy
+/// state when it happens.
+async fn check_busy_button(page: &Page, button: &str, status: &str) {
+    let state = |busy: bool| {
+        format!(
+            "(() => {{ const b = document.getElementById({button:?}); \
+             const s = document.getElementById({status:?}); \
+             const spin = getComputedStyle(b.querySelector('.autumn-button__spinner')).display; \
+             const label = b.querySelector('.autumn-button__label'); \
+             return {busy} \
+               ? b.getAttribute('aria-busy') === 'true' && s.getAttribute('aria-busy') === 'true' \
+                 && spin === 'block' && getComputedStyle(label).opacity === '0' \
+                 && label.textContent === b.id.replace('story-', '').replace(/^./, c => c.toUpperCase()) \
+               : !b.hasAttribute('aria-busy') && !s.hasAttribute('aria-busy') && spin === 'none'; }})()"
+        )
+    };
+    assert!(
+        eval_bool(page, &state(false)).await,
+        "#{button} is busy at rest"
+    );
+    assert!(
+        eval_bool(
+            page,
+            &format!(
+                "(() => {{ window.__busySeen = false; \
+                 const check = () => {{ if ({}) window.__busySeen = true; }}; \
+                 new MutationObserver(check).observe(document.body, \
+                   {{ attributes: true, subtree: true, attributeFilter: ['aria-busy', 'class'] }}); \
+                 return true; }})()",
+                state(true)
+            ),
+        )
+        .await,
+        "could not watch #{button}"
+    );
+    focus(page, &format!("#{button}")).await;
+    press(page, "Enter").await;
+    wait_for(
+        page,
+        &format!("document.getElementById({status:?}).textContent.includes('Saved.')"),
+    )
+    .await;
+    assert!(
+        eval_bool(page, "window.__busySeen === true").await,
+        "#{button} never showed the busy state during the request"
+    );
+    wait_for(page, &state(false)).await;
+    assert_eq!(active_id(page).await, button, "focus left #{button}");
+}
+
+/// An `hx-indicator` skeleton or spinner (#3406) is hidden at rest, shows
+/// while the request runs, and hides again after the response.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn display_set_indicators_show_only_during_a_request() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for (path, trigger, indicator, result) in [
+        (
+            "/_stories/skeleton",
+            "Reload",
+            "#story-skeleton",
+            "#story-skeleton-result",
+        ),
+        (
+            "/_stories/spinner",
+            "Load",
+            "#story-spinner",
+            "#story-spinner-status",
+        ),
+    ] {
+        // A spinner indicator keeps its root. Its content shows and hides.
+        let indicator = &if indicator.contains("spinner") {
+            format!("{indicator} > :first-child")
+        } else {
+            indicator.to_owned()
+        };
+        open(&page, path).await;
+        assert!(!shown(&page, indicator).await, "{indicator} shows at rest");
+        assert!(
+            eval_bool(
+                &page,
+                &format!(
+                    "(() => {{ const b = Array.from(document.querySelectorAll('.autumn-button')) \
+                     .find(b => b.textContent.trim() === {trigger:?}); \
+                     if (!b) return false; b.click(); return true; }})()"
+                ),
+            )
+            .await,
+            "no {trigger} button on {path}"
+        );
+        wait_for(
+            &page,
+            &format!("getComputedStyle(document.querySelector({indicator:?})).display !== 'none'"),
+        )
+        .await;
+        wait_for(
+            &page,
+            &format!("document.querySelector({result:?}).textContent.includes('Saved.')"),
+        )
+        .await;
+        wait_for(
+            &page,
+            &format!("getComputedStyle(document.querySelector({indicator:?})).display === 'none'"),
+        )
+        .await;
+    }
     page.expect_no_console_errors().await.expect("no errors");
 }

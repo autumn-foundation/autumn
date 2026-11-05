@@ -357,19 +357,74 @@ exposed on `AppState` as the same value the framework used to gate its own
 workers, so self-gate app-owned loops instead of re-reading `AUTUMN_ROLE`:
 
 ```rust
-use autumn_web::{AppState, ProcessRole};
+use autumn_web::AppState;
 
-// on_startup hook: only start the embedded loop where workers run.
-if state.role().runs_workers() {
+// on_startup hook: only start the embedded loop where job workers run.
+if state.capabilities().job_workers {
     tokio::spawn(my_embedded_worker(state.clone()));
 }
 ```
 
-`state.role()` returns a `ProcessRole` with `serves_http()` / `runs_workers()`
-predicates; see
+`state.capabilities()` returns the `RoleCapabilities` the process resolved at
+boot, one field for each framework subsystem. `/actuator/info` shows the same
+set. See [Role capabilities](jobs.md#role-capabilities) and
 [Self-gating app-owned background work](jobs.md#self-gating-app-owned-background-work).
-Custom/named roles are unsupported today — for finer placement use per-queue
-worker pinning (#1623) plus app-level `state.role()` gating.
+
+### Named tiers
+
+For more than two tiers, declare each tier once as a `[roles.<name>]` preset in
+`autumn.toml`. Each Deployment then sets only `AUTUMN_ROLE=<name>`:
+
+```toml
+[jobs]
+backend = "postgres"
+
+[roles.critical]
+base = "worker"
+pin = ["critical"]
+scheduler = false
+
+[roles.bulk]
+base = "worker"
+pin = ["bulk", "default"]
+scheduler = false
+
+[roles.cron]
+base = "worker"
+pin = []          # no job workers
+scheduler = true
+```
+
+```yaml
+  worker-critical:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: critical
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+```
+
+- The base (`combined`, `web` or `worker`) is the safety contract. A preset can
+  only turn a capability off. The durable-backend check reads the base.
+  A `combined` preset with no job workers counts as `web`.
+- `state.role().name()` is `"critical"`. `state.role().base()` is
+  `ProcessRole::Worker`.
+- `/actuator/info`, `/actuator/jobs`, a `role` metric label and the default
+  scheduler `replica_id` show the name.
+- `autumn doctor --strict` derives the fleet coverage from the presets. You do
+  not declare the tiers a second time in `[jobs.fleet]`. The derived list has
+  only the presets. If a tier runs as a plain built-in role, declare it as a
+  preset or set `[jobs.fleet] tiers`.
+- An undeclared name stops the boot.
+
+See [Named roles](jobs.md#named-roles) for every key and rule.
+
+### Route groups on HTTP tiers
+
+A preset over `web` or `combined` can serve only some route groups. Set
+`mount = ["marketing"]`. One image then runs a `marketing` role and a
+`service` role. Probes and the actuator stay on every role. See
+[Route groups and per-role mounting](route-groups.md) for a worked example on
+Fly `[processes]` and on two Kubernetes Deployments.
 
 ## Migration Jobs
 
@@ -736,7 +791,7 @@ autumn_web::app()
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-cache-redis = "0.9"
+autumn-cache-redis = "0.10"
 ```
 
 `CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the

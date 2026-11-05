@@ -1333,6 +1333,22 @@ mod tests {
         sql_candidate_symbols(&stream)
     }
 
+    /// A boundary check needs every joined table, not only the `FROM` table
+    /// (#3549).
+    #[test]
+    fn every_joined_table_is_a_candidate() {
+        let symbols = sql_symbols(
+            "\"SELECT c.id FROM campaigns c INNER JOIN contacts ct ON ct.id = c.contact_id \
+             LEFT OUTER JOIN deals d ON d.contact_id = ct.id\"",
+        );
+        for table in ["campaigns", "contacts", "deals"] {
+            assert!(
+                symbols.contains(&table.to_owned()),
+                "{table} missing: {symbols:?}"
+            );
+        }
+    }
+
     /// A comment above the statement is ordinary SQL style. Reading the verb off
     /// the comment's first word loses the shape, and with it every table symbol
     /// and the mutation evidence — a dropped edge, which is the one failure this

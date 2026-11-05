@@ -284,7 +284,7 @@ fn run_inner(
         project_name: name,
         crate_name: &crate_name,
         autumn_version: env!("CARGO_PKG_VERSION"),
-        rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        rust_version: crate::MSRV,
     };
 
     println!("\nCreating `{name}`:");
@@ -491,7 +491,7 @@ mod tests {
             project_name: "app",
             crate_name: &crate_name,
             autumn_version: env!("CARGO_PKG_VERSION"),
-            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+            rust_version: crate::MSRV,
         };
         scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
         assert!(dest.join("Cargo.toml").is_file());
@@ -574,7 +574,7 @@ mod tests {
             project_name: "acme-app",
             crate_name: &crate_name,
             autumn_version: env!("CARGO_PKG_VERSION"),
-            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+            rust_version: crate::MSRV,
         };
         scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
 
@@ -645,7 +645,7 @@ mod tests {
             project_name,
             crate_name: &crate_name,
             autumn_version: env!("CARGO_PKG_VERSION"),
-            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+            rust_version: crate::MSRV,
         };
         scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
 
@@ -734,7 +734,7 @@ mod tests {
             project_name: "acme-site",
             crate_name: "acme_site",
             autumn_version: env!("CARGO_PKG_VERSION"),
-            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+            rust_version: crate::MSRV,
         };
         scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
 

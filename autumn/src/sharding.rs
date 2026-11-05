@@ -1215,6 +1215,22 @@ impl ShardSet {
             .sum()
     }
 
+    /// The databases that this set opens: one per configured pool, or
+    /// `max_open` for a fleet. A fleet burst opens more. The boot warning
+    /// uses this count for the `SQLite` open-file estimate.
+    #[must_use]
+    pub fn total_databases(&self) -> usize {
+        #[cfg(feature = "sqlite")]
+        if let Some(backing) = &self.inner.fleet {
+            return backing.fleet.max_open();
+        }
+        self.inner
+            .shards
+            .iter()
+            .map(|shard| 1 + usize::from(shard.topology().replica().is_some()))
+            .sum()
+    }
+
     /// Whether `key` is owned by the shard at the given index in declaration order.
     ///
     /// Uses the hash-based slot assignment, **not** the installed router (which
@@ -3545,6 +3561,59 @@ mod tests {
             .expect("configured");
         // a primary (7) + b primary (7).
         assert_eq!(set.total_max_connections(), 14);
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn total_databases_counts_every_pool() {
+        let mut config = sharded_config(&["a", "b"]);
+        config.shards[1].replica_url = Some("postgres://localhost/b_ro".to_owned());
+        let set = create_shard_set(&config, Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        // a primary + b primary + b replica.
+        assert_eq!(set.total_databases(), 3);
+    }
+
+    #[test]
+    fn total_databases_counts_every_primary() {
+        let set = create_shard_set(&sharded_config(&["a", "b"]), Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        assert_eq!(set.total_databases(), 2);
+    }
+
+    // A fleet opens `max_open` databases, not one per shard.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_fleet_counts_max_open_databases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fleet = crate::db::fleet::DatabaseFleet::builder(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: tmp.path().display().to_string(),
+            path: None,
+            max_open: 64,
+            pool_size: 2,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+        })
+        .build()
+        .expect("fleet builds");
+        let control = crate::db::create_pool(&crate::config::DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        })
+        .expect("control pool builds")
+        .expect("url configured");
+        let set = ShardSet::from_fleet(fleet, control);
+        assert_eq!(set.total_databases(), 64);
+        assert_eq!(set.total_max_connections(), 128);
     }
 
     // ── ShardRepositorySeed (#1273) ─────────────────────────────────────

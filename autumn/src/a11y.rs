@@ -196,7 +196,7 @@ pub enum ButtonType {
 }
 
 impl ButtonType {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Button => "button",
             Self::Submit => "submit",
@@ -1056,6 +1056,7 @@ pub struct TextArea<State> {
     maxlength: Option<u32>,
     rows: Option<u32>,
     cols: Option<u32>,
+    auto_grow: bool,
     hx: Vec<(String, String)>,
     label: Option<LabelSource>,
     _state: std::marker::PhantomData<State>,
@@ -1078,6 +1079,7 @@ impl TextArea<NoLabel> {
             maxlength: None,
             rows: None,
             cols: None,
+            auto_grow: false,
             hx: Vec::new(),
             label: None,
             _state: std::marker::PhantomData,
@@ -1128,6 +1130,7 @@ impl TextArea<NoLabel> {
             maxlength: self.maxlength,
             rows: self.rows,
             cols: self.cols,
+            auto_grow: self.auto_grow,
             hx: self.hx,
             label: Some(label),
             _state: std::marker::PhantomData,
@@ -1220,6 +1223,15 @@ impl<State> TextArea<State> {
         self
     }
 
+    /// Let the text area grow with its text (`field-sizing: content`). It
+    /// gets the `autumn-auto-grow` class. A browser with no `field-sizing`
+    /// keeps the fixed height.
+    #[must_use]
+    pub const fn auto_grow(mut self) -> Self {
+        self.auto_grow = true;
+        self
+    }
+
     /// Attach an arbitrary `hx-*` attribute (the `name` is the suffix after
     /// `hx-`), preserving the typed label obligation. Emitted in insertion
     /// order. Available before or after a label is attached.
@@ -1234,13 +1246,18 @@ impl Render for TextArea<Labeled> {
     fn render(&self) -> Markup {
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
             label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
+        let class = match (self.class.as_deref(), self.auto_grow) {
+            (Some(class), true) => Some(format!("{class} autumn-auto-grow")),
+            (None, true) => Some("autumn-auto-grow".to_owned()),
+            (class, false) => class.map(str::to_owned),
+        };
         let textarea = html! {
             textarea
                 id=(self.name)
                 name=(self.name)
                 aria-label=[aria_label]
                 aria-labelledby=[aria_labelledby]
-                class=[self.class.as_deref()]
+                class=[class]
                 minlength=[self.minlength]
                 maxlength=[self.maxlength]
                 rows=[self.rows]
@@ -1718,12 +1735,9 @@ impl Render for Checkbox<Labeled> {
 /// [`labelled_by`](FileField::labelled_by) consumes it and returns a
 /// `FileField<Labeled>`, the only state that implements [`maud::Render`].
 ///
-/// This is the typed, explicitly-labeled file input planned in issue #1933. It
-/// resolves the accessible-name caveat of the older
-/// `storage::form_helper::direct_upload_input` helper, whose *derived*
-/// `aria-label` takes ARIA precedence over a caller's visible `<label>`: with a
-/// visible label a `FileField` emits **no** competing `aria-label`, so the
-/// caller's `<label for=…>` is the control's accessible name.
+/// This is the typed, explicitly-labeled file input planned in issue #1933.
+/// With a visible label a `FileField` emits **no** competing `aria-label`, so
+/// the caller's `<label for=…>` is the control's accessible name.
 ///
 /// A file input has no repopulate-on-error value (a browser will not let markup
 /// pre-fill a file control), so `FileField` deliberately carries no `value`.
@@ -1888,8 +1902,7 @@ impl Render for FileField<Labeled> {
     fn render(&self) -> Markup {
         // With a visible label we deliberately emit NO `aria-label`: the
         // `<label for=…>` is the caller-controlled accessible name. This is the
-        // fix for the `direct_upload_input` derived-aria-label precedence caveat
-        // (issue #1933).
+        // fix for the derived-aria-label precedence caveat (issue #1933).
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
             label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let input = html! {
@@ -2331,6 +2344,27 @@ impl Render for RadioGroup<Labeled> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3406: `auto_grow` adds the class, before or after a label,
+    /// and keeps the caller class.
+    #[test]
+    fn text_area_auto_grow_adds_the_class() {
+        let html = TextArea::new("bio")
+            .auto_grow()
+            .label("Bio")
+            .render()
+            .into_string();
+        assert!(html.contains(r#"class="autumn-auto-grow""#), "{html}");
+        let html = TextArea::new("bio")
+            .label("Bio")
+            .class("wide")
+            .auto_grow()
+            .render()
+            .into_string();
+        assert!(html.contains(r#"class="wide autumn-auto-grow""#), "{html}");
+        let html = TextArea::new("bio").label("Bio").render().into_string();
+        assert!(!html.contains("autumn-auto-grow"), "{html}");
+    }
 
     #[test]
     fn img_new_requires_and_renders_alt() {

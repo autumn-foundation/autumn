@@ -11,6 +11,8 @@ name = "bench-loco"
 path = "src/main.rs"
 
 [dependencies]
+# Held at loco-rs 0.14 and sea-orm 1 (1.2 and 2 exist): a frozen third-party
+# benchmark baseline. The Docker image uses the same Rust as the Autumn image.
 loco-rs = { version = "0.14", features = ["with-db"] }
 sea-orm = { version = "1", features = [
     "sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono"

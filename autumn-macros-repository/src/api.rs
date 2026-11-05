@@ -974,6 +974,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                 seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
+                group: ::core::option::Option::None,
             }
         }
 
@@ -1033,6 +1034,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                 seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
+                group: ::core::option::Option::None,
             }
         }
 
@@ -1092,6 +1094,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                 seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
+                group: ::core::option::Option::None,
             }
         }
 
@@ -1153,6 +1156,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                 seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
+                group: ::core::option::Option::None,
             }
         }
 
@@ -1195,6 +1199,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
                 seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
+                group: ::core::option::Option::None,
             }
         }
 

@@ -81,6 +81,10 @@ set.
 | `token:Uuid`      | `uuid::Uuid`                    | `Uuid`             | `UUID`              |
 | `at:NaiveDateTime`| `chrono::NaiveDateTime`         | `Timestamp`        | `TIMESTAMP`         |
 | `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
+| `opens:time` *(or `NaiveTime`)* | `chrono::NaiveTime` | `Time`         | `TIME`              |
+| `mobile:phone` *(or `tel`)* | `String`              | `Text`             | `TEXT`              |
+| `accent:color`    | `String` (`#rrggbb`)            | `Text`             | `TEXT`              |
+| `price:money`     | `rust_decimal::Decimal`         | `Numeric`          | `NUMERIC(12,2)`     |
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
 | `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 | `slug:slug{from:title}` | `String`                  | `Text`              | `TEXT`              |
@@ -91,6 +95,24 @@ set.
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
+
+### `time`, `phone`, `color` and `money` — native form controls
+
+These kinds pick a native form control (issue #3405):
+
+| Kind | Form control | Notes |
+|---|---|---|
+| `time` | `<input type="time">` (`FieldControl::Time`) | The browser posts `HH:MM`. On `SQLite` the column is `TEXT`. |
+| `phone` (alias `tel`) | `<input type="tel">` (`FieldControl::Tel`) | A `String` column. The browser does not check the format. |
+| `color` | `<input type="color">` (`FieldControl::Color`) | A `String` column. The browser posts a lowercase `#rrggbb`. A color input always posts a value, so `Option<color>` is an error: use `Option<String>`. |
+| `money` | `<input type="number" step="0.01">` | The same column as a bare `decimal`: `NUMERIC(12,2)`. |
+
+`phone` and `color` take no `{…}` modifier. Use `String{…}` for a constrained
+text column, and `decimal{p,s}` for another precision or scale.
+
+```bash
+autumn generate scaffold Shop name:String opens:time mobile:phone accent:color price:money
+```
 
 ### `json`/`jsonb` — flexible structured data
 
@@ -1268,7 +1290,7 @@ JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
 `'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
 by the browser — the form would submit with no prompt, which is worse
 than not promising one. The framework's server-rendered replacement for
-`window.confirm()`, [`confirm_action`](../../autumn/src/widgets.rs), submits
+`window.confirm()`, [`confirm_action`](../../autumn/src/widgets/feedback.rs), submits
 its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
@@ -1701,7 +1723,7 @@ methods were waiting for (issue #1332) — zero lines of user code:
 - Per row: a **Restore** submit posting to
   `POST /<plural>/{id}/restore`, and a **Purge** control posting to
   `POST /<plural>/{id}/purge` behind
-  [`confirm_action`](../../autumn/src/widgets.rs)'s server-rendered dialog
+  [`confirm_action`](../../autumn/src/widgets/feedback.rs)'s server-rendered dialog
   (titled per row, so the person confirming an irreversible delete can see
   which record it is). Both carry the CSRF hidden field.
 - A `Deleted At` column showing each row's `deleted_at` stamp, so the page
@@ -2060,17 +2082,11 @@ The live HTTP test requires Docker access for the Postgres testcontainer and
 the `diesel` CLI on `PATH`, because `autumn migrate` delegates to
 `diesel migration run`.
 
-### WebAuthn native dependency note
+### WebAuthn dependency note
 
 `autumn generate auth --passkeys` enables the `webauthn` feature and adds
-`webauthn-rs`. That dependency currently builds through OpenSSL. On Ubuntu CI
-the system OpenSSL toolchain is already available, but Windows developers need
-to install the OpenSSL libraries through `vcpkg` and set `VCPKG_ROOT` so
-`openssl-sys` can find them.
-
-The release SemVer gate checks `autumn-web` optional public feature APIs, so this
-native dependency must be present on machines that run `scripts/check-semver.sh`
-locally.
+`webauthn-rs`. Since 0.6, `webauthn-rs` uses pure-Rust crypto. It needs no
+OpenSSL and no native libraries on any platform.
 
 ## `autumn generate policy`
 

@@ -16,25 +16,13 @@
 //! # Networking
 //!
 //! Pebble's HTTP-01 validation request originates *inside* the Pebble
-//! container, so it cannot reach a `127.0.0.1`-bound listener on this host the
-//! way the in-process fake CA's tests can. `testcontainers`' `host-port-exposure`
-//! feature solves exactly this: [`ImageExt::with_exposed_host_port`] opens an
-//! SSH tunnel and injects a `host.testcontainers.internal` DNS alias into the
-//! container, resolving to that tunnel. Ordering the certificate for the
-//! identifier `host.testcontainers.internal` itself — rather than `localhost`
-//! or a made-up name — means Pebble's normal DNS resolution of the identifier
-//! (it does no special-casing; "use the system DNS resolver" is its only
-//! documented mode) lands exactly on our HTTP-01 responder, with no custom
-//! DNS server needed the way [`acme_dns01`](super::acme_dns01)'s `FakeZone`
-//! provides for the wildcard/DNS-01 suite.
-//!
-//! `host-port-exposure` pulls its own small SSH-tunnel sidecar image from
-//! Docker Hub (separately from Pebble's own `ghcr.io` pull) — a second,
-//! unpinned registry dependency and a known source of incidental CI flakes
-//! on shared runner pools (Docker Hub's anonymous-pull rate limit). Accepted
-//! as the cost of testing the real container→host path at all; a failure
-//! pulling that sidecar is distinguishable in CI logs from a genuine ACME
-//! regression.
+//! container, so it cannot reach a `127.0.0.1`-bound listener on this host.
+//! The container gets the Docker `host-gateway` alias
+//! `host.docker.internal`, which resolves to this host. The challenge
+//! listener binds `0.0.0.0`, so the request arrives. The certificate is
+//! ordered for `host.docker.internal`, so Pebble's normal DNS lookup of the
+//! identifier finds our HTTP-01 responder. No SSH tunnel and no custom DNS
+//! server are necessary.
 //!
 //! Pebble's own HTTP-01 validation port is fixed at `5002` by its default
 //! bundled config (`test/config/pebble-config.json`, loaded automatically —
@@ -75,14 +63,14 @@ use autumn_web::scheduler::{InProcessSchedulerCoordinator, SchedulerCoordinator}
 use autumn_web::tls::{
     ReloadableCertResolver, certified_key_from_pem, crypto_provider, leaf_not_after_from_pem,
 };
-use testcontainers::core::{ContainerPort, WaitFor};
+use testcontainers::core::{ContainerPort, Host, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio_util::sync::CancellationToken;
 
-/// The DNS alias `testcontainers`' `host-port-exposure` feature injects into
-/// the container, resolving to a tunnel back to this host.
-const HOST_ALIAS: &str = "host.testcontainers.internal";
+/// The Docker `host-gateway` alias the test gives the container. It resolves
+/// to this host.
+const HOST_ALIAS: &str = "host.docker.internal";
 
 /// Pebble's fixed HTTP-01 validation port (its default bundled config's
 /// `httpPort`, loaded automatically with no `-config` flag).
@@ -122,15 +110,15 @@ struct Pebble {
     root_pem: Vec<u8>,
 }
 
-/// Start a Pebble container whose HTTP-01 validation reaches `challenge_port`
-/// on this host via the `host-port-exposure` tunnel (see the module doc).
+/// Start a Pebble container whose HTTP-01 validation reaches this host
+/// through the `host-gateway` alias (see the module doc).
 ///
 /// `#[allow(future_not_send)]`: `ContainerAsync::copy_file_from`'s returned
 /// future is not `Send` (testcontainers' internal archive-reading path), and
 /// this single-threaded `#[tokio::test]` never needs to move it across
 /// threads.
 #[allow(clippy::future_not_send)]
-async fn start_pebble(challenge_port: u16) -> Pebble {
+async fn start_pebble() -> Pebble {
     let container = GenericImage::new(PEBBLE_IMAGE, PEBBLE_TAG)
         .with_exposed_port(ContainerPort::Tcp(PEBBLE_ACME_PORT))
         .with_wait_for(WaitFor::message_on_stdout("ACME directory available at:"))
@@ -143,7 +131,7 @@ async fn start_pebble(challenge_port: u16) -> Pebble {
         // disable it so this test is not flaky on the CA's own fault
         // injection.
         .with_env_var("PEBBLE_WFE_NONCEREJECT", "0")
-        .with_exposed_host_port(challenge_port)
+        .with_host(HOST_ALIAS, Host::HostGateway)
         .start()
         .await
         .expect("start the Pebble container");
@@ -409,17 +397,18 @@ async fn drives_a_real_pebble_order_end_to_end() {
     // validation port is fixed (see `PEBBLE_HTTP01_PORT`), so nothing here
     // depends on Pebble's own startup — but binding first still fails fast
     // and clearly if the port is unexpectedly taken.
-    let challenge_tcp = tokio::net::TcpListener::bind(("127.0.0.1", PEBBLE_HTTP01_PORT))
+    // Bind all interfaces: the request arrives on the Docker gateway address.
+    let challenge_tcp = tokio::net::TcpListener::bind(("0.0.0.0", PEBBLE_HTTP01_PORT))
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "bind the ACME HTTP-01 challenge listener on 127.0.0.1:{PEBBLE_HTTP01_PORT} \
+                "bind the ACME HTTP-01 challenge listener on 0.0.0.0:{PEBBLE_HTTP01_PORT} \
                  (Pebble's fixed validation port): {e}"
             )
         });
     let (tokens, challenge_shutdown, challenge_handle) = spawn_challenge_listener(challenge_tcp);
 
-    let pebble = start_pebble(PEBBLE_HTTP01_PORT).await;
+    let pebble = start_pebble().await;
     let cache_dir = tempfile::tempdir().expect("cache dir");
     let (task, harness) = build_harness(&pebble, tokens, cache_dir.path());
 

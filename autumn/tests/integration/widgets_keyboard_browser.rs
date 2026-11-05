@@ -1,8 +1,9 @@
 //! The widget keyboard core in a real browser (issue #3397).
 //!
 //! Each test sends real key events and checks the WAI-ARIA APG keyboard
-//! model for tabs, the combobox and the menu button. Other tests check
-//! the no-JS fallback and the default CSP.
+//! model for tabs, the combobox and the menu button. The tags mode of the
+//! combobox (issue #3410) has tests for its chips. Other tests check the
+//! no-JS fallback and the default CSP.
 //!
 //! Run:
 //!
@@ -18,8 +19,8 @@ use std::time::Duration;
 use autumn_web::prelude::*;
 use autumn_web::system_test::{Page, SystemTest, SystemTestRunner};
 use autumn_web::widgets::{
-    AutocompleteConfig, NavBarConfig, NavItem, NavMenu, autocomplete_empty_state,
-    autocomplete_input, autocomplete_option, nav_bar, tabs,
+    AutocompleteConfig, NavBarConfig, NavItem, NavMenu, autocomplete_create_option,
+    autocomplete_empty_state, autocomplete_input, autocomplete_option, nav_bar, tabs,
 };
 use maud::{DOCTYPE, Markup, html};
 
@@ -81,6 +82,16 @@ fn page_body() -> Markup {
         .fallback_options(COLORS);
     // A long debounce holds the old options while the user edits the query.
     let slow = AutocompleteConfig::new("/colors", "slow_id").debounce(1500);
+    // Tags mode (#3410): Blue is a server-side pick.
+    let tags = AutocompleteConfig::new("/colors", "color_ids")
+        .debounce(0)
+        .multiple()
+        .fallback_options(COLORS)
+        .selected(&[("4", "Blue")]);
+    let words = AutocompleteConfig::new("/colors-create", "words")
+        .debounce(0)
+        .multiple()
+        .free_text();
     html! {
         (nav_bar("/", &nav))
         h1 id="title" { "Keyboard" }
@@ -90,12 +101,19 @@ fn page_body() -> Markup {
             button type="submit" { "Save" }
         }
         (autocomplete_input("slow", "Slow color", &slow))
+        form id="multi" action="/submitted-multi" method="get" {
+            (autocomplete_input("tags", "Colors", &tags))
+            (autocomplete_input("words", "Words", &words))
+            button id="multi-save" type="submit" { "Save colors" }
+        }
         button id="swap" hx-get="/fragment" hx-target="#slot" { "Swap" }
         div id="slot" {}
         button id="swap-outer" hx-get="/fragment-outer" hx-target="#slot-outer" hx-swap="outerHTML" {
             "Swap outer"
         }
         div id="slot-outer" {}
+        button id="swap-tags" hx-get="/fragment-tags" hx-target="#slot-tags" { "Swap tags" }
+        div id="slot-tags" {}
         a id="jump" href="#t-billing" { "Go to billing" }
         button id="swap-inner" hx-get="/fragment-inner" hx-target="#t" hx-swap="innerHTML" {
             "Swap inner"
@@ -113,7 +131,16 @@ async fn index() -> Markup {
 
 #[get("/rtl")]
 async fn rtl() -> Markup {
-    layout("rtl", &settings_tabs("r"))
+    let tags = AutocompleteConfig::new("/colors", "rtl_ids")
+        .multiple()
+        .selected(&[("1", "Green"), ("4", "Blue")]);
+    layout(
+        "rtl",
+        &html! {
+            (settings_tabs("r"))
+            (autocomplete_input("rtags", "Colors", &tags))
+        },
+    )
 }
 
 #[get("/fragment")]
@@ -141,6 +168,22 @@ async fn fragment_outer() -> Markup {
     settings_tabs("o")
 }
 
+/// A tags form for an htmx swap. htmx parses it with scripts off, so its
+/// `<noscript>` select is live markup.
+#[get("/fragment-tags")]
+async fn fragment_tags() -> Markup {
+    let tags = AutocompleteConfig::new("/colors", "color_ids")
+        .multiple()
+        .fallback_options(COLORS)
+        .selected(&[("2", "Grey")]);
+    html! {
+        form id="swapped" action="/submitted-multi" method="get" {
+            (autocomplete_input("swapped-tags", "Swapped colors", &tags))
+            button id="swapped-save" type="submit" { "Save swapped" }
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct Query {
     q: String,
@@ -162,9 +205,44 @@ async fn colors(axum::extract::Query(query): axum::extract::Query<Query>) -> Mar
     }
 }
 
+/// The colors that start with `q`, then a "create" entry when no color
+/// has the exact name.
+#[get("/colors-create")]
+async fn colors_create(axum::extract::Query(query): axum::extract::Query<Query>) -> Markup {
+    let q = query.q.trim();
+    let lower = q.to_lowercase();
+    let hits: Vec<_> = COLORS
+        .iter()
+        .filter(|(_, label)| !lower.is_empty() && label.to_lowercase().starts_with(&lower))
+        .collect();
+    let exact = hits.iter().any(|(_, label)| label.eq_ignore_ascii_case(q));
+    html! {
+        @for (_, label) in &hits { (autocomplete_option(label, label)) }
+        @if !q.is_empty() && !exact {
+            (autocomplete_create_option(q, &format!("Create \u{201c}{q}\u{201d}")))
+        }
+    }
+}
+
 #[get("/submitted")]
 async fn submitted() -> &'static str {
     "submitted"
+}
+
+#[derive(serde::Deserialize)]
+struct Multi {
+    #[serde(default)]
+    color_ids: Vec<String>,
+    #[serde(default)]
+    words: Vec<String>,
+}
+
+/// Repeated keys decode into `Vec<T>` (#3394).
+#[get("/submitted-multi")]
+async fn submitted_multi(
+    autumn_web::extract::Query(multi): autumn_web::extract::Query<Multi>,
+) -> String {
+    format!("color_ids={:?} words={:?}", multi.color_ids, multi.words)
 }
 
 async fn runner() -> SystemTestRunner {
@@ -177,8 +255,11 @@ async fn runner() -> SystemTestRunner {
                 fragment_inner,
                 fragment_outer,
                 fragment_same,
+                fragment_tags,
                 colors,
-                submitted
+                colors_create,
+                submitted,
+                submitted_multi
             ])
             .build(),
     )
@@ -238,6 +319,7 @@ async fn press(page: &Page, key: &str) {
 }
 
 async fn active_id(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.id : ''",
@@ -246,6 +328,7 @@ async fn active_id(page: &Page) -> String {
 }
 
 async fn active_text(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.textContent.trim() : ''",
@@ -253,7 +336,14 @@ async fn active_text(page: &Page) -> String {
     .await
 }
 
+/// The runtime reacts to the `toggle` event, which the browser queues as a
+/// task. Let it run before the test reads the page.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 async fn attr(page: &Page, id: &str, name: &str) -> String {
+    settle().await;
     eval_string(
         page,
         &format!("document.getElementById('{id}').getAttribute('{name}') || ''"),
@@ -741,6 +831,449 @@ async fn an_empty_listbox_stays_in_the_accessibility_tree() {
     );
 }
 
+// ── Tags mode (#3410) ───────────────────────────────────────────────────
+
+/// The values that widget `id` submits: its enabled, named chip inputs.
+async fn chip_values(page: &Page, id: &str) -> String {
+    settle().await;
+    eval_string(
+        page,
+        &format!(
+            "[...document.querySelectorAll('#{id}-chips [data-ac-chip] input[type=hidden]')]\
+             .filter(i => !i.disabled && i.name).map(i => i.value).join(',')"
+        ),
+    )
+    .await
+}
+
+/// The `aria-label` of the focused element.
+async fn focused_label(page: &Page) -> String {
+    settle().await;
+    eval_string(
+        page,
+        "document.activeElement ? (document.activeElement.getAttribute('aria-label') || '') : ''",
+    )
+    .await
+}
+
+/// Type `text` into widget `id` and wait for a shown option.
+async fn search_in(page: &Page, id: &str, text: &str) {
+    page.fill(&format!("#{id}-query"), text)
+        .await
+        .expect("fill");
+    wait_for(
+        page,
+        &format!(
+            "[...document.querySelectorAll('#{id}-options [role=option]')].some(o => !o.hidden) \
+             && document.getElementById('{id}-query').getAttribute('aria-expanded') === 'true'"
+        ),
+    )
+    .await;
+}
+
+/// Add the option of widget `id` whose text is `label`.
+async fn pick(page: &Page, id: &str, query: &str, label: &str) {
+    search_in(page, id, query).await;
+    for _ in 0..COLORS.len() {
+        press(page, "ArrowDown").await;
+        let text = eval_string(
+            page,
+            &format!(
+                "(() => {{ const i = document.getElementById('{id}-query'); \
+                   const o = document.getElementById(i.getAttribute('aria-activedescendant') || ''); \
+                   return o ? o.textContent.trim() : ''; }})()"
+            ),
+        )
+        .await;
+        if text == label {
+            press(page, "Enter").await;
+            return;
+        }
+    }
+    panic!("no option {label} for {query}");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_enter_adds_a_chip_and_keeps_focus_on_the_input() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    assert_eq!(chip_values(&page, "tags").await, "4", "server pick submits");
+    assert!(
+        shown(&page, "tags-chips").await,
+        "the runtime shows the chips"
+    );
+
+    search_in(&page, "tags", "g").await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    assert_eq!(chip_values(&page, "tags").await, "4,1");
+    assert_eq!(
+        eval_string(&page, "document.getElementById('tags-query').value").await,
+        "",
+        "the query clears"
+    );
+    assert_eq!(attr(&page, "tags-query", "aria-expanded").await, "false");
+    assert_eq!(active_id(&page).await, "tags-query");
+    assert!(
+        eval_bool(
+            &page,
+            "document.querySelector('#tags-chips [data-ac-chip]:last-child [data-ac-chip-remove]')\
+             .getAttribute('aria-label') === 'Remove Green'"
+        )
+        .await,
+        "a new chip has a labelled remove button"
+    );
+    assert!(
+        eval_bool(&page, "location.pathname === '/'").await,
+        "Enter on an option does not submit the form"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_hide_an_option_that_is_already_a_chip() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    pick(&page, "tags", "g", "Green").await;
+    search_in(&page, "tags", "g").await;
+    press(&page, "ArrowDown").await;
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.getElementById(document.getElementById('tags-query')\
+             .getAttribute('aria-activedescendant')).textContent.trim()"
+        )
+        .await,
+        "Grey",
+        "Green is a chip, so the list skips it"
+    );
+
+    // Blue is the only match and a chip: the popup has nothing to show.
+    // The runtime removes the option, so the empty listbox has no size.
+    page.fill("#tags-query", "b").await.expect("fill");
+    assert_eq!(attr(&page, "tags-query", "aria-expanded").await, "false");
+    assert!(
+        eval_bool(
+            &page,
+            "document.getElementById('tags-options').childElementCount === 0 \
+             && document.getElementById('tags-options').getBoundingClientRect().height === 0"
+        )
+        .await,
+        "no empty box"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_backspace_in_an_empty_query_removes_the_last_chip() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    pick(&page, "tags", "g", "Green").await;
+    assert_eq!(chip_values(&page, "tags").await, "4,1");
+
+    // Backspace with text edits the text.
+    page.fill("#tags-query", "gr").await.expect("fill");
+    press(&page, "Backspace").await;
+    assert_eq!(chip_values(&page, "tags").await, "4,1");
+    assert_eq!(
+        eval_string(&page, "document.getElementById('tags-query').value").await,
+        "g"
+    );
+
+    press(&page, "Backspace").await;
+    assert_eq!(
+        chip_values(&page, "tags").await,
+        "4,1",
+        "the text goes first"
+    );
+    press(&page, "Backspace").await;
+    assert_eq!(chip_values(&page, "tags").await, "4");
+    press(&page, "Backspace").await;
+    assert_eq!(chip_values(&page, "tags").await, "");
+    assert_eq!(active_id(&page).await, "tags-query");
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_arrow_keys_move_between_chips_and_delete_removes_one() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    pick(&page, "tags", "g", "Green").await;
+    pick(&page, "tags", "go", "Gold").await;
+    assert_eq!(chip_values(&page, "tags").await, "4,1,3");
+
+    // ArrowLeft at the start of the input goes to the last chip.
+    press(&page, "ArrowLeft").await;
+    assert_eq!(focused_label(&page).await, "Remove Gold");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(focused_label(&page).await, "Remove Green");
+    press(&page, "Home").await;
+    assert_eq!(focused_label(&page).await, "Remove Blue");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(focused_label(&page).await, "Remove Blue", "no wrap");
+    press(&page, "End").await;
+    assert_eq!(focused_label(&page).await, "Remove Gold");
+    // ArrowRight on the last chip goes back to the input.
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "tags-query");
+
+    // Delete removes a chip. Focus goes to the next chip.
+    press(&page, "ArrowLeft").await;
+    press(&page, "ArrowLeft").await;
+    assert_eq!(focused_label(&page).await, "Remove Green");
+    press(&page, "Delete").await;
+    assert_eq!(chip_values(&page, "tags").await, "4,3");
+    assert_eq!(focused_label(&page).await, "Remove Gold");
+    // Backspace on the last chip: focus goes to the previous chip.
+    press(&page, "Backspace").await;
+    assert_eq!(chip_values(&page, "tags").await, "4");
+    assert_eq!(focused_label(&page).await, "Remove Blue");
+    // Enter activates the button. With no chip left, focus goes to the input.
+    press(&page, "Enter").await;
+    assert_eq!(chip_values(&page, "tags").await, "");
+    assert_eq!(active_id(&page).await, "tags-query");
+    assert!(
+        eval_bool(&page, "location.pathname === '/'").await,
+        "no submit"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// Send a repeated `keydown` of `key` to the focused element, as a held
+/// key does. `Page::press` cannot set `repeat`.
+async fn hold(page: &Page, key: &str) {
+    page.evaluate(format!(
+        "document.activeElement.dispatchEvent(new KeyboardEvent('keydown', \
+         {{ key: '{key}', repeat: true, bubbles: true, cancelable: true }}))"
+    ))
+    .await
+    .expect("dispatch a repeated key");
+    settle().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_a_held_key_removes_no_extra_chips() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    pick(&page, "tags", "g", "Green").await;
+    pick(&page, "tags", "go", "Gold").await;
+    assert_eq!(chip_values(&page, "tags").await, "4,1,3");
+
+    // In the empty input: one press removes one chip. Repeats do nothing.
+    press(&page, "Backspace").await;
+    for _ in 0..3 {
+        hold(&page, "Backspace").await;
+    }
+    assert_eq!(chip_values(&page, "tags").await, "4,1");
+
+    // On a chip: focus moves to the next chip, which a repeat must keep.
+    press(&page, "ArrowLeft").await;
+    press(&page, "Home").await;
+    assert_eq!(focused_label(&page).await, "Remove Blue");
+    press(&page, "Delete").await;
+    assert_eq!(focused_label(&page).await, "Remove Green");
+    for key in ["Delete", "Backspace"] {
+        hold(&page, key).await;
+    }
+    assert_eq!(chip_values(&page, "tags").await, "1");
+    assert_eq!(focused_label(&page).await, "Remove Green");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_chip_list_is_one_tab_stop_before_the_input() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    pick(&page, "tags", "g", "Green").await;
+    assert_eq!(
+        eval_string(
+            &page,
+            "[...document.querySelectorAll('#tags-chips [data-ac-chip-remove]')]\
+             .map(b => b.tabIndex).join(',')"
+        )
+        .await,
+        "0,-1",
+        "one tab stop"
+    );
+    focus(&page, "tags-query").await;
+    press(&page, "ArrowLeft").await;
+    press(&page, "Tab").await;
+    assert_eq!(
+        active_id(&page).await,
+        "tags-query",
+        "Tab leaves the chip list"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_clicking_a_remove_button_removes_its_chip() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    pick(&page, "tags", "g", "Green").await;
+    page.click("#tags-chips [data-ac-chip]:first-child [data-ac-chip-remove]")
+        .await
+        .expect("click remove");
+    assert_eq!(chip_values(&page, "tags").await, "1");
+    assert_eq!(
+        active_id(&page).await,
+        "tags-query",
+        "focus goes to the input"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_free_text_enter_adds_the_typed_text_once() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    focus(&page, "words-query").await;
+    for _ in 0..2 {
+        page.fill("#words-query", "teal").await.expect("fill");
+        press(&page, "Enter").await;
+    }
+    assert_eq!(chip_values(&page, "words").await, "teal", "no duplicate");
+    assert_eq!(
+        eval_string(&page, "document.getElementById('words-query').value").await,
+        ""
+    );
+    assert!(
+        eval_bool(&page, "location.pathname === '/'").await,
+        "Enter on typed text does not submit the form"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_create_option_adds_its_value_not_its_label() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    search_in(&page, "words", "te").await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    assert_eq!(chip_values(&page, "words").await, "te");
+    assert!(
+        eval_bool(
+            &page,
+            "document.querySelector('#words-chips [data-ac-chip-label]').textContent === 'te'"
+        )
+        .await,
+        "the chip shows the value, not \"Create …\""
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_submit_as_repeated_keys() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    pick(&page, "tags", "g", "Green").await;
+    focus(&page, "words-query").await;
+    page.fill("#words-query", "teal").await.expect("fill");
+    press(&page, "Enter").await;
+    page.click("#multi-save").await.expect("submit");
+    wait_for(&page, "location.pathname === '/submitted-multi'").await;
+    assert_eq!(
+        eval_string(&page, "document.body.textContent.trim()").await,
+        r#"color_ids=["4", "1"] words=["teal"]"#
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_free_text_submit_adds_the_typed_text() {
+    // Text that the user typed but did not add with Enter is not lost.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.fill("#words-query", "teal").await.expect("fill");
+    // Close the popup: it covers the Save button.
+    press(&page, "Escape").await;
+    page.click("#multi-save").await.expect("submit");
+    wait_for(&page, "location.pathname === '/submitted-multi'").await;
+    assert_eq!(
+        eval_string(&page, "document.body.textContent.trim()").await,
+        r#"color_ids=["4"] words=["teal"]"#
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_status_region_says_what_was_added_and_removed() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    let status = "document.querySelector('#tags-wrapper [data-ac-status]').textContent";
+    pick(&page, "tags", "g", "Green").await;
+    assert_eq!(eval_string(&page, status).await, "Green added");
+    press(&page, "Backspace").await;
+    assert_eq!(eval_string(&page, status).await, "Green removed");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_swapped_in_by_htmx_send_each_value_once() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.click("#swap-tags").await.expect("swap");
+    wait_for(
+        &page,
+        "document.getElementById('swapped-tags-chips') !== null",
+    )
+    .await;
+    wait_for(
+        &page,
+        "document.getElementById('swapped-tags-chips').hidden === false",
+    )
+    .await;
+    assert!(
+        eval_bool(
+            &page,
+            "[...document.querySelectorAll('#swapped select')].every(s => s.disabled)"
+        )
+        .await,
+        "the runtime disables a live noscript select"
+    );
+    page.click("#swapped-save").await.expect("submit");
+    wait_for(&page, "location.pathname === '/submitted-multi'").await;
+    assert_eq!(
+        eval_string(&page, "document.body.textContent.trim()").await,
+        r#"color_ids=["2"] words=[]"#
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn rtl_tags_swap_left_and_right() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/rtl").await;
+    focus(&page, "rtags-query").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(focused_label(&page).await, "Remove Blue");
+    press(&page, "ArrowRight").await;
+    assert_eq!(focused_label(&page).await, "Remove Green");
+    press(&page, "ArrowLeft").await;
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "rtags-query");
+}
+
 // ── Menu button ─────────────────────────────────────────────────────────
 
 const TOGGLE: &str = "autumn-nav-menu-1-toggle";
@@ -748,7 +1281,7 @@ const MENU: &str = "autumn-nav-menu-1";
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
-async fn the_runtime_adds_menu_button_roles() {
+async fn the_menu_button_has_roles_and_one_tab_stop() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");
     open(&page, "/").await;
@@ -878,13 +1411,17 @@ async fn every_fallback_works_with_javascript_disabled() {
         .await
     );
 
-    // Nav: every dropdown link is visible.
-    assert!(shown(&page, MENU).await);
-    assert_eq!(attr(&page, TOGGLE, "aria-expanded").await, "true");
-    assert_eq!(
-        attr(&page, MENU, "role").await,
-        "",
-        "no role=menu without JS"
+    // Nav: the dropdown is a closed popover with the menu roles. The popover
+    // suite clicks it open; `Page::click` needs a script.
+    assert!(!shown(&page, MENU).await, "closed at first");
+    assert_eq!(attr(&page, MENU, "role").await, "menu");
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.getElementById('{TOGGLE}').getAttribute('commandfor') === '{MENU}'")
+        )
+        .await,
+        "commandfor opens it with no JS"
     );
 
     // Autocomplete: the `<noscript>` select is live and inside the form.
@@ -896,6 +1433,31 @@ async fn every_fallback_works_with_javascript_disabled() {
         )
         .await,
         "noscript select must render"
+    );
+
+    // Tags (#3410): a `<select multiple>` holds the server pick. The chip
+    // list is hidden and its inputs do not submit, so the form sends each value one time.
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { const s = document.querySelector('#multi select[name=color_ids]'); \
+             return !!s && s.multiple && [...s.selectedOptions].map(o => o.value).join() === '4' \
+               && getComputedStyle(s).display !== 'none'; })()"
+        )
+        .await,
+        "noscript select multiple must render with the pick"
+    );
+    assert!(
+        !shown(&page, "tags-chips").await,
+        "chips hidden with JS off"
+    );
+    page.evaluate("document.getElementById('multi').requestSubmit()")
+        .await
+        .expect("submit");
+    wait_for(&page, "location.pathname === '/submitted-multi'").await;
+    assert_eq!(
+        eval_string(&page, "document.body.textContent.trim()").await,
+        r#"color_ids=["4"] words=[]"#
     );
 }
 
@@ -936,6 +1498,10 @@ async fn widgets_run_under_the_default_csp_with_no_inline_script() {
     search(&page, "g").await;
     press(&page, "ArrowDown").await;
     press(&page, "Enter").await;
+    pick(&page, "tags", "g", "Green").await;
+    press(&page, "Backspace").await;
+    press(&page, "ArrowLeft").await;
+    press(&page, "Delete").await;
     page.expect_no_console_errors()
         .await
         .expect("no CSP errors");

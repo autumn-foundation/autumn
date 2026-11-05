@@ -98,7 +98,7 @@ async fn repo_write(
 }
 
 #[get("/notes")]
-async fn repo_read(repo: PgFleetNoteRepository) -> AutumnResult<Json<Vec<String>>> {
+async fn repo_read(repo: SqliteFleetNoteRepository) -> AutumnResult<Json<Vec<String>>> {
     let mut notes: Vec<String> = repo.find_all().await?.into_iter().map(|n| n.body).collect();
     notes.sort();
     Ok(Json(notes))
@@ -112,6 +112,14 @@ async fn admin_notes(
     let mut notes: Vec<String> = repo.find_all().await?.into_iter().map(|n| n.body).collect();
     notes.sort();
     Ok(Json(notes))
+}
+
+/// `across_tenants()` count over every database on disk.
+#[get("/admin/count")]
+async fn admin_count(
+    CrossShard(repo): CrossShard<PgFleetNoteRepository>,
+) -> AutumnResult<Json<i64>> {
+    Ok(Json(repo.count().await?))
 }
 
 /// `Shards::each_shard` over the fleet: one entry per database file.
@@ -175,6 +183,8 @@ fn fleet(dir: &FsPath, mode: FleetMode, create_on_demand: bool) -> DatabaseFleet
         ownership: None,
         replica_retention_after_delete: std::time::Duration::ZERO,
         restore_check_sample: 0,
+        replication_workers: 4,
+        min_residency: std::time::Duration::from_secs(2),
     })
     .migrations("app", MIGRATIONS)
     .migrations(
@@ -206,6 +216,7 @@ fn app(dir: &FsPath, fleet: DatabaseFleet) -> autumn_web::test::TestClient {
             repo_write,
             repo_read,
             admin_notes,
+            admin_count,
             admin_counts,
             provision,
             db_by_name
@@ -213,6 +224,16 @@ fn app(dir: &FsPath, fleet: DatabaseFleet) -> autumn_web::test::TestClient {
         .with_db(control_pool(dir))
         .with_fleet(fleet)
         .build()
+}
+
+/// A `SQLite` build names the generated repository `Sqlite<Trait>` too.
+#[test]
+fn the_sqlite_name_is_the_generated_repository() {
+    use std::any::TypeId;
+    assert_eq!(
+        TypeId::of::<SqliteFleetNoteRepository>(),
+        TypeId::of::<PgFleetNoteRepository>()
+    );
 }
 
 #[tokio::test]
@@ -429,4 +450,183 @@ async fn the_fleet_health_indicator_reports_the_counters() {
     assert_eq!(fleet["details"]["mode"], "tenant");
     assert_eq!(fleet["details"]["open"], 1);
     assert_eq!(fleet["details"]["created_total"], 1);
+}
+
+/// `autumn_web::db::prelude::*` sits next to `#[model]` and `#[repository]`.
+/// `diesel::prelude::*` there gives E0034: it also imports the blocking
+/// `RunQueryDsl`.
+mod db_prelude_next_to_the_macros {
+    use autumn_web::db::prelude::*;
+
+    mod schema {
+        autumn_web::reexports::diesel::table! {
+            prelude_notes (id) {
+                id -> Int8,
+                body -> Text,
+            }
+        }
+    }
+
+    use schema::prelude_notes;
+
+    #[autumn_web::model]
+    pub struct PreludeNote {
+        #[id]
+        pub id: i64,
+        pub body: String,
+    }
+
+    #[autumn_web::repository(PreludeNote)]
+    pub trait PreludeNoteRepository {}
+
+    pub async fn count(conn: &mut autumn_web::db::RuntimeConnection) -> QueryResult<i64> {
+        prelude_notes::table.count().get_result(conn).await
+    }
+}
+
+#[tokio::test]
+async fn the_db_prelude_runs_async_queries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = control_pool(tmp.path());
+    let mut conn = pool.get().await.unwrap();
+    diesel::sql_query("CREATE TABLE prelude_notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        db_prelude_next_to_the_macros::count(&mut conn)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// Ship the fleet's databases to a local replica directory.
+fn replicate(
+    fleet: &DatabaseFleet,
+    replicas: &FsPath,
+) -> std::sync::Arc<autumn_web::db::fleet_replication::FleetReplication> {
+    use autumn_web::db::fleet_replication::FleetReplication;
+    use autumn_web::replication::{FileDestination, ReplicaDestination, ReplicationSettings};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let destination: Arc<dyn ReplicaDestination> =
+        Arc::new(FileDestination::new(replicas).unwrap());
+    let replication = Arc::new(FleetReplication::new(
+        destination,
+        ReplicationSettings {
+            database_path: std::path::PathBuf::new(),
+            root: "app/test".to_owned(),
+            sync_interval: Duration::from_secs(1),
+            snapshot_interval: Duration::from_secs(3600),
+            max_wal_bytes: 4 * 1024 * 1024,
+            retention: Duration::from_secs(24 * 3600),
+            verify_interval: None,
+        },
+        Duration::from_secs(30),
+        false,
+        Arc::new(autumn_web::time::SystemClock),
+    ));
+    assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
+    replication
+}
+
+/// The lake over the replicas gives the same answer as `across_tenants()`
+/// over the volume, and it needs no volume (issue #3236).
+#[tokio::test]
+async fn the_lake_matches_across_tenants_with_no_volume() {
+    use autumn_web::db::fleet_lake::{LakeValue, TENANT_COLUMN};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), FleetMode::Tenant, true);
+    let replication = replicate(&fleet, &tmp.path().join("replicas"));
+    let client = app(tmp.path(), fleet.clone());
+    for (tenant, body) in [
+        ("acme", "plan"),
+        ("globex", "launch"),
+        ("acme", "ship"),
+        ("initech", "audit"),
+        ("initech", "bill"),
+        ("initech", "close"),
+    ] {
+        client
+            .post(&format!("/notes/{body}"))
+            .header("x-tenant-id", tenant)
+            .send()
+            .await
+            .assert_status(200);
+    }
+
+    // `across_tenants()` over the volume.
+    let count: i64 = client.get("/admin/count").send().await.json();
+    let bodies: Vec<String> = client.get("/admin/notes").send().await.json();
+    let counts: Vec<(String, i64)> = client.get("/admin/counts").send().await.json();
+    assert_eq!(count, 6);
+
+    // Ship the last frames, then take the volume away.
+    fleet.close_all().await;
+    std::fs::remove_dir_all(tmp.path().join("fleet")).unwrap();
+
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let snapshot = replication
+        .lake()
+        .markers_only()
+        .with_scratch_dir(&scratch)
+        .materialize()
+        .await
+        .unwrap();
+
+    let total = snapshot
+        .query("SELECT COUNT(*) FROM fleet_notes")
+        .await
+        .unwrap();
+    assert_eq!(total.rows, vec![vec![LakeValue::Integer(count)]]);
+
+    let lake_bodies = snapshot
+        .query("SELECT body FROM fleet_notes ORDER BY body")
+        .await
+        .unwrap();
+    let lake_bodies: Vec<String> = lake_bodies
+        .rows
+        .iter()
+        .map(|row| row[0].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(lake_bodies, bodies);
+
+    let per_tenant = snapshot
+        .query(&format!(
+            "SELECT 'tenant:' || {TENANT_COLUMN}, COUNT(*) FROM fleet_notes GROUP BY 1 ORDER BY 1"
+        ))
+        .await
+        .unwrap();
+    let per_tenant: Vec<(String, i64)> = per_tenant
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_str().unwrap().to_owned(),
+                row[1].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(per_tenant, counts);
+
+    // A grouped sum, which `across_tenants()` refuses across shards.
+    let lengths = snapshot
+        .query(&format!(
+            "SELECT {TENANT_COLUMN}, SUM(length(body)) FROM fleet_notes GROUP BY 1 ORDER BY 1"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        lengths.rows,
+        vec![
+            vec![LakeValue::Text("acme".into()), LakeValue::Integer(8)],
+            vec![LakeValue::Text("globex".into()), LakeValue::Integer(6)],
+            vec![LakeValue::Text("initech".into()), LakeValue::Integer(14)],
+        ]
+    );
+    assert!(!tmp.path().join("fleet").exists());
 }

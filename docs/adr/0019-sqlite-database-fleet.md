@@ -163,8 +163,12 @@ movement. Each fleet database ships its WAL to object storage under
 `fleet/<name>/`, through the same engine and the same `[replication]`
 destination as the control database:
 
-- the fleet replicator ticks one `Replicator` per **open** database on one
-  thread;
+- the fleet replicator ticks one `Replicator` per **open** database. One
+  thread starts a pass every sync interval. `replication_workers` threads
+  (default 4) ship the databases of a pass at the same time, the database
+  that shipped longest ago first. One thread for all databases did not keep
+  the RPO: with 150 to 230 busy databases per host, a pass took several
+  seconds (Murmuration, 2026-10);
 - a database it replicates runs with `wal_autocheckpoint = 0`, and only its
   replicator checkpoints. Fleet pools never inherit the process latch that
   disables auto-checkpointing for the control database, so a fleet that does
@@ -352,14 +356,17 @@ brings a deleted tenant back on its next open. Litestream has the same gap.
 - **Delete.** With replication installed, `delete` writes a pending
   tombstone row (`_autumn_fleet_tombstones`) on the control database before
   any file goes. If the row cannot be written, the delete fails. Then a crash
-  after the removal cannot leave a replica that nothing blocks. When the file
-  is present, an existing row is stale, and the delete resets it. When the
+  after the removal cannot leave a replica that nothing blocks. The delete
+  checks the file, writes the row and removes the file under the path lock
+  (issue #3516). So a second delete in another process sees no file after
+  the removal, and it cannot reset or drop the row of the first delete. When
+  the file is present, an existing row is stale, and the delete resets it. When the
   file is missing, an existing row is an older or a concurrent delete's,
   and it stays. A delete that removed nothing drops only the pending row
   that it wrote (each pending row names its delete).
 - **Confirm.** After the removal, the delete confirms its own pending row.
   `deleted_at` is the purge cutoff: the later of the app clock and the
-  newest generation in the replica. The retention runs from the removal. If
+  newest generation in the replica. The retention runs from the confirm. If
   the generations cannot be read, the row stays pending, and the retry task
   confirms it later. The confirm never inserts a row: when
   the row is gone, a re-create or a restore took the key, and nothing is
@@ -379,7 +386,9 @@ brings a deleted tenant back on its next open. Litestream has the same gap.
   turn, restores, and drops the marker. If the restore fails, the row goes
   back.
 - **Re-create.** During the retention, a create on demand answers `410`, so
-  a stale client cannot end the undo window. With `restore_missing`, a host
+  a stale client cannot end the undo window. A pending row also gives `410`
+  (issue #3516). Its delete has no cutoff yet, so its retention has not
+  started. Only `provision` ends the window early. With `restore_missing`, a host
   with its own control database reads the retention from the marker. `provision`, and any create
   after the retention, purges the old replica first and drops the row, or
   fails with `503`. So a later purge never removes the new database's data,
@@ -418,7 +427,9 @@ proofs are in `verification/fleet_replica_tombstones.rs`.
 - Existing sharded app code runs unchanged; a Postgres-sharded app and a
   SQLite-fleet app share handlers and repositories.
 - Bounded resources: `max_open × pool_size` connections, about
-  `max_open × (2 × pool_size + 1)` file descriptors.
+  `max_open × (2 × pool_size + 1)` file descriptors, when the fleet is not
+  busy. A burst can open more than `max_open` databases: the limit is soft
+  (see `database.fleet.min_residency` and ADR 0031).
 - Metrics stay bounded: a fleet database's metric and route label is
   `shard=fleet`; its name goes on spans and logs only.
 
@@ -460,9 +471,8 @@ proofs are in `verification/fleet_replica_tombstones.rs`.
    ([#3234](https://github.com/autumn-foundation/autumn/issues/3234)).
 4. **Replica lifecycle.** Done: see section 8
    ([#3235](https://github.com/autumn-foundation/autumn/issues/3235)).
-5. **Query the lake.** Cross-tenant analytics over the replicas in object
-   storage (snapshots plus WAL segments), in the spirit of Athena / DuckDB
-   over S3, instead of opening every file on a production volume.
+5. **Query the lake.** Done: see [ADR 0032](0032-fleet-lake-query.md)
+   ([#3236](https://github.com/autumn-foundation/autumn/issues/3236)).
 
 ## Alternatives considered
 

@@ -10,6 +10,14 @@ version, folding the changelog fragments in, dating the changelog section,
 updating install instructions) is a separate, deliberate step the user asks for
 by name.
 
+## Comments stand alone
+
+A comment says what the code does or why. It never cites a source that a
+later reader does not have: no findings documents (`FINDINGS 2`, `Finding 3`),
+no lab or app names (`Pigeonhole`, `Murmuration`, `Baton`), no review rounds or
+labels (`Codex review round 22, P2`, `F2`). Put that history in the commit
+message or the PR. An issue number (`#1234`) is fine.
+
 ## Security defaults, not security blocks
 
 Autumn is a framework. Make the safe path the default. Do not block the app
@@ -43,6 +51,28 @@ that has none. See `docs/perf/README.md`.
   `scripts/check-perf-profiles.py ledger`. Write the missing profiles with
   `scripts/ledger-profile.sh`, or run `scripts/perf/ledger_catalog.py update`
   on the `ledger-capture` artifact of the failed run.
+
+## Diesel table width: 32 columns or fewer
+
+**No framework Diesel declaration (`table!` or `#[model]`) goes over 32
+columns**, and no Autumn crate turns on diesel's `64-column-tables` or
+`128-column-tables`. Diesel compiles its tuple impls up to that cap, and Cargo
+unifies the feature, so one wide declaration makes every crate that uses
+diesel compile the larger set. Every app built on Autumn pays for it. Measured
+on one crate: 1.16 GB / 1m18s at 32, 2.92 GB / 2m04s at 64, 9.95 GB / 8m16s at
+128.
+
+- The cap is per **declaration**, not per database table. A table past 32
+  columns is declared in halves: a second `table!` with
+  `#[sql_name = "<table>"]` maps the same rows. Each `#[model(table = …)]`
+  sits on one half. Every `NOT NULL` column without a default goes in the half
+  you insert through.
+- The `lint` job runs `autumn schema width .`. It reads every `table!` and
+  `#[model]`, replays every migration set, and fails on a declaration over 32
+  columns, a migration table over 32 that no declaration maps, or a wide
+  diesel feature.
+- Apps are not blocked. `autumn build` prints the same findings as a warning
+  and keeps building. See `docs/guide/table-width.md`.
 
 ## Changelog
 
@@ -80,35 +110,71 @@ release time.
 - **Test all**: `cargo test --workspace`
 - **Test specific package**: `cargo test -p <pkg>`
 - **Test specific target**: `cargo test -p <pkg> --test <target>`
-- **Pre-push gate**: `./scripts/pre-push-check.sh` — compile-only (`--no-run`)
-  mirror of CI's `lint` + `test` jobs. Run it before pushing: a narrow `cargo
-  test -p <pkg>` never links the autumn-web consolidated `integration_tests`
-  binary, so it misses cross-package compile breaks the CI `cargo test
-  --workspace` gate catches. See CONTRIBUTING.md "Before you push".
+- **Pre-push gate**: `cargo xtask pre-push` (or `./scripts/pre-push-check.sh`,
+  which runs it) — compile-only (`--no-run`) mirror of CI's `lint` + `test`
+  jobs. Run it before pushing: a narrow `cargo test -p <pkg>` never links the
+  autumn-web consolidated `integration_tests` binary, so it misses
+  cross-package compile breaks the CI `cargo test --workspace` gate catches.
+  See CONTRIBUTING.md "Before you push".
+- **CI lint job, locally**: `cargo xtask ci lint` (one CI shard:
+  `--shard <shard>`; one step: `--only <step>`; steps and shards: `--list`).
+- **Every maintainer task and script**: `cargo xtask list`.
+
+## Repo tooling: `cargo xtask`
+
+`xtask/` is the maintainer task runner. It is never published. See
+`xtask/README.md` and `docs/adr/0033-xtask-for-repo-tooling.md`.
+
+- **CI's `lint` job is the `lint` lane** in `xtask/src/lanes.rs`; ci.yml runs
+  it as one `Lint (<shard>)` job per shard (`cargo xtask ci lint --shard
+  ${{ matrix.shard }}`), and `Lint` aggregates them. Add or change a lint
+  check there, not in ci.yml, and give it a shard: a test fails on a step with
+  none, and on a shard the ci.yml matrix does not list. The pre-push lane
+  reuses the same constants, so the two cannot drift.
+- **A CI clippy command stays one string literal on one line** in
+  `lanes.rs`, with `-p autumn-web`, a quoted `--features "…"` list and
+  `-D warnings`. `check-panic-gate.sh` and `check-determinism-gate.sh` read
+  those lines to prove each gated module is linted with its feature on.
+- **A new script under `scripts/` needs a header comment.** `cargo xtask list`
+  finds scripts by listing the directory and shows that header; a test fails
+  on a script without one. No registry to edit.
+- **Docs gates are moving to `xtask/src/docs/`**, one per PR, on the shared
+  `corpus` and `markdown` modules. `cargo xtask check <name>` runs a ported
+  gate, else `scripts/check-<name>.sh`. A port deletes its script in the same
+  PR, carries the script's `--self-test` cases over as `#[test]`s, and shows
+  the same report as the script on the tree and on mutated copies of the
+  corpus. See `xtask/README.md` "Docs gates".
+- **xtask stays dependency-light**: default features, or the smallest
+  feature set that covers the use (`smop`: `sh` and `fs` only), and never
+  autumn-web, diesel or sqlx. It is a workspace member, so its features are
+  unified into every `cargo build --workspace`.
 
 ---
 
 ## CI test sharding
 
-`.github/workflows/ci.yml` runs the suite as five sibling job families rather
+`.github/workflows/ci.yml` runs the suite as sibling job families rather
 than one job per OS. Which one a test lands in follows from how it is written,
 so it is usually automatic:
 
 | Job | OS | What it runs |
 | --- | --- | --- |
-| `test` | all 3 | `cargo test --workspace -- --skip compile_fail:: --skip sim_` — the default lane, plus a second step running `sim_` at `--test-threads=1` |
-| `trybuild` | Linux | `compile_fail::*` only, split into four shards |
+| `test-build` | Linux | `cargo nextest archive --workspace` once, writing two archives: every test binary (for `test`) and `--test integration_tests` only (for `trybuild`) |
+| `test-archive` | macOS, Windows | `cargo nextest archive --workspace` once per OS, for `test` |
+| `test` | all 3 | from the archive: the default lane (everything but `compile_fail::` and `sim_`) as `--partition count:k/N` slices, plus one `sim` shard per OS running `sim_` one test at a time |
+| `doctest` | all 3 | `cargo test --workspace --doc` (nextest does not run doctests) |
+| `trybuild` | Linux | `compile_fail::*` only, split into four shards, run with `cargo nextest run --archive-file` |
 | `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
 | `test-docker-deploy` | Linux | `deploy_e2e` alone, on a fresh disk (#2547) |
-| `widgets-browser` (own workflow) | Linux | Chromium: axe + keyboard over `/_stories`, the #3397 keyboard suite (#3398), the #3399 toast suite, and widget pack conformance (#3400). Runs only when widget paths change. |
+| `widgets-browser` (own workflow) | Linux | Chromium: axe + keyboard over `/_stories`, the #3397 keyboard suite (#3398), the #3399 toast suite, the #3404 tooltip suite, and widget pack conformance (#3400). Runs only when widget paths change. |
 
 `widgets-browser` is not in `ci.yml`. It is
 `.github/workflows/widgets-browser.yml`, with a `paths:` filter. Its tests are
 `#[ignore]`d and need the `system-tests` feature, so no other job runs them.
 See CONTRIBUTING.md "Widget browser gate".
 
-Only `test` runs on all three OSes. `trybuild` and `test-features` are Linux
+Only `test` and `doctest` run on all three OSes. `trybuild` and `test-features` are Linux
 only: a trybuild golden is pinned to the rustc *version*, not the OS (the same
 `.stderr` file served all three legs), and a feature lane asks whether a
 feature's own suite passes rather than whether a platform works. Cross-platform
@@ -123,15 +189,29 @@ Rules that matter when editing tests:
 
 - **`compile_fail.rs` is partitioned by test-function name.** A new `#[test]`
   in that module runs in the `rest` shard automatically. A **renamed** one does
-  not: `fail`, `pass_a` and `pass_b` name their functions explicitly and assert
-  a non-zero pass count, so a rename fails that shard loudly rather than
+  not: `fail`, `pass_a` and `pass_b` name their functions explicitly and run
+  with `--no-tests=fail`, so a rename fails that shard loudly rather than
   silently skipping it. Rename the shard filter in `ci.yml` alongside.
+- **No test shard compiles the workspace.** Each OS builds it once with
+  `cargo nextest archive --workspace`, and the `test` and `trybuild` shards run
+  from that archive, extracted into their own checkout so compile-time `env!`
+  paths resolve. A Linux shard checked out at a different path (a self-hosted
+  runner slot) builds locally instead. `trybuild` gets its own archive of
+  `--test integration_tests` only: an archive of every test binary ran a
+  shard's disk out. trybuild reads its fixtures' feature set from
+  `target/debug/.fingerprint`, so `.config/nextest.toml` adds that directory
+  to every archive; do not remove it.
+- **The `test` partitions must cover `1/N`..`N/N` per OS.** Change a slice
+  count in the matrix for every slice of that OS at once. A missing slice
+  leaves part of the suite running nowhere while every shard stays green;
+  `repo_hygiene`'s `test_shards_partition_the_workspace_nextest_archive`
+  fails on it.
 - **Branch protection should require `Test suite`** (the `test-gate` job), not
   the individual shards — it is the one check name that survives adding or
   removing a shard.
-- **A new `sim_*` module is single-threaded automatically.** The `test` job
-  skips `sim_` and a second step re-runs exactly that set with
-  `--test-threads=1`. These are determinism tests — each builds a
+- **A new `sim_*` module is single-threaded automatically.** The `test`
+  job's default lane skips `sim_`, and each OS's `sim` shard runs exactly that
+  set one test at a time. These are determinism tests — each builds a
   `start_paused(true)` current-thread runtime and asserts a seed replays
   byte-identically — and they fail under CPU oversubscription. Sharding made
   that *worse*: pulling trybuild out of the binary freed the libtest thread
@@ -139,19 +219,20 @@ Rules that matter when editing tests:
   gaps (863s) to full parallelism (61s), and on the 4-vCPU `ubuntu-latest`
   runner that flipped them. Name a new simulation module `sim_*` and it lands
   in the quiet lane; name it something else and it will not.
-- **A sim wall-clock budget must start after `sim.build`.** The `sim_` lane is
-  a short, freshly-started process, so whichever test mounts the first app in
-  it pays the one-time warm-up for every lazy static behind that app —
-  measured at 2.25s on `macos-latest`. A `let wall_start = Instant::now()`
+- **A sim wall-clock budget must start after `sim.build`.** nextest runs every
+  test in a freshly started process, so every test that mounts an app pays the
+  one-time warm-up for every lazy static behind that app — measured at 2.25s
+  on `macos-latest`. A `let wall_start = Instant::now()`
   placed above `sim.build(...)` charges that warm-up to the virtual-time
   budget and fails on the slow runners only. Start the clock immediately
   before the `advance`/`run_to_idle` under test, as
   `sim_strict_wall_clock`, `sim_advance_to` and `sim_clock_drain` all do.
 - **Process-global state needs its own binary, and sharding enforces that.**
-  The `test` lane now runs its ~1880 tests at full parallelism instead of
-  trickling through trybuild's gaps, so a test that mutates a process-wide
-  singleton and depends on it across several `await`s no longer survives on
-  luck. `TestApp::build` clears the global cache unconditionally, so
+  The `test` job runs each test in its own process under nextest. `cargo test`
+  does not: locally, and in the feature and Docker lanes, a binary's tests run
+  side by side at full parallelism. A test that mutates a process-wide
+  singleton and depends on it across several `await`s does not survive that
+  on luck. `TestApp::build` clears the global cache unconditionally, so
   `capsule_cache_effect` — which installs one and reads it back over two
   requests — had to move to its own `[[test]]` binary, joining
   `cache_global_integration` and `cached_global_backend`. If a test only passes

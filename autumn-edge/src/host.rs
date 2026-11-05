@@ -1007,6 +1007,37 @@ mod tests {
         assert!(detail.contains("execution budget"), "{detail}");
     }
 
+    /// A guest that loops on a failing `memory.grow` runs out of fuel and
+    /// falls through. It must not overflow the host thread. (wasmi 2.0's
+    /// tail-call dispatch did, in a release build too.) The thread has the
+    /// 2 MiB stack of a tokio worker.
+    #[test]
+    fn a_failing_memory_grow_loop_exhausts_its_fuel_and_falls_through() {
+        let wat = r#"(module
+  (memory (export "memory") 1 1)
+  (func (export "_start")
+    (loop $grow (drop (memory.grow (i32.const 1))) (br $grow))))"#;
+        let wasm = wat::parse_str(wat).expect("valid WAT");
+        let artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let kv = InMemoryEdgeKv::new();
+                artifact
+                    .run(&EdgeRequest::get("/grow"), &[], &kv)
+                    .expect("host setup succeeds")
+            })
+            .expect("spawn")
+            .join()
+            .expect("the guest must not crash the host thread");
+
+        let EdgeOutcome::Fallthrough { reason, detail } = outcome else {
+            panic!("expected a fallthrough");
+        };
+        assert_eq!(reason, FallthroughReason::CapsuleError);
+        assert!(detail.contains("execution budget"), "{detail}");
+    }
+
     #[test]
     fn stdout_line_budget_fails_the_write_and_stderr_budget_drops_the_excess() {
         let kv = InMemoryEdgeKv::new();

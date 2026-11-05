@@ -198,5 +198,5 @@ async fn login_is_throttled() {
 | Policy needs to be tuned by ops without a recompile | `[security.rate_limit.named.<name>]` + `#[throttle("name")]` |
 | Tier-based quotas (free vs. pro plan) | `[security.rate_limit.tiers.<name>]` + `RateLimitLayer::with_tier_hook(...)` |
 | Path-prefix override on the global limiter | `RateLimitLayer::with_path_override(...)` |
-| Concurrency ceiling / load shedding rather than request rate | See `docs/guide/load-shedding.md` (unreleased) |
+| Concurrency ceiling / load shedding rather than request rate | See [Overload Protection & Load Shedding](resilience.md#overload-protection--load-shedding) |
 | Failed-login lockout (attempt count, not rate) | `[auth.lockout]` — see `docs/guide/authentication.md` |

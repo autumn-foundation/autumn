@@ -328,7 +328,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_huge_timeout_does_not_overflow() {
         let deadline = Deadline::after(Duration::MAX);
-        assert!(deadline.remaining() > Duration::from_secs(60 * 60 * 24 * 365));
+        assert!(deadline.remaining() > Duration::from_hours(365 * 24));
     }
 
     #[tokio::test(start_paused = true)]

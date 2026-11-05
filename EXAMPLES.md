@@ -31,7 +31,7 @@ blocks publishing `autumn-web` or `autumn-cli`.
 | **Persona** | Developer evaluating Autumn for the first time |
 | **Journey** | First route: install CLI, run the app, see a response |
 | **Key capabilities** | `#[get]`, `routes![]`, `#[autumn_web::main]`, built-in `/health` |
-| **Prerequisites** | Rust 1.88.0+ |
+| **Prerequisites** | Rust 1.97.0+ |
 | **Run command** | `cargo run -p hello` |
 | **Success proof** | `curl http://localhost:3000/hello` returns `Hello, Autumn!` |
 
@@ -46,7 +46,7 @@ blocks publishing `autumn-web` or `autumn-cli`.
 | **Persona** | Developer who needs one heavy, client-side interactive widget inside an otherwise server-rendered Autumn page |
 | **Journey** | WASM island: server-render a maud page whose home route mounts a Yew CSR component compiled to `wasm32-unknown-unknown`, with a custom app-level CSP |
 | **Key capabilities** | maud-owned page, `data-*` island mount point, ES-module loader, `asset_url` static serving, custom `content_security_policy` with `'wasm-unsafe-eval'` |
-| **Prerequisites** | Rust 1.88.0+ (committed wasm artifacts run without a toolchain; rebuilding needs the `wasm32-unknown-unknown` target + `wasm-bindgen-cli`) |
+| **Prerequisites** | Rust 1.97.0+ (committed wasm artifacts run without a toolchain; rebuilding needs the `wasm32-unknown-unknown` target + `wasm-bindgen-cli`) |
 | **Run command** | `cargo run -p flock` |
 | **Success proof** | `curl -sD - -o /dev/null http://127.0.0.1:3000/ \| grep -i content-security-policy` shows `script-src 'self' 'wasm-unsafe-eval'`; the browser page animates the flocking canvas |
 
@@ -64,7 +64,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | **Persona** | Developer building a full-stack Rust web application with an AI-callable API |
 | **Journey** | CRUD app: routes, Diesel model, Maud templates, htmx interactions, bearer-token JSON API, MCP tool projection |
 | **Key capabilities** | `#[model]`, Diesel migrations, Maud, htmx, Tailwind, JSON endpoints, `RequireApiToken`, `#[api_doc(mcp)]`, `mount_mcp` |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL |
 | **Run command** | `cargo run -p todo-app` |
 | **Success proof** | `curl http://localhost:3000/` returns the todo list HTML page; `curl -X POST http://localhost:3000/mcp -H "Authorization: Bearer <token>" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' ` lists `list_json`, `create_json`, `scan_json` |
 
@@ -79,7 +79,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | **Persona** | Developer building a content site with an admin interface |
 | **Journey** | Admin/static rendering: content CRUD, form validation, pre-rendered public pages |
 | **Key capabilities** | `#[static_get]`, `static_routes![]`, `autumn build`, admin UI, input validation |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL |
 | **Run command** | `cargo run -p blog` |
 | **Success proof** | `curl http://localhost:3000/` returns the blog index page |
 
@@ -94,7 +94,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | **Persona** | Developer replacing a WordPress install, or starting a content site |
 | **Journey** | Full CMS: register → author → publish → moderate, with roles, themes and plugins |
 | **Key capabilities** | `#[state_machine]` post lifecycle, `#[searchable]`, `#[cached]` + `invalidates`, `MutationHooks`, `storage::BlobStore`, `#[scheduled]`, capability-based authorization, typed action/filter hooks |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL 12+ (stored generated column), Docker for the full test suite |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL 12+ (stored generated column), Docker for the full test suite |
 | **Run command** | `cargo run -p cms` |
 | **Success proof** | `curl http://localhost:3000/register` returns the registration screen |
 
@@ -109,7 +109,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | **Persona** | Developer adding operational features to an existing Autumn app |
 | **Journey** | Profiles/tasks: generated CRUD API, actuator endpoints, profile-based config, hourly scheduled task |
 | **Key capabilities** | `#[repository]`, `#[scheduled]`, actuator (`/actuator/health`, `/actuator/tasks`), profile layering, app-metrics facade (`autumn_web::metrics` counter + timer on `/actuator/prometheus`), OpenAPI spec + `autumn openapi export` for typed clients |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL |
 | **Run command** | `cargo run -p bookmarks` |
 | **Success proof** | `curl http://localhost:3000/actuator/health` returns `{"status":"UP"}` |
 
@@ -154,7 +154,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | **Persona** | Developer adding audit trails and lifecycle hooks to a content model, or serving Markdown-backed docs pages |
 | **Journey** | Hooks/revisions: slug lifecycle, before/after-save hooks, full revision history, REST API. Docs: embedded `content/*.md` rendered live at `/docs/{slug}` and pre-rendered to `dist/` by the same handler |
 | **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API, `markdown` feature (`MarkdownRegistry` + frontmatter + TOC) composed with `#[static_get]` SSG, `autumn-search` plugin (ranked keyword search, `GET /api/v1/search`) alongside the in-core `#[searchable]` FTS route |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL |
 | **Run command** | `cargo run -p wiki` |
 | **Success proof** | `curl http://localhost:3000/api/v1/pages` returns `[]` |
 
@@ -169,7 +169,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | **Persona** | Developer building a production-shaped Autumn application and exploring the full feature set |
 | **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, cookie consent, and live-tunable runtime config |
 | **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService`, typed accessible form primitives (`a11y::TextField`/`TextArea`/`Select`/`Button` — an unlabeled field does not compile), the `ChangesetForm` validation round-trip with inline errors and a no-JavaScript form POST, sanitized user-submitted rich text (`markdown::render_user_content`), offset pagination (`PageRequest` + `pagination_nav`, plain `<a href>` page links), cookie consent (`inject_consent_banner`, the `Consent` gate, a withdraw flow), failure capsules (`[failure_capture]` behind the `capsules` profile + a committed capsule and an `autumn replay` walkthrough), and deterministic simulation testing (a seeded `#[sim_test]` over the hot-rank decay curve, and a nightly seed sweep of the whole app) |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
 | **Success proof** | `curl http://localhost:3000/` returns the front-page HTML *and* the cookie-consent banner; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing the site's communities and posts; `curl 'http://localhost:3000/r/rust?page=2'` returns page 2 with a `<nav aria-label="Pagination">` of plain links |
 
@@ -184,7 +184,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | **Persona** | Developer evaluating Autumn who wants a complete, runnable SaaS archetype rather than hand-assembled primitives |
 | **Journey** | Multi-tenant SaaS: sign up an organisation → log in → a tenant-scoped dashboard that only ever shows the signed-in organisation's projects |
 | **Key capabilities** | Session auth (`Session` + bcrypt `hash_password`/`verify_password`), row-level multi-tenancy (`#[repository(tenant_scoped)]` + `with_tenant`), Maud + htmx UI |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL |
 | **Run command** | `cargo run -p saas` |
 | **Success proof** | After signing up in the browser, `GET /dashboard` returns `200 OK` with the tenant's projects; a second organisation never sees the first's data |
 
@@ -203,7 +203,7 @@ The committed tree here is the rendered form of the embedded starter; the
 | **Persona** | Developer building a multi-user B2B SaaS who needs teammates, roles, and email invitations without hand-rolling the join table, token record, and accept route |
 | **Journey** | Team membership: sign up → get a personal organization as `Owner` → invite a teammate by email and role → they accept (signup-then-join or direct join) → a role-gated member-management screen |
 | **Key capabilities** | Row-level multi-tenancy with the active organization as tenant (`#[repository(tenant_scoped)]`, issue #695), a closed `Role` enum + hierarchy-aware `require_role` guard layered on the existing session/Policy role plumbing (issue #496), `#[mailer]` invitation email, idempotent invite-accept, last-`Owner` protection |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL |
 | **Run command** | `cargo run -p teams` |
 | **Success proof** | After signing up in the browser, `GET /members` returns `200 OK` showing the signer as `owner`; inviting a teammate and following the accept link in the dev mailbox creates exactly one `Membership` row even on a double-click |
 
@@ -218,7 +218,7 @@ The committed tree here is the rendered form of the embedded starter; the
 | **Persona** | Developer building interactive video/audio who is evaluating `autumn-media-plugin` |
 | **Journey** | Install the media plugin with rooms → create a room from an app handler via the plugin-installed `RoomService` → list the created rooms |
 | **Key capabilities** | `MediaPlugin::new().config(media).with_rooms()`, the `RoomService` `AppState` extension, the plugin-mounted room routes under `/api/media`, a shared `AppState` extension |
-| **Prerequisites** | Rust 1.88.0+ |
+| **Prerequisites** | Rust 1.97.0+ |
 | **Run command** | `cargo run -p media-room` |
 | **Success proof** | `curl -X POST http://localhost:3000/rooms` then `curl http://localhost:3000/api/rooms` returns the created room's JSON |
 
@@ -236,7 +236,7 @@ Boots with no database or `MediaMTX` server; the companion narrative is
 | **Persona** | Developer who needs multiplayer editing and does not want to rent a real-time backend |
 | **Journey** | Mark a field `#[collaborative]` → open one note in two browsers → type in both → watch the text merge character by character with a live participant list |
 | **Key capabilities** | `#[collaborative]` field marker, `CollabText` (an in-tree RGA text CRDT), `CollabHub` + `serve_socket` over the existing `#[ws]`/channel/presence seams, a 150-line browser replica, cursor reporting |
-| **Prerequisites** | Rust 1.88.0+ |
+| **Prerequisites** | Rust 1.97.0+ |
 | **Run command** | `cargo run -p collab-notes` |
 | **Success proof** | `curl -s http://localhost:3000/notes/1 \| grep -o 'data-socket="[^"]*"'` prints `data-socket="/notes/1/collab"`; opening that page in two browser windows and typing in both leaves both windows showing the same merged text |
 
@@ -254,7 +254,7 @@ is `docs/guide/collaboration.md`.
 | **Persona** | Developer building billing/reporting features who needs a downloadable PDF |
 | **Journey** | Render one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` |
 | **Key capabilities** | `autumn_web::pdf::Pdf::from_markup`, `.filename(...)`, the `Clock` extractor for deterministic rendering, `TestResponse::assert_pdf_contains`, a `#[lifecycle]` invoice state machine proven sound at compile time |
-| **Prerequisites** | Rust 1.88.0+ |
+| **Prerequisites** | Rust 1.97.0+ |
 | **Run command** | `cargo run -p invoice` |
 | **Success proof** | `curl -OJ http://localhost:3000/invoices/42/pdf` downloads `invoice-42.pdf` |
 
@@ -271,7 +271,7 @@ Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`
 | **Persona** | Developer with a TypeScript/React front end who wants an Autumn backend, and wants to see how a GraphQL surface interacts with `#[model]`, `#[repository]`, hooks, and the pool |
 | **Journey** | SPA + GraphQL on a real model: Autumn renders the page shell → a committed Vite/React 19/TypeScript bundle mounts into it → the bundle queries and mutates over GraphQL served by a generic `GraphqlPlugin` → every resolver goes through the generated `PgNoteRepository`, so normalisation, validation, and hooks behave identically for GraphQL and the generated REST handlers |
 | **Key capabilities** | `#[model]` with `#[normalize(trim)]` + `#[validate]`, `MutationHooks` (`before_create` validation, `before_delete` rule), `#[repository(hooks = …, api = …)]` with a derived finder and generated REST CRUD mounted beside GraphQL, `PgNoteRepository::with_pool_untracked` from `AppState` in resolvers, an `on_startup` seed that runs once across instances under a transaction-scoped advisory lock, embedded migrations, `AutumnError` → GraphQL error with `extensions.status`, `Plugin` + `AppBuilder::nest` + `declare_plugin_routes` (audit-clean raw router), `PluginContract` + `plugin_conformance::run_conformance`, Maud shell + `asset_url` under the default `script-src 'self'` CSP, `autumn build --embed` single-binary deploy (`embed_static!` + `.embedded_static`), `GET /graphql/sdl` with a committed-SDL drift test, two-tier tests (`TestApp` without Docker; `TestDb` testcontainer with the real migration applied) |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL (`docker compose up -d` in the example directory provides one); the React bundle is committed, so Node 20.19+/22.12+ is needed only to change the frontend |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL (`docker compose up -d` in the example directory provides one); the React bundle is committed, so Node 20.19+/22.12+ is needed only to change the frontend |
 | **Run command** | `cargo run -p react-graphql` |
 | **Success proof** | `curl -s http://127.0.0.1:3000/graphql -H 'content-type: application/json' -d '{"query":"{ notes { title } }"}'` returns `{"data":{"notes":[{"title":"Welcome to Autumn Notes"},{"title":"Try the GraphQL endpoint"}]}}` (seeded on boot); `curl -s http://127.0.0.1:3000/api/notes` returns the same rows through the generated REST handler; the browser page lists them and adds a third from its form without a reload |
 
@@ -286,7 +286,7 @@ Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`
 | **Persona** | Developer who knows the conventions and asks: "What do I do when `#[model]` + `#[repository]` is not enough?" |
 | **Journey** | Convention first, then the hatch: each hatch in a stockroom app starts from the convention, names the exact limit, and has a test that proves the limit and the fix (a lost-update hazard test comes first) |
 | **Key capabilities** | `with_lock` (baseline); `Db::tx` + guarded Diesel `UPDATE` for an all-or-nothing cart; a set-based Diesel `UPDATE`; `diesel::sql_query` + `QueryableByName` for a window function; `#[intercept]` with a custom tower layer; `.scoped(..)` with `RequireApiToken`; a CSRF `exempt_paths` for bearer clients; `.layer(..)` with `tower_http`; `.nest(..)` + `ServeDir` + `declare_plugin_routes`; a `Plugin` around a plain Axum router with its own state; `.merge(..)` (in a test); `.error_pages(..)`; `.exception_filter(..)`; `.with_pool_provider(..)` that reads a rotated password file; a `201 Created` + `Location` tuple response |
-| **Prerequisites** | Rust 1.88.0+, PostgreSQL (`docker compose up -d` in the example directory provides one) |
+| **Prerequisites** | Rust 1.97.0+, PostgreSQL (`docker compose up -d` in the example directory provides one) |
 | **Run command** | `STOCKROOM_SCANNER_TOKEN=dev-scanner-token cargo run -p escape-hatches` |
 | **Success proof** | After the README's seed `INSERT`, `curl -si http://127.0.0.1:3000/api/checkout -H 'authorization: Bearer dev-scanner-token' -H 'content-type: application/json' -d '{"order_ref":"o-100","lines":[{"sku":"HAM-1","quantity":2}]}'` returns `201 Created` with `location: /api/orders/o-100`; `curl -s http://127.0.0.1:3000/reports/stock-value` returns the top products per category |
 
@@ -312,7 +312,7 @@ load a page" — it has its own dedicated CI job instead.
 | **Persona** | Developer who wants a read-path route served from the CDN edge without maintaining a second codebase |
 | **Journey** | Edge lane: mark a `GET` handler `#[edge]`, register it with `edge_routes![]`, and get a portable `wasm32-wasip1` capsule out of the same `autumn build` — with the origin binary still the authority and the fallback |
 | **Key capabilities** | `#[edge]`, `#[edge(needs(kv))]`, `edge_routes![]`, `autumn_edge::serve`, `EdgeCache` over the `EdgeKv` seam, `AppBuilder::with_edge_kv`, the NDJSON capsule wire protocol |
-| **Prerequisites** | Rust 1.88.0+ and the `wasm32-wasip1` target (`rustup target add wasm32-wasip1`) |
+| **Prerequisites** | Rust 1.97.0+ and the `wasm32-wasip1` target (`rustup target add wasm32-wasip1`) |
 | **Run command** | `cargo run -p edge-greeting` (origin); `cargo build -p edge-greeting --target wasm32-wasip1 --release --bin edge-capsule` (capsule) |
 | **Success proof** | `curl http://localhost:3000/greet/ada` returns `Hello, ada!`; `cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1` proves the capsule answers a request corpus byte-identically to the origin |
 | **Rationale for the tier** | Its proof is a conformance suite against a real wasm artifact, not a Chromium smoke, and it needs a toolchain target the supported fleet does not install. The dedicated `edge-conformance` CI job runs it on every push. |
@@ -331,7 +331,7 @@ design record is `docs/adr/0011-edge-capsule-read-lane.md`.
 | **Persona** | Operator of a single-binary Autumn app who wants to deploy continuously without a load balancer, a cold cache, or a dropped connection |
 | **Journey** | In-place upgrade: designate a block of live state, build a new binary whose state shape changed, `kill -USR2`, and watch the same socket keep serving while the state is carried across a compile-checked migration |
 | **Key capabilities** | `AppBuilder::with_live_state`, `with_live_state_from`, `AppState::live_state`, `state_migration!`, `LiveStateHandle` freeze semantics, `[server.upgrade]` |
-| **Prerequisites** | Rust 1.88.0+ on Linux or another Unix. No database, no config file |
+| **Prerequisites** | Rust 1.97.0+ on Linux or another Unix. No database, no config file |
 | **Run command** | `cargo build -p hot-upgrade`, then `AUTUMN_UPGRADE_BINARY=target/debug/hot-upgrade-v2 ./target/debug/hot-upgrade-v1` |
 | **Success proof** | `cargo test -p hot-upgrade --test live_upgrade` boots the real v1 binary, upgrades it to the real v2 binary under sustained load, and asserts zero refused connections, zero failed reads, 100% carry-over of the pre-upgrade value, and a bounded cutover latency spike |
 | **Rationale for the tier** | Its proof is a live two-process upgrade under load, not a Chromium smoke: what it demonstrates has no page to click. The test runs in the ordinary `cargo test --workspace` lane. |
@@ -350,7 +350,7 @@ Two binaries rather than one — the whole point is the *old* build becoming the
 | **Persona** | Team carving the first service out of an Autumn monolith |
 | **Journey** | Service contract, callee side: mark a typed handler `#[endpoint]` and let the framework emit the contract its callers are compiled against |
 | **Key capabilities** | `#[endpoint]`, `#[derive(WireShape)]`, the JSON wire descriptor build artifact |
-| **Prerequisites** | Rust 1.88.0+. No database, no config file |
+| **Prerequisites** | Rust 1.97.0+. No database, no config file |
 | **Run command** | `AUTUMN_SERVER__PORT=3001 cargo run -p mesh-catalog` |
 | **Success proof** | `curl http://127.0.0.1:3001/items/42` returns the item as JSON; `target/autumn-contracts/` carries its wire descriptors |
 | **Rationale for the tier** | Half of a two-crate pair whose proof is a *compile-time* contract failure in its sibling, not a browser smoke. See `examples/mesh-storefront`. |
@@ -368,7 +368,7 @@ Boots with no database; the companion narrative is `docs/guide/wire-contracts.md
 | **Persona** | Team carving the first service out of an Autumn monolith |
 | **Journey** | Service contract, caller side: call another Autumn service through a generated typed client, and have a breaking change on the callee fail *this* build at the call site |
 | **Key capabilities** | `wire_client!`, `#[contract_checked]`, `autumn_web::wire::Endpoint`, `NoBody` |
-| **Prerequisites** | Rust 1.88.0+ and `examples/mesh-catalog` in the same workspace |
+| **Prerequisites** | Rust 1.97.0+ and `examples/mesh-catalog` in the same workspace |
 | **Run command** | `CATALOG_URL=http://127.0.0.1:3001 cargo run -p mesh-storefront` |
 | **Success proof** | `python3 scripts/wire-contract-sweep.py` seeds wire-breaking and compatible changes into `mesh-catalog` and reports that every breaking one turns `cargo build` red with a caller-named error, and no compatible one is rejected |
 | **Rationale for the tier** | Its proof is a build that must *fail*, which no Chromium smoke can express. The sweep script is the dedicated proof. |

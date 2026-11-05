@@ -5,12 +5,12 @@
 #
 # WHY THIS EXISTS: the corpus already gates the seven things a reader copies off
 # a page and the one thing they cannot copy at all.
-# `scripts/check-docs-links.sh` gates its *links* (a 404 on GitHub),
+# `xtask/src/docs/links.rs` gates its *links* (a 404 on GitHub),
 # `scripts/check-docs-cli.sh` its *commands* (`unrecognized subcommand`),
 # `scripts/check-docs-config.sh` the `AUTUMN_*` variables they SET (a silent
 # no-op), `scripts/check-docs-toml.sh` the `autumn.toml` keys they WRITE
 # (dropped silently), `scripts/check-docs-symbols.sh` the `autumn_web::…` paths
-# they IMPORT (E0432 against their own file), `scripts/check-docs-routes.sh`
+# they IMPORT (E0432 against their own file), `xtask/src/docs/routes.rs`
 # the `/actuator/…` URLs they CURL, `scripts/check-docs-macro-args.sh` the
 # keyword arguments they put inside an attribute macro,
 # `scripts/check-docs-versions.sh` the dependency pin every one of those is
@@ -307,7 +307,7 @@
 #          snippet this page offers -->
 #
 # A waiver covers its own blank-line-separated block and the one above it, the
-# same scope `check-docs-routes.sh` and `check-docs-versions.sh` give theirs: a
+# same scope `xtask/src/docs/routes.rs` and `check-docs-versions.sh` give theirs: a
 # page-wide waiver silently re-admits the defect the gate exists to catch. The
 # baseline needed none — all eight defects were real, including the three under
 # "**You write:**" — so the mechanism ships unexercised by the corpus and
@@ -366,7 +366,7 @@ def in_scope(path):
 
 # `readme = "…"` in a crate manifest names that crate's crates.io landing page.
 # It is reader-facing by PUBLICATION rather than by where it sits in the tree,
-# which is why a directory-shaped rule cannot reach it — `check-docs-routes.sh`
+# which is why a directory-shaped rule cannot reach it — `xtask/src/docs/routes.rs`
 # reads the manifests for exactly this reason, and its argument carries here
 # unchanged: these pages carry `autumn_web::…` paths and `AUTUMN_*` variables
 # the same way they carry `/actuator/…` URLs.
@@ -2125,7 +2125,7 @@ def waived_lines(text):
     A waiver covers its own blank-line-separated block and the one directly
     above it — the passage it was written for. Anything further down the page
     is still reported, because a page-wide waiver silently re-admits the defect
-    the gate exists to catch. Same scope as `check-docs-routes.sh`'s.
+    the gate exists to catch. Same scope as `xtask/src/docs/routes.rs`'s.
     """
     lines = text.splitlines()
     block_of = []

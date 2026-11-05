@@ -3,7 +3,7 @@
 # docs tell someone to SET must name a config key that exists.
 #
 # WHY THIS EXISTS: the corpus already gates the two things a reader copies off a
-# page and finds out about immediately — its links (`check-docs-links.sh`, a 404)
+# page and finds out about immediately — its links (`xtask/src/docs/links.rs`, a 404)
 # and its commands (`check-docs-cli.sh`, `unrecognized subcommand`). This gates
 # the third thing they copy, and the only one of the three that fails *silently*.
 #
@@ -371,8 +371,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Kept in Python for the same reason as its two sibling gates: snapshot
 # prefix matching and code-fence-aware scanning are both work bash renders
-# unreadable, and python3 is already a dependency of check-docs-links.sh,
-# check-docs-cli.sh and check-plugin-freshness.sh.
+# unreadable, and python3 is already a dependency of check-docs-cli.sh and
+# check-plugin-freshness.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
 import tomllib
@@ -444,7 +444,7 @@ SELF = 'scripts/check-docs-config.sh'
 # `.claude/skills/` is a SECOND skill tree, not a copy of `skills/`: the agent
 # machinery loads a `SKILL.md` there by name, which is why
 # `check-docs-orphans.sh` seeds both trees as reader entry surfaces and why
-# `check-docs-routes.sh` reads both for `/actuator/…` paths. `run-autumn` lives
+# `xtask/src/docs/routes.rs` reads both for `/actuator/…` paths. `run-autumn` lives
 # only here, and its SKILL.md is copy-and-run text end to end — `autumn seed
 # --package`, `autumn routes --bin`, `AUTUMN_SERVER__PORT`,
 # `AUTUMN_DATABASE__URL`, `-p autumn-web`. It already carries
@@ -5766,7 +5766,7 @@ def source_tokens(root):
 
 # `readme = "…"` in a crate manifest names that crate's crates.io landing page.
 # It is reader-facing by PUBLICATION rather than by where it sits in the tree,
-# which is why a directory-shaped rule cannot reach it — `check-docs-routes.sh`
+# which is why a directory-shaped rule cannot reach it — `xtask/src/docs/routes.rs`
 # reads the manifests for exactly this reason, and its argument carries here
 # unchanged: these pages carry `autumn_web::…` paths and `AUTUMN_*` variables
 # the same way they carry `/actuator/…` URLs.

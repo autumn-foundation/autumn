@@ -29,9 +29,9 @@ use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_
 const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
     ("axum", "\"0.8\""),
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
-    ("sha2", "{ version = \"0.10\", features = [] }"),
+    ("sha2", "{ version = \"0.11\", features = [] }"),
     ("hex", "\"0.4\""),
-    ("rand", "{ version = \"0.9\", features = [\"os_rng\"] }"),
+    ("rand", "{ version = \"0.10\", features = [\"sys_rng\"] }"),
     ("tokio", "{ version = \"1\", features = [\"time\"] }"),
     ("tracing", "\"0.1\""),
 ];
@@ -42,14 +42,14 @@ const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
 ///   `WebAuthn` ceremony implementation. State serialisation lets the in-progress
 ///   ceremony challenge survive across requests via the session.
 /// - `uuid` generates random credential IDs if the authenticator doesn't supply one.
-/// - `conditional-ui` gates `start/finish_discoverable_authentication` in webauthn-rs 0.5.
+/// - `conditional-ui` gates `start/finish_discoverable_authentication` in webauthn-rs.
 const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
     (
         "webauthn-rs",
-        "{ version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }",
+        "{ version = \"0.6\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }",
     ),
     ("uuid", "{ version = \"1\", features = [\"v4\"] }"),
-    ("base64", "\"0.22\""),
+    ("base64", "\"0.23\""),
 ];
 
 /// The byte index of the first occurrence of `needle` in `s` that falls
@@ -224,7 +224,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
             .collect();
 
         if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
-            let version = rest.split('"').next().unwrap_or("0.5");
+            let version = rest.split('"').next().unwrap_or("0.6");
             lines[i] = format!(
                 "{indent}{CRATE} = {{ version = \"{version}\", features = [{feats_csv}] }}"
             );
@@ -356,8 +356,8 @@ const TOTP_EXTRA_DEPS: &[(&str, &str)] = &[
         "totp-rs",
         "{ version = \"5\", features = [\"qr\", \"gen_secret\", \"otpauth\"] }",
     ),
-    ("aes-gcm", "\"0.10\""),
-    ("base64", "\"0.22\""),
+    ("aes-gcm", "\"0.11\""),
+    ("base64", "\"0.23\""),
 ];
 
 /// `totp-rs` cargo features the generated `--totp` routes rely on
@@ -1100,7 +1100,10 @@ fn plan_auth_with_providers_ex_impl(
         .chain(AUTH_EXTRA_DEPS.iter().copied())
         .chain(if totp { TOTP_EXTRA_DEPS } else { &[] }.iter().copied())
         .collect();
-    // The `--totp` routes add `base64 = "0.22"` and use its 0.21+ `Engine`
+    // `ensure_cargo_dependencies` is name-only, so an app that pins an older
+    // crate keeps it. The generated code uses the `rand` 0.10 API. Warn.
+    super::model::warn_if_existing_dep_below_version(&mut plan, &cargo_existing, "rand", 0, 10);
+    // The `--totp` routes add `base64 = "0.23"` and use its 0.21+ `Engine`
     // API; `ensure_cargo_dependencies` is name-only, so an app pinning an older
     // `base64` keeps it and the generated 2FA code won't compile. Warn instead.
     if totp {
@@ -1628,9 +1631,17 @@ fn plan_auth_options_impl(
             .unwrap_or_else(|| read_or_empty(&cargo_toml_path));
         let all_passkey_deps: Vec<(&str, &str)> = PASSKEY_EXTRA_DEPS.to_vec();
         // `ensure_cargo_dependencies` is name-only, so an app that already pins
-        // an older `base64` keeps it and never gets `0.22`; the emitted
+        // an older `base64` keeps it and never gets `0.23`; the emitted
         // `encode_cred_id` needs the 0.21+ `Engine` API, so warn if it's too old.
         super::model::warn_if_existing_dep_below_version(&mut plan, &base_cargo, "base64", 0, 22);
+        // The emitted passkey code uses the `webauthn-rs` 0.6 API.
+        super::model::warn_if_existing_dep_below_version(
+            &mut plan,
+            &base_cargo,
+            "webauthn-rs",
+            0,
+            6,
+        );
         let with_deps = super::model::ensure_cargo_dependencies(&base_cargo, &all_passkey_deps);
         // If the project already declared webauthn-rs without the required features,
         // ensure_cargo_dependencies would have skipped it; merge them here.
@@ -3027,6 +3038,7 @@ use autumn_web::auth::{{
     hash_password, hash_remember_token, parse_remember_cookie_value, verify_password,
 }};
 use autumn_web::extract::Query;
+use autumn_web::form::{{FieldOptions, password_input_with}};
 use autumn_web::prelude::*;
 use axum::extract::Path;
 use axum::response::{{IntoResponse, Response}};
@@ -3050,6 +3062,12 @@ use crate::schema::{table};
 
 fn redirect_to(url: &str) -> Response {{
     axum::response::Redirect::to(url).into_response()
+}}
+
+/// A password field from `autumn_web::form`. The page shows the error
+/// itself, so the changeset is empty.
+fn password_field(field: &str, label: &str, options: FieldOptions<'_>) -> Markup {{
+    password_input_with(&Changeset::new(()), field, label, &options)
 }}
 
 // ── Persistent "remember-me" login (issue #1397) ─────────────────────────────
@@ -3953,11 +3971,8 @@ fn render_signup_form(
                 label for="email" {{ "Email" }}
                 input type="email" id="email" name="email" required autocomplete="email";
             }}
-            div {{
-                label for="password" {{ "Password (" (min_len) "+ characters)" }}
-                input type="password" id="password" name="password" required
-                      autocomplete="new-password" minlength=(min_len);
-            }}
+            (password_field("password", &format!("Password ({{min_len}}+ characters)"),
+                FieldOptions::new().required().new_password().minlength(min_len).strength_hint().reveal()))
             button type="submit" {{ "Sign Up" }}
         }}
         p {{ a href="/login" {{ "Already have an account? Log in" }} }}
@@ -4121,11 +4136,7 @@ pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Optio
                 label for="email" {{ "Email" }}
                 input type="email" id="email" name="email" required autocomplete="email";
             }}
-            div {{
-                label for="password" {{ "Password" }}
-                input type="password" id="password" name="password" required
-                      autocomplete="current-password";
-            }}
+            (password_field("password", "Password", FieldOptions::new().required().current_password().reveal()))
             label {{
                 input type="checkbox" name="remember" value="on";
                 " Remember me on this device"
@@ -4662,18 +4673,12 @@ fn render_change_password_form(
         }}
         form action="/account/password" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
-            div {{
-                label for="current-password" {{ "Current password" }}
-                input type="password" id="current-password" name="current_password" autocomplete="current-password" required;
-            }}
-            div {{
-                label for="new-password" {{ "New password" }}
-                input type="password" id="new-password" name="new_password" autocomplete="new-password" required;
-            }}
-            div {{
-                label for="new-password-confirmation" {{ "Confirm new password" }}
-                input type="password" id="new-password-confirmation" name="new_password_confirmation" autocomplete="new-password" required;
-            }}
+            (password_field("current_password", "Current password",
+                FieldOptions::new().required().current_password().reveal_label("Show current password")))
+            (password_field("new_password", "New password",
+                FieldOptions::new().required().new_password().strength_hint().reveal_label("Show new password")))
+            (password_field("new_password_confirmation", "Confirm new password",
+                FieldOptions::new().required().new_password().reveal_label("Show confirmation")))
             button type="submit" {{ "Change Password" }}
         }}
         p {{ a href="/account" {{ "← Back to account" }} }}
@@ -4873,10 +4878,7 @@ fn render_change_email_form(
                 label for="new-email" {{ "New email address" }}
                 input type="email" id="new-email" name="new_email" autocomplete="email" required;
             }}
-            div {{
-                label for="current-password" {{ "Current password" }}
-                input type="password" id="current-password" name="current_password" autocomplete="current-password" required;
-            }}
+            (password_field("current_password", "Current password", FieldOptions::new().required().current_password().reveal()))
             button type="submit" {{ "Send Confirmation Link" }}
         }}
         p {{ a href="/account" {{ "← Back to account" }} }}
@@ -5233,10 +5235,7 @@ pub async fn reauth_form(
         form action="/reauth" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="return_to" value=(return_to);
-            div {{
-                label for="password" {{ "Password" }}
-                input type="password" id="password" name="password" autocomplete="current-password" required;
-            }}
+            (password_field("password", "Password", FieldOptions::new().required().current_password().reveal()))
             {totp_reauth_field}
             button type="submit" {{ "Confirm" }}
         }}
@@ -5296,10 +5295,7 @@ pub async fn reauth(
                 form action="/reauth" method="post" {{
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(ret);
-                    div {{
-                        label for="password" {{ "Password" }}
-                        input type="password" id="password" name="password" autocomplete="current-password" required;
-                    }}
+                    (password_field("password", "Password", FieldOptions::new().required().current_password().reveal()))
                     {totp_reauth_field}
                     button type="submit" {{ "Confirm" }}
                 }}
@@ -5553,11 +5549,8 @@ fn render_reset_password_form(
         form action="/reset-password" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="token" value=(token);
-            div {{
-                label for="password" {{ "New Password (" (min_len) "+ characters)" }}
-                input type="password" id="password" name="password" required
-                      autocomplete="new-password" minlength=(min_len);
-            }}
+            (password_field("password", &format!("New Password ({{min_len}}+ characters)"),
+                FieldOptions::new().required().new_password().minlength(min_len).strength_hint().reveal()))
             button type="submit" {{ "Set New Password" }}
         }}
     }})
@@ -5730,9 +5723,9 @@ pub async fn reset_password(
 
 /// Generate a 32-byte cryptographically-random reset token, hex-encoded.
 fn generate_reset_token() -> String {{
-    use rand::TryRngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS RNG failed");
     hex::encode(bytes)
@@ -5998,9 +5991,9 @@ pub async fn resend_confirmation(
 
 /// Generate a 32-byte cryptographically-random confirmation token, hex-encoded.
 fn generate_confirmation_token() -> String {{
-    use rand::TryRngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS RNG failed");
     hex::encode(bytes)
@@ -7674,7 +7667,7 @@ password hashing, and mail primitives.
 
 - **Passwords**: Hashed with bcrypt (cost 12) via `autumn_web::auth::hash_password`.
   Raw passwords are never logged or stored.
-- **Reset tokens**: 32-byte random values generated with `OsRng`; only the
+- **Reset tokens**: 32-byte random values generated with `SysRng`; only the
   SHA-256 digest is stored in `reset_token_digest`. The raw token is sent by
   email only and expires after 2 hours.
 - **Non-enumeration**: Duplicate signup, failed login, unconfirmed-login,
@@ -8584,6 +8577,7 @@ const fn totp_imports_src() -> &'static str {
      use aes_gcm::{Aes256Gcm, Key, Nonce};\n\
      use base64::Engine as _;\n\
      use base64::engine::general_purpose::STANDARD as B64;\n\
+     use autumn_web::form::{OtpFormat, otp_input_with};\n\
      use totp_rs::{Algorithm, Secret, TOTP};\n\
      use crate::models::recovery_code::{NewRecoveryCode, RecoveryCode};\n\
      use crate::schema::recovery_codes;\n"
@@ -8936,11 +8930,11 @@ fn totp_enc_key() -> AutumnResult<[u8; 32]> {
 
 /// Encrypt a TOTP secret for storage. Output is base64(nonce ‖ ciphertext).
 fn encrypt_secret(plaintext: &[u8]) -> AutumnResult<String> {
-    use rand::TryRngCore;
+    use rand::TryRng;
     let key = totp_enc_key()?;
     let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::from(&key));
     let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut nonce_bytes)
         .map_err(|_| AutumnError::internal_server_error_msg("RNG failure generating nonce"))?;
     let nonce = <&Nonce<_>>::from(&nonce_bytes);
@@ -8965,7 +8959,8 @@ fn decrypt_secret(stored: &str) -> AutumnResult<Vec<u8>> {
         ));
     }
     let (nonce_bytes, ct) = raw.split_at(12);
-    let nonce = <&Nonce<_>>::from(nonce_bytes);
+    let nonce = <&Nonce<_>>::try_from(nonce_bytes)
+        .map_err(|_| AutumnError::internal_server_error_msg("stored TOTP secret is malformed"))?;
     cipher
         .decrypt(nonce, ct)
         .map_err(|_| AutumnError::internal_server_error_msg("failed to decrypt TOTP secret"))
@@ -9024,9 +9019,9 @@ fn verify_totp_code(totp: &TOTP, code: &str) -> Option<i64> {
 
 /// Generate one human-friendly single-use recovery code (10 hex chars, grouped).
 fn generate_recovery_code() -> String {
-    use rand::TryRngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 5];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS RNG failed");
     let hexs = hex::encode(bytes);
@@ -9065,22 +9060,16 @@ pub async fn two_factor_status(
             p { "You have " (remaining) " recovery codes remaining." }
             form action="/account/2fa/disable" method="post" {
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
-                p {
-                    label for="disable-password" { "Confirm with your password" }
-                    input type="password" id="disable-password" name="password" autocomplete="current-password";
-                    label for="disable-code" { "or a current 6-digit code" }
-                    input type="text" id="disable-code" name="code" inputmode="numeric" autocomplete="one-time-code";
-                }
+                (password_field("password", "Confirm with your password", FieldOptions::new().current_password().reveal()))
+                // One input: paste and SMS autofill fill all six boxes.
+                (otp_input_with(&Changeset::new(()), "code", "or a current 6-digit code", OtpFormat::digits(6), &FieldOptions::new()))
                 button type="submit" { "Disable two-factor" }
             }
         } @else {
             p { "Two-factor authentication is " strong { "disabled" } "." }
             form action="/account/2fa/enable" method="post" {
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
-                p {
-                    label for="enable-password" { "Confirm your password to begin enrollment:" }
-                    input type="password" id="enable-password" name="password" autocomplete="current-password" required;
-                }
+                (password_field("password", "Confirm your password to begin enrollment:", FieldOptions::new().required().current_password().reveal()))
                 button type="submit" { "Enable two-factor" }
             }
         }
@@ -9167,8 +9156,7 @@ pub async fn two_factor_enable(
         p { "Enter the 6-digit code shown in your app to finish enabling 2FA." }
         form action="/account/2fa/confirm" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
-            label for="confirm-code" { "6-digit code" }
-            input type="text" id="confirm-code" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+            (otp_input_with(&Changeset::new(()), "code", "6-digit code", OtpFormat::digits(6), &FieldOptions::new().required()))
             button type="submit" { "Confirm and enable" }
         }
     }))
@@ -9715,7 +9703,7 @@ fn magic_link_routes_section_src(
 // Generated by `autumn generate auth --magic-link` (issue #1328). Edit freely.
 //
 // Security properties:
-// - Tokens are 32-byte random values (`OsRng`); only their SHA-256 digest is
+// - Tokens are 32-byte random values (`SysRng`); only their SHA-256 digest is
 //   persisted (`magic_link_tokens.token_digest`). The raw token appears only in
 //   the emailed link — never in the database, logs, or error reports.
 // - Scanner-safe verify: `GET /login/magic/verify?token=…` NEVER consumes the
@@ -9837,7 +9825,7 @@ pub async fn magic_link_request(
             .unwrap_or(0);
 
         if recent == 0 {
-            // Reuse the reset-token generator: 32-byte OsRng hex. Only the
+            // Reuse the reset-token generator: 32-byte SysRng hex. Only the
             // SHA-256 digest is stored; the raw token appears only in the link.
             let raw_token = generate_reset_token();
             let token_digest = sha256_hex(&raw_token);
@@ -10439,12 +10427,11 @@ use webauthn_rs::prelude::*;
 
 /// Encode an opaque credential ID as a base64url (no padding) string.
 ///
-/// webauthn-rs 0.5's `CredentialID` is a `HumanBinaryData` newtype over
-/// `Vec<u8>` and no longer implements `Display`/`ToString`, so encode the raw
-/// bytes explicitly. Registration and login use this same helper, keeping the
-/// stored `credential_id` and the login lookup key byte-for-byte consistent.
+/// `CredentialID` is a `Vec<u8>` and has no `Display`, so encode the raw
+/// bytes. Registration and login use this helper, so the stored
+/// `credential_id` and the login lookup key are the same bytes.
 fn encode_cred_id(cred_id: &CredentialID) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id.as_ref())
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id.as_slice())
 }
 
 fn redirect_to(url: &str) -> axum::response::Redirect {
@@ -11282,6 +11269,61 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// The generated app stamps the majors that this release supports.
+    #[test]
+    fn generated_auth_stamps_current_dependency_majors() {
+        let stamp = |deps: &[(&str, &'static str)], name: &str| {
+            deps.iter()
+                .find(|(crate_name, _)| *crate_name == name)
+                .map_or_else(|| panic!("{name} must be stamped"), |(_, spec)| *spec)
+        };
+        for (deps, name, version) in [
+            (AUTH_EXTRA_DEPS, "sha2", "\"0.11\""),
+            (AUTH_EXTRA_DEPS, "rand", "\"0.10\""),
+            (PASSKEY_EXTRA_DEPS, "webauthn-rs", "\"0.6\""),
+            (PASSKEY_EXTRA_DEPS, "base64", "\"0.23\""),
+            (TOTP_EXTRA_DEPS, "aes-gcm", "\"0.11\""),
+            (TOTP_EXTRA_DEPS, "base64", "\"0.23\""),
+        ] {
+            let spec = stamp(deps, name);
+            assert!(
+                spec.contains(version),
+                "{name} must be stamped at {version}, got {spec}"
+            );
+        }
+    }
+
+    /// `ensure_cargo_dependencies` keeps a crate the app already declares. The
+    /// generated code uses the `rand` 0.10 and `webauthn-rs` 0.6 APIs, so an
+    /// older pin must give a warning, not a silent compile error.
+    #[test]
+    fn generated_auth_warns_about_an_older_rand_or_webauthn_pin() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.3\"\n\
+             rand = \"0.9\"\nwebauthn-rs = \"0.5\"\n",
+        )
+        .unwrap();
+        let plan = plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions::default(),
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        for name in ["'rand'", "'webauthn-rs'"] {
+            assert!(
+                plan.warnings.iter().any(|warning| warning.contains(name)),
+                "no warning names {name}: {:?}",
+                plan.warnings
+            );
+        }
+    }
+
     /// Issue #3170: every `<label>` must name a control. A bare label gives a
     /// screen reader no accessible name. A label is bound by `for` plus a
     /// matching `id` in the same form, or by wrapping a checkbox. Every visible
@@ -11341,6 +11383,20 @@ mod tests {
                     assert!(!ids.contains(&id), "duplicate id \"{id}\" in one form");
                     ids.push(id);
                 }
+                // A form helper (issue #3412) writes its label and its id
+                // at run time: the field name is both.
+                for helper in [
+                    "(password_field(\"",
+                    "(otp_input_with(&Changeset::new(()), \"",
+                ] {
+                    for (at, _) in form.match_indices(helper) {
+                        let rest = &form[at + helper.len()..];
+                        let id = &rest[..rest.find('"').expect("field name ends")];
+                        assert!(!ids.contains(&id), "duplicate id \"{id}\" in one form");
+                        ids.push(id);
+                        bound += 1;
+                    }
+                }
                 for (at, _) in form.match_indices("label ") {
                     if form[..at]
                         .chars()
@@ -11379,6 +11435,104 @@ mod tests {
             }
         }
         assert!(bound >= 40, "scan found too few labels: {bound}");
+    }
+
+    /// Issue #3412: each password field uses `password_input_with`, with a
+    /// reveal button and an `autocomplete` token. A new password also has a
+    /// strength hint. No raw password input stays.
+    #[test]
+    fn password_fields_use_the_form_helper() {
+        for (totp, magic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let routes = render_routes_file("User", "user", "users", &[], totp, magic);
+            assert!(
+                routes.contains("use autumn_web::form::{FieldOptions, password_input_with};"),
+                "missing import"
+            );
+            assert!(
+                routes.contains("password_input_with(&Changeset::new(()), field, label, &options)"),
+                "the helper uses the form helper"
+            );
+            assert!(
+                !routes.contains("input type=\"password\""),
+                "a raw password input stays:\n{routes}"
+            );
+            let calls: Vec<&str> = routes
+                .match_indices("(password_field(\"")
+                .map(|(at, _)| {
+                    let rest = &routes[at..];
+                    &rest[..rest.find("))").expect("call ends") + 2]
+                })
+                .collect();
+            let expected = if totp { 11 } else { 9 };
+            assert_eq!(calls.len(), expected, "password fields: {calls:#?}");
+            for call in &calls {
+                assert!(
+                    call.contains(".current_password()") || call.contains(".new_password()"),
+                    "no autocomplete token: {call}"
+                );
+                assert!(
+                    call.contains(".reveal()") || call.contains(".reveal_label(\"Show "),
+                    "no reveal button: {call}"
+                );
+            }
+            // Three buttons on one page have three names.
+            for label in [
+                "Show current password",
+                "Show new password",
+                "Show confirmation",
+            ] {
+                assert!(
+                    routes.contains(&format!(".reveal_label(\"{label}\")")),
+                    "{label}"
+                );
+            }
+            // Signup, reset and the new password of a change get the hint.
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.contains(".strength_hint()"))
+                    .count(),
+                3,
+                "{calls:#?}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.contains(".new_password().minlength(min_len)"))
+                    .count(),
+                2,
+                "signup and reset keep the minimum length: {calls:#?}"
+            );
+        }
+    }
+
+    /// Issue #3412: the two 6-digit fields on `/account/2fa` use
+    /// `otp_input_with`. `/login/verify` and `/reauth` also take a recovery
+    /// code (`a1b2c-3d4e5`), so they keep a text input.
+    #[test]
+    fn totp_code_fields_use_the_otp_helper() {
+        let routes = render_routes_file("User", "user", "users", &[], true, false);
+        assert!(routes.contains("use autumn_web::form::{OtpFormat, otp_input_with};"));
+        let calls = routes
+            .matches("(otp_input_with(&Changeset::new(()), \"code\"")
+            .count();
+        assert_eq!(calls, 2, "{routes}");
+        assert!(routes.contains("OtpFormat::digits(6), &FieldOptions::new().required()))"));
+        assert!(!routes.contains("id=\"confirm-code\""));
+        assert!(!routes.contains("id=\"disable-code\""));
+        // A recovery code has letters and a dash: no digits-only field.
+        let verify = &routes[routes
+            .find("pub async fn login_verify_form(")
+            .expect("form")..];
+        let verify = &verify[..verify.find("\n}\n").expect("fn ends")];
+        assert!(
+            verify.contains("input type=\"text\" id=\"code\" name=\"code\""),
+            "{verify}"
+        );
+        assert!(!verify.contains("otp_input"), "{verify}");
+        // Without --totp, nothing imports the OTP helper.
+        let plain = render_routes_file("User", "user", "users", &[], false, false);
+        assert!(!plain.contains("otp_input_with"));
     }
 
     /// Issue #3106: a placeholder is not a label or an instruction. The TOTP

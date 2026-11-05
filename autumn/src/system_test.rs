@@ -1065,6 +1065,81 @@ impl Page {
         Ok(self)
     }
 
+    /// Move the mouse to the point (`x`, `y`), in CSS pixels from the top
+    /// left of the viewport. CSS `:hover` then applies at that point. Use it
+    /// to move the pointer through a gap, as a user does.
+    ///
+    /// # Errors
+    /// CDP errors.
+    pub async fn move_mouse(&self, x: f64, y: f64) -> Result<&Self, SystemTestError> {
+        self.inner
+            .move_mouse(chromiumoxide::layout::Point::new(x, y))
+            .await?;
+        Ok(self)
+    }
+
+    /// Paste `text` into the focused element, as a user does with Ctrl+V.
+    ///
+    /// The text goes on the clipboard first. The browser then runs its own
+    /// paste: a trusted `paste` event, then an `input` event with
+    /// `inputType` `insertFromPaste`. Auto-waits for htmx to settle.
+    ///
+    /// # Errors
+    /// [`SystemTestError::AssertionFailed`] when the clipboard write fails,
+    /// or CDP errors.
+    pub async fn paste(&self, text: &str) -> Result<&Self, SystemTestError> {
+        use chromiumoxide::cdp::browser_protocol::emulation::SetFocusEmulationEnabledParams;
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+        use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+        let fail = |message: String| SystemTestError::AssertionFailed {
+            message,
+            artifact_path: None,
+        };
+        // A headless page has no focus, and the clipboard needs focus.
+        self.inner
+            .execute(SetFocusEmulationEnabledParams::new(true))
+            .await?;
+        let quoted = serde_json::to_string(text).map_err(|err| fail(err.to_string()))?;
+        let write = EvaluateParams::builder()
+            .expression(format!(
+                "navigator.clipboard.writeText({quoted}).then(() => true)"
+            ))
+            .await_promise(true)
+            .user_gesture(true)
+            .build()
+            .map_err(fail)?;
+        let written = self
+            .inner
+            .evaluate_expression(write)
+            .await?
+            .into_value::<bool>()
+            .unwrap_or(false);
+        if !written {
+            return Err(fail("the clipboard write failed".into()));
+        }
+        // Ctrl+V with the editing command `paste`, so each OS pastes.
+        for kind in [
+            DispatchKeyEventType::RawKeyDown,
+            DispatchKeyEventType::KeyUp,
+        ] {
+            let mut event = DispatchKeyEventParams::builder()
+                .r#type(kind.clone())
+                .modifiers(2)
+                .key("v")
+                .code("KeyV")
+                .windows_virtual_key_code(86)
+                .native_virtual_key_code(86);
+            if kind == DispatchKeyEventType::RawKeyDown {
+                event = event.commands(vec!["paste".to_owned()]);
+            }
+            self.inner.execute(event.build().map_err(fail)?).await?;
+        }
+        self.wait_for_hx_settle().await?;
+        Ok(self)
+    }
+
     /// Click the viewport point `(x, y)` with a real mouse event.
     ///
     /// Use it to hit what has no element, such as a dialog backdrop.
@@ -1941,6 +2016,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 

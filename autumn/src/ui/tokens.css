@@ -59,6 +59,7 @@
     --z-sticky: 100;
     --z-banner: 1000;
     --z-toast: 1100;
+    --z-tooltip: 1200;
 
     /* Breakpoints. For reference only: @media cannot read var(). */
     --breakpoint-sm: 640px;

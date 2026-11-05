@@ -12,7 +12,7 @@ documentation pages.
 
 ## Prerequisites
 
-- Rust 1.88.0 or later
+- Rust 1.97.0 or later
 - PostgreSQL (or Docker for a quick start)
 
 ## Installation

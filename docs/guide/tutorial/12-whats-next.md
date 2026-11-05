@@ -3,7 +3,7 @@
 **Goal:** By the end of this chapter, you will have a complete, working todo
 application and a clear picture of where to go from here.
 
-This tutorial tracks Rust 1.88.0+ and whatever `autumn-cli` version
+This tutorial tracks Rust 1.97.0+ and whatever `autumn-cli` version
 [Chapter 1](01-project-setup.md) told you to install. If you are following
 `trunk` from a checkout instead, confirm the workspace version before
 copying dependency snippets.

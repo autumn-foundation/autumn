@@ -4,6 +4,19 @@ Repositories in `autumn-web` provide a clean, type-safe, and highly optimized OR
 
 In version `0.5.0`, Autumn introduces high-performance **Bulk CRUD operations** to minimize database round trips and execute massive writes transaction-safely and hook-compliantly.
 
+### Names and imports
+
+`#[repository] trait NoteRepository` generates the struct `PgNoteRepository`.
+A SQLite build (`sqlite` feature) also names it `SqliteNoteRepository`. The two
+names are one type. The generators still write the `Pg` name.
+
+In a module with `#[model]` or `#[repository]`, import
+`autumn_web::db::prelude::*`, not `diesel::prelude::*`. Diesel's prelude also
+imports the blocking `RunQueryDsl`, and the generated code then fails with
+E0034 ("multiple applicable items in scope"). `autumn_web::db::prelude` has
+all of Diesel's prelude, with the `diesel_async` `RunQueryDsl` and
+`SaveChangesDsl`.
+
 ---
 
 ## Generated Bulk CRUD Methods
@@ -129,7 +142,7 @@ RETURNING *;
 
 ---
 
-## 6. Race-safe get-or-insert: `find_or_create_by_<field>` *(unreleased)*
+## 6. Race-safe get-or-insert: `find_or_create_by_<field>` *(0.6.0)*
 
 The classic "find it, and if it isn't there create it" pattern is a **TOCTOU
 race**: between your `find_by_slug` returning empty and your `insert` landing,
@@ -257,7 +270,7 @@ single-constraint guarantee.
 
 ---
 
-## 7. Grouped aggregate queries: `count_/sum_/avg_/min_/max_..._grouped_by_<col>` *(unreleased)*
+## 7. Grouped aggregate queries: `count_/sum_/avg_/min_/max_..._grouped_by_<col>` *(0.6.0)*
 
 Dashboard roll-ups — a post's vote tally, an experiment's audit-trail size, a
 per-day event time series — are `GROUP BY` aggregates. Hand-writing them as raw
@@ -378,7 +391,7 @@ shard with `from_shard(..)` instead.
 
 ---
 
-## 8. Declarative reactions: `#[votable]` + `react()`/`reaction_of()` *(unreleased)*
+## 8. Declarative reactions: `#[votable]` + `react()`/`reaction_of()` *(0.7.0)*
 
 Votes, likes, and favourites are the same shape every time: a
 `(reactor, target)`-unique edge table, a toggle/flip/insert on it, and a

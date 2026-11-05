@@ -700,7 +700,7 @@ fn install_outbound_webhook_manager(
 /// secrets key it with their raw bytes.
 fn standard_webhooks_signature(secret: &str, id: &str, timestamp: i64, body: &str) -> String {
     use base64::Engine as _;
-    use hmac::Mac as _;
+    use hmac::{KeyInit as _, Mac as _};
     let engine = base64::engine::general_purpose::STANDARD;
     let key = secret
         .strip_prefix("whsec_")

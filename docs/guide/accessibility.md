@@ -67,6 +67,27 @@ html! {
 }
 ```
 
+`password_input_with` has these options for a password (issue #3412). See
+[Forms](forms.md#passwords-and-one-time-codes).
+
+- `reveal()` adds a toggle button with `aria-pressed`. Its label does not
+  change, so a screen reader announces one control with a state. The button
+  is `hidden` until the script runs, so a user never finds a button that does
+  nothing.
+- `strength_hint()` adds a polite live region, linked by `aria-describedby`.
+  It speaks only when the level changes. The region is in the accessibility
+  tree before the first level, and each label names its subject
+  ("Strength: weak").
+- `current_password()` and `new_password()` set `autocomplete`, so a password
+  manager fills the field (WCAG 3.3.8).
+
+### `otp_input`
+
+One `<input autocomplete="one-time-code" inputmode="numeric">` over a row of
+`aria-hidden` boxes (issue #3412). A screen reader finds one field with one
+label, not one field for each digit. SMS autofill and paste fill the whole
+code.
+
 ### `required_text_input` and the other `required_*` helpers
 
 Like `text_input` but adds both the HTML `required` attribute and
@@ -176,8 +197,9 @@ struct EventForm {
 
 ### `select_input`
 
-Renders a labelled `<select>` from `(value, label)` option pairs, marking the
-option matching the changeset's current value as `selected`. This is the
+Renders a labelled `<select>` from `(value, label)` option pairs. It marks
+the first option that matches the changeset's current value as `selected`.
+This is the
 control closed-set fields (enums, references) target.
 
 ```rust
@@ -186,6 +208,36 @@ html! {
     (select_input(&changeset, "status", "Status", &statuses))
 }
 ```
+
+`grouped_select_input` adds `<optgroup>` elements, and
+`FieldOptions::multiple()` adds `multiple` (issue #3409). See
+[Forms](forms.md#select-groups-multiple-and-style).
+
+- The control stays a native `<select>`. The browser gives each group
+  label to assistive technology. The browser supplies the keyboard support.
+- `FieldOptions::styled_select()` changes only CSS (`appearance:
+  base-select`). The element and its role do not change. The browser keeps
+  the keyboard support: the arrow keys open the picker, Enter chooses an
+  option and Escape closes the picker. With no browser support, the native
+  control shows.
+
+### Native inputs and choice groups
+
+`switch_input`, `range_input`, `radio_group`, `checkbox_group`,
+`segmented_control`, `email_input`, `tel_input`, `url_input`, `time_input`,
+`month_input`, `color_input` and `hidden_input` use native controls (issue
+#3405). See [Forms](forms.md#native-inputs).
+
+- A switch is `<input type="checkbox" role="switch">`. A screen reader says
+  "on" or "off".
+- A radio group, a checkbox group and a segmented control are a `<fieldset>`
+  with a `<legend>`. The hint and error links (`aria-describedby`,
+  `aria-invalid`) go on the `<fieldset>`.
+- A radio gets `required`, not `aria-required`: ARIA does not allow
+  `aria-required` on a radio.
+- A segmented radio is visually hidden, but it stays in the Tab order. The
+  arrow keys move the selection, and the label shows the focus ring.
+- A hidden input has no label. It is not visible and not announced.
 
 ### `skip_link`
 

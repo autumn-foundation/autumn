@@ -24,10 +24,10 @@ internet connection.
 
 ## Prerequisites
 
-- **Rust 1.88.0+** with `cargo`
+- **Rust 1.97.0+** with `cargo`
 - **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
-- The `autumn` CLI - `cargo install autumn-cli --version 0.9.0`
+- The `autumn` CLI - `cargo install autumn-cli --version 0.10.0`
 
 ---
 
@@ -1838,7 +1838,7 @@ Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
-{ "status": "ok", "version": "0.9.0" }
+{ "status": "ok", "version": "0.10.0" }
 ```
 
 > **Migration failure stops the rollout.** If the primary URL is wrong or the
@@ -1850,7 +1850,7 @@ response looks like:
 ## How the production image works
 
 ```
-rust:1.88.0-bookworm (chef stage)
+rust:1.97.0-bookworm (chef stage)
   └─ cargo chef prepare          # snapshot dependency graph
        └─ cargo chef cook        # build all dependencies (cached layer)
             └─ autumn build --embed         # fingerprint + embed assets (embed-assets feature)
@@ -3478,7 +3478,7 @@ fires on your first push no matter what the default branch is named:
 | Build | `cargo build` |
 | Test | `cargo test` |
 
-The Rust toolchain is pinned to the project MSRV (1.88.0+) via
+The Rust toolchain is pinned to the project MSRV (1.97.0+) via
 `dtolnay/rust-toolchain@<msrv>` so local and CI toolchains can't drift.
 
 A Postgres 16 service container is provisioned and `DATABASE_URL` is wired in

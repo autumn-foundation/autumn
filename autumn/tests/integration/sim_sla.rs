@@ -156,7 +156,7 @@ async fn sim_sla_clock_pauses_on_weekend_and_holiday_then_escalates_once(mut sim
     assert!(ran_at >= breach.due_at);
 
     // Time goes on; nothing fires again.
-    sim.advance(Duration::from_secs(14 * 24 * 3600)).await;
+    sim.advance(Duration::from_hours(14 * 24)).await;
     sim.run_to_idle().await;
     assert_eq!(fired_keys(&fired).len(), 1);
 
@@ -248,7 +248,7 @@ async fn sim_sla_status_is_readable_without_tracking(mut sim: Sim) {
         .starting_at(utc(2020, 1, 3, 15, 0));
     let status = sla.status(&ob).unwrap();
     assert_eq!(status.state, ObligationState::Running);
-    assert_eq!(status.remaining, Duration::from_secs(3 * 3600));
+    assert_eq!(status.remaining, Duration::from_hours(3));
     assert_eq!(status.due_at, Some(utc(2020, 1, 6, 11, 0)));
 
     let unknown = ob.clone().calendar("nope");

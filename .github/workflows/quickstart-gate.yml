@@ -72,8 +72,8 @@ jobs:
     name: README quickstart vs published crates (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
     # Two toolchain legs: `stable` is the typical new user (and the canonical
-    # funnel metric); "1.88.0" is the MSRV the README advertises ("Rust
-    # 1.88.0+" — README ## Requirements), so an upstream dependency release
+    # funnel metric); "1.97.0" is the MSRV the README advertises ("Rust
+    # 1.97.0+" — README ## Requirements), so an upstream dependency release
     # or a published crate that quietly raises its rust-version above the
     # documented floor turns this gate red instead of silently breaking only
     # the users on the documented minimum. Keep the pin in lockstep with the
@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: [stable, "1.88.0"]
+        toolchain: [stable, "1.97.0"]
     # A hung cargo install/build or download must not burn the default 6-hour
     # job budget; the whole quickstart fits well inside an hour even cold.
     timeout-minutes: 60

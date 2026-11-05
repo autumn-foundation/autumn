@@ -89,6 +89,16 @@ pub trait Plugin: Sized + Send + 'static {
         Cow::Borrowed(std::any::type_name::<Self>())
     }
 
+    /// The route group of the routes this plugin adds (#3544).
+    ///
+    /// Defaults to [`name`](Self::name). A `[roles.<name>] mount = [...]` list
+    /// names groups. Override this method to give the routes a short group
+    /// name, or to put them in an app group such as `"marketing"`. A route
+    /// that names its own group keeps it.
+    fn route_group(&self) -> Cow<'static, str> {
+        self.name()
+    }
+
     /// Apply this plugin's configuration to the builder.
     ///
     /// Called exactly once per `AppBuilder`. Implementations typically chain
@@ -133,7 +143,7 @@ pub trait Plugin: Sized + Send + 'static {
     ///         Some(
     ///             PluginContract::new(env!("CARGO_PKG_NAME"))
     ///                 .plugin_version(env!("CARGO_PKG_VERSION"))
-    ///                 .autumn_web("0.9"),
+    ///                 .autumn_web("0.10"),
     ///         )
     ///     }
     ///

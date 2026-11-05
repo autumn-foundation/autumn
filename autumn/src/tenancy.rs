@@ -6,6 +6,7 @@ use axum::{
 };
 use http_body::Body as HttpBody;
 use pin_project_lite::pin_project;
+#[cfg(feature = "jwt")]
 use secrecy::ExposeSecret;
 use std::future::Future;
 use std::pin::Pin;
@@ -435,6 +436,14 @@ async fn extract_tenant_from_parts_inner(
             }
             Ok(tenant)
         }
+        // Fail closed: without `jsonwebtoken` the token cannot be verified,
+        // and an unverified claim must never pick the tenant. `run` refuses
+        // this config at boot; this arm covers a router built without `run`.
+        #[cfg(not(feature = "jwt"))]
+        "jwt" => Err(crate::AutumnError::internal_server_error_msg(
+            crate::config::JWT_FEATURE_MISSING,
+        )),
+        #[cfg(feature = "jwt")]
         "jwt" => {
             let auth_header = parts
                 .headers

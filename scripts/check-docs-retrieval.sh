@@ -3,12 +3,12 @@
 # that answers it, using only the words the asker would type.
 #
 # WHY THIS EXISTS: the corpus already gates eleven things about a page a reader
-# HAS REACHED — its links (`check-docs-links.sh`, a 404), its commands
+# HAS REACHED — its links (`xtask/src/docs/links.rs`, a 404), its commands
 # (`check-docs-cli.sh`), the `AUTUMN_*` variables it tells them to SET
 # (`check-docs-config.sh`), the `autumn.toml` keys it tells them to WRITE
 # (`check-docs-toml.sh`), the `autumn_web::…` paths they IMPORT
 # (`check-docs-symbols.sh`), the `/actuator/…` URLs they CURL
-# (`check-docs-routes.sh`), the macro arguments they copy
+# (`xtask/src/docs/routes.rs`), the macro arguments they copy
 # (`check-docs-macro-args.sh`), the Cargo feature a gated snippet needs
 # (`check-docs-features.sh`), the dependency pin all of it is relative to
 # (`check-docs-versions.sh`), and the agreement between those corpora

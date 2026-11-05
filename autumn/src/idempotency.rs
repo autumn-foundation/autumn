@@ -533,7 +533,7 @@ pub trait IdempotencyStore: std::any::Any + Send + Sync {
 
     /// The response retention for [`IdempotencyLayer::new`]. Default: 24 hours.
     fn default_ttl(&self) -> Duration {
-        Duration::from_secs(86_400)
+        Duration::from_hours(24)
     }
 }
 
@@ -814,7 +814,7 @@ impl StoredEntry {
                 metadata: entry.metadata,
             },
             body_hash: entry.body_hash,
-            expires_at: saturating_deadline(Duration::from_secs(86_400)),
+            expires_at: saturating_deadline(Duration::from_hours(24)),
         })
     }
 }

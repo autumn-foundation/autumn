@@ -44,8 +44,9 @@ anything and fails with `cannot find attribute commentable in this scope`.
 
 `#[commentable]` is part of `#[autumn_web::model]`, so it needs the default
 Postgres/Diesel stack any Autumn app with a `#[model]` and a `#[repository]`
-already has — no extra feature, no extra dependency. The widget needs `maud`
-(also a default), and the generic router needs both. Both backends are
+already has — no extra feature, no extra dependency. The widget needs
+`widgets-social` (also a default; it turns on `maud`), and the generic router
+needs `db` and `widgets-social` (#3408). Both backends are
 supported: `autumn generate scaffold … comments:commentable` emits the shared
 table spelled for whichever one the project uses.
 

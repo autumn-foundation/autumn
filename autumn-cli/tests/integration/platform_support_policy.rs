@@ -197,14 +197,17 @@ fn the_guide_names_the_ac_mandated_tier_one_floor() {
 
 #[test]
 fn the_guide_documents_the_windows_prerequisites_doctor_reports() {
+    // `webauthn-rs` 0.6 uses pure-Rust crypto, so `--passkeys` needs no
+    // OpenSSL. The guide must not ask for OpenSSL. It must say that
+    // `--passkeys` needs no native library.
     let doc = policy_doc();
     assert!(
-        doc.contains("vcpkg") && doc.contains("VCPKG_ROOT"),
-        "the guide must document the OpenSSL/vcpkg prerequisite doctor flags"
+        !doc.contains("vcpkg") && !doc.contains("VCPKG_ROOT"),
+        "the guide must not ask for the OpenSSL/vcpkg prerequisite"
     );
     assert!(
-        doc.contains("--passkeys"),
-        "the guide must say which command needs it"
+        doc.contains("--passkeys") && doc.contains("needs no native library"),
+        "the guide must say that `--passkeys` needs no native library"
     );
 }
 

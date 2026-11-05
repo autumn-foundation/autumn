@@ -172,7 +172,7 @@ then enforces that widgets cannot ship without examples:
 
 1. an `EXPECTED_STORY_SLUGS` inventory is diffed both ways against
    `stories::builtin()`, and
-2. every public render fn in `src/widgets.rs`, `src/ui/pagination.rs`,
+2. every public render fn in `src/widgets/`, `src/ui/pagination.rs`,
    `src/flash.rs` and `src/wizard.rs`, and every `src/a11y.rs` primitive, must
    appear in at least one builtin story's source.
 

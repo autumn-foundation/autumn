@@ -134,7 +134,7 @@ impl SyncEngine {
         reason = "infallible: reqwest client built from static config; a TLS-backend init failure is an unrecoverable environment fault surfaced as a documented panic"
     )]
     pub fn new(store: SyncStore, config: SyncConfig) -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::reqwest_tls::client_builder()
             .timeout(config.request_timeout)
             .build()
             .expect("failed to construct the sync HTTP client");

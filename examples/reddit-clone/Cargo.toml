@@ -50,9 +50,8 @@ example-e2e = { path = "../../example-e2e" }
 # helper exists in `example-e2e` (only Chromium + Postgres provisioning), and
 # a `cookie_store(true)` client is exactly what the issue's own `curl -c/-b`
 # repro needs: one shared session across every concurrent `/submit`.
-# `rustls-tls`, not the default TLS backend, to match `example-e2e`'s own
-# choice and avoid pulling in a second, openssl-backed stack.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies"] }
+# `default-features = false` with `rustls`, the same choice as `example-e2e`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies"] }
 
 [lints.rust]
 unsafe_code = "forbid"

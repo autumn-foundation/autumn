@@ -246,7 +246,7 @@ fn generate_inner(
 
     let crate_name = name.replace('-', "_");
     let autumn_version = env!("CARGO_PKG_VERSION");
-    let rust_version = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
+    let rust_version = crate::MSRV;
 
     fs::create_dir_all(project_dir.join("src"))?;
     // The JSON-first API flavor ships no CSS/JS assets, so it has no `static/`
@@ -294,10 +294,7 @@ fn generate_inner(
     // waiver list is the app author's to grow: a file the developer is *asked*
     // to edit would otherwise come back as a scaffold-reconciliation conflict
     // on every `autumn upgrade`, exactly like `Cargo.toml` would.
-    fs::write(
-        project_dir.join("deny.toml"),
-        render_deny_toml(&render(templates::DENY_TOML), opts),
-    )?;
+    fs::write(project_dir.join("deny.toml"), render(templates::DENY_TOML))?;
 
     // Linker remedy for the Windows PDB symbol limit (issue #2448). Written
     // here, not as a framework-owned file: the app author may extend it.
@@ -540,38 +537,6 @@ pub fn member_workflow(path: &str, rendered: &str, package: &str, dir: &str) -> 
         }
         _ => None,
     }
-}
-
-/// Anchors around the waiver that only a `--bundled-pg` app's tree can reach.
-const DENY_BUNDLED_PG_OPEN: &str = "    # >>> autumn:bundled-pg-waiver\n";
-const DENY_BUNDLED_PG_CLOSE: &str = "    # <<< autumn:bundled-pg-waiver\n";
-
-/// Resolve the scaffolded `deny.toml` for `opts`.
-///
-/// `managed-pg-bundled` drags the embedded-Postgres build stack — and with it
-/// `instant` (RUSTSEC-2024-0384, unmaintained, no fix) — into the tree, so a
-/// `--bundled-pg` app needs that waiver on day one or its first CI run is red.
-/// Every other flavor would be carrying a waiver for a crate it does not have,
-/// and cargo-deny warns about unused waivers by design: that warning is how a
-/// developer learns one of *their* waivers has gone stale, so it must not be
-/// spent on one the framework shipped for a feature they never enabled.
-fn render_deny_toml(rendered: &str, opts: GenerateOptions) -> String {
-    if opts.with_bundled_pg {
-        return rendered
-            .replace(DENY_BUNDLED_PG_OPEN, "")
-            .replace(DENY_BUNDLED_PG_CLOSE, "");
-    }
-    let (open, close) = (
-        rendered.find(DENY_BUNDLED_PG_OPEN),
-        rendered.find(DENY_BUNDLED_PG_CLOSE),
-    );
-    let (Some(open), Some(close)) = (open, close) else {
-        debug_assert!(false, "deny.toml.tmpl lost its bundled-pg waiver anchors");
-        return rendered.to_owned();
-    };
-    let mut out = rendered.to_owned();
-    out.replace_range(open..close + DENY_BUNDLED_PG_CLOSE.len(), "");
-    out
 }
 
 fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
@@ -2065,7 +2030,7 @@ mod tests {
 
     #[test]
     fn default_readme_db_bootstrap_does_not_dead_end_on_release_init() {
-        // Finding 1: the default golden path must bootstrap a local Postgres
+        // The default golden path must bootstrap a local Postgres
         // with `docker run` (which always works), not lead with
         // `release init --target docker-compose` (which file-errors on a fresh
         // scaffold). The AC-required pointer is still present for deployment.
@@ -2773,8 +2738,8 @@ mod tests {
             "rust-toolchain.toml must set channel: {content}"
         );
         assert!(
-            content.contains("1.88.0"),
-            "rust-toolchain.toml channel must match the Cargo.toml rust-version (1.88.0): {content}"
+            content.contains("1.97.0"),
+            "rust-toolchain.toml channel must match the Cargo.toml rust-version (1.97.0): {content}"
         );
     }
 
@@ -2841,8 +2806,8 @@ mod tests {
             "clippy.toml must set msrv: {content}"
         );
         assert!(
-            content.contains("1.88.0"),
-            "clippy.toml msrv must match Cargo.toml rust-version (1.88.0): {content}"
+            content.contains("1.97.0"),
+            "clippy.toml msrv must match Cargo.toml rust-version (1.97.0): {content}"
         );
     }
 
@@ -3482,41 +3447,29 @@ mod tests {
         assert!(!ci.contains("pull-requests: write"));
     }
 
-    /// The bundled-pg waiver is resolved by flag, and its anchors are internal
-    /// bookkeeping — a leaked `>>> autumn:` marker would ship in every app.
+    /// Every flavor gets the same waivers. `managed-pg-bundled` no longer
+    /// pulls `instant` (RUSTSEC-2024-0384), so no flavor waives it.
     #[test]
-    fn the_advisory_policy_resolves_its_flavor_anchors() {
+    fn the_advisory_policy_is_the_same_for_every_flavor() {
         let vars = TemplateVars {
             project_name: "demo",
             crate_name: "demo",
             autumn_version: "0.7.0",
-            rust_version: "1.88.0",
+            rust_version: "1.97.0",
         };
-        let rendered = render_template(templates::DENY_TOML, &vars);
-        for opts in [
-            GenerateOptions::default(),
-            GenerateOptions {
-                with_bundled_pg: true,
-                with_daemon: true,
-                ..GenerateOptions::default()
-            },
-        ] {
-            let policy = render_deny_toml(&rendered, opts);
-            assert!(
-                !policy.contains("autumn:bundled-pg-waiver"),
-                "template anchors must never reach a generated project:\n{policy}"
-            );
-            assert_eq!(
-                policy.contains("RUSTSEC-2024-0384"),
-                opts.with_bundled_pg,
-                "the managed-pg-bundled waiver belongs to exactly the flavor whose \
-                 tree can reach it"
-            );
-            assert!(
-                policy.contains("RUSTSEC-2023-0071"),
-                "every flavor's tree reaches rsa through jsonwebtoken"
-            );
-        }
+        let policy = render_template(templates::DENY_TOML, &vars);
+        assert!(
+            !policy.contains("autumn:bundled-pg-waiver"),
+            "no template anchor may reach a generated project:\n{policy}"
+        );
+        assert!(
+            !policy.contains("RUSTSEC-2024-0384"),
+            "no flavor reaches `instant` any more:\n{policy}"
+        );
+        assert!(
+            policy.contains("RUSTSEC-2023-0071"),
+            "every flavor keeps the default `jwt` feature, so its tree reaches rsa through jsonwebtoken"
+        );
     }
 
     /// The advisory policy is generated but deliberately *not* reconciled
@@ -3650,7 +3603,7 @@ mod tests {
             project_name: "owned-app",
             crate_name: "owned_app",
             autumn_version: env!("CARGO_PKG_VERSION"),
-            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+            rust_version: crate::MSRV,
         };
         for (path, expected) in framework_owned_files(&vars, GenerateOptions::default()) {
             let actual = fs::read_to_string(tmp.path().join("owned-app").join(path))
@@ -3677,7 +3630,7 @@ mod tests {
                 project_name: "provenance-app",
                 crate_name: "provenance_app",
                 autumn_version: env!("CARGO_PKG_VERSION"),
-                rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+                rust_version: crate::MSRV,
             },
             GenerateOptions::default(),
         )

@@ -49,8 +49,10 @@ Enable the runtime by building the application with the `sqlite` cargo feature (
   `postgres`:
 
   ```toml
-  autumn-web = { version = "0.9", default-features = false, features = [
+  autumn-web = { version = "0.10", default-features = false, features = [
       "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
+      # The widget families (#3408). Keep the ones the app renders.
+      "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts",
   ] }
   ```
 
@@ -567,6 +569,13 @@ your replicas. Set `allow_shared_bucket = true` to opt in.
 is destroyed**, under normal write load. Only *committed transactions* are ever
 shipped — a segment always ends on a commit boundary, so a replica is never half
 a transaction.
+
+**A database fleet.** One process ships all its open fleet databases. The
+bound holds while one pass over these databases fits in
+`sync_interval_secs`. With many busy databases in one process, the bound can
+fail. Monitor `worst_lag_seconds` in `replication:fleet`. Set
+`database.fleet.replication_workers`. See
+[Replication lag](sqlite-fleet.md#replication-lag).
 
 That bound covers the machine *disappearing*. A **planned** stop — a deploy, a
 restart, a `SIGTERM` — loses nothing: once in-flight requests have drained, the

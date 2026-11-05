@@ -4,8 +4,10 @@
 #
 # Sources checked:
 #   - [workspace.package].rust-version in Cargo.toml  (canonical MSRV)
+#   - clippy.toml `msrv`
 #   - README.md badge + "Requirements" section
-#   - .github/workflows/ci.yml       (`msrv:` job pin)
+#   - .github/workflows/ci.yml       (`msrv:` and `windows-tier1:` job pins)
+#   - scripts/check-semver.sh + publish-gate.yml `semver:` job (not below the MSRV)
 #
 # Called from the `msrv` job in ci.yml. Runs locally with:
 #
@@ -56,6 +58,12 @@ while IFS= read -r manifest; do
   fi
 done < <(find . -type f -name Cargo.toml -not -path "./target/*")
 
+# clippy.toml `msrv`: clippy gates its lints on this, so it must match.
+clippy_msrv="$(sed -n 's/^msrv = "\([^"]*\)"$/\1/p' clippy.toml)"
+if [[ "$clippy_msrv" != "$canonical" ]]; then
+  die "clippy.toml msrv = \"$clippy_msrv\" but workspace MSRV is \"$canonical\""
+fi
+
 # README badge.
 if ! grep -q "rust-${canonical}" README.md; then
   die "README.md badge does not reference rust-${canonical}"
@@ -74,12 +82,12 @@ fi
 ci="$root/.github/workflows/ci.yml"
 
 job_block() {
-  local job="$1"
+  local job="$1" file="${2:-$ci}"
   awk -v job="  ${job}:" '
     $0 == job { flag = 1; next }
     flag && /^  [A-Za-z]/ { flag = 0 }
     flag
-  ' "$ci"
+  ' "$file"
 }
 
 if ! grep -Eq "rust-toolchain@${canonical}\b" <<<"$(job_block msrv)"; then
@@ -100,6 +108,22 @@ fi
 # failures fixed in #2994.
 if ! grep -Eq "rust-toolchain@${canonical}\b" <<<"$(job_block windows-tier1)"; then
   die "$ci windows-tier1 job does not pin dtolnay/rust-toolchain@${canonical} (must match the canonical MSRV, not just the msrv job's own pin)"
+fi
+
+# SemVer toolchain. Cargo does not build a crate on a toolchain below its
+# `rust-version`, so the semver job must use the MSRV or a newer toolchain.
+semver_script="$root/scripts/check-semver.sh"
+semver_toolchain="$(
+  sed -n 's/^semver_toolchain="\${AUTUMN_SEMVER_RUST_VERSION:-\([0-9.]*\)}"$/\1/p' "$semver_script"
+)"
+[[ -n "$semver_toolchain" ]] || die "could not find the default semver_toolchain in $semver_script"
+lowest="$(printf '%s\n%s\n' "$canonical" "$semver_toolchain" | sort -V | head -n 1)"
+if [[ "$lowest" != "$canonical" ]]; then
+  die "$semver_script semver toolchain $semver_toolchain is below the MSRV $canonical"
+fi
+if ! grep -Eq "rust-toolchain@${semver_toolchain//./\\.}\b" \
+  <<<"$(job_block semver "$root/.github/workflows/publish-gate.yml")"; then
+  die "publish-gate.yml semver job does not pin dtolnay/rust-toolchain@${semver_toolchain} (the semver toolchain)"
 fi
 
 echo "MSRV alignment OK (${canonical})"
