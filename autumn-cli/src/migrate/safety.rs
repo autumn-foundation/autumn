@@ -4162,4 +4162,122 @@ mod tests {
             }
         }
     }
+
+    // ── Non-ASCII text (issue #3530) ─────────────────────────────────────────
+    //
+    // Postgres and `SQLite` read each non-ASCII character as a name character,
+    // also a space or a combining mark. They fold the case of ASCII letters only.
+
+    /// Non-ASCII characters that are a space, a combining mark or a case
+    /// variant in Unicode.
+    const NON_ASCII_NAME_CHARS: [char; 6] = [
+        '\u{a0}', '\u{2028}', '\u{3000}', '\u{301}', '\u{212a}', '\u{130}',
+    ];
+
+    #[test]
+    fn non_ascii_case_variant_does_not_close_dollar_quote() {
+        // U+212A (Kelvin sign) lowercases to `k`. Postgres does not match it to `k`.
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT $k$ $\u{212a}$ $k$, \
+                   ADD COLUMN b int NOT NULL;";
+        assert_eq!(
+            ops(DatabaseBackend::Postgres, sql),
+            ["ADD COLUMN NOT NULL (no default)"]
+        );
+    }
+
+    #[test]
+    fn non_ascii_character_before_dollar_starts_no_quote() {
+        // The character is part of the name `a<c>$x$`, so `$x$` opens nothing.
+        for c in NON_ASCII_NAME_CHARS {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a{c}$x$ int DEFAULT 0, ADD COLUMN b int NOT NULL;"
+            );
+            assert_eq!(
+                ops(DatabaseBackend::Postgres, &sql),
+                ["ADD COLUMN NOT NULL (no default)"],
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ascii_case_is_not_folded() {
+        // `ÜSERS` and `üsers` are two tables.
+        let new_table = "CREATE TABLE \u{dc}SERS (id int); CREATE INDEX i ON \u{dc}SERS (id);";
+        let old_table = "CREATE TABLE \u{dc}SERS (id int); CREATE INDEX i ON \u{fc}sers (id);";
+        for (backend, op) in [
+            (DatabaseBackend::Postgres, CREATE_INDEX_PG_OP),
+            (DatabaseBackend::Sqlite, CREATE_INDEX_SQLITE_OP),
+        ] {
+            assert_eq!(ops(backend, new_table), Vec::<String>::new());
+            assert_eq!(ops(backend, old_table), [op]);
+            assert_eq!(
+                normalize_statement(backend, "SELECT \u{c9}\u{a0}A"),
+                "select \u{c9}\u{a0}a"
+            );
+        }
+    }
+
+    #[test]
+    fn default_call_name_may_end_in_any_name_character() {
+        let pg = DatabaseBackend::Postgres;
+        for call in ["f$()", "fa\u{301}()", "f\u{a0}()", "\"F\"()", "s.\"f\"()"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT {call};");
+            assert_eq!(
+                ops(pg, &sql),
+                ["ADD COLUMN NOT NULL (volatile default)"],
+                "{sql:?}"
+            );
+        }
+        let sql = "ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT f\u{a0}();";
+        assert_eq!(
+            ops(DatabaseBackend::Sqlite, sql),
+            ["ADD COLUMN (non-constant default)"]
+        );
+    }
+
+    #[test]
+    fn parenthesis_in_quoted_default_is_not_a_call() {
+        let pg = DatabaseBackend::Postgres;
+        for literal in ["'a(b'", "$$(x)$$", "$t$f()$t$", "e'f()'"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b text NOT NULL DEFAULT {literal};");
+            assert_eq!(ops(pg, &sql), Vec::<String>::new(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn sqlite_variable_arguments_end_at_ascii_space() {
+        // `SQLite` ends `$a(..` at `)` or an ASCII space. U+00A0 is text, so the
+        // `'` is part of the variable and opens no literal.
+        assert_eq!(sqlite_variable_len("$a(x\u{a0}y) z"), Some(8));
+        let sql = "SELECT $a(x\u{a0}'y); DROP TABLE t; -- '";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+    }
+
+    /// The quoted spans in `sql`, in order.
+    fn quoted_spans(backend: DatabaseBackend, sql: &str) -> Vec<String> {
+        tokens(backend, sql)
+            .filter(|(kind, _)| *kind == TokenKind::Quoted)
+            .map(|(_, text)| text.to_owned())
+            .collect()
+    }
+
+    proptest::proptest! {
+        /// A scan of a normalized statement reads the same quoted spans as a
+        /// scan of the statement. A second normalization changes nothing.
+        #[test]
+        fn normalize_keeps_quoted_spans(
+            sql in r#"[aeEkxK\x{212a}\x{130}\x{a0}\x{301}\x{2028} \t\n\r$'"`\[\]\\;,()/*@:#\-]{0,24}"#,
+        ) {
+            for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+                let stripped = strip_line_comments(backend, &strip_block_comments(backend, &sql));
+                let normalized = normalize_statement(backend, &sql);
+                proptest::prop_assert_eq!(
+                    quoted_spans(backend, &stripped),
+                    quoted_spans(backend, &normalized)
+                );
+                proptest::prop_assert_eq!(normalize_statement(backend, &normalized), normalized);
+            }
+        }
+    }
 }
