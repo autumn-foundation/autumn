@@ -380,9 +380,19 @@ fn request_breaks(
     }
     let writes = call.writes.as_deref().unwrap_or_default();
     // With an unknown write-set, a field the type sometimes sends counts as
-    // sent: the one-build check makes the same choice.
+    // sent only when the caller's own release already required it: the
+    // one-build check accepted that call. A requirement that is new in the
+    // serving release gets no such benefit.
+    let own_release_requires = |f: &WireFieldDescriptor| {
+        view.request
+            .deserialized
+            .iter()
+            .any(|d| d.required && d.wire_name == f.wire_name)
+    };
     let always_sent = |f: &WireFieldDescriptor| {
-        f.required || call.writes.is_none() || writes.contains(&f.rust_name)
+        f.required
+            || writes.contains(&f.rust_name)
+            || (call.writes.is_none() && own_release_requires(f))
     };
     for need in accepted {
         if key_hits(sent, need) > 1 {
@@ -1222,6 +1232,27 @@ mod tests {
         assert_eq!(
             compare(&deployed, &current).verdict(),
             Verdict::Incompatible
+        );
+    }
+
+    #[test]
+    fn an_unknown_write_set_does_not_cover_a_field_that_became_required() {
+        let mut deployed = release_1();
+        let req = &mut ep(&mut deployed, "get_item").request;
+        req.name = "Lookup".to_owned();
+        // Release 1: sent only when not empty, and optional on decode.
+        req.serialized.push(plain("token", false));
+        req.deserialized.push(plain("token", false));
+        let mut current = deployed.clone();
+        let req = &mut ep(&mut current, "get_item").request;
+        req.serialized.retain(|f| f.rust_name != "token");
+        req.deserialized.retain(|f| f.rust_name != "token");
+        req.serialized.push(plain("token", true));
+        req.deserialized.push(plain("token", true));
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::RequestFieldNotSent("token".to_owned())]
         );
     }
 }

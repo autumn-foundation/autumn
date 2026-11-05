@@ -291,7 +291,8 @@ fn resolve_call<'a>(
     // A path that starts with a crate name narrows the match to that crate.
     let crate_hint = match segments.as_slice() {
         [first, _, ..] if !["crate", "self", "super"].contains(first) => Some((*first).to_owned()),
-        [_, _, ..] => Some(caller.krate.replace('-', "_")),
+        // `crate::…` is relative to the crate that declares the client.
+        [_, _, ..] => Some(client.krate.replace('-', "_")),
         _ => None,
     };
     let candidates: Vec<&EndpointDescriptor> = endpoints
@@ -604,5 +605,36 @@ mod tests {
         );
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert_eq!(bundle.callers[0].endpoint, "get_item");
+    }
+
+    #[test]
+    fn a_crate_relative_marker_resolves_in_the_crate_that_declares_the_client() {
+        let dir = fixture();
+        std::fs::remove_file(dir.path().join("client.mesh-storefront.CatalogClient.json"))
+            .expect("rm");
+        // The client lives in the catalog crate and names its marker
+        // relative to that crate.
+        let mut shared = client();
+        shared.krate = "mesh-catalog".to_owned();
+        shared.endpoints[0].marker = "crate::get_item_endpoint".to_owned();
+        write(
+            dir.path(),
+            "client.mesh-catalog.CatalogClient.json",
+            &shared,
+        );
+        // The caller's own crate also has an endpoint with that marker name.
+        let mut local = endpoint("get_item", "/local/{id}", "NoBody");
+        local.krate = "mesh-storefront".to_owned();
+        local.service = "storefront".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-storefront.storefront.get_item.json",
+            &local,
+        );
+        let mut local_item = item();
+        local_item.krate = "mesh-storefront".to_owned();
+        write(dir.path(), "type.mesh-storefront.Item.json", &local_item);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.callers[0].service, "catalog");
     }
 }
