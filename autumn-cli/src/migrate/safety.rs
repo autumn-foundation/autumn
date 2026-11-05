@@ -229,7 +229,7 @@ pub fn split_statements(backend: DatabaseBackend, sql: &str) -> Vec<String> {
     let mut current = String::new();
     for (kind, text) in tokens(backend, sql) {
         if kind == TokenKind::Plain && text == ";" {
-            let trimmed = current.trim();
+            let trimmed = current.trim_matches(is_sql_space);
             if !trimmed.is_empty() {
                 statements.push(trimmed.to_owned());
             }
@@ -239,7 +239,7 @@ pub fn split_statements(backend: DatabaseBackend, sql: &str) -> Vec<String> {
             current.push_str(text);
         }
     }
-    let trimmed = current.trim();
+    let trimmed = current.trim_matches(is_sql_space);
     if !trimmed.is_empty() {
         statements.push(trimmed.to_owned());
     }
@@ -264,7 +264,7 @@ fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&s
         .take_while(|&(kind, text)| !(kind == TokenKind::Plain && text == " "))
         .map(|(_, text)| text.len())
         .sum();
-    let subcommands = rest[name_len..].trim_start();
+    let subcommands = rest[name_len..].trim_start_matches(is_sql_space);
 
     let mut result = Vec::new();
     let mut depth: i32 = 0;
@@ -276,7 +276,7 @@ fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&s
                 "(" => depth += 1,
                 ")" => depth -= 1,
                 "," if depth == 0 => {
-                    result.push(subcommands[start..i].trim());
+                    result.push(subcommands[start..i].trim_matches(is_sql_space));
                     start = i + 1;
                 }
                 _ => {}
@@ -284,7 +284,7 @@ fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&s
         }
         i += text.len();
     }
-    let last = subcommands[start..].trim();
+    let last = subcommands[start..].trim_matches(is_sql_space);
     if !last.is_empty() {
         result.push(last);
     }
