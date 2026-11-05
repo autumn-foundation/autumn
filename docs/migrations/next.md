@@ -109,6 +109,39 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Database: `DatabaseConfig` has a `roles` field
+
+**Why:** each boundary can connect as its own Postgres role (issue #3550).
+`[database.roles.<boundary>]` sets the connection of that role.
+
+**You are affected only if your code builds a `DatabaseConfig` with a struct
+literal and no `..Default::default()`.** TOML and `AUTUMN_*` config need no
+change: an empty `roles` keeps one role.
+
+**Before (`{X.Y}`):**
+
+```rust
+DatabaseConfig {
+    url: Some(url),
+    // ...every other field...
+    fleet: None,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+DatabaseConfig {
+    url: Some(url),
+    // ...every other field...
+    fleet: None,
+    roles: std::collections::BTreeMap::new(),
+}
+```
+
+**Automation:** `manual` — add `roles: BTreeMap::new()`, or end the literal
+with `..Default::default()`. A codemod cannot know which ending the app wants.
+
 ---
 
 ### Graph: `NodeKind`, `GraphNode` and `Completeness` have new members

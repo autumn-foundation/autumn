@@ -484,6 +484,34 @@ impl AppState {
         self.pool.as_ref()
     }
 
+    /// Returns the pool of the database role of boundary `B`.
+    ///
+    /// * No `[database.roles]` in the config: the primary pool. The app has
+    ///   one role.
+    /// * `[database.roles.<B::NAME>]` is set: the pool of that role.
+    /// * Other roles are set, but not this one: `None`, with one warning. The
+    ///   boundary does not fall back to the owner role.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn pool_for<B: crate::db_roles::Boundary>(
+        &self,
+    ) -> Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>> {
+        self.pool_for_name(B::NAME)
+    }
+
+    /// [`Self::pool_for`], by boundary name.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn pool_for_name(
+        &self,
+        name: &str,
+    ) -> Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>> {
+        match self.extension::<crate::db_roles::RolePools>() {
+            Some(pools) if !pools.is_empty() => pools.get(name),
+            _ => self.pool.clone(),
+        }
+    }
+
     /// Returns the read-replica database connection pool, if configured.
     #[cfg(feature = "db")]
     #[must_use]
@@ -1187,6 +1215,18 @@ impl DbState for AppState {
 
     fn shards(&self) -> Option<&crate::sharding::ShardSet> {
         self.shards.as_ref()
+    }
+
+    fn boundary_pool(
+        &self,
+        name: &str,
+    ) -> Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>> {
+        self.pool_for_name(name)
+    }
+
+    fn boundary_roles_configured(&self) -> bool {
+        self.extension::<crate::db_roles::RolePools>()
+            .is_some_and(|pools| !pools.is_empty())
     }
 
     fn db_interceptors(

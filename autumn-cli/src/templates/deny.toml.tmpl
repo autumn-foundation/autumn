@@ -105,15 +105,14 @@ ignore = [
     # leaves out autumn-web's `jwt` feature (and `oauth2`, which turns it on).
     # Review-by: 2026-11-08.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x via jsonwebtoken ES256/ES384 (autumn-web `jwt` feature, default-on) -> p256/p384 -> elliptic-curve 0.13; fix needs crypto-bigint >=0.7.6; review-by 2026-11-08" },
-    # RUSTSEC-2026-0441 — `pin-utils` is unmaintained (its repository was
-    # archived on 2026-10-01).
+    # RUSTSEC-2026-0441 — `pin-utils` is unmaintained: no one fixes a new bug in it.
     # https://rustsec.org/advisories/RUSTSEC-2026-0441
     #
-    # Ships pre-waived because it reaches every app only through `loom`, which
-    # autumn-web compiles only for its own model checks (`cfg(loom_models)`).
-    # Your build never sets that cfg, so it never compiles `pin-utils`. Remove
-    # this entry when loom drops it. Review-by: 2026-12-03.
-    { id = "RUSTSEC-2026-0441", reason = "pin-utils via loom only, an autumn-web cfg(loom_models) dependency that an app build never compiles; review-by 2026-12-03" },
+    # Ships pre-waived because autumn-web names `loom` 0.7.2 as a
+    # `cfg(loom_models)` dependency for its own model checks, and cargo-deny
+    # audits every target. A normal build never compiles it. No `loom`
+    # release drops `pin-utils`. Review-by: 2026-12-05.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; via autumn-web's cfg(loom_models) loom 0.7.2 dependency, never compiled in a normal build; review-by 2026-12-05" },
 ]
 
 # ── Licenses (optional) ─────────────────────────────────────────────────────

@@ -107,6 +107,7 @@
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_POOL_SIZE` | `database.shards[i].primary_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_POOL_SIZE` | `database.shards[i].replica_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_FALLBACK` | `database.shards[i].replica_fallback` | `fail_readiness` / `primary` |
+//! | `AUTUMN_DATABASE__ROLES` | `database.roles` | comma-separated boundary names; each has `__<NAME>__URL`, `__USER`, `__PASSWORD`, `__POOL_SIZE` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_TELEMETRY__ENABLED` | `telemetry.enabled` | `bool` |
@@ -8199,6 +8200,7 @@ impl AutumnConfig {
             &mut self.database.migration_lock_retries,
         );
         self.apply_shard_env_overrides(env);
+        crate::db_roles::apply_env_overrides(&mut self.database.roles, env);
         self.apply_fleet_env_overrides(env);
     }
 
@@ -11779,6 +11781,12 @@ pub struct DatabaseConfig {
     /// [`shards`](Self::shards). See [`DatabaseFleetConfig`].
     #[serde(default)]
     pub fleet: Option<DatabaseFleetConfig>,
+
+    /// One connection role per boundary, as `[database.roles.<boundary>]`.
+    /// Empty (the default) means one role for the whole app. See
+    /// [`DatabaseRoleConfig`](crate::db_roles::DatabaseRoleConfig).
+    #[serde(default)]
+    pub roles: std::collections::BTreeMap<String, crate::db_roles::DatabaseRoleConfig>,
 }
 
 /// `[database.fleet]`: one `SQLite` database per tenant or per routing slot.
@@ -12624,6 +12632,9 @@ impl DatabaseConfig {
         }
 
         self.validate_backend_consistency()?;
+
+        crate::db_roles::validate(&self.roles, self.effective_primary_url())
+            .map_err(ConfigError::Validation)?;
 
         let mut seen_names = std::collections::HashSet::new();
         for (idx, shard) in self.shards.iter().enumerate() {
@@ -14083,6 +14094,7 @@ impl Default for DatabaseConfig {
             directory_shard_router: false,
             max_connections_warn_threshold: default_max_connections_warn_threshold(),
             fleet: None,
+            roles: std::collections::BTreeMap::new(),
         }
     }
 }

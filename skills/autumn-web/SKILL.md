@@ -349,8 +349,7 @@ error. See `docs/guide/getting-started.md` "Tuning the Tokio runtime".
 | `.jobs(jobs![...])` | Register request-triggered `#[job]` work |
 | `.one_off_tasks(one_off_tasks![...])` | Register operational `#[task]` commands |
 | `.migrations(MIGRATIONS)` | Register embedded Diesel migrations |
-| `.migrations_for(MigrationScope::Control \| Shards, MIGRATIONS)` | Register a set for the control database only, or for the shards and fleet files only. With no shard and no fleet, the one database gets every scope. Embed `migrations-control/` as `Control`. Embed `migrations-shards/` as `Shards`. The CLI reads the scope from the directory name. On Postgres, use `AUTUMN_MIGRATE=1` |
-| `.plugin_migrations_for(name, MigrationScope, MIGRATIONS)` | A plugin's set, scoped as `.migrations_for` |
+| `.migrations_for(MigrationScope::Control \| Shards, MIGRATIONS)` | Register a set for the control database only, or for the shards and fleet files only. Do not run `autumn migrate` on such an app; use `AUTUMN_MIGRATE=1` |
 | `.plugin_migrations(name, MIGRATIONS)` | Register a plugin's embedded Diesel migrations (named; version collisions with other sources auto-resolve) |
 | `.plugin(plugin)` / `.plugins((...))` | Install first- or third-party plugins |
 | `.plugin_assets(&ASSETS)` | Serve a plugin crate's JS/CSS/fonts (`PluginAssets`, from `plugin_assets!("ns")` or `PluginAssets::from_files`) at content-hashed `immutable` URLs under `/static/_plugins/<ns>/`, with SRI; call it from `Plugin::build`. Never hand-roll a fixed-URL asset route in a plugin (see `docs/guide/plugin-assets.md`) |
@@ -2765,10 +2764,10 @@ the build.
   advisory still fails.
 - A fresh scaffold ships three waivers already — RUSTSEC-2023-0071 (`rsa`) and
   RUSTSEC-2026-0387 (`crypto-bigint` 0.5), both reached through the
-  unconditional `jsonwebtoken` dependency, no patched release exists, and
-  RUSTSEC-2026-0441 (`pin-utils`, unmaintained), reached only through
-  autumn-web's `cfg(loom_models)` `loom` dependency — which is why day-one CI
-  is green. Do not remove any without checking
+  unconditional `jsonwebtoken` dependency, no patched release exists — and a
+  third, RUSTSEC-2026-0441 (`pin-utils`, unmaintained, via autumn-web's
+  `cfg(loom_models)` `loom` dependency). That is why day-one CI is green. Do
+  not remove one without checking
   whether a fixed release has shipped. An unused-waiver warning means one of the
   app author's own waivers went stale.
 - An app upgraded from a release before this gate existed receives the workflow
@@ -3093,10 +3092,7 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   peak (about `2 × pool_size + 1` fds per open database).
 - Control-only or tenant-only tables: `.migrations_for(MigrationScope::Control,
   SET)` / `.migrations_for(MigrationScope::Shards, SET)`
-  (`autumn_web::migrate::MigrationScope`), not one set for both. A plugin
-  uses `.plugin_migrations_for(name, scope, SET)`. Put the sets in
-  `migrations-control/` and `migrations-shards/`: `autumn migrate` and
-  `autumn fleet migrate` read the scope from the directory name.
+  (`autumn_web::migrate::MigrationScope`), not one set for both.
 - A SQLite build names the generated repository `Sqlite<Trait>` too (alias
   of `Pg<Trait>`). In a module with `#[model]`/`#[repository]`, import
   `autumn_web::db::prelude::*`, never `diesel::prelude::*` (E0034).
@@ -3716,6 +3712,7 @@ autumn graph show --manifest architecture-graph.json --check architecture-graph.
 # `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 autumn graph check-boundaries    # fail when one boundary queries a table another boundary owns (0.10.0, #3549)
+autumn db grants --apply         # GRANT/REVOKE so each boundary `role` reads only its own tables and exceptions; `autumn doctor --strict` checks it as each role
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
 autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
@@ -3750,7 +3747,10 @@ one is that a call into a helper in another module is not followed. See
 To keep one module out of another module's tables, declare boundaries in
 `boundaries.toml` and run `autumn graph check-boundaries`. A baseline holds
 today's violations, so an existing app can adopt it. See
-`docs/guide/table-ownership.md`.
+`docs/guide/table-ownership.md`. To make the database refuse
+the same queries, give a boundary `schema` and `role`, connect it with
+`[database.roles.<boundary>]`, and use `state.pool_for::<B>()` or
+`BoundaryDb<B>`. See `docs/guide/database-boundaries.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 

@@ -42,12 +42,10 @@ ignore = [
     # it. One copy is left: 0.5.5 via elliptic-curve 0.13 <- p256/p384 0.13 <-
     # jsonwebtoken (ES256/ES384 JWT), same as root deny.toml. Review-by: 2026-11-08.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only, via jsonwebtoken ES256/ES384 -> p256/p384 0.13 -> elliptic-curve 0.13; no patched 0.5.x; review-by 2026-11-08" },
-    # RUSTSEC-2026-0441 — pin-utils is unmaintained (repository archived on
-    # 2026-10-01). No safe upgrade: loom 0.7.2, the latest, still depends on it.
-    # Ingress: loom only, a `cfg(loom_models)` dependency that a normal build
-    # never compiles (the model checks set the cfg). Remove when loom drops it.
-    # Review-by: 2026-12-03.
-    { id = "RUSTSEC-2026-0441", reason = "pin-utils via loom only, under cfg(loom_models) model checks; no loom release drops it; review-by 2026-12-03" },
+    # RUSTSEC-2026-0441 — pin-utils is unmaintained. It comes from
+    # loom 0.7.2, through autumn-web's `cfg(loom_models)` model checks. No
+    # loom release drops it. Review-by: 2026-12-05.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; via loom 0.7.2 (cfg(loom_models) only), same as root deny.toml; no release drops it; review-by 2026-12-05" },
 ]
 
 [sources]

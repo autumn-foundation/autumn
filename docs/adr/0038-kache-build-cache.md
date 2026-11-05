@@ -57,7 +57,9 @@ Cargo file, and about half changed autumn-web or autumn-macros source.
     `save-cache: false`, which sets `KACHE_REMOTE_READONLY` for the daemon.
   - A composite action cannot read `secrets` or `vars`, so each workflow maps
     them into its env as `AUTUMN_KACHE_S3_*`. The bucket, endpoint and region
-    are repository variables. The two tokens are repository secrets.
+    are repository variables or secrets; a variable wins when both are set.
+    The two tokens are repository secrets. A run with the keys but no bucket
+    falls back to the GitHub cache with a warning annotation.
   - `publish-gate.yml` does not map them and stays on the GitHub cache. Its
     jobs prepare releases, which should not depend on a store other runs
     write to.

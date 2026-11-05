@@ -2427,6 +2427,15 @@ impl TestApp {
         state.insert_extension(self.commerce_docs);
         crate::app::install_webhook_registry(&state, &self.config);
 
+        // `[database.roles]` in the test config: build its role pools, so a
+        // `BoundaryDb` connects as the role, as in production.
+        #[cfg(feature = "db")]
+        if !self.config.database.roles.is_empty() {
+            state.insert_extension(
+                crate::db::create_role_pools(&self.config.database)
+                    .expect("test role pools should build from config"),
+            );
+        }
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
         // and HTTP Client resilience can read the test-supplied config.
         state.insert_extension(self.config.clone());
