@@ -1073,7 +1073,8 @@ fn string_escape_mode_finding(normalized: &str) -> Option<SafetyFinding> {
 /// Whether a Postgres statement can change `standard_conforming_strings`.
 /// The scanner reads `'..'` text with the setting on.
 ///
-/// These forms match, also in quoted text such as a `DO` body:
+/// These forms match, also in a `DO` body or a function body. Text data,
+/// such as `DEFAULT 'SET ..'`, does not match.
 ///
 /// - `SET` or `RESET` before the name, as in `ALTER ROLE r SET ..`.
 /// - A `SET` or `RESET` of a `U&".."` name.
@@ -1089,16 +1090,46 @@ fn changes_string_escape_mode(normalized: &str) -> bool {
     if sets_standard_conforming_strings_on(&lower) {
         return false;
     }
-    lower
-        .match_indices(STANDARD_CONFORMING_STRINGS)
-        .any(|(i, _)| ends_with_set_keyword(&lower[..i]))
-        || lower
+    // Text data does not run. The text body of a `DO` block or a function
+    // can run.
+    let text_body_runs = lower.starts_with("do ")
+        || (lower.starts_with("create ")
+            && (lower.contains(" function ") || lower.contains(" procedure ")));
+    let code = if text_body_runs {
+        lower.clone()
+    } else {
+        // Dollar tags are case-sensitive, so scan before lowercasing.
+        blank_text_literals(normalized).to_ascii_lowercase()
+    };
+    code.match_indices(STANDARD_CONFORMING_STRINGS)
+        .any(|(i, _)| ends_with_set_keyword(&code[..i]))
+        || code
             .match_indices("u&\"")
-            .any(|(i, _)| ends_with_set_keyword(&lower[..i]))
-        || set_config_can_change_it(&lower)
-        || resets_all(&lower)
-        || lower.contains("update pg_settings")
-        || lower.contains("update pg_catalog.pg_settings")
+            .any(|(i, _)| ends_with_set_keyword(&code[..i]))
+        || set_config_can_change_it(&code, &lower)
+        || resets_all(&code)
+        || code.contains("update pg_settings")
+        || code.contains("update pg_catalog.pg_settings")
+}
+
+/// `sql` with the text of each `'..'` and `E'..'` literal replaced by
+/// spaces. The byte offsets do not change.
+fn blank_text_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    for (kind, text) in tokens(DatabaseBackend::Postgres, sql) {
+        let open = match text.as_bytes() {
+            [b'\'', ..] => 1,
+            [b'e' | b'E', b'\'', ..] => 2,
+            _ => 0,
+        };
+        if kind == TokenKind::Quoted && open > 0 {
+            out.push_str(&text[..open]);
+            out.extend(std::iter::repeat_n(' ', text.len() - open));
+        } else {
+            out.push_str(text);
+        }
+    }
+    out
 }
 
 /// Whether `lower` holds `RESET ALL` or `DISCARD ALL`.
@@ -1140,11 +1171,12 @@ fn strip_word_suffix<'a>(text: &'a str, word: &str) -> Option<&'a str> {
         .then_some(rest)
 }
 
-/// Whether a `set_config` call in `lower` can name
+/// Whether a `set_config` call in `code` can name
 /// `standard_conforming_strings`. A call does not when its first argument is
-/// only a plain `'..'` literal with a different name.
-fn set_config_can_change_it(lower: &str) -> bool {
-    lower.match_indices("set_config").any(|(i, word)| {
+/// only a plain `'..'` literal with a different name. `lower` is `code` with
+/// its literal text, at the same byte offsets.
+fn set_config_can_change_it(code: &str, lower: &str) -> bool {
+    code.match_indices("set_config").any(|(i, word)| {
         // A quoted name such as `"set_config"` is the same function.
         let after = &lower[i + word.len()..];
         let after = after.strip_prefix('"').unwrap_or(after);
@@ -3208,6 +3240,9 @@ mod tests {
             "RESET ALL;",
             "DISCARD ALL;",
             "DO $$ BEGIN RESET ALL; END $$;",
+            // A plain-text body can run.
+            "DO 'BEGIN RESET ALL; END';",
+            "CREATE FUNCTION f() RETURNS void AS 'SET standard_conforming_strings = off' LANGUAGE sql;",
         ] {
             let findings = classify_sql_for(pg, sql);
             assert!(
@@ -3232,6 +3267,12 @@ mod tests {
             "CREATE TABLE settings (standard_conforming_strings boolean);",
             "SELECT a FROM x UNION ALL SELECT a FROM y;",
             "CREATE TABLE t (reset allowed);",
+            // Text data does not run.
+            "SELECT 'SET standard_conforming_strings = off';",
+            "CREATE TABLE t (m text DEFAULT 'SET standard_conforming_strings = off');",
+            "SELECT 'RESET ALL', E'update pg_settings', 'set_config(x)';",
+            "SELECT 'é RESET ALL', set_config('search_path', 'app', false);",
+            "SELECT $A$ $a$ $A$, 'RESET ALL';",
             "-- autumn-safety: reviewed\nSET standard_conforming_strings = off;",
         ] {
             assert_eq!(ops(pg, sql), Vec::<String>::new(), "{sql:?}");
