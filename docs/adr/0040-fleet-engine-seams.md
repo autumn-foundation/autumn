@@ -93,7 +93,7 @@ flowchart LR
     end
     subgraph rocks["autumn-plugin-rocksdb"]
         FR["FleetRocksDb extractor"]
-        RE["RocksDbEngine, bucket mode"]
+        RE["RocksDbEngine"]
     end
     SQ -.-> E
     DE -.-> E
@@ -138,6 +138,11 @@ pub trait FleetEngine: Send + Sync + 'static {
 }
 ```
 
+- **Modes do not change.** A fleet of any engine is `mode = "tenant"` (one
+  database per tenant) or `mode = "slot"` (one database per slot), as in
+  ADR 0019. The app picks the mode. An engine adds no mode of its own.
+  `{bucket}` stays a directory of 64 slots in the path template, so every
+  engine gets the same one-directory cell handoff.
 - `DatabaseFleet` becomes `DatabaseFleet<E: FleetEngine>`.
   `DatabaseFleet<SqliteEngine>` keeps the current API. A `sqlite`-gated type
   alias keeps the name `DatabaseFleet` for existing apps.
@@ -284,7 +289,7 @@ covers the engine side of the contract.
 |---|---|
 | `DuckDbEngine`, `FleetDuckDb`, DuckDB sidecar | `autumn-plugin-duckdb` |
 | Parquet `LakeSink` and DuckDB lake queries | `autumn-plugin-duckdb` |
-| `RocksDbEngine` (one database per bucket), `FleetRocksDb` | `autumn-plugin-rocksdb` |
+| `RocksDbEngine`, `FleetRocksDb` | `autumn-plugin-rocksdb` |
 | Incremental SST shipping logic | `autumn-plugin-rocksdb` |
 | Any database wire protocol | Nowhere. Handlers use the extractor. |
 
@@ -293,10 +298,9 @@ Notes for the plugins. These are not part of this decision:
 - **DuckDB per tenant** works best as a sidecar with `ShipMode::Rebuild`. It
   holds analytics derived from the tenant's SQLite data. Keep `threads` low
   and let the memory budget evict.
-- **RocksDB** works best with one database per bucket (`slot / 64`) and a
-  key prefix per tenant. One RocksDB per tenant holds too many memtables,
-  threads and file handles. A cell handoff is already one bucket directory.
-  The epoch goes in a reserved `autumn_fleet` column family.
+- **RocksDB** shares one block cache and one `WriteBufferManager` across
+  its open databases. The epoch goes in a reserved `autumn_fleet` column
+  family.
 - **The DuckDB lake sink** writes Parquet partitioned by tenant and date. It
   should not use DuckLake. The core inclusion rule and file manifests are
   the catalog.
@@ -323,8 +327,8 @@ Notes for the plugins. These are not part of this decision:
 2. Add `resolve`, `resolve_key`, the hook context and
    `fleet_ownership_store`. Then the DuckDB plugin adds `FleetDuckDb` as a
    sidecar.
-3. Add `ShipMode::Generations` and `Rebuild`. Then the RocksDB plugin adds a
-   bucket-mode engine.
+3. Add `ShipMode::Generations` and `Rebuild`. Then the RocksDB plugin adds
+   its engine.
 4. Add `LakeSink` and port the SQLite lake to it. Then the DuckDB plugin adds
    the Parquet sink.
 
