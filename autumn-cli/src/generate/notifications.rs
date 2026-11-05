@@ -253,13 +253,18 @@ fn migration_up_sql(backend: DatabaseBackend) -> String {
     };
     // `tenant_id` is `""` outside a tenant scope, so it is `NOT NULL DEFAULT ''`.
     // The composite index serves every feed query: all filter on both columns.
+    // The partial index serves the unread badge count and the unread feed: a
+    // recipient with a long read history would otherwise be walked row by row
+    // through the heap to find the few unread ones.
     let sql = sql.replace(
         "tenant_id TEXT NOT NULL",
         "tenant_id TEXT NOT NULL DEFAULT ''",
     );
     format!(
         "{sql}CREATE INDEX idx_notifications_tenant_recipient ON notifications \
-         (tenant_id, recipient_id);\n"
+         (tenant_id, recipient_id);\n\
+         CREATE INDEX idx_notifications_unread ON notifications \
+         (tenant_id, recipient_id) WHERE read_at IS NULL;\n"
     )
 }
 
@@ -788,7 +793,8 @@ async fn main() {
                  \x20   read_at TIMESTAMPTZ NULL,\n\
                  \x20   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n\
                  );\n\
-                 CREATE INDEX idx_notifications_tenant_recipient ON notifications (tenant_id, recipient_id);\n"
+                 CREATE INDEX idx_notifications_tenant_recipient ON notifications (tenant_id, recipient_id);\n\
+                 CREATE INDEX idx_notifications_unread ON notifications (tenant_id, recipient_id) WHERE read_at IS NULL;\n"
             );
 
             let down = fs::read_to_string(dir.join("down.sql")).unwrap();
