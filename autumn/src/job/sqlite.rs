@@ -1626,7 +1626,7 @@ fn queue_topology(
     config: &crate::config::JobConfig,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     run_workers: bool,
-    task_queues: &[String],
+    state: &AppState,
 ) -> (QueueSchedule, Arc<QueueSlots>) {
     let (mut schedule, unconfigured) =
         QueueSchedule::effective(&config.queues, &collect_declared_queues(jobs_by_name));
@@ -1645,7 +1645,7 @@ fn queue_topology(
             &uncovered,
             &config.pin,
             schedule.names().is_empty(),
-            task_queues,
+            &super::background_task_queues(state),
         );
     }
     let mut limits = QueueLimits::from_config(&config.queues);
@@ -1704,12 +1704,7 @@ pub(super) fn start_runtime(
         })));
     }
 
-    let (schedule, slots) = queue_topology(
-        config,
-        &jobs_by_name,
-        run_workers,
-        &super::background_task_queues(state),
-    );
+    let (schedule, slots) = queue_topology(config, &jobs_by_name, run_workers, state);
 
     install_enqueue_client(state, &queue_handle, &job_admin, per_job_settings, config);
 
