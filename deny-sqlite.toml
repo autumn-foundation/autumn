@@ -51,6 +51,19 @@ ignore = [
     # oracle). Autumn's own p256 (Web Push) and aws-sigv4 use 0.7.10. Remove
     # when jsonwebtoken moves to p256 0.14. Review-by: 2026-11-08.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only, via jsonwebtoken ES256/ES384 -> p256/p384 0.13 -> elliptic-curve 0.13; no patched 0.5.x; review-by 2026-11-08" },
+    # RUSTSEC-2026-0440 — astral-tokio-tar is unmaintained (Astral ended it on
+    # 2026-11-03). No safe upgrade: testcontainers 0.28.0, the latest, still
+    # depends on it. Ingress: testcontainers only, a dev-dependency and the
+    # opt-in `test-support` feature. It packs a build context for a test
+    # container; no production path reads a tar. Remove when testcontainers
+    # moves off it. Review-by: 2026-12-03.
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar via testcontainers only (dev-dependency and opt-in test-support); no maintained release of testcontainers drops it; review-by 2026-12-03" },
+    # RUSTSEC-2026-0441 — pin-utils is unmaintained (repository archived on
+    # 2026-10-01). No safe upgrade: loom 0.7.2, the latest, still depends on it.
+    # Ingress: loom only, a `cfg(loom_models)` dependency that a normal build
+    # never compiles (the model checks set the cfg). Remove when loom drops it.
+    # Review-by: 2026-12-03.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils via loom only, under cfg(loom_models) model checks; no loom release drops it; review-by 2026-12-03" },
 ]
 
 [licenses]

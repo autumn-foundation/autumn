@@ -2763,10 +2763,12 @@ the build.
   `{ id = "RUSTSEC-…", reason = "why this is acceptable here; review-by <date>" }`.
   A waiver lets exactly one id through; the gate stays on and every other
   advisory still fails.
-- A fresh scaffold ships two waivers already — RUSTSEC-2023-0071 (`rsa`) and
+- A fresh scaffold ships three waivers already — RUSTSEC-2023-0071 (`rsa`) and
   RUSTSEC-2026-0387 (`crypto-bigint` 0.5), both reached through the
-  unconditional `jsonwebtoken` dependency, no patched release exists — which is
-  why day-one CI is green. Do not remove either without checking
+  unconditional `jsonwebtoken` dependency, no patched release exists, and
+  RUSTSEC-2026-0441 (`pin-utils`, unmaintained), reached only through
+  autumn-web's `cfg(loom_models)` `loom` dependency — which is why day-one CI
+  is green. Do not remove any without checking
   whether a fixed release has shipped. An unused-waiver warning means one of the
   app author's own waivers went stale.
 - An app upgraded from a release before this gate existed receives the workflow

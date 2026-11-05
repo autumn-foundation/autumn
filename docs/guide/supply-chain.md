@@ -445,13 +445,15 @@ one in the same crate — still fails, and the gate itself stays on. The id and
 the rationale are committed to your repository, so the decision is reviewable
 in a pull request rather than living in someone's memory.
 
-Your generated `deny.toml` has two waivers: `RUSTSEC-2023-0071` (`rsa`) and
-`RUSTSEC-2026-0387` (`crypto-bigint` 0.5). Both reach an Autumn app through
+Your generated `deny.toml` has three waivers. `RUSTSEC-2023-0071` (`rsa`) and
+`RUSTSEC-2026-0387` (`crypto-bigint` 0.5) reach an Autumn app through
 `jsonwebtoken`, which `autumn-web` compiles behind its default-on `jwt`
 feature. No fix an app can take exists for either. An app that needs neither
 JWT tenancy nor OIDC can set `default-features = false`, leave out `jwt` (and
 `oauth2`, which turns it on), and delete both waivers. A passkey app still
-reaches `rsa` through `webauthn-rs`. cargo-deny's "this waiver is unused"
+reaches `rsa` through `webauthn-rs`. `RUSTSEC-2026-0441` (`pin-utils`, which
+is unmaintained) reaches the lockfile through `loom`. `autumn-web` compiles
+`loom` only for its own model checks, so your build never compiles it. cargo-deny's "this waiver is unused"
 warning tells you when one of *your* waivers has gone stale.
 
 Those waivers are why a freshly scaffolded app's CI is green on day one instead
