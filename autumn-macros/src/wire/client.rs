@@ -178,10 +178,13 @@ fn path_text(path: &Path) -> String {
 fn expand(input: TokenStream) -> Result<TokenStream, syn::Error> {
     let def: ClientDef = syn::parse2(input)?;
     let client = &def.name;
-    if let Some(dir) = store::contract_dir() {
+    let written = store::contract_dir().map_or_else(TokenStream::new, |dir| {
         let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-        store::write_client(&dir, &client_descriptor(&krate, &def)?);
-    }
+        client_descriptor(&krate, &def).map_or_else(
+            |e| e.to_compile_error(),
+            |d| store::write_outcome(store::write_client(&dir, &d)),
+        )
+    });
     let track = store::track_contract_dir();
 
     let mut methods = Vec::new();
@@ -208,6 +211,7 @@ fn expand(input: TokenStream) -> Result<TokenStream, syn::Error> {
 
     Ok(quote! {
         #track
+        #written
         #(#assertions)*
 
         #[doc = #client_doc]

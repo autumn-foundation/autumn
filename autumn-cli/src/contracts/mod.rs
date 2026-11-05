@@ -61,6 +61,8 @@ pub struct CheckOptions {
     pub current: Option<PathBuf>,
     /// The deploy order the operator plans.
     pub order: Order,
+    /// Accept an `http://` URL for `against`.
+    pub allow_http: bool,
     /// The crates to check.
     pub pass: PassOptions,
 }
@@ -95,46 +97,51 @@ impl Against {
 pub fn run_export(opts: &ExportOptions) {
     let bundle = export_pass(Path::new("."), &opts.pass).unwrap_or_else(|e| fail(&e));
     let bytes = bundle.to_bytes();
-    match &opts.out {
-        Some(path) => {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent)
-                    .unwrap_or_else(|e| fail(&format!("create {}: {e}", parent.display())));
-            }
-            std::fs::write(path, &bytes)
-                .unwrap_or_else(|e| fail(&format!("write {}: {e}", path.display())));
-            eprintln!(
-                "Wrote {} endpoint(s) and {} call(s) to {}.",
-                bundle.endpoints.len(),
-                bundle.callers.len(),
-                path.display()
-            );
-        }
-        None => {
-            use std::io::Write as _;
-            std::io::stdout()
-                .write_all(&bytes)
-                .unwrap_or_else(|e| fail(&format!("write stdout: {e}")));
-        }
+    let Some(path) = &opts.out else {
+        use std::io::Write as _;
+        std::io::stdout()
+            .write_all(&bytes)
+            .unwrap_or_else(|e| fail(&format!("write stdout: {e}")));
+        return;
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| fail(&format!("create {}: {e}", parent.display())));
     }
+    std::fs::write(path, &bytes)
+        .unwrap_or_else(|e| fail(&format!("write {}: {e}", path.display())));
+    eprintln!(
+        "Wrote {} endpoint(s) and {} call(s) to {}.",
+        bundle.endpoints.len(),
+        bundle.callers.len(),
+        path.display()
+    );
 }
 
 /// Run `autumn contracts check`. Exits with the report's code.
 pub fn run_check(opts: &CheckOptions) {
-    let deployed = load_against(&opts.against, &opts.pass).unwrap_or_else(|e| fail(&e));
-    let current = match &opts.current {
-        Some(path) => read_bundle(path).unwrap_or_else(|e| fail(&e)),
-        None => export_pass(Path::new("."), &opts.pass).unwrap_or_else(|e| fail(&e)),
-    };
+    let deployed =
+        load_against(&opts.against, opts.allow_http, &opts.pass).unwrap_or_else(|e| fail(&e));
+    let current = opts
+        .current
+        .as_deref()
+        .map_or_else(|| export_pass(Path::new("."), &opts.pass), read_bundle)
+        .unwrap_or_else(|e| fail(&e));
     let report = compat::compare(&deployed, &current);
     print!("{}", report.render(opts.order));
     std::process::exit(report.exit_code(opts.order));
 }
 
+/// Exit code: the tool could not run the check. It is not a verdict.
+pub const EXIT_ERROR: i32 = 4;
+
 fn fail(message: &str) -> ! {
     eprintln!("\u{2717} {message}");
-    std::process::exit(1);
+    std::process::exit(EXIT_ERROR);
 }
+
+/// The largest bundle a URL may serve.
+const MAX_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Read and parse a bundle file.
 fn read_bundle(path: &Path) -> Result<Bundle, String> {
@@ -143,33 +150,110 @@ fn read_bundle(path: &Path) -> Result<Bundle, String> {
 }
 
 /// Load the deployed bundle from a file, a URL, or a git ref.
-fn load_against(value: &str, pass: &PassOptions) -> Result<Bundle, String> {
+fn load_against(value: &str, allow_http: bool, pass: &PassOptions) -> Result<Bundle, String> {
     match Against::classify(value, Path::is_file) {
         Against::File(path) => read_bundle(&path),
-        Against::Url(url) => fetch_bundle(&url),
+        Against::Url(url) => fetch_bundle(&url, allow_http),
         Against::GitRef(git_ref) => export_at_ref(&git_ref, pass),
     }
 }
 
 /// Download a bundle.
-fn fetch_bundle(url: &str) -> Result<Bundle, String> {
-    let response = reqwest::blocking::get(url).map_err(|e| format!("fetch {url}: {e}"))?;
+///
+/// An `http://` URL needs `--allow-http`: a party in the path could serve a
+/// bundle with no callers, and every change would then read as safe. A
+/// redirect may not go from `https` to `http`.
+fn fetch_bundle(url: &str, allow_http: bool) -> Result<Bundle, String> {
+    use std::io::Read as _;
+    if url.starts_with("http://") && !allow_http {
+        return Err(format!(
+            "refusing plain-http bundle URL {url}; use https, or pass --allow-http"
+        ));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            let downgrade = attempt.url().scheme() == "http"
+                && attempt.previous().iter().any(|u| u.scheme() == "https");
+            if downgrade {
+                attempt.error("redirect from https to http")
+            } else if attempt.previous().len() > 5 {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("fetch {url}: {e}"))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("fetch {url}: HTTP {status}"));
     }
-    let bytes = response.bytes().map_err(|e| format!("fetch {url}: {e}"))?;
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_BUNDLE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("fetch {url}: {e}"))?;
+    if bytes.len() as u64 > MAX_BUNDLE_BYTES {
+        return Err(format!(
+            "fetch {url}: the bundle is larger than {MAX_BUNDLE_BYTES} bytes"
+        ));
+    }
     Bundle::from_slice(&bytes).map_err(|e| format!("{url}: {e}"))
+}
+
+/// A temporary git worktree. Drop removes it, also after an error or a panic.
+struct Worktree {
+    top: PathBuf,
+    path: PathBuf,
+    _scratch: tempfile::TempDir,
+}
+
+impl Worktree {
+    fn add(top: &Path, commit: &str) -> Result<Self, String> {
+        let scratch = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
+        let path = scratch.path().join("tree");
+        let text = path.to_string_lossy().into_owned();
+        git(
+            top,
+            &["worktree", "add", "--detach", "--quiet", &text, commit],
+        )?;
+        Ok(Self {
+            top: top.to_path_buf(),
+            path,
+            _scratch: scratch,
+        })
+    }
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        let text = self.path.to_string_lossy().into_owned();
+        if git(&self.top, &["worktree", "remove", "--force", &text]).is_err() {
+            let _ = std::fs::remove_dir_all(&self.path);
+            let _ = git(&self.top, &["worktree", "prune"]);
+        }
+    }
 }
 
 /// Export a bundle from another commit, in a temporary git worktree.
 ///
-/// The pass uses this workspace's target directory, so the dependencies
-/// compile once for both commits.
+/// The pass uses its own target directory under this workspace's target
+/// directory. Cargo names a path crate's artifacts by its path relative to the
+/// workspace root, so a shared directory would mix the two commits' crates.
+/// The directory stays, so dependencies compile only once.
 fn export_at_ref(git_ref: &str, pass: &PassOptions) -> Result<Bundle, String> {
     let commit = git(
         Path::new("."),
-        &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{git_ref}^{{commit}}"),
+        ],
     )
     .map_err(|e| format!("`{git_ref}` is not a bundle file, an http(s) URL, or a git ref: {e}"))?;
     let top = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
@@ -178,31 +262,57 @@ fn export_at_ref(git_ref: &str, pass: &PassOptions) -> Result<Bundle, String> {
     let top = top.canonicalize().unwrap_or(top);
     let relative = here
         .strip_prefix(&top)
-        .unwrap_or(Path::new(""))
+        .unwrap_or_else(|_| Path::new(""))
         .to_path_buf();
-    let target_dir = target_dir(Path::new("."))?;
+    let target = target_dir(&metadata(Path::new("."))?)?.join("autumn-contracts-ref");
 
-    let scratch = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
-    let tree = scratch.path().join("tree");
-    let tree_text = tree.to_string_lossy().into_owned();
-    git(
-        &top,
-        &[
-            "worktree", "add", "--detach", "--quiet", &tree_text, &commit,
-        ],
-    )?;
-    let result = with_target_dir(&tree.join(&relative), pass, &target_dir);
-    // Remove the worktree whatever the pass did.
-    let _ = git(&top, &["worktree", "remove", "--force", &tree_text]);
-    result.map_err(|e| format!("export at `{git_ref}`: {e}"))
+    let tree = Worktree::add(&top, &commit)?;
+    let workspace = tree.path.join(&relative);
+    if !workspace.is_dir() {
+        return Err(format!(
+            "`{}` does not exist at `{git_ref}`",
+            relative.display()
+        ));
+    }
+    let pass = packages_at(&workspace, pass, git_ref)?;
+    run_pass(&workspace, &pass, Some(&target)).map_err(|e| format!("export at `{git_ref}`: {e}"))
 }
 
-fn with_target_dir(
-    workspace: &Path,
-    pass: &PassOptions,
-    target_dir: &Path,
-) -> Result<Bundle, String> {
-    run_pass(workspace, pass, Some(target_dir))
+/// Keep only the `-p` packages that exist in `workspace`. A release that adds
+/// a service has no such package at an older commit.
+fn packages_at(workspace: &Path, pass: &PassOptions, git_ref: &str) -> Result<PassOptions, String> {
+    if pass.packages.is_empty() {
+        return Ok(pass.clone());
+    }
+    let meta = metadata(workspace)?;
+    let names: Vec<&str> = meta
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .map(|packages| {
+            packages
+                .iter()
+                .filter_map(|p| p.get("name").and_then(serde_json::Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (kept, dropped): (Vec<String>, Vec<String>) = pass
+        .packages
+        .iter()
+        .cloned()
+        .partition(|p| names.contains(&p.as_str()));
+    if !dropped.is_empty() {
+        eprintln!(
+            "Not at `{git_ref}`, so not checked there: {}.",
+            dropped.join(", ")
+        );
+    }
+    if kept.is_empty() {
+        return Err(format!("none of the -p packages exist at `{git_ref}`"));
+    }
+    Ok(PassOptions {
+        packages: kept,
+        features: pass.features.clone(),
+    })
 }
 
 /// Run git and return its trimmed stdout.
@@ -218,8 +328,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// The workspace's target directory, from `cargo metadata`.
-fn target_dir(workspace: &Path) -> Result<PathBuf, String> {
+/// `cargo metadata --no-deps` for the workspace at `workspace`.
+fn metadata(workspace: &Path) -> Result<serde_json::Value, String> {
     let out = Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .current_dir(workspace)
@@ -229,8 +339,11 @@ fn target_dir(workspace: &Path) -> Result<PathBuf, String> {
     if !out.status.success() {
         return Err("cargo metadata failed".to_owned());
     }
-    let meta: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))
+}
+
+/// The target directory in `cargo metadata` output.
+fn target_dir(meta: &serde_json::Value) -> Result<PathBuf, String> {
     meta.get("target_directory")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
@@ -249,7 +362,8 @@ fn export_pass(workspace: &Path, pass: &PassOptions) -> Result<Bundle, String> {
 /// directory each time makes every wire macro run and write its descriptor,
 /// so a cached build cannot leave a descriptor out. The pass also turns off a
 /// rustc wrapper such as sccache: a wrapper that replays a cached compile does
-/// not run the macros.
+/// not run the macros. `AUTUMN_CONTRACT_STRICT` makes a failed descriptor
+/// write a compile error, so a lost file cannot shrink the bundle.
 fn run_pass(workspace: &Path, pass: &PassOptions, target: Option<&Path>) -> Result<Bundle, String> {
     let out = tempfile::Builder::new()
         .prefix("autumn-contracts-")
@@ -259,6 +373,7 @@ fn run_pass(workspace: &Path, pass: &PassOptions, target: Option<&Path>) -> Resu
     cmd.args(pass.cargo_args())
         .current_dir(workspace)
         .env("AUTUMN_CONTRACT_DIR", out.path())
+        .env("AUTUMN_CONTRACT_STRICT", "1")
         .env("RUSTC_WRAPPER", "")
         .env("RUSTC_WORKSPACE_WRAPPER", "")
         .stdout(Stdio::null())

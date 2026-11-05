@@ -147,7 +147,7 @@ fn expand(attr: TokenStream, item: &TokenStream) -> Result<TokenStream, syn::Err
         |ty| quote! { #ty },
     );
 
-    write_descriptor(
+    let written = write_descriptor(
         &args.service,
         &name,
         &marker,
@@ -167,6 +167,7 @@ fn expand(attr: TokenStream, item: &TokenStream) -> Result<TokenStream, syn::Err
 
     Ok(quote! {
         #track
+        #written
 
         #[doc = #doc]
         #[allow(non_camel_case_types)]
@@ -268,12 +269,12 @@ fn write_descriptor(
     path: &str,
     request_ty: Option<&syn::Type>,
     response_ty: &syn::Type,
-) {
+) -> TokenStream {
     let Some(dir) = store::contract_dir() else {
-        return;
+        return TokenStream::new();
     };
     let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-    store::write_endpoint(
+    store::write_outcome(store::write_endpoint(
         &dir,
         &EndpointDescriptor {
             service: service.to_owned(),
@@ -288,7 +289,7 @@ fn write_descriptor(
             ),
             response_type: autumn_macros_support::schema::type_name_str(response_ty),
         },
-    );
+    ))
 }
 
 #[cfg(test)]

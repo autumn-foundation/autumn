@@ -110,13 +110,21 @@ fn expand(attr: TokenStream, item: &TokenStream) -> Result<TokenStream, syn::Err
         .iter()
         .flat_map(|call| assertions_for(call, &args.clients[call.client], &caller))
         .collect();
-    if let Some(dir) = store::contract_dir() {
+    let written = store::contract_dir().map_or_else(TokenStream::new, |dir| {
         let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
         let descriptor = caller_descriptor(&krate, &caller, &calls, &args.clients);
-        store::write_caller(&dir, &descriptor, &stable_key(&item.to_string()));
-    }
+        store::write_outcome(store::write_caller(
+            &dir,
+            &descriptor,
+            &stable_key(&item.to_string()),
+        ))
+    });
+    // The tracker goes in the body: a `const _` item is not allowed in an
+    // `impl` block, and the body works for a free function and a method.
+    let mut func = func;
     let track = store::track_contract_dir();
-    Ok(quote! { #track #(#assertions)* #func })
+    func.block.stmts.insert(0, syn::parse_quote! { #track });
+    Ok(quote! { #written #(#assertions)* #func })
 }
 
 /// The JSON descriptor for one checked function: what each call reads and
@@ -1280,5 +1288,18 @@ mod tests {
         );
         assert!(out.contains("option_env"), "{out}");
         assert!(out.contains("AUTUMN_CONTRACT_DIR"), "{out}");
+    }
+
+    #[test]
+    fn a_method_with_no_assertions_still_expands_to_one_impl_item() {
+        let out = expand_str(
+            "client = CatalogClient",
+            "async fn page(&self, catalog: CatalogClient) { catalog.list(self.query()).await.unwrap(); }",
+        );
+        let method: syn::ImplItemFn = syn::parse_str(&out).expect("one method, no free items");
+        assert!(
+            quote::quote!(#method).to_string().contains("option_env"),
+            "{out}"
+        );
     }
 }

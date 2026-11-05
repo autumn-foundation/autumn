@@ -77,7 +77,7 @@ COMPATIBLE = [
 ]
 
 # Release 2 cases: (label, [(file, old, new)], exit code, text the report
-# must hold). Exit 0 is safe in any order, 1 is safe in no order, 2 is safe
+# must hold). Exit 0 is safe in any order, 1 is safe in no order, 3 is safe
 # only in the order the report names.
 DEPLOY_CALLERS_FIRST = 'Deploy mesh-storefront before catalog'
 DEPLOY_CALLEES_FIRST = 'Deploy catalog before mesh-storefront'
@@ -92,10 +92,10 @@ CROSS_RELEASE = [
     (LIB, "            name,\n            price_cents,\n        }", "            name,\n        }"),
     (LIB, "fn sample(id: String, name: String, price_cents: u32)", "fn sample(id: String, name: String, _price_cents: u32)"),
     (MAIN, '        p { "$" (item.price_cents / 100) }\n', ""),
- ], 2, DEPLOY_CALLERS_FIRST),
+ ], 3, DEPLOY_CALLERS_FIRST),
  ("new required request field", [
     (LIB, "    /// Optional note. Absent from a request body is fine.", "    /// Stock code. Required.\n    pub sku: String,\n    /// Optional note. Absent from a request body is fine."),
- ], 2, DEPLOY_CALLERS_FIRST),
+ ], 3, DEPLOY_CALLERS_FIRST),
  ("new optional request field", [
     (LIB, "    /// Optional note. Absent from a request body is fine.", "    /// Coupon code. Optional.\n    pub coupon: Option<String>,\n    /// Optional note. Absent from a request body is fine."),
  ], 0, 'safe in any deploy order'),
@@ -103,7 +103,7 @@ CROSS_RELEASE = [
     (LIB, "    /// Price in cents.\n    pub price_cents: u32,\n}", "    /// Price in cents.\n    pub price_cents: u32,\n    /// Promotion badge. Optional.\n    pub badge: Option<String>,\n}"),
     (LIB, "            price_cents,\n        }", "            price_cents,\n            badge: None,\n        }"),
     (MAIN, '        h1 { (item.name) }\n', '        h1 { (item.name) }\n        p { (item.badge.clone().unwrap_or_default()) }\n'),
- ], 2, DEPLOY_CALLEES_FIRST),
+ ], 3, DEPLOY_CALLEES_FIRST),
  ("path changed", [
     (LIB, '#[get("/items/{id}")]', '#[get("/catalog/items/{id}")]'),
  ], 1, 'not safe in any deploy order'),
@@ -111,7 +111,7 @@ CROSS_RELEASE = [
     (LIB, '#[get("/items/{id}")]', '#[get("/catalog/items/{id}")]'),
     (LIB, "/// The catalog service's routes.", '/// The old route of `get_item`, kept for deployed callers.\n#[endpoint(service = "catalog")]\n#[get("/items/{id}")]\n#[public]\npub async fn get_item_legacy(id: Path<String>) -> AutumnResult<Json<Item>> {\n    Ok(Json(Item::sample(id.to_string(), format!(\"Item {}\", *id), 1299)))\n}\n\n/// The catalog service\'s routes.'),
     (LIB, "routes![get_item, create_item]", "routes![get_item, get_item_legacy, create_item]"),
- ], 2, DEPLOY_CALLEES_FIRST),
+ ], 3, DEPLOY_CALLEES_FIRST),
  ("method changed", [
     (LIB, '#[get("/items/{id}")]', '#[post("/items/{id}")]'),
  ], 1, 'not safe in any deploy order'),

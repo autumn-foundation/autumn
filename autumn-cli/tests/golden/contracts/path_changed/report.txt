@@ -1,7 +1,7 @@
 Wire contracts: the current build against the deployed release.
 
 If the callees ship first (new callees, deployed callers): 1 break(s)
-  - catalog.get_item (GET /items/{id}): the new callee no longer serves this route; any client gets no endpoint
+  - catalog.get_item (GET /items/{id}): caller `mesh-storefront::show_item` calls this route, and the new callee does not serve it
 
 If the callers ship first (new callers, deployed callees): 1 break(s)
   - catalog.get_item (GET /catalog/items/{id}): caller `mesh-storefront::show_item` calls this route, and the deployed callee does not serve it

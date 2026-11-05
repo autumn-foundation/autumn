@@ -2432,8 +2432,8 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   sorted, byte-stable bundle; store it with each release.
   `autumn contracts check --against <bundle|url|git-ref>` checks both deploy
   windows (new callees with deployed callers, new callers with deployed
-  callees). Exit 0 safe, 1 not safe, 2 safe in one order only (the report
-  names it; `--order callee-first|caller-first` declares it).
+  callees). Exit 0 safe, 1 not safe, 3 safe in one order only (the report
+  names it; `--order callee-first|caller-first` declares it), 4 tool error.
 
 Limits: one workspace, sync request/response, JSON over HTTP. Guide:
 `docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +

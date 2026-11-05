@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 pub const BUNDLE_FORMAT: u32 = 1;
 
 /// The type name of an endpoint with no request body.
-const NO_BODY: &str = "NoBody";
+pub const NO_BODY: &str = "NoBody";
 
 /// The wire contract of one release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,23 +257,26 @@ fn resolve_call<'a>(
         "`{}::{}` calls `{}`",
         caller.krate, caller.function, call.method
     );
-    let client = match clients
+    // A client in the caller's own crate wins. Otherwise the name must be
+    // unique across the pass, as for a client in a shared crate.
+    let named: Vec<&ClientDescriptor> = clients.iter().filter(|c| c.name == call.client).collect();
+    let own: Vec<&ClientDescriptor> = named
         .iter()
-        .filter(|c| c.krate == caller.krate && c.name == call.client)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [one] => *one,
-        [] => {
+        .copied()
+        .filter(|c| c.krate == caller.krate)
+        .collect();
+    let client = match (own.as_slice(), named.as_slice()) {
+        ([one], _) | ([], [one]) => *one,
+        (_, []) => {
             return Err(format!(
-                "{at} through `{}`, and crate `{}` has no `wire_client!` of that name",
-                call.client, caller.krate
+                "{at} through `{}`, and no crate in the pass has a `wire_client!` of that name",
+                call.client
             ));
         }
         _ => {
             return Err(format!(
-                "{at} through `{}`, and crate `{}` declares two clients of that name",
-                call.client, caller.krate
+                "{at} through `{}`, and more than one `wire_client!` has that name",
+                call.client
             ));
         }
     };
@@ -320,7 +323,8 @@ fn read_all<T: serde::de::DeserializeOwned>(dir: &Path, prefix: &str) -> Result<
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".json"))
+                .is_some_and(|n| n.starts_with(prefix))
+                && p.extension().is_some_and(|e| e == "json")
         })
         .collect();
     paths.sort();
@@ -584,5 +588,21 @@ mod tests {
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert_eq!(bundle.callers.len(), 1);
         let _: BTreeSet<&BundleCall> = bundle.callers.iter().collect();
+    }
+
+    #[test]
+    fn a_client_declared_in_another_crate_resolves_when_its_name_is_unique() {
+        let dir = fixture();
+        std::fs::remove_file(dir.path().join("client.mesh-storefront.CatalogClient.json"))
+            .expect("rm");
+        let mut shared = client();
+        shared.krate = "mesh-clients".to_owned();
+        write(
+            dir.path(),
+            "client.mesh-clients.CatalogClient.json",
+            &shared,
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.callers[0].endpoint, "get_item");
     }
 }

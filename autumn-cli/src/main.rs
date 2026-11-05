@@ -659,7 +659,8 @@ pub enum ContractsSubcommands {
     ///
     /// Checks both deploy windows: new callees with deployed callers, and new
     /// callers with deployed callees. Exit 0: safe in the declared order.
-    /// Exit 1: not safe. Exit 2: safe only in the order the report names.
+    /// Exit 1: not safe. Exit 3: safe only in the order the report names.
+    /// Exit 4: the check could not run.
     Check {
         /// The deployed release: a bundle file, an http(s) URL, or a git ref.
         #[arg(long, value_name = "BUNDLE|URL|GIT-REF")]
@@ -670,6 +671,9 @@ pub enum ContractsSubcommands {
         /// The deploy order you plan. `any` needs both windows to be safe.
         #[arg(long, value_enum, default_value_t = contracts::compat::Order::Any)]
         order: contracts::compat::Order,
+        /// Accept a plain `http://` URL for `--against`.
+        #[arg(long)]
+        allow_http: bool,
         #[command(flatten)]
         pass: ContractsPassArgs,
     },
@@ -6139,12 +6143,14 @@ fn run_command(command: Commands) {
             against,
             current,
             order,
+            allow_http,
             pass,
         }) => {
             contracts::run_check(&contracts::CheckOptions {
                 against,
                 current,
                 order,
+                allow_http,
                 pass: pass.into_pass(),
             });
         }
@@ -10574,8 +10580,10 @@ mod tests {
                 against,
                 current,
                 order,
+                allow_http,
                 pass,
             }) => {
+                assert!(!allow_http, "https only by default");
                 assert_eq!(against, "deployed.json");
                 assert!(current.is_none());
                 assert_eq!(order, contracts::compat::Order::CallerFirst);

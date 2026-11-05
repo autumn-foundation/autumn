@@ -98,7 +98,7 @@ Verdict: safe only if the callees ship first.
   Deploy catalog before mesh-storefront.
 ```
 
-The check exits 2. Ship the catalog first, or run with `--order callee-first`
+The check exits 3. Ship the catalog first, or run with `--order callee-first`
 to declare that order. Remove `subtitle`, which no caller reads, and the check
 exits 0. Change the `get_item` path, and the check exits 1: no order is safe.
 

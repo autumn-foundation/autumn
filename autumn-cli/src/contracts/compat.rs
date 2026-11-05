@@ -13,9 +13,9 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use autumn_macros_support::wire::{WireFieldDescriptor, WireTypeDescriptor};
+use autumn_macros_support::wire::WireFieldDescriptor;
 
-use super::bundle::{Bundle, BundleCall, BundleEndpoint};
+use super::bundle::{Bundle, BundleCall, BundleEndpoint, NO_BODY};
 
 /// The two deploy windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,6 +40,9 @@ pub enum BreakKind {
     /// The caller's response type denies unknown fields, and the callee
     /// produces one.
     ResponseFieldRejected(String),
+    /// The caller's response type gets one field under two keys: its name
+    /// and an alias. serde refuses that object.
+    ResponseDuplicateKey(String),
     /// A response field changed its Rust type.
     ResponseTypeChanged {
         /// The field's wire key.
@@ -49,12 +52,17 @@ pub enum BreakKind {
         /// The type the callee produces.
         callee: String,
     },
+    /// The caller sends no body, and the callee now reads one.
+    RequestBodyMissing,
     /// The callee requires a request field the caller does not always send.
     RequestFieldNotSent(String),
     /// The caller sets a request field the callee ignores.
     RequestFieldDropped(String),
     /// The callee denies unknown fields, and the caller may send one.
     RequestFieldRejected(String),
+    /// The callee gets one field under two keys: its name and an alias.
+    /// serde refuses that object.
+    RequestDuplicateKey(String),
     /// A request field changed its Rust type.
     RequestTypeChanged {
         /// The field's wire key.
@@ -119,15 +127,30 @@ pub enum Order {
     CallerFirst,
 }
 
+/// Exit code: safe in the declared order.
+pub const EXIT_SAFE: i32 = 0;
+/// Exit code: not safe in the declared order.
+pub const EXIT_UNSAFE: i32 = 1;
+/// Exit code: safe only in an order that `--order` did not declare. Clap uses
+/// `2` for a usage error, so this is `3`.
+pub const EXIT_ORDER: i32 = 3;
+
 /// Compare the current release with the deployed one, in both windows.
 #[must_use]
 pub fn compare(deployed: &Bundle, current: &Bundle) -> Report {
-    let mut callee_first = Vec::new();
+    let mut old_callers = Vec::new();
+    for call in &deployed.callers {
+        old_callers.extend(check_call(Window::CalleeFirst, deployed, call, current));
+    }
     // A deployed route must still be served. Clients outside the bundle may
-    // call it, so this holds with no known caller.
+    // call it, so this holds with no known caller. A caller break already
+    // names the route when a deployed caller calls it.
     for old in &deployed.endpoints {
-        if serving(current, old).is_none() {
-            callee_first.push(Break {
+        let named = old_callers
+            .iter()
+            .any(|b| b.kind == BreakKind::RouteMissing && b.endpoint == old.id());
+        if !named && serving(current, old).is_none() {
+            old_callers.push(Break {
                 window: Window::CalleeFirst,
                 endpoint: old.id(),
                 route: old.route(),
@@ -138,25 +161,17 @@ pub fn compare(deployed: &Bundle, current: &Bundle) -> Report {
             });
         }
     }
-    for call in &deployed.callers {
-        callee_first.extend(
-            check_call(Window::CalleeFirst, deployed, call, current)
-                .into_iter()
-                // The route break above already names this route.
-                .filter(|b| b.kind != BreakKind::RouteMissing),
-        );
-    }
-    let mut caller_first = Vec::new();
+    let mut new_callers = Vec::new();
     for call in &current.callers {
-        caller_first.extend(check_call(Window::CallerFirst, current, call, deployed));
+        new_callers.extend(check_call(Window::CallerFirst, current, call, deployed));
     }
-    callee_first.sort();
-    callee_first.dedup();
-    caller_first.sort();
-    caller_first.dedup();
+    old_callers.sort();
+    old_callers.dedup();
+    new_callers.sort();
+    new_callers.dedup();
     Report {
-        callee_first,
-        caller_first,
+        callee_first: old_callers,
+        caller_first: new_callers,
     }
 }
 
@@ -169,22 +184,23 @@ fn route_key(endpoint: &BundleEndpoint) -> (String, String, String) {
     )
 }
 
-/// A path with each `{name}` replaced by `{}`. The name is not on the wire.
+/// A path with each `{name}` replaced by `{}`, and each `{*name}` by `{*}`.
+/// The name is not on the wire. A trailing slash stays: it is another route.
 fn normalize_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
-    let mut in_param = false;
+    let mut param: Option<String> = None;
     for ch in path.chars() {
-        match ch {
-            '{' => {
-                in_param = true;
-                out.push_str("{}");
+        match (ch, param.as_mut()) {
+            ('{', None) => param = Some(String::new()),
+            ('}', Some(name)) => {
+                out.push_str(if name.starts_with('*') { "{*}" } else { "{}" });
+                param = None;
             }
-            '}' => in_param = false,
-            _ if in_param => {}
-            _ => out.push(ch),
+            (_, Some(name)) => name.push(ch),
+            (_, None) => out.push(ch),
         }
     }
-    out.trim_end_matches('/').to_owned()
+    out
 }
 
 /// The endpoint in `side` that serves `wanted`'s route. A same-named endpoint
@@ -252,18 +268,30 @@ fn normalize_type(ty: &str) -> String {
     out
 }
 
+/// Whether a decoder of type `decoder` reads what a producer of type
+/// `producer` writes. The same type reads, and `Option<T>` reads a `T`.
+fn type_reads(decoder: &str, producer: &str) -> bool {
+    let (decoder, producer) = (normalize_type(decoder), normalize_type(producer));
+    decoder == producer || decoder == format!("Option<{producer}>")
+}
+
+/// How many fields in `fields` carry a key of `field`.
+fn key_hits(fields: &[WireFieldDescriptor], field: &WireFieldDescriptor) -> usize {
+    keys(field).filter(|k| by_key(fields, k).is_some()).count()
+}
+
 /// Check one call against the endpoint that serves it.
 ///
-/// `caller_side` is the caller's own release: it gives the shapes the caller
-/// was built against. `callee_side` is the release that serves the call.
+/// `built_against` is the caller's own release: it gives the shapes the
+/// caller was built against. `serving_release` serves the call.
 #[must_use]
 pub fn check_call(
     window: Window,
-    caller_side: &Bundle,
+    built_against: &Bundle,
     call: &BundleCall,
-    callee_side: &Bundle,
+    serving_release: &Bundle,
 ) -> Vec<Break> {
-    let Some(view) = caller_side.endpoint(&call.service, &call.endpoint) else {
+    let Some(view) = built_against.endpoint(&call.service, &call.endpoint) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -278,12 +306,22 @@ pub fn check_call(
             kind,
         });
     };
-    let Some(serve) = serving(callee_side, view) else {
+    let Some(serve) = serving(serving_release, view) else {
         report(BreakKind::RouteMissing);
         return out;
     };
+    response_breaks(view, serve, call, &mut report);
+    request_breaks(view, serve, call, &mut report);
+    out
+}
 
-    // Response: the caller decodes the callee's output with its own type.
+/// Response rules: the caller decodes the callee's output with its own type.
+fn response_breaks(
+    view: &BundleEndpoint,
+    serve: &BundleEndpoint,
+    call: &BundleCall,
+    report: &mut impl FnMut(BreakKind),
+) {
     let decoded = &view.response.deserialized;
     let produced = &serve.response.serialized;
     let mut named = BTreeSet::new();
@@ -297,8 +335,11 @@ pub fn check_call(
         }
     }
     for field in decoded {
+        if key_hits(produced, field) > 1 {
+            report(BreakKind::ResponseDuplicateKey(field.wire_name.clone()));
+        }
         match produced_for(produced, field) {
-            Some(made) if normalize_type(&made.ty) != normalize_type(&field.ty) => {
+            Some(made) if !type_reads(&field.ty, &made.ty) => {
                 report(BreakKind::ResponseTypeChanged {
                     field: field.wire_name.clone(),
                     caller: field.ty.clone(),
@@ -321,12 +362,33 @@ pub fn check_call(
             }
         }
     }
+}
 
-    // Request: the callee decodes what the caller's own type sends.
+/// Request rules: the callee decodes what the caller's own type sends.
+fn request_breaks(
+    view: &BundleEndpoint,
+    serve: &BundleEndpoint,
+    call: &BundleCall,
+    report: &mut impl FnMut(BreakKind),
+) {
     let sent = &view.request.serialized;
     let accepted = &serve.request.deserialized;
+    if view.request.name == NO_BODY && serve.request.name != NO_BODY {
+        // The client sends no body and no content type. A `Json` extractor
+        // refuses that request, whatever its fields are.
+        report(BreakKind::RequestBodyMissing);
+    }
     let writes = call.writes.as_deref().unwrap_or_default();
-    let always_sent = |f: &WireFieldDescriptor| f.required || writes.contains(&f.rust_name);
+    // With an unknown write-set, a field the type sometimes sends counts as
+    // sent: the one-build check makes the same choice.
+    let always_sent = |f: &WireFieldDescriptor| {
+        f.required || call.writes.is_none() || writes.contains(&f.rust_name)
+    };
+    for need in accepted {
+        if key_hits(sent, need) > 1 {
+            report(BreakKind::RequestDuplicateKey(need.wire_name.clone()));
+        }
+    }
     for need in accepted.iter().filter(|f| f.required) {
         let covered = keys(need).any(|k| by_key(sent, k).is_some_and(always_sent));
         if !covered {
@@ -343,7 +405,7 @@ pub fn check_call(
     }
     for field in sent {
         match accepting(accepted, field) {
-            Some(into) if normalize_type(&into.ty) != normalize_type(&field.ty) => {
+            Some(into) if !type_reads(&into.ty, &field.ty) => {
                 report(BreakKind::RequestTypeChanged {
                     field: field.wire_name.clone(),
                     caller: field.ty.clone(),
@@ -356,13 +418,12 @@ pub fn check_call(
             _ => {}
         }
     }
-    out
 }
 
 impl Report {
     /// Which deploy orders are safe.
     #[must_use]
-    pub fn verdict(&self) -> Verdict {
+    pub const fn verdict(&self) -> Verdict {
         match (self.callee_first.is_empty(), self.caller_first.is_empty()) {
             (true, true) => Verdict::Compatible,
             (true, false) => Verdict::CalleeFirst,
@@ -371,18 +432,23 @@ impl Report {
         }
     }
 
-    /// The process exit code for a declared order.
-    ///
-    /// `0` safe. `1` not safe. `2` safe only in an order that `--order` did
-    /// not declare.
+    /// The process exit code for a declared order: [`EXIT_SAFE`],
+    /// [`EXIT_UNSAFE`], or [`EXIT_ORDER`].
     #[must_use]
     pub fn exit_code(&self, order: Order) -> i32 {
+        let safe_if = |breaks: &[Break]| {
+            if breaks.is_empty() {
+                EXIT_SAFE
+            } else {
+                EXIT_UNSAFE
+            }
+        };
         match (order, self.verdict()) {
-            (Order::Any, Verdict::Compatible) => 0,
-            (Order::Any, Verdict::CalleeFirst | Verdict::CallerFirst) => 2,
-            (Order::Any, Verdict::Incompatible) => 1,
-            (Order::CalleeFirst, _) => i32::from(!self.callee_first.is_empty()),
-            (Order::CallerFirst, _) => i32::from(!self.caller_first.is_empty()),
+            (Order::Any, Verdict::Compatible) => EXIT_SAFE,
+            (Order::Any, Verdict::CalleeFirst | Verdict::CallerFirst) => EXIT_ORDER,
+            (Order::Any, Verdict::Incompatible) => EXIT_UNSAFE,
+            (Order::CalleeFirst, _) => safe_if(&self.callee_first),
+            (Order::CallerFirst, _) => safe_if(&self.caller_first),
         }
     }
 
@@ -401,8 +467,8 @@ impl Report {
             "If the callers ship first (new callers, deployed callees)",
             &self.caller_first,
         );
-        let callees = |breaks: &[Break]| join(breaks.iter().map(|b| b.service.clone()));
-        let callers = |breaks: &[Break]| {
+        let services_of = |breaks: &[Break]| join(breaks.iter().map(|b| b.service.clone()));
+        let crates_of = |breaks: &[Break]| {
             let named = join(breaks.iter().filter_map(|b| b.caller_krate.clone()));
             if named.is_empty() {
                 "every caller".to_owned()
@@ -419,13 +485,13 @@ impl Report {
             }
             Verdict::CalleeFirst => format!(
                 "Verdict: safe only if the callees ship first.\n  Deploy {} before {}.\n",
-                callees(&self.caller_first),
-                callers(&self.caller_first),
+                services_of(&self.caller_first),
+                crates_of(&self.caller_first),
             ),
             Verdict::CallerFirst => format!(
                 "Verdict: safe only if the callers ship first.\n  Deploy {} before {}.\n",
-                callers(&self.callee_first),
-                callees(&self.callee_first),
+                crates_of(&self.callee_first),
+                services_of(&self.callee_first),
             ),
         };
         out.push_str(&verdict);
@@ -498,6 +564,17 @@ fn render_window(out: &mut String, title: &str, breaks: &[Break]) {
                 "{who} decodes the response with {caller_release}, which denies unknown fields, \
                  and {callee} produces `{f}`"
             ),
+            BreakKind::ResponseDuplicateKey(f) => format!(
+                "{who} decodes field `{f}` under its name or an alias, and {callee} produces \
+                 both keys"
+            ),
+            BreakKind::RequestBodyMissing => {
+                format!("{who} sends no request body, and {callee} reads one")
+            }
+            BreakKind::RequestDuplicateKey(f) => format!(
+                "{callee} decodes field `{f}` under its name or an alias, and {who} sends both \
+                 keys"
+            ),
             BreakKind::ResponseTypeChanged {
                 field,
                 caller,
@@ -533,6 +610,7 @@ fn render_window(out: &mut String, title: &str, breaks: &[Break]) {
 mod tests {
     use super::*;
     use crate::contracts::bundle::BUNDLE_FORMAT;
+    use autumn_macros_support::wire::WireTypeDescriptor;
 
     fn field(rust: &str, wire: &str, ty: &str, required: bool) -> WireFieldDescriptor {
         WireFieldDescriptor {
@@ -716,10 +794,20 @@ mod tests {
         let mut current = release_1();
         ep(&mut current, "get_item").path = "/catalog/items/{id}".to_owned();
         let report = compare(&deployed, &current);
-        assert!(kinds(&report.callee_first).contains(&BreakKind::RouteRemoved));
-        assert!(kinds(&report.caller_first).contains(&BreakKind::RouteMissing));
+        assert_eq!(kinds(&report.callee_first), [BreakKind::RouteMissing]);
+        assert_eq!(kinds(&report.caller_first), [BreakKind::RouteMissing]);
         assert_eq!(report.verdict(), Verdict::Incompatible);
         assert_eq!(report.exit_code(Order::Any), 1);
+    }
+
+    #[test]
+    fn a_route_with_no_known_caller_is_still_kept() {
+        let mut deployed = release_1();
+        deployed.callers.retain(|c| c.endpoint != "get_item");
+        let mut current = deployed.clone();
+        current.endpoints.retain(|e| e.name != "get_item");
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::RouteRemoved]);
     }
 
     #[test]
@@ -745,7 +833,7 @@ mod tests {
         assert_eq!(report.callee_first, Vec::new());
         assert_eq!(kinds(&report.caller_first), [BreakKind::RouteMissing]);
         assert_eq!(report.verdict(), Verdict::CalleeFirst);
-        assert_eq!(report.exit_code(Order::Any), 2);
+        assert_eq!(report.exit_code(Order::Any), EXIT_ORDER);
         assert_eq!(report.exit_code(Order::CalleeFirst), 0);
         assert_eq!(report.exit_code(Order::CallerFirst), 1);
         let text = report.render(Order::Any);
@@ -1022,5 +1110,118 @@ mod tests {
         assert!(text.contains("catalog.create_item (POST /items)"), "{text}");
         assert!(text.contains("mesh-storefront::add_item"), "{text}");
         assert!(text.contains("`sku`"), "{text}");
+    }
+
+    // --- review regressions ---
+
+    #[test]
+    fn a_body_on_a_route_that_had_none_is_a_break() {
+        let deployed = release_1();
+        let mut current = release_1();
+        ep(&mut current, "get_item").request = shape(
+            "Filter",
+            vec![field("q", "q", "Option<String>", true)],
+            vec![field("q", "q", "Option<String>", false)],
+        );
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::RequestBodyMissing]);
+    }
+
+    #[test]
+    fn an_alias_and_its_target_key_both_produced_break_the_decode() {
+        let mut deployed = release_1();
+        for f in &mut ep(&mut deployed, "get_item").response.deserialized {
+            if f.rust_name == "name" {
+                f.aliases = vec!["title".to_owned()];
+            }
+        }
+        let mut current = deployed.clone();
+        let item = &mut ep(&mut current, "get_item").response;
+        item.serialized.push(plain("title", true));
+        item.deserialized.push(plain("title", true));
+        let report = compare(&deployed, &current);
+        assert!(
+            kinds(&report.callee_first)
+                .contains(&BreakKind::ResponseDuplicateKey("name".to_owned())),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_removed_route_names_the_deployed_callers_in_the_order() {
+        let deployed = release_1();
+        let mut current = release_1();
+        current.endpoints.retain(|e| e.name != "get_item");
+        current.callers.retain(|c| c.endpoint != "get_item");
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            report
+                .callee_first
+                .iter()
+                .map(|b| b.caller.clone())
+                .collect::<Vec<_>>(),
+            [Some("mesh-storefront::show_item".to_owned())]
+        );
+        let text = report.render(Order::Any);
+        assert!(
+            text.contains("Deploy mesh-storefront before catalog"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_write_set_is_not_a_break_in_an_unchanged_release() {
+        let mut release = release_1();
+        let req = &mut ep(&mut release, "get_item").request;
+        req.name = "Lookup".to_owned();
+        req.serialized.push(plain("token", false));
+        req.deserialized.push(plain("token", true));
+        assert_eq!(compare(&release, &release), Report::default());
+    }
+
+    #[test]
+    fn a_field_that_becomes_optional_on_decode_is_safe_in_one_order() {
+        let deployed = release_1();
+        let mut current = release_1();
+        // The callee now decodes `name` as optional. Deployed callers still
+        // send a `String`: safe. New callers may leave it out: the old callee
+        // needs it.
+        let req = &mut ep(&mut current, "create_item").request;
+        for f in &mut req.deserialized {
+            if f.rust_name == "name" {
+                f.ty = "Option<String>".to_owned();
+                f.required = false;
+            }
+        }
+        for f in &mut req.serialized {
+            if f.rust_name == "name" {
+                f.ty = "Option<String>".to_owned();
+            }
+        }
+        let report = compare(&deployed, &current);
+        assert_eq!(report.callee_first, Vec::new(), "{report:?}");
+        assert_ne!(report.caller_first, Vec::new());
+    }
+
+    #[test]
+    fn a_trailing_slash_is_a_different_route() {
+        let deployed = release_1();
+        let mut current = release_1();
+        ep(&mut current, "create_item").path = "/items/".to_owned();
+        assert_eq!(
+            compare(&deployed, &current).verdict(),
+            Verdict::Incompatible
+        );
+    }
+
+    #[test]
+    fn a_catch_all_is_not_a_plain_parameter() {
+        let deployed = release_1();
+        let mut current = release_1();
+        ep(&mut current, "get_item").path = "/items/{*rest}".to_owned();
+        assert_eq!(
+            compare(&deployed, &current).verdict(),
+            Verdict::Incompatible
+        );
     }
 }
