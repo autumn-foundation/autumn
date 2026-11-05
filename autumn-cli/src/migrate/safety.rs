@@ -402,7 +402,7 @@ fn add_column_default_token(subcommand: &str) -> Option<String> {
         if let Some(value) = value
             && !subcommand[..at].trim_end().ends_with(" set")
         {
-            break value.trim_start();
+            break value.trim_start_matches(is_sql_space);
         }
         from = at + " default".len();
     };
@@ -439,7 +439,7 @@ fn add_column_default_token(subcommand: &str) -> Option<String> {
         return Some(rest.to_owned());
     }
     Some(
-        rest.split_whitespace()
+        rest.split(is_sql_space)
             .next()
             .unwrap_or_default()
             .trim_end_matches(',')
@@ -823,8 +823,14 @@ fn quoted_len(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Optio
 }
 
 /// Whether `c` can be part of an identifier. Postgres and `SQLite` agree.
+/// Each non-ASCII character is a name character, also a Unicode space.
 const fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii()
+}
+
+/// Whether `c` is SQL white space. Postgres and `SQLite` use ASCII only.
+const fn is_sql_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
 }
 
 /// Byte length of the span at the start of `rest` that `close` ends.
@@ -942,7 +948,7 @@ fn sqlite_variable_len(rest: &str) -> Option<usize> {
     let after = &body[name_len..];
     let args_len = if after.starts_with('(') {
         after
-            .find(|c: char| c == ')' || c.is_whitespace())
+            .find(|c: char| c == ')' || is_sql_space(c))
             .map_or(after.len(), |p| {
                 p + usize::from(after[p..].starts_with(')'))
             })
@@ -977,27 +983,31 @@ fn strip_line_comments(backend: DatabaseBackend, sql: &str) -> String {
         .collect()
 }
 
-/// Strip comments, collapse whitespace, and lowercase a single statement.
+/// Strip comments, collapse white space, and lowercase a single statement.
 ///
 /// Quoted spans stay as they are. A later scan of the result then reads the
 /// same spans: Postgres dollar tags are case-sensitive (`$A$` is not `$a$`).
+/// Only ASCII letters and ASCII white space change, as in Postgres and
+/// `SQLite`: `ÜSERS` and `üsers` are two names, and U+00A0 is part of a name.
 pub fn normalize_statement(backend: DatabaseBackend, stmt: &str) -> String {
     let stripped = strip_line_comments(backend, &strip_block_comments(backend, stmt));
     let mut out = String::with_capacity(stripped.len());
+    let mut space = false;
     for (kind, text) in tokens(backend, &stripped) {
-        if kind == TokenKind::Quoted {
-            out.push_str(text);
+        // A white-space token is one character.
+        if kind == TokenKind::Plain && text.starts_with(is_sql_space) {
+            space = !out.is_empty();
             continue;
         }
-        for c in text.chars() {
-            if !c.is_whitespace() {
-                out.extend(c.to_lowercase());
-            } else if !out.is_empty() && !out.ends_with(' ') {
-                out.push(' ');
-            }
+        if std::mem::take(&mut space) {
+            out.push(' ');
+        }
+        if kind == TokenKind::Quoted {
+            out.push_str(text);
+        } else {
+            out.extend(text.chars().map(|c| c.to_ascii_lowercase()));
         }
     }
-    out.truncate(out.trim_end().len());
     out
 }
 
@@ -1030,16 +1040,19 @@ const STABLE_FN_PREFIXES: &[&str] = &["now(", "current_timestamp(", "localtimest
 /// `(0)` or `('draft')` have `(` as the first non-space character (no identifier
 /// before the parenthesis) and are treated as constants — they use the fast path.
 /// STABLE/IMMUTABLE functions (e.g. `now()`) are also exempt via `STABLE_FN_PREFIXES`.
-fn is_volatile_function_default(default_expr: &str) -> bool {
-    let Some(paren_pos) = default_expr.find('(') else {
+fn is_volatile_function_default(backend: DatabaseBackend, default_expr: &str) -> bool {
+    // A `(` in a quoted span is text: `'a(b'` is a constant.
+    let unquoted = blank_quoted_spans(backend, default_expr);
+    let Some(paren_pos) = unquoted.find('(') else {
         return false; // no parentheses — constant literal
     };
-    // A function call has an identifier character immediately before `(`.
-    // A grouped constant like `(0)` or `('x')` has nothing or whitespace before it.
-    let is_fn_call = default_expr[..paren_pos]
+    // A function call has a name just before `(`. The name ends in a name
+    // character or in the `"` of a quoted name. A grouped constant like `(0)`
+    // has nothing or white space before it.
+    let is_fn_call = unquoted[..paren_pos]
         .chars()
         .next_back()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        .is_some_and(|c| is_identifier_char(c) || c == '"');
     if !is_fn_call {
         return false; // parenthesized constant — uses the fast-default path
     }
@@ -1272,8 +1285,9 @@ fn classify_statement(
                 // evaluated once at statement time and do not require a table rewrite.
                 let has_volatile_default = has_default
                     && subcommand.find(" default ").is_some_and(|pos| {
-                        let default_expr = subcommand[pos + " default ".len()..].trim();
-                        is_volatile_function_default(default_expr)
+                        let default_expr =
+                            subcommand[pos + " default ".len()..].trim_matches(is_sql_space);
+                        is_volatile_function_default(backend, default_expr)
                     });
 
                 if !has_default {
@@ -4221,7 +4235,16 @@ mod tests {
     #[test]
     fn default_call_name_may_end_in_any_name_character() {
         let pg = DatabaseBackend::Postgres;
-        for call in ["f$()", "fa\u{301}()", "f\u{a0}()", "\"F\"()", "s.\"f\"()"] {
+        // `\u{a0}(0)` calls a function with the name U+00A0.
+        let calls = [
+            "f$()",
+            "fa\u{301}()",
+            "f\u{a0}()",
+            "\u{a0}(0)",
+            "\"F\"()",
+            "s.\"f\"()",
+        ];
+        for call in calls {
             let sql = format!("ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT {call};");
             assert_eq!(
                 ops(pg, &sql),
@@ -4229,11 +4252,14 @@ mod tests {
                 "{sql:?}"
             );
         }
-        let sql = "ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT f\u{a0}();";
-        assert_eq!(
-            ops(DatabaseBackend::Sqlite, sql),
-            ["ADD COLUMN (non-constant default)"]
-        );
+        for call in ["f\u{a0}()", "\u{a0}(0)"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT {call};");
+            assert_eq!(
+                ops(DatabaseBackend::Sqlite, &sql),
+                ["ADD COLUMN (non-constant default)"],
+                "{sql:?}"
+            );
+        }
     }
 
     #[test]
