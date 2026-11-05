@@ -141,7 +141,7 @@ fn caller_descriptor(
         calls: calls
             .iter()
             .map(|call| CallerCall {
-                client: last_ident(&clients[call.client]).to_string(),
+                client: path_text(&clients[call.client]),
                 method: call.method.to_string(),
                 reads: call.reads.clone(),
                 writes: call.writes.clone().map(|mut writes| {
@@ -152,6 +152,15 @@ fn caller_descriptor(
             })
             .collect(),
     }
+}
+
+/// A path as `a::b::C`, without generic arguments or a leading `::`.
+fn path_text(path: &Path) -> String {
+    path.segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 /// The last segment of a path — a client's or marker's own name.
@@ -1269,7 +1278,7 @@ mod tests {
         let got = caller_descriptor("storefront", "page", &calls, &clients);
         assert_eq!(got.function, "page");
         assert_eq!(got.calls.len(), 2);
-        assert_eq!(got.calls[0].client, "CatalogClient");
+        assert_eq!(got.calls[0].client, "crate::CatalogClient");
         assert_eq!(got.calls[0].method, "get_item");
         assert_eq!(got.calls[0].reads, ["name", "price"]);
         assert_eq!(got.calls[0].writes, None);

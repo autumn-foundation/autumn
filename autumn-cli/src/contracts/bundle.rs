@@ -175,7 +175,9 @@ impl Bundle {
         let mut calls = BTreeSet::new();
         for caller in &callers {
             for call in &caller.calls {
-                let target = resolve_call(caller, call, &clients, &endpoints)?;
+                let Some(target) = resolve_call(caller, call, &clients, &endpoints)? else {
+                    continue;
+                };
                 calls.insert(BundleCall {
                     krate: caller.krate.clone(),
                     function: caller.function.clone(),
@@ -256,46 +258,64 @@ fn resolve_type(
     Ok(canonical(found.shape.clone()))
 }
 
-/// The endpoint one caller call reaches: caller -> client -> marker -> endpoint.
+/// The client a call goes through.
+///
+/// A crate-qualified path (`shared::CatalogClient`) narrows the match to that
+/// crate. Otherwise a client in the caller's own crate wins, and else the
+/// name must be unique across the pass.
+fn resolve_client<'a>(
+    caller: &CallerDescriptor,
+    call: &CallerCall,
+    clients: &'a [ClientDescriptor],
+) -> Result<&'a ClientDescriptor, String> {
+    let segments: Vec<&str> = call.client.split("::").collect();
+    let name = segments.last().copied().unwrap_or_default();
+    let named: Vec<&ClientDescriptor> = clients.iter().filter(|c| c.name == name).collect();
+    let hint = match segments.as_slice() {
+        [first, _, ..] if !["crate", "self", "super"].contains(first) => (*first).to_owned(),
+        _ => caller.krate.replace('-', "_"),
+    };
+    let preferred: Vec<&ClientDescriptor> = named
+        .iter()
+        .copied()
+        .filter(|c| c.krate.replace('-', "_") == hint)
+        .collect();
+    match (preferred.as_slice(), named.as_slice()) {
+        ([one], _) | ([], [one]) => Ok(*one),
+        (_, []) => Err(format!(
+            "`{}`, and no crate in the pass has a `wire_client!` of that name",
+            call.client
+        )),
+        _ => Err(format!(
+            "`{}`, and more than one `wire_client!` has that name",
+            call.client
+        )),
+    }
+}
+
+/// The endpoint one caller call reaches: caller -> client -> marker ->
+/// endpoint. `None` for an extension method, which makes no wire call.
 fn resolve_call<'a>(
     caller: &CallerDescriptor,
     call: &CallerCall,
     clients: &[ClientDescriptor],
     endpoints: &'a [EndpointDescriptor],
-) -> Result<&'a EndpointDescriptor, String> {
+) -> Result<Option<&'a EndpointDescriptor>, String> {
     let at = format!(
         "`{}::{}` calls `{}`",
         caller.krate, caller.function, call.method
     );
-    // A client in the caller's own crate wins. Otherwise the name must be
-    // unique across the pass, as for a client in a shared crate.
-    let named: Vec<&ClientDescriptor> = clients.iter().filter(|c| c.name == call.client).collect();
-    let own: Vec<&ClientDescriptor> = named
-        .iter()
-        .copied()
-        .filter(|c| c.krate == caller.krate)
-        .collect();
-    let client = match (own.as_slice(), named.as_slice()) {
-        ([one], _) | ([], [one]) => *one,
-        (_, []) => {
-            return Err(format!(
-                "{at} through `{}`, and no crate in the pass has a `wire_client!` of that name",
-                call.client
-            ));
-        }
-        _ => {
-            return Err(format!(
-                "{at} through `{}`, and more than one `wire_client!` has that name",
-                call.client
-            ));
-        }
-    };
-    let marker = client
+    let client = resolve_client(caller, call, clients).map_err(|e| format!("{at} through {e}"))?;
+    // A method that is not one of the client's endpoints is an extension
+    // method. It makes no wire call, so it has no contract to record.
+    let Some(marker) = client
         .endpoints
         .iter()
         .find(|e| e.method == call.method)
         .map(|e| e.marker.as_str())
-        .ok_or_else(|| format!("{at}, and client `{}` has no such method", client.name))?;
+    else {
+        return Ok(None);
+    };
     let segments: Vec<&str> = marker.split("::").collect();
     let ident = segments.last().copied().unwrap_or_default();
     // A path that starts with a crate name narrows the match to that crate.
@@ -315,7 +335,7 @@ fn resolve_call<'a>(
         .filter(|e| crate_hint.as_deref() == Some(e.krate.replace('-', "_").as_str()))
         .collect();
     match (by_crate.as_slice(), candidates.as_slice()) {
-        ([one], _) | ([], [one]) => Ok(one),
+        ([one], _) | ([], [one]) => Ok(Some(one)),
         (_, []) => Err(format!(
             "{at} (`{marker}`), and no `#[endpoint]` in the pass defines `{ident}`"
         )),
@@ -351,7 +371,7 @@ fn read_all<T: serde::de::DeserializeOwned>(dir: &Path, prefix: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autumn_macros_support::wire::{ClientEndpoint, WireFieldDescriptor};
+    use autumn_macros_support::wire::{CallerCall, ClientEndpoint, WireFieldDescriptor};
 
     fn field(name: &str, required: bool) -> WireFieldDescriptor {
         WireFieldDescriptor {
@@ -665,5 +685,66 @@ mod tests {
         assert!(ep.response_list);
         assert_eq!(ep.response.name, "Item");
         assert!(!ep.has_body);
+    }
+
+    #[test]
+    fn an_extension_method_on_a_client_is_not_a_wire_call() {
+        let dir = fixture();
+        let mut with_extension = caller("show_item", &["name"]);
+        with_extension.calls.push(CallerCall {
+            client: "CatalogClient".to_owned(),
+            method: "warm_cache".to_owned(),
+            reads: Vec::new(),
+            writes: None,
+        });
+        write(
+            dir.path(),
+            "caller.mesh-storefront.show_item.1.json",
+            &with_extension,
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.callers.len(), 1);
+        assert_eq!(bundle.callers[0].endpoint, "get_item");
+    }
+
+    #[test]
+    fn a_qualified_client_path_picks_that_crates_client() {
+        let dir = fixture();
+        // The caller's own crate has a `CatalogClient` that calls another
+        // service. The function names the shared crate's client.
+        let mut local = client();
+        local.endpoints[0].marker = "warehouse::get_item_endpoint".to_owned();
+        write(
+            dir.path(),
+            "client.mesh-storefront.CatalogClient.json",
+            &local,
+        );
+        let mut shared = client();
+        shared.krate = "shared-clients".to_owned();
+        write(
+            dir.path(),
+            "client.shared-clients.CatalogClient.json",
+            &shared,
+        );
+        let mut other = endpoint("get_item", "/w/{id}", "NoBody");
+        other.krate = "warehouse".to_owned();
+        other.service = "warehouse".to_owned();
+        write(
+            dir.path(),
+            "endpoint.warehouse.warehouse.get_item.json",
+            &other,
+        );
+        let mut other_item = item();
+        other_item.krate = "warehouse".to_owned();
+        write(dir.path(), "type.warehouse.Item.json", &other_item);
+        let mut qualified = caller("show_item", &["name"]);
+        qualified.calls[0].client = "shared_clients::CatalogClient".to_owned();
+        write(
+            dir.path(),
+            "caller.mesh-storefront.show_item.1.json",
+            &qualified,
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.callers[0].service, "catalog");
     }
 }

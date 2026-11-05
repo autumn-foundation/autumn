@@ -190,7 +190,8 @@ pub struct CallerDescriptor {
 /// One call through a generated client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerCall {
-    /// The client type's name, as `#[contract_checked(client = …)]` gives it.
+    /// The client type's path, as `#[contract_checked(client = …)]` gives
+    /// it, e.g. `CatalogClient` or `shared::CatalogClient`.
     pub client: String,
     /// The client method called. It is also the endpoint's name.
     pub method: String,
