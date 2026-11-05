@@ -448,6 +448,13 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   by serving it. Turn on [slot ownership](#failover-slot-ownership) with it:
   without ownership, nothing stops the previous owner, and the two copies
   diverge. Boot logs a warning for `restore_missing` without ownership.
+  The restored database holds what the previous owner shipped, and no more.
+  A write it committed after its last sync is not in the replica, even if the
+  request already returned success. So a takeover after a crash loses the
+  writes since the last sync: up to `rpo_secs` while replication keeps up
+  ([the RPO contract](sqlite-in-production.md#the-rpo-contract), and
+  [Replication lag](#replication-lag)). Replication bounds that loss. It does
+  not prevent it.
   This setting is only for a missing file. With ownership on, a host also
   restores a stale file (older than the replica) without `restore_missing`.
   See step 5 of [the failover procedure](#the-failover-procedure).
@@ -701,13 +708,12 @@ the first request.
    Start the new host with the same `slots`. The new host claims the ranges
    when the old lease ends: after at most `lease_secs`, plus one renew
    interval and the clock skew. Then it serves at a new epoch.
-   The first request to each database restores it from the replica, so the
-   first requests after a takeover are slow. A host that claims many
-   databases at once can use all its CPU for restores. Limit the number of
-   requests that open databases at the same time. Or open the claimed
-   databases in the background before traffic arrives.
-   A takeover loses the commits that the old host did not ship. See
-   [What a failover costs](#what-a-failover-costs).
+   The new host serves what the old host shipped to the replica. Writes that
+   the old host committed in its last `rpo_secs` can be missing, including
+   writes it answered with success. They stay in the old host's files, but a
+   fail-back (step 5) replaces those files with the replica, so they do not
+   come back. A planned move (step 2) loses nothing: the old host ships
+   everything before it releases the ranges.
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a

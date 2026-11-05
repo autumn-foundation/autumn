@@ -26,6 +26,10 @@ smop = { version = "0.3.1", default-features = false, features = ["sh", "fs"] }
 # already in the build.
 unicase = "2.10"
 unicode-general-category = "1.1"
+# The actuator-path gate reads every crate's `readme` from its `Cargo.toml`.
+# Parsing into a `Table` only: no writer. `Table` and `Value` sit behind
+# `serde`, which adds `serde_core`; no derive.
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 
 [lints]
 workspace = true

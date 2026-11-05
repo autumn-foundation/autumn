@@ -54,7 +54,7 @@ pub const PREFIX: &str = "/reference";
 /// Derived from the crate's own version rather than hard-coded, because the
 /// reference plugin ships *inside* the framework repository and is by
 /// construction always in lockstep with it. A real out-of-tree plugin either
-/// writes a literal (`"0.9"`) or, if it too releases in lockstep, calls this
+/// writes a literal (`"0.10"`) or, if it too releases in lockstep, calls this
 /// same helper.
 #[must_use]
 pub fn declared_autumn_web_range() -> String {
@@ -71,6 +71,25 @@ static ASSETS: autumn_web::assets::PluginAssets = autumn_web::assets::PluginAsse
     "autumn-plugin-reference",
     &[("reference.js", b"window.autumnPluginReference = true;\n")],
 );
+
+// surface: background
+//
+// A plugin capability. A role runs it when the role runs job workers. A named
+// role can set it with `[roles.<name>] capabilities = { "reference.sweeper" = false }`.
+/// The capability of the reference sweeper.
+pub const SWEEPER: autumn_web::background::PluginCapability =
+    autumn_web::background::PluginCapability::new(
+        "reference.sweeper",
+        autumn_web::Capability::JobWorkers,
+    );
+
+/// A capability that no task uses. The plugin reads it with
+/// `state.role().runs_plugin(WARMER)`.
+pub const WARMER: autumn_web::background::PluginCapability =
+    autumn_web::background::PluginCapability::new(
+        "reference.warmer",
+        autumn_web::Capability::ServesHttp,
+    );
 
 /// A plugin that exercises every stable plugin-facing API.
 #[derive(Debug, Default, Clone, Copy)]
@@ -108,6 +127,43 @@ impl Plugin for ReferencePlugin {
             autumn_web::reexports::tracing::debug!("autumn-plugin-reference started");
             Ok(())
         });
+
+        // surface: AppBuilder::background_task
+        //
+        // A loop that runs until shutdown. Do not `tokio::spawn` it in
+        // `on_startup`: every role runs every startup hook. The framework
+        // starts this task only on roles that run `maintenance`.
+        let app = app.background_task(
+            "reference.heartbeat",
+            autumn_web::Capability::Maintenance,
+            |_state, shutdown| async move {
+                shutdown.cancelled().await;
+                Ok(())
+            },
+        );
+
+        // surface: AppBuilder::background
+        //
+        // The full form: a plugin capability, a queue and the plugin's own
+        // switch. `None` lets the role decide.
+        let app = app.background(
+            autumn_web::background::BackgroundTask::new(
+                "reference.sweeper",
+                SWEEPER,
+                |state, shutdown| async move {
+                    if state.role().runs_plugin(WARMER) {
+                        autumn_web::reexports::tracing::debug!("reference sweeper on an HTTP role");
+                    }
+                    shutdown.cancelled().await;
+                    Ok(())
+                },
+            )
+            .queues(["reference"])
+            .explicit(None),
+        );
+
+        // surface: AppBuilder::plugin_capability
+        let app = app.plugin_capability(WARMER);
 
         // surface: AppBuilder::on_shutdown
         let app = app.on_shutdown(|| async move {
@@ -421,6 +477,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The sweeper runs where the role drains `reference`. A named role turns
+    /// it off.
+    #[tokio::test]
+    async fn the_sweeper_follows_the_role() {
+        let config: autumn_web::config::AutumnConfig = toml::from_str(
+            "[actuator]\nsensitive = true\n\n[roles.quiet]\nbase = \"worker\"\n\
+             capabilities = { \"reference.sweeper\" = false }\n",
+        )
+        .expect("config parses");
+        let client = autumn_web::test::TestApp::new()
+            .config(config)
+            .plugin(ReferencePlugin::new())
+            .build();
+        let body: serde_json::Value = client
+            .get("/actuator/tasks")
+            .send()
+            .await
+            .assert_ok()
+            .json();
+        let tasks = &body["background_tasks"];
+        assert_eq!(
+            tasks["reference.sweeper"]["roles"],
+            serde_json::json!(["combined", "worker"])
+        );
+        assert_eq!(
+            tasks["reference.sweeper"]["queues"],
+            serde_json::json!(["reference"])
+        );
+        assert_eq!(
+            tasks["reference.heartbeat"]["roles"],
+            serde_json::json!(["combined", "worker", "quiet"])
+        );
+        assert_eq!(tasks["reference.heartbeat"]["runs_here"], true);
     }
 
     #[test]

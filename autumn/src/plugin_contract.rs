@@ -41,7 +41,7 @@
 //!         Some(
 //!             PluginContract::new(env!("CARGO_PKG_NAME"))
 //!                 .plugin_version(env!("CARGO_PKG_VERSION"))
-//!                 .autumn_web("0.9"),
+//!                 .autumn_web("0.10"),
 //!         )
 //!     }
 //!
@@ -127,6 +127,16 @@ pub struct PluginSurface {
 /// suite enforces both the ordering and the absence of duplicates.
 pub const PLUGIN_SURFACES: &[PluginSurface] = &[
     PluginSurface {
+        name: "AppBuilder::background",
+        tier: SurfaceTier::Stable,
+        note: "Register a `BackgroundTask`: the full form of `background_task`, with queues and an explicit switch.",
+    },
+    PluginSurface {
+        name: "AppBuilder::background_task",
+        tier: SurfaceTier::Stable,
+        note: "Register a loop that runs until shutdown. The framework starts it only on the roles that run its capability.",
+    },
+    PluginSurface {
         name: "AppBuilder::config_section",
         tier: SurfaceTier::Stable,
         note: "Declare a plugin-owned top-level config root so `server.strict_config` treats it as known-and-opaque.",
@@ -170,6 +180,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "AppBuilder::plugin_assets",
         tier: SurfaceTier::Stable,
         note: "Serve a `PluginAssets` bundle of files compiled into the plugin crate under `/static/_plugins/<namespace>/`, at content-hashed `immutable` URLs with SRI hashes, and declare its routes. Build the bundle with `plugin_assets!` (requires the `embed-assets` feature) or `PluginAssets::from_files`.",
+    },
+    PluginSurface {
+        name: "AppBuilder::plugin_capability",
+        tier: SurfaceTier::Stable,
+        note: "Declare a plugin capability that no background task uses, so a `[roles.<name>] capabilities` key can name it.",
     },
     PluginSurface {
         name: "AppBuilder::plugin_contracts",
@@ -250,6 +265,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "autumn_edge::host",
         tier: SurfaceTier::Experimental,
         note: "Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790).",
+    },
+    PluginSurface {
+        name: "background",
+        tier: SurfaceTier::Stable,
+        note: "`BackgroundTask`, `PluginCapability`, `BackgroundCapability` and `Role::runs_plugin`: role-aware background work.",
     },
     PluginSurface {
         name: "db::Pool",

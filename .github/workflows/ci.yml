@@ -475,9 +475,10 @@ jobs:
         # drift it is checking for, which is the same reason `#[cfg(test)]`
         # bodies are stripped.
         #
-        # Shares this docs-only job for the same reason as the gates above:
-        # no toolchain, no cache, reports in seconds.
-        run: ./scripts/check-docs-routes.sh --self-test && ./scripts/check-docs-routes.sh
+        # The gate and its self-test (now `#[test]`s, run by `cargo test`)
+        # live in xtask/src/docs/routes.rs; `cargo xtask docs routes --list`
+        # prints the mounted surface it read.
+        run: cargo xtask check docs-routes
       - name: Macro argument gate
         # The seventh thing a reader copies off a page: the keyword arguments
         # inside an Autumn attribute macro. The gates above cover the links,
@@ -819,7 +820,7 @@ jobs:
       # version is already there, and the auditor this gate trusts must come
       # from the pin, not from a cache entry.
       - uses: ./.github/actions/kache
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-deny@0.20.2
       # The shared gate (issue #1600) makes PR CI, the publish gate and a local
@@ -962,7 +963,7 @@ jobs:
           # kache saves even when a later step fails, so a red job still
           # warms the next run.
           shared-key: workspace-test
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-nextest@0.9.149
       - name: Archive the workspace test build
@@ -1020,7 +1021,7 @@ jobs:
         with:
           # See `test-build`.
           shared-key: workspace-test
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-nextest@0.9.149
       - name: Archive the workspace test build
@@ -1097,7 +1098,7 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-nextest@0.9.149
       - uses: actions/download-artifact@v8
@@ -1257,7 +1258,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-nextest@0.9.149
       - uses: actions/download-artifact@v8
@@ -2523,7 +2524,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.31
+        uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)

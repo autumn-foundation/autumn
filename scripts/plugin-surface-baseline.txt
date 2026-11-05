@@ -17,6 +17,8 @@
 # `## Plugin authors` section in `docs/migrations/next.md` saying so.
 #
 # One name per line, sorted, `#` comments ignored.
+AppBuilder::background
+AppBuilder::background_task
 AppBuilder::config_section
 AppBuilder::declare_plugin_routes
 AppBuilder::error_pages
@@ -26,6 +28,7 @@ AppBuilder::on_shutdown
 AppBuilder::on_startup
 AppBuilder::plugin
 AppBuilder::plugin_assets
+AppBuilder::plugin_capability
 AppBuilder::plugin_contracts
 AppBuilder::plugin_migrations
 AppBuilder::plugins
@@ -40,6 +43,7 @@ AppBuilder::with_telemetry_provider
 Plugin::build
 Plugin::contract
 Plugin::name
+background
 db::Pool
 form::FieldRenderer
 plugin_conformance

@@ -350,25 +350,24 @@ same way it does web.
 
 ### Gating app-owned background work
 
-`AUTUMN_ROLE` gates the **framework's** `#[job]`/`#[scheduled]` workers, but not
-a background loop your app spawns itself in an `on_startup` hook — that runs on
-every replica, including the web tier, unless you gate it. The resolved role is
-exposed on `AppState` as the same value the framework used to gate its own
-workers, so self-gate app-owned loops instead of re-reading `AUTUMN_ROLE`:
+`AUTUMN_ROLE` gates the **framework's** background work. A loop that your app
+or a plugin spawns itself in an `on_startup` hook runs on every replica,
+including the web tier. Declare it as a background task instead. The
+framework then starts it only where the role runs its capability, and stops
+it with the server:
 
 ```rust
-use autumn_web::AppState;
+use autumn_web::Capability;
 
-// on_startup hook: only start the embedded loop where job workers run.
-if state.capabilities().job_workers {
-    tokio::spawn(my_embedded_worker(state.clone()));
-}
+app.background_task("app.embedded_worker", Capability::JobWorkers, |state, shutdown| async move {
+    my_embedded_worker(state, shutdown).await
+})
 ```
 
-`state.capabilities()` returns the `RoleCapabilities` the process resolved at
-boot, one field for each framework subsystem. `/actuator/info` shows the same
-set. See [Role capabilities](jobs.md#role-capabilities) and
-[Self-gating app-owned background work](jobs.md#self-gating-app-owned-background-work).
+`/actuator/tasks` lists each task and the roles that run it. It needs
+`[actuator] sensitive = true`. See
+[Role capabilities](jobs.md#role-capabilities) and
+[Background tasks for plugins and apps](jobs.md#background-tasks-for-plugins-and-apps).
 
 ### Named tiers
 
@@ -791,7 +790,7 @@ autumn_web::app()
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-cache-redis = "0.9"
+autumn-cache-redis = "0.10"
 ```
 
 `CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the

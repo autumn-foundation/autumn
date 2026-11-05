@@ -5,7 +5,7 @@
 # WHY THIS EXISTS: four gates each answer a different question about the same
 # set of pages — `check-docs-cli.sh` (the `autumn …` commands a reader copies),
 # `check-docs-config.sh` (the `AUTUMN_*` variables), `check-docs-symbols.sh`
-# (the `autumn_web::…` paths) and `check-docs-routes.sh` (the `/actuator/…`
+# (the `autumn_web::…` paths) and `xtask/src/docs/routes.rs` (the `/actuator/…`
 # URLs). Each spells its own corpus as a tuple of path prefixes, and three of
 # them carry a comment saying the definitions "are kept identical on purpose,
 # since a page covered by one gate and not the other is how a page ends up with
@@ -15,7 +15,7 @@
 #
 #   `.claude/skills/` is a second skill tree — the agent machinery loads a
 #   `SKILL.md` there by name, and `run-autumn` lives only there. It was added to
-#   `check-docs-routes.sh` (with the argument that its SKILL.md "drives a real
+#   `xtask/src/docs/routes.rs` (with the argument that its SKILL.md "drives a real
 #   server with `curl`, so its actuator paths are the most literally copy-and-run
 #   text in the tree") and to `check-docs-orphans.sh`'s entry surfaces, and never
 #   to the other three. `check-docs-toml.sh` and `check-docs-macro-args.sh` read
@@ -42,7 +42,7 @@
 #     scaffold` and `autumn release init` — sat outside the one gate that exists
 #     to check `autumn …` commands. Identical tuples, different corpora.
 #
-#   - `check-docs-routes.sh` reads the `readme = "…"` page of every crate
+#   - `xtask/src/docs/routes.rs` reads the `readme = "…"` page of every crate
 #     manifest, because a crates.io landing page is reader-facing by PUBLICATION
 #     rather than by where it sits in the tree. Its three siblings did not, so
 #     the seven published plugin and subcrate READMEs were ungated for the
@@ -63,7 +63,7 @@
 #      not after its corpus had a chance to drift: it copies the same scope
 #      block, and copying is precisely what this file exists to watch.
 #
-#   2. Every page `check-docs-routes.sh` reads that the siblings do not, or the
+#   2. Every page `xtask/src/docs/routes.rs` reads that the siblings do not, or the
 #      reverse, is DECLARED below in `DECLARED_DIFFERENCES` — with the DIRECTION
 #      the difference runs in, so a note cannot outlive the thing it describes
 #      and waive its own opposite.
@@ -176,7 +176,7 @@ SIBLINGS = (
     'scripts/check-docs-symbols.sh',
     'scripts/check-docs-versions.sh',
 )
-SUPERSET = 'scripts/check-docs-routes.sh'
+SUPERSET = 'cargo xtask docs routes'
 SELF = 'scripts/check-docs-scope.sh'
 
 # Every page the routes gate reads that its siblings do not, or vice versa, must
@@ -258,6 +258,21 @@ def universe(corpora):
     return tracked | set.intersection(*(set(c) for c in corpora.values()))
 
 
+def command_for(gate):
+    """The command that asks `gate` for its corpus.
+
+    A sibling is a script, asked with `--corpus`. The routes gate is ported to
+    `cargo xtask`, so it is asked through that; the self-test hands in a stub
+    script for it through `SCOPE_SELFTEST_SUPERSET`, absent in every real run.
+    """
+    if gate == SUPERSET:
+        stub = os.environ.get('SCOPE_SELFTEST_SUPERSET')
+        if stub is not None:
+            return ['bash', stub, '--corpus']
+        return ['cargo', 'xtask', 'docs', 'routes', '--corpus']
+    return ['bash', gate, '--corpus']
+
+
 def corpus(path):
     """Ask one gate for the pages it reads.
 
@@ -269,11 +284,10 @@ def corpus(path):
     some of them. It compared the three scope tuples and reported agreement
     while `check-docs-cli.sh` was passing a narrower `git ls-files` glob than
     its siblings; once the globs were modelled too, it still missed the crate
-    `readme = "…"` manifests that `check-docs-routes.sh` reads. Asking cannot
+    `readme = "…"` manifests that `xtask/src/docs/routes.rs` reads. Asking cannot
     drift from the answer.
     """
-    out = subprocess.run(['bash', path, '--corpus'],
-                         capture_output=True, text=True)
+    out = subprocess.run(command_for(path), capture_output=True, text=True)
     if out.returncode != 0:
         raise ValueError(
             f'{path} --corpus exited {out.returncode}: '
@@ -526,7 +540,7 @@ examples/todo/NOTES.md'
           echo 'CORPUS'; } > "$dir/scripts/check-docs-$g.sh"
       done
       { echo '#!/usr/bin/env bash'; echo "cat <<'CORPUS'"; echo "$rts"
-        echo 'CORPUS'; } > "$dir/scripts/check-docs-routes.sh"
+        echo 'CORPUS'; } > "$dir/scripts/routes-corpus.sh"
     }
 
     check() {
@@ -534,7 +548,10 @@ examples/todo/NOTES.md'
       local got=0
       # `SCOPE_SELFTEST_TABLE` is exported by the caller for the cases that
       # hand in a synthetic table; unset elsewhere, so the real one is used.
-      (cd "$dir" && python3 -c "$PYSRC") >/dev/null 2>&1 || got=$?
+      # The routes gate is a `cargo xtask` command in a real run; here its
+      # answer comes from the stub `make_gates` wrote.
+      (cd "$dir" && SCOPE_SELFTEST_SUPERSET=scripts/routes-corpus.sh \
+        python3 -c "$PYSRC") >/dev/null 2>&1 || got=$?
       if { [ "$want" = pass ] && [ "$got" -eq 0 ]; } \
         || { [ "$want" = fail ] && [ "$got" -ne 0 ]; }; then
         echo "  ok   $label"
@@ -573,7 +590,7 @@ examples/todo/NOTES.md"
     # other — which is exactly why a superset rule passed this state.
     c4="$tmp/c4"; make_gates "$c4" "$SIB_OK" "$RTS_OK"
     echo 'echo .claude/skills/run/SKILL.md' \
-      >> "$c4/scripts/check-docs-routes.sh"
+      >> "$c4/scripts/routes-corpus.sh"
     check "a page the routes gate gained alone fails" fail "$c4"
 
     # The reverse: the siblings read a page the routes gate does not.

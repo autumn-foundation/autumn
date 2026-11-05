@@ -182,6 +182,50 @@ See [`autumn/src/plugin.rs`](../../autumn/src/plugin.rs) for the trait
 definition and naming conventions for first-party vs third-party plugin
 crates.
 
+### Background work in a plugin
+
+Do not start a loop with `tokio::spawn` in `on_startup`. Every role runs every
+startup hook, so the loop also runs on `web` replicas. Declare the loop as a
+background task. The framework starts it only on the roles that run its
+capability, and stops it with the server (#3545):
+
+```rust,no_run
+use autumn_web::app::AppBuilder;
+use autumn_web::background::PluginCapability;
+use autumn_web::plugin::Plugin;
+use autumn_web::Capability;
+
+/// A role runs this capability when it runs job workers. A named role can
+/// change that.
+pub const SYNC_WORKER: PluginCapability = PluginCapability::new("sync.worker", Capability::JobWorkers);
+
+pub struct SyncPlugin;
+
+impl Plugin for SyncPlugin {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        app.background_task("sync.poller", SYNC_WORKER, |_state, shutdown| async move {
+            shutdown.cancelled().await;
+            Ok(())
+        })
+    }
+}
+```
+
+- Use a built-in capability (`Capability::Maintenance`, `Scheduler`,
+  `JobWorkers`) or a `PluginCapability` with a built-in parent.
+- An operator sets a plugin capability on one named role:
+  `[roles.cron] capabilities = { "sync.worker" = false }`.
+- Use `BackgroundTask::queues` for a task that drains named queues.
+- Use `BackgroundTask::explicit` for the on/off switch of the plugin. The
+  plugin switch wins. The boot then logs a warning.
+- Always register the task. Use `explicit(Some(false))` to turn it off. A
+  `capabilities` key for a task that is not registered fails the boot.
+- `/actuator/tasks` and `autumn graph` list each task and the roles that run
+  it. `/actuator/tasks` needs `[actuator] sensitive = true`.
+
+See [Background tasks for plugins and apps](jobs.md#background-tasks-for-plugins-and-apps)
+for every rule.
+
 ### The stability contract you get, and the one you owe
 
 Once you are distributing to someone else, the question stops being "can I
@@ -204,7 +248,7 @@ fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
     Some(
         autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
             .plugin_version(env!("CARGO_PKG_VERSION"))
-            .autumn_web("0.9"),
+            .autumn_web("0.10"),
     )
 }
 ```

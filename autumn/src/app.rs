@@ -100,6 +100,7 @@ pub fn app() -> AppBuilder {
         custom_layers: Vec::new(),
         static_gate_layers: Vec::new(),
         startup_hooks: Vec::new(),
+        background: crate::background::Registry::default(),
         state_initializers: Vec::new(),
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
@@ -468,6 +469,8 @@ pub struct AppBuilder {
     /// is served.
     pub(crate) static_gate_layers: Vec<CustomLayerRegistration>,
     pub(crate) startup_hooks: Vec<StartupHook>,
+    /// Role-aware background tasks and plugin capabilities (#3545).
+    pub(crate) background: crate::background::Registry,
     pub(crate) state_initializers: Vec<StateInitializer>,
     pub(crate) shutdown_hooks: Vec<ShutdownHook>,
     pub(crate) extensions: HashMap<TypeId, Box<dyn Any + Send>>,
@@ -2061,8 +2064,9 @@ impl AppBuilder {
     /// Register an async startup hook that runs after [`AppState`] exists and
     /// before the server begins accepting requests.
     ///
-    /// This is intended for background runtimes that need the fully built app
-    /// state, such as workers or pollers that share the database pool.
+    /// Every role runs every startup hook. Do not start a loop here. Use
+    /// [`background_task`](Self::background_task). The framework starts a
+    /// background task only on the roles that run its capability.
     #[must_use]
     pub fn on_startup<F, Fut>(mut self, hook: F) -> Self
     where
@@ -2071,6 +2075,81 @@ impl AppBuilder {
     {
         self.startup_hooks
             .push(Box::new(move |state| Box::pin(hook(state))));
+        self
+    }
+
+    /// Register a background task that runs until shutdown (#3545).
+    ///
+    /// The framework starts it after the startup hooks, only on a role that
+    /// runs `capability`: a built-in [`Capability`](crate::Capability) or a
+    /// [`PluginCapability`](crate::background::PluginCapability). `run` gets
+    /// a child of the server shutdown token. The graceful drain waits for it.
+    ///
+    /// ```rust,no_run
+    /// # use autumn_web::app::AppBuilder;
+    /// use autumn_web::Capability;
+    ///
+    /// # fn wire(app: AppBuilder) -> AppBuilder {
+    /// app.background_task("media.room_reaper", Capability::Maintenance, |state, shutdown| async move {
+    ///     shutdown.cancelled().await;
+    ///     let _ = state;
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    ///
+    /// See [`crate::background`] for the rules. For queues or an explicit
+    /// switch, use [`background`](Self::background).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the task name is invalid or registered already. Panics if
+    /// the plugin capability name is invalid, or has another parent.
+    #[track_caller]
+    #[must_use]
+    pub fn background_task<F, Fut>(
+        self,
+        name: impl Into<std::borrow::Cow<'static, str>>,
+        capability: impl Into<crate::background::BackgroundCapability>,
+        run: F,
+    ) -> Self
+    where
+        F: Fn(AppState, tokio_util::sync::CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.background(crate::background::BackgroundTask::new(
+            name, capability, run,
+        ))
+    }
+
+    /// Register a [`BackgroundTask`](crate::background::BackgroundTask)
+    /// (#3545). This is the full form of
+    /// [`background_task`](Self::background_task): the task can also name
+    /// its queues and an explicit switch.
+    ///
+    /// # Panics
+    ///
+    /// As [`background_task`](Self::background_task).
+    #[must_use]
+    pub fn background(mut self, task: crate::background::BackgroundTask) -> Self {
+        let task = task.registered_by_plugin(self.current_plugin.clone());
+        self.background.add_task(task);
+        self
+    }
+
+    /// Declare a plugin capability that no background task uses (#3545).
+    ///
+    /// A task declares its own capability, so most plugins do not call this.
+    /// Call it when the plugin gates other code with
+    /// [`Role::runs_plugin`](crate::Role::runs_plugin), so that
+    /// `[roles.<name>] capabilities` can name it.
+    ///
+    /// # Panics
+    ///
+    /// If the name is invalid, or the name is declared with another parent.
+    #[must_use]
+    pub fn plugin_capability(mut self, capability: crate::background::PluginCapability) -> Self {
+        self.background.add_capability(capability);
         self
     }
 
@@ -4342,6 +4421,7 @@ impl AppBuilder {
             custom_layers,
             static_gate_layers,
             startup_hooks,
+            background,
             state_initializers,
             shutdown_hooks,
             extensions: _,
@@ -4764,6 +4844,22 @@ impl AppBuilder {
             capabilities = ?capabilities.enabled().map(crate::config::Capability::as_str).collect::<Vec<_>>(),
             "process role resolved"
         );
+        // A `[roles.<name>] capabilities` key names a declared plugin
+        // capability, inside its base (#3545).
+        match background.validate_roles(&config, state.role().name()) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    tracing::warn!(warning = %warning, "[roles] capabilities on another role");
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "invalid [roles] capabilities");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        }
+        state.insert_extension(crate::background::BackgroundQueues(background.queues()));
 
         // Tee clock reads into the capsule of whatever request took them, so a
         // replayed handler sees the same `now()` sequence the failure did.
@@ -5441,7 +5537,8 @@ impl AppBuilder {
         #[cfg(feature = "graph")]
         crate::graph::install(
             &state,
-            crate::graph::manifest::audit_for_fleet(&graph_mounted, &graph_elsewhere, graph_opaque),
+            crate::graph::manifest::audit_for_fleet(&graph_mounted, &graph_elsewhere, graph_opaque)
+                .with_background_tasks(crate::background::graph_entries(&background, &config)),
         );
 
         let router_build = if capabilities.serves_http {
@@ -6663,7 +6760,15 @@ impl AppBuilder {
                 }
             };
 
+        // Started after the startup hooks, as the scheduler is (#3545).
+        let mut background_runtime = None;
         if !state.probes().is_shutting_down() {
+            background_runtime = Some(crate::background::start(
+                &background,
+                &state,
+                &server_shutdown,
+                &config,
+            ));
             // The `scheduler` capability gates app tasks and the `retention`
             // capability gates retention sweeps. Skipping the scheduler must not
             // regress readiness: mark_startup_complete and signal_serve_ready
@@ -6778,6 +6883,23 @@ impl AppBuilder {
                 })
         };
         let shutdown_budget = std::time::Duration::from_secs(shutdown_timeout);
+
+        // Phase 6 (background): `server_shutdown` fired at phase 5, so each
+        // background task has seen its token (#3545). Wait for the tasks
+        // before the fleet and the hooks close what they use. The tasks get
+        // half of what is left, so a stuck task cannot use up the budget of
+        // the later phases.
+        if let Some(runtime) = background_runtime.take()
+            && runtime.len() > 0
+        {
+            let wait = crate::background::drain_budget(
+                shutdown_budget.saturating_sub(elapsed_since_drain_start()),
+            );
+            let aborted = runtime.drain(wait).await;
+            if aborted == 0 {
+                tracing::info!("shutdown: background tasks stopped");
+            }
+        }
 
         // Phase 6a: the replication loop's final flush. Cancelling the token at
         // phase 5 only wakes that loop; the tick that ships the last committed
@@ -6959,6 +7081,7 @@ impl AppBuilder {
             custom_layers,
             static_gate_layers: _,
             startup_hooks: _,
+            background,
             state_initializers,
             shutdown_hooks: _,
             extensions: _,
@@ -7416,8 +7539,11 @@ impl AppBuilder {
                 // no declared plugin routes (see the `RouterContext` below), so the
                 // merge count is the whole opaque surface here.
                 omitted_router_count(merge_routers.len(), std::iter::empty::<&str>(), &[]),
-            ),
+            )
+            .with_background_tasks(crate::background::graph_entries(&background, &config)),
         );
+        #[cfg(not(feature = "graph"))]
+        let _ = &background;
         // The router build installs the AEO site in the state's shared
         // extensions; the agent documents below read its home `Link`s.
         let aeo_state = state.clone();
@@ -7605,11 +7731,14 @@ impl AppBuilder {
     /// Does not connect to a database or bind a TCP port.
     async fn run_dump_graph_mode(self) {
         let surface = self.dump_graph_surface().await;
-        crate::graph::manifest::print_manifest_dump(&crate::graph::manifest::audit_for_fleet(
-            &surface.mounted,
-            &surface.elsewhere,
-            surface.opaque,
-        ));
+        crate::graph::manifest::print_manifest_dump(
+            &crate::graph::manifest::audit_for_fleet(
+                &surface.mounted,
+                &surface.elsewhere,
+                surface.opaque,
+            )
+            .with_background_tasks(surface.background),
+        );
     }
 
     #[cfg(feature = "graph")]
@@ -7638,6 +7767,17 @@ impl AppBuilder {
         let role = config
             .resolve_role()
             .unwrap_or_else(|_| crate::config::Role::from(crate::config::ProcessRole::Combined));
+        // Doctor and the graph do not boot, so warn here on a bad
+        // `[roles] capabilities` key (#3545). Stdout carries the graph.
+        match self.background.validate_roles(&config, role.name()) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Err(error) => eprintln!("warning: the boot of this role fails: {error}"),
+        }
+        let background = crate::background::graph_entries(&self.background, &config);
         let elsewhere = graph_fleet_routes(
             &self.routes,
             &self.scoped_groups,
@@ -7650,6 +7790,7 @@ impl AppBuilder {
                 mounted: graph_worker_mounted_routes(&config),
                 elsewhere,
                 opaque: 0,
+                background,
             };
         }
         if let Err(error) = self.retain_mounted_groups(&role) {
@@ -7669,6 +7810,7 @@ impl AppBuilder {
             mounted,
             elsewhere,
             opaque,
+            background,
         }
     }
 
@@ -8107,6 +8249,7 @@ impl AppBuilder {
         let Self {
             jobs,
             listeners,
+            background,
             config_loader_factory,
             telemetry_provider,
             plugin_config_roots,
@@ -8123,7 +8266,8 @@ impl AppBuilder {
         // Fold in the synthesized durable-listener jobs exactly as the boot path
         // does, so the manifest reflects the same effective drained-queue set the
         // runtime drains (including the `default` queue those jobs land on).
-        let manifest = dump_jobs_manifest(&config.jobs.queues, jobs, listeners);
+        let manifest =
+            dump_jobs_manifest(&config.jobs.queues, jobs, listeners, &background.queues());
         print!("{manifest}");
         std::process::exit(0);
     }
@@ -9829,6 +9973,8 @@ pub(crate) struct GraphSurface {
     pub(crate) elsewhere: Vec<crate::graph::MountedRoute>,
     /// Raw routers the graph cannot enumerate.
     pub(crate) opaque: usize,
+    /// The registered background tasks (#3545).
+    pub(crate) background: Vec<crate::graph::manifest::BackgroundTaskEntry>,
 }
 
 #[cfg(feature = "graph")]
@@ -11752,9 +11898,10 @@ fn dump_jobs_manifest(
     cfg: &crate::config::JobQueuesConfig,
     mut jobs: Vec<crate::job::JobInfo>,
     listeners: Vec<crate::events::ListenerInfo>,
+    background_queues: &[String],
 ) -> String {
     synthesize_durable_listener_jobs(listeners, &mut jobs);
-    crate::job::render_jobs_manifest(cfg, &jobs)
+    crate::job::render_jobs_manifest(cfg, &jobs, background_queues)
 }
 
 /// `jobs` with the `pin` and `workers` of a `[roles.<name>]` preset applied
@@ -18806,8 +18953,29 @@ mod tests {
         // The dump path holds no builder-registered jobs, only the durable
         // listener; the manifest must still surface `default` (where that
         // listener's synthesized job runs) alongside the configured `critical`.
-        let manifest = dump_jobs_manifest(&cfg, Vec::new(), vec![durable]);
+        let manifest = dump_jobs_manifest(&cfg, Vec::new(), vec![durable], &[]);
         assert_eq!(manifest, "queues = [\"critical\", \"default\"]\n");
+    }
+
+    /// The queues of background tasks (#3545) go into the manifest, so the
+    /// `autumn doctor` coverage check includes them.
+    #[test]
+    fn dump_jobs_manifest_includes_background_task_queues() {
+        let cfg = crate::config::JobQueuesConfig::strict_list(["critical"]);
+        let builder = app().background(
+            crate::background::BackgroundTask::new(
+                "sync.drain",
+                crate::background::PluginCapability::new(
+                    "sync.worker",
+                    crate::Capability::JobWorkers,
+                ),
+                |_state, _shutdown| async { Ok(()) },
+            )
+            .queues(["sync", "critical"]),
+        );
+        let manifest =
+            dump_jobs_manifest(&cfg, Vec::new(), Vec::new(), &builder.background.queues());
+        assert_eq!(manifest, "queues = [\"critical\", \"sync\"]\n");
     }
 
     #[cfg(feature = "db")]
@@ -20165,6 +20333,52 @@ mod tests {
         }
     }
 
+    /// `run()` checks `[roles] capabilities` before the job runtime, starts
+    /// background tasks after the startup hooks, and drains them after the
+    /// request drain and before the fleet close and the `on_shutdown` hooks
+    /// (#3545).
+    #[test]
+    fn run_places_and_drains_background_tasks_in_order() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let run = &source[server_start..build_mode_start];
+        let at = |needle: &str| {
+            run.find(needle)
+                .unwrap_or_else(|| panic!("run() must contain {needle:?}"))
+        };
+        let validate = at("background.validate_roles(&config, state.role().name())");
+        let job_runtime = at("initialize_job_runtime(");
+        let hooks = at("run_startup_hooks(&startup_hooks, state.clone())");
+        let start = at("crate::background::start(");
+        let scheduler = at("start_task_scheduler_with_config(");
+        let request_drain = at("server_task.await");
+        let drain = at("runtime.drain(wait)");
+        assert!(run.contains("crate::background::drain_budget("));
+        let shutdown_hooks = at("run_shutdown_hooks_with_timeout(");
+        assert!(
+            validate < job_runtime
+                && hooks < start
+                && start < scheduler
+                && request_drain < drain
+                && drain < shutdown_hooks,
+            "validate={validate} job_runtime={job_runtime} hooks={hooks} start={start} \
+             scheduler={scheduler} request_drain={request_drain} drain={drain} \
+             shutdown_hooks={shutdown_hooks}"
+        );
+        assert!(drain < at("fleet_shutdown.cancel();"));
+        // The tasks get a child of the server shutdown token.
+        assert!(
+            run.contains(
+                "&background,\n                &state,\n                &server_shutdown,"
+            )
+        );
+    }
+
     /// The accept loop must go live only after the startup hooks succeed —
     /// but only for an in-place-upgrade successor.
     ///
@@ -20599,6 +20813,64 @@ mod tests {
         assert!(paths.contains(&"/custom-live"), "{paths:?}");
         assert!(!paths.contains(&"/static/{*path}"), "{paths:?}");
         assert_eq!(surface.opaque, 0);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard spans the config load, which resets the global metric limits"
+    )]
+    async fn dump_graph_surface_lists_background_tasks_with_their_roles() {
+        // `try_load_config` resets the process-global metric limits. See
+        // `metrics::LIMITS_TEST_LOCK`.
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config: AutumnConfig =
+            toml::from_str("[roles.cron]\nbase = \"worker\"\nmaintenance = false\n")
+                .expect("config parses");
+        let builder = app()
+            .with_config_loader(CensusLoader(Ok(config)))
+            .background_task(
+                "media.room_reaper",
+                crate::Capability::Maintenance,
+                |_state, _shutdown| async { Ok(()) },
+            );
+        let surface = builder.dump_graph_surface().await;
+        let graph = crate::graph::manifest::audit_for_fleet(
+            &surface.mounted,
+            &surface.elsewhere,
+            surface.opaque,
+        )
+        .with_background_tasks(surface.background);
+        let node = graph
+            .node("background_task:media.room_reaper")
+            .expect("a background_task node");
+        assert_eq!(node.kind, crate::graph::NodeKind::BackgroundTask);
+        assert_eq!(node.module, "app");
+        assert!(
+            node.location.starts_with("autumn/src/app.rs:"),
+            "{}",
+            node.location
+        );
+        let facts = node.background.as_ref().expect("background facts");
+        assert_eq!(facts.capability, "maintenance");
+        assert_eq!(facts.roles, ["combined", "worker"]);
+        assert_eq!(graph.completeness.background_tasks, 1);
+        assert!(
+            graph
+                .summary()
+                .contains("media.room_reaper (maintenance; runs on combined, worker)"),
+            "{}",
+            graph.summary()
+        );
+        let json: serde_json::Value = serde_json::from_str(&graph.to_json()).expect("json");
+        let nodes = json["nodes"].as_array().expect("nodes");
+        assert!(
+            nodes.iter().any(|n| n["kind"] == "background_task"
+                && n["background"]["roles"] == serde_json::json!(["combined", "worker"])),
+            "{json}"
+        );
     }
 
     #[tokio::test]

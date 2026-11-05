@@ -143,7 +143,7 @@ pub trait Plugin: Sized + Send + 'static {
     ///         Some(
     ///             PluginContract::new(env!("CARGO_PKG_NAME"))
     ///                 .plugin_version(env!("CARGO_PKG_VERSION"))
-    ///                 .autumn_web("0.9"),
+    ///                 .autumn_web("0.10"),
     ///         )
     ///     }
     ///

@@ -1,13 +1,14 @@
-# autumn-web API Reference (0.9.0)
+# autumn-web API Reference (0.10.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.9.0**, the current release line,
+Version identity: this reference tracks **0.10.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
 arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
-earlier, **(0.8.0)** is absent from 0.7.x and earlier, and **(0.9.0)** is absent
-from 0.8.x and earlier. Unmarked entries predate 0.6.0.
+earlier, **(0.8.0)** is absent from 0.7.x and earlier, **(0.9.0)** is absent
+from 0.8.x and earlier, and **(0.10.0)** is absent from 0.9.x and earlier.
+Unmarked entries predate 0.6.0.
 
 ## Published crates
 
@@ -29,7 +30,7 @@ from 0.8.x and earlier. Unmarked entries predate 0.6.0.
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.9.0`. This table lists the same crates, in the same order, as
+together at `0.10.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 
@@ -728,7 +729,7 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
 - Tables `ACCOUNTS_TABLE` / `TRANSACTIONS_TABLE` / `POSTINGS_TABLE`
   (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
   framework migration set. The account row stores the balance
-  (`balance_minor`, #3339). A trigger keeps it, so `post` and `balance` do not
+  (`balance_minor`, 0.10.0, #3339). A trigger keeps it, so `post` and `balance` do not
   read the posting history, except one time for each account after the
   migration. `NULL` means "not known": the next `post` sums the
   postings and stores the result.
@@ -821,12 +822,12 @@ Free functions rendering changeset-aware, accessible inputs:
   `FieldControl` variants (`#[non_exhaustive]`): `Text`, `Textarea`,
   `Password`, `Number { step: Option<String> }`, `Checkbox`, `Date`,
   `DateTime`, `Select { options: Vec<(String, String)> }`, `File` (any
-  `File` field ⇒ `enctype="multipart/form-data"`), and **(#3405)**
+  `File` field ⇒ `enctype="multipart/form-data"`), and **(0.10.0, #3405)**
   `Switch`, `Range { step }`, `Radio { options }`, `CheckboxGroup { options }`,
   `Segmented { options }`, `Email`, `Tel`, `Url`, `Time` (derived for a
-  `NaiveTime` column), `Month`, `Color`, `Hidden`, and **(#3412)**
+  `NaiveTime` column), `Month`, `Color`, `Hidden`, and **(0.10.0, #3412)**
   `Otp(OtpFormat)`.
-- **(#3412)** `otp_input`, `required_otp_input`,
+- **(0.10.0, #3412)** `otp_input`, `required_otp_input`,
   `otp_input_with(.., OtpFormat, &FieldOptions)`: one
   `<input autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{n}">`
   over `aria-hidden` boxes; the value is never rendered; `maxlength="{n}"`
@@ -842,7 +843,7 @@ Free functions rendering changeset-aware, accessible inputs:
   `.strength_labels([..; 4])` (`{field}-strength` polite live region in
   `aria-describedby`; a hint, not a policy). Also `.minlength(n)` /
   `.maxlength(n)` on text-entry controls.
-- **(#3405)** native input helpers, each with `*_with(.., &FieldOptions)`:
+- **(0.10.0, #3405)** native input helpers, each with `*_with(.., &FieldOptions)`:
   `switch_input` (`role="switch"` checkbox, `#[serde(default)] bool`),
   `range_input(.., step)`, `radio_group(.., &[(value, label)])`,
   `checkbox_group(..)` (bind `#[serde(default)] Vec<String>`; prefilled from
@@ -855,7 +856,7 @@ Free functions rendering changeset-aware, accessible inputs:
   only (validate "one or more" on the server). A group is a `<fieldset>` +
   `<legend>`; the first input has `id="{field}"` so `error_summary` links
   land on it, the rest `id="{field}-{index}"`.
-- **(#3409)** select: `grouped_select_input(&cs, field, label, &[(value,
+- **(0.10.0, #3409)** select: `grouped_select_input(&cs, field, label, &[(value,
   label)], &[(group_label, &[(value, label)])])` (+ `_with`, `required_`)
   writes top-level options, then one `<optgroup>` per group;
   `FieldControl::GroupedSelect { options, groups }` for `form_for`.
@@ -971,7 +972,7 @@ Per-primitive setters (in addition to the shared set):
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
   `modal_close_button`, `confirm_action(...)`,
-  `drawer(id, title, &body, &DrawerConfig)`, `drawer_trigger` (#3403);
+  `drawer(id, title, &body, &DrawerConfig)`, `drawer_trigger` (0.10.0, #3403);
   `DialogSize` sizes both, `close_button(label)` adds a ×.
 - `autumn_web::widgets::transition_controls(action, field, current,
   transitions, can, csrf, csrf_field)` (#1917) — renders one CSRF-protected,
@@ -1081,7 +1082,7 @@ Per-primitive setters (in addition to the shared set):
   `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
   focus moves to it on a failed submit — one per page). All prelude
   re-exported.
-- `autumn_web::widgets` small display set (#3406,
+- `autumn_web::widgets` small display set (0.10.0, #3406,
   `docs/guide/display-widgets.md`): `button(label, &ButtonConfig)` with
   `ButtonVariant::{Primary,Secondary,Ghost,Destructive,Link}`,
   `ButtonSize::{Small,Medium,Large}`, `.kind/.submit/.icon/.icon_only/
@@ -1175,7 +1176,7 @@ Per-primitive setters (in addition to the shared set):
 `TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` — are documented
 in **Typed accessible primitives** above.)
 
-## Widget packs (`autumn_web::widget_pack`, feature `maud`, #3400)
+## Widget packs (`autumn_web::widget_pack`, feature `maud`, 0.10.0, #3400)
 
 | API | Notes |
 |---|---|
@@ -1514,7 +1515,9 @@ double-submits and replays.
 | `merge(router)`, `nest(path, router)` | Raw Axum composition |
 | `declare_plugin_routes(...)` | Plugin route declarations |
 | `plugin_assets(&'static PluginAssets)` | Serve a plugin's compiled-in assets under `/static/_plugins/<ns>/`: hashed URL `immutable`, plain URL `must-revalidate`, ETag/304/Range, routes declared public. Build the bundle with `plugin_assets!("ns")` (embeds `assets/`, `embed-assets`) or `PluginAssets::from_files(ns, &[(path, bytes)])`; emit tags with `ASSETS.script_tag(path)` / `deferred_script_tag` / `stylesheet_tag` (hashed URL + `integrity`). A second, different bundle with the same namespace panics. Guide: `docs/guide/plugin-assets.md` |
-| `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks |
+| `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks. Every role runs them: use `background_task` for a loop |
+| `background_task(name, capability, run)`, `background(BackgroundTask)` | A loop that runs until shutdown, only on the roles that run `capability` (a `Capability` or a `PluginCapability`). `BackgroundTask::queues` and `::explicit` add queues and the plugin switch. Listed in `/actuator/tasks` and `autumn graph` (#3545) |
+| `plugin_capability(PluginCapability)` | Declare a plugin capability that no task uses, so `[roles.<name>] capabilities` can name it |
 | `with_extension(value)`, `update_extension(...)`, `extension<T>()` | Typed state extensions |
 | `i18n(bundle)`, `i18n_auto()` | I18n bundle setup |
 | `with_config_loader(loader)` | Replace config loading |
@@ -1707,7 +1710,7 @@ csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.9"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.10"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 

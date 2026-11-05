@@ -50,15 +50,18 @@ The `scripts/check-docs-*.sh` gates are being ported to
 - [`markdown.rs`](src/docs/markdown.rs): live prose (fences, comments and
   code spans removed), heading anchors and link destinations.
 - One module per gate: [`links.rs`](src/docs/links.rs),
-  [`guide_index.rs`](src/docs/guide_index.rs) and
-  [`aliases.rs`](src/docs/aliases.rs). The guide-index gate reads
+  [`guide_index.rs`](src/docs/guide_index.rs),
+  [`aliases.rs`](src/docs/aliases.rs) and
+  [`routes.rs`](src/docs/routes.rs). The guide-index gate reads
   links inside block quotes, list items and raw HTML, so it carries a finer,
   character-indexed model of its own in `src/docs/guide_index/`.
 
 `cargo xtask check <name>` runs a ported gate first and falls back to
 `scripts/check-<name>.sh`, so CI and docs call a gate the same way before and
 after it is ported. `cargo xtask docs <name> --root <dir>` runs one over
-another checkout.
+another checkout. A gate that can say what it reads answers `--corpus` (the
+pages, one per line, which `scripts/check-docs-scope.sh` compares across
+gates) and `--list` (the truth set it checks against).
 
 To port a gate:
 
