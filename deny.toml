@@ -71,6 +71,18 @@ ignore = [
     # oracle). Autumn's own p256 (Web Push) and aws-sigv4 use 0.7.10. Remove
     # when jsonwebtoken moves to p256 0.14. Review-by: 2026-11-08.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only, via jsonwebtoken ES256/ES384 -> p256/p384 0.13 -> elliptic-curve 0.13; no patched 0.5.x; review-by 2026-11-08" },
+    # RUSTSEC-2026-0440 — astral-tokio-tar unmaintained (Astral ended maintenance
+    # 2026-11-03). No safe upgrade exists. Ingress: testcontainers 0.27 only,
+    # which every crate here pulls as a dev-dependency to start Docker databases
+    # in tests. Nothing in a shipped binary reads a tar through it. Replace
+    # when testcontainers moves off it. Review-by: 2026-12-05.
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar unmaintained, no safe upgrade; testcontainers dev-dependency only, not in shipped binaries; review-by 2026-12-05" },
+    # RUSTSEC-2026-0441 — pin-utils unmaintained (upstream archived 2026-10-01).
+    # No safe upgrade exists. It is a transitive crate of loom and wasmtimer
+    # (via reqwest-retry <- postgresql_archive, a build-time download helper). It
+    # holds no unsound code, only `pin_mut!`-style macros that core::pin::pin!
+    # replaces. Replace when those crates drop it. Review-by: 2026-12-05.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained, no safe upgrade; transitive via loom and wasmtimer, no unsound code; review-by 2026-12-05" },
 ]
 
 [licenses]
