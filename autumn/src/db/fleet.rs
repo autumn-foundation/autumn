@@ -4930,10 +4930,9 @@ pub(crate) fn build_for_app(
     );
     // SQLite has no schemas: a set for a Postgres schema must not reach a
     // fleet file, where it would run in the default namespace.
-    if let Some((label, _, _, Some(schema))) = all
-        .iter()
-        .find(|(_, set, scope, schema)| schema.is_some() && scope.reaches_shards() && keep(set))
-    {
+    if let Some((label, _, _, Some(schema))) = all.iter().find(|(_, set, scope, schema)| {
+        schema.is_some() && crate::migrate::applied_scope(set, *scope).reaches_shards()
+    }) {
         return Err(format!(
             "Failed to set up database.fleet: the migration set `{label}` targets the \
              Postgres schema `{schema}`, and a SQLite fleet has no schemas"

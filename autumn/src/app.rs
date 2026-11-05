@@ -8501,7 +8501,9 @@ impl AppBuilder {
                 if is_sqlite_control {
                     // SQLite has no schemas. Refuse before anything writes.
                     #[cfg(feature = "sqlite")]
-                    if let Some(schema) = control_sets(&migrations).find_map(|(_, s)| s) {
+                    if let Some(schema) =
+                        control_sets(&migrations, only_database).find_map(|(_, s)| s)
+                    {
                         eprintln!(
                             "autumn migrate: a migration set targets the Postgres schema \
                              `{schema}`, but the database is SQLite, which has no schemas"
@@ -15460,7 +15462,9 @@ async fn run_startup_migrations(
                 == Some(crate::config::DatabaseBackend::Sqlite)
         {
             // SQLite has no schemas. Refuse before anything writes.
-            if let Some(schema) = control_sets(&migrations).find_map(|(_, schema)| schema) {
+            if let Some(schema) =
+                control_sets(&migrations, only_database).find_map(|(_, schema)| schema)
+            {
                 tracing::error!(
                     schema,
                     target = "control",
