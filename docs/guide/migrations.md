@@ -18,7 +18,8 @@ columns and no declaration splits it. See [Table width](./table-width.md).
 
 `AppBuilder::migrations` sends a set to the control database and to every
 shard (`[[database.shards]]`, or each `[database.fleet]` file). Use
-`migrations_for` to keep a set on one side:
+`migrations_for` (or `plugin_migrations_for` in a plugin) to keep a set on
+one side:
 
 ```rust
 use autumn_web::migrate::MigrationScope;
@@ -26,12 +27,17 @@ use autumn_web::migrate::MigrationScope;
 autumn_web::app()
     .migrations_for(MigrationScope::Control, CONTROL_MIGRATIONS)
     .migrations_for(MigrationScope::Shards, TENANT_MIGRATIONS)
+    .plugin_migrations_for("my-plugin", MigrationScope::Control, PLUGIN_MIGRATIONS)
 ```
 
-Boot and `AUTUMN_MIGRATE=1` obey the scope. The `autumn migrate` and
-`autumn fleet migrate` commands read `migrations/` and do not know a scope.
-Do not run `autumn migrate` on an app with a scoped set: use
-`AUTUMN_MIGRATE=1`.
+- Boot and `AUTUMN_MIGRATE=1` obey the scope.
+- With no shard and no fleet, the one database gets every scope.
+- The framework control-plane set always applies as `Control`.
+- The CLI reads the scope from the directory name: `migrations/`,
+  `migrations-control/`, `migrations-shards/`. Embed each directory with its
+  scope. `autumn migrate` applies them to a `SQLite` database only. On
+  Postgres it stops: use `AUTUMN_MIGRATE=1`.
+
 See [SQLite fleet: migrations](sqlite-fleet.md#control-only-and-tenant-only-sets).
 
 ---

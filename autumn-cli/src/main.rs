@@ -3530,12 +3530,14 @@ enum FleetCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Apply pending migrations from `migrations/` to every database.
+    /// Apply pending migrations from `migrations/` and `migrations-shards/`
+    /// to every database.
     ///
     /// Each database also gets the framework tables a fleet database gets at
-    /// boot. Plugin migrations are not applied: run the app once with
-    /// `AUTUMN_MIGRATE=1` for them. A failure on one database does not stop the
-    /// others. The command exits non-zero when one or more fail.
+    /// boot. `migrations-control/` is for the control database only, so it
+    /// is not applied. Plugin migrations are not applied: run the app once
+    /// with `AUTUMN_MIGRATE=1` for them. A failure on one database does not
+    /// stop the others. The command exits non-zero when one or more fail.
     Migrate {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]

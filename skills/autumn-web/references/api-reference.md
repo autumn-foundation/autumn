@@ -1485,7 +1485,8 @@ double-submits and replays.
   `HxResponseExt`, `Sse`, `Event`, `TaskArgs`, `SignedWebhook`. With CSRF off
   (the dev default), `CsrfToken` is empty; `Option<CsrfToken>` is `None`.
 - Database: `autumn_web::db::prelude::*` (Diesel's prelude with the async
-  `RunQueryDsl`), `AppBuilder::migrations_for(MigrationScope, set)`.
+  `RunQueryDsl`), `AppBuilder::migrations_for(MigrationScope, set)`,
+  `AppBuilder::plugin_migrations_for(name, MigrationScope, set)`.
 - Error and response: `AutumnError`, `AutumnResult`, `IntoResponse`,
   `StatusCode`, `Redirect`.
 - Data helpers: `Changeset`, `ChangesetForm`, `IntoChangeset`, mutation hook

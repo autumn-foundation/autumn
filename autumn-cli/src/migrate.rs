@@ -123,16 +123,20 @@ fn all_targets_sqlite(targets: &[(String, String)]) -> bool {
 #[cfg(feature = "sqlite")]
 fn apply_pending_sqlite_cli(
     database_url: &str,
-    migrations_dir: &Path,
+    migrations_dirs: &[std::path::PathBuf],
 ) -> Result<MigrationResult, MigrationError> {
-    let migrations =
-        diesel_migrations::FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
-            MigrationError::Migration(format!(
-                "failed to read migrations directory {}: {e}",
-                migrations_dir.display()
-            ))
-        })?;
-    autumn_web::migrate::run_pending_sqlite_with_framework_migrations(database_url, &migrations)
+    let sets = migrations_dirs
+        .iter()
+        .map(|dir| {
+            diesel_migrations::FileBasedMigrations::from_path(dir).map_err(|e| {
+                MigrationError::Migration(format!(
+                    "failed to read migrations directory {}: {e}",
+                    dir.display()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    autumn_web::migrate::run_pending_sqlite_sets_with_framework_migrations(database_url, &sets)
 }
 
 /// `SQLite` apply seam in the default (Postgres-only) build — references no
@@ -140,7 +144,7 @@ fn apply_pending_sqlite_cli(
 #[cfg(not(feature = "sqlite"))]
 fn apply_pending_sqlite_cli(
     _database_url: &str,
-    _migrations_dir: &Path,
+    _migrations_dirs: &[std::path::PathBuf],
 ) -> Result<MigrationResult, MigrationError> {
     Err(MigrationError::Migration(SQLITE_FEATURE_MSG.to_owned()))
 }
@@ -288,6 +292,13 @@ pub fn run(
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
+    let base = migrations_base(&migrations_dir);
+    if *action == MigrateAction::Run
+        && let Err(message) = refuse_scope_dirs_on_postgres(&targets, base)
+    {
+        eprintln!("\u{2717} {message}");
+        std::process::exit(1);
+    }
 
     // 3. Check that diesel CLI is available — but only when a target actually
     //    needs the `diesel` subprocess. The SQLite apply path uses the in-process
@@ -312,9 +323,14 @@ pub fn run(
                 |key| autumn_web::config::Env::var(&env, key),
                 config_table.as_ref(),
             );
+            let only_database = control_is_only_database(
+                |key| autumn_web::config::Env::var(&env, key),
+                config_table.as_ref(),
+            );
             run_all_targets(
                 &targets,
                 &migrations_dir,
+                only_database,
                 with_maintenance,
                 wait,
                 lock_policy,
@@ -553,11 +569,87 @@ fn reject_duplicate_target_urls(targets: &[(String, String)]) -> Result<(), Stri
     Ok(())
 }
 
+/// The directory that holds the `migrations/` directory.
+fn migrations_base(migrations_dir: &str) -> &Path {
+    Path::new(migrations_dir)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+}
+
+/// Whether the control database is the only database: no
+/// `[[database.shards]]` and no `[database.fleet]`. Boot then applies every
+/// scope to it (see `MigrationScope`).
+fn control_is_only_database<F>(env_var: F, table: Option<&toml::Table>) -> bool
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let fleet_in_file = table
+        .and_then(|t| t.get("database"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|database| database.contains_key("fleet"));
+    let fleet_in_env = [
+        "AUTUMN_DATABASE__FLEET__MODE",
+        "AUTUMN_DATABASE__FLEET__ROOT",
+    ]
+    .iter()
+    .any(|key| env_var(key).is_ok());
+    !fleet_in_file
+        && !fleet_in_env
+        && resolve_shard_database_urls_from_sources(env_var, table).is_empty()
+}
+
+/// The migration directories of the control database, in apply order, as
+/// boot applies the registered sets: `migrations/`, then
+/// `migrations-control/`. With `only_database`, also `migrations-shards/`.
+/// A scope directory that does not exist is skipped.
+fn control_migration_dirs(base: &Path, only_database: bool) -> Vec<std::path::PathBuf> {
+    use autumn_web::migrate::MigrationScope;
+
+    let mut dirs = vec![base.join(MigrationScope::Everywhere.directory())];
+    let mut scoped = vec![MigrationScope::Control];
+    if only_database {
+        scoped.push(MigrationScope::Shards);
+    }
+    for scope in scoped {
+        let dir = base.join(scope.directory());
+        if dir.is_dir() {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Stop before any apply when a Postgres target would miss a scope
+/// directory. The Postgres path reads `migrations/` only: its checksum
+/// check reads one directory.
+fn refuse_scope_dirs_on_postgres(targets: &[(String, String)], base: &Path) -> Result<(), String> {
+    use autumn_web::migrate::MigrationScope;
+
+    if targets.iter().all(|(_, url)| is_sqlite_target(url)) {
+        return Ok(());
+    }
+    let found: Vec<String> = [MigrationScope::Control, MigrationScope::Shards]
+        .iter()
+        .map(|scope| scope.directory())
+        .filter(|dir| base.join(dir).is_dir())
+        .map(|dir| format!("{dir}/"))
+        .collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "`autumn migrate` does not apply {} to a Postgres database.\n  Run the app once \
+         with AUTUMN_MIGRATE=1 instead. It applies each registered set by its scope.",
+        found.join(" or ")
+    ))
+}
+
 /// Apply migrations to every target in order, failing fast with a
 /// per-target summary.
 fn run_all_targets(
     targets: &[(String, String)],
     migrations_dir: &str,
+    only_database: bool,
     with_maintenance: bool,
     wait: std::time::Duration,
     lock_policy: autumn_web::migrate::MigrationLockPolicy,
@@ -569,7 +661,14 @@ fn run_all_targets(
         // the shard-required framework migrations (version history + commit
         // hook queue), not the full control-plane schema.
         let is_shard = label.starts_with("shard:");
-        if run_single_target(url, migrations_dir, is_shard, wait, lock_policy) {
+        if run_single_target(
+            url,
+            migrations_dir,
+            is_shard,
+            only_database,
+            wait,
+            lock_policy,
+        ) {
             completed.push(label);
             eprintln!();
         } else {
@@ -649,6 +748,7 @@ fn run_single_target(
     database_url: &str,
     migrations_dir: &str,
     is_shard: bool,
+    only_database: bool,
     wait: std::time::Duration,
     lock_policy: autumn_web::migrate::MigrationLockPolicy,
 ) -> bool {
@@ -660,7 +760,8 @@ fn run_single_target(
     // migrations directly (mirrors `autumn schema migrate`, #1999/#2036). The
     // Postgres path below is unchanged.
     if is_sqlite_target(database_url) {
-        return run_single_target_sqlite(database_url, migrations_dir);
+        let dirs = control_migration_dirs(migrations_base(migrations_dir), only_database);
+        return run_single_target_sqlite(database_url, &dirs);
     }
 
     if let Err(message) = framework_migrations_backend_mismatch(database_url) {
@@ -784,12 +885,11 @@ fn run_single_target(
 /// framework sets are version-disambiguated together before any is applied,
 /// as at boot, so an app migration that shares a version with a framework one
 /// masks nothing.
-fn run_single_target_sqlite(database_url: &str, migrations_dir: &str) -> bool {
-    let dir = std::path::Path::new(migrations_dir);
+fn run_single_target_sqlite(database_url: &str, migrations_dirs: &[std::path::PathBuf]) -> bool {
     eprintln!(
-        "  Running pending migrations (SQLite, unlocked harness; app set, then framework sets)...\n"
+        "  Running pending migrations (SQLite, unlocked harness; app sets, then framework sets)...\n"
     );
-    match apply_pending_sqlite_cli(database_url, dir) {
+    match apply_pending_sqlite_cli(database_url, migrations_dirs) {
         Ok(result) if result.applied.is_empty() => {
             eprintln!("\u{2713} Migrations are already up to date.");
             true
@@ -3743,6 +3843,49 @@ mod tests {
     #[test]
     fn default_migrations_dir_is_migrations() {
         assert_eq!(DEFAULT_MIGRATIONS_DIR, "migrations");
+    }
+
+    /// The control database gets `migrations/` and `migrations-control/`.
+    /// The only database also gets `migrations-shards/`. A missing
+    /// directory is skipped.
+    #[test]
+    fn control_migration_dirs_follow_the_topology() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        for dir in ["migrations", "migrations-control", "migrations-shards"] {
+            std::fs::create_dir(base.join(dir)).unwrap();
+        }
+        let names = |only: bool| -> Vec<String> {
+            control_migration_dirs(base, only)
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names(false), ["migrations", "migrations-control"]);
+        assert_eq!(
+            names(true),
+            ["migrations", "migrations-control", "migrations-shards"]
+        );
+        std::fs::remove_dir(base.join("migrations-control")).unwrap();
+        assert_eq!(names(true), ["migrations", "migrations-shards"]);
+        assert_eq!(names(false), ["migrations"]);
+    }
+
+    /// A Postgres target reads `migrations/` only, so a scope directory
+    /// stops the run before any apply. A `SQLite` target applies them.
+    #[test]
+    fn a_postgres_target_refuses_a_scope_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let postgres = [("control".to_owned(), "postgres://db/app".to_owned())];
+        let sqlite = [("control".to_owned(), "sqlite://app.db".to_owned())];
+        refuse_scope_dirs_on_postgres(&postgres, base).expect("no scope directory");
+
+        std::fs::create_dir(base.join("migrations-shards")).unwrap();
+        let err = refuse_scope_dirs_on_postgres(&postgres, base).unwrap_err();
+        assert!(err.contains("migrations-shards"), "{err}");
+        assert!(err.contains("AUTUMN_MIGRATE=1"), "{err}");
+        refuse_scope_dirs_on_postgres(&sqlite, base).expect("SQLite applies them");
     }
 
     // ── rollback planning ────────────────────────────────────────────────────

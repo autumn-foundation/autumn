@@ -347,7 +347,8 @@ error. See `docs/guide/getting-started.md` "Tuning the Tokio runtime".
 | `.jobs(jobs![...])` | Register request-triggered `#[job]` work |
 | `.one_off_tasks(one_off_tasks![...])` | Register operational `#[task]` commands |
 | `.migrations(MIGRATIONS)` | Register embedded Diesel migrations |
-| `.migrations_for(MigrationScope::Control \| Shards, MIGRATIONS)` | Register a set for the control database only, or for the shards and fleet files only. Do not run `autumn migrate` on such an app; use `AUTUMN_MIGRATE=1` |
+| `.migrations_for(MigrationScope::Control \| Shards, MIGRATIONS)` | Register a set for the control database only, or for the shards and fleet files only. With no shard and no fleet, the one database gets every scope. Embed `migrations-control/` as `Control` and `migrations-shards/` as `Shards`: the CLI reads the scope from the directory name (SQLite only; Postgres: `AUTUMN_MIGRATE=1`) |
+| `.plugin_migrations_for(name, MigrationScope, MIGRATIONS)` | A plugin's set, scoped as `.migrations_for` |
 | `.plugin_migrations(name, MIGRATIONS)` | Register a plugin's embedded Diesel migrations (named; version collisions with other sources auto-resolve) |
 | `.plugin(plugin)` / `.plugins((...))` | Install first- or third-party plugins |
 | `.plugin_assets(&ASSETS)` | Serve a plugin crate's JS/CSS/fonts (`PluginAssets`, from `plugin_assets!("ns")` or `PluginAssets::from_files`) at content-hashed `immutable` URLs under `/static/_plugins/<ns>/`, with SRI; call it from `Plugin::build`. Never hand-roll a fixed-URL asset route in a plugin (see `docs/guide/plugin-assets.md`) |
@@ -3075,7 +3076,10 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   peak (about `2 × pool_size + 1` fds per open database).
 - Control-only or tenant-only tables: `.migrations_for(MigrationScope::Control,
   SET)` / `.migrations_for(MigrationScope::Shards, SET)`
-  (`autumn_web::migrate::MigrationScope`), not one set for both.
+  (`autumn_web::migrate::MigrationScope`), not one set for both. A plugin
+  uses `.plugin_migrations_for(name, scope, SET)`. Put the sets in
+  `migrations-control/` and `migrations-shards/`: `autumn migrate` and
+  `autumn fleet migrate` read the scope from the directory name.
 - A SQLite build names the generated repository `Sqlite<Trait>` too (alias
   of `Pg<Trait>`). In a module with `#[model]`/`#[repository]`, import
   `autumn_web::db::prelude::*`, never `diesel::prelude::*` (E0034).

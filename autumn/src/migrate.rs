@@ -78,10 +78,73 @@ impl MigrationScope {
     pub const fn reaches_shards(self) -> bool {
         matches!(self, Self::Everywhere | Self::Shards)
     }
+
+    /// The directory that the CLI reads as a set of this scope, relative to
+    /// the app directory. `autumn migrate` and `autumn fleet migrate` read
+    /// it. Embed the same directory with the same scope, so the CLI and
+    /// boot apply the same sets:
+    ///
+    /// ```rust,ignore
+    /// const CONTROL: EmbeddedMigrations = embed_migrations!("migrations-control");
+    /// app().migrations_for(MigrationScope::Control, CONTROL)
+    /// ```
+    #[must_use]
+    pub const fn directory(self) -> &'static str {
+        match self {
+            Self::Everywhere => "migrations",
+            Self::Control => "migrations-control",
+            Self::Shards => "migrations-shards",
+        }
+    }
 }
 
 /// One registered migration set: its label, the set, and its scope.
 pub(crate) type RegisteredMigrations = (&'static str, EmbeddedMigrations, MigrationScope);
+
+/// The scope a registered set applies with. The control-plane
+/// [`FRAMEWORK_MIGRATIONS`] set applies as [`MigrationScope::Control`] in
+/// every scope: a shard never gets the control-plane tables. Each other set
+/// keeps its registered scope.
+///
+/// Only the apply loops use this. A collision map reads the registered
+/// scope, so a substitute version that a shard already records does not
+/// change.
+#[cfg(feature = "db")]
+pub(crate) fn applied_scope(
+    set: &EmbeddedMigrations,
+    registered: MigrationScope,
+) -> MigrationScope {
+    if registered.reaches_control() && is_control_framework_set(set) {
+        MigrationScope::Control
+    } else {
+        registered
+    }
+}
+
+/// Whether `set` is the control-plane [`FRAMEWORK_MIGRATIONS`] set.
+///
+/// The test is a migration that is in [`FRAMEWORK_MIGRATIONS`] and in no
+/// shard-required set. [`FRAMEWORK_MIGRATIONS`] also holds the migrations of
+/// the shard-required sets, so a plain name match would also match those
+/// sets and keep them off the shards.
+#[cfg(feature = "db")]
+pub(crate) fn is_control_framework_set(set: &EmbeddedMigrations) -> bool {
+    use crate::db::RuntimeBackend;
+
+    fn names(set: &EmbeddedMigrations) -> std::collections::HashSet<String> {
+        let migrations: Vec<Box<dyn Migration<RuntimeBackend>>> =
+            set.migrations().unwrap_or_default();
+        migrations.iter().map(|m| m.name().to_string()).collect()
+    }
+
+    let mut control_only = names(&FRAMEWORK_MIGRATIONS);
+    for shard_required in shard_framework_migration_sets() {
+        for name in names(shard_required) {
+            control_only.remove(&name);
+        }
+    }
+    names(set).iter().any(|name| control_only.contains(name))
+}
 
 /// Embedded Autumn framework migrations.
 ///
@@ -3742,10 +3805,34 @@ pub fn run_pending_sqlite_with_framework_migrations<S>(
 where
     S: diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
 {
+    run_pending_sqlite_sets_with_framework_migrations(
+        database_url,
+        std::slice::from_ref(app_migrations),
+    )
+}
+
+/// [`run_pending_sqlite_with_framework_migrations`] for more than one app
+/// set, for example `migrations/` and `migrations-control/`. Each set counts
+/// as its own set in the collision map, as each registered set does at boot.
+/// The sets apply in the given order, then the framework sets.
+///
+/// # Errors
+///
+/// The same errors as [`run_pending_sqlite_with_framework_migrations`].
+#[cfg(feature = "sqlite")]
+pub fn run_pending_sqlite_sets_with_framework_migrations<S>(
+    database_url: &str,
+    app_sets: &[S],
+) -> Result<MigrationResult, MigrationError>
+where
+    S: diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+{
     use diesel::sqlite::Sqlite;
 
-    let mut sets: Vec<Vec<(String, String)>> =
-        vec![migration_versions_and_names::<Sqlite, S>(app_migrations)?];
+    let mut sets: Vec<Vec<(String, String)>> = Vec::with_capacity(app_sets.len() + 4);
+    for app_set in app_sets {
+        sets.push(migration_versions_and_names::<Sqlite, S>(app_set)?);
+    }
     sets.push(migration_versions_and_names::<Sqlite, _>(
         &FRAMEWORK_MIGRATIONS,
     )?);
@@ -3754,11 +3841,16 @@ where
     }
     let disambiguated = compute_migration_disambiguation_from_names(sets.clone());
     adopt_sqlite_collision_history(database_url, &sets, &disambiguated)?;
-    let mut applied = run_pending_sqlite(
-        database_url,
-        DisambiguatedMigrations::new(app_migrations, &disambiguated),
-    )?
-    .applied;
+    let mut applied = Vec::new();
+    for app_set in app_sets {
+        applied.extend(
+            run_pending_sqlite(
+                database_url,
+                DisambiguatedMigrations::new(app_set, &disambiguated),
+            )?
+            .applied,
+        );
+    }
     let framework_result = run_pending_sqlite(
         database_url,
         DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &disambiguated),
@@ -4464,6 +4556,15 @@ pub(crate) fn auto_migrate_sqlite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each scope has its own CLI directory. `Everywhere` keeps the
+    /// directory that `embed_migrations!()` reads by default.
+    #[test]
+    fn each_scope_names_its_cli_directory() {
+        assert_eq!(MigrationScope::Everywhere.directory(), "migrations");
+        assert_eq!(MigrationScope::Control.directory(), "migrations-control");
+        assert_eq!(MigrationScope::Shards.directory(), "migrations-shards");
+    }
 
     /// A shard holds tenant rows, so it needs every framework table the
     /// repositories that write those rows touch. Missing one leaves

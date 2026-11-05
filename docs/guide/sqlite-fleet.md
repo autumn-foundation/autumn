@@ -310,25 +310,43 @@ migrations expand-then-contract.
 ### Control-only and tenant-only sets
 
 `AppBuilder::migrations` sends a set to the control database and to every
-fleet database. To keep a set on one side, use `migrations_for`:
+fleet database. To keep a set on one side, use `migrations_for`, or
+`plugin_migrations_for` in a plugin:
 
 ```rust
 use autumn_web::migrate::{EmbeddedMigrations, MigrationScope, embed_migrations};
 
+const SHARED: EmbeddedMigrations = embed_migrations!("migrations");
 const CONTROL: EmbeddedMigrations = embed_migrations!("migrations-control");
-const TENANT: EmbeddedMigrations = embed_migrations!("migrations");
+const TENANT: EmbeddedMigrations = embed_migrations!("migrations-shards");
 
 autumn_web::app()
+    .migrations(SHARED)                               // every database
     .migrations_for(MigrationScope::Control, CONTROL) // control database only
     .migrations_for(MigrationScope::Shards, TENANT)   // each fleet database only
 ```
 
-Boot and `AUTUMN_MIGRATE=1` obey the scope. `autumn migrate` and
-`autumn fleet migrate` read `migrations/` and do not know a scope. Keep the
-tenant set in `migrations/` and the control set in its own directory. Then
-`autumn fleet migrate` is correct for the fleet. Do not run `autumn migrate`
-on this app: it applies `migrations/` to the control database. Use
-`AUTUMN_MIGRATE=1`.
+Boot and `AUTUMN_MIGRATE=1` obey the scope. The framework control-plane set
+(`FRAMEWORK_MIGRATIONS`) always applies as `Control`.
+
+The CLI reads the scope from the directory name
+(`MigrationScope::directory`). Embed each directory with its scope, as
+above:
+
+| Directory | Scope | `autumn migrate` | `autumn fleet migrate` |
+| --- | --- | --- | --- |
+| `migrations/` | `Everywhere` | control database | each fleet database |
+| `migrations-control/` | `Control` | control database | no |
+| `migrations-shards/` | `Shards` | no | each fleet database |
+
+With no `[database.fleet]` and no `[[database.shards]]`, the one database
+gets every scope, at boot and from `autumn migrate`. Thus a plugin can
+register `Control` or `Shards` and not check the topology.
+
+`autumn migrate` applies the scope directories to a `SQLite` database only.
+On a Postgres target it stops: run the app once with `AUTUMN_MIGRATE=1`.
+`autumn migrate down` reads `migrations/` only. Plugin sets are not on disk:
+`AUTUMN_MIGRATE=1` applies them.
 
 ## Opening and closing
 
