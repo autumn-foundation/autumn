@@ -647,7 +647,7 @@ role = "marketing"
         assert_eq!(names(&role(&plan, "marketing").own), ["shared.contacts"]);
         let sql = plan.sql().unwrap();
         assert!(
-            sql.contains(r#"GRANT USAGE ON SCHEMA "marketing", "shared" TO "marketing";"#),
+            sql.contains(r#"GRANT USAGE ON SCHEMA "shared" TO "marketing";"#),
             "{sql}"
         );
     }
