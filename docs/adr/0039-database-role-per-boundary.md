@@ -38,9 +38,17 @@ database refuse a query on a table that the boundary does not own.
   transactional migration, a session setting and `RESET` in another. The
   rest of the path stays, so `__diesel_schema_migrations` stays in `public`.
 - **Doctor reads, not trusts.** `autumn doctor --strict` connects as each
-  role and tries `SELECT 1 FROM t LIMIT 0` on every table. A readable table
-  outside the grant fails. This finds a grant that `REVOKE` cannot remove,
-  for example one to `PUBLIC`.
+  role and tries `SELECT 1 FROM t LIMIT 0` on every table, and reads
+  `has_table_privilege` for the other rights. A table outside the grant that
+  the role can read or change fails. This finds a grant that `REVOKE` cannot
+  remove, for example one to `PUBLIC`.
+- **Only a boundary role.** `--apply` refuses a role that is a superuser,
+  the role that runs the command, or a table owner. A `REVOKE` on it takes
+  the rights of the owner, or has no effect.
+- **Views by pattern only.** A view runs with the rights of its owner. A
+  schema does not give a boundary its views; an `owns` pattern does.
+- **One registration.** A migration registered with a schema and without
+  one stops the boot. The first copy would run, in the wrong schema.
 
 ## Consequences
 

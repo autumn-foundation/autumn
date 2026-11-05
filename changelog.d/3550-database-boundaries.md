@@ -14,7 +14,8 @@
   - `autumn db grants` prints the `REVOKE` / `GRANT` statements of each role,
     from `boundaries.toml` and the live catalog. `--apply` runs them.
   - `autumn doctor --strict` connects as each role. It fails when a role can
-    read a table outside its grant.
+    read or change a table outside its grant, or write a `may_read` table.
+    `--apply` refuses a superuser, the role that runs it, or a table owner.
   - `src/schema.rs` sync keeps the schema of a `marketing.campaigns` block.
   - See `docs/guide/database-boundaries.md`.
 

@@ -1223,6 +1223,11 @@ impl DbState for AppState {
         self.pool_for_name(name)
     }
 
+    fn boundary_roles_configured(&self) -> bool {
+        self.extension::<crate::db_roles::RolePools>()
+            .is_some_and(|pools| !pools.is_empty())
+    }
+
     fn db_interceptors(
         &self,
     ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {

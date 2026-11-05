@@ -11430,7 +11430,7 @@ fn check_database_roles(
                     format!("no [database.roles.{}] in autumn.toml", grants.boundary),
                 ),
                 Some(Err(e)) => RoleProbe::unreachable(grants, e.clone()),
-                Some(Ok(url)) => probe_role(url, grants).await,
+                Some(Ok(url)) => probe_role(url, grants, &plan.schemas).await,
             });
         }
         Ok::<_, String>(probes)
@@ -11475,9 +11475,31 @@ fn database_roles_verdict(probes: &[crate::db::grants::RoleProbe]) -> CheckResul
         if !leaks.is_empty() {
             status = CheckStatus::Fail;
             lines.push(format!(
-                "{name}: reads {} table(s) outside its grant: {}",
+                "{name}: reads or changes {} table(s) outside its grant: {}",
                 leaks.len(),
                 join_names(leaks.into_iter())
+            ));
+        }
+        if !probe.writes_read_only.is_empty() {
+            status = CheckStatus::Fail;
+            lines.push(format!(
+                "{name}: writes {} `may_read` table(s): {}",
+                probe.writes_read_only.len(),
+                join_names(probe.writes_read_only.iter())
+            ));
+        }
+        if !probe.creates_in.is_empty() {
+            warn(&mut status);
+            lines.push(format!(
+                "{name}: can create objects in schema(s): {}",
+                probe.creates_in.join(", ")
+            ));
+        }
+        if !probe.member_of.is_empty() {
+            warn(&mut status);
+            lines.push(format!(
+                "{name}: is a member of role(s) {}; `SET ROLE` gives their rights",
+                probe.member_of.join(", ")
             ));
         }
         let closed: Vec<_> = probe
@@ -24441,7 +24463,41 @@ mod database_roles_tests {
                 (t("contacts"), Access::Denied),
                 (t("deals"), Access::Denied),
             ],
+            ..RoleProbe::default()
         }
+    }
+
+    #[test]
+    fn a_write_privilege_outside_the_grant_fails() {
+        let mut p = probe();
+        p.denied[0].1 = Access::Writable;
+        p.writes_read_only = vec![t("accounts")];
+        let result = database_roles_verdict(&[p]);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(
+            detail.contains("reads or changes 1 table(s) outside its grant: public.contacts"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("writes 1 `may_read` table(s): public.accounts"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn create_rights_and_memberships_warn() {
+        let mut p = probe();
+        p.creates_in = vec!["public".into()];
+        p.member_of = vec!["app_owner".into()];
+        let result = database_roles_verdict(&[p]);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.unwrap();
+        assert!(
+            detail.contains("can create objects in schema(s): public"),
+            "{detail}"
+        );
+        assert!(detail.contains("member of role(s) app_owner"), "{detail}");
     }
 
     #[test]
@@ -24462,7 +24518,8 @@ mod database_roles_tests {
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap();
         assert!(
-            detail.contains("marketing: reads 1 table(s) outside its grant: public.deals"),
+            detail
+                .contains("marketing: reads or changes 1 table(s) outside its grant: public.deals"),
             "{detail}"
         );
     }

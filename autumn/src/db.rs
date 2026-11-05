@@ -1077,6 +1077,12 @@ pub trait DbState {
         self.pool().cloned()
     }
 
+    /// Whether [`Self::boundary_pool`] gives role pools, not the primary
+    /// pool. A role pool does not record failure-capture traffic.
+    fn boundary_roles_configured(&self) -> bool {
+        false
+    }
+
     /// Returns any registered database connection checkout interceptors.
     fn db_interceptors(
         &self,
@@ -4573,6 +4579,10 @@ where
     }
 }
 
+/// Why a capsule is not complete when a request uses a role pool.
+#[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+const BOUNDARY_CAPTURE_GAP: &str = "a [database.roles] pool does not record capture traffic";
+
 /// A [`Db`] connection as the database role of boundary `B` (#3550).
 ///
 /// The connection comes from
@@ -4654,7 +4664,11 @@ where
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
             #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
-            capture_gap: state.db_capture_gap(),
+            capture_gap: if state.boundary_roles_configured() {
+                Some(std::sync::Arc::from(BOUNDARY_CAPTURE_GAP))
+            } else {
+                state.db_capture_gap()
+            },
             clock: ctx.clock,
         })
         .await?;

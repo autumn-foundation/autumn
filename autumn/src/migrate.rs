@@ -97,14 +97,58 @@ pub(crate) type RegisteredMigrations = (
 ///
 /// A transactional migration uses a local setting, which ends at commit. A
 /// non-transactional one uses a session setting; [`SCHEMA_EXIT_SQL`] resets it.
+///
+/// The batch starts with DDL, so the Ledger capture does not gate it. The
+/// migration role needs `CREATE` on the database: Postgres checks it before
+/// `IF NOT EXISTS`.
 fn schema_enter_sql(schema: &str, run_in_transaction: bool) -> String {
     let ident = format!("\"{}\"", schema.replace('"', "\"\""));
-    let literal = format!("'{}, '", ident.replace('\'', "''"));
+    let literal = format!("'{}'", ident.replace('\'', "''"));
+    // `concat_ws` drops an empty path, so `search_path = ''` gives a valid list.
     format!(
         "CREATE SCHEMA IF NOT EXISTS {ident}; \
-         SELECT set_config('search_path', {literal} || current_setting('search_path'), \
+         SELECT set_config('search_path', \
+         concat_ws(', ', {literal}, NULLIF(current_setting('search_path'), '')), \
          {run_in_transaction})"
     )
+}
+
+/// The first migration that is registered both in a schema and without one,
+/// as an error message (#3550).
+///
+/// A plugin that registers its own migrations, and the same set again with
+/// [`AppBuilder::plugin_migrations_in_schema`](crate::app::AppBuilder::plugin_migrations_in_schema),
+/// has one migration name twice. The first copy runs, so the tables land in
+/// the wrong schema with no error. Boot refuses that.
+pub(crate) fn schema_registration_conflict(sets: &[RegisteredMigrations]) -> Option<String> {
+    use diesel::migration::MigrationSource as _;
+    let mut seen: HashMap<String, Option<&'static str>> = HashMap::new();
+    for (label, set, _, schema) in sets {
+        let Ok(migrations) = MigrationSource::<crate::db::RuntimeBackend>::migrations(set) else {
+            continue;
+        };
+        for m in migrations {
+            let name = m.name().to_string();
+            match seen.get(&name) {
+                Some(other) if other != schema => {
+                    let show = |s: &Option<&str>| {
+                        s.map_or_else(|| "no schema".to_owned(), |s| format!("schema `{s}`"))
+                    };
+                    return Some(format!(
+                        "migration `{name}` (set `{label}`) is registered with {} and with {}; \
+                         register the set once",
+                        show(other),
+                        show(schema)
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(name, *schema);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The SQL that runs after a non-transactional migration in a schema.
@@ -171,10 +215,13 @@ impl<DB: diesel::backend::Backend> SchemaMigration<DB> {
         let in_transaction = self.inner.metadata().run_in_transaction();
         conn.batch_execute(&schema_enter_sql(self.schema, in_transaction))?;
         let result = step(conn);
-        if !in_transaction {
-            conn.batch_execute(SCHEMA_EXIT_SQL)?;
+        if in_transaction {
+            return result;
         }
-        result
+        // Reset also after a failure; report the failure of the step first.
+        let reset = conn.batch_execute(SCHEMA_EXIT_SQL);
+        result?;
+        reset.map_err(Into::into)
     }
 }
 
@@ -5732,7 +5779,8 @@ mod tests {
         assert_eq!(
             schema_enter_sql("marketing", true),
             "CREATE SCHEMA IF NOT EXISTS \"marketing\"; \
-             SELECT set_config('search_path', '\"marketing\", ' || current_setting('search_path'), true)"
+             SELECT set_config('search_path', \
+             concat_ws(', ', '\"marketing\"', NULLIF(current_setting('search_path'), '')), true)"
         );
         assert!(schema_enter_sql("marketing", false).ends_with(", false)"));
     }
@@ -5741,7 +5789,47 @@ mod tests {
     fn schema_enter_sql_quotes_the_name() {
         let sql = schema_enter_sql("we\"ird'name", true);
         assert!(sql.contains("\"we\"\"ird'name\";"), "{sql}");
-        assert!(sql.contains("'\"we\"\"ird''name\", '"), "{sql}");
+        assert!(sql.contains("'\"we\"\"ird''name\"'"), "{sql}");
+    }
+
+    #[test]
+    fn a_set_in_a_schema_and_without_one_is_a_conflict() {
+        let set = |schema| {
+            (
+                "p",
+                FRAMEWORK_MIGRATIONS,
+                MigrationScope::Everywhere,
+                schema,
+            )
+        };
+        assert_eq!(schema_registration_conflict(&[set(None), set(None)]), None);
+        assert_eq!(
+            schema_registration_conflict(&[set(Some("a")), set(Some("a"))]),
+            None
+        );
+        let err = schema_registration_conflict(&[set(None), set(Some("billing"))]).unwrap();
+        assert!(
+            err.contains("no schema") && err.contains("schema `billing`"),
+            "{err}"
+        );
+    }
+
+    /// Boot wraps a set as `SchemaMigrations(DisambiguatedMigrations(set))`.
+    /// The substitute version of a collision must survive the wrapper.
+    #[test]
+    fn a_schema_set_keeps_its_substitute_versions() {
+        let first = MigrationSource::<diesel::pg::Pg>::migrations(&FRAMEWORK_MIGRATIONS)
+            .unwrap()
+            .remove(0)
+            .name()
+            .to_string();
+        let renamed = HashMap::from([(first.clone(), "99990101000000".to_owned())]);
+        let set = SchemaMigrations::new(
+            DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &renamed),
+            Some("marketing"),
+        );
+        let migrations = MigrationSource::<diesel::pg::Pg>::migrations(&set).unwrap();
+        assert_eq!(migrations[0].name().version().to_string(), "99990101000000");
     }
 
     #[test]

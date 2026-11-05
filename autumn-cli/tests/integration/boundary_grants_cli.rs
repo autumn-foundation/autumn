@@ -1,14 +1,18 @@
 //! `autumn db grants` and the doctor role check on a real database (#3550).
 //!
-//! **Requires Docker.** Postgres gets three tables in two schemas and two
+//! **Requires Docker.** Postgres 16 gets three tables in two schemas and two
 //! boundary roles. The test prints and applies the grants, connects as each
 //! role, and runs `autumn doctor --strict`. A stray grant makes doctor fail.
-//! Applying the grants again removes it.
+//! Applying the grants again removes it. A grant to `PUBLIC` stays, and
+//! doctor still finds it.
 
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// The marketing role is `mkt`, not `marketing`. The default `search_path`
+/// of a role starts with `"$user"`, so a role named like its schema finds a
+/// bare table name with no grant help.
 const BOUNDARIES: &str = r#"
 [boundaries.core]
 owns = ["contacts", "deals"]
@@ -17,7 +21,7 @@ role = "core"
 [boundaries.marketing]
 owns = ["campaigns"]
 schema = "marketing"
-role = "marketing"
+role = "mkt"
 may_read = ["contacts"]
 "#;
 
@@ -29,7 +33,7 @@ user = "core"
 password = "core-pw"
 
 [database.roles.marketing]
-user = "marketing"
+user = "mkt"
 "#;
 
 fn autumn(dir: &Path, args: &[&str], url: &str) -> Output {
@@ -37,10 +41,7 @@ fn autumn(dir: &Path, args: &[&str], url: &str) -> Output {
         .args(args)
         .current_dir(dir)
         .env("AUTUMN_DATABASE__URL", url)
-        .env(
-            "AUTUMN_DATABASE__ROLES__MARKETING__PASSWORD",
-            "marketing-pw",
-        )
+        .env("AUTUMN_DATABASE__ROLES__MARKETING__PASSWORD", "mkt-pw")
         .env_remove("AUTUMN_ENV")
         .env_remove("AUTUMN_PROFILE")
         .output()
@@ -71,8 +72,11 @@ async fn start_postgres() -> (
     String,
     String,
 ) {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
+    // Postgres 15 changed the privileges of the `public` schema.
     let container = testcontainers_modules::postgres::Postgres::default()
+        .with_tag("16-alpine")
         .start()
         .await
         .expect("start Postgres — is Docker running?");
@@ -124,6 +128,15 @@ fn doctor_roles(dir: &Path, url: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no database_roles check: {json}"))
 }
 
+fn detail(check: &serde_json::Value) -> &str {
+    check["detail"].as_str().expect("detail")
+}
+
+fn apply(root: &Path, url: &str) {
+    let output = autumn(root, &["db", "grants", "--apply"], url);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers); run with -- --ignored"]
 async fn grants_are_generated_applied_and_checked_by_doctor() {
@@ -132,7 +145,7 @@ async fn grants_are_generated_applied_and_checked_by_doctor() {
     owner
         .batch_execute(
             "CREATE ROLE core LOGIN PASSWORD 'core-pw';
-             CREATE ROLE marketing LOGIN PASSWORD 'marketing-pw';
+             CREATE ROLE mkt LOGIN PASSWORD 'mkt-pw';
              CREATE TABLE contacts (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL);
              CREATE TABLE deals (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);
              CREATE SCHEMA marketing;
@@ -148,15 +161,15 @@ async fn grants_are_generated_applied_and_checked_by_doctor() {
     assert!(output.status.success(), "{}", text(&output.stderr));
     let sql = text(&output.stdout);
     for line in [
-        r#"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "marketing"."campaigns" TO "marketing";"#,
-        r#"GRANT SELECT ON TABLE "public"."contacts" TO "marketing";"#,
+        r#"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "marketing"."campaigns" TO "mkt";"#,
+        r#"GRANT SELECT ON TABLE "public"."contacts" TO "mkt";"#,
         r#"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "public"."contacts", "public"."deals" TO "core";"#,
-        r#"ALTER ROLE "marketing" SET search_path = "marketing", "public";"#,
+        r#"ALTER ROLE "mkt" SET search_path = "marketing", "public";"#,
     ] {
         assert!(sql.contains(line), "missing {line}\n{sql}");
     }
-    let marketing_url = format!("postgres://marketing:marketing-pw@{addr}/postgres");
-    let before = connect(&marketing_url).await;
+    let mkt_url = format!("postgres://mkt:mkt-pw@{addr}/postgres");
+    let before = connect(&mkt_url).await;
     assert_eq!(
         read(&before, "marketing.campaigns").await.as_deref(),
         Some("42501")
@@ -168,18 +181,15 @@ async fn grants_are_generated_applied_and_checked_by_doctor() {
     assert!(output.status.success(), "{}", text(&output.stderr));
     assert!(text(&output.stderr).contains("Applied the grants of 2 role(s)"));
 
-    // Each role reads its grant and is denied the rest.
-    let marketing = connect(&marketing_url).await;
-    assert_eq!(read(&marketing, "campaigns").await, None, "search_path");
-    assert_eq!(read(&marketing, "public.contacts").await, None, "may_read");
-    assert_eq!(
-        read(&marketing, "public.deals").await.as_deref(),
-        Some("42501")
-    );
-    marketing
-        .batch_execute("INSERT INTO marketing.campaigns (name) VALUES ('fall')")
+    // Each role reads its grant and is denied the rest. The bare name
+    // resolves only through the `search_path` of the grants.
+    let mkt = connect(&mkt_url).await;
+    assert_eq!(read(&mkt, "campaigns").await, None, "search_path");
+    assert_eq!(read(&mkt, "public.contacts").await, None, "may_read");
+    assert_eq!(read(&mkt, "public.deals").await.as_deref(), Some("42501"));
+    mkt.batch_execute("INSERT INTO campaigns (name) VALUES ('fall')")
         .await
-        .expect("marketing writes its own table and sequence");
+        .expect("mkt writes its own table and sequence");
     let core = connect(&format!("postgres://core:core-pw@{addr}/postgres")).await;
     assert_eq!(read(&core, "public.deals").await, None);
     assert_eq!(
@@ -190,40 +200,62 @@ async fn grants_are_generated_applied_and_checked_by_doctor() {
     // Doctor: the negative check passes for each role.
     let check = doctor_roles(root, &url);
     assert_eq!(check["status"], "pass", "{check}");
-    let detail = check["detail"].as_str().expect("detail");
-    assert!(
-        detail
-            .contains("marketing: 2 of 2 granted table(s) readable; 1 of 1 other table(s) denied"),
-        "{detail}"
-    );
-    assert!(
-        detail.contains("core: 2 of 2 granted table(s) readable; 1 of 1 other table(s) denied"),
-        "{detail}"
-    );
+    for line in [
+        "marketing: 2 of 2 granted table(s) readable; 1 of 1 other table(s) denied",
+        "core: 2 of 2 granted table(s) readable; 1 of 1 other table(s) denied",
+    ] {
+        assert!(detail(&check).contains(line), "{check}");
+    }
 
-    // A grant outside the config: doctor fails and names it.
+    // A grant outside the config: doctor fails and names it. An apply
+    // removes it.
     owner
-        .batch_execute("GRANT SELECT ON deals TO marketing")
+        .batch_execute("GRANT SELECT ON deals TO mkt")
         .await
         .expect("stray grant");
     let check = doctor_roles(root, &url);
     assert_eq!(check["status"], "fail", "{check}");
     assert!(
-        check["detail"]
-            .as_str()
-            .expect("detail")
-            .contains("marketing: reads 1 table(s) outside its grant: public.deals"),
+        detail(&check)
+            .contains("marketing: reads or changes 1 table(s) outside its grant: public.deals"),
         "{check}"
     );
-
-    // Apply again: the REVOKE removes it.
-    let output = autumn(root, &["db", "grants", "--apply"], &url);
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    assert_eq!(
-        read(&marketing, "public.deals").await.as_deref(),
-        Some("42501")
-    );
+    apply(root, &url);
+    assert_eq!(read(&mkt, "public.deals").await.as_deref(), Some("42501"));
     assert_eq!(doctor_roles(root, &url)["status"], "pass");
+
+    // A write privilege only, and a write on a `may_read` table.
+    owner
+        .batch_execute("GRANT INSERT ON deals TO mkt; GRANT UPDATE ON contacts TO mkt")
+        .await
+        .expect("stray write grants");
+    let check = doctor_roles(root, &url);
+    assert_eq!(check["status"], "fail", "{check}");
+    assert!(
+        detail(&check).contains("reads or changes 1 table(s) outside its grant: public.deals"),
+        "{check}"
+    );
+    assert!(
+        detail(&check).contains("writes 1 `may_read` table(s): public.contacts"),
+        "{check}"
+    );
+    apply(root, &url);
+    assert_eq!(doctor_roles(root, &url)["status"], "pass");
+
+    // A grant to PUBLIC: the REVOKE of a role cannot remove it. Doctor still
+    // finds it after an apply.
+    owner
+        .batch_execute("GRANT SELECT ON deals TO PUBLIC")
+        .await
+        .expect("PUBLIC grant");
+    apply(root, &url);
+    let check = doctor_roles(root, &url);
+    assert_eq!(check["status"], "fail", "{check}");
+    assert!(
+        detail(&check)
+            .contains("marketing: reads or changes 1 table(s) outside its grant: public.deals"),
+        "{check}"
+    );
 }
 
 #[tokio::test]
@@ -239,8 +271,28 @@ async fn apply_refuses_a_missing_role() {
     let output = autumn(dir.path(), &["db", "grants", "--apply"], &url);
     assert!(!output.status.success());
     let stderr = text(&output.stderr);
-    assert!(stderr.contains("has no role core, marketing"), "{stderr}");
+    assert!(stderr.contains("has no role core, mkt"), "{stderr}");
     assert!(stderr.contains(r#"CREATE ROLE "core" LOGIN"#), "{stderr}");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn apply_refuses_a_role_that_owns_tables() {
+    let (_container, url, _) = start_postgres().await;
+    connect(&url)
+        .await
+        .batch_execute(
+            "CREATE ROLE core LOGIN; CREATE ROLE mkt LOGIN;
+             CREATE TABLE contacts (id BIGSERIAL PRIMARY KEY);
+             ALTER TABLE contacts OWNER TO core;",
+        )
+        .await
+        .expect("schema");
+    let dir = project();
+    let output = autumn(dir.path(), &["db", "grants", "--apply"], &url);
+    assert!(!output.status.success());
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("`core` is the owner of tables"), "{stderr}");
 }
 
 #[test]

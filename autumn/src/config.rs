@@ -107,11 +107,7 @@
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_POOL_SIZE` | `database.shards[i].primary_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_POOL_SIZE` | `database.shards[i].replica_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_FALLBACK` | `database.shards[i].replica_fallback` | `fail_readiness` / `primary` |
-//! | `AUTUMN_DATABASE__ROLES` | `database.roles` | comma-separated boundary names (declares roles) |
-//! | `AUTUMN_DATABASE__ROLES__{NAME}__URL` | `database.roles.<name>.url` | `String` |
-//! | `AUTUMN_DATABASE__ROLES__{NAME}__USER` | `database.roles.<name>.user` | `String` |
-//! | `AUTUMN_DATABASE__ROLES__{NAME}__PASSWORD` | `database.roles.<name>.password` | `String` (secret) |
-//! | `AUTUMN_DATABASE__ROLES__{NAME}__POOL_SIZE` | `database.roles.<name>.pool_size` | `usize` |
+//! | `AUTUMN_DATABASE__ROLES` | `database.roles` | comma-separated boundary names; each has `__<NAME>__URL`, `__USER`, `__PASSWORD`, `__POOL_SIZE` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_TELEMETRY__ENABLED` | `telemetry.enabled` | `bool` |

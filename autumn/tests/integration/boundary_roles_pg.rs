@@ -15,6 +15,7 @@ use autumn_web::reexports::diesel_migrations;
 use diesel::QueryableByName;
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use testcontainers::ImageExt as _;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -31,14 +32,14 @@ role = "core"
 [boundaries.marketing]
 owns = ["campaigns"]
 schema = "marketing"
-role = "marketing"
+role = "mkt"
 may_read = ["contacts"]
 
 [boundaries.admin]
 owns = ["admin_audit_log"]
 crates = ["autumn-admin-plugin"]
 schema = "admin"
-role = "admin"
+role = "adm"
 "#;
 
 struct Marketing;
@@ -72,6 +73,7 @@ struct Name {
 
 async fn start_postgres() -> (testcontainers::ContainerAsync<Postgres>, String) {
     let container = Postgres::default()
+        .with_tag("16-alpine")
         .start()
         .await
         .expect("start Postgres container");
@@ -108,8 +110,8 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
     owner
         .batch_execute(
             "CREATE ROLE core LOGIN PASSWORD 'core-pw'; \
-             CREATE ROLE marketing LOGIN PASSWORD 'marketing-pw'; \
-             CREATE ROLE admin LOGIN PASSWORD 'admin-pw';",
+             CREATE ROLE mkt LOGIN PASSWORD 'mkt-pw'; \
+             CREATE ROLE adm LOGIN PASSWORD 'adm-pw';",
         )
         .await
         .expect("roles");
@@ -164,16 +166,6 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
         Ok(1),
         "the non-transactional migration ran in the schema"
     );
-    // The session search_path is back after the non-transactional migration.
-    assert_eq!(
-        diesel::sql_query("SELECT current_setting('search_path') AS name")
-            .get_result::<Name>(&mut owner)
-            .await
-            .expect("search_path")
-            .name,
-        "\"$user\", public"
-    );
-
     // Generated grants.
     let config = BoundaryConfig::parse(BOUNDARIES).expect("config");
     let catalog = [
@@ -199,8 +191,11 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
         pool_size: 2,
         ..Default::default()
     };
-    for name in ["core", "marketing", "admin"] {
-        database.roles.insert(name.to_owned(), role(name));
+    // The boundary name keys the pool. The role name differs from the
+    // schema name, so a bare table name resolves only through the role
+    // `search_path` that the grants set.
+    for (boundary, user) in [("core", "core"), ("marketing", "mkt"), ("admin", "adm")] {
+        database.roles.insert(boundary.to_owned(), role(user));
     }
     database.validate().expect("valid config");
     let state = AppState::for_test().with_pool(

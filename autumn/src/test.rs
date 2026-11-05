@@ -2384,6 +2384,15 @@ impl TestApp {
 
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
         // and HTTP Client resilience can read the test-supplied config.
+        // `[database.roles]` in the test config: build its role pools, so a
+        // `BoundaryDb` connects as the role, as in production (#3550).
+        #[cfg(feature = "db")]
+        if !self.config.database.roles.is_empty() {
+            state.insert_extension(
+                crate::db::create_role_pools(&self.config.database)
+                    .expect("test role pools should build from config"),
+            );
+        }
         state.insert_extension(self.config.clone());
         // A sim kill stops the app's background tasks through this (#3067).
         state.insert_extension(crate::sim::AppTasks::default());

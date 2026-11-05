@@ -28,7 +28,7 @@ const INSUFFICIENT_PRIVILEGE: &str = "42501";
 /// The tables of the catalog, with the sequences they own. System schemas
 /// and the members of an extension are left out: no boundary owns them.
 const TABLES_SQL: &str = "\
-SELECT n.nspname::text, c.relname::text
+SELECT n.nspname::text, c.relname::text, c.relkind IN ('v', 'm')
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
@@ -41,7 +41,8 @@ WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
   )
 ORDER BY 1, 2";
 
-/// The sequences that a table owns (`serial` and identity columns).
+/// The sequences that a table uses: owned ones (`serial` and identity
+/// columns), and the ones a column default calls with `nextval`.
 const SEQUENCES_SQL: &str = "\
 SELECT tn.nspname::text, t.relname::text, sn.nspname::text, s.relname::text
 FROM pg_depend d
@@ -52,6 +53,15 @@ JOIN pg_namespace tn ON tn.oid = t.relnamespace
 WHERE d.classid = 'pg_class'::regclass
   AND d.refclassid = 'pg_class'::regclass
   AND d.deptype IN ('a', 'i')
+UNION
+SELECT tn.nspname::text, t.relname::text, sn.nspname::text, s.relname::text
+FROM pg_attrdef ad
+JOIN pg_depend d ON d.classid = 'pg_attrdef'::regclass AND d.objid = ad.oid
+JOIN pg_class s ON s.oid = d.refobjid AND s.relkind = 'S'
+JOIN pg_namespace sn ON sn.oid = s.relnamespace
+JOIN pg_class t ON t.oid = ad.adrelid
+JOIN pg_namespace tn ON tn.oid = t.relnamespace
+WHERE d.refclassid = 'pg_class'::regclass
 ORDER BY 1, 2, 3, 4";
 
 /// The arguments of `autumn db grants`.
@@ -92,9 +102,9 @@ fn run_inner(args: &GrantsArgs) -> Result<(), String> {
         let catalog = read_catalog(&client).await?;
         let plan = grants::plan(&config, &catalog).map_err(|e| e.to_string())?;
         if args.apply {
-            let missing = missing_roles(&client, &plan).await?;
-            if !missing.is_empty() {
-                return Err(missing_roles_message(&missing));
+            let roles = role_facts(&client, &plan).await?;
+            if let Some(message) = refuse_roles(&plan, &roles) {
+                return Err(message);
             }
             if let Some(sql) = plan.sql() {
                 client
@@ -180,6 +190,7 @@ pub async fn read_catalog(client: &tokio_postgres::Client) -> Result<Vec<Catalog
                 CatalogTable {
                     table,
                     sequences: Vec::new(),
+                    view: row.get::<_, bool>(2),
                 },
             )
         })
@@ -200,21 +211,82 @@ pub async fn read_catalog(client: &tokio_postgres::Client) -> Result<Vec<Catalog
     Ok(tables.into_values().collect())
 }
 
-/// The roles of `plan` that the database does not have.
-async fn missing_roles(
+/// What the database knows about a role of the plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleFacts {
+    /// The role name.
+    pub name: String,
+    /// A superuser passes every privilege check.
+    pub superuser: bool,
+    /// The role is the one that runs this command.
+    pub current: bool,
+    /// The role owns a table, so it is the owner of a schema, not a boundary.
+    pub owns_tables: bool,
+}
+
+async fn role_facts(
     client: &tokio_postgres::Client,
     plan: &GrantPlan,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<RoleFacts>, String> {
     let names: Vec<String> = plan.roles.iter().map(|r| r.role.clone()).collect();
     let rows = client
         .query(
-            "SELECT rolname::text FROM pg_roles WHERE rolname = ANY($1)",
+            "SELECT r.rolname::text, r.rolsuper, r.rolname = current_user, \
+             EXISTS (SELECT 1 FROM pg_class c WHERE c.relowner = r.oid \
+             AND c.relkind IN ('r', 'p', 'v', 'm', 'f')) \
+             FROM pg_roles r WHERE r.rolname = ANY($1)",
             &[&names],
         )
         .await
         .map_err(|e| format!("cannot read the roles: {}", db_error(&e)))?;
-    let present: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
-    Ok(names.into_iter().filter(|n| !present.contains(n)).collect())
+    Ok(rows
+        .iter()
+        .map(|r| RoleFacts {
+            name: r.get(0),
+            superuser: r.get(1),
+            current: r.get(2),
+            owns_tables: r.get(3),
+        })
+        .collect())
+}
+
+/// Why `--apply` must not run, or `None`.
+///
+/// A role that does not exist cannot get a grant. A superuser, the role that
+/// runs the command, or a role that owns tables is not a boundary role: the
+/// `REVOKE` would take the rights of the owner, or have no effect.
+#[must_use]
+pub fn refuse_roles(plan: &GrantPlan, facts: &[RoleFacts]) -> Option<String> {
+    let missing: Vec<String> = plan
+        .roles
+        .iter()
+        .filter(|r| !facts.iter().any(|f| f.name == r.role))
+        .map(|r| r.role.clone())
+        .collect();
+    if !missing.is_empty() {
+        return Some(missing_roles_message(&missing));
+    }
+    let unsafe_roles: Vec<String> = facts
+        .iter()
+        .filter_map(|f| {
+            let why = if f.superuser {
+                "a superuser"
+            } else if f.current {
+                "the role that runs this command"
+            } else if f.owns_tables {
+                "the owner of tables"
+            } else {
+                return None;
+            };
+            Some(format!("`{}` is {why}", f.name))
+        })
+        .collect();
+    (!unsafe_roles.is_empty()).then(|| {
+        format!(
+            "a boundary role must be a role of its own: {}. Make a new role for the boundary",
+            unsafe_roles.join("; ")
+        )
+    })
 }
 
 /// The error for roles that the database does not have.
@@ -279,9 +351,12 @@ pub fn role_urls(
 /// What one table access gave.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Access {
-    /// The `SELECT` ran.
+    /// The role can read the table.
     Allowed,
-    /// The database refused it with `permission denied`.
+    /// The role cannot read the table, but it has another privilege on it,
+    /// for example `INSERT`.
+    Writable,
+    /// The database refused the read, and the role has no privilege on it.
     Denied,
     /// Another error, with its message.
     Error(String),
@@ -298,8 +373,29 @@ pub struct RoleProbe {
     pub connected_as: Result<String, String>,
     /// Each table the role may read, and what a read gave.
     pub allowed: Vec<(QualifiedName, Access)>,
-    /// Each table outside the grant, and what a read gave.
+    /// Each table outside the grant, and what a check gave.
     pub denied: Vec<(QualifiedName, Access)>,
+    /// The `may_read` tables that the role can also write.
+    pub writes_read_only: Vec<QualifiedName>,
+    /// The schemas in which the role can create objects.
+    pub creates_in: Vec<String>,
+    /// Other roles that this role is a member of.
+    pub member_of: Vec<String>,
+}
+
+impl Default for RoleProbe {
+    fn default() -> Self {
+        Self {
+            boundary: String::new(),
+            role: String::new(),
+            connected_as: Err("not connected".to_owned()),
+            allowed: Vec::new(),
+            denied: Vec::new(),
+            writes_read_only: Vec::new(),
+            creates_in: Vec::new(),
+            member_of: Vec::new(),
+        }
+    }
 }
 
 impl RoleProbe {
@@ -310,52 +406,104 @@ impl RoleProbe {
             boundary: grants.boundary.clone(),
             role: grants.role.clone(),
             connected_as: Err(why),
-            allowed: Vec::new(),
-            denied: Vec::new(),
+            ..Self::default()
         }
     }
 
-    /// The tables outside the grant that the role could read.
+    /// The tables outside the grant that the role can read or change.
     #[must_use]
     pub fn leaks(&self) -> Vec<&QualifiedName> {
         self.denied
             .iter()
-            .filter(|(_, a)| *a == Access::Allowed)
+            .filter(|(_, a)| matches!(a, Access::Allowed | Access::Writable))
             .map(|(t, _)| t)
             .collect()
     }
 }
 
-/// Connect as one role and try to read each table: its own tables and
-/// exceptions must open, every other table must give `permission denied`.
+/// The time limits of the check connection. A table lock of a running
+/// migration must not stop doctor.
+const PROBE_LIMITS_SQL: &str = "SET statement_timeout = '5s'; SET lock_timeout = '2s'";
+
+/// The privileges that a table outside the grant must not have.
+const ANY_TABLE_PRIVILEGE: &str = "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER";
+
+/// The privileges that a `may_read` table must not have.
+const WRITE_PRIVILEGE: &str = "INSERT, UPDATE, DELETE, TRUNCATE";
+
+/// Connect as one role and check each table: its own tables and exceptions
+/// must open, and every other table must give `permission denied`.
 ///
-/// Each read is `SELECT 1 FROM <table> LIMIT 0`. It reads no row, but
-/// Postgres checks the privilege first.
-pub async fn probe_role(url: &str, grants: &RoleGrants) -> RoleProbe {
+/// A read is `SELECT 1 FROM <table> LIMIT 0`. It reads no row, but Postgres
+/// checks the privilege first. `has_table_privilege` then finds a write
+/// privilege outside the grant, and on a `may_read` table. It counts grants
+/// to `PUBLIC` and through role membership. The probe also lists the
+/// `schemas` in which the role can create objects, and the roles it is a
+/// member of.
+pub async fn probe_role(url: &str, grants: &RoleGrants, schemas: &[String]) -> RoleProbe {
     let client = match connect(url).await {
         Ok(client) => client,
         Err(why) => return RoleProbe::unreachable(grants, why),
     };
-    let connected_as = client
-        .query_one("SELECT current_user::text", &[])
-        .await
-        .map(|row| row.get::<_, String>(0))
-        .map_err(|e| db_error(&e));
-    let mut allowed = Vec::new();
-    for table in grants.own.iter().chain(&grants.read).chain(&grants.write) {
-        allowed.push((table.clone(), read(&client, table).await));
-    }
-    let mut denied = Vec::new();
-    for table in &grants.denied {
-        denied.push((table.clone(), read(&client, table).await));
-    }
-    RoleProbe {
+    let connected_as = match client.batch_execute(PROBE_LIMITS_SQL).await {
+        Err(e) => Err(db_error(&e)),
+        Ok(()) => client
+            .query_one("SELECT current_user::text", &[])
+            .await
+            .map(|row| row.get::<_, String>(0))
+            .map_err(|e| db_error(&e)),
+    };
+    let mut probe = RoleProbe {
         boundary: grants.boundary.clone(),
         role: grants.role.clone(),
         connected_as,
-        allowed,
-        denied,
+        ..RoleProbe::default()
+    };
+    for table in grants.own.iter().chain(&grants.read).chain(&grants.write) {
+        probe
+            .allowed
+            .push((table.clone(), read(&client, table).await));
     }
+    for table in &grants.read {
+        if has_privilege(&client, table, WRITE_PRIVILEGE).await == Some(true) {
+            probe.writes_read_only.push(table.clone());
+        }
+    }
+    for table in &grants.denied {
+        let access = match read(&client, table).await {
+            Access::Denied
+                if has_privilege(&client, table, ANY_TABLE_PRIVILEGE).await == Some(true) =>
+            {
+                Access::Writable
+            }
+            other => other,
+        };
+        probe.denied.push((table.clone(), access));
+    }
+    for schema in schemas {
+        let creates = client
+            .query_one(
+                "SELECT has_schema_privilege(current_user, $1, 'CREATE')",
+                &[schema],
+            )
+            .await
+            .is_ok_and(|row| row.get::<_, bool>(0));
+        if creates {
+            probe.creates_in.push(schema.clone());
+        }
+    }
+    if let Ok(rows) = client
+        .query(
+            "SELECT r.rolname::text FROM pg_roles r \
+             WHERE r.rolname <> current_user AND r.rolname NOT LIKE 'pg\\_%' \
+             AND pg_has_role(current_user, r.oid, 'MEMBER') ORDER BY 1",
+            &[],
+        )
+        .await
+    {
+        probe.member_of = rows.iter().map(|r| r.get(0)).collect();
+    }
+    probe
 }
 
 async fn read(client: &tokio_postgres::Client, table: &QualifiedName) -> Access {
@@ -370,6 +518,22 @@ async fn read(client: &tokio_postgres::Client, table: &QualifiedName) -> Access 
         }
         Err(e) => Access::Error(db_error(&e)),
     }
+}
+
+/// Whether the role has any of `privileges` on `table`. `None` on an error.
+async fn has_privilege(
+    client: &tokio_postgres::Client,
+    table: &QualifiedName,
+    privileges: &str,
+) -> Option<bool> {
+    client
+        .query_one(
+            "SELECT has_table_privilege(current_user, $1::text::regclass, $2)",
+            &[&table.quoted(), &privileges],
+        )
+        .await
+        .ok()
+        .map(|row| row.get(0))
 }
 
 #[cfg(test)]
@@ -422,6 +586,57 @@ url = "postgres://billing@h/app"
         assert!(err.contains("[database.roles]"), "{err}");
     }
 
+    fn facts(name: &str) -> RoleFacts {
+        RoleFacts {
+            name: name.into(),
+            superuser: false,
+            current: false,
+            owns_tables: false,
+        }
+    }
+
+    fn plan_for(roles: &[&str]) -> GrantPlan {
+        GrantPlan {
+            roles: roles
+                .iter()
+                .map(|r| RoleGrants {
+                    boundary: (*r).into(),
+                    role: (*r).into(),
+                    ..RoleGrants::default()
+                })
+                .collect(),
+            ..GrantPlan::default()
+        }
+    }
+
+    #[test]
+    fn apply_refuses_missing_and_unsafe_roles() {
+        let plan = plan_for(&["core", "marketing"]);
+        assert_eq!(
+            refuse_roles(&plan, &[facts("core"), facts("marketing")]),
+            None
+        );
+        let missing = refuse_roles(&plan, &[facts("core")]).unwrap();
+        assert!(missing.contains("no role marketing"), "{missing}");
+        for (field, why) in [
+            ("superuser", "a superuser"),
+            ("current", "the role that runs this command"),
+            ("owns_tables", "the owner of tables"),
+        ] {
+            let mut f = facts("marketing");
+            match field {
+                "superuser" => f.superuser = true,
+                "current" => f.current = true,
+                _ => f.owns_tables = true,
+            }
+            let message = refuse_roles(&plan, &[facts("core"), f]).unwrap();
+            assert!(
+                message.contains(&format!("`marketing` is {why}")),
+                "{message}"
+            );
+        }
+    }
+
     #[test]
     fn missing_roles_message_shows_the_create_statement() {
         let message = missing_roles_message(&["marketing".to_owned()]);
@@ -438,13 +653,20 @@ url = "postgres://billing@h/app"
             boundary: "m".into(),
             role: "m".into(),
             connected_as: Ok("m".into()),
-            allowed: Vec::new(),
             denied: vec![
                 (QualifiedName::new("public", "a"), Access::Denied),
                 (QualifiedName::new("public", "b"), Access::Allowed),
                 (QualifiedName::new("public", "c"), Access::Error("x".into())),
+                (QualifiedName::new("public", "d"), Access::Writable),
             ],
+            ..RoleProbe::default()
         };
-        assert_eq!(probe.leaks(), [&QualifiedName::new("public", "b")]);
+        assert_eq!(
+            probe.leaks(),
+            [
+                &QualifiedName::new("public", "b"),
+                &QualifiedName::new("public", "d")
+            ]
+        );
     }
 }

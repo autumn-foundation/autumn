@@ -125,19 +125,28 @@ fn with_user(
         return Err(not_url());
     }
     let mut url = url::Url::parse(primary).map_err(|_| not_url())?;
+    // A `user` or `password` in the query wins over the user part of the
+    // URL, so the role would connect as the owner. Remove them.
+    let query: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| !matches!(k.as_ref(), "user" | "password" | "passfile"))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if query.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut().clear().extend_pairs(query);
+    }
     url.set_username(user).map_err(|()| not_url())?;
     let password = password.map(secrecy::ExposeSecret::expose_secret);
     url.set_password(password).map_err(|()| not_url())?;
     Ok(url.to_string())
 }
 
-/// The env var prefix of one role: `AUTUMN_DATABASE__ROLES__<NAME>__`.
+/// A role name as it appears in an env var: upper case, with `-` as `_`.
 #[must_use]
-pub fn env_prefix(name: &str) -> String {
-    format!(
-        "AUTUMN_DATABASE__ROLES__{}__",
-        name.to_ascii_uppercase().replace('-', "_")
-    )
+pub fn env_name(name: &str) -> String {
+    name.to_ascii_uppercase().replace('-', "_")
 }
 
 /// Apply the env overrides of `[database.roles]`.
@@ -152,29 +161,26 @@ pub fn apply_env_overrides(roles: &mut BTreeMap<String, DatabaseRoleConfig>, env
             roles.entry(name.to_owned()).or_default();
         }
     }
+    let read = |key: &str| env.var(key).ok().map(|v| v.trim().to_owned());
     for (name, role) in roles.iter_mut() {
-        let prefix = env_prefix(name);
-        let var = |field: &str| {
-            env.var(&format!("{prefix}{field}"))
-                .ok()
-                .map(|v| v.trim().to_owned())
-        };
-        if let Some(v) = var("URL") {
+        let upper = env_name(name);
+        if let Some(v) = read(&format!("AUTUMN_DATABASE__ROLES__{upper}__URL")) {
             role.url = (!v.is_empty()).then_some(v);
         }
-        if let Some(v) = var("USER") {
+        if let Some(v) = read(&format!("AUTUMN_DATABASE__ROLES__{upper}__USER")) {
             role.user = (!v.is_empty()).then_some(v);
         }
-        if let Some(v) = var("PASSWORD") {
+        if let Some(v) = read(&format!("AUTUMN_DATABASE__ROLES__{upper}__PASSWORD")) {
             role.password = (!v.is_empty()).then(|| secrecy::SecretString::from(v));
         }
-        if let Some(v) = var("POOL_SIZE") {
+        let pool_key = format!("AUTUMN_DATABASE__ROLES__{upper}__POOL_SIZE");
+        if let Some(v) = read(&pool_key) {
             if v.is_empty() {
                 role.pool_size = None;
             } else if let Ok(size) = v.parse() {
                 role.pool_size = Some(size);
             } else {
-                eprintln!("Warning: {prefix}POOL_SIZE={v:?} is not valid, ignoring");
+                eprintln!("Warning: {pool_key}={v:?} is not valid, ignoring");
             }
         }
     }
@@ -199,8 +205,16 @@ pub fn validate(
     roles: &BTreeMap<String, DatabaseRoleConfig>,
     primary: Option<&str>,
 ) -> Result<(), String> {
+    let mut env_names: BTreeMap<String, &str> = BTreeMap::new();
     for (name, role) in roles {
         let key = format!("database.roles.{name}");
+        if let Some(other) = env_names.insert(env_name(name), name) {
+            return Err(format!(
+                "{key}: `{other}` and `{name}` have one env name, \
+                 AUTUMN_DATABASE__ROLES__{}__*; rename one",
+                env_name(name)
+            ));
+        }
         if name.is_empty()
             || !name
                 .chars()
@@ -326,6 +340,23 @@ mod tests {
         assert_eq!(
             r.effective_url(Some(PRIMARY)).unwrap(),
             "postgres://marketing@db.internal:5432/app?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn user_drops_the_credentials_in_the_query() {
+        let r = role("user = \"marketing\"\npassword = \"pw\"");
+        assert_eq!(
+            r.effective_url(Some(
+                "postgres://db/app?user=owner&sslmode=require&password=opw&passfile=/x"
+            ))
+            .unwrap(),
+            "postgres://marketing:pw@db/app?sslmode=require"
+        );
+        assert_eq!(
+            r.effective_url(Some("postgres://db/app?user=owner"))
+                .unwrap(),
+            "postgres://marketing:pw@db/app"
         );
     }
 
@@ -468,6 +499,15 @@ mod tests {
     }
 
     #[test]
+    fn two_names_with_one_env_name_are_an_error() {
+        let mut roles = BTreeMap::new();
+        roles.insert("ad-sync".to_owned(), role(r#"user = "a""#));
+        roles.insert("ad_sync".to_owned(), role(r#"user = "b""#));
+        let err = validate(&roles, Some(PRIMARY)).unwrap_err();
+        assert!(err.contains("AUTUMN_DATABASE__ROLES__AD_SYNC__"), "{err}");
+    }
+
+    #[test]
     fn validate_does_not_print_the_password() {
         let mut roles = BTreeMap::new();
         roles.insert("m".to_owned(), role("url = \"mysql://m:topsecret@h/app\""));
@@ -528,6 +568,34 @@ mod tests {
             // No fallback to the owner pool.
             assert_eq!(size(state.pool_for::<Billing>()), None);
             assert_eq!(size(state.pool_for::<Billing>()), None);
+        }
+
+        #[test]
+        fn a_url_role_needs_no_primary_url() {
+            let mut database = crate::config::DatabaseConfig {
+                connect_timeout_secs: 1,
+                ..Default::default()
+            };
+            database.roles.insert(
+                "marketing".into(),
+                role(&format!(
+                    "url = \"{}\"\npool_size = 3",
+                    crate::test_urls::unreachable("db-roles-url")
+                )),
+            );
+            database.validate().unwrap();
+            let state = AppState::for_test();
+            state.insert_extension(crate::db::create_role_pools(&database).unwrap());
+            assert_eq!(size(state.pool_for::<Marketing>()), Some(3));
+        }
+
+        #[test]
+        fn role_pools_are_reported_to_the_extractor() {
+            use crate::db::DbState as _;
+            let state = AppState::for_test();
+            assert!(!state.boundary_roles_configured());
+            state.insert_extension(crate::db::create_role_pools(&database()).unwrap());
+            assert!(state.boundary_roles_configured());
         }
 
         #[test]

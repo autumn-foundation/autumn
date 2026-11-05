@@ -55,8 +55,13 @@ impl fmt::Display for QualifiedName {
 pub struct CatalogTable {
     /// The table.
     pub table: QualifiedName,
-    /// The sequences that the table owns (`serial` and identity columns).
+    /// The sequences that the table uses: `serial` and identity columns,
+    /// and `nextval` defaults.
     pub sequences: Vec<QualifiedName>,
+    /// A view or a materialized view. A view runs with the rights of its
+    /// owner, so a schema does not give a boundary its views. Only an `owns`
+    /// pattern does.
+    pub view: bool,
 }
 
 impl CatalogTable {
@@ -66,7 +71,15 @@ impl CatalogTable {
         Self {
             table: QualifiedName::new(schema, name),
             sequences: Vec::new(),
+            view: false,
         }
+    }
+
+    /// Mark the table as a view.
+    #[must_use]
+    pub const fn as_view(mut self) -> Self {
+        self.view = true;
+        self
     }
 
     /// Add an owned sequence in the schema of the table.
@@ -161,7 +174,7 @@ pub fn plan(config: &BoundaryConfig, catalog: &[CatalogTable]) -> Result<GrantPl
     tables.dedup_by(|a, b| a.table == b.table);
     let owners = tables
         .iter()
-        .map(|t| owner(config, &t.table))
+        .map(|t| owner(config, t))
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut roles = Vec::new();
@@ -207,16 +220,9 @@ pub fn plan(config: &BoundaryConfig, catalog: &[CatalogTable]) -> Result<GrantPl
         roles.push(grants);
     }
 
-    let schemas: BTreeSet<String> = tables
-        .iter()
-        .map(|t| t.table.schema.clone())
-        .chain(
-            config
-                .boundaries
-                .values()
-                .map(|b| b.schema_name().to_owned()),
-        )
-        .collect();
+    // Only schemas that exist: a REVOKE on a missing schema stops the whole
+    // transaction.
+    let schemas: BTreeSet<String> = tables.iter().map(|t| t.table.schema.clone()).collect();
     Ok(GrantPlan {
         roles,
         schemas: schemas.into_iter().collect(),
@@ -228,15 +234,17 @@ pub fn plan(config: &BoundaryConfig, catalog: &[CatalogTable]) -> Result<GrantPl
 ///
 /// An `owns` pattern with no `.` matches a table name in the schema of its
 /// boundary. A pattern with a `.` matches `schema.table`. The most specific
-/// pattern wins. When no pattern matches, a table in a schema other than
-/// `public` belongs to the one boundary with that schema.
+/// pattern wins. When no pattern matches, a table (not a view) in a schema
+/// other than `public` belongs to the one boundary with that schema. Schema
+/// names match without case.
 fn owner<'a>(
     config: &'a BoundaryConfig,
-    table: &QualifiedName,
+    entry: &CatalogTable,
 ) -> Result<Option<&'a str>, BoundaryError> {
+    let table = &entry.table;
     let mut candidates = Vec::new();
     for (name, boundary) in &config.boundaries {
-        let in_schema = boundary.schema_name() == table.schema;
+        let in_schema = boundary.schema_name().eq_ignore_ascii_case(&table.schema);
         for pattern in &boundary.owns {
             let hit = if pattern.contains('.') {
                 exception_matches(pattern, table)
@@ -255,13 +263,18 @@ fn owner<'a>(
     if let Some(found) = pick("table", &table.to_string(), &candidates)? {
         return Ok(Some(found));
     }
-    if table.schema == super::boundaries::DEFAULT_SCHEMA {
+    if entry.view
+        || table
+            .schema
+            .eq_ignore_ascii_case(super::boundaries::DEFAULT_SCHEMA)
+    {
         return Ok(None);
     }
-    let mut in_schema = config
-        .boundaries
-        .iter()
-        .filter(|(_, b)| b.schema.as_deref() == Some(table.schema.as_str()));
+    let mut in_schema = config.boundaries.iter().filter(|(_, b)| {
+        b.schema
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(&table.schema))
+    });
     Ok(match (in_schema.next(), in_schema.next()) {
         (Some((name, _)), None) => Some(name.as_str()),
         _ => None,
@@ -298,38 +311,40 @@ impl GrantPlan {
         );
         for g in &self.roles {
             let role = quote_ident(&g.role);
-            let _ = writeln!(
-                out,
-                "\n-- Boundary `{}`: role {role}, schema {}.",
-                comment_text(&g.boundary),
+            let comment = format!(
+                "-- Boundary `{}`: role {role}, schema {}.",
+                g.boundary,
                 quote_ident(&g.schema)
             );
-            let _ = writeln!(
-                out,
-                "REVOKE ALL ON ALL TABLES IN SCHEMA {schemas} FROM {role};"
-            );
-            let _ = writeln!(
-                out,
-                "REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schemas} FROM {role};"
-            );
-            let _ = writeln!(out, "REVOKE ALL ON SCHEMA {schemas} FROM {role};");
+            let _ = writeln!(out, "\n{}", comment_text(&comment));
+            if !self.schemas.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "REVOKE ALL ON ALL TABLES IN SCHEMA {schemas} FROM {role};"
+                );
+                let _ = writeln!(
+                    out,
+                    "REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schemas} FROM {role};"
+                );
+                let _ = writeln!(out, "REVOKE ALL ON SCHEMA {schemas} FROM {role};");
+            }
             // Every schema that holds a granted table or sequence. A
             // qualified `owns` pattern can name a table outside `g.schema`.
-            let usage: BTreeSet<&str> = std::iter::once(g.schema.as_str())
-                .chain(
-                    g.own
-                        .iter()
-                        .chain(&g.read)
-                        .chain(&g.write)
-                        .chain(&g.sequences)
-                        .map(|t| t.schema.as_str()),
-                )
+            let usage: BTreeSet<&str> = g
+                .own
+                .iter()
+                .chain(&g.read)
+                .chain(&g.write)
+                .chain(&g.sequences)
+                .map(|t| t.schema.as_str())
                 .collect();
-            let _ = writeln!(
-                out,
-                "GRANT USAGE ON SCHEMA {} TO {role};",
-                join(usage.into_iter().map(quote_ident))
-            );
+            if !usage.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "GRANT USAGE ON SCHEMA {} TO {role};",
+                    join(usage.into_iter().map(quote_ident))
+                );
+            }
             for (privileges, tables) in [(DML, &g.own), ("SELECT", &g.read), (DML, &g.write)] {
                 if !tables.is_empty() {
                     let _ = writeln!(
@@ -368,9 +383,12 @@ fn join(items: impl Iterator<Item = String>) -> String {
     items.collect::<Vec<_>>().join(", ")
 }
 
-/// A name that is safe in a `--` comment: no line breaks.
-fn comment_text(name: &str) -> String {
-    name.replace(['\n', '\r'], " ")
+/// A line that is safe as a `--` comment: no line breaks or other control
+/// characters, which would end the comment.
+fn comment_text(line: &str) -> String {
+    line.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Quote a Postgres identifier: `"name"`, with each `"` doubled.
@@ -626,6 +644,41 @@ role = "marketing"
     }
 
     #[test]
+    fn a_view_is_owned_only_through_a_pattern() {
+        let mut tables = catalog();
+        tables.push(CatalogTable::new("marketing", "deal_stats").as_view());
+        tables.push(CatalogTable::new("marketing", "attribution_report").as_view());
+        let plan = plan(&config(CONFIG), &tables).unwrap();
+        let marketing = role(&plan, "marketing");
+        assert!(names(&marketing.denied).contains(&"marketing.deal_stats".to_owned()));
+        assert!(names(&marketing.own).contains(&"marketing.attribution_report".to_owned()));
+    }
+
+    #[test]
+    fn only_schemas_with_tables_are_revoked_or_granted() {
+        // `marketing` has no table yet: no statement names it.
+        let tables = [CatalogTable::new("public", "contacts")];
+        let sql = plan(&config(CONFIG), &tables).unwrap().sql().unwrap();
+        assert!(!sql.contains(r#"SCHEMA "marketing""#), "{sql}");
+        assert!(
+            sql.contains(r#"REVOKE ALL ON SCHEMA "public" FROM "marketing";"#),
+            "{sql}"
+        );
+        // The search_path still names it; a missing schema there is no error.
+        assert!(
+            sql.contains(r#"SET search_path = "marketing", "public";"#),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn schema_names_match_without_case() {
+        let text = CONFIG.replace(r#"schema = "marketing""#, r#"schema = "Marketing""#);
+        let plan = plan(&config(&text), &catalog()).unwrap();
+        assert!(names(&role(&plan, "marketing").own).contains(&"marketing.drafts".to_owned()));
+    }
+
+    #[test]
     fn identifiers_are_quoted() {
         assert_eq!(quote_ident(r#"we"ird"#), r#""we""ird""#);
         let text = r#"
@@ -634,10 +687,21 @@ owns = ["t"]
 schema = "s\"; DROP TABLE t; --"
 role = "r\""
 "#;
-        let plan = plan(&config(text), &[]).unwrap();
+        let plan = plan(
+            &config(text),
+            &[CatalogTable::new("s\"; DROP TABLE t; --", "t")],
+        )
+        .unwrap();
         let sql = plan.sql().unwrap();
         assert!(sql.contains(r#"FROM "r""";"#), "{sql}");
         assert!(sql.contains(r#""s""; DROP TABLE t; --""#), "{sql}");
+        // A boundary name with a line break stays in its comment.
+        let text = "[boundaries.\"x\\nDROP TABLE t;\"]\nowns = [\"t\"]\nrole = \"r\"\n";
+        let sql = plan(&config(text), &[CatalogTable::new("public", "t")])
+            .unwrap()
+            .sql()
+            .unwrap();
+        assert!(!sql.lines().any(|l| l.starts_with("DROP")), "{sql}");
     }
 
     #[test]

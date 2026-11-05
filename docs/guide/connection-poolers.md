@@ -84,6 +84,8 @@ its own role. The pooler keeps one server pool for each database and user.
   roles of one database together.
 * The grants set the `search_path` of each role with `ALTER ROLE`. It holds
   in transaction mode.
+* `ALTER ROLE ... SET` changes new sessions only. Apply the grants before the
+  app starts, or recycle the pools (PgBouncer `RECONNECT`).
 * Run `autumn db grants --apply` with the direct URL, after `autumn migrate`.
 
 ## Related

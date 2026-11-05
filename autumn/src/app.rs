@@ -8275,6 +8275,11 @@ impl AppBuilder {
             }
         }
 
+        if let Some(conflict) = crate::migrate::schema_registration_conflict(&migrations) {
+            eprintln!("autumn migrate: {conflict}");
+            std::process::exit(1);
+        }
+
         // Computed once, on the FINAL registered set (after the fold above),
         // so a version collision resolves automatically instead of one
         // migration silently never applying — see
@@ -8315,6 +8320,15 @@ impl AppBuilder {
                 #[cfg(not(feature = "sqlite"))]
                 let is_sqlite_control = false;
                 if is_sqlite_control {
+                    // SQLite has no schemas. Refuse before anything writes.
+                    #[cfg(feature = "sqlite")]
+                    if let Some(schema) = control_sets(&migrations).find_map(|(_, s)| s) {
+                        eprintln!(
+                            "autumn migrate: a migration set targets the Postgres schema \
+                             `{schema}`, but the database is SQLite, which has no schemas"
+                        );
+                        std::process::exit(1);
+                    }
                     // A migration this database already ran under a version the
                     // map now gives a substitute keeps its record, moved to that
                     // substitute, rather than running twice (same as the CLI's
@@ -8328,14 +8342,6 @@ impl AppBuilder {
                         eprintln!(
                             "autumn migrate: could not move an already-applied migration's \
                              version record (target control): {error}"
-                        );
-                        std::process::exit(1);
-                    }
-                    #[cfg(feature = "sqlite")]
-                    if let Some(schema) = control_sets(&migrations).find_map(|(_, s)| s) {
-                        eprintln!(
-                            "autumn migrate: a migration set targets the Postgres schema \
-                             `{schema}`, but the database is SQLite, which has no schemas"
                         );
                         std::process::exit(1);
                     }
@@ -15243,6 +15249,10 @@ async fn run_startup_migrations(
         ));
     #[cfg(feature = "sqlite")]
     let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
+    if let Some(conflict) = crate::migrate::schema_registration_conflict(&migrations) {
+        tracing::error!("{conflict}");
+        std::process::exit(1);
+    }
     let migration_result = crate::time::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (#1614, PR3): apply the
         // registered migrations to a `sqlite://` control target with no advisory
@@ -15256,6 +15266,16 @@ async fn run_startup_migrations(
             && crate::config::DatabaseBackend::detect(url)
                 == Some(crate::config::DatabaseBackend::Sqlite)
         {
+            // SQLite has no schemas. Refuse before anything writes.
+            if let Some(schema) = control_sets(&migrations).find_map(|(_, schema)| schema) {
+                tracing::error!(
+                    schema,
+                    target = "control",
+                    "A migration set targets a Postgres schema, but the database is SQLite. \
+                     SQLite has no schemas. Register the set with `migrations` instead."
+                );
+                std::process::exit(1);
+            }
             // Only when this boot applies (the same decision `auto_migrate_sqlite`
             // makes): a migration this database already ran under a version the
             // map now gives a substitute keeps its record, moved to that
@@ -15272,15 +15292,6 @@ async fn run_startup_migrations(
                     error = %error,
                     target = "control",
                     "Could not move an already-applied migration's version record"
-                );
-                std::process::exit(1);
-            }
-            if let Some(schema) = control_sets(&migrations).find_map(|(_, schema)| schema) {
-                tracing::error!(
-                    schema,
-                    target = "control",
-                    "A migration set targets a Postgres schema, but the database is SQLite. \
-                     SQLite has no schemas. Register the set with `migrations` instead."
                 );
                 std::process::exit(1);
             }
@@ -17727,7 +17738,7 @@ fn build_state(
     // One pool per `[database.roles.<boundary>]` (#3550). With no roles, no
     // extension: `pool_for` then gives the primary pool.
     #[cfg(feature = "db")]
-    if !config.database.roles.is_empty() && state.pool.is_some() {
+    if !config.database.roles.is_empty() {
         match crate::db::create_role_pools(&config.database) {
             Ok(pools) => state.insert_extension(pools),
             Err(error) => {

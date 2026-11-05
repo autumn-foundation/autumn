@@ -12,8 +12,8 @@ ERROR:  permission denied for table deals
 ```
 
 When a boundary works with its own role, a later move to its own database is
-a URL change. Each read that it still needs from another boundary is already
-an API call, because the database refused the SQL.
+a URL change. Each read that it still needs from another boundary is an API
+call or a `may_read` grant, because the database refused all other SQL.
 
 This is opt-in. An app with no `role` and no `[database.roles]` keeps one role
 and one schema.
@@ -42,11 +42,17 @@ may_read = ["contacts"]
 | `schema` | The Postgres schema of the owned tables. When unset, `public`. |
 | `role` | The Postgres role of the boundary. Only a boundary with a `role` gets grants. |
 
-An `owns` pattern matches a table in the schema of its boundary. A pattern
-with a `.` (`marketing.campaigns`) matches one schema and table. A table in a
-schema that only one boundary has, and that no pattern matches, belongs to
-that boundary. An exception pattern (`may_read`, `may_write`) with no `.`
-matches the table name in every schema.
+* An `owns` pattern matches a table in the schema of its boundary. A pattern
+  with a `.` (`marketing.campaigns`) matches one schema and table.
+* A table (not a view) in a schema other than `public`, that no pattern
+  matches, belongs to the one boundary with that schema.
+* A view belongs to a boundary only through an `owns` pattern. A view runs
+  with the rights of its owner, so it can read tables outside the grant. Give
+  such a view `security_invoker = true` (Postgres 15 and later).
+* An exception pattern (`may_read`, `may_write`) with no `.` matches the
+  table name in every schema, also in the schema of another boundary. Write
+  `public.contacts` to match one table.
+* Schema names match without case.
 
 ## 2. Put the tables in the schema
 
@@ -67,13 +73,21 @@ const MARKETING: EmbeddedMigrations = embed_migrations!("migrations-marketing");
 autumn_web::app()
     .migrations(MIGRATIONS)
     .migrations_in_schema("marketing", MARKETING)
-    .plugin_migrations_in_schema("autumn-admin-plugin", "admin", autumn_admin_plugin::MIGRATIONS)
+    .plugin_migrations_in_schema("my-plugin", "admin", my_plugin::MIGRATIONS)
     .run()
     .await;
 ```
 
 `plugin_migrations_in_schema` puts the tables of a plugin into the schema of
 the boundary that owns them. The plugin SQL does not change.
+
+* Use it for a plugin that does not register its own migrations. When a
+  plugin registers the same set with `plugin_migrations`, the boot stops: one
+  migration is then registered with a schema and without one.
+* The plugin code must find its tables. Run it as the boundary role, or put
+  the schema on the `search_path` of the owner role too.
+* The role that runs the migrations needs `CREATE` on the database. Postgres
+  checks it before `IF NOT EXISTS`, also when the schema exists.
 
 * `autumn migrate` runs `migrations/` only. It does not see an embedded set.
   Run the embedded sets with `AUTUMN_MIGRATE=1`, or at boot.
@@ -101,8 +115,14 @@ writes `src/schema.rs`. The width gate (`autumn schema width`) reads a
 qualified block too.
 
 Some framework features write raw SQL with the bare table name. The grants
-put the schema first on the `search_path` of the role, so these features
-find the table when they run as that role.
+put the schema first on the `search_path` of the boundary role, so these
+features find the table when they run as that role. On the primary pool (a
+repository, for example) the owner `search_path` applies, and a bare
+`campaigns` in `marketing` is not found. Set it on the owner role too:
+
+```sql
+ALTER ROLE app_owner SET search_path = "$user", public, marketing;
+```
 
 ## 4. Connect as the role
 
@@ -129,7 +149,10 @@ pool_size = 4
 | `pool_size` | The pool size. When unset, `database.pool_size`. |
 
 Set `url` or `user`, not both. The name after `roles.` is the boundary name.
-It matches `[a-z0-9_-]`.
+It matches `[a-z0-9_-]`. With `user`, a `user`, `password` or `passfile` in
+the query of `database.url` is removed, so the role does not connect as the
+owner. `user` needs `database.url`: a URL that a pool provider finds at boot
+is not used. Set `url` then.
 
 Each key has an env var: `AUTUMN_DATABASE__ROLES__<NAME>__URL`, `__USER`,
 `__PASSWORD` and `__POOL_SIZE`. `<NAME>` is the name in upper case, with `-`
@@ -166,7 +189,7 @@ async fn campaigns(mut db: autumn_web::db::BoundaryDb<Marketing>) -> AutumnResul
 
 Each role pool opens its own connections. The boot log adds them to
 `total_max_connections`, and `database.max_connections_warn_threshold`
-counts them.
+counts them. `TestApp` builds the role pools of its config too.
 
 ## 5. Generate the grants
 
@@ -196,7 +219,10 @@ COMMIT;
   its `may_read` tables (read only). So a grant that the config does not have
   goes away.
 * A sequence of an own or `may_write` table gets `USAGE, SELECT`, so an
-  insert can use it.
+  insert can use it. This includes a sequence that a column default calls
+  with `nextval`.
+* A schema with no table gets no statement. A `REVOKE` on a missing schema
+  would stop the transaction.
 * The `owns` globs resolve against the live tables, with the same rules as
   the graph check. Plugin tables come from `cargo metadata`.
 
@@ -209,6 +235,9 @@ autumn db grants --apply
 
 `--apply` stops when a role does not exist, and prints the `CREATE ROLE`
 statement. The command does not make roles, because a role has a password.
+It also stops when a role is a superuser, is the role that runs the command,
+or owns tables. A `REVOKE` on such a role takes the rights of the owner, or
+has no effect.
 `--json` prints the plan per role. `--config` names another
 `boundaries.toml`. `--profile` selects the database URL.
 
@@ -219,12 +248,20 @@ cannot read it.
 ## 6. Check it with doctor
 
 `autumn doctor --strict` (or `--online`) connects as each role. It tries
-`SELECT 1 FROM <table> LIMIT 0` on each table:
+`SELECT 1 FROM <table> LIMIT 0` on each table, and reads
+`has_table_privilege` for the other rights:
 
 * Each table of the grant must open.
-* Each other table must give `permission denied`. This is the negative
-  check. It finds a grant that `REVOKE` cannot remove, for example a grant to
-  `PUBLIC` or through role membership.
+* Each other table must give `permission denied`, and the role must have no
+  other right on it (`INSERT`, `UPDATE`, ...). This is the negative check. It
+  finds a grant that `REVOKE` cannot remove, for example a grant to `PUBLIC`
+  or through role membership.
+* A `may_read` table must not be writable.
+* The role should not create objects in a schema, and should not be a member
+  of another role.
+
+Each check connection has `statement_timeout = 5s` and `lock_timeout = 2s`,
+so a migration that locks a table does not stop doctor.
 
 ```text
 ✓ database_roles
@@ -234,8 +271,8 @@ cannot read it.
 
 | Result | Why |
 |--------|-----|
-| Fail | A role reads a table outside its grant. Doctor names the table. |
-| Warn | A role cannot connect, connects as another role, cannot read a table of its grant, or a table cannot be checked. |
+| Fail | A role reads or changes a table outside its grant, or writes a `may_read` table. Doctor names the table. |
+| Warn | A role cannot connect, connects as another role, cannot read a table of its grant, can create objects in a schema, is a member of another role, or a table cannot be checked. |
 | Pass | Every role reads its grant and nothing else. |
 
 Without `--strict` or `--online`, doctor does not connect, and does not run
@@ -253,6 +290,9 @@ of database and user. So each boundary gets its own server pool.
 * **Transaction mode.** A `SET search_path` at connect does not hold. The
   grants use `ALTER ROLE ... SET search_path`. Postgres applies it when the
   server connection starts, so it holds in every pooler mode.
+* **Open connections.** `ALTER ROLE ... SET` changes new sessions only. Apply
+  the grants before the app starts, or recycle the pools (PgBouncer
+  `RECONNECT`).
 * **RDS Proxy, Supavisor, Neon.** Each role needs its own credentials in the
   pooler. RDS Proxy reads each one from Secrets Manager.
 * **Migrations and grants.** Run `autumn migrate` and `autumn db grants
@@ -262,11 +302,13 @@ of database and user. So each boundary gets its own server pool.
 ## Limits
 
 * Postgres only. SQLite has no schemas or roles.
-* `ALTER ROLE ... SET search_path` needs a superuser, or `CREATEROLE` with
-  admin rights on the role (Postgres 16 and later). The role that made the
-  boundary roles has them.
+* `ALTER ROLE ... SET search_path` needs a superuser or `CREATEROLE`. From
+  Postgres 16, the role also needs `ADMIN OPTION` on each boundary role. The
+  role that made the boundary roles has it.
 * `REVOKE` removes only grants of the owner. A grant from another role, or
   to `PUBLIC`, stays. The doctor check finds it.
+* Before Postgres 15, `PUBLIC` can create objects in schema `public`. Doctor
+  warns. Remove it once: `REVOKE CREATE ON SCHEMA public FROM PUBLIC;`.
 * A repository uses the primary pool. Use `BoundaryDb` or `pool_for` for the
   queries of a boundary.
 

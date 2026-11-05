@@ -94,6 +94,15 @@ impl Boundary {
     }
 }
 
+/// Role names that Postgres reserves. `PUBLIC` means every role.
+const RESERVED_ROLES: &[&str] = &[
+    "public",
+    "none",
+    "current_user",
+    "session_user",
+    "current_role",
+];
+
 /// The schema of a boundary that sets no `schema`.
 pub const DEFAULT_SCHEMA: &str = "public";
 
@@ -112,11 +121,22 @@ impl BoundaryConfig {
                 return Err(BoundaryError::Empty(name.clone()));
             }
             for (key, value) in [("schema", &boundary.schema), ("role", &boundary.role)] {
-                if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                let Some(value) = value.as_deref() else {
+                    continue;
+                };
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
                     return Err(BoundaryError::Parse(format!(
-                        "boundary `{name}` has an empty `{key}`"
+                        "boundary `{name}` has an empty `{key}`, or one with a control character"
                     )));
                 }
+            }
+            if let Some(role) = boundary.role.as_deref()
+                && (RESERVED_ROLES.contains(&role.to_ascii_lowercase().as_str())
+                    || role.to_ascii_lowercase().starts_with("pg_"))
+            {
+                return Err(BoundaryError::Parse(format!(
+                    "boundary `{name}` names the reserved role `{role}`; use a role of its own"
+                )));
             }
         }
         Ok(config)
