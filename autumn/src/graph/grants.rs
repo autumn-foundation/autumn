@@ -222,7 +222,11 @@ pub fn plan(config: &BoundaryConfig, catalog: &[CatalogTable]) -> Result<GrantPl
 
     // Only schemas that exist: a REVOKE on a missing schema stops the whole
     // transaction.
-    let schemas: BTreeSet<String> = tables.iter().map(|t| t.table.schema.clone()).collect();
+    let schemas: BTreeSet<String> = tables
+        .iter()
+        .flat_map(|t| std::iter::once(&t.table).chain(&t.sequences))
+        .map(|name| name.schema.clone())
+        .collect();
     Ok(GrantPlan {
         roles,
         schemas: schemas.into_iter().collect(),
@@ -657,6 +661,20 @@ role = "marketing"
         let marketing = role(&plan, "marketing");
         assert!(names(&marketing.denied).contains(&"marketing.deal_stats".to_owned()));
         assert!(names(&marketing.own).contains(&"marketing.attribution_report".to_owned()));
+    }
+
+    #[test]
+    fn a_schema_with_sequences_only_is_revoked() {
+        let mut tables = catalog();
+        tables[0]
+            .sequences
+            .push(QualifiedName::new("shared", "contact_ids"));
+        let plan = plan(&config(CONFIG), &tables).unwrap();
+        assert!(
+            plan.schemas.contains(&"shared".to_owned()),
+            "{:?}",
+            plan.schemas
+        );
     }
 
     #[test]
