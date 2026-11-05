@@ -26,7 +26,9 @@ description: >
 # S3 settings. A composite action cannot read `secrets` or `vars`, so each
 # workflow that uses this action maps them into its env:
 #
-#   AUTUMN_KACHE_S3_BUCKET, _ENDPOINT, _REGION        repository variables
+#   AUTUMN_KACHE_S3_BUCKET, _ENDPOINT, _REGION        repository variables,
+#                                                      or secrets of the
+#                                                      same name
 #   AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID, _SECRET_KEY    a read-only token
 #   AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID, _SECRET_KEY   a read-write token,
 #                                                      mapped only when
@@ -92,6 +94,11 @@ runs:
           echo "save=$write" >> "$GITHUB_OUTPUT"
           echo "kache: S3 remote, writes $write (protected ref: $PROTECTED)"
         else
+          # Keys with no bucket is a setup error, not a fork PR. Say so in the
+          # run's annotations, or the fallback looks like a working cache.
+          if [ -z "$BUCKET" ] && [ -n "$READ_KEY" ]; then
+            echo "::warning title=kache S3 not used::AUTUMN_KACHE_S3_BUCKET is empty, but the S3 keys are set. Add AUTUMN_KACHE_S3_BUCKET (and _ENDPOINT for R2) as a repository variable or secret."
+          fi
           echo "s3=false" >> "$GITHUB_OUTPUT"
           echo "write=false" >> "$GITHUB_OUTPUT"
           echo "save=$SAVE" >> "$GITHUB_OUTPUT"
