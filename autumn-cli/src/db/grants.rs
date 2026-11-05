@@ -121,10 +121,10 @@ fn run_inner(args: &GrantsArgs) -> Result<(), String> {
     if args.json {
         let json = serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?;
         println!("{json}");
-    } else if let Some(sql) = plan.sql() {
-        if !args.apply {
-            print!("{sql}");
-        }
+    } else if !args.apply
+        && let Some(sql) = plan.sql()
+    {
+        print!("{sql}");
     }
     if args.apply {
         eprintln!(

@@ -11239,7 +11239,7 @@ pub fn run(opts: DoctorOptions) {
     // 21. The database role of each boundary (#3550). It connects to the
     //     database, so it runs with `--strict` or `--online` only.
     if boundaries_path.exists() && (opts.strict || opts.online) {
-        let primary = db_topology.primary_url.clone();
+        let primary = db_topology.primary_url;
         let roles = crate::db::grants::role_urls(
             Some(&merged_db_toml),
             db_denv.as_ref(),
