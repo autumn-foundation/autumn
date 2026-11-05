@@ -35,8 +35,9 @@ autumn_web::app()
 - The framework control-plane set always applies as `Control`.
 - The CLI reads the scope from the directory name: `migrations/`,
   `migrations-control/`, `migrations-shards/`. Embed each directory with its
-  scope. `autumn migrate` applies them to a `SQLite` database only. On
-  Postgres it stops: use `AUTUMN_MIGRATE=1`.
+  scope. `autumn migrate` applies them to a SQLite database only. On
+  Postgres it stops: use `AUTUMN_MIGRATE=1`. `autumn migrate down` reads
+  `migrations/` only, so it stops when a scope directory exists.
 
 See [SQLite fleet: migrations](sqlite-fleet.md#control-only-and-tenant-only-sets).
 

@@ -101,20 +101,21 @@ impl MigrationScope {
 /// One registered migration set: its label, the set, and its scope.
 pub(crate) type RegisteredMigrations = (&'static str, EmbeddedMigrations, MigrationScope);
 
-/// The scope a registered set applies with. The control-plane
-/// [`FRAMEWORK_MIGRATIONS`] set applies as [`MigrationScope::Control`] in
-/// every scope: a shard never gets the control-plane tables. Each other set
-/// keeps its registered scope.
+/// The scope a registered set has on the shards. The control-plane
+/// [`FRAMEWORK_MIGRATIONS`] set gives [`MigrationScope::Control`] in every
+/// registered scope: a shard never gets the control-plane tables. Each other
+/// set keeps its registered scope.
 ///
-/// Only the apply loops use this. A collision map reads the registered
-/// scope, so a substitute version that a shard already records does not
-/// change.
+/// The shard loops, the fleet and the framework-set fold use this. The
+/// control database reads the registered scope. A collision map also reads
+/// the registered scope, so a substitute version that a shard already
+/// records does not change.
 #[cfg(feature = "db")]
 pub(crate) fn applied_scope(
     set: &EmbeddedMigrations,
     registered: MigrationScope,
 ) -> MigrationScope {
-    if registered.reaches_control() && is_control_framework_set(set) {
+    if is_control_framework_set(set) {
         MigrationScope::Control
     } else {
         registered

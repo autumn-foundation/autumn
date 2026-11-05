@@ -3220,6 +3220,17 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
               || { echo "::error::no autumn fleet test ran (${log})"; exit 1; }
           done
+      - name: Run the autumn migrate suite under sqlite
+        # Issues #2058 and #3536. `autumn migrate` and `migrate down` against a
+        # temporary SQLite file, and the scope directories (`migrations-control/`,
+        # `migrations-shards/`). No Docker. The step checks the pass count,
+        # because a filter that matches nothing exits 0.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --test cli_tests migrate_sqlite | tee "${RUNNER_TEMP}/cli-migrate-sqlite-it.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/cli-migrate-sqlite-it.log" \
+            || { echo "::error::no autumn migrate sqlite test ran"; exit 1; }
       - name: Clippy autumn-search under the sqlite backend
         # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
         # does not have, so the crate did not compile under the flip. It now

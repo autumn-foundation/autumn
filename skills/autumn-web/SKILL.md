@@ -347,7 +347,7 @@ error. See `docs/guide/getting-started.md` "Tuning the Tokio runtime".
 | `.jobs(jobs![...])` | Register request-triggered `#[job]` work |
 | `.one_off_tasks(one_off_tasks![...])` | Register operational `#[task]` commands |
 | `.migrations(MIGRATIONS)` | Register embedded Diesel migrations |
-| `.migrations_for(MigrationScope::Control \| Shards, MIGRATIONS)` | Register a set for the control database only, or for the shards and fleet files only. With no shard and no fleet, the one database gets every scope. Embed `migrations-control/` as `Control` and `migrations-shards/` as `Shards`: the CLI reads the scope from the directory name (SQLite only; Postgres: `AUTUMN_MIGRATE=1`) |
+| `.migrations_for(MigrationScope::Control \| Shards, MIGRATIONS)` | Register a set for the control database only, or for the shards and fleet files only. With no shard and no fleet, the one database gets every scope. Embed `migrations-control/` as `Control`. Embed `migrations-shards/` as `Shards`. The CLI reads the scope from the directory name. On Postgres, use `AUTUMN_MIGRATE=1` |
 | `.plugin_migrations_for(name, MigrationScope, MIGRATIONS)` | A plugin's set, scoped as `.migrations_for` |
 | `.plugin_migrations(name, MIGRATIONS)` | Register a plugin's embedded Diesel migrations (named; version collisions with other sources auto-resolve) |
 | `.plugin(plugin)` / `.plugins((...))` | Install first- or third-party plugins |

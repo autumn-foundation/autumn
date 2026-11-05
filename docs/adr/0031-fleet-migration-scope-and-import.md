@@ -51,7 +51,7 @@ retained replica.
 
 - `autumn migrate` and `autumn fleet migrate` read `migrations/` and do not
   know a scope. The guide tells the app to keep a scoped set in its own
-  directory and to use `AUTUMN_MIGRATE=1`. ADR 0039 replaces this: the CLI
+  directory and to use `AUTUMN_MIGRATE=1`. [ADR 0039](0039-migration-scope-for-plugins-and-cli.md) replaces this: the CLI
   reads the scope from the directory name.
 - The registered list is `(label, set, scope)`. The label is still unused.
 - An import never replaces a file. To replace a database, delete it first.

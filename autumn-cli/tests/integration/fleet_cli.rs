@@ -374,8 +374,8 @@ mod sqlite {
         assert!(has_table(&path, "orders"));
         assert!(!has_table(&path, "tenants"), "a control set stays off");
 
-        // A database made later gets the same sets, and the check of
-        // unknown versions knows the shard directory.
+        // `fleet list --open` counts the shard directory, and a second
+        // migrate is clean: the check of unknown versions knows it.
         let (stdout, _) = run_ok(&app.dir, &["fleet", "list", "--open", "--json"]);
         assert!(stdout.contains("\"pending\":0"), "{stdout}");
         run_ok(&app.dir, &["fleet", "migrate"]);

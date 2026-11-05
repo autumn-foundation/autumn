@@ -292,9 +292,13 @@ pub fn run(
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
-    let base = migrations_base(&migrations_dir);
+    let only_database = control_is_only_database(
+        |key| autumn_web::config::Env::var(&env, key),
+        config_table.as_ref(),
+    );
     if *action == MigrateAction::Run
-        && let Err(message) = refuse_scope_dirs_on_postgres(&targets, base)
+        && let Err(message) =
+            refuse_scope_dirs_on_postgres(&targets, migrations_base(&migrations_dir), only_database)
     {
         eprintln!("\u{2717} {message}");
         std::process::exit(1);
@@ -320,10 +324,6 @@ pub fn run(
             let wait = resolve_startup_wait(wait_override, config_table.as_ref());
             // Same env as target resolution: the real env over the `.env` overlay.
             let lock_policy = resolve_migration_lock_policy_from_sources(
-                |key| autumn_web::config::Env::var(&env, key),
-                config_table.as_ref(),
-            );
-            let only_database = control_is_only_database(
                 |key| autumn_web::config::Env::var(&env, key),
                 config_table.as_ref(),
             );
@@ -587,12 +587,11 @@ where
         .and_then(|t| t.get("database"))
         .and_then(toml::Value::as_table)
         .is_some_and(|database| database.contains_key("fleet"));
-    let fleet_in_env = [
-        "AUTUMN_DATABASE__FLEET__MODE",
-        "AUTUMN_DATABASE__FLEET__ROOT",
-    ]
-    .iter()
-    .any(|key| env_var(key).is_ok());
+    // The config loader makes a fleet from the env only when both keys are
+    // set and the mode is valid.
+    let fleet_in_env = env_var("AUTUMN_DATABASE__FLEET__ROOT").is_ok()
+        && env_var("AUTUMN_DATABASE__FLEET__MODE")
+            .is_ok_and(|mode| mode.parse::<autumn_web::fleet_layout::FleetMode>().is_ok());
     !fleet_in_file
         && !fleet_in_env
         && resolve_shard_database_urls_from_sources(env_var, table).is_empty()
@@ -619,21 +618,50 @@ fn control_migration_dirs(base: &Path, only_database: bool) -> Vec<std::path::Pa
     dirs
 }
 
+/// The scope directories of `scopes` that exist under `base`, as
+/// `"<dir>/"`.
+fn existing_scope_dirs(
+    base: &Path,
+    scopes: impl IntoIterator<Item = autumn_web::migrate::MigrationScope>,
+) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for scope in scopes {
+        let dir = scope.directory();
+        let name = format!("{dir}/");
+        if base.join(dir).is_dir() && !found.contains(&name) {
+            found.push(name);
+        }
+    }
+    found
+}
+
 /// Stop before any apply when a Postgres target would miss a scope
 /// directory. The Postgres path reads `migrations/` only: its checksum
-/// check reads one directory.
-fn refuse_scope_dirs_on_postgres(targets: &[(String, String)], base: &Path) -> Result<(), String> {
+/// check reads one directory. A shard target takes `migrations-shards/`. The
+/// control target takes `migrations-control/`, and `migrations-shards/` with
+/// `only_database`.
+fn refuse_scope_dirs_on_postgres(
+    targets: &[(String, String)],
+    base: &Path,
+    only_database: bool,
+) -> Result<(), String> {
     use autumn_web::migrate::MigrationScope;
 
-    if targets.iter().all(|(_, url)| is_sqlite_target(url)) {
-        return Ok(());
+    let mut scopes = Vec::new();
+    for (label, url) in targets {
+        if is_sqlite_target(url) {
+            continue;
+        }
+        if label.starts_with("shard:") {
+            scopes.push(MigrationScope::Shards);
+        } else {
+            scopes.push(MigrationScope::Control);
+            if only_database {
+                scopes.push(MigrationScope::Shards);
+            }
+        }
     }
-    let found: Vec<String> = [MigrationScope::Control, MigrationScope::Shards]
-        .iter()
-        .map(|scope| scope.directory())
-        .filter(|dir| base.join(dir).is_dir())
-        .map(|dir| format!("{dir}/"))
-        .collect();
+    let found = existing_scope_dirs(base, scopes);
     if found.is_empty() {
         return Ok(());
     }
@@ -642,6 +670,39 @@ fn refuse_scope_dirs_on_postgres(targets: &[(String, String)], base: &Path) -> R
          with AUTUMN_MIGRATE=1 instead. It applies each registered set by its scope.",
         found.join(" or ")
     ))
+}
+
+/// Stop `autumn migrate down` when a scope directory exists. `down` reads
+/// `migrations/` only, so it cannot revert a migration of another
+/// directory.
+fn refuse_scope_dirs_for_down(base: &Path) -> Result<(), String> {
+    use autumn_web::migrate::MigrationScope;
+
+    let found = existing_scope_dirs(base, [MigrationScope::Control, MigrationScope::Shards]);
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "`autumn migrate down` reads {}/ only, and {} exists.\n  It cannot revert a \
+         migration of that directory. Revert it by hand.",
+        MigrationScope::Everywhere.directory(),
+        found.join(" and ")
+    ))
+}
+
+/// The directories `autumn migrate check` scans: `migrations/` and each
+/// scope directory that exists.
+fn safety_check_dirs(base: &Path) -> Vec<std::path::PathBuf> {
+    use autumn_web::migrate::MigrationScope;
+
+    let mut dirs = vec![base.join(MigrationScope::Everywhere.directory())];
+    for scope in [MigrationScope::Control, MigrationScope::Shards] {
+        let dir = base.join(scope.directory());
+        if dir.is_dir() {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Apply migrations to every target in order, failing fast with a
@@ -1046,21 +1107,30 @@ fn run_safety_check(migrations_dir: &str, profile: Option<&str>) {
     // honors `--profile`, reads no `.env`, and never exits, so `check` stays the
     // offline, URL-free preflight documented above.
     let backend = crate::generate::detect_backend_offline(Path::new("."), profile);
-    let reports = match check_migrations_in_dir_for(backend, Path::new(migrations_dir)) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("\u{2717} Migration safety check failed: {e}");
-            std::process::exit(1);
+    let dirs = safety_check_dirs(migrations_base(migrations_dir));
+    let mut reports = Vec::new();
+    for dir in &dirs {
+        match check_migrations_in_dir_for(backend, dir) {
+            Ok(r) => reports.extend(r),
+            Err(e) => {
+                eprintln!("\u{2717} Migration safety check failed: {e}");
+                std::process::exit(1);
+            }
         }
-    };
+    }
+    let scanned = dirs
+        .iter()
+        .map(|dir| format!("{}/", dir.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     if reports.is_empty() {
-        eprintln!("\u{2713} No migrations found in {migrations_dir}/");
+        eprintln!("\u{2713} No migrations found in {scanned}");
         return;
     }
 
     let total = reports.len();
-    eprintln!("  Scanning {total} migration(s) in {migrations_dir}/...\n");
+    eprintln!("  Scanning {total} migration(s) in {scanned}...\n");
 
     for report in &reports {
         print_findings("up.sql", &report.name, &report.up);
@@ -2684,6 +2754,10 @@ fn run_down(
     let (targets, _) = resolve_targets(target, profile, &env);
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
+    if let Err(message) = refuse_scope_dirs_for_down(migrations_base(&migrations_dir)) {
+        eprintln!("\u{2717} {message}");
+        std::process::exit(1);
+    }
 
     // Preflight EVERY target before mutating any of them: build and validate
     // each target's rollback plan (down.sql present, CONCURRENTLY opt-out) up
@@ -3879,13 +3953,100 @@ mod tests {
         let base = tmp.path();
         let postgres = [("control".to_owned(), "postgres://db/app".to_owned())];
         let sqlite = [("control".to_owned(), "sqlite://app.db".to_owned())];
-        refuse_scope_dirs_on_postgres(&postgres, base).expect("no scope directory");
+        refuse_scope_dirs_on_postgres(&postgres, base, true).expect("no scope directory");
 
         std::fs::create_dir(base.join("migrations-shards")).unwrap();
-        let err = refuse_scope_dirs_on_postgres(&postgres, base).unwrap_err();
+        let err = refuse_scope_dirs_on_postgres(&postgres, base, true).unwrap_err();
         assert!(err.contains("migrations-shards"), "{err}");
         assert!(err.contains("AUTUMN_MIGRATE=1"), "{err}");
-        refuse_scope_dirs_on_postgres(&sqlite, base).expect("SQLite applies them");
+        refuse_scope_dirs_on_postgres(&sqlite, base, true).expect("SQLite applies them");
+        refuse_scope_dirs_on_postgres(&postgres, base, false)
+            .expect("with shards, the control database never takes a Shards set");
+        let shard = [("shard:a".to_owned(), "postgres://db/a".to_owned())];
+        assert!(refuse_scope_dirs_on_postgres(&shard, base, false).is_err());
+
+        std::fs::create_dir(base.join("migrations-control")).unwrap();
+        let err = refuse_scope_dirs_on_postgres(&postgres, base, false).unwrap_err();
+        assert!(err.contains("migrations-control/"), "{err}");
+        assert!(!err.contains("migrations-shards/"), "{err}");
+    }
+
+    /// `down` reads `migrations/` only, so a scope directory stops it.
+    #[test]
+    fn down_refuses_a_scope_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir(base.join("migrations")).unwrap();
+        refuse_scope_dirs_for_down(base).expect("migrations/ only");
+        std::fs::create_dir(base.join("migrations-control")).unwrap();
+        let err = refuse_scope_dirs_for_down(base).unwrap_err();
+        assert!(err.contains("migrations-control/"), "{err}");
+        assert!(err.contains("by hand"), "{err}");
+    }
+
+    /// `check` scans every scope directory that exists.
+    #[test]
+    fn check_scans_every_scope_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let names = || -> Vec<String> {
+            safety_check_dirs(base)
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names(), ["migrations"]);
+        for dir in ["migrations-control", "migrations-shards"] {
+            std::fs::create_dir(base.join(dir)).unwrap();
+        }
+        assert_eq!(
+            names(),
+            ["migrations", "migrations-control", "migrations-shards"]
+        );
+    }
+
+    /// The CLI finds a fleet or a shard as the config loader does. An env
+    /// fleet needs both keys and a valid mode.
+    #[test]
+    fn control_is_only_database_reads_the_file_and_the_env() {
+        let no_env = |_: &str| Err(std::env::VarError::NotPresent);
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_owned())
+                    .ok_or(std::env::VarError::NotPresent)
+            }
+        };
+        assert!(control_is_only_database(no_env, None));
+
+        let fleet: toml::Table =
+            toml::from_str("[database.fleet]\nmode = \"tenant\"\nroot = \"f\"").unwrap();
+        assert!(!control_is_only_database(no_env, Some(&fleet)));
+        let shards: toml::Table =
+            toml::from_str("[[database.shards]]\nname = \"a\"\nprimary_url = \"postgres://db/a\"")
+                .unwrap();
+        assert!(!control_is_only_database(no_env, Some(&shards)));
+
+        assert!(!control_is_only_database(
+            env(&[
+                ("AUTUMN_DATABASE__FLEET__MODE", "slot"),
+                ("AUTUMN_DATABASE__FLEET__ROOT", "f")
+            ]),
+            None
+        ));
+        assert!(control_is_only_database(
+            env(&[("AUTUMN_DATABASE__FLEET__ROOT", "f")]),
+            None
+        ));
+        assert!(control_is_only_database(
+            env(&[
+                ("AUTUMN_DATABASE__FLEET__MODE", "bogus"),
+                ("AUTUMN_DATABASE__FLEET__ROOT", "f")
+            ]),
+            None
+        ));
     }
 
     // ── rollback planning ────────────────────────────────────────────────────

@@ -360,3 +360,25 @@ fn migrate_applies_every_scope_directory_to_the_only_database() {
     assert_eq!(code, Some(0), "second migrate failed: {err}");
     assert!(err.contains("already up to date"), "{err}");
 }
+
+/// `autumn migrate down` reads `migrations/` only. With a scope directory
+/// it stops before it reverts anything.
+#[test]
+fn migrate_down_refuses_a_scope_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_scoped_project(root);
+
+    let db_path = root.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(code, Some(0), "migrate failed: {err}");
+
+    let (_out, err, code) = run_autumn(root, &["migrate", "down"], &envs);
+    assert_eq!(code, Some(1), "down must stop: {err}");
+    assert!(err.contains("migrations-control/"), "{err}");
+    for table in ["posts", "tenants", "orders"] {
+        assert!(table_exists(&db_path, table), "nothing reverted: {table}");
+    }
+}

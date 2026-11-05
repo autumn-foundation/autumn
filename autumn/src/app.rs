@@ -3978,7 +3978,10 @@ impl AppBuilder {
     /// and no fleet, the one database gets every scope.
     ///
     /// The version-collision rules of [`Self::plugin_migrations`] apply to
-    /// each database separately.
+    /// each database separately. On one database, a `Control` set and a
+    /// `Shards` set share a collision map. When you add a fleet or a shard
+    /// later, the map of that database changes. Do not give two scopes the
+    /// same migration version.
     ///
     /// # Examples
     ///
@@ -16804,8 +16807,7 @@ mod fleet_boot_tests {
     }
 
     /// A `Shards` set reaches a fleet database made before the set existed
-    /// (on its next open) and a new one. It never reaches the control
-    /// database.
+    /// (on its next open) and a new one.
     #[tokio::test]
     async fn a_shard_set_reaches_new_and_opened_fleet_databases() {
         use crate::migrate::MigrationScope;
@@ -16836,12 +16838,6 @@ mod fleet_boot_tests {
         assert!(table_exists(&new, "scope_shard_rows").await);
         assert!(!table_exists(&new, "api_tokens").await);
         fleet.close_all().await;
-
-        let control = tmp.path().join("control.db");
-        assert!(
-            !control.exists() || !tables(&control).contains(&"scope_shard_rows".to_owned()),
-            "the fleet never writes the control database"
-        );
     }
 
     /// A custom pool provider must say which file its control pool opens
@@ -17155,6 +17151,45 @@ mod fleet_boot_tests {
         assert_eq!(migrate_fleet_or_exit(&config, Arc::clone(&all)).await, 0);
         config.database.fleet = None;
         assert_eq!(migrate_fleet_or_exit(&config, all).await, 0);
+    }
+
+    /// The `AUTUMN_MIGRATE=1` fleet pass applies a `Shards` set to each
+    /// database on disk and never a `Control` set, as boot does.
+    #[tokio::test]
+    async fn migrate_mode_applies_only_the_shard_sets_to_the_fleet() {
+        use crate::migrate::MigrationScope;
+        const CONTROL: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_control_migrations");
+        const SHARDS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, fleet, _state) = booted(tmp.path());
+        let keys: Vec<_> = ["acme", "globex"]
+            .iter()
+            .map(|tenant| fleet.key_for(tenant).unwrap())
+            .collect();
+        for key in &keys {
+            fleet.provision(key).await.unwrap();
+        }
+        fleet.close_all().await;
+
+        let all = Arc::new(vec![
+            (
+                "framework",
+                crate::migrate::FRAMEWORK_MIGRATIONS,
+                MigrationScope::Everywhere,
+            ),
+            ("app", CONTROL, MigrationScope::Control),
+            ("app", SHARDS, MigrationScope::Shards),
+        ]);
+        assert_eq!(migrate_fleet_or_exit(&config, all).await, keys.len());
+        for key in &keys {
+            let tables = tables(&fleet.path_of(key));
+            assert!(tables.contains(&"scope_shard_rows".to_owned()), "{key}");
+            assert!(!tables.contains(&"scope_control_rows".to_owned()), "{key}");
+            assert!(!tables.contains(&"api_tokens".to_owned()), "{key}");
+        }
     }
 }
 
@@ -20898,6 +20933,45 @@ mount = ["service"]
         }
     }
 
+    /// Boot and the `AUTUMN_MIGRATE=1` one-shot make one control decision:
+    /// both read [`control_is_only_database`], give it to the control
+    /// collision map, and give it to every control apply loop. A one-database
+    /// app then gets every scope on both paths, Postgres and `SQLite`.
+    #[test]
+    fn boot_and_the_one_shot_share_the_one_database_rule() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        for (start, end) in [
+            (
+                "async fn run_migrate_only_mode(self)",
+                "async fn run_one_off_task_mode(self, requested_name: String)",
+            ),
+            (
+                "async fn run_startup_migrations(",
+                "async fn check_shard_replica_migration_parity(",
+            ),
+        ] {
+            let from = source.find(start).expect(start);
+            let to = from + source[from..].find(end).expect(end);
+            let body = &source[from..to];
+            assert!(
+                body.contains("let only_database = control_is_only_database("),
+                "{start}: reads the one-database rule"
+            );
+            assert!(
+                body.contains("control_takes(only_database)"),
+                "{start}: the control collision map reads the rule"
+            );
+            let loops = body.matches("control_sets(").count();
+            assert!(loops > 0, "{start}: applies the control sets");
+            assert_eq!(
+                loops,
+                body.matches("control_sets(&migrations, only_database)")
+                    .count(),
+                "{start}: each control apply loop reads the rule"
+            );
+        }
+    }
+
     #[test]
     fn migrate_only_one_shot_applies_and_exits_without_serving() {
         // The runtime effect (applying against Postgres, exiting without binding a
@@ -21863,8 +21937,8 @@ mount = ["service"]
         assert_eq!(sets.len(), 1);
     }
 
-    /// The framework control set applies as `Control`, in each registered
-    /// scope that includes the control database. Other sets keep their scope.
+    /// The framework control set applies as `Control` in each registered
+    /// scope, so it never reaches a shard. Other sets keep their scope.
     #[cfg(feature = "db")]
     #[test]
     fn the_framework_set_applies_as_control() {
@@ -21885,6 +21959,14 @@ mount = ["service"]
                 MigrationScope::Control
             ),
             MigrationScope::Control
+        );
+        assert_eq!(
+            applied_scope(
+                &crate::migrate::FRAMEWORK_MIGRATIONS,
+                MigrationScope::Shards
+            ),
+            MigrationScope::Control,
+            "registered for the shards, the control-plane set still stays off them"
         );
         for scope in [
             MigrationScope::Everywhere,

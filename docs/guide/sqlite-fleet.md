@@ -343,10 +343,12 @@ With no `[database.fleet]` and no `[[database.shards]]`, the one database
 gets every scope, at boot and from `autumn migrate`. Thus a plugin can
 register `Control` or `Shards` and not check the topology.
 
-`autumn migrate` applies the scope directories to a `SQLite` database only.
-On a Postgres target it stops: run the app once with `AUTUMN_MIGRATE=1`.
-`autumn migrate down` reads `migrations/` only. Plugin sets are not on disk:
-`AUTUMN_MIGRATE=1` applies them.
+`autumn migrate` applies the scope directories to a SQLite database only.
+On a Postgres target that takes one, it stops: run the app once with
+`AUTUMN_MIGRATE=1`. `autumn migrate check` scans all three directories.
+`autumn migrate down` reads `migrations/` only, so it stops when a scope
+directory exists. Plugin sets are not on disk: `AUTUMN_MIGRATE=1` applies
+them.
 
 ## Opening and closing
 
