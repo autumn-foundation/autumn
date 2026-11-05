@@ -260,7 +260,9 @@ cannot read it.
   other right on it (`INSERT`, `UPDATE`, ...). This is the negative check. It
   finds a grant that `REVOKE` cannot remove, for example a grant to `PUBLIC`
   or through role membership.
-* A `may_read` table must not be writable.
+* A `may_read` table must have `SELECT` only. A `may_write` table must not
+  have `TRUNCATE`, `REFERENCES` or `TRIGGER`. A trigger on another
+  boundary's table can change that boundary's writes.
 * The role should not create objects in a schema, and should not be a member
   of another role.
 
@@ -275,7 +277,7 @@ so a migration that locks a table does not stop doctor.
 
 | Result | Why |
 |--------|-----|
-| Fail | A role reads or changes a table outside its grant, writes a `may_read` table, or is a member of `pg_read_all_data` / `pg_write_all_data`. Doctor names the table or role. |
+| Fail | A role reads or changes a table outside its grant, has a right on a `may_read` or `may_write` table that the grant does not give, or is a member of `pg_read_all_data` / `pg_write_all_data`. Doctor names the table or role. |
 | Warn | A role cannot connect, connects as another role, cannot read a table of its grant, can create objects in a schema, is a member of another role, or a table cannot be checked. |
 | Pass | Every role reads its grant and nothing else. |
 

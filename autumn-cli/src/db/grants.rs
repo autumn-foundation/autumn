@@ -384,8 +384,9 @@ pub struct RoleProbe {
     pub allowed: Vec<(QualifiedName, Access)>,
     /// Each table outside the grant, and what a check gave.
     pub denied: Vec<(QualifiedName, Access)>,
-    /// The `may_read` tables that the role can also write.
-    pub writes_read_only: Vec<QualifiedName>,
+    /// The `may_read` and `may_write` tables on which the role has a right
+    /// that the grant does not give, for example `TRIGGER`.
+    pub exceeds_grant: Vec<QualifiedName>,
     /// The schemas in which the role can create objects.
     pub creates_in: Vec<String>,
     /// Other roles that this role is a member of.
@@ -400,7 +401,7 @@ impl Default for RoleProbe {
             connected_as: Err("not connected".to_owned()),
             allowed: Vec::new(),
             denied: Vec::new(),
-            writes_read_only: Vec::new(),
+            exceeds_grant: Vec::new(),
             creates_in: Vec::new(),
             member_of: Vec::new(),
         }
@@ -437,21 +438,30 @@ const PROBE_LIMITS_SQL: &str = "SET statement_timeout = '5s'; SET lock_timeout =
 /// The privileges that a table outside the grant must not have.
 const ANY_TABLE_PRIVILEGE: &str = "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER";
 
-/// The privileges that a `may_read` table must not have.
-const WRITE_PRIVILEGE: &str = "INSERT, UPDATE, DELETE, TRUNCATE";
+/// The privileges that a `may_read` table must not have. The grant gives
+/// `SELECT` only.
+const NOT_READ_PRIVILEGE: &str = "INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER";
+
+/// The privileges that a `may_write` table must not have. The grant gives
+/// `SELECT, INSERT, UPDATE, DELETE` only.
+const NOT_WRITE_PRIVILEGE: &str = "TRUNCATE, REFERENCES, TRIGGER";
 
 /// The column privileges that a table outside the grant must not have.
 const ANY_COLUMN_PRIVILEGE: &str = "SELECT, INSERT, UPDATE, REFERENCES";
 
 /// The column privileges that a `may_read` table must not have.
-const WRITE_COLUMN_PRIVILEGE: &str = "INSERT, UPDATE";
+const NOT_READ_COLUMN_PRIVILEGE: &str = "INSERT, UPDATE, REFERENCES";
+
+/// The column privileges that a `may_write` table must not have.
+const NOT_WRITE_COLUMN_PRIVILEGE: &str = "REFERENCES";
 
 /// Connect as one role and check each table: its own tables and exceptions
 /// must open, and every other table must give `permission denied`.
 ///
 /// A read is `SELECT 1 FROM <table> LIMIT 0`. It reads no row, but Postgres
-/// checks the privilege first. `has_table_privilege` then finds a write
-/// privilege outside the grant, and on a `may_read` table. It counts grants
+/// checks the privilege first. `has_table_privilege` then finds a right
+/// outside the grant, and a right on a `may_read` or `may_write` table that
+/// the grant does not give. It counts grants
 /// to `PUBLIC` and through role membership. The probe also lists the
 /// `schemas` in which the role can create objects, and the roles it is a
 /// member of.
@@ -479,11 +489,19 @@ pub async fn probe_role(url: &str, grants: &RoleGrants, schemas: &[String]) -> R
             .allowed
             .push((table.clone(), read(&client, table).await));
     }
-    for table in &grants.read {
-        if has_privilege(&client, table, WRITE_PRIVILEGE, WRITE_COLUMN_PRIVILEGE).await
-            == Some(true)
-        {
-            probe.writes_read_only.push(table.clone());
+    let exceptions = grants
+        .read
+        .iter()
+        .map(|t| (t, NOT_READ_PRIVILEGE, NOT_READ_COLUMN_PRIVILEGE))
+        .chain(
+            grants
+                .write
+                .iter()
+                .map(|t| (t, NOT_WRITE_PRIVILEGE, NOT_WRITE_COLUMN_PRIVILEGE)),
+        );
+    for (table, privileges, column) in exceptions {
+        if has_privilege(&client, table, privileges, column).await == Some(true) {
+            probe.exceeds_grant.push(table.clone());
         }
     }
     for table in &grants.denied {

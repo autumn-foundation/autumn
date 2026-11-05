@@ -11471,12 +11471,13 @@ fn privilege_findings(
             join_names(leaks.into_iter())
         ));
     }
-    if !probe.writes_read_only.is_empty() {
+    if !probe.exceeds_grant.is_empty() {
         *status = CheckStatus::Fail;
         lines.push(format!(
-            "{name}: writes {} `may_read` table(s): {}",
-            probe.writes_read_only.len(),
-            join_names(probe.writes_read_only.iter())
+            "{name}: has a right that the grant does not give on {} \
+             `may_read`/`may_write` table(s): {}",
+            probe.exceeds_grant.len(),
+            join_names(probe.exceeds_grant.iter())
         ));
     }
     if !probe.creates_in.is_empty() {
@@ -24510,7 +24511,7 @@ mod database_roles_tests {
     fn a_write_privilege_outside_the_grant_fails() {
         let mut p = probe();
         p.denied[0].1 = Access::Writable;
-        p.writes_read_only = vec![t("accounts")];
+        p.exceeds_grant = vec![t("accounts")];
         let result = database_roles_verdict(&[p]);
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap();
@@ -24519,7 +24520,10 @@ mod database_roles_tests {
             "{detail}"
         );
         assert!(
-            detail.contains("writes 1 `may_read` table(s): public.accounts"),
+            detail.contains(
+                "has a right that the grant does not give on 1 `may_read`/`may_write` \
+                 table(s): public.accounts"
+            ),
             "{detail}"
         );
     }

@@ -128,6 +128,10 @@ fn doctor_roles(dir: &Path, url: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no database_roles check: {json}"))
 }
 
+/// The doctor line for a right on `contacts` that the grant does not give.
+const EXCEEDS_CONTACTS: &str = "has a right that the grant does not give on 1 \
+                                `may_read`/`may_write` table(s): public.contacts";
+
 fn detail(check: &serde_json::Value) -> &str {
     check["detail"].as_str().expect("detail")
 }
@@ -256,10 +260,7 @@ async fn doctor_finds_grants_outside_the_config() {
         detail(&check).contains("reads or changes 1 table(s) outside its grant: public.deals"),
         "{check}"
     );
-    assert!(
-        detail(&check).contains("writes 1 `may_read` table(s): public.contacts"),
-        "{check}"
-    );
+    assert!(detail(&check).contains(EXCEEDS_CONTACTS), "{check}");
     apply(root, &url);
     assert_eq!(doctor_roles(root, &url)["status"], "pass");
 
@@ -270,11 +271,23 @@ async fn doctor_finds_grants_outside_the_config() {
         .await
         .expect("column grant");
     let check = doctor_roles(root, &url);
-    assert!(
-        detail(&check).contains("writes 1 `may_read` table(s): public.contacts"),
-        "{check}"
-    );
+    assert!(detail(&check).contains(EXCEEDS_CONTACTS), "{check}");
     apply(root, &url);
+    assert_eq!(doctor_roles(root, &url)["status"], "pass");
+
+    // `TRIGGER` on a `may_read` table: a trigger can change the writes of
+    // the owner boundary. Doctor finds it through `PUBLIC` too.
+    owner
+        .batch_execute("GRANT TRIGGER ON contacts TO PUBLIC")
+        .await
+        .expect("TRIGGER grant");
+    let check = doctor_roles(root, &url);
+    assert_eq!(check["status"], "fail", "{check}");
+    assert!(detail(&check).contains(EXCEEDS_CONTACTS), "{check}");
+    owner
+        .batch_execute("REVOKE TRIGGER ON contacts FROM PUBLIC")
+        .await
+        .expect("revoke TRIGGER");
     assert_eq!(doctor_roles(root, &url)["status"], "pass");
 
     // A grant to PUBLIC: the REVOKE of a role cannot remove it. Doctor still
