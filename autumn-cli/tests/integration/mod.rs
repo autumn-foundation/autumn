@@ -65,6 +65,8 @@ mod serve;
 mod slo_generate;
 mod supply_chain;
 mod table_boundaries_cli;
+// `autumn db grants` and the doctor role check. Docker.
+mod boundary_grants_cli;
 mod tauri_mobile_thin_client;
 mod test_command;
 mod upgrade_codemod;

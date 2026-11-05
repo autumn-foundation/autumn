@@ -138,5 +138,11 @@ changelog_view() {
 
   printf '%s\n' "$changelog" | sed -n "1,${heading_line}p"
   printf '\n%s' "$fragments"
-  printf '%s\n' "$changelog" | sed -n "$((heading_line + 1)),\$p"
+  # A release leaves `Nothing yet.` under the new heading. With a fragment
+  # it is false, and a gate would read it as an entry of the last fragment
+  # heading: drop it, up to the next `## ` section.
+  printf '%s\n' "$changelog" | sed -n "$((heading_line + 1)),\$p" |
+    awk 'done == 0 && /^## / { done = 1 }
+         done == 0 && /^Nothing yet\.?[[:space:]]*$/ { done = 1; next }
+         { print }'
 }

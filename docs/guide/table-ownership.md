@@ -45,6 +45,8 @@ Each list holds glob patterns. `*` matches any run of characters.
 | `may_read` | Tables of other boundaries that this boundary may read. |
 | `may_write` | Tables of other boundaries that this boundary may read and write. |
 | `schema_crates` | The crates that hold the schema of the boundary. See [the crate rule](#the-crate-rule). |
+| `schema` | The Postgres schema of the owned tables. See [Database Boundaries](database-boundaries.md). |
+| `role` | The Postgres role of the boundary. See [Database Boundaries](database-boundaries.md). |
 
 At the top level, `baseline` names the [baseline file](#adopt-the-check-with-a-baseline).
 `graph` names a committed graph for `autumn doctor`. Both paths are relative to
@@ -228,11 +230,14 @@ apply. These matter most here:
   table through a model. A query on a table with no model makes no edge.
 * **A `use … as …` rename is not followed.** Write the table module or the
   model in the item.
-* **SQL built at run time is not seen.** Only string literals are read.
+* **SQL built at run time is not seen.** Only string literals are read. A
+  [database role per boundary](database-boundaries.md) sees it.
 * **A helper in the same crate is not followed.** The crate rule covers a
   helper in another crate only.
 
 ## Related
 
 * [The Architecture Graph](architecture-graph.md) — the graph this check reads.
+* [Database Boundaries](database-boundaries.md) — a role per boundary, so the
+  database refuses the queries that this check cannot see.
 * [Table width](table-width.md) — another schema rule that CI checks.

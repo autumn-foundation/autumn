@@ -2762,10 +2762,12 @@ the build.
   `{ id = "RUSTSEC-…", reason = "why this is acceptable here; review-by <date>" }`.
   A waiver lets exactly one id through; the gate stays on and every other
   advisory still fails.
-- A fresh scaffold ships two waivers already — RUSTSEC-2023-0071 (`rsa`) and
+- A fresh scaffold ships three waivers already — RUSTSEC-2023-0071 (`rsa`) and
   RUSTSEC-2026-0387 (`crypto-bigint` 0.5), both reached through the
-  unconditional `jsonwebtoken` dependency, no patched release exists — which is
-  why day-one CI is green. Do not remove either without checking
+  unconditional `jsonwebtoken` dependency, no patched release exists — and a
+  third, RUSTSEC-2026-0441 (`pin-utils`, unmaintained, via autumn-web's
+  `cfg(loom_models)` `loom` dependency). That is why day-one CI is green. Do
+  not remove one without checking
   whether a fixed release has shipped. An unused-waiver warning means one of the
   app author's own waivers went stale.
 - An app upgraded from a release before this gate existed receives the workflow
@@ -3710,6 +3712,7 @@ autumn graph show --manifest architecture-graph.json --check architecture-graph.
 # `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 autumn graph check-boundaries    # fail when one boundary queries a table another boundary owns (0.10.0, #3549)
+autumn db grants --apply         # GRANT/REVOKE so each boundary `role` reads only its own tables and exceptions; `autumn doctor --strict` checks it as each role
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
 autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
@@ -3744,7 +3747,10 @@ one is that a call into a helper in another module is not followed. See
 To keep one module out of another module's tables, declare boundaries in
 `boundaries.toml` and run `autumn graph check-boundaries`. A baseline holds
 today's violations, so an existing app can adopt it. See
-`docs/guide/table-ownership.md`.
+`docs/guide/table-ownership.md`. To make the database refuse
+the same queries, give a boundary `schema` and `role`, connect it with
+`[database.roles.<boundary>]`, and use `state.pool_for::<B>()` or
+`BoundaryDb<B>`. See `docs/guide/database-boundaries.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 

@@ -281,8 +281,9 @@ async fn timeout_fires_cleanly_during_graceful_drain() {
 
     // The in-flight request must still terminate with a single clean 503 from
     // the deadline (not hang for 30s, not a raw/duplicated error), proving the
-    // timeout and the shutdown drain compose.
-    let response = tokio::time::timeout(Duration::from_secs(5), client)
+    // timeout and the shutdown drain compose. The 15s limit stops a hang
+    // (the handler sleeps 30s) and leaves room for a slow CI runner.
+    let response = tokio::time::timeout(Duration::from_secs(15), client)
         .await
         .expect("hung request must be released by the deadline during drain")
         .expect("client task must not panic");
@@ -291,7 +292,7 @@ async fn timeout_fires_cleanly_during_graceful_drain() {
         "a request that exceeds the deadline during drain must return a clean 503; got: {response}"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), server)
+    tokio::time::timeout(Duration::from_secs(15), server)
         .await
         .expect("server must drain and exit cleanly")
         .ok();

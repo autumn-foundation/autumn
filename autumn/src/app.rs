@@ -3892,7 +3892,7 @@ impl AppBuilder {
     #[must_use]
     pub fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
         self.migrations
-            .push(("app", migrations, migrate::MigrationScope::Everywhere));
+            .push(("app", migrations, migrate::MigrationScope::Everywhere, None));
         self
     }
 
@@ -3936,7 +3936,7 @@ impl AppBuilder {
         scope: migrate::MigrationScope,
         migrations: migrate::EmbeddedMigrations,
     ) -> Self {
-        self.migrations.push(("app", migrations, scope));
+        self.migrations.push(("app", migrations, scope, None));
         self
     }
 
@@ -4045,7 +4045,73 @@ impl AppBuilder {
         migrations: migrate::EmbeddedMigrations,
     ) -> Self {
         self.migrations
-            .push((name, migrations, migrate::MigrationScope::Everywhere));
+            .push((name, migrations, migrate::MigrationScope::Everywhere, None));
+        self
+    }
+
+    /// Register the app's embedded migrations into one Postgres schema.
+    ///
+    /// Each migration runs with `schema` first on the `search_path`. The
+    /// schema is made when it does not exist. So an unqualified
+    /// `CREATE TABLE campaigns` makes `marketing.campaigns`. A qualified name
+    /// stays as written. The set runs at the same points as
+    /// [`Self::migrations`].
+    ///
+    /// Postgres only. A `SQLite` database refuses the set at boot.
+    /// `autumn migrate` does not see an embedded set; run it with
+    /// `AUTUMN_MIGRATE=1`, or write `marketing.campaigns` in a `migrations/`
+    /// file.
+    ///
+    /// ```rust,ignore
+    /// const MARKETING: EmbeddedMigrations = embed_migrations!("migrations-marketing");
+    ///
+    /// autumn_web::app()
+    ///     .migrations_in_schema("marketing", MARKETING)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn migrations_in_schema(
+        mut self,
+        schema: &'static str,
+        migrations: migrate::EmbeddedMigrations,
+    ) -> Self {
+        self.migrations.push((
+            "app",
+            migrations,
+            migrate::MigrationScope::Everywhere,
+            Some(schema),
+        ));
+        self
+    }
+
+    /// Register a plugin's embedded migrations into one Postgres schema.
+    ///
+    /// The same as [`Self::plugin_migrations`], with the schema rule of
+    /// [`Self::migrations_in_schema`]. Use it to put a plugin's tables into
+    /// the schema of the boundary that owns them.
+    ///
+    /// ```rust,ignore
+    /// autumn_web::app()
+    ///     .plugin_migrations_in_schema("autumn-admin-plugin", "admin", autumn_admin_plugin::MIGRATIONS)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn plugin_migrations_in_schema(
+        mut self,
+        name: &'static str,
+        schema: &'static str,
+        migrations: migrate::EmbeddedMigrations,
+    ) -> Self {
+        self.migrations.push((
+            name,
+            migrations,
+            migrate::MigrationScope::Everywhere,
+            Some(schema),
+        ));
         self
     }
 
@@ -4735,7 +4801,9 @@ impl AppBuilder {
         if pool.is_some() || shards.is_some() {
             // Pool sizes multiply across shards: surface the total so
             // N-shard deployments notice the aggregate connection count.
-            let budget = connection_budget(pool.as_ref(), shards.as_ref());
+            let mut budget = connection_budget(pool.as_ref(), shards.as_ref());
+            // Each `[database.roles]` pool opens its own connections.
+            budget.total += crate::db_roles::max_connections(&config.database);
             tracing::info!(
                 primary_max_connections = config.database.effective_primary_pool_size(),
                 replica_configured = config.database.replica_url.is_some(),
@@ -8349,6 +8417,11 @@ impl AppBuilder {
             }
         }
 
+        if let Some(conflict) = crate::migrate::schema_registration_conflict(&migrations) {
+            eprintln!("autumn migrate: {conflict}");
+            std::process::exit(1);
+        }
+
         // Computed once, on the FINAL registered set (after the fold above),
         // so a version collision resolves automatically instead of one
         // migration silently never applying — see
@@ -8389,6 +8462,15 @@ impl AppBuilder {
                 #[cfg(not(feature = "sqlite"))]
                 let is_sqlite_control = false;
                 if is_sqlite_control {
+                    // SQLite has no schemas. Refuse before anything writes.
+                    #[cfg(feature = "sqlite")]
+                    if let Some(schema) = control_sets(&migrations).find_map(|(_, s)| s) {
+                        eprintln!(
+                            "autumn migrate: a migration set targets the Postgres schema \
+                             `{schema}`, but the database is SQLite, which has no schemas"
+                        );
+                        std::process::exit(1);
+                    }
                     // A migration this database already ran under a version the
                     // map now gives a substitute keeps its record, moved to that
                     // substitute, rather than running twice (same as the CLI's
@@ -8406,7 +8488,7 @@ impl AppBuilder {
                         std::process::exit(1);
                     }
                     #[cfg(feature = "sqlite")]
-                    for mig in control_sets(&migrations) {
+                    for (mig, _) in control_sets(&migrations) {
                         total += apply_pending_sqlite_or_exit(
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
@@ -8414,10 +8496,13 @@ impl AppBuilder {
                         );
                     }
                 } else {
-                    for mig in control_sets(&migrations) {
+                    for (mig, schema) in control_sets(&migrations) {
                         total += apply_pending_or_exit(
                             url,
-                            crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                            crate::migrate::SchemaMigrations::new(
+                                crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                                schema,
+                            ),
                             "control",
                             lock_policy,
                         );
@@ -8429,10 +8514,13 @@ impl AppBuilder {
             // A `sqlite:` shard is rejected by the guard above, so every shard here
             // is Postgres.
             for (label, url) in &shard_targets {
-                for mig in shard_sets(&migrations) {
+                for (mig, schema) in shard_sets(&migrations) {
                     total += apply_pending_or_exit(
                         url,
-                        crate::migrate::DisambiguatedMigrations::new(mig, &shard_disambiguated),
+                        crate::migrate::SchemaMigrations::new(
+                            crate::migrate::DisambiguatedMigrations::new(mig, &shard_disambiguated),
+                            schema,
+                        ),
                         label,
                         lock_policy,
                     );
@@ -15220,6 +15308,23 @@ mod sqlite_sharding_unsupported_guard_tests {
 /// `keep` selects one side by [`MigrationScope`](crate::migrate::MigrationScope):
 /// the control map and the shard map each read only the sets of their side.
 /// With no scoped set, both maps equal the map over every set.
+/// Build one pool per `[database.roles.<boundary>]`. With no roles,
+/// no extension: `pool_for` then gives the primary pool. A role that cannot
+/// get a pool stops the boot.
+#[cfg(feature = "db")]
+fn install_role_pools(state: &AppState, config: &AutumnConfig) {
+    if config.database.roles.is_empty() {
+        return;
+    }
+    match crate::db::create_role_pools(&config.database) {
+        Ok(pools) => state.insert_extension(pools),
+        Err(error) => {
+            tracing::error!(error = %error, "Failed to build the database role pools");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(feature = "db")]
 fn migration_sets_for_disambiguation(
     migrations: &[crate::migrate::RegisteredMigrations],
@@ -15228,8 +15333,8 @@ fn migration_sets_for_disambiguation(
 ) -> Vec<(&str, &crate::migrate::EmbeddedMigrations)> {
     let owned = migrations
         .iter()
-        .filter(move |(_, _, scope)| keep(*scope))
-        .map(|(name, set, _)| (*name, set));
+        .filter(move |(_, _, scope, _)| keep(*scope))
+        .map(|(name, set, _, _)| (*name, set));
     if shards_configured {
         owned
             .chain([
@@ -15306,6 +15411,10 @@ async fn run_startup_migrations(
         ));
     #[cfg(feature = "sqlite")]
     let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
+    if let Some(conflict) = crate::migrate::schema_registration_conflict(&migrations) {
+        tracing::error!("{conflict}");
+        std::process::exit(1);
+    }
     let migration_result = crate::time::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (#1614, PR3): apply the
         // registered migrations to a `sqlite://` control target with no advisory
@@ -15319,6 +15428,16 @@ async fn run_startup_migrations(
             && crate::config::DatabaseBackend::detect(url)
                 == Some(crate::config::DatabaseBackend::Sqlite)
         {
+            // SQLite has no schemas. Refuse before anything writes.
+            if let Some(schema) = control_sets(&migrations).find_map(|(_, schema)| schema) {
+                tracing::error!(
+                    schema,
+                    target = "control",
+                    "A migration set targets a Postgres schema, but the database is SQLite. \
+                     SQLite has no schemas. Register the set with `migrations` instead."
+                );
+                std::process::exit(1);
+            }
             // Only when this boot applies (the same decision `auto_migrate_sqlite`
             // makes): a migration this database already ran under a version the
             // map now gives a substitute keeps its record, moved to that
@@ -15338,7 +15457,7 @@ async fn run_startup_migrations(
                 );
                 std::process::exit(1);
             }
-            for mig in control_sets(&migrations) {
+            for (mig, _) in control_sets(&migrations) {
                 crate::migrate::auto_migrate_sqlite(
                     url,
                     profile.as_deref(),
@@ -15352,13 +15471,16 @@ async fn run_startup_migrations(
         }
 
         if let Some(url) = control_url {
-            for mig in control_sets(&migrations) {
+            for (mig, schema) in control_sets(&migrations) {
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                    crate::migrate::SchemaMigrations::new(
+                        crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                        schema,
+                    ),
                     "control",
                     lock_policy,
                 );
@@ -15408,13 +15530,16 @@ async fn run_startup_migrations(
         // keep reporting them as pending, even though `autumn migrate --shard`
         // applies only the shard-required framework migrations.
         for (target, url) in &shard_targets {
-            for mig in shard_sets(&migrations) {
+            for (mig, schema) in shard_sets(&migrations) {
                 crate::migrate::auto_migrate(
                     url,
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    crate::migrate::DisambiguatedMigrations::new(mig, &shard_disambiguated),
+                    crate::migrate::SchemaMigrations::new(
+                        crate::migrate::DisambiguatedMigrations::new(mig, &shard_disambiguated),
+                        schema,
+                    ),
                     target,
                     lock_policy,
                 );
@@ -15689,6 +15814,7 @@ fn migrations_with_repository_framework_migrations(
             "repository-commit-hooks",
             crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
             crate::migrate::MigrationScope::Everywhere,
+            None,
         ));
     }
     if version_history_required
@@ -15699,6 +15825,7 @@ fn migrations_with_repository_framework_migrations(
             "version-history",
             crate::version_history::VERSION_HISTORY_MIGRATIONS,
             crate::migrate::MigrationScope::Everywhere,
+            None,
         ));
     }
     // The derivation state table follows the same rule as the two above: it is a
@@ -15713,6 +15840,7 @@ fn migrations_with_repository_framework_migrations(
             "derivations",
             crate::derivation::DERIVATION_MIGRATIONS,
             crate::migrate::MigrationScope::Everywhere,
+            None,
         ));
     }
     migrations
@@ -15745,11 +15873,11 @@ fn shard_applied_sets_include(
 
     migrations
         .iter()
-        .filter(|(_, set, scope)| {
+        .filter(|(_, set, scope, _)| {
             *scope == crate::migrate::MigrationScope::Everywhere
                 && !migration_set_is_control_framework(set)
         })
-        .any(|(_, source, _)| {
+        .any(|(_, source, _, _)| {
             let Ok(source_migrations): Result<Vec<Box<dyn Migration<RuntimeBackend>>>, _> =
                 source.migrations()
             else {
@@ -15771,36 +15899,36 @@ fn unreachable_shard_sets_warning(
 ) -> Option<&'static str> {
     let shard_only = migrations
         .iter()
-        .any(|(_, _, scope)| *scope == crate::migrate::MigrationScope::Shards);
+        .any(|(_, _, scope, _)| *scope == crate::migrate::MigrationScope::Shards);
     (shard_only && !config.database.has_shards() && config.database.fleet.is_none()).then_some(
         "A migration set has MigrationScope::Shards, but this profile has no \
          [[database.shards]] and no [database.fleet]: no database gets it.",
     )
 }
 
-/// The registered sets that go to the control database.
+/// The registered sets that go to the control database, each with its schema.
 #[cfg(feature = "db")]
 fn control_sets(
     migrations: &[crate::migrate::RegisteredMigrations],
-) -> impl Iterator<Item = &crate::migrate::EmbeddedMigrations> {
+) -> impl Iterator<Item = (&crate::migrate::EmbeddedMigrations, Option<&'static str>)> {
     migrations
         .iter()
-        .filter(|(_, _, scope)| scope.reaches_control())
-        .map(|(_, set, _)| set)
+        .filter(|(_, _, scope, _)| scope.reaches_control())
+        .map(|(_, set, _, schema)| (set, *schema))
 }
 
 /// The registered sets that go to each shard: not a control-scoped set, and
-/// not the control-plane framework set.
+/// not the control-plane framework set. Each comes with its schema.
 #[cfg(feature = "db")]
 fn shard_sets(
     migrations: &[crate::migrate::RegisteredMigrations],
-) -> impl Iterator<Item = &crate::migrate::EmbeddedMigrations> {
+) -> impl Iterator<Item = (&crate::migrate::EmbeddedMigrations, Option<&'static str>)> {
     migrations
         .iter()
-        .filter(|(_, set, scope)| {
+        .filter(|(_, set, scope, _)| {
             scope.reaches_shards() && !migration_set_is_control_framework(set)
         })
-        .map(|(_, set, _)| set)
+        .map(|(_, set, _, schema)| (set, *schema))
 }
 
 /// Whether a migration set is the control-plane
@@ -16891,8 +17019,8 @@ mod fleet_boot_tests {
         let database = setup_database(
             &config,
             vec![
-                ("app", CONTROL, MigrationScope::Control),
-                ("app", SHARDS, MigrationScope::Shards),
+                ("app", CONTROL, MigrationScope::Control, None),
+                ("app", SHARDS, MigrationScope::Shards, None),
             ],
             None,
             None,
@@ -16976,11 +17104,13 @@ mod fleet_boot_tests {
                 "framework",
                 crate::migrate::FRAMEWORK_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             ),
             (
                 "version-history",
                 crate::version_history::VERSION_HISTORY_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             ),
         ]);
         let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {
@@ -16999,6 +17129,42 @@ mod fleet_boot_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A set for a Postgres schema never reaches a SQLite fleet.
+    #[test]
+    fn a_schema_set_refuses_the_fleet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = AutumnConfig::default();
+        config.database.url = Some(format!(
+            "sqlite://{}",
+            tmp.path().join("control.db").display()
+        ));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: tmp.path().join("fleet").display().to_string(),
+            path: None,
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+        });
+        let all = Arc::new(vec![(
+            "app",
+            crate::version_history::VERSION_HISTORY_MIGRATIONS,
+            crate::migrate::MigrationScope::Everywhere,
+            Some("marketing"),
+        )]);
+        let Err(err) = crate::db::fleet::build_for_app(&config, None, &all, |_| true) else {
+            panic!("a schema set must not reach a fleet");
+        };
+        assert!(err.contains("schema `marketing`"), "{err}");
     }
 
     /// A control database plus a slot fleet under `dir`, the way `run()` sees
@@ -17032,6 +17198,7 @@ mod fleet_boot_tests {
             "framework",
             crate::migrate::FRAMEWORK_MIGRATIONS,
             crate::migrate::MigrationScope::Everywhere,
+            None,
         )]);
         let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {
             !migration_set_is_control_framework(set)
@@ -17230,6 +17397,7 @@ mod fleet_boot_tests {
             "framework",
             crate::migrate::FRAMEWORK_MIGRATIONS,
             crate::migrate::MigrationScope::Everywhere,
+            None,
         )]);
         // Created databases are migrated already: nothing is pending.
         assert_eq!(migrate_fleet_or_exit(&config, Arc::clone(&all)).await, 0);
@@ -17765,6 +17933,8 @@ fn build_state(
             config.health.ping_timeout(),
         );
     }
+    #[cfg(feature = "db")]
+    install_role_pools(&state, config);
     state.insert_extension(config.clone());
     state.insert_extension(crate::step_up::StepUpGlobalConfig {
         default_max_age_secs: config.auth.step_up.default_max_age_secs,
@@ -21582,6 +21752,7 @@ mount = ["service"]
                 "app",
                 APP_TEST_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             )],
             true,
             false,
@@ -21630,6 +21801,7 @@ mount = ["service"]
                 "app",
                 APP_TEST_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             )],
             false,
             true,
@@ -21741,6 +21913,7 @@ mount = ["service"]
                 "app",
                 APP_TEST_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             )],
             false,
             false,
@@ -21770,6 +21943,7 @@ mount = ["service"]
                 "app",
                 APP_TEST_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             )],
             false,
             false,
@@ -21793,8 +21967,8 @@ mount = ["service"]
 
         migrations
             .iter()
-            .filter(|(_, _, scope)| keep(*scope))
-            .flat_map(|(_, source, _)| {
+            .filter(|(_, _, scope, _)| keep(*scope))
+            .flat_map(|(_, source, _, _)| {
                 let migrations: Vec<Box<dyn Migration<Pg>>> = source.migrations().unwrap();
                 migrations
             })
@@ -21809,7 +21983,7 @@ mount = ["service"]
 
         migrations
             .iter()
-            .flat_map(|(_, source, _)| {
+            .flat_map(|(_, source, _, _)| {
                 let migrations: Vec<Box<dyn Migration<Pg>>> = source.migrations().unwrap();
                 migrations
             })
@@ -21855,6 +22029,7 @@ mount = ["service"]
                 "app",
                 crate::migrate::FRAMEWORK_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             )],
             true,
             true,
@@ -21866,8 +22041,8 @@ mount = ["service"]
         // that is not the control framework set (which gets stripped on shards).
         let shard_names: Vec<String> = migrations
             .iter()
-            .filter(|(_, set, _)| !migration_set_is_control_framework(set))
-            .flat_map(|(_, set, _)| {
+            .filter(|(_, set, _, _)| !migration_set_is_control_framework(set))
+            .flat_map(|(_, set, _, _)| {
                 let ms: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
                 ms.into_iter()
                     .map(|m| m.name().to_string())
@@ -21894,6 +22069,29 @@ mount = ["service"]
             "shards maintain derivations too, so they need the state table: \
              {shard_names:?}"
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn migrations_in_schema_records_the_schema() {
+        const SET: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        let builder = app()
+            .migrations_in_schema("marketing", SET)
+            .plugin_migrations_in_schema("test-plugin", "admin", SET)
+            .migrations(SET);
+        let got: Vec<_> = builder.migrations.iter().map(|m| (m.0, m.2, m.3)).collect();
+        let everywhere = crate::migrate::MigrationScope::Everywhere;
+        assert_eq!(
+            got,
+            [
+                ("app", everywhere, Some("marketing")),
+                ("test-plugin", everywhere, Some("admin")),
+                ("app", everywhere, None),
+            ]
+        );
+        let control: Vec<_> = control_sets(&builder.migrations).map(|(_, s)| s).collect();
+        assert_eq!(control, [Some("marketing"), Some("admin"), None]);
     }
 
     #[cfg(feature = "db")]
@@ -21967,8 +22165,8 @@ mount = ["service"]
             diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
 
         let scoped = vec![
-            ("app", CONTROL, MigrationScope::Control),
-            ("app", SHARDS, MigrationScope::Shards),
+            ("app", CONTROL, MigrationScope::Control, None),
+            ("app", SHARDS, MigrationScope::Shards, Some("tenant")),
         ];
         for side in [
             MigrationScope::reaches_control,
@@ -21980,13 +22178,14 @@ mount = ["service"]
         }
         let control: Vec<_> = control_sets(&scoped).collect();
         let shards: Vec<_> = shard_sets(&scoped).collect();
-        assert!(std::ptr::eq(control[0], std::ptr::from_ref(&scoped[0].1)) && control.len() == 1);
-        assert!(std::ptr::eq(shards[0], std::ptr::from_ref(&scoped[1].1)) && shards.len() == 1);
+        assert!(std::ptr::eq(control[0].0, std::ptr::from_ref(&scoped[0].1)) && control.len() == 1);
+        assert!(std::ptr::eq(shards[0].0, std::ptr::from_ref(&scoped[1].1)) && shards.len() == 1);
+        assert_eq!((control[0].1, shards[0].1), (None, Some("tenant")));
 
         // The same two sets for every database collide, as before.
         let everywhere = vec![
-            ("app", CONTROL, MigrationScope::Everywhere),
-            ("app", SHARDS, MigrationScope::Everywhere),
+            ("app", CONTROL, MigrationScope::Everywhere, None),
+            ("app", SHARDS, MigrationScope::Everywhere, None),
         ];
         let sets =
             migration_sets_for_disambiguation(&everywhere, false, MigrationScope::reaches_control);
@@ -22000,9 +22199,9 @@ mount = ["service"]
         const SHARDS: crate::migrate::EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
         let config = AutumnConfig::default();
-        let only = vec![("app", SHARDS, MigrationScope::Shards)];
+        let only = vec![("app", SHARDS, MigrationScope::Shards, None)];
         assert!(unreachable_shard_sets_warning(&config, &only).is_some());
-        let everywhere = vec![("app", SHARDS, MigrationScope::Everywhere)];
+        let everywhere = vec![("app", SHARDS, MigrationScope::Everywhere, None)];
         assert!(unreachable_shard_sets_warning(&config, &everywhere).is_none());
     }
 

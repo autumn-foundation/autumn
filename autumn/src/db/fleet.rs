@@ -582,7 +582,7 @@ impl FleetMigrations {
         let sets = all
             .iter()
             .enumerate()
-            .filter(|(_, (_, set, scope))| scope.reaches_shards() && keep(set))
+            .filter(|(_, (_, set, scope, _))| scope.reaches_shards() && keep(set))
             .map(|(idx, _)| {
                 FleetSet(Arc::new(SharedEmbedded {
                     all: Arc::clone(all),
@@ -4927,6 +4927,17 @@ pub(crate) fn build_for_app(
         config.database.auto_migrate,
         config.database.auto_migrate_in_production,
     );
+    // SQLite has no schemas: a set for a Postgres schema must not reach a
+    // fleet file, where it would run in the default namespace.
+    if let Some((label, _, _, Some(schema))) = all
+        .iter()
+        .find(|(_, set, scope, schema)| schema.is_some() && scope.reaches_shards() && keep(set))
+    {
+        return Err(format!(
+            "Failed to set up database.fleet: the migration set `{label}` targets the \
+             Postgres schema `{schema}`, and a SQLite fleet has no schemas"
+        ));
+    }
     let fleet = DatabaseFleet::from_parts(
         fleet_config,
         config.database.connect_timeout_secs,
@@ -6236,16 +6247,19 @@ mod tests {
                 "repository-commit-hooks",
                 crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             ),
             (
                 "version-history",
                 crate::version_history::VERSION_HISTORY_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             ),
             (
                 "derivations",
                 crate::derivation::DERIVATION_MIGRATIONS,
                 crate::migrate::MigrationScope::Everywhere,
+                None,
             ),
         ]);
         let boot = DatabaseFleet::from_parts(

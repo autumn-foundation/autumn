@@ -3155,6 +3155,32 @@ enum DbCommands {
     ///   autumn db replica status
     #[command(subcommand, verbatim_doc_comment)]
     Replica(ReplicaCommands),
+    /// Print or apply the database grants of each boundary role.
+    ///
+    /// Reads `boundaries.toml` and the live catalog. A boundary with a
+    /// `role` gets its own tables and its `may_read` / `may_write`
+    /// exceptions. Every other privilege of that role on a table, sequence
+    /// or schema is revoked. All statements run in one transaction.
+    ///
+    /// Examples:
+    ///   autumn db grants              # print the SQL
+    ///   autumn db grants --apply      # run it, after `autumn migrate`
+    ///   autumn db grants --json       # the plan, per role
+    #[command(verbatim_doc_comment)]
+    Grants {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The boundary config.
+        #[arg(long, value_name = "PATH", default_value = "boundaries.toml")]
+        config: std::path::PathBuf,
+        /// Run the statements against the database.
+        #[arg(long)]
+        apply: bool,
+        /// Print the plan as JSON instead of SQL.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands for `autumn db offsite` (issue #1619).
@@ -3258,10 +3284,11 @@ impl DbCommands {
             | Self::Scrub { .. }
             | Self::Retention { .. }
             | Self::Offsite(_)
-            | Self::Replica(_) => {
+            | Self::Replica(_)
+            | Self::Grants { .. } => {
                 unreachable!(
-                    "db pull/backup/restore/scrub/retention/offsite/replica are dispatched \
-                     before into_command"
+                    "db pull/backup/restore/scrub/retention/offsite/replica/grants are \
+                     dispatched before into_command"
                 )
             }
         }
@@ -5592,6 +5619,17 @@ fn run_command(command: Commands) {
                 db::backup::run_offsite_list(profile.as_deref());
             }
             DbCommands::Replica(cmd) => db::replica::run(&cmd.into_command()),
+            DbCommands::Grants {
+                profile,
+                config,
+                apply,
+                json,
+            } => db::grants::run(&db::grants::GrantsArgs {
+                profile,
+                config,
+                apply,
+                json,
+            }),
             other => {
                 let (command, profile) = other.into_command();
                 db::run(&command, profile.as_deref());
@@ -9472,6 +9510,48 @@ mod tests {
         assert!(force);
         assert_eq!(shard.as_deref(), Some("east"));
         assert!(!offsite);
+    }
+
+    #[test]
+    fn parse_db_grants() {
+        let cli = Cli::try_parse_from(["autumn", "db", "grants"]).unwrap();
+        let Commands::Db(DbCommands::Grants {
+            profile,
+            config,
+            apply,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected db grants");
+        };
+        assert_eq!(profile, None);
+        assert_eq!(config, std::path::PathBuf::from("boundaries.toml"));
+        assert!(!apply && !json);
+
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "grants",
+            "--apply",
+            "--json",
+            "--profile",
+            "prod",
+            "--config",
+            "crm/boundaries.toml",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Grants {
+            profile,
+            config,
+            apply,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected db grants");
+        };
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(config, std::path::PathBuf::from("crm/boundaries.toml"));
+        assert!(apply && json);
     }
 
     #[test]

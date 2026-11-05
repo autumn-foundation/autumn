@@ -71,6 +71,16 @@ ignore = [
     # oracle). Autumn's own p256 (Web Push) and aws-sigv4 use 0.7.10. Remove
     # when jsonwebtoken moves to p256 0.14. Review-by: 2026-11-08.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only, via jsonwebtoken ES256/ES384 -> p256/p384 0.13 -> elliptic-curve 0.13; no patched 0.5.x; review-by 2026-11-08" },
+    # RUSTSEC-2026-0440 — astral-tokio-tar is unmaintained. Dev and
+    # test only: testcontainers 0.27 and 0.28 depend on it, for the Docker
+    # tests and the `test-support` feature. No testcontainers release drops
+    # it. Remove when one ships. Review-by: 2026-12-05.
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar unmaintained; only via testcontainers (Docker tests, `test-support`); testcontainers 0.28 still uses it; review-by 2026-12-05" },
+    # RUSTSEC-2026-0441 — pin-utils is unmaintained. It comes from
+    # loom 0.7.2 (the `cfg(loom_models)` model checks only) and from
+    # wasmtimer 0.4.3 (wasm32 only, under reqwest-retry). Neither has a
+    # release without it. Review-by: 2026-12-05.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; via loom 0.7.2 (cfg(loom_models) only) and wasmtimer 0.4.3 (wasm32 only); no release drops it; review-by 2026-12-05" },
 ]
 
 [licenses]

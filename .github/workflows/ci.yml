@@ -2946,6 +2946,20 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- table_boundaries_cli \
             | tee "$RUNNER_TEMP/cli-boundaries-e2e-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-boundaries-e2e-cov.log"
+          # No other coverage lane runs the grants and database-role tests.
+          # `grep` fails the step when a filter matches no test.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::grants:: \
+            database_roles_tests:: tests::parse_db_grants \
+            | tee "$RUNNER_TEMP/cli-grants-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-grants-cov.log"
+          cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- --include-ignored \
+            --test-threads=1 boundary_grants_cli:: \
+            | tee "$RUNNER_TEMP/cli-grants-e2e-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-grants-e2e-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored boundary_roles_pg:: \
+            | tee "$RUNNER_TEMP/boundary-roles-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/boundary-roles-pg-cov.log"
           # Issue #3232: same gap for `autumn fleet` (its clap shape and the
           # Postgres-build stub) and the `db::replica` config loader it shares.
           # Check the count.

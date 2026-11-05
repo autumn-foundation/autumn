@@ -191,6 +191,7 @@ pub mod custom_domain;
 pub mod db;
 #[cfg(feature = "db")]
 pub(crate) mod db_ping;
+pub mod db_roles;
 pub(crate) mod db_url;
 pub mod fleet_layout;
 // Request deadlines (issue #3058). The module carries its own `//!` docs.

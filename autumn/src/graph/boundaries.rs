@@ -77,7 +77,34 @@ pub struct Boundary {
     /// that declare the models of the owned tables are used.
     #[serde(default)]
     pub schema_crates: Vec<String>,
+    /// The Postgres schema of the owned tables. When unset, `public`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// The database role of this boundary. When set, `autumn db grants`
+    /// gives this role access to the owned tables and the exceptions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
+
+impl Boundary {
+    /// The Postgres schema of the owned tables: [`Self::schema`] or `public`.
+    #[must_use]
+    pub fn schema_name(&self) -> &str {
+        self.schema.as_deref().unwrap_or(DEFAULT_SCHEMA)
+    }
+}
+
+/// Role names that Postgres reserves. `PUBLIC` means every role.
+const RESERVED_ROLES: &[&str] = &[
+    "public",
+    "none",
+    "current_user",
+    "session_user",
+    "current_role",
+];
+
+/// The schema of a boundary that sets no `schema`.
+pub const DEFAULT_SCHEMA: &str = "public";
 
 impl BoundaryConfig {
     /// Parse `boundaries.toml`.
@@ -92,6 +119,24 @@ impl BoundaryConfig {
             if boundary.owns.is_empty() && boundary.crates.is_empty() && boundary.modules.is_empty()
             {
                 return Err(BoundaryError::Empty(name.clone()));
+            }
+            for (key, value) in [("schema", &boundary.schema), ("role", &boundary.role)] {
+                let Some(value) = value.as_deref() else {
+                    continue;
+                };
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err(BoundaryError::Parse(format!(
+                        "boundary `{name}` has an empty `{key}`, or one with a control character"
+                    )));
+                }
+            }
+            if let Some(role) = boundary.role.as_deref()
+                && (RESERVED_ROLES.contains(&role.to_ascii_lowercase().as_str())
+                    || role.to_ascii_lowercase().starts_with("pg_"))
+            {
+                return Err(BoundaryError::Parse(format!(
+                    "boundary `{name}` names the reserved role `{role}`; use a role of its own"
+                )));
             }
         }
         Ok(config)
@@ -971,7 +1016,7 @@ impl<'a> Resolver<'a> {
         let mut candidates = Vec::new();
         for (name, b) in &self.config.boundaries {
             for p in &b.owns {
-                if glob(&p.to_ascii_lowercase(), &table) {
+                if glob(&table_pattern(p), &table) {
                     candidates.push((name.as_str(), specificity(p)));
                 }
             }
@@ -1041,7 +1086,7 @@ impl<'a> Resolver<'a> {
             return false;
         };
         let table = table.to_ascii_lowercase();
-        let hit = |list: &[String]| list.iter().any(|p| glob(&p.to_ascii_lowercase(), &table));
+        let hit = |list: &[String]| list.iter().any(|p| glob(&table_pattern(p), &table));
         hit(&b.may_write) || (access == Access::Read && hit(&b.may_read))
     }
 
@@ -1050,7 +1095,7 @@ impl<'a> Resolver<'a> {
     /// The pattern is matched against the tables in the graph, and read as a
     /// table name too. A tie between two boundaries counts for neither.
     fn exception_owners(&self, pattern: &str) -> BTreeSet<&'a str> {
-        let lower = pattern.to_ascii_lowercase();
+        let lower = table_pattern(pattern);
         self.tables
             .iter()
             .filter(|t| glob(&lower, t))
@@ -1075,7 +1120,7 @@ impl<'a> Resolver<'a> {
 
 /// The boundary with the most specific match. A tie between two boundaries
 /// is an error, because the config does not say which one is meant.
-fn pick<'a>(
+pub(super) fn pick<'a>(
     what: &'static str,
     name: &str,
     candidates: &[(&'a str, usize)],
@@ -1100,8 +1145,19 @@ fn pick<'a>(
     }
 }
 
+/// A table pattern as the graph reads it: lower case, with no schema. The
+/// graph names a table without its Postgres schema, so `public.contacts`
+/// matches the table `contacts` here. The grant planner reads the schema.
+fn table_pattern(pattern: &str) -> String {
+    let lower = pattern.to_ascii_lowercase();
+    match lower.rsplit_once('.') {
+        Some((_, table)) => table.to_owned(),
+        None => lower,
+    }
+}
+
 /// How specific a pattern is: its count of characters that are not `*`.
-fn specificity(pattern: &str) -> usize {
+pub(super) fn specificity(pattern: &str) -> usize {
     pattern.chars().filter(|c| *c != '*').count()
 }
 
@@ -1135,7 +1191,7 @@ fn base_id(id: &str) -> &str {
 }
 
 /// Whether `text` matches `pattern`, where `*` matches any run.
-fn glob(pattern: &str, text: &str) -> bool {
+pub(super) fn glob(pattern: &str, text: &str) -> bool {
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or_default();
     let Some(mut rest) = text.strip_prefix(first) else {
@@ -1390,6 +1446,20 @@ schema_crates = ["billing-schema"]
     fn may_read_clears_a_read_violation() {
         let report = check(&config("may_read = [\"contacts\"]\n"), Some(&graph()), None)
             .expect("check runs");
+        assert!(table_violation(&report, "report").is_none());
+        assert!(table_violation(&report, "joined").is_none());
+    }
+
+    /// The grant planner reads `public.contacts` as one schema and table;
+    /// the graph has no schemas, so it reads the table part.
+    #[test]
+    fn a_schema_qualified_exception_clears_a_read_violation() {
+        let report = check(
+            &config("may_read = [\"public.contacts\"]\n"),
+            Some(&graph()),
+            None,
+        )
+        .expect("check runs");
         assert!(table_violation(&report, "report").is_none());
         assert!(table_violation(&report, "joined").is_none());
     }
