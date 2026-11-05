@@ -141,6 +141,13 @@ fn with_user(
         .collect();
     let query = query.join("&");
     url.set_query((!query.is_empty()).then_some(query.as_str()));
+    // With no database in the URL, Postgres uses the user name. Keep the
+    // database of the primary URL when the user changes.
+    let has_dbname = url.query_pairs().any(|(k, _)| k == "dbname");
+    if matches!(url.path(), "" | "/") && !has_dbname && !url.username().is_empty() {
+        let database = url.username().to_owned();
+        url.set_path(&format!("/{database}"));
+    }
     // `Url` keeps a `%` as it is, and the driver decodes it: escape it first.
     let escape = |text: &str| text.replace('%', "%25");
     url.set_username(&escape(user)).map_err(|()| not_url())?;
@@ -372,6 +379,20 @@ mod tests {
             ))
             .unwrap(),
             "postgres://marketing:pw@db/app?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn the_implicit_database_of_the_primary_url_stays() {
+        let r = role(r#"user = "marketing""#);
+        assert_eq!(
+            r.effective_url(Some("postgres://owner:pw@db")).unwrap(),
+            "postgres://marketing@db/owner"
+        );
+        assert_eq!(
+            r.effective_url(Some("postgres://owner@db/?dbname=app"))
+                .unwrap(),
+            "postgres://marketing@db/?dbname=app"
         );
     }
 
