@@ -766,14 +766,36 @@ enum TokenKind {
 
 /// Split `sql` into tokens for `backend`. Each item is a kind and its text.
 /// The texts join back to `sql`.
+///
+/// Postgres joins a `'..'` to the `E'..'` literal before it when the white
+/// space between them holds a newline. That white space can hold `--`
+/// comments. The joined part is a quoted span of its own, but it keeps the
+/// `E` escape rules: `\'` does not end it.
 fn tokens(backend: DatabaseBackend, sql: &str) -> impl Iterator<Item = (TokenKind, &str)> {
     let mut rest = sql;
     let mut prev = None;
+    // `Some(newline)` after an `E'..'` literal: `newline` tells if the white
+    // space after it holds a newline yet.
+    let mut e_literal: Option<bool> = None;
     std::iter::from_fn(move || {
-        let (kind, len) = token_at(backend, rest, prev)?;
+        let (kind, len) = if e_literal == Some(true) && rest.starts_with('\'') {
+            (TokenKind::Quoted, escape_string_len(rest))
+        } else {
+            token_at(backend, rest, prev)?
+        };
         let (text, tail) = rest.split_at(len);
         rest = tail;
         prev = text.chars().next_back();
+        e_literal = match kind {
+            TokenKind::Quoted if e_literal == Some(true) || text.starts_with(['e', 'E']) => {
+                Some(false)
+            }
+            TokenKind::Plain if text.starts_with(is_sql_space) => {
+                e_literal.map(|newline| newline || matches!(text, "\n" | "\r"))
+            }
+            TokenKind::LineComment => e_literal,
+            _ => None,
+        };
         Some((kind, text))
     })
 }
@@ -831,11 +853,7 @@ fn quoted_len(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Optio
         b'`' if !postgres => Some(doubled_quote_len(rest, '`')),
         b'[' if !postgres => Some(rest[1..].find(']').map_or(rest.len(), |p| p + 2)),
         b'e' | b'E' if postgres && word_start && rest[1..].starts_with('\'') => {
-            let mut len = 1 + escape_string_len(&rest[1..]);
-            while let Some(gap) = string_continuation_len(&rest[len..]) {
-                len += gap + escape_string_len(&rest[len + gap..]);
-            }
-            Some(len)
+            Some(1 + escape_string_len(&rest[1..]))
         }
         b'$' if postgres && word_start => dollar_quote_len(rest),
         _ => None,
@@ -889,27 +907,6 @@ fn escape_string_len(rest: &str) -> usize {
         }
     }
     rest.len()
-}
-
-/// Byte length of the white space before a `'` that continues a Postgres
-/// literal, or `None`. The white space holds a newline and can hold `--`
-/// comments: `E'a'` and `'b'` on the next line are one literal.
-fn string_continuation_len(rest: &str) -> Option<usize> {
-    let mut newline = false;
-    let mut i = 0;
-    while let Some(c) = rest[i..].chars().next() {
-        if rest[i..].starts_with("--") {
-            i += line_comment_len(DatabaseBackend::Postgres, &rest[i..])?;
-        } else if matches!(c, '\n' | '\r') {
-            newline = true;
-            i += 1;
-        } else if matches!(c, ' ' | '\t' | '\x0C') || (newline && c == '\x0B') {
-            i += 1;
-        } else {
-            break;
-        }
-    }
-    (newline && rest[i..].starts_with('\'')).then_some(i)
 }
 
 /// Byte length of the dollar-quoted block (`$$…$$`, `$tag$…$tag$`) at the
@@ -1034,16 +1031,24 @@ fn strip_line_comments(backend: DatabaseBackend, sql: &str) -> String {
 pub fn normalize_statement(backend: DatabaseBackend, stmt: &str) -> String {
     let stripped = strip_line_comments(backend, &strip_block_comments(backend, stmt));
     let mut out = String::with_capacity(stripped.len());
-    let mut space = false;
+    // `Some(newline)` in a run of white space after text.
+    let mut space: Option<bool> = None;
+    let mut after_quoted = false;
     for (kind, text) in tokens(backend, &stripped) {
         // A white-space token is one character.
         if kind == TokenKind::Plain && text.starts_with(is_sql_space) {
-            space = !out.is_empty();
+            if !out.is_empty() {
+                let newline = matches!(text, "\n" | "\r");
+                space = Some(space.unwrap_or(false) || newline);
+            }
             continue;
         }
-        if std::mem::take(&mut space) {
-            out.push(' ');
+        if let Some(newline) = space.take() {
+            // A newline between two quoted spans can join them (see `tokens`).
+            let joins = newline && after_quoted && kind == TokenKind::Quoted;
+            out.push(if joins { '\n' } else { ' ' });
         }
+        after_quoted = kind == TokenKind::Quoted;
         if kind == TokenKind::Quoted {
             out.push_str(text);
         } else {
