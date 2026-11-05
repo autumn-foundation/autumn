@@ -72,7 +72,7 @@ impl WireTypeDescriptor {
 /// `TypeDescriptor` artifact, and referenced by name — the same DTO usually
 /// serves several endpoints, and one description keeps them from drifting.
 /// A reader joins the two into a [`ResolvedEndpoint`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointDescriptor {
     /// The service this endpoint belongs to, from `#[endpoint(service = "…")]`.
     pub service: String,
@@ -90,6 +90,16 @@ pub struct EndpointDescriptor {
     pub request_type: String,
     /// Rust name of the response body type.
     pub response_type: String,
+    /// Whether the handler reads a JSON request body. `Json<NoBody>` reads
+    /// one, so the type name alone cannot tell.
+    #[serde(default)]
+    pub has_body: bool,
+    /// Whether the request body is a JSON array of `request_type`.
+    #[serde(default)]
+    pub request_list: bool,
+    /// Whether the response body is a JSON array of `response_type`.
+    #[serde(default)]
+    pub response_list: bool,
 }
 
 impl EndpointDescriptor {

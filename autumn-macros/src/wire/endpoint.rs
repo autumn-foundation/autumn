@@ -129,17 +129,7 @@ fn expand(attr: TokenStream, item: &TokenStream) -> Result<TokenStream, syn::Err
     let name = args.name.unwrap_or_else(|| func.sig.ident.to_string());
     let marker = format_ident!("{}_endpoint", name);
 
-    let request_ty = func.sig.inputs.iter().find_map(|arg| match arg {
-        syn::FnArg::Typed(pat) => crate::api_doc::unwrap_json_body(&pat.ty),
-        syn::FnArg::Receiver(_) => None,
-    });
-    let response_ty = response_type(&func).ok_or_else(|| {
-        syn::Error::new_spanned(
-            &func.sig,
-            "#[endpoint] needs a JSON response: the handler must return `Json<T>`, \
-             `AutumnResult<Json<T>>`, or `(StatusCode, Json<T>)`",
-        )
-    })?;
+    let (request_ty, response_ty) = body_types(&func)?;
 
     let has_body = request_ty.is_some();
     let request_tokens = request_ty.as_ref().map_or_else(
@@ -147,15 +137,19 @@ fn expand(attr: TokenStream, item: &TokenStream) -> Result<TokenStream, syn::Err
         |ty| quote! { #ty },
     );
 
-    let written = write_descriptor(
-        &args.service,
-        &name,
-        &marker,
-        &method,
-        &path,
-        request_ty.as_ref(),
-        &response_ty,
-    );
+    let written = store::contract_dir().map_or_else(TokenStream::new, |dir| {
+        let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+        let descriptor = endpoint_descriptor(
+            &krate,
+            &args.service,
+            &name,
+            &marker,
+            (&method, &path),
+            request_ty.as_ref(),
+            &response_ty,
+        );
+        store::write_outcome(store::write_endpoint(&dir, &descriptor))
+    });
 
     let doc = format!(
         "Wire contract for the `{}.{}` endpoint (`{method} {path}`).\n\n\
@@ -260,36 +254,77 @@ fn nested_route_tokens(attr: &syn::Attribute) -> Option<TokenStream> {
     })
 }
 
-/// Write this endpoint's JSON descriptor, if a contract directory resolves.
-fn write_descriptor(
+/// The `Json<T>` request body type, if any, and the `Json<T>` response type.
+fn body_types(func: &ItemFn) -> Result<(Option<syn::Type>, syn::Type), syn::Error> {
+    let request_ty = func.sig.inputs.iter().find_map(|arg| match arg {
+        syn::FnArg::Typed(pat) => crate::api_doc::unwrap_json_body(&pat.ty),
+        syn::FnArg::Receiver(_) => None,
+    });
+    let response_ty = response_type(func).ok_or_else(|| {
+        syn::Error::new_spanned(
+            &func.sig,
+            "#[endpoint] needs a JSON response: the handler must return `Json<T>`, \
+             `AutumnResult<Json<T>>`, or `(StatusCode, Json<T>)`",
+        )
+    })?;
+    Ok((request_ty, response_ty))
+}
+
+/// The element type of `Vec<T>`, or `None` for any other type.
+fn list_element(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    let last = path.path.segments.last()?;
+    if last.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// A body type's descriptor name and whether it is a JSON array.
+///
+/// `Vec<T>` has the shape of `T` on the wire, inside an array. The name is
+/// the element's, so a reader finds the element's descriptor.
+fn body_name(ty: &syn::Type) -> (String, bool) {
+    list_element(ty).map_or_else(
+        || (autumn_macros_support::schema::type_name_str(ty), false),
+        |inner| (autumn_macros_support::schema::type_name_str(inner), true),
+    )
+}
+
+/// This endpoint's JSON descriptor.
+fn endpoint_descriptor(
+    krate: &str,
     service: &str,
     name: &str,
     marker: &Ident,
-    method: &str,
-    path: &str,
+    (method, path): (&str, &str),
     request_ty: Option<&syn::Type>,
     response_ty: &syn::Type,
-) -> TokenStream {
-    let Some(dir) = store::contract_dir() else {
-        return TokenStream::new();
-    };
-    let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-    store::write_outcome(store::write_endpoint(
-        &dir,
-        &EndpointDescriptor {
-            service: service.to_owned(),
-            name: name.to_owned(),
-            endpoint_ident: marker.to_string(),
-            krate,
-            method: method.to_owned(),
-            path: path.to_owned(),
-            request_type: request_ty.map_or_else(
-                || "NoBody".to_owned(),
-                autumn_macros_support::schema::type_name_str,
-            ),
-            response_type: autumn_macros_support::schema::type_name_str(response_ty),
-        },
-    ))
+) -> EndpointDescriptor {
+    let (request_type, request_list) =
+        request_ty.map_or_else(|| ("NoBody".to_owned(), false), body_name);
+    let (response_type, response_list) = body_name(response_ty);
+    EndpointDescriptor {
+        service: service.to_owned(),
+        name: name.to_owned(),
+        endpoint_ident: marker.to_string(),
+        krate: krate.to_owned(),
+        method: method.to_owned(),
+        path: path.to_owned(),
+        request_type,
+        response_type,
+        has_body: request_ty.is_some(),
+        request_list,
+        response_list,
+    }
 }
 
 #[cfg(test)]
@@ -470,5 +505,38 @@ mod tests {
         );
         assert!(out.contains("option_env"), "{out}");
         assert!(out.contains("AUTUMN_CONTRACT_DIR"), "{out}");
+    }
+
+    fn descriptor_of(item: &str) -> EndpointDescriptor {
+        let func: ItemFn = syn::parse_str(item).expect("fixture parses");
+        let (request, response) = body_types(&func).expect("json response");
+        endpoint_descriptor(
+            "k",
+            "catalog",
+            "f",
+            &format_ident!("f_endpoint"),
+            ("GET", "/x"),
+            request.as_ref(),
+            &response,
+        )
+    }
+
+    #[test]
+    fn a_list_response_records_its_element_and_the_array() {
+        let d = descriptor_of("async fn f() -> Json<Vec<Item>> { todo!() }");
+        assert_eq!(d.response_type, "Item");
+        assert!(d.response_list);
+        assert!(!d.has_body);
+        assert_eq!(d.request_type, "NoBody");
+    }
+
+    #[test]
+    fn a_json_no_body_parameter_counts_as_a_body() {
+        let d = descriptor_of("async fn f(b: Json<NoBody>) -> Json<Item> { todo!() }");
+        assert_eq!(d.request_type, "NoBody");
+        assert!(d.has_body);
+        let d = descriptor_of("async fn f(b: Json<Vec<NewItem>>) -> Json<Item> { todo!() }");
+        assert_eq!(d.request_type, "NewItem");
+        assert!(d.request_list);
     }
 }

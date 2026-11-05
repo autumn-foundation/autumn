@@ -45,6 +45,12 @@ pub struct BundleEndpoint {
     pub method: String,
     /// Route path, with `{param}` placeholders.
     pub path: String,
+    /// Whether the handler reads a JSON request body.
+    pub has_body: bool,
+    /// Whether the request body is a JSON array of `request`.
+    pub request_list: bool,
+    /// Whether the response body is a JSON array of `response`.
+    pub response_list: bool,
     /// What the endpoint accepts.
     pub request: WireTypeDescriptor,
     /// What the endpoint produces.
@@ -156,6 +162,10 @@ impl Bundle {
                 krate: endpoint.krate.clone(),
                 method: endpoint.method.clone(),
                 path: endpoint.path.clone(),
+                // A descriptor without the flag predates it: infer it.
+                has_body: endpoint.has_body || endpoint.request_type != NO_BODY,
+                request_list: endpoint.request_list,
+                response_list: endpoint.response_list,
                 request: resolve_type(&endpoint.request_type, endpoint, &types)?,
                 response: resolve_type(&endpoint.response_type, endpoint, &types)?,
             });
@@ -371,6 +381,8 @@ mod tests {
             path: path.to_owned(),
             request_type: request.to_owned(),
             response_type: "Item".to_owned(),
+            has_body: request != "NoBody",
+            ..EndpointDescriptor::default()
         }
     }
 
@@ -636,5 +648,22 @@ mod tests {
         write(dir.path(), "type.mesh-storefront.Item.json", &local_item);
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert_eq!(bundle.callers[0].service, "catalog");
+    }
+
+    #[test]
+    fn a_list_endpoint_resolves_its_element_shape_and_keeps_the_array() {
+        let dir = fixture();
+        let mut list = endpoint("list_items", "/items", "NoBody");
+        list.response_list = true;
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.list_items.json",
+            &list,
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let ep = bundle.endpoint("catalog", "list_items").expect("endpoint");
+        assert!(ep.response_list);
+        assert_eq!(ep.response.name, "Item");
+        assert!(!ep.has_body);
     }
 }

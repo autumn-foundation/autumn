@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 
 use autumn_macros_support::wire::WireFieldDescriptor;
 
-use super::bundle::{Bundle, BundleCall, BundleEndpoint, NO_BODY};
+use super::bundle::{Bundle, BundleCall, BundleEndpoint};
 
 /// The two deploy windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,6 +33,8 @@ pub enum BreakKind {
     RouteRemoved,
     /// The caller's route has no endpoint on the serving side.
     RouteMissing,
+    /// The response body changed between a JSON object and a JSON array.
+    ResponseListChanged,
     /// The caller reads a response field the callee does not produce.
     ResponseFieldMissing(String),
     /// The caller's response type needs a field the callee may leave out.
@@ -54,6 +56,8 @@ pub enum BreakKind {
     },
     /// The caller sends no body, and the callee now reads one.
     RequestBodyMissing,
+    /// The request body changed between a JSON object and a JSON array.
+    RequestListChanged,
     /// The callee requires a request field the caller does not always send.
     RequestFieldNotSent(String),
     /// The caller sets a request field the callee ignores.
@@ -322,6 +326,11 @@ fn response_breaks(
     call: &BundleCall,
     report: &mut impl FnMut(BreakKind),
 ) {
+    if view.response_list != serve.response_list {
+        // An object where an array was, or the reverse: no field matters.
+        report(BreakKind::ResponseListChanged);
+        return;
+    }
     let decoded = &view.response.deserialized;
     let produced = &serve.response.serialized;
     let mut named = BTreeSet::new();
@@ -373,7 +382,11 @@ fn request_breaks(
 ) {
     let sent = &view.request.serialized;
     let accepted = &serve.request.deserialized;
-    if view.request.name == NO_BODY && serve.request.name != NO_BODY {
+    if view.request_list != serve.request_list {
+        report(BreakKind::RequestListChanged);
+        return;
+    }
+    if !view.has_body && serve.has_body {
         // The client sends no body and no content type. A `Json` extractor
         // refuses that request, whatever its fields are.
         report(BreakKind::RequestBodyMissing);
@@ -578,6 +591,14 @@ fn render_window(out: &mut String, title: &str, breaks: &[Break]) {
                 "{who} decodes field `{f}` under its name or an alias, and {callee} produces \
                  both keys"
             ),
+            BreakKind::ResponseListChanged => format!(
+                "the response body is a JSON array on one side and an object on the other, so \
+                 {who} cannot decode what {callee} sends"
+            ),
+            BreakKind::RequestListChanged => format!(
+                "the request body is a JSON array on one side and an object on the other, so \
+                 {callee} cannot decode what {who} sends"
+            ),
             BreakKind::RequestBodyMissing => {
                 format!("{who} sends no request body, and {callee} reads one")
             }
@@ -660,6 +681,9 @@ mod tests {
                     krate: "mesh-catalog".to_owned(),
                     method: "POST".to_owned(),
                     path: "/items".to_owned(),
+                    has_body: true,
+                    request_list: false,
+                    response_list: false,
                     request: shape(
                         "NewItem",
                         vec![
@@ -679,6 +703,9 @@ mod tests {
                     krate: "mesh-catalog".to_owned(),
                     method: "GET".to_owned(),
                     path: "/items/{id}".to_owned(),
+                    has_body: false,
+                    request_list: false,
+                    response_list: false,
                     request: shape("NoBody", Vec::new(), Vec::new()),
                     response: item(),
                 },
@@ -1128,6 +1155,7 @@ mod tests {
     fn a_body_on_a_route_that_had_none_is_a_break() {
         let deployed = release_1();
         let mut current = release_1();
+        ep(&mut current, "get_item").has_body = true;
         ep(&mut current, "get_item").request = shape(
             "Filter",
             vec![field("q", "q", "Option<String>", true)],
@@ -1254,5 +1282,32 @@ mod tests {
             kinds(&report.callee_first),
             [BreakKind::RequestFieldNotSent("token".to_owned())]
         );
+    }
+
+    #[test]
+    fn a_json_no_body_extractor_still_needs_a_body() {
+        let deployed = release_1();
+        let mut current = release_1();
+        // `Json<NoBody>`: the type name is `NoBody`, and a body is read.
+        ep(&mut current, "get_item").has_body = true;
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::RequestBodyMissing]);
+    }
+
+    #[test]
+    fn an_object_body_that_becomes_a_list_is_a_break() {
+        let deployed = release_1();
+        let mut current = release_1();
+        ep(&mut current, "get_item").response_list = true;
+        let report = compare(&deployed, &current);
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::ResponseListChanged]
+        );
+        let mut current = release_1();
+        ep(&mut current, "create_item").request_list = true;
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::RequestListChanged]);
     }
 }

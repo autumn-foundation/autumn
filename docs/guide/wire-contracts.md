@@ -229,8 +229,9 @@ serves with the types of its release. The rules:
 * **Request dropped.** The callee must accept each field the call site sets.
 * **Closed objects.** With `#[serde(deny_unknown_fields)]`, the other side must
   not send an unknown key.
-* **Request body.** A caller that sends no body must not meet a callee that
-  reads one.
+* **Body.** A caller that sends no body must not meet a callee that reads
+  one. A body that is a JSON array (`Vec<T>`) must stay an array, and an
+  object must stay an object.
 * **Field types.** A field's Rust type must not change. Path prefixes do not
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.

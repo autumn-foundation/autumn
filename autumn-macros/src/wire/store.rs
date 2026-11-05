@@ -259,6 +259,7 @@ mod tests {
             path: "/items/{id}".to_owned(),
             request_type: "NoBody".to_owned(),
             response_type: "Item".to_owned(),
+            ..EndpointDescriptor::default()
         }
     }
 

@@ -7,6 +7,9 @@
       "krate": "mesh-catalog",
       "method": "POST",
       "path": "/items",
+      "has_body": true,
+      "request_list": false,
+      "response_list": false,
       "request": {
         "name": "NewItem",
         "serialized": [
@@ -138,6 +141,9 @@
       "krate": "mesh-catalog",
       "method": "GET",
       "path": "/items/{id}",
+      "has_body": false,
+      "request_list": false,
+      "response_list": false,
       "request": {
         "name": "NoBody",
         "serialized": [],
