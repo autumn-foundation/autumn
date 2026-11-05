@@ -16874,8 +16874,8 @@ mod fleet_boot_tests {
         let database = setup_database(
             &config,
             vec![
-                ("app", CONTROL, MigrationScope::Control),
-                ("app", SHARDS, MigrationScope::Shards),
+                ("app", CONTROL, MigrationScope::Control, None),
+                ("app", SHARDS, MigrationScope::Shards, None),
             ],
             None,
             None,
