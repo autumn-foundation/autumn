@@ -91,6 +91,12 @@ pub const WARMER: autumn_web::background::PluginCapability =
         autumn_web::Capability::ServesHttp,
     );
 
+/// The background task name of the reference heartbeat.
+pub const HEARTBEAT_TASK: &str = "reference.heartbeat";
+
+/// The interval of the reference heartbeat.
+const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A plugin that exercises every stable plugin-facing API.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReferencePlugin;
@@ -123,6 +129,9 @@ impl Plugin for ReferencePlugin {
         let app = app.routes(routes![index]);
 
         // surface: AppBuilder::on_startup
+        //
+        // One-time setup that every role needs. Every role runs every
+        // startup hook, so do not start a loop here.
         let app = app.on_startup(|_state| async move {
             autumn_web::reexports::tracing::debug!("autumn-plugin-reference started");
             Ok(())
@@ -130,15 +139,22 @@ impl Plugin for ReferencePlugin {
 
         // surface: AppBuilder::background_task
         //
-        // A loop that runs until shutdown. Do not `tokio::spawn` it in
-        // `on_startup`: every role runs every startup hook. The framework
-        // starts this task only on roles that run `maintenance`.
+        // A loop that runs until shutdown. The framework starts it only on
+        // roles that run `maintenance` (`combined` and `worker`), and the
+        // drain waits for it. Select on `shutdown` at each wait.
         let app = app.background_task(
-            "reference.heartbeat",
+            HEARTBEAT_TASK,
             autumn_web::Capability::Maintenance,
             |_state, shutdown| async move {
-                shutdown.cancelled().await;
-                Ok(())
+                let mut ticker = autumn_web::reexports::tokio::time::interval(HEARTBEAT_EVERY);
+                loop {
+                    autumn_web::reexports::tokio::select! {
+                        () = shutdown.cancelled() => return Ok(()),
+                        _ = ticker.tick() => {
+                            autumn_web::reexports::tracing::trace!("reference heartbeat");
+                        }
+                    }
+                }
             },
         );
 
@@ -512,6 +528,36 @@ mod tests {
             serde_json::json!(["combined", "worker", "quiet"])
         );
         assert_eq!(tasks["reference.heartbeat"]["runs_here"], true);
+    }
+
+    /// The heartbeat status on `role`.
+    async fn heartbeat_on(role: &str) -> serde_json::Value {
+        let config: autumn_web::config::AutumnConfig = toml::from_str(&format!(
+            "role = \"{role}\"\n[actuator]\nsensitive = true\n"
+        ))
+        .expect("config parses");
+        let client = autumn_web::test::TestApp::new()
+            .config(config)
+            .plugin(ReferencePlugin::new())
+            .build();
+        let body: serde_json::Value = client
+            .get("/actuator/tasks")
+            .send()
+            .await
+            .assert_ok()
+            .json();
+        body["background_tasks"][HEARTBEAT_TASK].clone()
+    }
+
+    /// The heartbeat runs on `maintenance` roles. `web` does not start it.
+    #[tokio::test]
+    async fn the_heartbeat_runs_on_worker_and_not_on_web() {
+        let web = heartbeat_on("web").await;
+        assert_eq!(web["runs_here"], false, "{web}");
+        assert_eq!(web["status"], "not_placed", "{web}");
+        let worker = heartbeat_on("worker").await;
+        assert_eq!(worker["runs_here"], true, "{worker}");
+        assert_eq!(worker["status"], "running", "{worker}");
     }
 
     #[test]

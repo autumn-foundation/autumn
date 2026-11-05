@@ -159,8 +159,12 @@ the claim releases it, so the provider's redelivery applies again.
 `invoice.payment_failed` opens a row in `billing_dunning` and enqueues the
 `autumn_billing_dunning_retry` job at the first retry time. The row is the
 schedule; the job only carries the invoice id and reads the row, so a duplicate
-run, an early run, or a restart is safe. On startup the plugin re-arms every
-open row and prunes applied ledger rows older than 30 days. A row left
+run, an early run, or a restart is safe. At boot the background task
+`billing.dunning_rearm` re-arms every open row and prunes applied ledger rows
+older than 30 days. Each process whose role drains the `billing` queue runs
+it once at boot (capability `billing.dunning`, parent `job_workers`):
+`combined` and `worker`, not `web`. Two workers that re-arm one row queue one job: the retry job is
+unique per invoice while it is pending. A row left
 `running` by a crashed process is reclaimed 10 minutes after its last update.
 Each retry asks the provider to collect the invoice again with a stable
 idempotency key:

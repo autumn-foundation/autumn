@@ -4927,7 +4927,7 @@ impl JobClient {
     /// uniqueness window (its key eviction needs its own round trip per
     /// key). Only the Postgres case, with no interceptor and no TTL
     /// window, batches every `INSERT` into one round trip. This is the
-    /// case `dunning::rearm_pending` hits on each restart (issue #2748).
+    /// case `dunning::rearm_pending_now` hits on each restart.
     ///
     /// Returns one result per item in `items`, in the same order. A
     /// coalesced duplicate counts as success, same as [`Self::enqueue_due`].

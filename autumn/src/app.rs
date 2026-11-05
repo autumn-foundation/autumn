@@ -19046,6 +19046,46 @@ mod tests {
         assert_eq!(manifest, "queues = [\"critical\", \"sync\"]\n");
     }
 
+    /// A plugin declares its job queue with `.jobs(...)`. The manifest lists
+    /// it, and a pin on it keeps it in the drain plan.
+    #[test]
+    fn plugin_job_queues_reach_the_manifest_and_the_pin() {
+        fn noop(
+            _state: AppState,
+            _payload: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        struct QueuePlugin;
+        impl crate::plugin::Plugin for QueuePlugin {
+            fn build(self, app: AppBuilder) -> AppBuilder {
+                app.jobs(vec![crate::job::JobInfo {
+                    version: 1,
+                    name: "plugin_encode".to_owned(),
+                    max_attempts: 1,
+                    initial_backoff_ms: 1,
+                    queue: "media".to_owned(),
+                    uniqueness: None,
+                    concurrency: None,
+                    handler: noop,
+                    timeout: None,
+                }])
+            }
+        }
+        let builder = app().plugin(QueuePlugin);
+        let cfg = crate::config::JobQueuesConfig::strict_list(["critical"]);
+        let manifest = dump_jobs_manifest(&cfg, builder.jobs.clone(), Vec::new(), &[]);
+        assert_eq!(manifest, "queues = [\"critical\", \"media\"]\n");
+
+        let declared: Vec<String> = builder.jobs.iter().map(|job| job.queue.clone()).collect();
+        let (mut schedule, _) = crate::job::QueueSchedule::effective(&cfg, &declared);
+        let uncovered = schedule.retain_pinned(&["media".to_owned()]);
+        assert_eq!(schedule.names(), ["media"]);
+        assert_eq!(uncovered, ["critical"]);
+    }
+
     #[cfg(feature = "db")]
     const APP_TEST_MIGRATIONS: crate::migrate::EmbeddedMigrations =
         diesel_migrations::embed_migrations!("test_migrations");
