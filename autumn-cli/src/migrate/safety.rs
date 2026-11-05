@@ -1092,7 +1092,7 @@ fn changes_string_escape_mode(normalized: &str) -> bool {
     }
     // Text data does not run. The text body of a `DO` block or a function
     // can run.
-    let text_body_runs = lower.starts_with("do ")
+    let text_body_runs = strip_word_prefix(&lower, "do").is_some()
         || (lower.starts_with("create ")
             && (lower.contains(" function ") || lower.contains(" procedure ")));
     let code = if text_body_runs {
@@ -1159,6 +1159,16 @@ fn ends_with_set_keyword(before: &str) -> bool {
     ["set", "reset"]
         .iter()
         .any(|w| strip_word_suffix(rest, w).is_some())
+}
+
+/// `text` without the word `word` at its start, or `None`. The character
+/// after `word` must not be an identifier character, as in `DO'..'`.
+fn strip_word_prefix<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(word)?;
+    rest.chars()
+        .next()
+        .is_none_or(|c| !is_identifier_char(c))
+        .then_some(rest)
 }
 
 /// `text` without the word `word` at its end, or `None`. The character
@@ -3242,6 +3252,8 @@ mod tests {
             "DO $$ BEGIN RESET ALL; END $$;",
             // A plain-text body can run.
             "DO 'BEGIN RESET ALL; END';",
+            "DO'BEGIN SET standard_conforming_strings = off; END';",
+            "DO E'BEGIN RESET ALL; END';",
             "CREATE FUNCTION f() RETURNS void AS 'SET standard_conforming_strings = off' LANGUAGE sql;",
         ] {
             let findings = classify_sql_for(pg, sql);
@@ -3273,6 +3285,7 @@ mod tests {
             "SELECT 'RESET ALL', E'update pg_settings', 'set_config(x)';",
             "SELECT 'é RESET ALL', set_config('search_path', 'app', false);",
             "SELECT $A$ $a$ $A$, 'RESET ALL';",
+            "done 'RESET ALL';",
             "-- autumn-safety: reviewed\nSET standard_conforming_strings = off;",
         ] {
             assert_eq!(ops(pg, sql), Vec::<String>::new(), "{sql:?}");
