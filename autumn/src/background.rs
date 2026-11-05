@@ -1375,7 +1375,9 @@ base = "web"
                 }),
             )],
         };
-        assert_eq!(runtime.drain(Duration::from_millis(20)).await, 1);
+        // 400 ms: the abort reserve (a quarter) is well above the 15 ms timer
+        // resolution of Windows.
+        assert_eq!(runtime.drain(Duration::from_millis(400)).await, 1);
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "the aborted task still runs after drain"
