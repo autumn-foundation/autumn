@@ -4757,6 +4757,69 @@ mod tests {
         );
     }
 
+    /// Two app sets apply with one collision map, as two registered sets do
+    /// at boot. A version both sets use applies twice: one migration keeps
+    /// it, the other gets a substitute. A second run applies nothing.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_sets_apply_each_app_set_with_one_collision_map() {
+        use diesel::{Connection as _, RunQueryDsl as _};
+
+        #[derive(diesel::QueryableByName)]
+        struct Name {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+
+        let (migrations_dir, url) = sqlite_scratch("sets");
+        let control_dir = migrations_dir.with_file_name("migrations-control");
+        for (dir, name, table) in [
+            (&migrations_dir, "20990101000000_create_notes", "notes"),
+            (&control_dir, "20990101000000_create_tenants", "tenants"),
+        ] {
+            let migration = dir.join(name);
+            std::fs::create_dir_all(&migration).expect("migration dir");
+            std::fs::write(
+                migration.join("up.sql"),
+                format!("CREATE TABLE {table} (id INTEGER);"),
+            )
+            .expect("up.sql");
+            std::fs::write(migration.join("down.sql"), format!("DROP TABLE {table};"))
+                .expect("down.sql");
+        }
+        let sets = [
+            FileBasedMigrations::from_path(&migrations_dir).expect("app set"),
+            FileBasedMigrations::from_path(&control_dir).expect("control set"),
+        ];
+
+        let first =
+            run_pending_sqlite_sets_with_framework_migrations(&url, &sets).expect("first apply");
+        let shared: Vec<&String> = first
+            .applied
+            .iter()
+            .filter(|version| version.starts_with("20990101000000"))
+            .collect();
+        assert_eq!(shared.len(), 2, "both sets apply: {:?}", first.applied);
+        assert_ne!(shared[0], shared[1], "one gets a substitute version");
+
+        let path = url.trim_start_matches("sqlite://");
+        let mut conn = diesel::SqliteConnection::establish(path).expect("open");
+        let tables: Vec<String> =
+            diesel::sql_query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .load::<Name>(&mut conn)
+                .expect("tables")
+                .into_iter()
+                .map(|row| row.name)
+                .collect();
+        for table in ["notes", "tenants"] {
+            assert!(tables.contains(&table.to_owned()), "{table}: {tables:?}");
+        }
+
+        let second =
+            run_pending_sqlite_sets_with_framework_migrations(&url, &sets).expect("second apply");
+        assert!(second.applied.is_empty(), "{:?}", second.applied);
+    }
+
     /// A history table the guarded path cannot read stops the run before
     /// the guard sees anything, and nothing is applied.
     #[cfg(feature = "sqlite")]
