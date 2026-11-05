@@ -313,8 +313,17 @@ impl GrantPlan {
                 "REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schemas} FROM {role};"
             );
             let _ = writeln!(out, "REVOKE ALL ON SCHEMA {schemas} FROM {role};");
+            // Every schema that holds a granted table or sequence. A
+            // qualified `owns` pattern can name a table outside `g.schema`.
             let usage: BTreeSet<&str> = std::iter::once(g.schema.as_str())
-                .chain(g.read.iter().chain(&g.write).map(|t| t.schema.as_str()))
+                .chain(
+                    g.own
+                        .iter()
+                        .chain(&g.read)
+                        .chain(&g.write)
+                        .chain(&g.sequences)
+                        .map(|t| t.schema.as_str()),
+                )
                 .collect();
             let _ = writeln!(
                 out,
@@ -596,6 +605,24 @@ ALTER ROLE "marketing" SET search_path = "marketing", "public";
 COMMIT;
 "#;
         assert_eq!(sql, expected);
+    }
+
+    #[test]
+    fn a_qualified_owns_pattern_gets_usage_on_its_schema() {
+        let text = r#"
+[boundaries.marketing]
+owns = ["shared.contacts"]
+schema = "marketing"
+role = "marketing"
+"#;
+        let tables = [CatalogTable::new("shared", "contacts")];
+        let plan = plan(&config(text), &tables).unwrap();
+        assert_eq!(names(&role(&plan, "marketing").own), ["shared.contacts"]);
+        let sql = plan.sql().unwrap();
+        assert!(
+            sql.contains(r#"GRANT USAGE ON SCHEMA "marketing", "shared" TO "marketing";"#),
+            "{sql}"
+        );
     }
 
     #[test]

@@ -60,17 +60,8 @@ pub struct SchemaRsCheck {
     pub stale_macros: bool,
 }
 
-/// Render the `diesel::table!` block for `table`.
-///
-/// # Errors
-///
-/// Returns the reason when the block cannot be rendered.
-pub fn render_block(table: &Table) -> Result<String, String> {
-    render_block_in(table, None)
-}
-
-/// [`render_block`] in a Postgres schema: the header is
-/// `schema.table (key) {` (#3550).
+/// Render the `diesel::table!` block for `table`. With a Postgres schema,
+/// the header is `schema.table (key) {` (#3550).
 ///
 /// # Errors
 ///
@@ -852,7 +843,7 @@ mod tests {
     #[test]
     fn render_block_postgres() {
         assert_eq!(
-            render_block(&posts(Backend::Postgres)).unwrap(),
+            render_block_in(&posts(Backend::Postgres), None).unwrap(),
             POSTS_BLOCK
         );
     }
@@ -869,7 +860,7 @@ mod tests {
         t.columns.push(Column::new("meta", ColumnType::Json));
         t.columns.push(Column::new("token", ColumnType::Uuid));
         t.primary_key = vec!["id".to_owned()];
-        let block = render_block(&t).unwrap();
+        let block = render_block_in(&t, None).unwrap();
         assert!(block.contains("seen_at -> TimestamptzSqlite,"), "{block}");
         assert!(block.contains("data -> Binary,"), "{block}");
         assert!(block.contains("meta -> Json,"), "{block}");
@@ -880,7 +871,7 @@ mod tests {
     fn render_block_writes_a_keyword_column_as_a_raw_ident() {
         let mut t = posts(Backend::Postgres);
         t.columns.push(Column::new("type", ColumnType::Text));
-        let block = render_block(&t).unwrap();
+        let block = render_block_in(&t, None).unwrap();
         assert!(block.contains("        r#type -> Text,\n"), "{block}");
     }
 
@@ -893,18 +884,26 @@ mod tests {
                 pg_type: "inet".to_owned(),
             },
         ));
-        assert!(render_block(&opaque).unwrap_err().contains("addr"));
+        assert!(render_block_in(&opaque, None).unwrap_err().contains("addr"));
 
         let mut no_pk = posts(Backend::Postgres);
         no_pk.primary_key.clear();
-        assert!(render_block(&no_pk).unwrap_err().contains("primary key"));
+        assert!(
+            render_block_in(&no_pk, None)
+                .unwrap_err()
+                .contains("primary key")
+        );
 
         let mut bad_name = posts(Backend::Postgres);
         bad_name.columns.push(Column::new("self", ColumnType::Text));
-        assert!(render_block(&bad_name).unwrap_err().contains("self"));
+        assert!(
+            render_block_in(&bad_name, None)
+                .unwrap_err()
+                .contains("self")
+        );
 
         let qualified = Table::new("auth.users", Backend::Postgres);
-        assert!(render_block(&qualified).is_err());
+        assert!(render_block_in(&qualified, None).is_err());
     }
 
     // -- sync ----------------------------------------------------------------
