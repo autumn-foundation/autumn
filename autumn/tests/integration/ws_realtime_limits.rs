@@ -14,6 +14,12 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as TMessage;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
+/// How long a test waits for a closed socket to free its slot. A release
+/// normally takes milliseconds. The limit only stops a test that hangs, so
+/// it leaves room for a slow CI runner, which can pass 5s before the first
+/// reconnect.
+const SLOT_RELEASE_BUDGET: Duration = Duration::from_secs(15);
+
 type Client =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -196,7 +202,7 @@ async fn connections_beyond_max_connections_are_rejected() {
     // Closing the first socket frees its slot.
     first.close(None).await.ok();
     drop(first);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SLOT_RELEASE_BUDGET;
     loop {
         if tokio_tungstenite::connect_async(format!("ws://{addr}/limited"))
             .await
@@ -292,7 +298,7 @@ async fn a_server_close_releases_a_split_socket() {
         .await
         .expect("first socket");
     // After the idle close, the slot is free, although the writer half lives.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SLOT_RELEASE_BUDGET;
     loop {
         if tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
             .await
@@ -321,7 +327,7 @@ async fn a_receive_error_releases_a_split_socket() {
     };
     tcp.write_all(&[0x83, 0x80, 0, 0, 0, 0]).await.unwrap();
     // The client keeps its socket open. The slot must still come free.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SLOT_RELEASE_BUDGET;
     loop {
         if tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
             .await
@@ -351,7 +357,7 @@ async fn a_peer_close_releases_a_split_socket() {
         .expect("close reply in time");
     assert!(matches!(reply, Some(Ok(TMessage::Close(_)))), "{reply:?}");
     // The slot comes free, although the writer half lives on.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SLOT_RELEASE_BUDGET;
     loop {
         if tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
             .await
@@ -425,7 +431,7 @@ async fn a_sink_side_close_releases_the_socket() {
         .expect("close frame in time");
     assert!(matches!(close, Some(Ok(TMessage::Close(_)))), "{close:?}");
     // The handler keeps both halves, but the closed socket frees its slot.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SLOT_RELEASE_BUDGET;
     loop {
         if tokio_tungstenite::connect_async(format!("ws://{addr}/sink-close"))
             .await
@@ -448,7 +454,7 @@ async fn a_sent_close_message_releases_the_socket() {
     let (_silent, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/sink-send-close"))
         .await
         .expect("first socket");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SLOT_RELEASE_BUDGET;
     loop {
         if tokio_tungstenite::connect_async(format!("ws://{addr}/sink-send-close"))
             .await
@@ -472,7 +478,7 @@ async fn a_send_error_releases_the_socket() {
         .expect("first socket");
     // The peer goes away. The handler keeps sending and keeps both halves.
     drop(client);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SLOT_RELEASE_BUDGET;
     loop {
         if tokio_tungstenite::connect_async(format!("ws://{addr}/sink-error"))
             .await
