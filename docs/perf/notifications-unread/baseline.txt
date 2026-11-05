@@ -1,0 +1,140 @@
+=== recipient 1
+Finalize Aggregate  (cost=44009.01..44009.02 rows=1 width=8) (actual rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=239 read=38922 written=13138
+  ->  Gather  (cost=44008.79..44009.00 rows=2 width=8) (actual rows=3 loops=1)
+        Output: (PARTIAL count(*))
+        Workers Planned: 2
+        Workers Launched: 2
+        Buffers: shared hit=239 read=38922 written=13138
+        ->  Partial Aggregate  (cost=43008.79..43008.80 rows=1 width=8) (actual rows=1 loops=3)
+              Output: PARTIAL count(*)
+              Buffers: shared hit=239 read=38922 written=13138
+              Worker 0:  actual rows=1 loops=1
+                Buffers: shared hit=41 read=11591 written=4237
+              Worker 1:  actual rows=1 loops=1
+                Buffers: shared hit=30 read=13376 written=4363
+              ->  Parallel Bitmap Heap Scan on public.notifications  (cost=2488.97..43006.46 rows=935 width=0) (actual rows=820 loops=3)
+                    Recheck Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '1'::bigint))
+                    Filter: (notifications.read_at IS NULL)
+                    Rows Removed by Filter: 55307
+                    Heap Blocks: exact=13988
+                    Buffers: shared hit=239 read=38922 written=13138
+                    Worker 0:  actual rows=724 loops=1
+                      Buffers: shared hit=41 read=11591 written=4237
+                    Worker 1:  actual rows=894 loops=1
+                      Buffers: shared hit=30 read=13376 written=4363
+                    ->  Bitmap Index Scan on idx_notifications_tenant_recipient  (cost=0.00..2488.41 rows=169198 width=0) (actual rows=168382 loops=1)
+                          Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '1'::bigint))
+                          Buffers: shared hit=135
+Query Identifier: -7205966525969651028
+Planning:
+  Buffers: shared hit=102
+Planning Time: 0.446 ms
+Execution Time: 111.524 ms
+Limit  (cost=44031.36..44033.69 rows=20 width=121) (actual rows=20 loops=1)
+  Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+  Buffers: shared hit=33 read=39158 written=1059
+  ->  Gather Merge  (cost=44031.36..44249.54 rows=1870 width=121) (actual rows=20 loops=1)
+        Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+        Workers Planned: 2
+        Workers Launched: 2
+        Buffers: shared hit=33 read=39158 written=1059
+        ->  Sort  (cost=43031.34..43033.67 rows=935 width=121) (actual rows=17 loops=3)
+              Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+              Sort Key: notifications.created_at DESC, notifications.id DESC
+              Sort Method: top-N heapsort  Memory: 30kB
+              Buffers: shared hit=33 read=39158 written=1059
+              Worker 0:  actual rows=20 loops=1
+                Sort Method: top-N heapsort  Memory: 30kB
+                Buffers: shared hit=15 read=10564 written=311
+              Worker 1:  actual rows=20 loops=1
+                Sort Method: top-N heapsort  Memory: 30kB
+                Buffers: shared hit=15 read=12498 written=302
+              ->  Parallel Bitmap Heap Scan on public.notifications  (cost=2488.97..43006.46 rows=935 width=121) (actual rows=820 loops=3)
+                    Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+                    Recheck Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '1'::bigint))
+                    Filter: (notifications.read_at IS NULL)
+                    Rows Removed by Filter: 55307
+                    Heap Blocks: exact=15964
+                    Buffers: shared hit=3 read=39158 written=1059
+                    Worker 0:  actual rows=709 loops=1
+                      Buffers: shared read=10564 written=311
+                    Worker 1:  actual rows=784 loops=1
+                      Buffers: shared read=12498 written=302
+                    ->  Bitmap Index Scan on idx_notifications_tenant_recipient  (cost=0.00..2488.41 rows=169198 width=0) (actual rows=168382 loops=1)
+                          Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '1'::bigint))
+                          Buffers: shared hit=3 read=132 written=12
+Query Identifier: 6908552937042743349
+Planning:
+  Buffers: shared hit=27 read=3
+Planning Time: 0.222 ms
+Execution Time: 100.899 ms
+=== recipient 126
+Aggregate  (cost=204.28..204.29 rows=1 width=8) (actual rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=423 read=655
+  ->  Index Scan using idx_notifications_tenant_recipient on public.notifications  (cost=0.43..204.27 rows=1 width=0) (actual rows=15 loops=1)
+        Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+        Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '126'::bigint))
+        Filter: (notifications.read_at IS NULL)
+        Rows Removed by Filter: 1077
+        Buffers: shared hit=423 read=655
+Query Identifier: -7205966525969651028
+Planning:
+  Buffers: shared hit=81 read=21
+Planning Time: 0.706 ms
+Execution Time: 5.224 ms
+Limit  (cost=204.28..204.29 rows=1 width=121) (actual rows=15 loops=1)
+  Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+  Buffers: shared hit=1084
+  ->  Sort  (cost=204.28..204.29 rows=1 width=121) (actual rows=15 loops=1)
+        Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+        Sort Key: notifications.created_at DESC, notifications.id DESC
+        Sort Method: quicksort  Memory: 28kB
+        Buffers: shared hit=1084
+        ->  Index Scan using idx_notifications_tenant_recipient on public.notifications  (cost=0.43..204.27 rows=1 width=121) (actual rows=15 loops=1)
+              Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+              Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '126'::bigint))
+              Filter: (notifications.read_at IS NULL)
+              Rows Removed by Filter: 1077
+              Buffers: shared hit=1078
+Query Identifier: 6908552937042743349
+Planning:
+  Buffers: shared hit=27 read=3
+Planning Time: 0.192 ms
+Execution Time: 0.905 ms
+=== recipient 3926
+Aggregate  (cost=204.28..204.29 rows=1 width=8) (actual rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=24 read=37
+  ->  Index Scan using idx_notifications_tenant_recipient on public.notifications  (cost=0.43..204.27 rows=1 width=0) (actual rows=2 loops=1)
+        Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+        Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '3926'::bigint))
+        Filter: (notifications.read_at IS NULL)
+        Rows Removed by Filter: 57
+        Buffers: shared hit=24 read=37
+Query Identifier: -7205966525969651028
+Planning:
+  Buffers: shared hit=102
+Planning Time: 0.333 ms
+Execution Time: 0.416 ms
+Limit  (cost=204.28..204.29 rows=1 width=121) (actual rows=2 loops=1)
+  Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+  Buffers: shared hit=67
+  ->  Sort  (cost=204.28..204.29 rows=1 width=121) (actual rows=2 loops=1)
+        Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+        Sort Key: notifications.created_at DESC, notifications.id DESC
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=67
+        ->  Index Scan using idx_notifications_tenant_recipient on public.notifications  (cost=0.43..204.27 rows=1 width=121) (actual rows=2 loops=1)
+              Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+              Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = '3926'::bigint))
+              Filter: (notifications.read_at IS NULL)
+              Rows Removed by Filter: 57
+              Buffers: shared hit=61
+Query Identifier: 6908552937042743349
+Planning:
+  Buffers: shared hit=30
+Planning Time: 0.125 ms
+Execution Time: 0.079 ms
