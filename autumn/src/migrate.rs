@@ -3812,9 +3812,10 @@ where
     )
 }
 
-/// [`run_pending_sqlite_with_framework_migrations`] for more than one app
-/// set, for example `migrations/` and `migrations-control/`. Each set counts
-/// as its own set in the collision map, as each registered set does at boot.
+/// [`run_pending_sqlite_with_framework_migrations`] for more than one app set.
+///
+/// For example, `migrations/` and `migrations-control/`. Each set counts as
+/// its own set in the collision map, as each registered set does at boot.
 /// The sets apply in the given order, then the framework sets.
 ///
 /// # Errors

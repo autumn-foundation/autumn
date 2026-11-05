@@ -15649,7 +15649,7 @@ fn shard_applied_sets_include(
 /// `[[database.shards]]` and no `[database.fleet]`. It then gets every
 /// scope, so a `Shards` set does not go missing on a one-database app.
 #[cfg(feature = "db")]
-fn control_is_only_database(config: &AutumnConfig) -> bool {
+const fn control_is_only_database(config: &AutumnConfig) -> bool {
     !config.database.has_shards() && config.database.fleet.is_none()
 }
 
