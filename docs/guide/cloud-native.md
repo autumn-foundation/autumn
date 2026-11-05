@@ -790,7 +790,7 @@ autumn_web::app()
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-cache-redis = "0.9"
+autumn-cache-redis = "0.10"
 ```
 
 `CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the

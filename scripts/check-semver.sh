@@ -251,13 +251,19 @@ for crate in "${CRATES[@]}"; do
     #     intersection-eligible and have been ADDED. `acme-pebble`, also new in
     #     0.8.0, stays OUT: it implies `test-support` (excluded below) and only
     #     the dedicated Pebble CI step enables it.
-    #   - EXCLUDES the 0.9.0-only features `ledger-profile`, `repl` and `webmcp`:
-    #     all three are NEW in 0.9.0 and absent from the 0.8.0 baseline, so the
-    #     symmetric enable would fail the baseline build ("v0.8.0 does not have
-    #     feature ...") and re-break the gate. Add each once a future baseline
-    #     carries it — the same rule that gated `collab`/`sla`/`constela`/
-    #     `plugin-sandbox` out of the previous revision. `postgres`, also new in
-    #     0.9.0, is named for the current build only (see below).
+    #   - Recomputed for the 0.10.0 release: 0.9.0 is now the crates.io
+    #     baseline, so `ledger-profile`, `repl` and `webmcp` — new in 0.9.0, and
+    #     excluded for that reason while 0.8.0 was the baseline — are
+    #     intersection-eligible and have been ADDED.
+    #   - EXCLUDES the 0.10.0-only features: the 16 module features of #2795
+    #     (`alerts` … `wizard`), the four widget families of #3408, and `jwt`
+    #     and `push`. All are NEW in 0.10.0 and absent from the 0.9.0 baseline,
+    #     so the symmetric enable would fail the baseline build ("v0.9.0 does
+    #     not have feature ...") and re-break the gate. Each gates items the
+    #     baseline compiled with no feature of its own, so they are named for the
+    #     current build only (`autumn_web_semver_current_only` below); without
+    #     them those items would look removed. `ledger-capture`, also new in
+    #     0.10.0, is a contributor-only diagnostic and is not in either list.
     #   - EXCLUDES `sqlite`, which IS baseline-present in 0.6.0, because it
     #     flips `db::RuntimeConnection` to a SQLite connection and is therefore
     #     type-incompatible with the Postgres surface this pass covers. It is
@@ -318,21 +324,21 @@ for crate in "${CRATES[@]}"; do
     # cargo-semver-checks is exactly `workspace_package_value "version"` — parsed
     # with the SAME method used for `workspace_version` above; if it cannot be
     # parsed at all, FAIL CLOSED (a release gate must be conservative).
-    SEMVER_ALLOWLIST_TARGET_VERSION="0.9.0"
+    SEMVER_ALLOWLIST_TARGET_VERSION="0.10.0"
     autumn_web_current_version="$(workspace_package_value "version")"
     [[ -n "$autumn_web_current_version" ]] || \
       die "could not determine autumn-web version for the SemVer allowlist guard"
     if [[ "$autumn_web_current_version" != "$SEMVER_ALLOWLIST_TARGET_VERSION" ]]; then
-      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.8.0-baseline ∩ 0.9.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently ledger-profile/repl/webmcp) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
+      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.9.0-baseline ∩ 0.10.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently the 0.10.0 module features, widget families, jwt and push) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
     fi
 
-    # `ledger-profile`, `repl` and `webmcp` are deliberately ABSENT: this list is the
-    # 0.8.0-baseline ∩ 0.9.0 intersection and is passed to BOTH builds, so
+    # The 0.10.0-only features are deliberately ABSENT: this list is the
+    # 0.9.0-baseline ∩ 0.10.0 intersection and is passed to BOTH builds, so
     # naming a feature the published baseline does not have fails that
     # invocation outright ("does not have feature") and turns the gate into a
     # tool error instead of a check. Each joins the list when a baseline
-    # carries it, as `collab` (#1806) did for this release.
-    autumn_web_semver_features="maud,htmx,tailwind,db,postgres,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme,sim-testing,pdf,edge,collab,sla,constela,plugin-sandbox"
+    # carries it, as `webmcp` did for this release.
+    autumn_web_semver_features="maud,htmx,tailwind,db,postgres,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme,sim-testing,pdf,edge,collab,sla,constela,plugin-sandbox,ledger-profile,repl,webmcp"
     # The SQLite backend surface: the SAME list plus `sqlite`.
     #
     # It was `sqlite` alone at first, on the theory that a minimal set is the
@@ -357,8 +363,10 @@ for crate in "${CRATES[@]}"; do
     # client. The 0.9.0 baseline has `postgres`, so both builds name it in the
     # shared list. Use this for a feature only the current build has.
     # The widget families (#3408) gate items the baseline has under `maud`
-    # alone. Without them here, those items look removed.
-    autumn_web_semver_current_only="widgets-search,widgets-social,widgets-workflow,widgets-charts"
+    # alone, and the module features (#2795), `jwt` and `push` gate items the
+    # baseline compiled with no feature of its own. Without them here, those
+    # items look removed.
+    autumn_web_semver_current_only="widgets-search,widgets-social,widgets-workflow,widgets-charts,alerts,custom-domains,data-retention,experiments,feature-flags,gdpr,graph,idempotency,job-tracking,ledger,money,nested-form,slo,upgrade,version-history,wizard,jwt,push"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
     pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
