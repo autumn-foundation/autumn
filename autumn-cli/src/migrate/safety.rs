@@ -114,13 +114,13 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
     // tables when we encounter their CREATE INDEX statements below.
     let newly_created: Vec<String> = stmts
         .iter()
-        .filter(|s| !has_review_suppression(s))
+        .filter(|s| !has_review_suppression(backend, s))
         .filter_map(|s| extract_created_table_name(&normalize_statement(backend, s)))
         .collect();
 
     stmts
         .iter()
-        .filter(|stmt| !has_review_suppression(stmt))
+        .filter(|stmt| !has_review_suppression(backend, stmt))
         .flat_map(|stmt| {
             let normalized = normalize_statement(backend, stmt);
             let mut findings = classify_statement(backend, &normalized, &newly_created);
@@ -139,12 +139,18 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
 /// Returns `true` if the raw (un-normalized) statement carries an operator
 /// acknowledgement marker (`-- autumn-safety: reviewed`).
 ///
-/// The check is done on the raw text before comment-stripping so the marker
-/// is not accidentally erased.
-fn has_review_suppression(stmt: &str) -> bool {
-    stmt.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("--") && trimmed.contains("autumn-safety: reviewed")
+/// The marker is a `--` comment at the start of a line. Only white space can
+/// come before it on the line. The same text in a quoted span is not a marker.
+fn has_review_suppression(backend: DatabaseBackend, stmt: &str) -> bool {
+    let mut line_start = true;
+    tokens(backend, stmt).any(|(kind, text)| {
+        let marker = kind == TokenKind::LineComment
+            && line_start
+            && text.contains("autumn-safety: reviewed");
+        line_start = kind == TokenKind::Plain
+            && text.starts_with(is_sql_space)
+            && (line_start || text == "\n");
+        marker
     })
 }
 
@@ -387,7 +393,7 @@ const CREATE_INDEX_SQLITE_OP: &str = "CREATE INDEX";
 /// (`'a b'`, with `''` as the escaped quote), and a signed number (`-1`).
 /// A `DEFAULT` inside a foreign-key action (`ON UPDATE SET DEFAULT`) is not a
 /// column default and is skipped.
-fn add_column_default_token(subcommand: &str) -> Option<String> {
+fn add_column_default_token(backend: DatabaseBackend, subcommand: &str) -> Option<String> {
     let mut from = 0;
     let rest = loop {
         let at = subcommand[from..].find(" default")? + from;
@@ -400,22 +406,27 @@ fn add_column_default_token(subcommand: &str) -> Option<String> {
         };
         // `SET DEFAULT` here is an FK action, not this column's default.
         if let Some(value) = value
-            && !subcommand[..at].trim_end().ends_with(" set")
+            && !subcommand[..at]
+                .trim_end_matches(is_sql_space)
+                .ends_with(" set")
         {
             break value.trim_start_matches(is_sql_space);
         }
         from = at + " default".len();
     };
     if rest.starts_with('(') {
+        // A `(` or `)` in a quoted span is text.
         let mut depth = 0usize;
-        for (i, c) in rest.char_indices() {
-            match c {
-                '(' => depth += 1,
-                // `depth` is at least 1 here: the first character is `(`.
-                ')' => {
+        let mut end = 0;
+        for (kind, text) in tokens(backend, rest) {
+            end += text.len();
+            match (kind, text) {
+                (TokenKind::Plain, "(") => depth += 1,
+                // `depth` is at least 1 here: the first token is `(`.
+                (TokenKind::Plain, ")") => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(rest[..=i].to_owned());
+                        return Some(rest[..end].to_owned());
                     }
                 }
                 _ => {}
@@ -461,12 +472,14 @@ fn is_sqlite_constant_default(default: &str) -> bool {
         .strip_prefix('(')
         .and_then(|d| d.strip_suffix(')'))
         .unwrap_or(default)
-        .trim();
+        .trim_matches(is_sql_space);
     if matches!(inner, "current_time" | "current_date" | "current_timestamp") {
         return false;
     }
-    // A quoted literal is constant whatever it contains.
-    if inner.starts_with('\'') || inner.starts_with("x'") {
+    // A quoted literal or blob is constant whatever it holds, but only when
+    // it is the whole value: `'a' || random()` is an expression.
+    let literal = inner.strip_prefix('x').unwrap_or(inner);
+    if literal.starts_with('\'') && doubled_quote_len(literal, '\'') == literal.len() {
         return true;
     }
     // A number, including exponent form (`1e-3`), whose sign is part of the
@@ -476,7 +489,9 @@ fn is_sqlite_constant_default(default: &str) -> bool {
     }
     // Otherwise: a bare keyword literal. A call or an operator makes it an
     // expression.
-    let unsigned = inner.trim_start_matches(['+', '-']).trim_start();
+    let unsigned = inner
+        .trim_start_matches(['+', '-'])
+        .trim_start_matches(is_sql_space);
     !unsigned.contains(['(', ')', '+', '-', '*', '/', '|', '<', '>', '=', '\''])
 }
 
@@ -780,8 +795,9 @@ fn token_at(
     if let Some(len) = quoted_len(backend, rest, prev) {
         return Some((TokenKind::Quoted, len));
     }
+    // `$` is a name character, so `a$b` is one name. `@`, `:` and `#` are not.
     if backend == DatabaseBackend::Sqlite
-        && prev.is_none_or(|c| !is_identifier_char(c))
+        && (first != '$' || prev.is_none_or(|c| !is_identifier_char(c)))
         && let Some(len) = sqlite_variable_len(rest)
     {
         return Some((TokenKind::Plain, len));
@@ -815,7 +831,11 @@ fn quoted_len(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Optio
         b'`' if !postgres => Some(doubled_quote_len(rest, '`')),
         b'[' if !postgres => Some(rest[1..].find(']').map_or(rest.len(), |p| p + 2)),
         b'e' | b'E' if postgres && word_start && rest[1..].starts_with('\'') => {
-            Some(1 + escape_string_len(&rest[1..]))
+            let mut len = 1 + escape_string_len(&rest[1..]);
+            while let Some(gap) = string_continuation_len(&rest[len..]) {
+                len += gap + escape_string_len(&rest[len + gap..]);
+            }
+            Some(len)
         }
         b'$' if postgres && word_start => dollar_quote_len(rest),
         _ => None,
@@ -868,6 +888,27 @@ fn escape_string_len(rest: &str) -> usize {
         }
     }
     rest.len()
+}
+
+/// Byte length of the white space before a `'` that continues a Postgres
+/// literal, or `None`. The white space holds a newline and can hold `--`
+/// comments: `E'a'` and `'b'` on the next line are one literal.
+fn string_continuation_len(rest: &str) -> Option<usize> {
+    let mut newline = false;
+    let mut i = 0;
+    while let Some(c) = rest[i..].chars().next() {
+        if rest[i..].starts_with("--") {
+            i += line_comment_len(DatabaseBackend::Postgres, &rest[i..])?;
+        } else if matches!(c, '\n' | '\r') {
+            newline = true;
+            i += 1;
+        } else if matches!(c, ' ' | '\t' | '\x0C') || (newline && c == '\x0B') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (newline && rest[i..].starts_with('\'')).then_some(i)
 }
 
 /// Byte length of the dollar-quoted block (`$$…$$`, `$tag$…$tag$`) at the
@@ -932,30 +973,30 @@ fn block_comment_len(backend: DatabaseBackend, rest: &str) -> Option<usize> {
 
 /// Byte length of the `SQLite` variable at the start of `rest`, or `None`.
 ///
-/// A variable is `$`, `@`, `:` or `#`, then name characters. A `(` after the
-/// name runs to `)` or to a space, as in `$a(x)`. A quote in the variable is
-/// text, as in `SQLite`.
+/// A variable is `$`, `@`, `:` or `#`, then name characters. The name can
+/// hold `::`, as in `$a::b`. A `(` after the name runs to `)` or to white
+/// space, as in `$a(x)`. A quote in the variable is text, as in `SQLite`.
 fn sqlite_variable_len(rest: &str) -> Option<usize> {
     let body = rest.strip_prefix(['$', '@', ':', '#'])?;
-    let name_len: usize = body
-        .chars()
-        .take_while(|&c| is_identifier_char(c))
-        .map(char::len_utf8)
-        .sum();
-    if name_len == 0 {
-        return None;
+    let mut has_name = false;
+    let mut i = 0;
+    while let Some(c) = body[i..].chars().next() {
+        if is_identifier_char(c) {
+            has_name = true;
+            i += c.len_utf8();
+        } else if body[i..].starts_with("::") {
+            i += 2;
+        } else if c == '(' && has_name {
+            let args = &body[i..];
+            i += args
+                .find(|c: char| c == ')' || is_sql_space(c))
+                .map_or(args.len(), |p| p + usize::from(args[p..].starts_with(')')));
+            break;
+        } else {
+            break;
+        }
     }
-    let after = &body[name_len..];
-    let args_len = if after.starts_with('(') {
-        after
-            .find(|c: char| c == ')' || is_sql_space(c))
-            .map_or(after.len(), |p| {
-                p + usize::from(after[p..].starts_with(')'))
-            })
-    } else {
-        0
-    };
-    Some(1 + name_len + args_len)
+    has_name.then_some(1 + i)
 }
 
 /// Replace each `/* ... */` block comment in `sql` with one space.
@@ -1046,13 +1087,12 @@ fn is_volatile_function_default(backend: DatabaseBackend, default_expr: &str) ->
     let Some(paren_pos) = unquoted.find('(') else {
         return false; // no parentheses — constant literal
     };
-    // A function call has a name just before `(`. The name ends in a name
-    // character or in the `"` of a quoted name. A grouped constant like `(0)`
-    // has nothing or white space before it.
+    // A function call has a name character just before `(`. A grouped
+    // constant like `(0)` has nothing or white space before it.
     let is_fn_call = unquoted[..paren_pos]
         .chars()
         .next_back()
-        .is_some_and(|c| is_identifier_char(c) || c == '"');
+        .is_some_and(is_identifier_char);
     if !is_fn_call {
         return false; // parenthesized constant — uses the fast-default path
     }
@@ -1273,7 +1313,7 @@ fn classify_statement(
             if subcommand.starts_with("add column ") && subcommand.contains("not null") {
                 // SQLite drops a literal `DEFAULT NULL` before applying the
                 // NOT NULL check, so it is not a default there.
-                let default_token = add_column_default_token(subcommand);
+                let default_token = add_column_default_token(backend, subcommand);
                 let has_default = if sqlite {
                     default_token.as_deref().is_some_and(|d| d != "null")
                 } else {
@@ -1407,7 +1447,7 @@ fn classify_statement(
                 // `establish_sqlite_migration_connection`), so the statement does
                 // apply on the path this classifier grades.
                 if !fresh_table
-                    && let Some(default) = add_column_default_token(subcommand)
+                    && let Some(default) = add_column_default_token(backend, subcommand)
                     && !is_sqlite_constant_default(&default)
                 {
                     findings.push(SafetyFinding {
