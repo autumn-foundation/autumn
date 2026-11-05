@@ -149,6 +149,25 @@ pub enum GrantError {
     },
 }
 
+/// The spelling of `schema` in the catalog. Ownership matches a schema
+/// name without case, so the `search_path` must name the schema as the
+/// catalog has it: a quoted `"Marketing"` does not find `marketing`. An
+/// exact match comes first. A schema the catalog does not have keeps its
+/// configured name.
+fn catalog_spelling(schema: &str, tables: &[&CatalogTable]) -> String {
+    let names = || {
+        tables
+            .iter()
+            .flat_map(|t| std::iter::once(&t.table).chain(&t.sequences))
+            .map(|q| q.schema.as_str())
+    };
+    names()
+        .find(|s| *s == schema)
+        .or_else(|| names().find(|s| s.eq_ignore_ascii_case(schema)))
+        .unwrap_or(schema)
+        .to_owned()
+}
+
 /// Make the grant plan for `config` over the live `catalog`.
 ///
 /// # Errors
@@ -186,7 +205,7 @@ pub fn plan(config: &BoundaryConfig, catalog: &[CatalogTable]) -> Result<GrantPl
         let mut grants = RoleGrants {
             boundary: name.clone(),
             role: role.to_owned(),
-            schema: boundary.schema_name().to_owned(),
+            schema: catalog_spelling(boundary.schema_name(), &tables),
             ..RoleGrants::default()
         };
         for (table, owner) in tables.iter().zip(&owners) {
@@ -699,6 +718,20 @@ role = "marketing"
         let text = CONFIG.replace(r#"schema = "marketing""#, r#"schema = "Marketing""#);
         let plan = plan(&config(&text), &catalog()).unwrap();
         assert!(names(&role(&plan, "marketing").own).contains(&"marketing.drafts".to_owned()));
+        // The search_path names the schema as the catalog spells it.
+        let sql = plan.sql().unwrap();
+        assert!(
+            sql.contains(r#"ALTER ROLE "marketing" SET search_path = "marketing", "public";"#),
+            "{sql}"
+        );
+        // An exact spelling in the catalog wins over a match without case.
+        let mut both = catalog();
+        both.push(CatalogTable::new("Marketing", "drafts"));
+        let sql = super::plan(&config(&text), &both).unwrap().sql().unwrap();
+        assert!(
+            sql.contains(r#"SET search_path = "Marketing", "public";"#),
+            "{sql}"
+        );
     }
 
     #[test]
