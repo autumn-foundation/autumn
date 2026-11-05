@@ -1445,7 +1445,7 @@ mod tests {
         struct CachePlugin;
         impl crate::plugin::Plugin for CachePlugin {
             fn contract(&self) -> Option<PluginContract> {
-                Some(PluginContract::new("my-cache").autumn_web("0.9"))
+                Some(PluginContract::new("my-cache").autumn_web("0.10"))
             }
             fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
                 app.routes(crate::routes![stats])

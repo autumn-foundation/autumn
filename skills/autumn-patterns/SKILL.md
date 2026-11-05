@@ -37,7 +37,7 @@ server is needed. Add the feature for tests only:
 
 ```toml
 [dev-dependencies]
-autumn-web = { version = "0.9", features = ["test-support"] }
+autumn-web = { version = "0.10", features = ["test-support"] }
 ```
 
 ```rust

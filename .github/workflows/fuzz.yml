@@ -25,6 +25,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # kache S3 remote (.github/actions/kache). Unset variables keep the GitHub
+  # Actions cache. The write token is mapped only on a protected ref, so only
+  # pushes to trunk and trunk-dev (and scheduled runs) add to the store.
+  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET }}
+  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT }}
+  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION }}
+  AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID: ${{ secrets.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
+  AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY: ${{ secrets.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY }}
+  AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || '' }}
+  AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || '' }}
 
 jobs:
   meta:
@@ -47,8 +57,8 @@ jobs:
         # shutdown signal" — the runner agent is killed, so it takes the log
         # with it and no OOM line survives to read.
         #
-        # Warm caches were hiding this. Swatinem/rust-cache keys per matrix
-        # job, so each target has its own cache: whichever targets happened to
+        # Warm caches were hiding this. The build cache was keyed per matrix
+        # job, so each target had its own cache: whichever targets happened to
         # restore one passed, and the cold ones died. That is why an arbitrary
         # 2 of 5 failed per run (idempotency+headers on trunk-dev dd9e8ae3,
         # body+routing on #2182) and why touching fuzz/Cargo.toml — a
@@ -74,9 +84,7 @@ jobs:
         uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2.7.8
-        with:
-          workspaces: fuzz
+      - uses: ./.github/actions/kache
       - name: Fuzz ${{ matrix.target }} (30s burst, seeded from committed corpus)
         # Corpus dir defaults to fuzz/corpus/${{ matrix.target }}; -max_total_time
         # caps the run and -timeout flags any single input that hangs past 10s.

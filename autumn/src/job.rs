@@ -15790,9 +15790,29 @@ mod tests {
         assert!(status.last_error.is_some());
     }
 
+    /// Entropy whose every `u64` draw is one value, so a full-jitter delay is
+    /// known in advance.
+    #[derive(Debug)]
+    struct FixedDraw(u64);
+
+    impl crate::entropy::Entropy for FixedDraw {
+        fn next_u64(&self) -> u64 {
+            self.0
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            crate::entropy::OsEntropy.fill_bytes(dest);
+        }
+    }
+
     #[tokio::test]
     async fn job_admin_local_retriable_failure_is_not_operator_retryable_failed_work() {
-        let state = AppState::for_test().with_profile("dev");
+        // The retry delay is full jitter in [0, 60 s]. A random draw under
+        // 25 ms would requeue inside the window this test asserts is quiet,
+        // so pin the draw to the 60 s ceiling (60_000 % 60_001).
+        let state = AppState::for_test()
+            .with_profile("dev")
+            .with_entropy(Arc::new(FixedDraw(60_000)));
+        assert_eq!(job_retry_delay_ms(&state, 60_000, 1), 60_000);
         state.job_registry().register("flaky");
         state.job_registry().record_enqueue("flaky");
 

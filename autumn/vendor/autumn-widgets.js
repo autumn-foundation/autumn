@@ -830,6 +830,194 @@
     });
   }, true);
 
+  // ── password and one-time code (#3412) ────────────────────────────────────
+  // A reveal button has `hidden` in the server HTML. This code shows it and
+  // toggles its input between `password` and `text`. A submit, a page hide
+  // and an htmx history snapshot hide the password again, so the browser
+  // does not keep it as text. A strength hint shows a level as the user
+  // types. A one-time code keeps only digits. With a group, it writes a
+  // space between groups, and the `formdata` event removes the spaces.
+  var REVEAL = '[data-autumn-reveal]';
+  var OTP = 'input[data-autumn-otp]';
+
+  function revealed(btn) {
+    var input = document.getElementById(btn.getAttribute('aria-controls') || '');
+    return input && input.matches('input') ? input : null;
+  }
+
+  function setReveal(btn, on) {
+    var input = revealed(btn);
+    if (!input) return;
+    input.type = on ? 'text' : 'password';
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  function initReveal(btn) {
+    if (revealed(btn)) btn.hidden = false;
+  }
+
+  function hidePasswords() {
+    document.querySelectorAll(REVEAL + '[aria-pressed="true"]').forEach(function (btn) {
+      setReveal(btn, false);
+    });
+  }
+
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest && e.target.closest(REVEAL);
+    if (btn && !btn.disabled) setReveal(btn, btn.getAttribute('aria-pressed') !== 'true');
+  });
+  document.addEventListener('submit', hidePasswords, true);
+  window.addEventListener('pagehide', hidePasswords);
+  document.addEventListener('htmx:beforeHistorySave', hidePasswords);
+
+  // 0 to 3: one point each for 8, 12 and 16 characters, and one for three
+  // kinds of characters. One kind of character, or a character three times
+  // in a row, removes a point. A hint only: it does not know common
+  // passwords, and the server checks the policy.
+  function strength(value) {
+    var kinds = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^a-zA-Z0-9]/].filter(function (re) {
+      return re.test(value);
+    }).length;
+    var n = value.length;
+    var points = (n >= 8) + (n >= 12) + (n >= 16) + (kinds >= 3) - (kinds < 2) - /(.)\1\1/.test(value);
+    return Math.max(0, Math.min(3, points));
+  }
+
+  // The strength hint is the describedby element with the labels.
+  function showStrength(input) {
+    var ids = (input.getAttribute('aria-describedby') || '').split(/\s+/);
+    var out = null;
+    ids.forEach(function (id) {
+      var el = id && document.getElementById(id);
+      if (el && el.hasAttribute('data-autumn-strength')) out = el;
+    });
+    if (!out) return;
+    var level = input.value ? String(strength(input.value)) : '';
+    // Write only a new level, so the live region does not speak on each key.
+    if ((out.getAttribute('data-autumn-strength-level') || '') === level) return;
+    var labels;
+    try { labels = JSON.parse(out.getAttribute('data-autumn-strength')); } catch (err) { return; }
+    if (level) out.setAttribute('data-autumn-strength-level', level);
+    else out.removeAttribute('data-autumn-strength-level');
+    out.textContent = level && Array.isArray(labels) ? String(labels[+level] || '') : '';
+  }
+
+  // [length, group]. The group is 0 until `initOtp` turns it on.
+  function otpSize(input) {
+    return [parseInt(input.getAttribute('data-autumn-otp'), 10) || 6,
+      input.hasAttribute('data-autumn-otp-grouped')
+        ? parseInt(input.getAttribute('data-autumn-otp-group'), 10) || 0 : 0];
+  }
+
+  // Full-width digits (from CJK mail or an IME) become ASCII digits.
+  function asciiDigits(v) {
+    return v.replace(/[０-９]/g, function (c) {
+      return String.fromCharCode(c.charCodeAt(0) - 0xFEE0);
+    });
+  }
+
+  // The last value, so Backspace on a group space deletes the digit before
+  // it. `otpCollapsed` is true when the caret had no selection.
+  var otpLast = new WeakMap();
+  var otpCollapsed = new WeakMap();
+
+  // Keep the digits, up to the length. Put a space between groups. The caret
+  // stays after the same digit.
+  function formatOtp(input, type) {
+    var size = otpSize(input), n = size[0], g = size[1];
+    var raw = asciiDigits(input.value);
+    var at = input.selectionStart === null ? raw.length : input.selectionStart;
+    var before = raw.slice(0, at).replace(/\D/g, '').length;
+    var digits = raw.replace(/\D/g, '');
+    var last = otpLast.get(input);
+    if (g && last !== undefined && digits === last.replace(/\D/g, '') && otpCollapsed.get(input)) {
+      // Only a group space went away: delete the digit next to it.
+      if (type === 'deleteContentBackward' && before > 0) {
+        digits = digits.slice(0, before - 1) + digits.slice(before);
+        before--;
+      } else if (type === 'deleteContentForward') {
+        digits = digits.slice(0, before) + digits.slice(before + 1);
+      }
+    }
+    digits = digits.slice(0, n);
+    var value = g ? digits.replace(new RegExp('(\\d{' + g + '})(?=\\d)', 'g'), '$1 ') : digits;
+    otpLast.set(input, value);
+    if (value === input.value) return;
+    input.value = value;
+    before = Math.min(before, digits.length);
+    var pos = before + (g && before ? Math.floor((before - 1) / g) : 0);
+    if (document.activeElement === input) input.setSelectionRange(pos, pos);
+  }
+
+  // The server sends `maxlength` for a page with no JS. Remove it, so the
+  // browser does not cut a paste such as `123-456` before this code runs. A
+  // grouped code needs JS: the pattern allows the spaces, and the CSS shows
+  // the separator cells. An app pattern wins: the code stays ungrouped, so
+  // that pattern still checks it.
+  function initOtp(input) {
+    var n = otpSize(input)[0];
+    var g = parseInt(input.getAttribute('data-autumn-otp-group'), 10) || 0;
+    if (input.maxLength === n) input.removeAttribute('maxlength');
+    if (g && !input.hasAttribute('data-autumn-otp-grouped') &&
+        input.getAttribute('pattern') === '[0-9]{' + n + '}') {
+      var parts = [];
+      for (var i = 0; i < n; i += g) parts.push('[0-9]{' + Math.min(g, n - i) + '}');
+      input.pattern = parts.join(' ');
+      input.setAttribute('data-autumn-otp-grouped', '');
+    }
+    if (input.value) formatOtp(input);
+  }
+
+  document.addEventListener('beforeinput', function (e) {
+    var t = e.target;
+    if (t.matches && t.matches(OTP)) otpCollapsed.set(t, t.selectionStart === t.selectionEnd);
+  });
+
+  // The capture phase runs before the listeners on the input, so an htmx
+  // trigger on `input` reads the formatted code. An IME writes the value in
+  // steps. Format it once, at the end.
+  document.addEventListener('input', function (e) {
+    var t = e.target;
+    if (!t.matches || e.isComposing) return;
+    if (t.matches(OTP)) formatOtp(t, e.inputType);
+    else if (t.matches('input[aria-describedby]')) showStrength(t);
+  }, true);
+  document.addEventListener('compositionend', function (e) {
+    if (e.target.matches && e.target.matches(OTP)) formatOtp(e.target);
+  }, true);
+
+  // A form reset hides the passwords and clears the strength hints.
+  document.addEventListener('reset', function (e) {
+    hidePasswords();
+    setTimeout(function () {
+      if (e.target.querySelectorAll) e.target.querySelectorAll('input[aria-describedby]').forEach(showStrength);
+    });
+  }, true);
+
+  function grouped(el) {
+    return el.name && !el.disabled && el.matches && el.matches(OTP + '[data-autumn-otp-grouped]');
+  }
+
+  // The server gets the digits of a grouped code, with no spaces. `set`
+  // keeps the entry in its place.
+  document.addEventListener('formdata', function (e) {
+    Array.prototype.forEach.call(e.target.elements || [], function (el) {
+      if (!grouped(el)) return;
+      var all = e.formData.getAll(el.name);
+      if (all.length === 1 && all[0] === el.value) e.formData.set(el.name, el.value.replace(/\s/g, ''));
+    });
+  }, true);
+
+  // htmx reads the value itself when it sends an input with no form
+  // (`hx-include`, `hx-get` on the input). Remove the spaces there too.
+  document.addEventListener('htmx:configRequest', function (e) {
+    var params = e.detail && e.detail.parameters;
+    if (!params) return;
+    document.querySelectorAll(OTP + '[data-autumn-otp-grouped]').forEach(function (el) {
+      if (grouped(el) && params[el.name] === el.value) params[el.name] = el.value.replace(/\s/g, '');
+    });
+  });
+
   // ── direct upload (#3411) ─────────────────────────────────────────────────
   // fetch gets the presigned URL from the app. XHR sends the bytes, because
   // fetch has no upload progress. The input loses its name, so the file goes
@@ -1071,6 +1259,8 @@
     each(root, REGION, initRegion);
     each(root, TOAST, initToast);
     each(root, TIP, initTooltip);
+    each(root, REVEAL, initReveal);
+    each(root, OTP, initOtp);
     each(root, UPLOAD, initUpload);
     // A swap inside a tooltip (a new trigger).
     var outer = root.parentElement && root.parentElement.closest(TIP);
