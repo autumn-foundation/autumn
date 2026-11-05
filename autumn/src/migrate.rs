@@ -5822,7 +5822,7 @@ mod tests {
             .remove(0)
             .name()
             .to_string();
-        let renamed = HashMap::from([(first.clone(), "99990101000000".to_owned())]);
+        let renamed = HashMap::from([(first, "99990101000000".to_owned())]);
         let set = SchemaMigrations::new(
             DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &renamed),
             Some("marketing"),

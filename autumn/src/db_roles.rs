@@ -680,16 +680,16 @@ mod tests {
             database
         }
 
-        fn size(pool: Option<crate::db::Pool<crate::db::RuntimeConnection>>) -> Option<usize> {
-            pool.map(|p| p.status().max_size)
+        fn size(pool: &crate::db::Pool<crate::db::RuntimeConnection>) -> usize {
+            pool.status().max_size
         }
 
         #[test]
         fn with_no_roles_every_boundary_gets_the_primary_pool() {
             let primary = crate::db::create_pool(&database()).unwrap().unwrap();
             let state = AppState::for_test().with_pool(primary);
-            assert_eq!(size(state.pool_for::<Marketing>()), Some(7));
-            assert_eq!(size(state.pool_for::<Billing>()), Some(7));
+            assert_eq!(state.pool_for::<Marketing>().as_ref().map(size), Some(7));
+            assert_eq!(state.pool_for::<Billing>().as_ref().map(size), Some(7));
         }
 
         #[test]
@@ -700,10 +700,10 @@ mod tests {
             let pools = crate::db::create_role_pools(&database).unwrap();
             assert_eq!(pools.names().collect::<Vec<_>>(), ["marketing"]);
             state.insert_extension(pools);
-            assert_eq!(size(state.pool_for::<Marketing>()), Some(3));
+            assert_eq!(state.pool_for::<Marketing>().as_ref().map(size), Some(3));
             // No fallback to the owner pool.
-            assert_eq!(size(state.pool_for::<Billing>()), None);
-            assert_eq!(size(state.pool_for::<Billing>()), None);
+            assert_eq!(state.pool_for::<Billing>().as_ref().map(size), None);
+            assert_eq!(state.pool_for::<Billing>().as_ref().map(size), None);
         }
 
         #[test]
@@ -722,7 +722,7 @@ mod tests {
             database.validate().unwrap();
             let state = AppState::for_test();
             state.insert_extension(crate::db::create_role_pools(&database).unwrap());
-            assert_eq!(size(state.pool_for::<Marketing>()), Some(3));
+            assert_eq!(state.pool_for::<Marketing>().as_ref().map(size), Some(3));
         }
 
         #[test]
