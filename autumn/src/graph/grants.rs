@@ -697,7 +697,7 @@ role = "r\""
         assert!(sql.contains(r#""s""; DROP TABLE t; --""#), "{sql}");
         // A boundary name with a line break stays in its comment.
         let text = "[boundaries.\"x\\nDROP TABLE t;\"]\nowns = [\"t\"]\nrole = \"r\"\n";
-        let sql = plan(&config(text), &[CatalogTable::new("public", "t")])
+        let sql = super::plan(&config(text), &[CatalogTable::new("public", "t")])
             .unwrap()
             .sql()
             .unwrap();

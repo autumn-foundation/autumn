@@ -121,7 +121,6 @@ fn schema_enter_sql(schema: &str, run_in_transaction: bool) -> String {
 /// has one migration name twice. The first copy runs, so the tables land in
 /// the wrong schema with no error. Boot refuses that.
 pub(crate) fn schema_registration_conflict(sets: &[RegisteredMigrations]) -> Option<String> {
-    use diesel::migration::MigrationSource as _;
     let mut seen: HashMap<String, Option<&'static str>> = HashMap::new();
     for (label, set, _, schema) in sets {
         let Ok(migrations) = MigrationSource::<crate::db::RuntimeBackend>::migrations(set) else {
