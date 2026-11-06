@@ -608,8 +608,10 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `autumn_edge::host` | experimental | Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790). |
 | `background` | stable | `BackgroundTask`, `PluginCapability`, `BackgroundCapability` and `Role::runs_plugin`: role-aware background work. |
 | `db::Pool` | stable | The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature). |
+| `db::fleet_engine` | experimental | `FleetEngine` and `DatabaseFleet::with_engine`: one database engine of a fleet (requires the `db` feature). Experimental: the trait may change in any release while the fleet seams land (ADR 0040). |
 | `form::FieldRenderer` | stable | Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature). |
 | `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack. |
+| `plugin_conformance::fleet` | experimental | `run_fleet_conformance` and `FleetFixture`: the conformance kit of a fleet engine (requires the `db` feature). Experimental: checks may change in any release with the engine trait. |
 | `plugin_contract` | stable | This module: `PluginContract`, `PLUGIN_SURFACES`, `SurfaceTier`, `evaluate`, `lockstep_range`, and the `PLUGIN_CONTRACT_MARKER` dump protocol. |
 | `route_listing::RouteInfo` | stable | The route manifest type the conformance harness and `autumn routes --format json` share. |
 | `widget_pack` | stable | The widget contract and `WidgetPack`: render, passthrough, tokens, `autumn-<pack>-*` classes, keyboard core, CSP, stories (requires the `maud` feature). |

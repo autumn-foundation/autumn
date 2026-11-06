@@ -1286,6 +1286,7 @@ mod imp {
                 root: tmp.path().display().to_string(),
                 path: None,
                 max_open: 1,
+                max_resident_bytes: 0,
                 pool_size: 1,
                 create_on_demand: None,
                 idle_close_secs: 0,

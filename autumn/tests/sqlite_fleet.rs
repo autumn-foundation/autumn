@@ -176,6 +176,7 @@ fn fleet(dir: &FsPath, mode: FleetMode, create_on_demand: bool) -> DatabaseFleet
         root: dir.join("fleet").display().to_string(),
         path: None,
         max_open: 4,
+        max_resident_bytes: 0,
         pool_size: 2,
         create_on_demand: Some(create_on_demand),
         idle_close_secs: 0,
