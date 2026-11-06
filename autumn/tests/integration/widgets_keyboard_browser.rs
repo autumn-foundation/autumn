@@ -325,7 +325,8 @@ async fn tree_disabled_page() -> Markup {
 }
 
 /// A tree whose owned group is far from its owner: after the other root
-/// item.
+/// item. The guide says to put the group just after its owner. ArrowRight
+/// and ArrowLeft still follow `aria-owns` here.
 fn far_owned_tree() -> Markup {
     html! {
         ul id="f" role="tree" aria-label="Files" data-autumn-roving

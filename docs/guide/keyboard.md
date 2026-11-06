@@ -100,7 +100,9 @@ Example: a plugin listbox. Your code opens it; the core closes it.
 A `data-autumn-roving` list with `role="tree"` gets the APG tree view keys.
 A parent `treeitem` has `aria-expanded`. It holds its `role="group"` list of
 children, or names the list in `aria-owns`. An end node has no
-`aria-expanded`.
+`aria-expanded`. Put an owned group just after its owner, as the APG
+navigation tree does: ArrowUp, ArrowDown, Home, End and typeahead move in
+DOM order.
 
 | Key | Effect |
 |---|---|
