@@ -1,0 +1,82 @@
+                                                                             QUERY PLAN                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=171585.51..171585.53 rows=5 width=16) (actual time=1100.324..1108.773 rows=5 loops=1)
+   Output: post_id, (sum(value))
+   Buffers: shared hit=16 read=24928, temp read=9150 written=14410
+   I/O Timings: shared read=52.594, temp read=14.065 write=382.338
+   ->  Sort  (cost=171585.51..171855.92 rows=108161 width=16) (actual time=1093.393..1101.841 rows=5 loops=1)
+         Output: post_id, (sum(value))
+         Sort Key: (sum(votes.value)) DESC NULLS LAST, votes.post_id
+         Sort Method: top-N heapsort  Memory: 25kB
+         Buffers: shared hit=16 read=24928, temp read=9150 written=14410
+         I/O Timings: shared read=52.594, temp read=14.065 write=382.338
+         ->  Finalize GroupAggregate  (cost=142386.45..169789.00 rows=108161 width=16) (actual time=767.635..1057.564 rows=474971 loops=1)
+               Output: post_id, sum(value)
+               Group Key: votes.post_id
+               Buffers: shared hit=16 read=24928, temp read=9150 written=14410
+               I/O Timings: shared read=52.594, temp read=14.065 write=382.338
+               ->  Gather Merge  (cost=142386.45..167625.78 rows=216322 width=16) (actual time=767.581..950.334 rows=1036528 loops=1)
+                     Output: post_id, (PARTIAL sum(value))
+                     Workers Planned: 2
+                     Workers Launched: 2
+                     Buffers: shared hit=16 read=24928, temp read=9150 written=14410
+                     I/O Timings: shared read=52.594, temp read=14.065 write=382.338
+                     ->  Sort  (cost=141386.43..141656.83 rows=108161 width=16) (actual time=746.348..787.600 rows=345509 loops=3)
+                           Output: post_id, (PARTIAL sum(value))
+                           Sort Key: votes.post_id
+                           Sort Method: external merge  Disk: 8968kB
+                           Buffers: shared hit=16 read=24928, temp read=9150 written=14410
+                           I/O Timings: shared read=52.594, temp read=14.065 write=382.338
+                           Worker 0:  actual time=723.582..763.531 rows=329815 loops=1
+                             Sort Method: external merge  Disk: 8408kB
+                             JIT:
+                               Functions: 12
+                               Options: Inlining false, Optimization false, Expressions true, Deforming true
+                               Timing: Generation 0.947 ms, Inlining 0.000 ms, Optimization 0.635 ms, Emission 9.456 ms, Total 11.038 ms
+                             Buffers: shared hit=8 read=7476, temp read=2783 written=4281
+                             I/O Timings: shared read=16.154, temp read=4.237 write=129.882
+                           Worker 1:  actual time=748.144..793.297 rows=355101 loops=1
+                             Sort Method: external merge  Disk: 9056kB
+                             JIT:
+                               Functions: 12
+                               Options: Inlining false, Optimization false, Expressions true, Deforming true
+                               Timing: Generation 0.839 ms, Inlining 0.000 ms, Optimization 0.684 ms, Emission 8.654 ms, Total 10.178 ms
+                             Buffers: shared hit=8 read=8826, temp read=3216 written=5099
+                             I/O Timings: shared read=18.465, temp read=5.072 write=132.085
+                           ->  Partial HashAggregate  (cost=117237.87..130491.14 rows=108161 width=16) (actual time=471.256..632.553 rows=345509 loops=3)
+                                 Output: post_id, PARTIAL sum(value)
+                                 Group Key: votes.post_id
+                                 Batches: 5  Memory Usage: 8241kB  Disk Usage: 19216kB
+                                 Buffers: shared read=24928, temp read=5846 written=11091
+                                 I/O Timings: shared read=52.594, temp read=9.242 write=278.534
+                                 Worker 0:  actual time=461.134..609.301 rows=329815 loops=1
+                                   Batches: 5  Memory Usage: 8241kB  Disk Usage: 15552kB
+                                   Buffers: shared read=7476, temp read=1732 written=3225
+                                   I/O Timings: shared read=16.154, temp read=2.681 write=93.769
+                                 Worker 1:  actual time=466.323..634.240 rows=355101 loops=1
+                                   Batches: 5  Memory Usage: 8241kB  Disk Usage: 19328kB
+                                   Buffers: shared read=8826, temp read=2084 written=3962
+                                   I/O Timings: shared read=18.465, temp read=3.320 write=98.639
+                                 ->  Parallel Seq Scan on public.votes  (cost=0.00..37391.78 rows=1246378 width=10) (actual time=3.532..103.332 rows=997102 loops=3)
+                                       Output: id, user_id, post_id, comment_id, value, created_at
+                                       Filter: (votes.post_id IS NOT NULL)
+                                       Buffers: shared read=24928
+                                       I/O Timings: shared read=52.594
+                                       Worker 0:  actual time=5.454..100.808 rows=897067 loops=1
+                                         Buffers: shared read=7476
+                                         I/O Timings: shared read=16.154
+                                       Worker 1:  actual time=5.111..102.504 rows=1059120 loops=1
+                                         Buffers: shared read=8826
+                                         I/O Timings: shared read=18.465
+ Query Identifier: -910236275765372446
+ Planning:
+   Buffers: shared hit=138 read=8
+   I/O Timings: shared read=0.046
+ Planning Time: 0.473 ms
+ JIT:
+   Functions: 40
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+   Timing: Generation 2.776 ms, Inlining 0.000 ms, Optimization 1.961 ms, Emission 28.830 ms, Total 33.568 ms
+ Execution Time: 1128.027 ms
+(78 rows)
+

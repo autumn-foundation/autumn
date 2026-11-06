@@ -1,0 +1,12 @@
+          relname           | heap_blks_read | heap_blks_hit | idx_blks_read | idx_blks_hit | toast_blks_read | toast_blks_hit 
+----------------------------+----------------+---------------+---------------+--------------+-----------------+----------------
+ comments                   |         130887 |         86172 |          3494 |          789 |               0 |              0
+ votes                      |         123205 |          1440 |             6 |           18 |                 |               
+ posts                      |          47724 |         57245 |           451 |          538 |               0 |              0
+ users                      |           4732 |          4598 |           230 |         1615 |               0 |              0
+ subreddits                 |             17 |           171 |            25 |          105 |               0 |              0
+ tags                       |              8 |            51 |            16 |           40 |               0 |              0
+ post_tags                  |             12 |            30 |            48 |          121 |                 |               
+ __diesel_schema_migrations |              0 |             0 |             0 |            0 |                 |               
+(8 rows)
+
