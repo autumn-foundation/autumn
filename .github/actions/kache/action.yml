@@ -51,6 +51,12 @@ inputs:
     description: "Set to false for a job that only restores."
     required: false
     default: "true"
+  s3:
+    description: >
+      Set to false to use the GitHub Actions cache even when S3 is set up.
+      For a job whose runner cannot hold the S3 store's local copy.
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -79,9 +85,10 @@ runs:
         WRITE_KEY: ${{ env.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID }}
         PROTECTED: ${{ github.ref_protected }}
         SAVE: ${{ inputs.save }}
+        S3_ALLOWED: ${{ inputs.s3 }}
       run: |
         set -euo pipefail
-        if [ -n "$BUCKET" ] && [ -n "$READ_KEY" ]; then
+        if [ "$S3_ALLOWED" = true ] && [ -n "$BUCKET" ] && [ -n "$READ_KEY" ]; then
           # Write only from a protected ref, with the write token, and only in
           # a job that saves at all. Anything else reads.
           if [ "$PROTECTED" = true ] && [ -n "$WRITE_KEY" ] && [ "$SAVE" = true ]; then
@@ -96,13 +103,13 @@ runs:
         else
           # Keys with no bucket is a setup error, not a fork PR. Say so in the
           # run's annotations, or the fallback looks like a working cache.
-          if [ -z "$BUCKET" ] && [ -n "$READ_KEY" ]; then
+          if [ "$S3_ALLOWED" = true ] && [ -z "$BUCKET" ] && [ -n "$READ_KEY" ]; then
             echo "::warning title=kache S3 not used::AUTUMN_KACHE_S3_BUCKET is empty, but the S3 keys are set. Add AUTUMN_KACHE_S3_BUCKET (and _ENDPOINT for R2) as a repository variable or secret."
           fi
           echo "s3=false" >> "$GITHUB_OUTPUT"
           echo "write=false" >> "$GITHUB_OUTPUT"
           echo "save=$SAVE" >> "$GITHUB_OUTPUT"
-          echo "kache: no S3 remote or read key; using the GitHub Actions cache"
+          echo "kache: S3 off for this job, or no S3 remote or read key; using the GitHub Actions cache"
         fi
     # v1 as of 2026-09-25.
     - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
