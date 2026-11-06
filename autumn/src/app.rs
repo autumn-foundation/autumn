@@ -5067,26 +5067,7 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
-                // The collaboration hub holds the channel registry and the
-                // presence tracker it was built with, so replacing either
-                // leaves it publishing into the old backend (#1806).
-                #[cfg(feature = "collab")]
-                {
-                    state.collab = crate::collab::CollabHub::new(
-                        state.channels.clone(),
-                        state.presence.clone(),
-                    );
-                }
-            }
+            state.intercept_channels(vec![interceptor]);
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -5259,7 +5240,7 @@ impl AppBuilder {
             // Wrapped once, so the global and the state hold the same `Arc`.
             let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
-            state.shared_cache = Some(cache);
+            state.fields_mut().shared_cache = Some(cache);
         } else {
             crate::cache::clear_global_cache();
         }
@@ -7420,26 +7401,7 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
-                // The collaboration hub holds the channel registry and the
-                // presence tracker it was built with, so replacing either
-                // leaves it publishing into the old backend (#1806).
-                #[cfg(feature = "collab")]
-                {
-                    state.collab = crate::collab::CollabHub::new(
-                        state.channels.clone(),
-                        state.presence.clone(),
-                    );
-                }
-            }
+            state.intercept_channels(vec![interceptor]);
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -7453,7 +7415,7 @@ impl AppBuilder {
             // Wrapped once, so the global and the state hold the same `Arc`.
             let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
-            state.shared_cache = Some(cache);
+            state.fields_mut().shared_cache = Some(cache);
         } else {
             crate::cache::clear_global_cache();
         }
@@ -7492,7 +7454,7 @@ impl AppBuilder {
         #[cfg(feature = "maud")]
         install_story_registry(&state, story_gallery);
         // run_build_mode used ProbeState::default(), which does not start as pending
-        state.probes = crate::probe::ProbeState::default();
+        state.fields_mut().probes = crate::probe::ProbeState::default();
         state.apply_health_config(&config.health);
 
         // Apply deferred policy and scope registrations onto the live app state,
@@ -9259,26 +9221,7 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
-                // The collaboration hub holds the channel registry and the
-                // presence tracker it was built with, so replacing either
-                // leaves it publishing into the old backend (#1806).
-                #[cfg(feature = "collab")]
-                {
-                    state.collab = crate::collab::CollabHub::new(
-                        state.channels.clone(),
-                        state.presence.clone(),
-                    );
-                }
-            }
+            state.intercept_channels(vec![interceptor]);
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -9292,7 +9235,7 @@ impl AppBuilder {
             // Wrapped once, so the global and the state hold the same `Arc`.
             let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
-            state.shared_cache = Some(cache);
+            state.fields_mut().shared_cache = Some(cache);
         } else {
             crate::cache::clear_global_cache();
         }
@@ -9740,7 +9683,7 @@ impl AppBuilder {
         // No startup barrier is applied on this path (`try_build_router_inner`
         // does not add one), and a replayed request should meet the app as a
         // warm process, not one still starting.
-        state.probes = crate::probe::ProbeState::default();
+        state.fields_mut().probes = crate::probe::ProbeState::default();
         state.apply_health_config(&config.health);
         state.insert_extension(RegisteredApiVersions(api_versions));
         // The AEO documents must replay as captured.
@@ -9752,7 +9695,8 @@ impl AppBuilder {
         }
         // In place of the builder's backend, which replay does not build: in
         // the global cache and the state, as `with_cache_backend` does.
-        state.shared_cache = crate::cache::install_replay_cache(cache_backend.is_some());
+        state.fields_mut().shared_cache =
+            crate::cache::install_replay_cache(cache_backend.is_some());
 
         for register in policy_registrations {
             register(state.policy_registry());
@@ -17975,7 +17919,7 @@ fn build_state(
     #[cfg(feature = "presence")]
     let presence = crate::presence::Presence::new(channels.clone());
 
-    let state = AppState {
+    let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
         pool: database_topology.map(|topology| topology.primary().clone()),
@@ -18016,7 +17960,7 @@ fn build_state(
         clock: std::sync::Arc::new(crate::time::SystemClock),
         entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
         app_id: AppState::next_app_id(),
-    };
+    });
     state.apply_health_config(&config.health);
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
@@ -19188,10 +19132,10 @@ mod tests {
     /// Helper to build a test router with default config and no database.
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
-        let state = AppState {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
-            ..AppState::test_default()
-        };
+            ..crate::state::AppStateInner::test_default_fields()
+        });
         crate::router::build_router(routes, &config, state)
     }
 
@@ -24386,10 +24330,10 @@ mount = ["service"]
 
         // No dynamic route for /docs — only a static file.
         let config = AutumnConfig::default();
-        let state = AppState {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
-            ..AppState::test_default()
-        };
+            ..crate::state::AppStateInner::test_default_fields()
+        });
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
             &config,
@@ -24768,10 +24712,10 @@ mount = ["service"]
 
     /// Helper to build a test router with custom config.
     pub fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
-        let state = AppState {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
-            ..AppState::test_default()
-        };
+            ..crate::state::AppStateInner::test_default_fields()
+        });
         crate::router::build_router(routes, config, state)
     }
 
@@ -24892,10 +24836,10 @@ mount = ["service"]
         // No manifest.json — just an empty dist/
 
         let config = AutumnConfig::default();
-        let state = AppState {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
-            ..AppState::test_default()
-        };
+            ..crate::state::AppStateInner::test_default_fields()
+        });
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
             &config,
@@ -24914,10 +24858,10 @@ mount = ["service"]
     async fn build_router_with_static_none_dist() {
         // When dist_dir is None, return the app router directly.
         let config = AutumnConfig::default();
-        let state = AppState {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
-            ..AppState::test_default()
-        };
+            ..crate::state::AppStateInner::test_default_fields()
+        });
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
             &config,
@@ -25165,10 +25109,10 @@ mount = ["service"]
     #[cfg(feature = "ws")]
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_events() {
-        let state = AppState {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
-            ..AppState::test_default()
-        };
+            ..crate::state::AppStateInner::test_default_fields()
+        });
 
         let mut rx = state.channels().subscribe("sys:tasks");
 
@@ -25213,10 +25157,10 @@ mount = ["service"]
     #[cfg(feature = "ws")]
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_failure_events() {
-        let state = AppState {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
-            ..AppState::test_default()
-        };
+            ..crate::state::AppStateInner::test_default_fields()
+        });
 
         let mut rx = state.channels().subscribe("sys:tasks");
 

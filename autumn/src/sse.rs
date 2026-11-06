@@ -490,7 +490,8 @@ mod tests {
         use crate::channels::{Channels, LocalChannelsBackend};
 
         let mut state = crate::AppState::for_test();
-        state.channels = Channels::with_backend(LiveOnlyBackend(LocalChannelsBackend::new(32)));
+        state.fields_mut().channels =
+            Channels::with_backend(LiveOnlyBackend(LocalChannelsBackend::new(32)));
 
         // Reconnect *with* a Last-Event-ID against a backend that keeps no
         // history: the client must be told replay was unavailable.
@@ -527,7 +528,7 @@ mod tests {
         // subscriber, so its first `recv` lags by 8 and the buffer retains the
         // last two (ids 9 and 10).
         let mut state = crate::AppState::for_test();
-        state.channels = crate::channels::Channels::new(2);
+        state.fields_mut().channels = crate::channels::Channels::new(2);
         let topic = "lag";
 
         // Cold connect subscribes now, but we do not poll the body yet.

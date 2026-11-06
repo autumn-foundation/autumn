@@ -107,9 +107,8 @@ pub struct ProbeState {
 
 /// The shutdown state, shared by all clones of a [`ProbeState`].
 ///
-/// It holds the server's shutdown token here rather than in `AppState`:
-/// `AppState` is copied into many per-request futures, so a field there costs
-/// bytes on every request (`tests/config_alloc_gate.rs`).
+/// It holds the server's shutdown token, so all clones of a [`ProbeState`]
+/// see one token.
 #[derive(Debug, Default)]
 struct Shutdown {
     /// `true` once readiness drains.
