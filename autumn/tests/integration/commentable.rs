@@ -700,6 +700,7 @@ fn comment_helpers_are_generated() {
     fn assert_is_fn<F>(_f: F) {}
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::add_comment);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::comment_thread);
+    assert_is_fn(<PgCmtPostRepository as CmtPostComments>::comment_thread_page);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::delete_comment);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::recompute_comment_count);
     assert_is_fn(<PgCmtPhotoRepository as CmtPhotoComments>::add_comment);
@@ -2762,4 +2763,397 @@ async fn call_with_author(
     let session = autumn_web::session::Session::new_for_test("test-session".to_owned(), data);
     request.extensions_mut().insert(session);
     call(app, request).await
+}
+
+// ── #3325: threads load in pages of top-level comments ──────────────────────
+
+/// The bodies of a page's top-level comments, in order.
+fn roots(nodes: &[CommentNode]) -> Vec<String> {
+    nodes.iter().map(|node| node.comment.body.clone()).collect()
+}
+
+/// A page holds `page_size` top-level comments and every reply under them.
+/// `next` is the cursor for the page after it. A late reply stays under its
+/// root and does not move to a later page.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_page_splits_top_level_comments_into_pages() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+
+    let a = repo.add_comment(post, author, "a", None).await.expect("a");
+    let b = repo.add_comment(post, author, "b", None).await.expect("b");
+    let b1 = repo
+        .add_comment(post, author, "b1", Some(b.id))
+        .await
+        .expect("b1");
+    repo.add_comment(post, author, "b1x", Some(b1.id))
+        .await
+        .expect("b1x");
+    repo.add_comment(post, author, "c", None).await.expect("c");
+    let d = repo.add_comment(post, author, "d", None).await.expect("d");
+    repo.add_comment(post, author, "e", None).await.expect("e");
+    // Written last, but it belongs on the first page, under `a`.
+    repo.add_comment(post, author, "a1", Some(a.id))
+        .await
+        .expect("a1");
+
+    let first = repo
+        .comment_thread_page(post, None, 2)
+        .await
+        .expect("first page");
+    assert_eq!(
+        flatten(&first.nodes),
+        vec![
+            (0, "a".to_owned()),
+            (1, "a1".to_owned()),
+            (0, "b".to_owned()),
+            (1, "b1".to_owned()),
+            (2, "b1x".to_owned()),
+        ]
+    );
+    assert_eq!(first.after, None);
+    assert_eq!(first.next, Some(b.id));
+
+    let second = repo
+        .comment_thread_page(post, first.next, 2)
+        .await
+        .expect("second page");
+    assert_eq!(roots(&second.nodes), vec!["c", "d"]);
+    assert_eq!(second.after, Some(b.id));
+    assert_eq!(second.next, Some(d.id));
+
+    let last = repo
+        .comment_thread_page(post, second.next, 2)
+        .await
+        .expect("last page");
+    assert_eq!(roots(&last.nodes), vec!["e"]);
+    assert_eq!(last.next, None, "no page after the last one");
+
+    // Every page together is the whole thread, in the same order.
+    let whole = repo.comment_thread(post).await.expect("whole thread");
+    let mut joined = first.nodes;
+    joined.extend(second.nodes);
+    joined.extend(last.nodes);
+    assert_eq!(flatten(&joined), flatten(&whole));
+}
+
+/// A page that ends exactly at the last top-level comment has no `next`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_page_has_no_next_when_the_page_is_exactly_full() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    repo.add_comment(post, author, "a", None).await.expect("a");
+    repo.add_comment(post, author, "b", None).await.expect("b");
+
+    let page = repo.comment_thread_page(post, None, 2).await.expect("page");
+    assert_eq!(roots(&page.nodes), vec!["a", "b"]);
+    assert_eq!(page.next, None);
+}
+
+/// A deleted top-level comment does not use a place on the page. A live reply
+/// whose parent is gone shows as a top-level comment, as in `comment_thread`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_page_skips_deleted_comments_and_keeps_orphans() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+
+    let a = repo.add_comment(post, author, "a", None).await.expect("a");
+    let b = repo.add_comment(post, author, "b", None).await.expect("b");
+    let b1 = repo
+        .add_comment(post, author, "b1", Some(b.id))
+        .await
+        .expect("b1");
+    repo.add_comment(post, author, "c", None).await.expect("c");
+    repo.delete_comment(post, a.id).await.expect("delete a");
+    // Not a framework write: a parent tombstoned while its reply stays live.
+    diesel::sql_query("UPDATE cmt_comments SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(b.id)
+        .execute(&mut conn)
+        .await
+        .expect("tombstone b only");
+
+    let page = repo.comment_thread_page(post, None, 2).await.expect("page");
+    assert_eq!(roots(&page.nodes), vec!["b1", "c"]);
+    assert_eq!(page.nodes[0].comment.id, b1.id);
+    assert_eq!(page.next, None);
+}
+
+/// A cursor names a comment of the same thread. A comment id from another
+/// record gives an empty page, never that record's comments.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_page_ignores_a_cursor_from_another_thread() {
+    let (pool, _container) = setup_pool().await;
+    let posts = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let photos = PgCmtPhotoRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "p").await;
+    let photo = seed_one_col(&mut conn, "cmt_photos", "caption", "c").await;
+    let other = seed_one_col(&mut conn, "cmt_posts", "title", "other").await;
+
+    posts
+        .add_comment(post, author, "on the post", None)
+        .await
+        .expect("post comment");
+    let foreign = photos
+        .add_comment(photo, author, "on the photo", None)
+        .await
+        .expect("photo comment");
+    let elsewhere = posts
+        .add_comment(other, author, "on another post", None)
+        .await
+        .expect("other comment");
+
+    for cursor in [foreign.id, elsewhere.id, i64::MAX] {
+        let page = posts
+            .comment_thread_page(post, Some(cursor), 10)
+            .await
+            .expect("page");
+        assert!(page.nodes.is_empty(), "cursor {cursor}: {:?}", page.nodes);
+        assert_eq!(page.next, None);
+    }
+}
+
+/// The page read keeps the thread read's rules: an unknown or soft-deleted
+/// parent is a `404`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_page_on_a_missing_parent_is_not_found() {
+    let (pool, _container) = setup_pool().await;
+    let posts = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let softs = PgCmtSoftRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let soft = seed_one_col(&mut conn, "cmt_softs", "title", "soft").await;
+    softs
+        .add_comment(soft, author, "hi", None)
+        .await
+        .expect("comment");
+    diesel::sql_query("UPDATE cmt_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(soft)
+        .execute(&mut conn)
+        .await
+        .expect("soft-delete parent");
+
+    let err = posts
+        .comment_thread_page(9_999_999, None, 10)
+        .await
+        .expect_err("unknown parent");
+    assert_eq!(err.status().as_u16(), 404);
+    let err = softs
+        .comment_thread_page(soft, None, 10)
+        .await
+        .expect_err("soft-deleted parent");
+    assert_eq!(err.status().as_u16(), 404);
+}
+
+/// A comments table with no `deleted_at` pages the same way.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_page_works_without_soft_delete() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtHardRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let hard = seed_one_col(&mut conn, "cmt_hards", "title", "hard").await;
+    let a = repo.add_comment(hard, author, "a", None).await.expect("a");
+    repo.add_comment(hard, author, "a1", Some(a.id))
+        .await
+        .expect("a1");
+    repo.add_comment(hard, author, "b", None).await.expect("b");
+
+    let page = repo.comment_thread_page(hard, None, 1).await.expect("page");
+    assert_eq!(
+        flatten(&page.nodes),
+        vec![(0, "a".to_owned()), (1, "a1".to_owned())]
+    );
+    assert_eq!(page.next, Some(a.id));
+}
+
+/// `thread_page_containing` returns the page that shows one comment: the
+/// first page when its top-level comment is on it, else the page that ends
+/// at that top-level comment.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn thread_page_containing_returns_the_page_that_shows_a_comment() {
+    use autumn_web::commentable::thread_page_containing;
+
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+
+    let mut ids = Vec::new();
+    for body in ["a", "b", "c", "d", "e"] {
+        ids.push(
+            repo.add_comment(post, author, body, None)
+                .await
+                .expect(body)
+                .id,
+        );
+    }
+    let d1 = repo
+        .add_comment(post, author, "d1", Some(ids[3]))
+        .await
+        .expect("d1");
+    let d1x = repo
+        .add_comment(post, author, "d1x", Some(d1.id))
+        .await
+        .expect("d1x");
+
+    let spec = CmtPost::commentable_spec();
+    let ty = CmtPost::COMMENTABLE_TYPE;
+    let page = thread_page_containing(&mut conn, spec, ty, post, ids[1], 2, None, None)
+        .await
+        .expect("page for b");
+    assert_eq!(roots(&page.nodes), vec!["a", "b"], "b is on the first page");
+    assert_eq!(page.after, None);
+
+    let page = thread_page_containing(&mut conn, spec, ty, post, d1x.id, 2, None, None)
+        .await
+        .expect("page for d1x");
+    assert_eq!(roots(&page.nodes), vec!["c", "d"], "the page ends at d");
+    assert_eq!(page.after, Some(ids[1]));
+    assert_eq!(page.next, Some(ids[3]));
+    assert!(
+        flatten(&page.nodes).contains(&(2, "d1x".to_owned())),
+        "{:?}",
+        page.nodes
+    );
+
+    let page = thread_page_containing(&mut conn, spec, ty, post, ids[4], 2, None, None)
+        .await
+        .expect("page for e");
+    assert_eq!(roots(&page.nodes), vec!["d", "e"], "the newest comment");
+    assert_eq!(page.after, Some(ids[2]));
+    assert_eq!(page.next, None);
+
+    let page = thread_page_containing(&mut conn, spec, ty, post, i64::MAX, 2, None, None)
+        .await
+        .expect("page for an unknown comment");
+    assert_eq!(
+        roots(&page.nodes),
+        vec!["a", "b"],
+        "an unknown comment gives the first page"
+    );
+}
+
+/// The router shows one page and a link to the next. `?after=` serves it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
+async fn router_serves_a_thread_one_page_at_a_time() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    repo.add_comment(post, author, "alpha", None)
+        .await
+        .expect("a");
+    let b = repo
+        .add_comment(post, author, "bravo", None)
+        .await
+        .expect("b");
+    repo.add_comment(post, author, "charlie", None)
+        .await
+        .expect("c");
+    drop(conn);
+
+    let config = autumn_web::commentable::CommentsConfig::default().page_size(2);
+    let app = comment_app(pool, config);
+
+    let (status, body) = call(app.clone(), get(&format!("/comments/CmtPost/{post}"))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("alpha") && body.contains("bravo"), "{body}");
+    assert!(!body.contains("charlie"), "{body}");
+    assert!(body.contains("autumn-comments-more"), "{body}");
+    assert!(body.contains(&format!("after={}", b.id)), "{body}");
+
+    let (status, body) = call(
+        app.clone(),
+        get(&format!("/comments/CmtPost/{post}?after={}", b.id)),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("charlie"), "{body}");
+    assert!(!body.contains("alpha"), "{body}");
+    assert!(!body.contains("autumn-comments-more"), "{body}");
+
+    let (status, _) = call(app, get(&format!("/comments/CmtPost/{post}?after=x"))).await;
+    assert_eq!(status, 400, "a cursor that is not an id is refused");
+}
+
+/// The router's default page size bounds a long thread.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
+async fn router_pages_a_long_thread_by_default() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    let total = autumn_web::commentable::DEFAULT_PAGE_SIZE + 1;
+    diesel::sql_query(format!(
+        "INSERT INTO cmt_comments (commentable_type, commentable_id, author_id, body) \
+         SELECT 'CmtPost', $1, $2, 'comment-' || n FROM generate_series(1, {total}) AS n"
+    ))
+    .bind::<BigInt, _>(post)
+    .bind::<BigInt, _>(author)
+    .execute(&mut conn)
+    .await
+    .expect("seed a long thread");
+    drop(conn);
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, body) = call(app, get(&format!("/comments/CmtPost/{post}"))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("comment-1<"), "{body}");
+    assert!(!body.contains(&format!("comment-{total}<")), "{body}");
+    assert!(body.contains("autumn-comments-more"), "{body}");
+}
+
+/// After a post, the router shows the page that holds the new comment, even
+/// when that is not the first page.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
+async fn router_post_shows_the_page_that_holds_the_new_comment() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    for body in ["alpha", "bravo", "charlie"] {
+        repo.add_comment(post, author, body, None)
+            .await
+            .expect(body);
+    }
+    drop(conn);
+
+    let config = autumn_web::commentable::CommentsConfig::default().page_size(2);
+    let (status, body) = call_with_author(
+        comment_app(pool, config),
+        form_post(&format!("/comments/CmtPost/{post}"), "body=delta"),
+        author,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("delta"), "the new comment shows: {body}");
+    assert!(!body.contains("alpha"), "{body}");
+    assert!(body.contains("autumn-comments-earlier"), "{body}");
 }

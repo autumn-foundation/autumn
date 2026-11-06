@@ -19,6 +19,9 @@ use crate::models::{
     UpdateSubreddit, UpdateVote, Vote,
 };
 use crate::schema::{posts, subreddits, votes};
+use diesel::prelude::*;
+use diesel::sql_types::{BigInt, Bool, Text};
+use diesel_async::RunQueryDsl as _;
 
 #[autumn_web::repository(Subreddit, hooks = SubredditHooks, api = "/api/subreddits")]
 pub trait SubredditRepository {
@@ -64,39 +67,23 @@ pub trait PostRepository {
 
 // Typed grouped aggregate (#1364): `sum_value_grouped_by_post_id` rolls the
 // votes table up to `SUM(value) GROUP BY post_id`, returning one
-// `(post_id, Option<sum>)` pair per post. The front-page "Top posts by votes"
-// leaderboard (`routes::posts::front_page`) chains
-// `.order_by_aggregate_desc().limit(5)` for a top-N roll-up in a single call —
-// a *read*, so it is replica-eligible via the repository's read route.
+// `(post_id, Option<sum>)` pair per post. Chain
+// `.order_by_aggregate_desc().limit(n)` for a top-N roll-up in one call.
 //
-// Score maintenance is deliberately NOT this API. Since #1362 it is owned
-// entirely by `Post`'s `#[votable(by = User, aggregate = sum)]`: every
-// `posts.react(...)` locks the target post row, rewrites the edge, recomputes
-// `SUM(value)` from ground truth and persists `posts.score` — all inside one
-// transaction on the primary, so a reader never sees the edge and the score
-// disagree. No route hand-writes that `UPDATE` any more (see `routes::votes`).
-//
-// This leaderboard is untouched by that and must stay so. `#[votable]` declares
-// its own edge `table!` in a hidden private module, so `crate::schema::votes`,
-// the `Vote` model and this grouped aggregate keep their nullable `post_id` —
-// which is exactly what the codegen's `IS NOT NULL` group guard uses to exclude
-// comment votes from the top-N. Regression-guarded by
+// It reads every vote, so its cost grows with the `votes` table. The front
+// page does not use it (#3325): see `top_posts_by_score` below. It stays as
+// the example of the grouped-aggregate API, guarded by
 // `leaderboard_grouped_aggregate_still_works_after_react` in
 // `tests/votable_pg_integration.rs`.
 //
-// Checked once already: in a production-shaped fixture where post-directed
-// votes were 88.1% of the table (comment votes, which this guard excludes,
-// were a small minority), `post_id IS NOT NULL` was NOT selective enough —
-// it matched nearly the whole table — for a partial covering index —
-// `(post_id) INCLUDE (value) WHERE post_id IS NOT NULL` — to ever get
-// chosen by the planner over the seq scan. That is a property of *that*
-// vote mix, not a guarantee: a deployment where comment votes are a much
-// larger share of `votes` would see a more selective guard (matching a
-// smaller fraction of the table), and the index could earn its keep there.
-// Re-measure against real data before concluding either way — don't just
-// reason from this comment. See
-// `docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/`
-// for the methodology and the fixture's exact ratio.
+// Score maintenance is NOT this API. Since #1362 it is owned by `Post`'s
+// `#[votable(by = User, aggregate = sum)]`: every `posts.react(...)` locks the
+// post row, writes the vote, recomputes `SUM(value)` and stores `posts.score`,
+// in one transaction on the primary. No route writes that `UPDATE` by hand.
+//
+// `#[votable]` declares its own edge `table!` in a hidden module, so
+// `crate::schema::votes` and the `Vote` model keep their nullable `post_id`.
+// The codegen's `IS NOT NULL` group guard uses it to exclude comment votes.
 #[autumn_web::repository(Vote, table = "votes")]
 pub trait VoteRepository {
     /// SUM(value) GROUP BY post_id -> `Vec<(post_id, Option<sum>)>`.
@@ -222,4 +209,47 @@ impl autumn_web::live::LiveFragment for Post {
             "#posts-list".to_string(),
         )
     }
+}
+
+/// One row of the front-page "Top posts by votes" list.
+#[derive(Debug, Clone, PartialEq, Eq, diesel::Queryable)]
+pub struct TopPost {
+    /// The post id.
+    pub id: i64,
+    /// The post title.
+    pub title: String,
+    /// The post's net vote score.
+    pub score: i64,
+}
+
+/// The front-page "Top posts by votes" query (#3325): posts with a positive
+/// `posts.score`, highest first, ties by id, at most `limit` rows.
+///
+/// `#[votable(aggregate = sum)]` keeps `posts.score` equal to the post's vote
+/// sum, in the vote transaction. So this gives the vote-sum ranking without a
+/// read of `votes`. The partial index `idx_posts_score_top` gives the order.
+/// Its predicate is `score > 0`, so the filter here is that literal SQL, not
+/// a bind: Postgres cannot match a bound value to the index predicate.
+#[must_use]
+pub fn top_posts_by_score_query(
+    limit: i64,
+) -> posts::BoxedQuery<'static, diesel::pg::Pg, (BigInt, Text, BigInt)> {
+    posts::table
+        .filter(diesel::dsl::sql::<Bool>("posts.score > 0"))
+        .order((posts::score.desc(), posts::id.asc()))
+        .limit(limit)
+        .select((posts::id, posts::title, posts::score))
+        .into_boxed()
+}
+
+/// Load the [`top_posts_by_score_query`] rows.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn top_posts_by_score(
+    conn: &mut diesel_async::AsyncPgConnection,
+    limit: i64,
+) -> diesel::QueryResult<Vec<TopPost>> {
+    top_posts_by_score_query(limit).load(conn).await
 }

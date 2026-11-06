@@ -553,3 +553,48 @@ async fn the_migration_backfills_existing_post_comments() {
         "pre-migration comments must survive the re-key"
     );
 }
+
+/// #3325: the post page reads its thread one page of top-level comments at a
+/// time. A page holds every reply under its comments, and `next` names the
+/// page after it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn post_thread_reads_in_pages() {
+    let (_pg, pool) = start_postgres().await;
+    let mut conn = pool.get().await.expect("conn");
+    setup_schema(&mut conn).await;
+    let ada = seed_user(&mut conn, "ada").await;
+    let sub = seed_subreddit(&mut conn, ada).await;
+    let post = seed_post(&mut conn, ada, sub).await;
+
+    let posts = PgPostRepository::with_pool_untracked(pool.clone());
+    let first_root = posts
+        .add_comment(post, ada, "one", None)
+        .await
+        .expect("one");
+    posts
+        .add_comment(post, ada, "two", None)
+        .await
+        .expect("two");
+    posts
+        .add_comment(post, ada, "a reply", Some(first_root.id))
+        .await
+        .expect("reply");
+
+    let first = posts
+        .comment_thread_page(post, None, 1)
+        .await
+        .expect("first page");
+    assert_eq!(
+        flatten(&first.nodes),
+        vec![(0, "one".to_owned()), (1, "a reply".to_owned())]
+    );
+    assert_eq!(first.next, Some(first_root.id));
+
+    let second = posts
+        .comment_thread_page(post, first.next, 1)
+        .await
+        .expect("second page");
+    assert_eq!(flatten(&second.nodes), vec![(0, "two".to_owned())]);
+    assert_eq!(second.next, None);
+}

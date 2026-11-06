@@ -325,6 +325,11 @@ let per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
     .await?;
 ```
 
+A grouped aggregate reads every row it groups. Its cost grows with the
+table. For a top-N list on a request path, read a column that is kept up to
+date instead, with an index on it. reddit-clone's front page reads
+`posts.score`, which `#[votable(aggregate = sum)]` maintains (#3325).
+
 ### Method-name shapes and the `Vec<(K, V)>` return
 
 The trait method **must** declare its pair return type; the macro reads `K` and

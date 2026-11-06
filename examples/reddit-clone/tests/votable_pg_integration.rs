@@ -61,7 +61,9 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 // The trait `#[votable(by = User, aggregate = sum)]` emits on `Post`, bringing
 // `react` / `reaction_of` into scope for `PgPostRepository`.
 use reddit_clone::models::PostReactions as _;
-use reddit_clone::repositories::{PgPostRepository, PgVoteRepository};
+use reddit_clone::repositories::{
+    PgPostRepository, PgVoteRepository, top_posts_by_score, top_posts_by_score_query,
+};
 use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -72,6 +74,9 @@ const ADD_AVATAR: &str = include_str!("../migrations/20260427000000_add_user_ava
 // insert into `comments` need the reshaped table.
 const POLYMORPHIC_COMMENTS: &str =
     include_str!("../migrations/20260820000000_polymorphic_comments/up.sql");
+// The front-page leaderboard index (#3325).
+const SCORE_TOP_INDEX: &str =
+    include_str!("../migrations/20261106000000_posts_score_top_index/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
@@ -138,6 +143,9 @@ async fn setup_schema(conn: &mut AsyncPgConnection) {
     conn.batch_execute(POLYMORPHIC_COMMENTS)
         .await
         .expect("make comments polymorphic");
+    conn.batch_execute(SCORE_TOP_INDEX)
+        .await
+        .expect("add the leaderboard index");
 }
 
 /// Seed `n` users, one subreddit, and one post per title. Returns the user ids.
@@ -457,4 +465,115 @@ async fn leaderboard_grouped_aggregate_still_works_after_react() {
     );
     assert_eq!(top[0], (hot, Some(3)), "hot leads the leaderboard: {top:?}");
     assert_eq!(top[1], (cold, Some(-1)), "cold trails: {top:?}");
+}
+
+// ── #3325: the leaderboard reads the maintained score ─────────────────────────
+
+/// The front-page leaderboard reads `posts.score`, which `react()` keeps equal
+/// to the post's vote sum. It lists posts with a positive score, highest
+/// first, ties by id. A post with no votes, a negative score or only comment
+/// votes is not on it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers) or AUTUMN_TEST_PG_URL"]
+async fn front_page_leaderboard_reads_the_maintained_score() {
+    let (_c, pool) = start_postgres().await;
+    let mut conn = pool.get().await.expect("conn");
+    setup_schema(&mut conn).await;
+    let users = seed_users(&mut conn, 4).await;
+    let sub = seed_subreddit(&mut conn, users[0]).await;
+    let hot = seed_post(&mut conn, "hot", users[0], sub).await;
+    let warm = seed_post(&mut conn, "warm", users[0], sub).await;
+    let tie = seed_post(&mut conn, "tie", users[0], sub).await;
+    let cold = seed_post(&mut conn, "cold", users[0], sub).await;
+    let quiet = seed_post(&mut conn, "quiet", users[0], sub).await;
+    // A comment vote on `quiet`'s thread. It is not a post vote.
+    diesel::sql_query(
+        "INSERT INTO comments (commentable_type, commentable_id, author_id, body) \
+         VALUES ('Post', $1, $2, 'c')",
+    )
+    .bind::<BigInt, _>(quiet)
+    .bind::<BigInt, _>(users[0])
+    .execute(&mut conn)
+    .await
+    .expect("seed comment");
+    diesel::sql_query(
+        "INSERT INTO votes (user_id, comment_id, value) \
+         VALUES ($1, (SELECT id FROM comments LIMIT 1), 1)",
+    )
+    .bind::<BigInt, _>(users[0])
+    .execute(&mut conn)
+    .await
+    .expect("seed comment vote");
+
+    let posts = PgPostRepository::with_pool_untracked(pool.clone());
+    for user in &users[..3] {
+        posts.react(*user, hot, 1).await.expect("upvote hot");
+    }
+    posts.react(users[0], tie, 1).await.expect("upvote tie");
+    posts.react(users[1], warm, 1).await.expect("upvote warm");
+    posts
+        .react(users[3], cold, -1)
+        .await
+        .expect("downvote cold");
+
+    let top = top_posts_by_score(&mut conn, 5).await.expect("leaderboard");
+    let ranked: Vec<(i64, &str, i64)> = top
+        .iter()
+        .map(|post| (post.id, post.title.as_str(), post.score))
+        .collect();
+    assert_eq!(
+        ranked,
+        vec![(hot, "hot", 3), (warm, "warm", 1), (tie, "tie", 1)],
+        "ties go to the older post"
+    );
+
+    // The score it reads is the vote sum.
+    for post in &top {
+        let snap = score_snapshot(&mut conn, post.id).await;
+        assert_eq!(snap.persisted, snap.ground_truth, "post {}", post.id);
+    }
+
+    let two = top_posts_by_score(&mut conn, 2).await.expect("limit");
+    assert_eq!(two.len(), 2);
+}
+
+/// The leaderboard query can use `idx_posts_score_top`. The index is partial
+/// (`score > 0`), so the query must carry the same predicate as a literal.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers) or AUTUMN_TEST_PG_URL"]
+async fn front_page_leaderboard_uses_the_partial_score_index() {
+    #[derive(diesel::QueryableByName)]
+    struct PlanRow {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        line: String,
+    }
+
+    let (_c, pool) = start_postgres().await;
+    let mut conn = pool.get().await.expect("conn");
+    setup_schema(&mut conn).await;
+
+    let debug = diesel::debug_query::<diesel::pg::Pg, _>(&top_posts_by_score_query(5)).to_string();
+    let sql = debug.split(" -- binds").next().expect("sql text");
+    assert_eq!(
+        sql.matches('$').count(),
+        1,
+        "only the limit is a bind; `score > 0` is a literal: {sql}"
+    );
+    conn.batch_execute(&format!("PREPARE leaderboard AS {sql}"))
+        .await
+        .expect("prepare");
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .expect("prefer indexes");
+    let plan: Vec<PlanRow> = diesel::sql_query("EXPLAIN EXECUTE leaderboard(5)")
+        .load(&mut conn)
+        .await
+        .expect("explain");
+    let plan = plan
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("idx_posts_score_top"), "{plan}");
+    assert!(!plan.contains("Sort"), "the index gives the order: {plan}");
 }

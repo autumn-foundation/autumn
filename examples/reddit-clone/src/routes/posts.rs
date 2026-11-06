@@ -39,7 +39,7 @@ use crate::models::{
     NewTag, Post, PostAssociations, PostComments as _, PostReactions as _, PostTagsMutations,
     Subreddit, Tag,
 };
-use crate::repositories::{PgPostRepository, PgVoteRepository, PostRepository};
+use crate::repositories::{PgPostRepository, PostRepository, TopPost, top_posts_by_score};
 use crate::schema::{posts, subreddits, tags};
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread as comment_thread_widget};
 use autumn_web::{contains_letter_or_number, slugify};
@@ -91,7 +91,6 @@ pub async fn front_page(
     mut db: Db,
     State(state): State<AppState>,
     repo: PgPostRepository,
-    votes_repo: PgVoteRepository,
     flags: Flags,
     exps: Experiments,
     flash: Flash,
@@ -114,62 +113,23 @@ pub async fn front_page(
         .load(&mut *db)
         .await?;
 
+    // "Top posts by votes" (#3325): posts with a positive `posts.score`,
+    // highest first. `#[votable]` keeps that column equal to the vote sum, so
+    // one indexed read of five rows replaces a sum over every vote. It runs on
+    // `db`, before the release below.
+    let top_posts: Vec<TopPost> = top_posts_by_score(&mut db, 5).await?;
+
     // Release the `Db` extractor's connection now, before any other pooled
     // checkout. `Db` acquires its connection eagerly at extraction and holds it
     // until it is dropped (not just for the duration of a `&mut *db` borrow), so
-    // keeping it alive across the leaderboard aggregate below — or the `preload`
-    // further down — would make this handler hold *two* connections at once.
-    // That is invisible in dev and fatal under load: this app runs the default
-    // pool (10 connections, no read replica), so once ten requests are in this
-    // handler simultaneously, each holding `db` and waiting for a second
-    // checkout, none can ever proceed. Dropping `db` here keeps the handler at
-    // one connection at a time, which cannot deadlock at any concurrency.
+    // keeping it alive across the `preload` below would make this handler hold
+    // *two* connections at once. That is invisible in dev and fatal under load:
+    // this app runs the default pool (10 connections, no read replica), so once
+    // ten requests are in this handler simultaneously, each holding `db` and
+    // waiting for a second checkout, none can ever proceed. Dropping `db` here
+    // keeps the handler at one connection at a time, which cannot deadlock at
+    // any concurrency.
     drop(db);
-
-    // "Top posts by votes" leaderboard (#1364, AC3): a single typed
-    // grouped-aggregate call — `SUM(value) GROUP BY post_id`, ordered by the
-    // aggregate descending, top 5 — replacing what would otherwise be a
-    // hand-written `SUM ... GROUP BY ... ORDER BY ... LIMIT` string. This is a
-    // *read*, so it is replica-eligible (routes through the repository's read
-    // route). The score-maintenance path in `routes::votes` stays an atomic
-    // primary-side WRITE — see the note there.
-    //
-    // `votes.post_id` is nullable (comment votes carry a NULL `post_id`), and
-    // the grouped-aggregate codegen guards the group column with `IS NOT NULL`,
-    // so the NULL group is excluded — this leaderboard counts only
-    // post-directed votes (comment votes are correctly omitted), no per-call
-    // filter needed. Binding the result to an owned `Vec` releases the
-    // repository's pooled connection before the title lookup checks one out.
-    let top_by_votes: Vec<(i64, Option<i64>)> = votes_repo
-        .sum_value_grouped_by_post_id()
-        .order_by_aggregate_desc()
-        .limit(5)
-        .load()
-        .await?;
-    // Resolve the leaderboard entries' titles in one query (order preserved via
-    // the `top_by_votes` iteration below).
-    let top_ids: Vec<i64> = top_by_votes.iter().map(|(id, _)| *id).collect();
-    // Skip the follow-up title lookup entirely when the leaderboard is empty —
-    // otherwise we'd issue a pointless `WHERE id = ANY('{}')` query.
-    let top_titles: HashMap<i64, String> = if top_ids.is_empty() {
-        HashMap::new()
-    } else {
-        // Use a fresh, short-lived pool checkout — not the `Db` extractor, which
-        // was dropped above — so this lookup never overlaps another live
-        // connection held by this request. The `conn` guard is released at the
-        // end of this block, before `preload` checks one out.
-        let pool = state
-            .pool()
-            .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
-        let mut conn = pool.get().await.map_err(AutumnError::from)?;
-        posts::table
-            .filter(posts::id.eq_any(&top_ids))
-            .select((posts::id, posts::title))
-            .load::<(i64, String)>(&mut conn)
-            .await?
-            .into_iter()
-            .collect()
-    };
 
     // The base rows were read from the primary via `Db`, so pin the preload to
     // the primary too (`on_primary`) — otherwise, under replica lag, an
@@ -214,24 +174,22 @@ pub async fn front_page(
                 }
             }
 
-            // Top posts by votes — rendered from the typed grouped-aggregate
-            // leaderboard read (#1364, AC3). Empty until posts have votes.
-            @if !top_by_votes.is_empty() {
+            // Top posts by votes (#3325). Empty until a post has a positive
+            // score.
+            @if !top_posts.is_empty() {
                 div class="mb-4 px-4 py-3 bg-white rounded-lg shadow-sm border border-gray-200" {
                     div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2" {
                         "Top posts by votes"
                     }
                     ol class="space-y-1 text-sm" {
-                        @for (post_id, sum) in &top_by_votes {
-                            @if let Some(title) = top_titles.get(post_id) {
-                                li class="flex items-center gap-2" {
-                                    span class="font-semibold text-gray-500 w-8 text-right shrink-0" {
-                                        (sum.unwrap_or(0))
-                                    }
-                                    a href=(format!("/posts/{}", post_id))
-                                       class="text-gray-900 hover:text-orange-600 line-clamp-1" {
-                                        (title)
-                                    }
+                        @for top in &top_posts {
+                            li class="flex items-center gap-2" {
+                                span class="font-semibold text-gray-500 w-8 text-right shrink-0" {
+                                    (top.score)
+                                }
+                                a href=(format!("/posts/{}", top.id))
+                                   class="text-gray-900 hover:text-orange-600 line-clamp-1" {
+                                    (top.title)
                                 }
                             }
                         }
@@ -979,6 +937,8 @@ pub async fn show(
     // app that set `security.csrf.form_field` would otherwise render a thread
     // whose very first submit is a 403.
     csrf_field: CsrfFormField,
+    // The comment page (#3325). `?after=` comes from the widget's link.
+    autumn_web::extract::Query(comment_page): autumn_web::extract::Query<super::CommentPageQuery>,
     mut db: Db,
     repo: PgPostRepository,
     flags: Flags,
@@ -1019,12 +979,13 @@ pub async fn show(
     let author = post.author()?;
     let post_tags = post.tags()?;
 
-    // Threaded comments (#1367). One call, whatever the nesting depth: the
-    // whole live thread comes back nested, in stable order, with author names
-    // resolved -- no hand-written join, no N+1 walk, no sort to write. What
-    // used to be a `has_many(Comment)` preload plus a 30-line render plus a
-    // 188-line `routes/comments.rs` is this and the widget below.
-    let comment_thread = repo.comment_thread(post.id).await?;
+    // Threaded comments (#1367), one page at a time (#3325). One call, whatever
+    // the nesting depth: up to `COMMENTS_PER_PAGE` top-level comments and every
+    // reply under them come back nested, in stable order, with author names
+    // resolved. The cost is set by the page, not by the thread.
+    let comment_page = repo
+        .comment_thread_page(post.id, comment_page.after, super::COMMENTS_PER_PAGE)
+        .await?;
 
     // The widget posts to the one framework-mounted comment route, keyed on
     // this model's `commentable_type`. `return_to` is the no-JS round trip:
@@ -1044,7 +1005,8 @@ pub async fn show(
     )
     .label("Post comments")
     .empty_text("No comments yet. Start the conversation!")
-    .return_to(&post_path);
+    .return_to(&post_path)
+    .page(comment_page.after, comment_page.next);
     if current_user.is_some() {
         comment_config = comment_config
             .csrf_token(csrf.token())
@@ -1215,7 +1177,7 @@ pub async fn show(
             // freshly posted comment is worse than no count; the listings show
             // `comment_count`, and those are always full loads.
             h2 class="font-semibold text-gray-700 mb-2" { "Comments" }
-            (comment_thread_widget(&comment_config, &CommentView::from_thread(&comment_thread)))
+            (comment_thread_widget(&comment_config, &CommentView::from_thread(&comment_page.nodes)))
         },
     ))
 }

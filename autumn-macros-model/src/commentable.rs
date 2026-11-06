@@ -11,7 +11,7 @@
 //!    (inherent, so no trait import is needed at the call site — the same
 //!    shadowing trick `counter_caches()` uses);
 //! 3. a `{Model}Comments` trait — `add_comment` / `comment_thread` /
-//!    `delete_comment` — blanket-implemented over
+//!    `comment_thread_page` / `delete_comment` — blanket-implemented over
 //!    `M2mConnSource<Model = Model>`, exactly like `#[votable]`'s
 //!    `{Model}Reactions`, so method resolution stays unambiguous when several
 //!    models' comment traits are in scope.
@@ -825,6 +825,21 @@ pub fn emit_commentable_items(
     );
     // A plain literal, not `format!`/`concat!`: nothing is interpolated, and
     // clippy rightly objects to either wrapper.
+    let page_doc = format!(
+        "One page of this record's live comment thread: up to `page_size` \
+         top-level comments after the `after` cursor, and every live reply \
+         under them.\n\
+         \n\
+         Pass `None` for the first page, then the page's `next` cursor. The \
+         cost is set by the page, not by the thread. See \
+         `autumn_web::commentable::comment_thread_page`.\n\
+         \n\
+         {tenant_note}\
+         # Errors\n\
+         \n\
+         - `404` when this record does not exist (or is soft-deleted).\n\
+         - Any database error."
+    );
     let recompute_doc = "Rebuild this record's comment counter from the comments table, and \
          return the value written.\n\
          \n\
@@ -970,6 +985,16 @@ pub fn emit_commentable_items(
                 >
             > + Send;
 
+            #[doc = #page_doc]
+            fn comment_thread_page(
+                &self,
+                parent_id: i64,
+                after: ::core::option::Option<i64>,
+                page_size: usize,
+            ) -> impl ::std::future::Future<
+                Output = ::autumn_web::AutumnResult<::autumn_web::commentable::ThreadPage>
+            > + Send;
+
             #[doc = #delete_doc]
             fn delete_comment(
                 &self,
@@ -1034,6 +1059,28 @@ pub fn emit_commentable_items(
                     &#spec_static,
                     #type_name,
                     parent_id,
+                    #tenant_arg,
+                    self.__autumn_m2m_soft_delete(),
+                )
+                .await
+            }
+
+            async fn comment_thread_page(
+                &self,
+                parent_id: i64,
+                after: ::core::option::Option<i64>,
+                page_size: usize,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::commentable::ThreadPage> {
+                #resolve_tenant
+                // A read, routed like `comment_thread`.
+                let mut conn = self.__autumn_m2m_read_conn().await?;
+                ::autumn_web::commentable::comment_thread_page(
+                    &mut *conn,
+                    &#spec_static,
+                    #type_name,
+                    parent_id,
+                    after,
+                    page_size,
                     #tenant_arg,
                     self.__autumn_m2m_soft_delete(),
                 )

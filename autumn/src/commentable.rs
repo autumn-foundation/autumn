@@ -1204,6 +1204,452 @@ fn author_name_fragments(spec: &CommentableSpec) -> (String, String) {
     }
 }
 
+// ── Paged read path (#3325) ─────────────────────────────────────────────────
+
+/// The default number of top-level comments on one page.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// One page of a thread, from [`comment_thread_page`] or
+/// [`thread_page_containing`].
+///
+/// A page holds up to `page_size` top-level comments, in `(created_at, id)`
+/// order, and every live reply under them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ThreadPage {
+    /// The top-level comments of this page, with their replies nested.
+    pub nodes: Vec<CommentNode>,
+    /// The cursor this page starts after. `None` for the first page.
+    pub after: Option<i64>,
+    /// The cursor for the next page: the id of this page's last top-level
+    /// comment. `None` when no top-level comment comes after this page.
+    pub next: Option<i64>,
+}
+
+/// One page of the live thread for `(parent_type, parent_id)`.
+///
+/// The cost is set by the page, not by the thread. Use this on a request
+/// path. [`comment_thread`] reads the whole thread.
+///
+/// - `after`: `None` for the first page, else a [`ThreadPage::next`] cursor.
+///   The cursor is a comment id of this thread. Any other id gives an empty
+///   page.
+/// - `page_size`: the number of top-level comments. `0` is read as `1`.
+///
+/// A top-level comment is a live comment with no live parent in this thread.
+/// Thus a live reply under a deleted comment shows at the top level, as in
+/// [`comment_thread`]. Replies are read from the top-level comments down, so
+/// the comments table needs an index on its parent column.
+///
+/// `tenant` and `soft_delete` are the caller's scope: see
+/// [Caller scope](crate::commentable#caller-scope).
+///
+/// # Errors
+///
+/// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
+/// - Any database error.
+#[allow(clippy::too_many_arguments)] // The thread read's arguments, plus the
+// cursor and the page size.
+pub async fn comment_thread_page(
+    conn: &mut RuntimeConnection,
+    spec: &CommentableSpec,
+    parent_type: &str,
+    parent_id: i64,
+    after: Option<i64>,
+    page_size: usize,
+    tenant: Option<&str>,
+    soft_delete: Option<bool>,
+) -> AutumnResult<ThreadPage> {
+    assert_unique_discriminators();
+    spec.validate()?;
+    let soft_deletes = resolve_soft_deletes(spec, soft_delete);
+    probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
+    let scope = PageScope {
+        spec,
+        parent_type,
+        parent_id,
+        tenant,
+        soft_deletes,
+    };
+    read_page(conn, &scope, after, page_size).await
+}
+
+/// The page of the live thread that shows `comment_id`.
+///
+/// This is the first page when the comment's top-level comment is on it.
+/// Otherwise it is the page that ends at that top-level comment. Use it to
+/// show a comment just written. When `comment_id` is not a live comment of
+/// this thread, this is the first page.
+///
+/// The arguments and errors are those of [`comment_thread_page`].
+///
+/// # Errors
+///
+/// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
+/// - Any database error.
+#[allow(clippy::too_many_arguments)] // The page read's arguments, with the
+// target comment in place of the cursor.
+pub async fn thread_page_containing(
+    conn: &mut RuntimeConnection,
+    spec: &CommentableSpec,
+    parent_type: &str,
+    parent_id: i64,
+    comment_id: i64,
+    page_size: usize,
+    tenant: Option<&str>,
+    soft_delete: Option<bool>,
+) -> AutumnResult<ThreadPage> {
+    assert_unique_discriminators();
+    spec.validate()?;
+    let soft_deletes = resolve_soft_deletes(spec, soft_delete);
+    probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
+    let scope = PageScope {
+        spec,
+        parent_type,
+        parent_id,
+        tenant,
+        soft_deletes,
+    };
+    let after = page_after_for(conn, &scope, comment_id, page_size).await?;
+    read_page(conn, &scope, after, page_size).await
+}
+
+/// The `after` cursor of the page that shows `comment_id`, with no parent
+/// probe. For the router, after its write probed the parent.
+#[cfg(all(feature = "db", feature = "widgets-social"))]
+async fn page_after_containing(
+    conn: &mut RuntimeConnection,
+    spec: &CommentableSpec,
+    parent_type: &str,
+    parent_id: i64,
+    comment_id: i64,
+    page_size: usize,
+    tenant: Option<&str>,
+) -> AutumnResult<Option<i64>> {
+    let scope = PageScope {
+        spec,
+        parent_type,
+        parent_id,
+        tenant,
+        soft_deletes: resolve_soft_deletes(spec, None),
+    };
+    page_after_for(conn, &scope, comment_id, page_size).await
+}
+
+/// The facts every paged statement needs.
+struct PageScope<'a> {
+    spec: &'a CommentableSpec,
+    parent_type: &'a str,
+    parent_id: i64,
+    tenant: Option<&'a str>,
+    soft_deletes: bool,
+}
+
+/// A paged statement with its binds applied.
+type PageQuery = diesel::query_builder::BoxedSqlQuery<
+    'static,
+    crate::db::RuntimeBackend,
+    diesel::query_builder::SqlQuery,
+>;
+
+/// A bind value for a paged statement.
+enum PageBind {
+    Text(String),
+    BigInt(i64),
+}
+
+/// SQL text and its binds, in placeholder order.
+///
+/// Each placeholder gets the next number, and each bind is pushed once per
+/// use. Thus one statement serves Postgres (`$n`) and `SQLite` (`?`).
+#[derive(Default)]
+struct PageSql {
+    binds: Vec<PageBind>,
+}
+
+impl PageSql {
+    /// A placeholder for `value`.
+    fn bind(&mut self, value: PageBind) -> String {
+        self.binds.push(value);
+        ph(self.binds.len())
+    }
+
+    /// Placeholders for the thread's `(type, id)` pair.
+    fn thread(&mut self, scope: &PageScope<'_>) -> (String, String) {
+        (
+            self.bind(PageBind::Text(scope.parent_type.to_owned())),
+            self.bind(PageBind::BigInt(scope.parent_id)),
+        )
+    }
+
+    /// The statement with every bind applied.
+    fn query(self, sql: String) -> PageQuery {
+        let mut query = diesel::sql_query(sql).into_boxed();
+        for bind in self.binds {
+            query = match bind {
+                PageBind::Text(value) => query.bind::<Text, _>(value),
+                PageBind::BigInt(value) => query.bind::<BigInt, _>(value),
+            };
+        }
+        query
+    }
+}
+
+/// `AND` a live top-level comment, for the row aliased `alias`.
+///
+/// A comment is top-level when it has no parent, or when its parent is not a
+/// live comment of the same thread. This matches how [`nest`] places an
+/// orphan.
+fn top_level_predicate(spec: &CommentableSpec, alias: &str) -> String {
+    let comments = quote_ident(spec.comments_table);
+    let pk = quote_ident(spec.comment_pk);
+    let parent = quote_ident(spec.parent_column);
+    let type_column = quote_ident(spec.type_column);
+    let id_column = quote_ident(spec.id_column);
+    let live = spec.live_comments(alias);
+    let parent_live = spec.live_comments("__autumn_cmt_up");
+    format!(
+        "{live} AND ({alias}.{parent} IS NULL OR NOT EXISTS (\
+           SELECT 1 FROM {comments} AS __autumn_cmt_up \
+            WHERE __autumn_cmt_up.{pk} = {alias}.{parent} \
+              AND __autumn_cmt_up.{type_column} = {alias}.{type_column} \
+              AND __autumn_cmt_up.{id_column} = {alias}.{id_column}{parent_live}))"
+    )
+}
+
+/// `AND` the row aliased `alias` sorts after (or before) the comment the next
+/// bind names. The cursor row must be in the same thread, else no row
+/// matches.
+fn cursor_predicate(
+    sql: &mut PageSql,
+    scope: &PageScope<'_>,
+    alias: &str,
+    op: &str,
+    cursor: i64,
+) -> String {
+    let spec = scope.spec;
+    let comments = quote_ident(spec.comments_table);
+    let pk = quote_ident(spec.comment_pk);
+    let created_at = quote_ident(spec.created_at_column);
+    let type_column = quote_ident(spec.type_column);
+    let id_column = quote_ident(spec.id_column);
+    let cursor = sql.bind(PageBind::BigInt(cursor));
+    let (parent_type, parent_id) = sql.thread(scope);
+    format!(
+        " AND ({alias}.{created_at}, {alias}.{pk}) {op} (\
+           SELECT k.{created_at}, k.{pk} FROM {comments} AS k \
+            WHERE k.{pk} = {cursor} AND k.{type_column} = {parent_type} \
+              AND k.{id_column} = {parent_id})"
+    )
+}
+
+/// A page row: the comment, and its depth below its page's top-level comment.
+///
+/// In its own module: diesel's `embed` code names `QueryableByName` without a
+/// path.
+mod page_row {
+    use diesel::QueryableByName;
+    use diesel::sql_types::BigInt;
+
+    #[derive(QueryableByName)]
+    pub(super) struct PageRow {
+        #[diesel(embed)]
+        pub(super) comment: super::Comment,
+        #[diesel(sql_type = BigInt)]
+        pub(super) depth: i64,
+    }
+}
+use page_row::PageRow;
+
+/// Read one page after the parent probe.
+async fn read_page(
+    conn: &mut RuntimeConnection,
+    scope: &PageScope<'_>,
+    after: Option<i64>,
+    page_size: usize,
+) -> AutumnResult<ThreadPage> {
+    let limit = i64::try_from(page_size.max(1)).unwrap_or(i64::MAX);
+    let rows: Vec<PageRow> = page_statement(scope, after, limit)
+        .load::<PageRow>(conn)
+        .await
+        .map_err(AutumnError::from)?;
+
+    // Rows are in `(created_at, id)` order, and so are the top-level comments
+    // the page CTE picked. The last depth-0 row is the page's last one.
+    let top_level = rows.iter().filter(|row| row.depth == 0).count();
+    let last = rows
+        .iter()
+        .rev()
+        .find(|row| row.depth == 0)
+        .map(|row| row.comment.id);
+    let next = match last {
+        Some(last) if i64::try_from(top_level).unwrap_or(i64::MAX) >= limit => {
+            next_top_level(conn, scope, last).await?.map(|_| last)
+        }
+        _ => None,
+    };
+
+    Ok(ThreadPage {
+        nodes: nest(rows.into_iter().map(|row| row.comment).collect()),
+        after,
+        next,
+    })
+}
+
+/// The page read: up to `limit` top-level comments after `after`, and every
+/// live reply under them, in `(created_at, id)` order.
+///
+/// The `EXISTS` clause checks parent visibility inside the read, as
+/// [`thread_statement`] does.
+fn page_statement(scope: &PageScope<'_>, after: Option<i64>, limit: i64) -> PageQuery {
+    let spec = scope.spec;
+    let comments = quote_ident(spec.comments_table);
+    let pk = quote_ident(spec.comment_pk);
+    let parent_column = quote_ident(spec.parent_column);
+    let author_column = quote_ident(spec.author_column);
+    let body_column = quote_ident(spec.body_column);
+    let created_at = quote_ident(spec.created_at_column);
+    let type_column = quote_ident(spec.type_column);
+    let id_column = quote_ident(spec.id_column);
+    let parent_table = quote_ident(spec.parent_table);
+    let (author_join, author_name) = author_name_fragments(spec);
+    let reply_live = spec.live_comments("r");
+
+    let mut sql = PageSql::default();
+    let (top_type, top_id) = sql.thread(scope);
+    let top_level = top_level_predicate(spec, "c");
+    let cursor = after
+        .map(|cursor| cursor_predicate(&mut sql, scope, "c", ">", cursor))
+        .unwrap_or_default();
+    let limit = sql.bind(PageBind::BigInt(limit));
+    let (reply_type, reply_id) = sql.thread(scope);
+    let pk_placeholder = sql.binds.len() + 1;
+    let visibility = parent_visibility(
+        spec,
+        pk_placeholder,
+        pk_placeholder + 1,
+        scope.soft_deletes,
+        scope.tenant,
+    );
+    sql.binds.push(PageBind::BigInt(scope.parent_id));
+    if let Some(tenant) = visibility.tenant {
+        sql.binds.push(PageBind::Text(tenant));
+    }
+
+    let text = format!(
+        "WITH RECURSIVE __autumn_cmt_page AS (\
+           SELECT c.{pk} AS id FROM {comments} AS c \
+            WHERE c.{type_column} = {top_type} AND c.{id_column} = {top_id}{top_level}{cursor} \
+            ORDER BY c.{created_at} ASC, c.{pk} ASC \
+            LIMIT {limit}\
+         ), __autumn_cmt_tree(id, depth) AS (\
+           SELECT id, CAST(0 AS BIGINT) FROM __autumn_cmt_page \
+           UNION ALL \
+           SELECT r.{pk}, t.depth + 1 \
+             FROM {comments} AS r JOIN __autumn_cmt_tree AS t ON r.{parent_column} = t.id \
+            WHERE t.depth < {RECURSION_GUARD} \
+              AND r.{type_column} = {reply_type} AND r.{id_column} = {reply_id}{reply_live}\
+         ) \
+         SELECT c.{pk} AS id, c.{parent_column} AS parent_id, \
+                c.{author_column} AS author_id, c.{body_column} AS body, \
+                c.{created_at} AS created_at, {author_name} AS author_name, \
+                t.depth AS depth \
+           FROM __autumn_cmt_tree AS t JOIN {comments} AS c ON c.{pk} = t.id{author_join} \
+          WHERE EXISTS (SELECT 1 FROM {parent_table} WHERE {}) \
+          ORDER BY c.{created_at} ASC, c.{pk} ASC",
+        visibility.predicate
+    );
+    sql.query(text)
+}
+
+/// The first top-level comment after `cursor`, if any.
+async fn next_top_level(
+    conn: &mut RuntimeConnection,
+    scope: &PageScope<'_>,
+    cursor: i64,
+) -> AutumnResult<Option<i64>> {
+    let spec = scope.spec;
+    let comments = quote_ident(spec.comments_table);
+    let pk = quote_ident(spec.comment_pk);
+    let created_at = quote_ident(spec.created_at_column);
+    let type_column = quote_ident(spec.type_column);
+    let id_column = quote_ident(spec.id_column);
+
+    let mut sql = PageSql::default();
+    let (parent_type, parent_id) = sql.thread(scope);
+    let top_level = top_level_predicate(spec, "c");
+    let after = cursor_predicate(&mut sql, scope, "c", ">", cursor);
+    let text = format!(
+        "SELECT c.{pk} AS id FROM {comments} AS c \
+          WHERE c.{type_column} = {parent_type} AND c.{id_column} = {parent_id}{top_level}{after} \
+          ORDER BY c.{created_at} ASC, c.{pk} ASC \
+          LIMIT 1"
+    );
+    sql.query(text)
+        .get_result::<CommentIdRow>(conn)
+        .await
+        .optional_row()
+        .map(|row| row.map(|row| row.id))
+}
+
+/// The `after` cursor of the page that shows `comment_id`.
+///
+/// The statement walks up from the comment to its top-level comment. Then
+/// it reads the top-level comment `page_size` places before that one. That
+/// comment is the cursor of the page that ends at the target. When there is
+/// no such comment, the target is on the first page and the cursor is `None`.
+async fn page_after_for(
+    conn: &mut RuntimeConnection,
+    scope: &PageScope<'_>,
+    comment_id: i64,
+    page_size: usize,
+) -> AutumnResult<Option<i64>> {
+    let spec = scope.spec;
+    let comments = quote_ident(spec.comments_table);
+    let pk = quote_ident(spec.comment_pk);
+    let parent_column = quote_ident(spec.parent_column);
+    let created_at = quote_ident(spec.created_at_column);
+    let type_column = quote_ident(spec.type_column);
+    let id_column = quote_ident(spec.id_column);
+    let anchor_live = spec.live_comments("a");
+    let up_live = spec.live_comments("p");
+    let offset = i64::try_from(page_size.max(1) - 1).unwrap_or(i64::MAX);
+
+    let mut sql = PageSql::default();
+    let target = sql.bind(PageBind::BigInt(comment_id));
+    let (anchor_type, anchor_id) = sql.thread(scope);
+    let (up_type, up_id) = sql.thread(scope);
+    let (top_type, top_id) = sql.thread(scope);
+    let top_level = top_level_predicate(spec, "c");
+    let offset = sql.bind(PageBind::BigInt(offset));
+    let text = format!(
+        "WITH RECURSIVE __autumn_cmt_up(id, parent, depth) AS (\
+           SELECT a.{pk}, a.{parent_column}, CAST(0 AS BIGINT) FROM {comments} AS a \
+            WHERE a.{pk} = {target} AND a.{type_column} = {anchor_type} \
+              AND a.{id_column} = {anchor_id}{anchor_live} \
+           UNION ALL \
+           SELECT p.{pk}, p.{parent_column}, u.depth + 1 \
+             FROM {comments} AS p JOIN __autumn_cmt_up AS u ON p.{pk} = u.parent \
+            WHERE u.depth < {RECURSION_GUARD} \
+              AND p.{type_column} = {up_type} AND p.{id_column} = {up_id}{up_live}\
+         ), __autumn_cmt_root AS (\
+           SELECT k.{created_at} AS created_at, k.{pk} AS id \
+             FROM {comments} AS k \
+            WHERE k.{pk} = (SELECT id FROM __autumn_cmt_up ORDER BY depth DESC LIMIT 1)\
+         ) \
+         SELECT c.{pk} AS id FROM {comments} AS c, __autumn_cmt_root AS root \
+          WHERE c.{type_column} = {top_type} AND c.{id_column} = {top_id}{top_level} \
+            AND (c.{created_at}, c.{pk}) < (root.created_at, root.id) \
+          ORDER BY c.{created_at} DESC, c.{pk} DESC \
+          LIMIT 1 OFFSET {offset}"
+    );
+    sql.query(text)
+        .get_result::<CommentIdRow>(conn)
+        .await
+        .optional_row()
+        .map(|row| row.map(|row| row.id))
+}
+
 /// Assemble a flat, ordered comment list into a forest.
 ///
 /// Linear in the number of comments: one pass to index every row's position,
@@ -1949,6 +2395,29 @@ mod tests {
         }
     }
 
+    /// A no-JS submit returns to the host page that shows the comment, at the
+    /// comment's element. The result is still a safe return path.
+    #[cfg(all(feature = "db", feature = "widgets-social"))]
+    #[test]
+    fn a_no_js_submit_returns_to_the_page_that_shows_the_comment() {
+        let element = Some("autumn-comments-Post-1-c9".to_owned());
+        for (return_to, after, element, expected) in [
+            ("/p", None, None, "/p"),
+            (
+                "/p",
+                Some(4),
+                element.clone(),
+                "/p?after=4#autumn-comments-Post-1-c9",
+            ),
+            ("/p?sort=new", Some(4), None, "/p?sort=new&after=4"),
+            ("/p#old", None, element, "/p#autumn-comments-Post-1-c9"),
+        ] {
+            let location = redirect_location(return_to, after, element);
+            assert_eq!(location, expected);
+            assert!(is_safe_return_path(&location), "{location}");
+        }
+    }
+
     /// The identifier guard is what keeps a hand-constructed spec from
     /// smuggling SQL through `format!`.
     #[test]
@@ -2335,6 +2804,10 @@ pub struct CommentsConfig {
     /// still succeeds, because a broken notifier must not un-post a comment
     /// the user already sees.
     pub on_comment: Option<CommentCreatedHook>,
+    /// The number of top-level comments on one page of a thread. Default
+    /// [`DEFAULT_PAGE_SIZE`]. Both handlers read one page, never the whole
+    /// thread. See [`comment_thread_page`].
+    pub page_size: usize,
 }
 
 /// The record-level authorization callback for [`CommentsConfig::authorize`].
@@ -2402,6 +2875,7 @@ impl std::fmt::Debug for CommentsConfig {
             .field("label", &self.label)
             .field("authorize", &self.authorize.as_ref().map(|_| "<fn>"))
             .field("on_comment", &self.on_comment.as_ref().map(|_| "<fn>"))
+            .field("page_size", &self.page_size)
             .finish()
     }
 }
@@ -2429,6 +2903,13 @@ impl CommentsConfig {
         self
     }
 
+    /// Set the number of top-level comments on one page. `0` is read as `1`.
+    #[must_use]
+    pub const fn page_size(mut self, page_size: usize) -> Self {
+        self.page_size = page_size;
+        self
+    }
+
     /// Set the post-create callback. See [`on_comment`](Self::on_comment).
     #[must_use]
     pub fn on_comment<F>(mut self, on_comment: F) -> Self
@@ -2450,6 +2931,7 @@ impl Default for CommentsConfig {
             label: "Comments".to_owned(),
             authorize: None,
             on_comment: None,
+            page_size: DEFAULT_PAGE_SIZE,
         }
     }
 }
@@ -2779,11 +3261,13 @@ async fn show_thread(
 ) -> AutumnResult<maud::Markup> {
     let spec = resolve_spec(&commentable_type)?;
     let tenant = request_tenant(spec)?;
-    let thread = comment_thread(
+    let page = comment_thread_page(
         &mut db,
         spec,
         &commentable_type,
         parent_id,
+        query.after,
+        config.page_size,
         tenant.as_deref(),
         // The router has no repository. Use the registry rule (#2284).
         None,
@@ -2794,7 +3278,7 @@ async fn show_thread(
         spec,
         &commentable_type,
         parent_id,
-        &thread,
+        &page,
         csrf.as_ref(),
         csrf_field.as_ref(),
         author_id.is_some(),
@@ -2814,6 +3298,9 @@ async fn show_thread(
 struct ThreadQuery {
     #[serde(default)]
     return_to: Option<String>,
+    /// The page cursor. A value that is not an id is a `400`.
+    #[serde(default)]
+    after: Option<i64>,
 }
 
 /// Post a comment (or a reply) and re-render the thread.
@@ -2906,19 +3393,63 @@ async fn post_comment(
     // Returning early here would leave a durable comment the rest of the system
     // never hears about — a silent inconsistency worse than the refresh failure
     // the caller is about to be told about anyway.
-    let thread = if redirecting {
-        Ok(Vec::new())
+    //
+    // The response shows the page that holds the new comment. After a
+    // rejection it shows the page of the comment the visitor replied to, so
+    // the draft returns to that form. Else it shows the first page.
+    let focus = created.as_ref().map(|comment| comment.id).or(reply_to);
+    let page = if redirecting {
+        // No-JS: send the browser to the host page that shows the comment. A
+        // failed lookup costs only the position, so it is not an error.
+        let after = match focus {
+            Some(focus) => page_after_containing(
+                &mut db,
+                spec,
+                &commentable_type,
+                parent_id,
+                focus,
+                config.page_size,
+                tenant.as_deref(),
+            )
+            .await
+            .unwrap_or(None),
+            None => None,
+        };
+        Ok(ThreadPage {
+            nodes: Vec::new(),
+            after,
+            next: None,
+        })
     } else {
-        comment_thread(
-            &mut db,
-            spec,
-            &commentable_type,
-            parent_id,
-            tenant.as_deref(),
-            // The router has no repository. Use the registry rule (#2284).
-            None,
-        )
-        .await
+        match focus {
+            Some(focus) => {
+                thread_page_containing(
+                    &mut db,
+                    spec,
+                    &commentable_type,
+                    parent_id,
+                    focus,
+                    config.page_size,
+                    tenant.as_deref(),
+                    // The router has no repository. Use the registry rule (#2284).
+                    None,
+                )
+                .await
+            }
+            None => {
+                comment_thread_page(
+                    &mut db,
+                    spec,
+                    &commentable_type,
+                    parent_id,
+                    None,
+                    config.page_size,
+                    tenant.as_deref(),
+                    None,
+                )
+                .await
+            }
+        }
     };
 
     // Release the checkout before awaiting the hook. `on_comment` is documented
@@ -2950,7 +3481,7 @@ async fn post_comment(
 
     // Now that the hook has run for the committed comment, a failed refresh can
     // surface.
-    let thread = thread?;
+    let page = page?;
 
     // The draft rides with the error, never without it: these two are the same
     // event — "we refused this, here it is back".
@@ -2962,12 +3493,19 @@ async fn post_comment(
     // were carried at all. Falling back to the top-level form keeps the text on
     // screen where the visitor can copy it, which is the whole point.
     let draft = error.is_some().then(|| {
-        let target = reply_to.filter(|id| reply_form_exists(&thread, *id, spec.max_depth));
+        let target = reply_to.filter(|id| reply_form_exists(&page.nodes, *id, spec.max_depth));
         (target, submission.body.clone())
     });
 
     if redirecting && let Some(return_to) = return_to {
-        return Ok(crate::Redirect::to(return_to).into_response());
+        let location = redirect_location(
+            return_to,
+            page.after,
+            focus.map(|id| {
+                crate::widgets::comment_dom_id(&thread_dom_id(&commentable_type, parent_id), id)
+            }),
+        );
+        return Ok(crate::Redirect::to(&location).into_response());
     }
 
     Ok(render(
@@ -2975,7 +3513,7 @@ async fn post_comment(
         spec,
         &commentable_type,
         parent_id,
-        &thread,
+        &page,
         csrf.as_ref(),
         csrf_field.as_ref(),
         true,
@@ -3049,7 +3587,7 @@ fn render(
     spec: &CommentableSpec,
     commentable_type: &str,
     parent_id: i64,
-    thread: &[CommentNode],
+    page: &ThreadPage,
     csrf: Option<&crate::security::csrf::CsrfToken>,
     csrf_field: Option<&crate::security::csrf::CsrfFormField>,
     can_comment: bool,
@@ -3064,7 +3602,8 @@ fn render(
         thread_action(config, commentable_type, parent_id),
         spec,
     )
-    .label(config.label.clone());
+    .label(config.label.clone())
+    .page(page.after, page.next);
     if let Some(csrf) = csrf {
         widget = widget.csrf_token(csrf.token());
     }
@@ -3090,7 +3629,33 @@ fn render(
             .read_only()
             .sign_in_prompt(config.sign_in_prompt.clone());
     }
-    crate::widgets::comment_thread(&widget, &crate::widgets::CommentView::from_thread(thread))
+    crate::widgets::comment_thread(
+        &widget,
+        &crate::widgets::CommentView::from_thread(&page.nodes),
+    )
+}
+
+/// The `Location` for a no-JS submit: `return_to` on the page that shows the
+/// comment, at the comment's element.
+///
+/// `return_to` already passed [`is_safe_return_path`]. Its own fragment is
+/// replaced. The cursor and the element id are digits and identifier
+/// characters only, so the result stays a safe relative path.
+#[cfg(all(feature = "db", feature = "widgets-social"))]
+fn redirect_location(return_to: &str, after: Option<i64>, element: Option<String>) -> String {
+    let path = return_to.split('#').next().unwrap_or(return_to);
+    let mut location = match after {
+        Some(after) => {
+            let separator = if path.contains('?') { '&' } else { '?' };
+            format!("{path}{separator}after={after}")
+        }
+        None => path.to_owned(),
+    };
+    if let Some(element) = element {
+        location.push('#');
+        location.push_str(&element);
+    }
+    location
 }
 
 /// The DOM id the router renders a thread into.

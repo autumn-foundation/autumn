@@ -56,7 +56,7 @@ table spelled for whichever one the project uses.
 |---|---|
 | `Post::COMMENTABLE_TYPE` | the discriminator stored in `comments.commentable_type` |
 | `Post::commentable_spec()` | the compile-time binding (table, columns, depth, counter) |
-| `PostComments` trait | `add_comment` / `comment_thread` / `delete_comment` on the generated repository |
+| `PostComments` trait | `add_comment` / `comment_thread` / `comment_thread_page` / `delete_comment` on the generated repository |
 | `commentable::router(…)` | one pair of routes serving **every** commentable model |
 | `widgets::comment_thread` | the no-JS/htmx nested list with an inline reply form per node |
 
@@ -173,6 +173,14 @@ use crate::models::PostComments as _;   // the trait `#[commentable]` emits
 let comment = posts.add_comment(post_id, author_id, "first!", None).await?;
 let reply = posts.add_comment(post_id, author_id, "…", Some(comment.id)).await?;
 
+// One page: up to 50 top-level comments and every reply under them.
+let page: ThreadPage = posts.comment_thread_page(post_id, None, 50).await?;
+// The next page starts after the last top-level comment of this one.
+let more: Option<ThreadPage> = match page.next {
+    Some(next) => Some(posts.comment_thread_page(post_id, Some(next), 50).await?),
+    None => None,
+};
+
 // The whole live thread, replies nested under their parent.
 let thread: Vec<CommentNode> = posts.comment_thread(post_id).await?;
 
@@ -188,6 +196,28 @@ let live: i64 = posts.recompute_comment_count(post_id).await?;
 `comment_thread` is **one** query for the comments (plus the parent visibility
 probe) whatever the nesting depth — the tree is assembled in Rust, never with
 an N+1 walk. Order is stable: `(created_at, id)` at every level.
+
+### Read a thread in pages (#3325)
+
+`comment_thread` reads the whole thread, so its cost grows with the thread. On
+a request path, use `comment_thread_page(parent_id, after, page_size)`. Its
+cost is set by the page.
+
+- A page holds up to `page_size` top-level comments, in `(created_at, id)`
+  order, and every live reply under them. A reply never goes to a later page.
+- `after` is `None` for the first page. For the next page, pass the page's
+  `next` cursor. `next` is `None` on the last page.
+- The cursor is a comment id. The read scopes it to this thread, so an id
+  from another record gives an empty page.
+- A live reply under a deleted comment shows at the top level, as in
+  `comment_thread`.
+- The read is three statements at most: the parent probe, the page, and a
+  check for a next page. It walks replies down from the top-level comments, so
+  index the parent column (`parent_id`). Index
+  `(commentable_type, commentable_id, created_at, id)` for the top-level order.
+
+`commentable::thread_page_containing` returns the page that shows one
+comment. The router uses it to show a comment just written.
 
 > **These helpers take their own pooled connection.** Like `#[votable]`'s
 > `react()` and the many-to-many mutation helpers, they do not join an
@@ -238,7 +268,7 @@ graft a subtree onto someone else's row.
 ```rust,ignore
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 
-let thread = posts.comment_thread(post.id).await?;
+let page = posts.comment_thread_page(post.id, query.after, 50).await?;
 use autumn_web::commentable::{CommentsConfig, thread_action, thread_dom_id};
 
 let comments = CommentsConfig::default();          // must match what you `nest`
@@ -248,9 +278,10 @@ let cfg = CommentThread::from_spec(                 // depth + body caps from th
         Post::commentable_spec(),
     )
     .csrf_token(csrf.token())
-    .return_to(&post_path);
+    .return_to(&post_path)
+    .page(page.after, page.next);
 
-Ok(comment_thread(&cfg, &CommentView::from_thread(&thread)))
+Ok(comment_thread(&cfg, &CommentView::from_thread(&page.nodes)))
 ```
 
 It renders nested `<ol>`s (depth is exposed to assistive technology, not just
@@ -266,6 +297,18 @@ the thread still renders, every form is gone. A rejected body comes back through
 `.error(msg)`, rendered `role="alert"` above the form — htmx does not swap a
 non-2xx response, so returning the `422` instead would make the button look
 broken.
+
+`.page(after, next)` renders the page links:
+
+- When `next` is set, the top-level list ends with a "More comments" item.
+  With htmx, it loads the next page from the router and puts the new
+  top-level comments in its place. Without htmx, it is a link to
+  `return_to` with `?after=<next>`.
+- When `after` is set, a link back to the first page comes before the list.
+
+The host page must read `after` from its query string and pass it to
+`comment_thread_page`. Change the link text with `.more_label(…)` and
+`.earlier_label(…)`.
 
 `from_spec` is the spelling to prefer: it copies `max_depth` **and**
 `max_body_bytes` off the model, so the UI cannot drift from the write path and
@@ -285,8 +328,13 @@ mounts **one** pair of routes for the whole binary:
 
 | Method | Path | Does |
 |---|---|---|
-| `GET` | `/comments/{commentable_type}/{parent_id}` | render the thread fragment |
-| `POST` | `/comments/{commentable_type}/{parent_id}` | post a comment or reply, then re-render it |
+| `GET` | `/comments/{commentable_type}/{parent_id}` | render one page of the thread (`?after=<id>` for a later page) |
+| `POST` | `/comments/{commentable_type}/{parent_id}` | post a comment or reply, then render the page that shows it |
+
+Both handlers read one page, never the whole thread. Set the page size with
+`CommentsConfig::default().page_size(n)` (default 50). After a post, the
+response shows the page that holds the new comment. A no-JS post returns to
+`return_to?after=<cursor>#<comment id>`, the same page.
 
 `commentable_type` is matched against the registry, so an unregistered type is
 a `404` — the router can only ever reach a model that really declared
@@ -451,10 +499,9 @@ repository of the model soft-deletes.
 - **Live cross-client updates** — composes with model-change broadcast (#1336).
 - **Moderation queues, spam scoring, edit history, @mentions, email-on-reply** —
   follow-ups.
-- **Paginate a thread.** `comment_thread` loads every live comment for the
-  record in one query. That is the right shape for the discussion sizes this
-  targets and is what makes "one query at any depth" true; a record with a
-  million comments wants a different API, not a `LIMIT` bolted onto this one.
+- **Page the replies of one comment.** A page holds the whole reply tree of
+  each of its top-level comments. A top-level comment with very many replies
+  makes a large page.
 - **Nest without bound.** `max_depth` must stay below `1000`, the depth the
   runtime's recursive probe measures to; beyond that the render flattens rather
   than recursing, so a malformed chain cannot overflow the stack.
