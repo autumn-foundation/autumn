@@ -89,6 +89,7 @@
 //! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_OPEN` | `database.fleet.max_open` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES` | `database.fleet.max_resident_bytes` | `u64` |
 //! | `AUTUMN_DATABASE__FLEET__MIN_RESIDENCY` | `database.fleet.min_residency` | duration; empty is `2s` |
 //! | `AUTUMN_DATABASE__FLEET__POOL_SIZE` | `database.fleet.pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND` | `database.fleet.create_on_demand` | `Option<bool>` |
@@ -8224,6 +8225,7 @@ impl AutumnConfig {
                 root,
                 path: None,
                 max_open: default_fleet_max_open(),
+                max_resident_bytes: 0,
                 min_residency: default_fleet_min_residency(),
                 pool_size: default_fleet_pool_size(),
                 create_on_demand: None,
@@ -8242,6 +8244,8 @@ impl AutumnConfig {
         parse_env(env, "AUTUMN_DATABASE__FLEET__ROOT", &mut fleet.root);
         parse_env_option_string(env, "AUTUMN_DATABASE__FLEET__PATH", &mut fleet.path);
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_OPEN", &mut fleet.max_open);
+        let budget = &mut fleet.max_resident_bytes;
+        parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES", budget);
         let mut residency = Some(fleet.min_residency);
         parse_env_option_duration(env, "AUTUMN_DATABASE__FLEET__MIN_RESIDENCY", &mut residency);
         fleet.min_residency = residency.unwrap_or_else(default_fleet_min_residency);
@@ -11833,6 +11837,17 @@ pub struct DatabaseFleetConfig {
     /// limit (`ulimit -n`) for the peak count, not for this value.
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
+
+    /// The memory the open databases may hold, in bytes, as a soft limit.
+    /// Default: `0`, no budget.
+    ///
+    /// Each engine reports the memory of one open database. The `SQLite`
+    /// engine counts the page cache of each open connection (about 2 MB).
+    /// Past this value, the sweeper closes the least recently used idle
+    /// database, with the same rules as for [`max_open`](Self::max_open). A
+    /// background open finds no room while the budget is full.
+    #[serde(default)]
+    pub max_resident_bytes: u64,
 
     /// How long a database stays open after its last use before the
     /// [`max_open`](Self::max_open) sweep can close it. Default: `"2s"`.
@@ -22048,6 +22063,7 @@ path = "/healthz"
             root: "/var/lib/app/fleet".to_owned(),
             path: None,
             max_open: 16,
+            max_resident_bytes: 0,
             pool_size: 2,
             create_on_demand: None,
             idle_close_secs: 300,
@@ -22250,6 +22266,7 @@ path = "/healthz"
             .with("AUTUMN_DATABASE__FLEET__POOL_SIZE", "1")
             .with("AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND", "true")
             .with("AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS", "0")
+            .with("AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES", "1048576")
             .with("AUTUMN_DATABASE__FLEET__RESTORE_MISSING", "true");
         config.apply_env_overrides_with_env(&env);
         let fleet = config.database.fleet.expect("env creates the fleet");
@@ -22260,6 +22277,7 @@ path = "/healthz"
         assert_eq!(fleet.pool_size, 1);
         assert!(fleet.effective_create_on_demand());
         assert_eq!(fleet.idle_close_secs, 0);
+        assert_eq!(fleet.max_resident_bytes, 1_048_576);
         assert!(fleet.restore_missing);
         // Issue #3235: the defaults, then the overrides.
         assert_eq!(
@@ -22472,6 +22490,7 @@ path = "/healthz"
         assert_eq!(fleet.max_open, 256);
         assert_eq!(fleet.pool_size, 2);
         assert_eq!(fleet.idle_close_secs, 300);
+        assert_eq!(fleet.max_resident_bytes, 0, "no memory budget by default");
         config.database.validate().unwrap();
     }
 

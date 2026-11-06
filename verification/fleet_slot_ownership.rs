@@ -318,6 +318,46 @@ pub proof fn fenced_replicator_stops(old_epoch: nat, new_epoch: nat)
     ensures !may_ship(old_epoch, new_epoch)
 {}
 
+// ---- Open of a database file ----
+
+/// `FleetEngine::open`: an open under `epoch` accepts a file stamped at or
+/// below `epoch`. It refuses a file stamped above it.
+pub open spec fn may_open(stamp: nat, epoch: nat) -> bool {
+    stamp <= epoch
+}
+
+/// The stamp after an accepted open. It never goes down.
+pub open spec fn stamp_after_open(stamp: nat, epoch: nat) -> nat {
+    if stamp < epoch { epoch } else { stamp }
+}
+
+/// After the new owner opens the file, the old owner cannot open it.
+pub proof fn stale_owner_cannot_open(stamp: nat, old_epoch: nat, new_epoch: nat)
+    requires
+        old_epoch < new_epoch,
+        may_open(stamp, new_epoch),
+    ensures
+        stamp_after_open(stamp, new_epoch) == new_epoch,
+        !may_open(stamp_after_open(stamp, new_epoch), old_epoch),
+{}
+
+/// The current owner can open the file again with the same epoch.
+pub proof fn owner_can_open_again(stamp: nat, epoch: nat)
+    requires may_open(stamp, epoch)
+    ensures may_open(stamp_after_open(stamp, epoch), epoch)
+{}
+
+/// A grant from the table is never below a stamp the table issued.
+pub proof fn grant_can_open(s: State, op: Op, stamp: nat)
+    requires
+        inv(s),
+        grants(s, op),
+        stamp <= s.last,
+    ensures may_open(stamp, apply(s, op).slot.epoch)
+{
+    grant_is_above_the_counter(s, op);
+}
+
 fn main() {}
 
 } // verus!

@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use crate::plugin_contract::{PluginContract, SurfaceTier, surface};
 use crate::route_listing::{RouteInfo, RouteSource};
 
+#[cfg(feature = "db")]
+pub mod fleet;
 #[cfg(feature = "maud")]
 pub mod widgets;
 

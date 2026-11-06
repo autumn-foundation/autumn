@@ -33,6 +33,7 @@ mode = "tenant"                 # or "slot"
 root = "/var/lib/app/fleet"     # on the host's local volume
 # path = "{bucket}/{tenant}.db" # default for mode = "tenant"
 max_open = 256                  # soft limit on open databases (LRU past this)
+# max_resident_bytes = 0        # soft memory budget; 0 is off (LRU past this)
 # min_residency = "2s"          # LRU does not close a database used this recently
 pool_size = 2                   # connections per open database
 idle_close_secs = 300           # close a database idle this long
@@ -366,6 +367,11 @@ them.
   12 seconds after the burst.
 - A lower `min_residency` keeps the count nearer to `max_open` during a burst.
   A request can then reopen a database that it used a moment before.
+- `max_resident_bytes` is a soft memory budget, with the same rules as
+  `max_open`. The `SQLite` engine counts about 2 MB of page cache for each
+  open connection. Past the budget, the least recently used idle database
+  closes. `0` (the default) turns the budget off. `/actuator/health` reports
+  `resident_bytes` under `db:fleet`.
 - A new database is built and migrated in a private staging file, then
   published in one step: it is absent or complete, never half made. When two
   processes on one volume create the same database, both end up on one file.

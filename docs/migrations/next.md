@@ -180,6 +180,77 @@ let node = GraphNode { /* … */ job: None, background: None };
 **Automation:** `manual` — a new arm needs a label that only the caller can
 choose.
 
+### Fleet: `DatabaseFleetConfig` and `FleetStats` have new fields
+
+**Why:** a fleet has a memory budget next to `max_open` (issue #3642,
+ADR 0040). `DatabaseFleetConfig` has a new field `max_resident_bytes`.
+`FleetStats` has the new fields `resident_bytes` and `max_resident_bytes`.
+
+**You are affected only if your code builds a `DatabaseFleetConfig` or a
+`FleetStats` with a struct literal and no `..` spread.** TOML and
+`AUTUMN_*` config need no change: the default `0` means no budget.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    // ...every other field...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    max_resident_bytes: 0,
+    // ...every other field...
+}
+```
+
+**Automation:** `manual` — add `max_resident_bytes: 0`. A codemod cannot
+know the budget the app wants.
+
+---
+
+### Fleet: the fleet types take an engine parameter
+
+**Why:** the fleet core no longer depends on `SQLite` (issue #3642,
+ADR 0040). `DatabaseFleet`, `FleetDatabase`, `FleetLifecycle` and
+`BackgroundOpen` take a parameter `E: FleetEngine`. With `sqlite`, `E` has
+the default `SqliteEngine`, so the bare names mean the `SQLite` fleet as
+before.
+
+**You are affected only if** your code names one of these types in a
+build without `sqlite` (the types did not exist there before), or calls
+`FleetDatabase::pool` on a fleet of another engine (use `handle`).
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let fleet: DatabaseFleet = DatabaseFleet::builder(config).build()?;
+let pool = fleet.open(&key).await?.pool().clone();
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+// Unchanged for a SQLite app.
+let fleet: DatabaseFleet = DatabaseFleet::builder(config).build()?;
+let pool = fleet.open(&key).await?.pool().clone();
+// Another engine.
+let fleet = DatabaseFleet::with_engine(&config, MyEngine::new())?;
+let handle = fleet.open(&key).await?.handle().clone();
+```
+
+**Automation:** `manual` — `SQLite` code needs no change. Code of another
+engine is new code.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -207,6 +278,12 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   in `on_startup` that you do not move behaves as before. See
   [Background work in a plugin](../guide/extensibility.md#background-work-in-a-plugin)
   and [Background tasks for plugins and apps](../guide/jobs.md#background-tasks-for-plugins-and-apps).
+- **New experimental surface (fleet engines, #3642):** the
+  `db::fleet_engine::FleetEngine` trait, `DatabaseFleet::with_engine`, and
+  the `plugin_conformance::fleet` kit (`FleetFixture`,
+  `run_fleet_conformance`). An engine plugin implements `FleetEngine` and
+  runs the kit in its own CI. See
+  [ADR 0040](../adr/0040-fleet-engine-seams.md).
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -227,6 +304,9 @@ single most valuable section of the guide — keep it factual and short.
 
 ## Configuration changes
 
+- New key `[database.fleet] max_resident_bytes` (default `0`, no budget),
+  and its variable `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES`.
+
 - `autumn.toml` keys that were renamed, removed, or have new defaults.
 - New `AUTUMN_*` environment variables.
 - Default profile changes.
@@ -234,6 +314,13 @@ single most valuable section of the guide — keep it factual and short.
 If nothing changed, delete this section.
 
 ## Behavior changes
+
+- **Fleet:** an open under an ownership epoch refuses a database stamped
+  with a newer epoch (`FleetError::NewerEpoch`, `421`). Before, the open
+  served it. Only a host that lost its slot to a newer owner sees this.
+- **Fleet:** `DatabaseFleet::exists` and `DatabaseFleet::list` take a
+  directory at a template path as a database, for engines that keep a
+  database in a directory.
 
 Changes that still compile but behave differently at runtime. Examples:
 
