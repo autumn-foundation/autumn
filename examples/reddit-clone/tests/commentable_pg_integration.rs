@@ -55,7 +55,7 @@ const POLYMORPHIC_COMMENTS: &str =
     include_str!("../migrations/20260820000000_polymorphic_comments/up.sql");
 // The top-level comment index the paged read uses (#3325).
 const TOP_LEVEL_INDEX: &str =
-    include_str!("../migrations/20261106000001_comments_top_level_index/up.sql");
+    include_str!("../migrations/20261106180844_comments_top_level_index/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {

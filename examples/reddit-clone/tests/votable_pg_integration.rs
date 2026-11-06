@@ -79,7 +79,7 @@ const POLYMORPHIC_COMMENTS: &str =
     include_str!("../migrations/20260820000000_polymorphic_comments/up.sql");
 // The front-page leaderboard index (#3325).
 const SCORE_TOP_INDEX: &str =
-    include_str!("../migrations/20261106000000_posts_score_top_index/up.sql");
+    include_str!("../migrations/20261106180843_posts_score_top_index/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
