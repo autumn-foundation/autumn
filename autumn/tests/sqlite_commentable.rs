@@ -781,7 +781,9 @@ async fn comment_thread_page_pages_on_sqlite() {
     assert_eq!(roots(&page.nodes), vec!["c"]);
     assert_eq!(page.after, Some(b.id));
 
-    // A cursor from another record gives an empty page.
+    // A cursor from another record gives an empty page. The pool has one
+    // connection, so release it first.
+    drop(conn);
     let other = seed_dual(&pool).await;
     let foreign = repo.add_comment(other, author, "x", None).await.expect("x");
     let page = repo
