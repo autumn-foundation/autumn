@@ -144,8 +144,8 @@ pub struct Tag {
 
 // `Vote` is an `#[autumn_web::model]` so `VoteRepository` (see
 // `crate::repositories`) can expose the typed grouped-aggregate roll-up
-// `sum_value_grouped_by_post_id` (#1364), which the front-page "Top posts by
-// votes" leaderboard uses as a replica-eligible top-N read.
+// `sum_value_grouped_by_post_id` (#1364). The front page does not use it: it
+// reads `posts.score` (#3325).
 // A vote references *either* a post or a comment, so both FKs are nullable.
 //
 // This model **coexists with** `Post`'s `#[votable]` above rather than being
@@ -160,7 +160,8 @@ pub struct Tag {
 //     write path. It never collides with, or redefines, `crate::schema::votes`.
 //   * `Vote` maps the *full* `crate::schema::votes` -- including the nullable
 //     `post_id` / `comment_id` XOR pair -- which is exactly what the
-//     leaderboard's `IS NOT NULL` group guard needs to exclude comment votes.
+//     grouped aggregate's `IS NOT NULL` group guard needs to exclude comment
+//     votes.
 //
 // So: reads and roll-ups go through `Vote`/`VoteRepository`; writes go through
 // `posts.react(...)`. Guarded by `leaderboard_grouped_aggregate_still_works_
