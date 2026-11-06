@@ -1,5 +1,8 @@
-framework: Phoenix 1.7.14
-language:  Elixir 1.17.3 / OTP 27.1.1
-http:      Bandit (HTTP/1.1 + HTTP/2)
-db:        Ecto 3.12 + Postgrex
+framework: Phoenix 1.8.16
+language:  Elixir 1.19.7 / OTP 28.5.0.8
+http:      Bandit 1.14.1 (HTTP/1.1 + HTTP/2, via Bandit.PhoenixAdapter)
+db:        Ecto 3.14.3 / ecto_sql 3.14.0 + Postgrex 0.22.4
+templates: HEEx (phoenix_live_view 1.2.13, phoenix_html 4.4.0)
+other:     phoenix_ecto 4.7.0, jason 1.4.5
+image:     elixir:1.19.7-otp-28-slim builder, debian:trixie-slim runtime
 postgres:  16 (benchmark container)

@@ -1,14 +1,20 @@
 import Config
 
+config :benchmark,
+  ecto_repos: [Benchmark.Repo]
+
 config :benchmark, BenchmarkWeb.Endpoint,
   url: [host: "localhost"],
-  render_errors: [formats: [html: BenchmarkWeb.ErrorHTML, json: BenchmarkWeb.ErrorJSON], layout: false],
-  pubsub_server: Benchmark.PubSub,
-  live_view: [signing_salt: "benchmark_salt"]
+  adapter: Bandit.PhoenixAdapter,
+  render_errors: [
+    formats: [html: BenchmarkWeb.ErrorHTML, json: BenchmarkWeb.ErrorJSON],
+    layout: false
+  ],
+  pubsub_server: Benchmark.PubSub
 
-config :benchmark, Benchmark.Repo,
-  adapter: Ecto.Adapters.Postgres,
-  pool_size: 20
+config :benchmark, Benchmark.Repo, pool_size: 20
+
+config :phoenix, :json_library, Jason
 
 config :logger, level: :warning
 
