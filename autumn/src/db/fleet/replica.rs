@@ -182,8 +182,16 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             return Ok(());
         };
         let name = key.name();
+        let newer = |found: u64| FleetError::NewerEpoch {
+            name: name.clone(),
+            epoch,
+            found,
+        };
         let stamp = read_epoch_stamp(path, &name)?;
-        if stamp >= epoch {
+        if stamp > epoch {
+            return Err(newer(stamp));
+        }
+        if stamp == epoch {
             return Ok(());
         }
         let newest = replication
@@ -192,6 +200,11 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 name: name.clone(),
                 detail: format!("could not read the replica's epochs: {detail}"),
             })?;
+        // A newer owner shipped: this host is fenced. Do not replace the
+        // file for an open that is refused.
+        if let Some(found) = newest.filter(|newest| *newest > epoch) {
+            return Err(newer(found));
+        }
         // Newer than the file, and another owner's: an epoch belongs to one
         // owner, so the replica's generation of `epoch` is this host's own.
         if let Some(newest) = newest.filter(|newest| *newest > stamp && *newest != epoch) {

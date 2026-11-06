@@ -104,14 +104,13 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
-/// One database per tenant or per routing slot (ADR 0019, ADR 0040).
+// The fleet modules carry their own `//!` docs. An outer doc here would
+// make rustdoc resolve their links in this module.
 pub mod fleet;
-/// The engine seam of a fleet (ADR 0040).
 pub mod fleet_engine;
 /// Cross-tenant analytics over a fleet's replicas (issue #3236, ADR 0032).
 #[cfg(feature = "sqlite")]
 pub mod fleet_lake;
-/// Slot-ownership epochs and fencing for a fleet (issue #3233).
 pub mod fleet_ownership;
 /// Continuous replication of a fleet's databases (ADR 0019 §5).
 #[cfg(feature = "sqlite")]
@@ -119,7 +118,6 @@ pub mod fleet_replication;
 /// Background work on fleet databases nobody asks for (issue 3234).
 #[cfg(feature = "sqlite")]
 pub mod fleet_sweeper;
-/// Replica tombstones of a fleet (issue #3235).
 pub mod fleet_tombstones;
 pub mod pooler;
 

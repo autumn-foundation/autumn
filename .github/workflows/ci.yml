@@ -2698,7 +2698,7 @@ jobs:
           # rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet_sweeper
-          # Issue #3642: the fleet conformance kit against the SQLite engine.
+          # The fleet conformance kit against the SQLite engine.
           # Same features, so no rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet_conformance

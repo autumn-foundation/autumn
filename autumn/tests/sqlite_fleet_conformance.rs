@@ -68,7 +68,7 @@ impl FleetFixture for SqliteFixture {
                     sync_interval: Duration::from_secs(1),
                     snapshot_interval: Duration::from_secs(3600),
                     max_wal_bytes: 4 * 1024 * 1024,
-                    retention: Duration::from_secs(24 * 3600),
+                    retention: Duration::from_hours(24),
                     verify_interval: None,
                 },
                 Duration::from_secs(30),

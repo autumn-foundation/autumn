@@ -227,3 +227,90 @@ async fn generic_fleet_reports_its_ship_mode_and_handle() {
     let handle: &TextHandle = db.handle();
     assert!(!handle.is_closed());
 }
+
+fn slot(n: u16) -> FleetDbKey {
+    FleetDbKey::Slot(n)
+}
+
+#[test]
+fn victims_are_taken_in_lru_order_for_the_count() {
+    let idle = vec![(1, slot(1), 10), (2, slot(2), 10), (3, slot(3), 10)];
+    assert_eq!(super::pick_victims(idle, 2, 0, 3), [slot(1), slot(2)]);
+}
+
+#[test]
+fn victims_free_the_bytes_over_the_budget() {
+    let idle = vec![(1, slot(1), 10), (2, slot(2), 30), (3, slot(3), 10)];
+    // 35 bytes over: the first two free 40.
+    assert_eq!(super::pick_victims(idle, 0, 35, 4), [slot(1), slot(2)]);
+}
+
+#[test]
+fn the_count_and_the_budget_add_up() {
+    let idle = vec![(1, slot(1), 5), (2, slot(2), 50), (3, slot(3), 5)];
+    // One for the count; then 50 bytes still over.
+    assert_eq!(super::pick_victims(idle, 1, 55, 4), [slot(1), slot(2)]);
+}
+
+#[test]
+fn the_budget_skips_a_database_that_holds_no_memory() {
+    let idle = vec![(1, slot(1), 0), (2, slot(2), 20)];
+    assert_eq!(super::pick_victims(idle, 0, 10, 3), [slot(2)]);
+}
+
+#[test]
+fn the_budget_keeps_the_last_open_database() {
+    let idle = vec![(1, slot(1), 100)];
+    assert!(super::pick_victims(idle, 0, 50, 1).is_empty());
+    let idle = vec![(1, slot(1), 100), (2, slot(2), 100)];
+    assert_eq!(super::pick_victims(idle, 0, 500, 2), [slot(1)]);
+}
+
+#[test]
+fn nothing_over_means_no_victim() {
+    let idle = vec![(1, slot(1), 100)];
+    assert!(super::pick_victims(idle, 0, 0, 1).is_empty());
+}
+
+#[tokio::test]
+async fn a_budget_below_one_database_keeps_it_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 64, 1);
+    drop(fleet.open(&key(&fleet, "a")).await.unwrap());
+    fleet.enforce_capacity(None);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fleet.stats().open, 1);
+}
+
+#[tokio::test]
+async fn background_open_has_room_under_the_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 64, 1_000);
+    let b = key(&fleet, "b");
+    drop(fleet.open(&b).await.unwrap());
+    fleet.close(&b).await;
+    let held = fleet.open(&key(&fleet, "a")).await.unwrap();
+    let opened = fleet.open_background(&b).await.unwrap();
+    assert!(
+        opened.is_some_and(|open| open.opened),
+        "100 of 1000 bytes leaves room"
+    );
+    drop(held);
+}
+
+#[tokio::test]
+async fn exists_and_list_follow_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8, 0);
+    let acme = key(&fleet, "acme");
+    drop(fleet.open(&acme).await.unwrap());
+    let stray = key(&fleet, "stray");
+    std::fs::create_dir_all(fleet.path_of(&stray)).unwrap();
+    // The text engine takes a directory as a database; a file engine would not.
+    assert!(fleet.exists(&stray));
+    assert_eq!(fleet.list().await.unwrap(), {
+        let mut keys = vec![acme, stray];
+        keys.sort();
+        keys
+    });
+}

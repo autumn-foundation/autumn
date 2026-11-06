@@ -16,7 +16,7 @@
 //! | `fleet-reopen` | A closed database stays in use, or its data is gone after a reopen. |
 //! | `fleet-snapshot-restore` | A snapshot put at a database path does not open with the data. |
 //! | `fleet-delete` | A delete leaves the database, or its data comes back in a new database. |
-//! | `fleet-delete-restore` | The fixture's restore brings a deleted database back. Skipped without a restore. |
+//! | `fleet-delete-restore` | The fixture's restore fails before the delete, or brings the database back after it. Skipped without a restore. |
 //! | `fleet-budget` | An open database reports no memory, or the budget does not close the oldest idle one. |
 //!
 //! Each check uses its own fleet root under the scratch directory.
@@ -80,8 +80,10 @@ pub trait FleetFixture: Send + Sync {
 /// skips the check.
 type Outcome = Result<Option<String>, String>;
 
-/// Runs every check against `fixture`. `scratch` holds the fleet roots; use
-/// an empty temporary directory.
+/// Runs every check against `fixture`. `name` names the engine in the
+/// report. `scratch` holds the fleet roots: use an empty temporary
+/// directory.
+#[must_use]
 pub async fn run_fleet_conformance<F: FleetFixture>(
     name: &str,
     fixture: &F,
@@ -170,15 +172,34 @@ fn fail(what: &str) -> impl FnOnce(FleetError) -> String + '_ {
     move |e| format!("{what}: {e}")
 }
 
-/// Puts the `files` of a snapshot in `dir` at `target`: the entry named
-/// like the source database takes the name of `target`.
-fn place(files: &[PathBuf], dir: &Path, target: &Path) -> Result<(), String> {
+/// Puts the `files` of a snapshot of `source` in `dir` at `target`: the
+/// entry named like `source` takes the name of `target`.
+fn place(files: &[PathBuf], dir: &Path, source: &Path, target: &Path) -> Result<(), String> {
     let parent = target.parent().ok_or("the target has no parent")?;
     let name = target.file_name().ok_or("the target has no file name")?;
+    let own = source.file_name().ok_or("the source has no file name")?;
     for file in files {
         let relative = file
             .strip_prefix(dir)
             .map_err(|_| format!("{} is not in the snapshot directory", file.display()))?;
+        if relative
+            .components()
+            .next()
+            .map(std::path::Component::as_os_str)
+            != Some(own)
+        {
+            return Err(format!(
+                "the snapshot wrote {}: every file must be `{}` or under it",
+                relative.display(),
+                own.to_string_lossy()
+            ));
+        }
+        if !file.is_file() {
+            return Err(format!(
+                "the snapshot lists {}, which is no file",
+                file.display()
+            ));
+        }
         // The first component is the source database. The rest is its
         // layout, kept as is.
         let rest: PathBuf = relative.components().skip(1).collect();
@@ -239,8 +260,10 @@ async fn identity<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
     let dir = scratch.join("identity").join("snapshot");
     let files = snapshot(&fleet, &a, &dir).await?;
     fleet.close(&a).await;
-    place(&files, &dir, &fleet.path_of(&b))?;
-    match fleet.open(&b).await {
+    place(&files, &dir, &fleet.path_of(&a), &fleet.path_of(&b))?;
+    let opened = fleet.open(&b).await;
+    fleet.close_all().await;
+    match opened {
         Err(FleetError::Misplaced { found, .. }) if found == a.name() => Ok(Some(
             "a copy of one key's database is refused under another key".to_owned(),
         )),
@@ -311,6 +334,7 @@ async fn epoch<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
         .await?
         .map_err(fail("a second open under epoch 7 failed"))?;
     close(&again);
+    fleet.close_all().await;
     Ok(Some(
         "a lower epoch is refused, the stamp moves up, the same epoch opens again".to_owned(),
     ))
@@ -331,6 +355,8 @@ async fn reopen<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
     drop(db);
     let again = fleet.open(&key).await.map_err(fail("the reopen failed"))?;
     let values = fixture.read(again.handle()).await?;
+    drop(again);
+    fleet.close_all().await;
     if values != ["first"] {
         return Err(format!(
             "after a close and a reopen the database holds {values:?}, not [\"first\"]"
@@ -347,14 +373,16 @@ async fn snapshot_restore<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outco
     drop(db);
     let dir = scratch.join("snapshot-files");
     let files = snapshot(&source, &key, &dir).await?;
-    source.close(&key).await;
+    source.close_all().await;
     let target = fleet(fixture, scratch, "snapshot-target", 0).await?;
-    place(&files, &dir, &target.path_of(&key))?;
+    place(&files, &dir, &source.path_of(&key), &target.path_of(&key))?;
     let restored = target
         .open(&key)
         .await
         .map_err(fail("the restored copy did not open"))?;
     let values = fixture.read(restored.handle()).await?;
+    drop(restored);
+    target.close_all().await;
     if values != ["kept"] {
         return Err(format!(
             "the restored copy holds {values:?}, not [\"kept\"]"
@@ -374,6 +402,15 @@ async fn delete<F: FleetFixture>(fixture: &F, scratch: &Path) -> (Outcome, Outco
         let db = fleet.open(&key).await.map_err(fail("open failed"))?;
         fixture.write(db.handle(), "gone").await?;
         drop(db);
+        // A positive control: the restore works while the database is
+        // live, so a refusal after the delete is the delete's.
+        fleet.close(&key).await;
+        let control = fixture.restore(&fleet, &key).await;
+        if let Some(Err(error)) = &control {
+            return Err(format!(
+                "the restore failed before the delete, so the check cannot run: {error}"
+            ));
+        }
         match fleet.delete(&key).await {
             Ok(true) => {}
             Ok(false) => return Err("the delete found no database".to_owned()),
@@ -382,16 +419,18 @@ async fn delete<F: FleetFixture>(fixture: &F, scratch: &Path) -> (Outcome, Outco
         if fleet.exists(&key) {
             return Err("the database is still on disk after the delete".to_owned());
         }
-        let restored = match fixture.restore(&fleet, &key).await {
-            None => Ok(None),
-            Some(Ok(())) => Err("the restore brought a deleted database back".to_owned()),
-            Some(Err(refusal)) => Ok(Some(format!("the restore is refused: {refusal}"))),
+        let restored = match (control, fixture.restore(&fleet, &key).await) {
+            (None, _) | (_, None) => Ok(None),
+            (_, Some(Ok(()))) => Err("the restore brought a deleted database back".to_owned()),
+            (_, Some(Err(refusal))) => Ok(Some(format!("the restore is refused: {refusal}"))),
         };
         let fresh = fleet
             .open(&key)
             .await
             .map_err(fail("the open after the delete failed"))?;
         let values = fixture.read(fresh.handle()).await?;
+        drop(fresh);
+        fleet.close_all().await;
         if !values.is_empty() {
             return Err(format!(
                 "a new database at the deleted key holds old data: {values:?}"
@@ -432,10 +471,12 @@ async fn budget<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
     }
     drop(db);
     drop(fleet.open(&b).await.map_err(fail("open failed"))?);
-    if !eventually(|| fleet.open_keys() == [b.clone()]).await {
+    let closed = eventually(|| fleet.open_keys() == [b.clone()]).await;
+    let open = fleet.open_keys();
+    fleet.close_all().await;
+    if !closed {
         return Err(format!(
-            "over the budget the oldest idle database stays open: {:?}",
-            fleet.open_keys()
+            "over the budget the oldest idle database stays open: {open:?}"
         ));
     }
     Ok(Some(

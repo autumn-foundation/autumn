@@ -652,7 +652,6 @@ pub use store::{ControlConnection, FleetTombstones, TombstoneError};
 // The tests use the SQL store, which is `SQLite`.
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
-    use super::store::*;
     use super::*;
     use crate::db::RuntimeConnection;
     use crate::time::ClockSource;

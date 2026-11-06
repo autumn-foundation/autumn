@@ -11838,14 +11838,15 @@ pub struct DatabaseFleetConfig {
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
 
-    /// The memory the open databases may hold, in bytes, as a soft limit.
-    /// Default: `0`, no budget.
+    /// A soft limit, in bytes, on the memory of the open databases. Default:
+    /// `0` (no limit).
     ///
     /// Each engine reports the memory of one open database. The `SQLite`
-    /// engine counts the page cache of each open connection (about 2 MB).
-    /// Past this value, the sweeper closes the least recently used idle
-    /// database, with the same rules as for [`max_open`](Self::max_open). A
-    /// background open finds no room while the budget is full.
+    /// engine counts about 2 MB of page cache for each connection. Above the
+    /// limit, the fleet closes the least recently used idle database. The
+    /// rules are the same as for [`max_open`](Self::max_open). The fleet
+    /// keeps one database open, also when it alone is above the limit.
+    /// While the budget is full, a background open gets no room.
     #[serde(default)]
     pub max_resident_bytes: u64,
 
@@ -22469,6 +22470,21 @@ path = "/healthz"
         assert_eq!(ownership.owner, "host-b");
         assert_eq!(ownership.ranges().unwrap(), vec![(0, 99), (200, 200)]);
         assert_eq!(ownership.lease_secs, 12);
+    }
+
+    #[test]
+    fn fleet_memory_budget_deserializes_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [database.fleet]
+            mode = "slot"
+            root = "/var/lib/app/fleet"
+            max_resident_bytes = 536870912
+            "#,
+        )
+        .unwrap();
+        let fleet = config.database.fleet.as_ref().unwrap();
+        assert_eq!(fleet.max_resident_bytes, 512 * 1024 * 1024);
     }
 
     #[test]

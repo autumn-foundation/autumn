@@ -1,7 +1,8 @@
 ### Added
 
-- **db:** the fleet core is engine-agnostic (issue #3642, ADR 0040). The new
-  `FleetEngine` trait opens, closes, copies and removes one database.
+- **db:** the fleet core does not depend on the database engine (issue
+  #3642, ADR 0040). The new `FleetEngine` trait opens, closes, copies and
+  removes one database.
   `DatabaseFleet<E: FleetEngine>` keeps keys, paths, the path lock,
   single-flight opens, eviction, leases, ownership and fencing. With
   `sqlite`, `SqliteEngine` is the default engine, so `DatabaseFleet` still
@@ -19,6 +20,6 @@
 
 - **Breaking:** `DatabaseFleetConfig` has a new field `max_resident_bytes`,
   and `FleetStats` has the new fields `resident_bytes` and
-  `max_resident_bytes`. A fleet open now refuses a database stamped with an
-  epoch above the epoch of the open (`FleetError::NewerEpoch`, `421`)
-  ([migration guide](../docs/migrations/next.md)).
+  `max_resident_bytes`. An open now refuses a database that records a newer
+  ownership epoch (`FleetError::NewerEpoch`, `421`)
+  ([migration guide](docs/migrations/next.md)).

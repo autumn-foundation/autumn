@@ -14,24 +14,30 @@ use crate::lock::FencingToken;
 
 /// A file engine. Each open database holds `bytes` of memory.
 #[derive(Debug)]
-pub(crate) struct TextEngine {
-    pub(crate) bytes: u64,
+pub struct TextEngine {
+    pub bytes: u64,
     /// When set, `open` does not check the key. A broken engine for the kit.
-    pub(crate) skip_identity: bool,
-    pub(crate) opens: AtomicU64,
+    pub skip_identity: bool,
+    /// When set, `open` does not check or raise the epoch.
+    pub skip_epoch: bool,
+    /// When set, `remove` removes nothing.
+    pub keep_on_remove: bool,
+    pub opens: AtomicU64,
 }
 
 impl TextEngine {
-    pub(crate) const fn new(bytes: u64) -> Self {
+    pub const fn new(bytes: u64) -> Self {
         Self {
             bytes,
             skip_identity: false,
+            skip_epoch: false,
+            keep_on_remove: false,
             opens: AtomicU64::new(0),
         }
     }
 
     /// Appends `value` to the database.
-    pub(crate) fn write(handle: &TextHandle, value: &str) -> Result<(), String> {
+    pub fn write(handle: &TextHandle, value: &str) -> Result<(), String> {
         if handle.0.closed.load(Ordering::Acquire) {
             return Err("the handle is closed".to_owned());
         }
@@ -42,7 +48,7 @@ impl TextEngine {
     }
 
     /// The values in the database.
-    pub(crate) fn read(handle: &TextHandle) -> Result<Vec<String>, String> {
+    pub fn read(handle: &TextHandle) -> Result<Vec<String>, String> {
         let text = std::fs::read_to_string(&handle.0.path).map_err(|e| e.to_string())?;
         Ok(text.lines().skip(2).map(str::to_owned).collect())
     }
@@ -50,10 +56,10 @@ impl TextEngine {
 
 /// The open database of a [`TextEngine`].
 #[derive(Debug, Clone)]
-pub(crate) struct TextHandle(Arc<TextState>);
+pub struct TextHandle(Arc<TextState>);
 
 #[derive(Debug)]
-pub(crate) struct TextState {
+pub struct TextState {
     path: PathBuf,
     users: AtomicUsize,
     closed: AtomicBool,
@@ -61,18 +67,18 @@ pub(crate) struct TextState {
 
 impl TextHandle {
     /// Marks the handle in use until the guard drops.
-    pub(crate) fn checkout(&self) -> Checkout {
+    pub fn checkout(&self) -> Checkout {
         self.0.users.fetch_add(1, Ordering::AcqRel);
         Checkout(Arc::clone(&self.0))
     }
 
-    pub(crate) fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.0.closed.load(Ordering::Acquire)
     }
 }
 
 /// A user of a [`TextHandle`].
-pub(crate) struct Checkout(Arc<TextState>);
+pub struct Checkout(Arc<TextState>);
 
 impl Drop for Checkout {
     fn drop(&mut self) {
@@ -106,14 +112,16 @@ impl FleetEngine for TextEngine {
             if !self.skip_identity && found != name {
                 return Err(FleetError::Misplaced { name, found });
             }
-            if stamp > epoch && epoch > 0 {
+            if self.skip_epoch {
+                // A broken engine: no check, no stamp.
+            } else if stamp > epoch && epoch > 0 {
                 return Err(FleetError::NewerEpoch {
                     name,
                     epoch,
                     found: stamp,
                 });
             }
-            if epoch > stamp {
+            if epoch > stamp && !self.skip_epoch {
                 let rest: Vec<&str> = text.lines().skip(2).collect();
                 let mut body = format!("{found}\n{epoch}\n");
                 for line in rest {
@@ -160,6 +168,9 @@ impl FleetEngine for TextEngine {
     }
 
     fn remove(&self, _key: &FleetDbKey, path: &Path) -> Result<bool, FleetError> {
+        if self.keep_on_remove {
+            return Ok(path.exists());
+        }
         match std::fs::remove_file(path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),

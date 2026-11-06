@@ -4,7 +4,9 @@ verus! {
 
 // Model of the slot-ownership table of a SQLite fleet (issue #3233). Each spec
 // fn names the decision it models in `autumn/src/db/fleet_ownership.rs`
-// (`OwnershipTable`).
+// (`OwnershipTable`). `may_open` models the epoch stamp of an open
+// (`stamp_epoch` in `autumn/src/db/fleet/sqlite.rs`), which runs as one
+// transaction.
 //
 // The model shows one slot. A claim of a range changes every slot in the range
 // in the same way, so one slot is enough. `last` is the global epoch counter:
@@ -321,7 +323,8 @@ pub proof fn fenced_replicator_stops(old_epoch: nat, new_epoch: nat)
 // ---- Open of a database file ----
 
 /// `FleetEngine::open`: an open under `epoch` accepts a file stamped at or
-/// below `epoch`. It refuses a file stamped above it.
+/// below `epoch`. It refuses a file stamped above it. The check and the
+/// write are one atomic step.
 pub open spec fn may_open(stamp: nat, epoch: nat) -> bool {
     stamp <= epoch
 }

@@ -154,7 +154,23 @@ pub trait FleetEngine: Send + Sync + 'static {
 }
 ```
 
-The first implementation (issue #3642) changed the sketch in these ways:
+- **Modes do not change.** A fleet of any engine is `mode = "tenant"` (one
+  database per tenant) or `mode = "slot"` (one database per slot), as in
+  ADR 0019. The app picks the mode. An engine adds no mode of its own.
+  `{bucket}` stays a directory of 64 slots in the path template, so every
+  engine gets the same one-directory cell handoff.
+- `DatabaseFleet` becomes `DatabaseFleet<E: FleetEngine>`.
+  `DatabaseFleet<SqliteEngine>` keeps the current API. With `sqlite`, a
+  default type parameter keeps the name `DatabaseFleet` for existing apps.
+- The opener, the path lock, single-flight opens, eviction and leases stay
+  in core. They work on `E::Handle`.
+- **Memory budget.** Core adds `max_resident_bytes`. Eviction counts
+  `resident_bytes`, not only `max_open`. An engine with its own buffer pool
+  cannot then push a host out of memory one tenant at a time.
+
+##### Notes from the first implementation
+
+Issue #3642 changed the sketch in these ways:
 
 - `open` and `snapshot` are `async`. The `SQLite` open checks the key on
   the first pooled connection, which also sets WAL. A blocking check on its
@@ -162,8 +178,12 @@ The first implementation (issue #3642) changed the sketch in these ways:
   A blocking engine runs its work with `spawn_blocking`.
 - The errors are `FleetError`. A new variant, `NewerEpoch` (`421`), is the
   epoch refusal. A separate `EngineError` would only map back to it.
-- `in_use`, `remove`, `sidecars` and `migrations_applied` were added. Core
-  needs them for eviction, drains and deletes.
+- `in_use`, `remove`, `exists`, `sidecars` and `migrations_applied` were
+  added. Core needs them for eviction, drains and deletes. `exists` keeps
+  the `SQLite` rule that a database is a file.
+- The memory budget keeps one database open, and closes only a database
+  that holds memory.
+- An open checks and writes the epoch stamp in one transaction.
 - `ShipMode` has `Continuous` and `Rebuild`. Step 3 adds `Generations`. The
   enum is `#[non_exhaustive]`.
 - The name `DatabaseFleet` stays through a default type parameter, not a
@@ -176,20 +196,6 @@ The first implementation (issue #3642) changed the sketch in these ways:
 - WAL shipping, the lake and the sweeper stay with `SqliteEngine`. They work
   inside `SQLite` files. The core reaches replication through a small set of
   replica steps, which do nothing without `sqlite`.
-
-- **Modes do not change.** A fleet of any engine is `mode = "tenant"` (one
-  database per tenant) or `mode = "slot"` (one database per slot), as in
-  ADR 0019. The app picks the mode. An engine adds no mode of its own.
-  `{bucket}` stays a directory of 64 slots in the path template, so every
-  engine gets the same one-directory cell handoff.
-- `DatabaseFleet` becomes `DatabaseFleet<E: FleetEngine>`.
-  `DatabaseFleet<SqliteEngine>` keeps the current API. A `sqlite`-gated type
-  alias keeps the name `DatabaseFleet` for existing apps.
-- The opener, the path lock, single-flight opens, eviction and leases stay
-  in core. They work on `E::Handle`.
-- **Memory budget.** Core adds `max_resident_bytes`. Eviction counts
-  `resident_bytes`, not only `max_open`. An engine with its own buffer pool
-  cannot then push a host out of memory one tenant at a time.
 
 #### 2. Resolution for extractors
 

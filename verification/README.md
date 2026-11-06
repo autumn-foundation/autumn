@@ -111,6 +111,9 @@ It proves these properties:
   epoch it held.
 - A restore never selects a generation of an older epoch, and a fenced
   replicator stops.
+- An open refuses a file stamped by a newer owner. After the new owner opens
+  the file, the old owner cannot open it. The owner can open it again, and a
+  new grant can open any file the table stamped (`may_open`).
 
 It does not prove that two hosts never serve at once. That depends on the
 clock bound in the guide. The epoch makes a late write of the old owner

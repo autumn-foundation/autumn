@@ -21,8 +21,8 @@
 //! - `close` runs once, after core stops new use. Core then waits until
 //!   `in_use` is `false`.
 //! - `snapshot` writes `dir/<file name of path>`: one file, or one directory
-//!   with its files. Core restores a copy by putting that entry at a
-//!   database path.
+//!   with its files. To restore a copy, core puts that entry at a database
+//!   path.
 //! - `remove` deletes the database at the path and its sidecars. Core holds
 //!   the path lock and has closed the database in this process.
 
@@ -37,8 +37,8 @@ use crate::lock::FencingToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ShipMode {
-    /// The engine streams its changes itself, through a lifecycle hook.
-    /// `SQLite` WAL shipping.
+    /// The engine streams its changes through a lifecycle hook, for
+    /// example `SQLite` WAL shipping.
     Continuous,
     /// No replica. The engine rebuilds the data from its source.
     Rebuild,
@@ -51,7 +51,9 @@ pub trait FleetEngine: Send + Sync + 'static {
 
     /// Opens the database of `key` at `path`, or makes it when none is
     /// there. Stamps `epoch` on it. A new database has the stamp before it
-    /// returns.
+    /// returns. With `epoch` `None` (no ownership), stamp and check no
+    /// epoch. Make the check and the stamp one atomic step: two processes
+    /// can open one path at once.
     ///
     /// # Errors
     ///
@@ -70,6 +72,8 @@ pub trait FleetEngine: Send + Sync + 'static {
 
     /// Whether a user still holds part of `handle` (a checked-out
     /// connection, or a waiter). Core does not evict a database in use.
+    /// Core calls this with its state lock held: keep it fast, do not
+    /// block, and do not call the fleet.
     fn in_use(&self, handle: &Self::Handle) -> bool;
 
     /// Writes a consistent copy of the database at `path` into `dir`, as
@@ -95,11 +99,18 @@ pub trait FleetEngine: Send + Sync + 'static {
     fn remove(&self, key: &FleetDbKey, path: &Path) -> Result<bool, FleetError>;
 
     /// The memory the open database holds, in bytes. Eviction counts it
-    /// against `max_resident_bytes`.
+    /// against `max_resident_bytes`. Core calls this with its state lock
+    /// held: keep it fast, do not block, and do not call the fleet.
     fn resident_bytes(&self, handle: &Self::Handle) -> u64;
 
     /// How the databases get to object storage.
     fn ship_mode(&self) -> ShipMode;
+
+    /// Whether a database is at `path`. Default: anything is there. The
+    /// `SQLite` engine wants a file: a directory at the path is no database.
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
 
     /// Files beside `path` that belong to its database (a `-wal`). Core
     /// removes them when it finds them with no database. Default: none.

@@ -7,7 +7,7 @@
 //!
 //! A [`DatabaseFleet`] opens databases on first use and closes idle ones. It
 //! does not depend on the engine: a [`FleetEngine`] opens, closes, copies and
-//! removes one database. With the `sqlite` feature, [`SqliteEngine`] is the
+//! removes one database. With the `sqlite` feature, `SqliteEngine` is the
 //! default engine, and `DatabaseFleet` means `DatabaseFleet<SqliteEngine>`.
 //!
 //! ```text
@@ -26,7 +26,7 @@
 //!   wait until the engine reports no use ──► on_close hooks (final ship)
 //! ```
 //!
-//! # `SQLite` migrations
+//! # Migrations (`SQLite`)
 //!
 //! Every `SQLite` database gets the app's registered migrations and the shard
 //! framework sets (version history, commit hooks, derivations) — never the
@@ -52,7 +52,7 @@
 //!
 //! # Cancellation
 //!
-//! `open`, `close`, `delete`, `restore` and `provision` do their work in owned
+//! `open`, `close`, `delete`, and (`SQLite`) `restore` and `provision` do their work in owned
 //! tasks. If the caller is dropped, the work still finishes: a drain always
 //! ends, and a started open stays tracked. See ADR 0019, section 3.
 
@@ -91,14 +91,17 @@ mod replica {
     /// No tombstone row to write.
     pub(super) struct DeleteRecord;
 
+    /// No control connection to hold.
+    pub(super) struct NoControl;
+
     impl DeleteRecord {
         #[allow(clippy::unused_async)]
-        pub(super) async fn checkout(&self) -> Result<(), FleetError> {
-            Ok(())
+        pub(super) async fn checkout(&self) -> Result<NoControl, FleetError> {
+            Ok(NoControl)
         }
 
         #[allow(clippy::unused_async)]
-        pub(super) async fn record(&self, _: &mut (), _: bool) -> Result<(), FleetError> {
+        pub(super) async fn record(&self, _: &mut NoControl, _: bool) -> Result<(), FleetError> {
             Ok(())
         }
 
@@ -112,6 +115,7 @@ mod replica {
             false
         }
 
+        #[allow(dead_code)]
         pub(super) const fn replicates(&self) -> bool {
             false
         }
@@ -145,7 +149,8 @@ mod replica {
 
         pub(super) async fn purge_after_delete(&self, _: &FleetDbKey) {}
 
-        pub(super) const fn spawn_replica_lifecycle(
+        #[allow(clippy::needless_pass_by_value)]
+        pub(super) fn spawn_replica_lifecycle(
             &self,
             _: tokio_util::sync::CancellationToken,
         ) -> Option<tokio::task::JoinHandle<()>> {
@@ -166,8 +171,9 @@ pub use sqlite::{DatabaseFleetBuilder, FleetDbInfo, FleetMigrationReport, Sqlite
 #[cfg(feature = "sqlite")]
 pub(crate) use sqlite::{build_for_app, read_identity};
 
-/// Declares a type generic over `E: FleetEngine`. With `sqlite`, `E` has the
-/// default `SqliteEngine`, so the bare name means the `SQLite` fleet.
+/// Declares a type or a trait with the parameter `E: FleetEngine`. With
+/// `sqlite`, `E` defaults to `SqliteEngine`, so the bare name is the
+/// `SQLite` fleet.
 macro_rules! default_engine {
     ($(#[$meta:meta])* $vis:vis struct $name:ident<E: FleetEngine> $($rest:tt)*) => {
         #[cfg(feature = "sqlite")]
@@ -238,7 +244,8 @@ pub enum FleetError {
         /// The database name.
         name: String,
     },
-    /// The database has migrations this boot will not apply (`503`).
+    /// The database has migrations this boot will not apply (`503`,
+    /// `SQLite`).
     #[error(
         "fleet database {name} has {count} pending migration(s) and this boot does not \
          auto-apply them; run the app once with AUTUMN_MIGRATE=1"
@@ -261,7 +268,7 @@ pub enum FleetError {
         /// The name recorded inside the file.
         found: String,
     },
-    /// A migration failed (`503`).
+    /// A migration failed (`503`, `SQLite`).
     #[error("fleet database {name}: {detail}")]
     Migration {
         /// The database name.
@@ -324,7 +331,7 @@ pub enum FleetError {
         /// The epoch the database records.
         found: u64,
     },
-    /// `DatabaseFleet::import` refused its source file (`422`): it is
+    /// `DatabaseFleet::import` (`SQLite`) refused its source file (`422`): it is
     /// missing, is not a database, fails the integrity check, or does not
     /// record the key in its identity row. Nothing was changed.
     #[error("cannot import {path} as fleet database {name}: {detail}")]
@@ -407,8 +414,8 @@ pub struct FleetDatabase<E: FleetEngine> {
     /// The ownership epoch this database opened under. `None` without
     /// ownership.
     epoch: Option<crate::lock::FencingToken>,
-    /// Background work to stop before the database closes. `None` once the stop
-    /// has begun: a later registration is stopped at once.
+    /// Background work to stop before the database closes. `None` once the
+    /// stop has begun: a later registration is stopped at once.
     workers: Arc<Mutex<Option<Vec<Worker>>>>,
 }
 }
@@ -597,6 +604,7 @@ pub trait FleetLifecycle<E: FleetEngine>: Send + Sync + 'static {
 
 /// Counters for health and metrics. See [`DatabaseFleet::stats`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
 pub struct FleetStats {
     /// Databases open now.
     pub open: usize,
@@ -1319,10 +1327,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         result
     }
 
-    /// Whether the database is on disk: a file or a directory at its path.
+    /// Whether the database is on disk, by the engine's rule.
     #[must_use]
     pub fn exists(&self, key: &FleetDbKey) -> bool {
-        self.path_of(key).exists()
+        self.inner.engine.exists(&self.path_of(key))
     }
 
     async fn open_with(
@@ -1576,7 +1584,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let path = self.path_of(&key);
         let name = key.name();
         check_contained(self.root(), &path)?;
-        let mut existed = path.exists();
+        let mut existed = self.inner.engine.exists(&path);
         if !existed && restore {
             existed = self.restore_missing(&key, &path).await?;
         }
@@ -1672,7 +1680,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             // other process publishes meanwhile, and clear the stale sidecars
             // of the absent database first: they would replay onto it.
             with_path_lock(&root, &name, || {
-                if !hook_path.exists() {
+                if !fleet.inner.engine.exists(&hook_path) {
                     remove_files(
                         fleet.inner.engine.sidecars(&hook_path),
                         "clear stray sidecars",
@@ -1751,7 +1759,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 })
                 .collect();
             idle.sort_unstable();
-            pick_victims(idle, excess, over)
+            pick_victims(idle, excess, over, state.open.len())
         });
         for (key, db, drain) in victims {
             self.spawn_drain(key, db, drain, true);
@@ -2095,26 +2103,31 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // removal.
         let removed = self
             .with_provision_turn(&key, async {
-                // Before the lock: the lock then waits for one write only.
-                // The connection stays out of the pool while the lock is
-                // busy (at most the lock timeout).
-                let mut control = record.checkout().await?;
-                // The path lock first: the check, the row and the removal
-                // then see one state. A delete in another process that comes
-                // after the removal sees no database, and keeps the row of
-                // this delete (issue #3516).
                 let lock = {
-                    let (root, path, name) = (root.clone(), path.clone(), name.clone());
-                    crate::time::spawn_blocking(move || {
-                        check_contained(&root, &path)?;
-                        PathLock::acquire(&root, &name)
+                    // Before the lock: the lock then waits for one write
+                    // only. The connection stays out of the pool while the
+                    // lock is busy (at most the lock timeout). It goes back
+                    // at the end of this block.
+                    let mut control = record.checkout().await?;
+                    // The path lock first: the check, the row and the
+                    // removal then see one state. A delete in another
+                    // process that comes after the removal sees no
+                    // database, and keeps the row of this delete (issue
+                    // #3516).
+                    let (lock_root, lock_path, lock_name) =
+                        (root.clone(), path.clone(), name.clone());
+                    let lock = crate::time::spawn_blocking(move || {
+                        check_contained(&lock_root, &lock_path)?;
+                        PathLock::acquire(&lock_root, &lock_name)
                     })
                     .await
                     .map_err(join_error)
-                    .and_then(|r| r)?
+                    .and_then(|r| r)?;
+                    record
+                        .record(&mut control, self.inner.engine.exists(&path))
+                        .await?;
+                    lock
                 };
-                record.record(&mut control, path.exists()).await?;
-                drop(control);
                 let (fleet, root, path, task_key) =
                     (self.clone(), root.clone(), path.clone(), key.clone());
                 let removed = crate::time::spawn_blocking(move || {
@@ -2208,9 +2221,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     // ── Enumeration and fan-out ─────────────────────────────────────────
 
     /// Every database on disk, sorted by key. A database is a file or a
-    /// directory at a template path. Entries that do not match the template
-    /// (sidecars, strays, a tenant file in the wrong bucket) and symbolic
-    /// links are skipped.
+    /// directory at a template path that the engine takes as a database.
+    /// Entries that do not match the template (sidecars, strays, a tenant
+    /// file in the wrong bucket) and symbolic links are skipped.
     ///
     /// # Errors
     ///
@@ -2236,7 +2249,11 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 let next = relative.join(literal);
                 let meta = std::fs::symlink_metadata(self.inner.root.join(&next));
                 match meta {
-                    Ok(meta) if last && (meta.is_file() || meta.is_dir()) => {
+                    Ok(meta)
+                        if last
+                            && (meta.is_file() || meta.is_dir())
+                            && self.inner.engine.exists(&self.inner.root.join(&next)) =>
+                    {
                         if let Some(key) = template.key_for_path(&next, &slot_of) {
                             found.push(key);
                         }
@@ -2264,7 +2281,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                     continue;
                 };
                 let next = relative.join(&name);
-                if last && (file_type.is_file() || file_type.is_dir()) {
+                if last
+                    && (file_type.is_file() || file_type.is_dir())
+                    && self.inner.engine.exists(&self.inner.root.join(&next))
+                {
                     if let Some(key) = template.key_for_path(&next, &slot_of) {
                         found.push(key);
                     }
@@ -2423,13 +2443,31 @@ impl<E: FleetEngine> DatabaseFleet<E> {
 }
 
 /// The keys to close, in LRU order: enough for `excess` databases and
-/// `over` bytes. `idle` is `(last use, key, bytes)`, sorted.
-fn pick_victims(idle: Vec<(u64, FleetDbKey, u64)>, excess: usize, over: u64) -> Vec<FleetDbKey> {
+/// `over` bytes. `idle` is `(last use, key, bytes)`, sorted. `open` is the
+/// count of open databases.
+///
+/// A close for the budget alone must free memory, so it skips a database
+/// that holds none. It also keeps one database open: a budget below one
+/// database must not close the last one on each sweep.
+fn pick_victims(
+    idle: Vec<(u64, FleetDbKey, u64)>,
+    excess: usize,
+    over: u64,
+    open: usize,
+) -> Vec<FleetDbKey> {
     let (mut count, mut bytes) = (excess, over);
     let mut victims = Vec::new();
     for (_, key, held) in idle {
         if count == 0 && bytes == 0 {
             break;
+        }
+        if count == 0 {
+            if held == 0 {
+                continue;
+            }
+            if victims.len() + 1 >= open {
+                break;
+            }
         }
         victims.push(key);
         count = count.saturating_sub(1);
@@ -2439,6 +2477,9 @@ fn pick_victims(idle: Vec<(u64, FleetDbKey, u64)>, excess: usize, over: u64) -> 
 }
 
 /// The next candidate staging name in this process; see [`staging_path`].
+// Boot builds only a `SQLite` fleet so far: without `sqlite` the staging
+// helpers and the health indicator have no caller yet.
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A private path beside `path` for building a database before publishing it:
@@ -2448,6 +2489,7 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 /// share the volume but not a PID namespace (two containers can both be PID
 /// 1): a name someone else holds is skipped. Release it with
 /// [`discard_staging`].
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 pub(crate) fn staging_path(path: &Path, tag: &str) -> Result<PathBuf, FleetError> {
     let file_name = path.file_name().ok_or_else(|| FleetError::Io {
         op: "reserve staging name",
@@ -2473,6 +2515,7 @@ pub(crate) fn staging_path(path: &Path, tag: &str) -> Result<PathBuf, FleetError
 
 /// Remove a staging file, any sidecars `SQLite` left beside it, and the
 /// directory [`staging_path`] reserved for it.
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 pub(crate) fn discard_staging(staging: &Path) {
     let _ = std::fs::remove_file(staging);
     for sidecar in crate::fleet_layout::sidecar_paths(staging) {
@@ -2743,10 +2786,12 @@ async fn sleep_until_some(at: Option<tokio::time::Instant>) {
 /// Readiness indicator `db:fleet`: the root directory is usable, with the
 /// fleet's counters as details. Individual databases are not pinged — a
 /// tenant fleet can hold millions — a failed open answers its own request.
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 pub(crate) struct FleetHealthIndicator<E: FleetEngine> {
     fleet: DatabaseFleet<E>,
 }
 
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 impl<E: FleetEngine> FleetHealthIndicator<E> {
     pub(crate) const fn new(fleet: DatabaseFleet<E>) -> Self {
         Self { fleet }
@@ -3885,6 +3930,22 @@ mod tests {
         );
         drop(writer);
         fleet.close_all().await;
+    }
+
+    /// A directory at a database path is no `SQLite` database: `exists`,
+    /// `list` and `open` act as if nothing is there.
+    #[tokio::test]
+    async fn a_directory_at_a_database_path_is_no_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(&tmp.path().join("fleet"), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        std::fs::create_dir_all(fleet.path_of(&key)).unwrap();
+        assert!(!fleet.exists(&key));
+        assert!(fleet.list().await.unwrap().is_empty());
+        assert!(matches!(
+            fleet.open(&key).await,
+            Err(FleetError::NotFound { .. })
+        ));
     }
 
     /// The copy keeps no epoch of the source: a high stamp there would skip

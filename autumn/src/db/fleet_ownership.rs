@@ -43,12 +43,15 @@ use tokio::sync::Notify;
 
 use crate::config::SLOT_COUNT;
 use crate::lock::FencingToken;
+#[cfg(feature = "sqlite")]
 use crate::time::ClockSource;
 
 /// The ownership table on the control database.
+#[cfg(feature = "sqlite")]
 const OWNERS_TABLE: &str = "_autumn_fleet_slot_owners";
 
 /// The DDL, applied at install. Times are epoch milliseconds.
+#[cfg(feature = "sqlite")]
 const SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS _autumn_fleet_slot_owners (
     range_start      INTEGER NOT NULL,
@@ -2589,6 +2592,33 @@ mod tests {
             assert_eq!(ownership.held(), vec![(SlotRange::ALL, token(1))]);
             let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
             assert!(b.ownership.held().is_empty(), "nobody else may claim it");
+        }
+
+        /// A file stamped by a newer owner is refused with `421`, and the
+        /// file stays as it is.
+        #[tokio::test]
+        async fn an_open_refuses_a_file_a_newer_owner_stamped() {
+            use diesel::Connection as _;
+            use diesel::connection::SimpleConnection as _;
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = a.fleet.key_for("acme").unwrap();
+            drop(a.fleet.open(&key).await.unwrap());
+            a.fleet.close(&key).await;
+            let path = a.fleet.path_of(&key);
+            diesel::SqliteConnection::establish(&path.display().to_string())
+                .unwrap()
+                .batch_execute("UPDATE _autumn_fleet_epoch SET epoch = 999 WHERE id = 1")
+                .unwrap();
+            let error = a.fleet.open(&key).await.unwrap_err();
+            assert!(
+                matches!(error, FleetError::NewerEpoch { found: 999, .. }),
+                "{error}"
+            );
+            assert_eq!(error.http_status(), http::StatusCode::MISDIRECTED_REQUEST);
+            assert!(a.fleet.exists(&key), "a refused open replaces nothing");
+            a.fleet.close_all().await;
         }
 
         #[tokio::test(start_paused = true)]

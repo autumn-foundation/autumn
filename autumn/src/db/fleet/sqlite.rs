@@ -134,7 +134,7 @@ impl FleetEngine for SqliteEngine {
         epoch: Option<crate::lock::FencingToken>,
     ) -> Result<Pool<RuntimeConnection>, FleetError> {
         let name = key.name();
-        if !path.is_file() {
+        if !self.exists(path) {
             // Whether this open published the file. Another process may win
             // the race to create it: then we open theirs.
             let (root, create_path, create_name, migrations) = (
@@ -229,6 +229,10 @@ impl FleetEngine for SqliteEngine {
 
     fn ship_mode(&self) -> ShipMode {
         ShipMode::Continuous
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.is_file()
     }
 
     fn sidecars(&self, path: &Path) -> Vec<PathBuf> {
@@ -1322,17 +1326,55 @@ pub(super) fn write_epoch_stamp(path: &Path, name: &str, epoch: u64) -> Result<(
 
 /// Record that `path` is opened under `epoch`. Refuse a file stamped
 /// above `epoch`: a newer owner opened it. Blocking.
+///
+/// The read, the check and the write run in one `BEGIN IMMEDIATE`
+/// transaction. So two processes that open the file at once cannot both
+/// pass the check with different epochs.
 pub(super) fn stamp_epoch(path: &Path, name: &str, epoch: u64) -> Result<(), FleetError> {
-    let found = read_epoch_stamp(path, name)?;
-    if found > epoch {
+    use diesel::connection::SimpleConnection as _;
+    use diesel::{OptionalExtension as _, RunQueryDsl as _};
+
+    #[derive(diesel::QueryableByName)]
+    struct Stamp {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        epoch: i64,
+    }
+
+    let unavailable = |detail: String| FleetError::Unavailable {
+        name: name.to_owned(),
+        detail,
+    };
+    let wanted = i64::try_from(epoch).map_err(|e| unavailable(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(&existing_only_url(path))
+        .map_err(|e| unavailable(e.to_string()))?;
+    let found = conn
+        .immediate_transaction(|conn| {
+            conn.batch_execute(&format!(
+                "CREATE TABLE IF NOT EXISTS {EPOCH_TABLE} (\
+                     id INTEGER PRIMARY KEY CHECK (id = 1), \
+                     epoch INTEGER NOT NULL)"
+            ))?;
+            let found = diesel::sql_query(format!("SELECT epoch FROM {EPOCH_TABLE} WHERE id = 1"))
+                .get_result::<Stamp>(conn)
+                .optional()?
+                .map_or(0, |stamp| stamp.epoch);
+            if found < wanted {
+                diesel::sql_query(format!(
+                    "INSERT INTO {EPOCH_TABLE} (id, epoch) VALUES (1, ?) \
+                     ON CONFLICT (id) DO UPDATE SET epoch = max(epoch, excluded.epoch)"
+                ))
+                .bind::<diesel::sql_types::BigInt, _>(wanted)
+                .execute(conn)?;
+            }
+            Ok::<_, diesel::result::Error>(found)
+        })
+        .map_err(|e| unavailable(e.to_string()))?;
+    if found > wanted {
         return Err(FleetError::NewerEpoch {
             name: name.to_owned(),
             epoch,
-            found,
+            found: u64::try_from(found).unwrap_or(0),
         });
-    }
-    if found < epoch {
-        write_epoch_stamp(path, name, epoch)?;
     }
     Ok(())
 }
