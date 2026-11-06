@@ -1748,7 +1748,7 @@ jobs:
         if: matrix.lane == 'webmcp'
         # The free-disk step removes /opt/hostedtoolcache. The shim cases
         # run the served script under Node.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Run WebMCP-gated tests (in-page tool projection)
