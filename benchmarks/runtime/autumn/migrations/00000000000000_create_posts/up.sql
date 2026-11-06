@@ -1,4 +1,6 @@
-CREATE TABLE posts (
+-- IF NOT EXISTS: the compose database is created from schema/init.sql
+-- before the app starts, and this migration must apply on top of it.
+CREATE TABLE IF NOT EXISTS posts (
     id         BIGSERIAL    PRIMARY KEY,
     title      TEXT         NOT NULL,
     body       TEXT         NOT NULL,
@@ -16,6 +18,7 @@ BEGIN
 END;
 $$;
 
+DROP TRIGGER IF EXISTS posts_set_updated_at ON posts;
 CREATE TRIGGER posts_set_updated_at
 BEFORE UPDATE ON posts
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
