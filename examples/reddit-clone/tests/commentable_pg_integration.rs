@@ -53,6 +53,9 @@ const CREATE_SCHEMA: &str = include_str!("../migrations/20260419000000_create_re
 const ADD_AVATAR: &str = include_str!("../migrations/20260427000000_add_user_avatar/up.sql");
 const POLYMORPHIC_COMMENTS: &str =
     include_str!("../migrations/20260820000000_polymorphic_comments/up.sql");
+// The top-level comment index the paged read uses (#3325).
+const TOP_LEVEL_INDEX: &str =
+    include_str!("../migrations/20261106000001_comments_top_level_index/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
@@ -119,6 +122,9 @@ async fn setup_schema(conn: &mut AsyncPgConnection) {
     conn.batch_execute(POLYMORPHIC_COMMENTS)
         .await
         .expect("make comments polymorphic");
+    conn.batch_execute(TOP_LEVEL_INDEX)
+        .await
+        .expect("add the top-level comment index");
 }
 
 async fn seed_user(conn: &mut AsyncPgConnection, username: &str) -> i64 {

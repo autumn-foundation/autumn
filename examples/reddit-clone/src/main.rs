@@ -219,6 +219,9 @@ async fn main() {
             "/comments",
             autumn_web::commentable::router(
                 autumn_web::commentable::CommentsConfig::default()
+                    // The same page size as the post and subreddit pages, so
+                    // the page a no-JS post returns to shows the new comment.
+                    .page_size(routes::COMMENTS_PER_PAGE)
                     // The router owns no app-specific side effects, so this is
                     // where the app puts its own back: `/ws/feed` and
                     // `/ws/r/{slug}` keep announcing new comments exactly as

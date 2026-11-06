@@ -16,7 +16,8 @@
 //! ```
 //!
 //! which emits `Post::COMMENTABLE_TYPE`, `Post::commentable_spec()`, a
-//! `PostComments` trait (`add_comment` / `comment_thread` / `delete_comment`)
+//! `PostComments` trait (`add_comment` / `comment_thread` /
+//! `comment_thread_page` / `comment_thread_page_containing` / `delete_comment`)
 //! blanket-implemented over the generated repository, and an [`inventory`]
 //! registration so [`router()`] can serve the thread for *any* commentable model
 //! without the app writing a route per model.
@@ -1207,7 +1208,7 @@ fn author_name_fragments(spec: &CommentableSpec) -> (String, String) {
 // ── Paged read path (#3325) ─────────────────────────────────────────────────
 
 /// The default number of top-level comments on one page.
-pub const DEFAULT_PAGE_SIZE: usize = 50;
+pub const DEFAULT_THREAD_PAGE_SIZE: usize = 50;
 
 /// One page of a thread, from [`comment_thread_page`] or
 /// [`thread_page_containing`].
@@ -1228,18 +1229,26 @@ pub struct ThreadPage {
 
 /// One page of the live thread for `(parent_type, parent_id)`.
 ///
-/// The cost is set by the page, not by the thread. Use this on a request
-/// path. [`comment_thread`] reads the whole thread.
+/// The page size sets the cost. The thread size does not. Use this on a
+/// request path. [`comment_thread`] reads the whole thread.
 ///
 /// - `after`: `None` for the first page, else a [`ThreadPage::next`] cursor.
 ///   The cursor is a comment id of this thread. Any other id gives an empty
-///   page.
+///   page. A hard-deleted cursor row also gives an empty page.
 /// - `page_size`: the number of top-level comments. `0` is read as `1`.
 ///
-/// A top-level comment is a live comment with no live parent in this thread.
-/// Thus a live reply under a deleted comment shows at the top level, as in
-/// [`comment_thread`]. Replies are read from the top-level comments down, so
-/// the comments table needs an index on its parent column.
+/// A top-level comment is a live comment with no parent. A page shows the
+/// comments that its top-level comments reach through live replies. The
+/// framework write paths keep every live comment reachable: a delete removes
+/// or tombstones the whole subtree. A live reply under a dead parent (only
+/// possible by SQL written outside the framework) is not on any page.
+/// [`comment_thread`] shows it at the top level.
+///
+/// Index the comments table for this read:
+///
+/// - `(type, id, created_at, pk) WHERE parent IS NULL` (and `deleted_at IS
+///   NULL` for soft delete) for the top-level order and the next-page check.
+/// - the parent column, for the walk down to the replies.
 ///
 /// `tenant` and `soft_delete` are the caller's scope: see
 /// [Caller scope](crate::commentable#caller-scope).
@@ -1278,8 +1287,8 @@ pub async fn comment_thread_page(
 ///
 /// This is the first page when the comment's top-level comment is on it.
 /// Otherwise it is the page that ends at that top-level comment. Use it to
-/// show a comment just written. When `comment_id` is not a live comment of
-/// this thread, this is the first page.
+/// show a comment just written. When no page shows `comment_id`, this is the
+/// first page.
 ///
 /// The arguments and errors are those of [`comment_thread_page`].
 ///
@@ -1360,8 +1369,8 @@ enum PageBind {
 
 /// SQL text and its binds, in placeholder order.
 ///
-/// Each placeholder gets the next number, and each bind is pushed once per
-/// use. Thus one statement serves Postgres (`$n`) and `SQLite` (`?`).
+/// Each placeholder gets the next number. `bind` pushes the value once for
+/// each use. Thus one statement serves Postgres (`$n`) and `SQLite` (`?`).
 #[derive(Default)]
 struct PageSql {
     binds: Vec<PageBind>,
@@ -1397,24 +1406,13 @@ impl PageSql {
 
 /// `AND` a live top-level comment, for the row aliased `alias`.
 ///
-/// A comment is top-level when it has no parent, or when its parent is not a
-/// live comment of the same thread. This matches how [`nest`] places an
-/// orphan.
+/// A top-level comment has no parent. The test is a plain column check, so a
+/// partial index on `parent IS NULL` serves the page order. A test for a dead
+/// parent would read one more row for each reply the scan passes.
 fn top_level_predicate(spec: &CommentableSpec, alias: &str) -> String {
-    let comments = quote_ident(spec.comments_table);
-    let pk = quote_ident(spec.comment_pk);
     let parent = quote_ident(spec.parent_column);
-    let type_column = quote_ident(spec.type_column);
-    let id_column = quote_ident(spec.id_column);
     let live = spec.live_comments(alias);
-    let parent_live = spec.live_comments("__autumn_cmt_up");
-    format!(
-        "{live} AND ({alias}.{parent} IS NULL OR NOT EXISTS (\
-           SELECT 1 FROM {comments} AS __autumn_cmt_up \
-            WHERE __autumn_cmt_up.{pk} = {alias}.{parent} \
-              AND __autumn_cmt_up.{type_column} = {alias}.{type_column} \
-              AND __autumn_cmt_up.{id_column} = {alias}.{id_column}{parent_live}))"
-    )
+    format!("{live} AND {alias}.{parent} IS NULL")
 }
 
 /// `AND` the row aliased `alias` sorts after (or before) the comment the next
@@ -1598,6 +1596,11 @@ async fn next_top_level(
 /// it reads the top-level comment `page_size` places before that one. That
 /// comment is the cursor of the page that ends at the target. When there is
 /// no such comment, the target is on the first page and the cursor is `None`.
+/// When the walk does not end at a top-level comment, no page shows the
+/// target, and the cursor is `None`.
+///
+/// The cursor compare reads the root as a scalar subquery. Thus Postgres
+/// uses it as an index condition and does not scan the thread from its end.
 async fn page_after_for(
     conn: &mut RuntimeConnection,
     scope: &PageScope<'_>,
@@ -1635,11 +1638,12 @@ async fn page_after_for(
          ), __autumn_cmt_root AS (\
            SELECT k.{created_at} AS created_at, k.{pk} AS id \
              FROM {comments} AS k \
-            WHERE k.{pk} = (SELECT id FROM __autumn_cmt_up ORDER BY depth DESC LIMIT 1)\
+            WHERE k.{pk} = (SELECT id FROM __autumn_cmt_up \
+                             WHERE parent IS NULL ORDER BY depth DESC LIMIT 1)\
          ) \
-         SELECT c.{pk} AS id FROM {comments} AS c, __autumn_cmt_root AS root \
+         SELECT c.{pk} AS id FROM {comments} AS c \
           WHERE c.{type_column} = {top_type} AND c.{id_column} = {top_id}{top_level} \
-            AND (c.{created_at}, c.{pk}) < (root.created_at, root.id) \
+            AND (c.{created_at}, c.{pk}) < (SELECT created_at, id FROM __autumn_cmt_root) \
           ORDER BY c.{created_at} DESC, c.{pk} DESC \
           LIMIT 1 OFFSET {offset}"
     );
@@ -2410,7 +2414,19 @@ mod tests {
                 "/p?after=4#autumn-comments-Post-1-c9",
             ),
             ("/p?sort=new", Some(4), None, "/p?sort=new&after=4"),
-            ("/p#old", None, element, "/p#autumn-comments-Post-1-c9"),
+            (
+                "/p#old",
+                None,
+                element.clone(),
+                "/p#autumn-comments-Post-1-c9",
+            ),
+            ("/p?after=7", Some(4), None, "/p?after=4"),
+            (
+                "/p?after=7&x=1",
+                None,
+                element,
+                "/p?x=1#autumn-comments-Post-1-c9",
+            ),
         ] {
             let location = redirect_location(return_to, after, element);
             assert_eq!(location, expected);
@@ -2805,8 +2821,11 @@ pub struct CommentsConfig {
     /// the user already sees.
     pub on_comment: Option<CommentCreatedHook>,
     /// The number of top-level comments on one page of a thread. Default
-    /// [`DEFAULT_PAGE_SIZE`]. Both handlers read one page, never the whole
-    /// thread. See [`comment_thread_page`].
+    /// [`DEFAULT_THREAD_PAGE_SIZE`]. Both handlers read one page, never the
+    /// whole thread. See [`comment_thread_page`].
+    ///
+    /// Use the same size on a host page that renders the thread. A no-JS post
+    /// returns to the host page at the page this size gives.
     pub page_size: usize,
 }
 
@@ -2931,7 +2950,7 @@ impl Default for CommentsConfig {
             label: "Comments".to_owned(),
             authorize: None,
             on_comment: None,
-            page_size: DEFAULT_PAGE_SIZE,
+            page_size: DEFAULT_THREAD_PAGE_SIZE,
         }
     }
 }
@@ -2940,8 +2959,8 @@ impl Default for CommentsConfig {
 ///
 /// | Method | Path | Does |
 /// |---|---|---|
-/// | `GET` | `/{commentable_type}/{parent_id}` | render the thread fragment |
-/// | `POST` | `/{commentable_type}/{parent_id}` | post a comment or reply, then re-render it |
+/// | `GET` | `/{commentable_type}/{parent_id}` | render one page of the thread (`?after=<id>` for a later page) |
+/// | `POST` | `/{commentable_type}/{parent_id}` | post a comment or reply, then render the page that shows it |
 ///
 /// `commentable_type` is matched against the [`inventory`] registry, so an
 /// unregistered type is a `404` — the router can only ever reach a model that
@@ -3303,7 +3322,7 @@ struct ThreadQuery {
     after: Option<i64>,
 }
 
-/// Post a comment (or a reply) and re-render the thread.
+/// Post a comment (or a reply), then render the page that shows it.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
 #[allow(clippy::too_many_arguments)] // Every argument is a distinct axum
 // extractor -- config, path, session, CSRF token, CSRF field name, htmx
@@ -3638,19 +3657,13 @@ fn render(
 /// The `Location` for a no-JS submit: `return_to` on the page that shows the
 /// comment, at the comment's element.
 ///
-/// `return_to` already passed [`is_safe_return_path`]. Its own fragment is
-/// replaced. The cursor and the element id are digits and identifier
-/// characters only, so the result stays a safe relative path.
+/// `return_to` already passed [`is_safe_return_path`]. Its own fragment and
+/// its own `after` are replaced. The cursor and the element id are digits and
+/// identifier characters only, so the result stays a safe relative path.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
 fn redirect_location(return_to: &str, after: Option<i64>, element: Option<String>) -> String {
     let path = return_to.split('#').next().unwrap_or(return_to);
-    let mut location = match after {
-        Some(after) => {
-            let separator = if path.contains('?') { '&' } else { '?' };
-            format!("{path}{separator}after={after}")
-        }
-        None => path.to_owned(),
-    };
+    let mut location = crate::widgets::with_page_cursor(path, after);
     if let Some(element) = element {
         location.push('#');
         location.push_str(&element);

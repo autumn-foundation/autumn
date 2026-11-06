@@ -89,7 +89,6 @@ pub async fn front_page(
     // non-essential script below. See docs/guide/cookie-consent.md.
     consent: autumn_web::consent::Consent,
     mut db: Db,
-    State(state): State<AppState>,
     repo: PgPostRepository,
     flags: Flags,
     exps: Experiments,

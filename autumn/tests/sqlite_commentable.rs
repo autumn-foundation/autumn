@@ -763,4 +763,30 @@ async fn comment_thread_page_pages_on_sqlite() {
     .expect("page containing a");
     assert_eq!(roots(&page.nodes), vec!["a"]);
     assert_eq!(page.after, None);
+
+    // `c` is past the first page: the page ends at it.
+    let c = second.nodes[0].comment.id;
+    let page = autumn_web::commentable::thread_page_containing(
+        &mut conn,
+        spec,
+        SqcDual::COMMENTABLE_TYPE,
+        target,
+        c,
+        1,
+        None,
+        Some(true),
+    )
+    .await
+    .expect("page containing c");
+    assert_eq!(roots(&page.nodes), vec!["c"]);
+    assert_eq!(page.after, Some(b.id));
+
+    // A cursor from another record gives an empty page.
+    let other = seed_dual(&pool).await;
+    let foreign = repo.add_comment(other, author, "x", None).await.expect("x");
+    let page = repo
+        .comment_thread_page(target, Some(foreign.id), 5)
+        .await
+        .expect("foreign cursor");
+    assert!(page.nodes.is_empty());
 }

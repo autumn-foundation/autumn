@@ -173,11 +173,13 @@ use crate::models::PostComments as _;   // the trait `#[commentable]` emits
 let comment = posts.add_comment(post_id, author_id, "first!", None).await?;
 let reply = posts.add_comment(post_id, author_id, "…", Some(comment.id)).await?;
 
-// One page: up to 50 top-level comments and every reply under them.
-let page: ThreadPage = posts.comment_thread_page(post_id, None, 50).await?;
+use autumn_web::commentable::{DEFAULT_THREAD_PAGE_SIZE as SIZE, ThreadPage};
+
+// One page: up to SIZE top-level comments and every reply under them.
+let page: ThreadPage = posts.comment_thread_page(post_id, None, SIZE).await?;
 // The next page starts after the last top-level comment of this one.
 let more: Option<ThreadPage> = match page.next {
-    Some(next) => Some(posts.comment_thread_page(post_id, Some(next), 50).await?),
+    Some(next) => Some(posts.comment_thread_page(post_id, Some(next), SIZE).await?),
     None => None,
 };
 
@@ -200,8 +202,8 @@ an N+1 walk. Order is stable: `(created_at, id)` at every level.
 ### Read a thread in pages (#3325)
 
 `comment_thread` reads the whole thread, so its cost grows with the thread. On
-a request path, use `comment_thread_page(parent_id, after, page_size)`. Its
-cost is set by the page.
+a request path, use `comment_thread_page(parent_id, after, page_size)`. The
+page size sets its cost.
 
 - A page holds up to `page_size` top-level comments, in `(created_at, id)`
   order, and every live reply under them. A reply never goes to a later page.
@@ -209,15 +211,22 @@ cost is set by the page.
   `next` cursor. `next` is `None` on the last page.
 - The cursor is a comment id. The read scopes it to this thread, so an id
   from another record gives an empty page.
-- A live reply under a deleted comment shows at the top level, as in
-  `comment_thread`.
+- A top-level comment has no parent. A page shows what its top-level
+  comments reach through live replies. The framework write paths keep every
+  live comment reachable. A live reply under a dead parent (only possible
+  with SQL written outside the framework) is on no page. `comment_thread`
+  shows it at the top level.
 - The read is three statements at most: the parent probe, the page, and a
-  check for a next page. It walks replies down from the top-level comments, so
-  index the parent column (`parent_id`). Index
-  `(commentable_type, commentable_id, created_at, id)` for the top-level order.
+  check for a next page.
+- Add two indexes. The page reads top-level comments in order from
+  `(commentable_type, commentable_id, created_at, id) WHERE parent_id IS NULL
+  AND deleted_at IS NULL`. It walks down to the replies through `parent_id`.
+- Use one page size on the host page and in `CommentsConfig::page_size`.
+  Else a no-JS post can return to a page that does not show the new comment.
 
-`commentable::thread_page_containing` returns the page that shows one
-comment. The router uses it to show a comment just written.
+`comment_thread_page_containing(parent_id, comment_id, page_size)` returns the
+page that shows one comment. The router uses it to show a comment just
+written.
 
 > **These helpers take their own pooled connection.** Like `#[votable]`'s
 > `react()` and the many-to-many mutation helpers, they do not join an
@@ -268,8 +277,14 @@ graft a subtree onto someone else's row.
 ```rust,ignore
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 
-let page = posts.comment_thread_page(post.id, query.after, 50).await?;
-use autumn_web::commentable::{CommentsConfig, thread_action, thread_dom_id};
+use autumn_web::commentable::{
+    CommentsConfig, DEFAULT_THREAD_PAGE_SIZE, thread_action, thread_dom_id,
+};
+
+// `query` is the handler's `Query<…>` with `after: Option<i64>`.
+let page = posts
+    .comment_thread_page(post.id, query.after, DEFAULT_THREAD_PAGE_SIZE)
+    .await?;
 
 let comments = CommentsConfig::default();          // must match what you `nest`
 let cfg = CommentThread::from_spec(                 // depth + body caps from the model

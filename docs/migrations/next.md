@@ -243,6 +243,25 @@ Changes that still compile but behave differently at runtime. Examples:
 
 If nothing changed, delete this section.
 
+### Comments: the comment router shows one page (#3325)
+
+`commentable::router` reads one page of a thread, not the whole thread. A
+page holds up to 50 top-level comments and all their replies. After a post,
+the response shows the page that holds the new comment.
+
+What to do:
+
+1. On a host page that renders a thread, call `comment_thread_page` (not
+   `comment_thread`), and pass the page to the widget with
+   `.page(page.after, page.next)`.
+2. Read `?after=<id>` from the host page's query string, and pass it to
+   `comment_thread_page`.
+3. Use the same page size on the host page and in
+   `CommentsConfig::page_size`. Else a no-JS post can return to a page that
+   does not show the new comment.
+4. Index the comments table: `(commentable_type, commentable_id, created_at,
+   id) WHERE parent_id IS NULL AND deleted_at IS NULL`, and `parent_id`.
+
 ## Deprecations retained from `{X.Y}`
 
 Items that were deprecated during the `{X.Y}` line and have now been

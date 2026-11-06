@@ -27,11 +27,14 @@
 //! 5. `leaderboard_grouped_aggregate_still_works_after_react` -- the regression
 //!    guard for #1364: `#[votable]`'s hidden edge `table!` must not disturb
 //!    `crate::schema::votes`, the `Vote` model, or
-//!    `VoteRepository::sum_value_grouped_by_post_id`, which the front-page
-//!    "Top posts by votes" leaderboard depends on (including its `IS NOT NULL`
-//!    group guard that excludes comment votes). It also seeds a `NULL`-post_id
-//!    comment vote *before* reacting, so the whole burst runs against a table
-//!    that already holds rows the association must ignore.
+//!    `VoteRepository::sum_value_grouped_by_post_id` (including its `IS NOT
+//!    NULL` group guard that excludes comment votes). It also seeds a
+//!    `NULL`-post_id comment vote *before* reacting, so the whole burst runs
+//!    against a table that already holds rows the association must ignore.
+//! 6. `front_page_leaderboard_reads_the_maintained_score` and
+//!    `front_page_leaderboard_uses_the_partial_score_index` (#3325): the
+//!    front-page "Top posts by votes" list reads `posts.score` through
+//!    `idx_posts_score_top`. It does not sum the votes.
 //!
 //! This suite is illustrative: it is **not** part of CI (the example's
 //! Docker tests are not swept). The CI-backed race-safety evidence is
@@ -395,7 +398,7 @@ async fn votable_react_is_race_safe_on_the_shipped_votes_table() {
 /// `crate::schema::votes`, the `Vote` model and
 /// `VoteRepository::sum_value_grouped_by_post_id` must all keep working
 /// unchanged — including the nullable-`post_id` `IS NOT NULL` group guard that
-/// excludes comment votes from the front-page leaderboard.
+/// excludes comment votes from the roll-up.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers) or AUTUMN_TEST_PG_URL"]
 async fn leaderboard_grouped_aggregate_still_works_after_react() {

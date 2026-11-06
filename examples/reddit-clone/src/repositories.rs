@@ -19,9 +19,6 @@ use crate::models::{
     UpdateSubreddit, UpdateVote, Vote,
 };
 use crate::schema::{posts, subreddits, votes};
-use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Bool, Text};
-use diesel_async::RunQueryDsl as _;
 
 #[autumn_web::repository(Subreddit, hooks = SubredditHooks, api = "/api/subreddits")]
 pub trait SubredditRepository {
@@ -211,45 +208,56 @@ impl autumn_web::live::LiveFragment for Post {
     }
 }
 
-/// One row of the front-page "Top posts by votes" list.
-#[derive(Debug, Clone, PartialEq, Eq, diesel::Queryable)]
-pub struct TopPost {
-    /// The post id.
-    pub id: i64,
-    /// The post title.
-    pub title: String,
-    /// The post's net vote score.
-    pub score: i64,
-}
+pub use leaderboard::{TopPost, top_posts_by_score, top_posts_by_score_query};
 
-/// The front-page "Top posts by votes" query (#3325): posts with a positive
-/// `posts.score`, highest first, ties by id, at most `limit` rows.
-///
-/// `#[votable(aggregate = sum)]` keeps `posts.score` equal to the post's vote
-/// sum, in the vote transaction. So this gives the vote-sum ranking without a
-/// read of `votes`. The partial index `idx_posts_score_top` gives the order.
-/// Its predicate is `score > 0`, so the filter here is that literal SQL, not
-/// a bind: Postgres cannot match a bound value to the index predicate.
-#[must_use]
-pub fn top_posts_by_score_query(
-    limit: i64,
-) -> posts::BoxedQuery<'static, diesel::pg::Pg, (BigInt, Text, BigInt)> {
-    posts::table
-        .filter(diesel::dsl::sql::<Bool>("posts.score > 0"))
-        .order((posts::score.desc(), posts::id.asc()))
-        .limit(limit)
-        .select((posts::id, posts::title, posts::score))
-        .into_boxed()
-}
+/// The front-page "Top posts by votes" list (#3325). In its own module so its
+/// diesel imports do not meet the ones the `#[repository]` expansions use.
+mod leaderboard {
+    use crate::schema::posts;
+    use diesel::sql_types::{BigInt, Bool, Text};
+    use diesel::{ExpressionMethods as _, QueryDsl as _};
+    use diesel_async::RunQueryDsl as _;
 
-/// Load the [`top_posts_by_score_query`] rows.
-///
-/// # Errors
-///
-/// Any database error.
-pub async fn top_posts_by_score(
-    conn: &mut diesel_async::AsyncPgConnection,
-    limit: i64,
-) -> diesel::QueryResult<Vec<TopPost>> {
-    top_posts_by_score_query(limit).load(conn).await
+    /// One row of the front-page "Top posts by votes" list.
+    #[derive(Debug, Clone, PartialEq, Eq, diesel::Queryable)]
+    pub struct TopPost {
+        /// The post id.
+        pub id: i64,
+        /// The post title.
+        pub title: String,
+        /// The post's net vote score.
+        pub score: i64,
+    }
+
+    /// The front-page "Top posts by votes" query (#3325): posts with a positive
+    /// `posts.score`, highest first, ties by id, at most `limit` rows.
+    ///
+    /// `#[votable(aggregate = sum)]` keeps `posts.score` equal to the post's vote
+    /// sum, in the vote transaction. So this gives the vote-sum ranking without a
+    /// read of `votes`. The partial index `idx_posts_score_top` gives the order.
+    /// Its predicate is `score > 0`, so the filter here is that literal SQL, not
+    /// a bind: Postgres cannot match a bound value to the index predicate.
+    #[must_use]
+    pub fn top_posts_by_score_query(
+        limit: i64,
+    ) -> posts::BoxedQuery<'static, diesel::pg::Pg, (BigInt, Text, BigInt)> {
+        posts::table
+            .filter(diesel::dsl::sql::<Bool>("posts.score > 0"))
+            .order((posts::score.desc(), posts::id.asc()))
+            .limit(limit)
+            .select((posts::id, posts::title, posts::score))
+            .into_boxed()
+    }
+
+    /// Load the [`top_posts_by_score_query`] rows.
+    ///
+    /// # Errors
+    ///
+    /// Any database error.
+    pub async fn top_posts_by_score(
+        conn: &mut diesel_async::AsyncPgConnection,
+        limit: i64,
+    ) -> diesel::QueryResult<Vec<TopPost>> {
+        top_posts_by_score_query(limit).load(conn).await
+    }
 }

@@ -24,4 +24,4 @@ pub struct CommentPageQuery {
 }
 
 /// The number of top-level comments on one page.
-pub const COMMENTS_PER_PAGE: usize = autumn_web::commentable::DEFAULT_PAGE_SIZE;
+pub const COMMENTS_PER_PAGE: usize = autumn_web::commentable::DEFAULT_THREAD_PAGE_SIZE;

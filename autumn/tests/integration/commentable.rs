@@ -451,6 +451,10 @@ const DDL: &[&str] = &[
     "CREATE INDEX idx_cmt_comments_target \
      ON cmt_comments (commentable_type, commentable_id)",
     "CREATE INDEX idx_cmt_comments_parent ON cmt_comments (parent_id)",
+    // The top-level order the paged read uses (#3325).
+    "CREATE INDEX idx_cmt_comments_top_level \
+     ON cmt_comments (commentable_type, commentable_id, created_at, id) \
+     WHERE parent_id IS NULL AND deleted_at IS NULL",
     // Issue #2265: `cmt_posts`' own cleanup trigger. `autumn generate
     // scaffold … comments:commentable` writes this same shape into a real
     // parent migration. A hard delete has no foreign key to cascade from.
@@ -701,6 +705,7 @@ fn comment_helpers_are_generated() {
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::add_comment);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::comment_thread);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::comment_thread_page);
+    assert_is_fn(<PgCmtPostRepository as CmtPostComments>::comment_thread_page_containing);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::delete_comment);
     assert_is_fn(<PgCmtPostRepository as CmtPostComments>::recompute_comment_count);
     assert_is_fn(<PgCmtPhotoRepository as CmtPhotoComments>::add_comment);
@@ -2859,10 +2864,12 @@ async fn comment_thread_page_has_no_next_when_the_page_is_exactly_full() {
 }
 
 /// A deleted top-level comment does not use a place on the page. A live reply
-/// whose parent is gone shows as a top-level comment, as in `comment_thread`.
+/// under a dead parent (not a framework write) is on no page: a page holds
+/// only what its top-level comments reach. Its page lookup gives the first
+/// page.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn comment_thread_page_skips_deleted_comments_and_keeps_orphans() {
+async fn comment_thread_page_skips_deleted_comments_and_unreachable_replies() {
     let (pool, _container) = setup_pool().await;
     let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
     let mut conn = pool.get().await.expect("conn");
@@ -2885,9 +2892,96 @@ async fn comment_thread_page_skips_deleted_comments_and_keeps_orphans() {
         .expect("tombstone b only");
 
     let page = repo.comment_thread_page(post, None, 2).await.expect("page");
-    assert_eq!(roots(&page.nodes), vec!["b1", "c"]);
-    assert_eq!(page.nodes[0].comment.id, b1.id);
+    assert_eq!(roots(&page.nodes), vec!["c"]);
     assert_eq!(page.next, None);
+
+    let page = autumn_web::commentable::thread_page_containing(
+        &mut conn,
+        CmtPost::commentable_spec(),
+        CmtPost::COMMENTABLE_TYPE,
+        post,
+        b1.id,
+        1,
+        None,
+        None,
+    )
+    .await
+    .expect("page for an unreachable reply");
+    assert_eq!(roots(&page.nodes), vec!["c"]);
+    assert_eq!(page.after, None);
+}
+
+/// A parent cycle (not a framework write) does not stop the page reads. Its
+/// rows are on no page.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_page_survives_a_parent_cycle() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    repo.add_comment(post, author, "a", None).await.expect("a");
+    let x = repo.add_comment(post, author, "x", None).await.expect("x");
+    let y = repo
+        .add_comment(post, author, "y", Some(x.id))
+        .await
+        .expect("y");
+    diesel::sql_query("UPDATE cmt_comments SET parent_id = $1 WHERE id = $2")
+        .bind::<BigInt, _>(y.id)
+        .bind::<BigInt, _>(x.id)
+        .execute(&mut conn)
+        .await
+        .expect("make a cycle");
+
+    let page = repo.comment_thread_page(post, None, 5).await.expect("page");
+    assert_eq!(flatten(&page.nodes), vec![(0, "a".to_owned())]);
+    let page = autumn_web::commentable::thread_page_containing(
+        &mut conn,
+        CmtPost::commentable_spec(),
+        CmtPost::COMMENTABLE_TYPE,
+        post,
+        y.id,
+        5,
+        None,
+        None,
+    )
+    .await
+    .expect("page for a cycle row");
+    assert_eq!(page.after, None);
+}
+
+/// A tenant-scoped repository pages only its own tenant's thread.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_thread_page_keeps_the_tenant_boundary() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let acme = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "theirs").await;
+    CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.add_comment(acme, author, "ours", None).await
+        })
+        .await
+        .expect("same-tenant comment");
+
+    let page = CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.comment_thread_page(acme, None, 10).await
+        })
+        .await
+        .expect("own tenant");
+    assert_eq!(roots(&page.nodes), vec!["ours"]);
+
+    let err = CURRENT_TENANT
+        .scope(Some("globex".to_owned()), async {
+            repo.comment_thread_page(acme, None, 10).await
+        })
+        .await
+        .expect_err("another tenant's thread");
+    assert_eq!(err.status().as_u16(), 404);
 }
 
 /// A cursor names a comment of the same thread. A comment id from another
@@ -3035,7 +3129,9 @@ async fn thread_page_containing_returns_the_page_that_shows_a_comment() {
         page.nodes
     );
 
-    let page = thread_page_containing(&mut conn, spec, ty, post, ids[4], 2, None, None)
+    // The generated repository method gives the same page.
+    let page = repo
+        .comment_thread_page_containing(post, ids[4], 2)
         .await
         .expect("page for e");
     assert_eq!(roots(&page.nodes), vec!["d", "e"], "the newest comment");
@@ -3107,7 +3203,7 @@ async fn router_pages_a_long_thread_by_default() {
     let mut conn = pool.get().await.expect("conn");
     let author = seed_user(&mut conn, "ada").await;
     let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
-    let total = autumn_web::commentable::DEFAULT_PAGE_SIZE + 1;
+    let total = autumn_web::commentable::DEFAULT_THREAD_PAGE_SIZE + 1;
     diesel::sql_query(format!(
         "INSERT INTO cmt_comments (commentable_type, commentable_id, author_id, body) \
          SELECT 'CmtPost', $1, $2, 'comment-' || n FROM generate_series(1, {total}) AS n"
@@ -3156,4 +3252,131 @@ async fn router_post_shows_the_page_that_holds_the_new_comment() {
     assert!(body.contains("delta"), "the new comment shows: {body}");
     assert!(!body.contains("alpha"), "{body}");
     assert!(body.contains("autumn-comments-earlier"), "{body}");
+}
+
+/// Drive one request and read back `(status, Location header, body)`.
+#[cfg(feature = "widgets-social")]
+async fn call_with_location(
+    app: axum::Router,
+    mut request: axum::http::Request<axum::body::Body>,
+    author_id: i64,
+) -> (u16, Option<String>, String) {
+    use tower::ServiceExt as _;
+    let mut data = std::collections::HashMap::new();
+    data.insert("user_id".to_owned(), author_id.to_string());
+    request
+        .extensions_mut()
+        .insert(autumn_web::session::Session::new_for_test(
+            "test-session".to_owned(),
+            data,
+        ));
+    let response = app.oneshot(request).await.expect("router response");
+    let status = response.status().as_u16();
+    let location = response
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (
+        status,
+        location,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+/// A no-JS post returns to the host page that shows the new comment, at the
+/// comment. An `after` that `return_to` already has is replaced.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
+async fn router_redirects_a_no_js_post_to_the_page_that_shows_it() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    let mut ids = Vec::new();
+    for body in ["alpha", "bravo", "charlie"] {
+        ids.push(
+            repo.add_comment(post, author, body, None)
+                .await
+                .expect(body)
+                .id,
+        );
+    }
+    drop(conn);
+
+    let config = autumn_web::commentable::CommentsConfig::default().page_size(2);
+    let (status, location, body) = call_with_location(
+        comment_app(pool.clone(), config.clone()),
+        form_post(
+            &format!("/comments/CmtPost/{post}"),
+            "body=delta&return_to=%2Fposts%2Fhello%3Fafter%3D99",
+        ),
+        author,
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    let location = location.expect("a Location header");
+    let thread = autumn_web::commentable::thread_dom_id("CmtPost", post);
+    let prefix = format!("/posts/hello?after={}#{thread}-c", ids[1]);
+    assert!(location.starts_with(&prefix), "{location}");
+
+    // A reply to a comment on the first page goes to the first page.
+    let (status, location, _) = call_with_location(
+        comment_app(pool, config),
+        form_post(
+            &format!("/comments/CmtPost/{post}"),
+            &format!("body=re&reply_to={}&return_to=%2Fposts%2Fhello", ids[0]),
+        ),
+        author,
+    )
+    .await;
+    assert_eq!(status, 303);
+    let location = location.expect("a Location header");
+    assert!(
+        location.starts_with(&format!("/posts/hello#{thread}-c")),
+        "{location}"
+    );
+}
+
+/// A rejected reply to a comment on a later page shows that page, with the
+/// draft back in that comment's reply form.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
+async fn router_returns_a_rejected_reply_on_its_own_page() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let post = seed_one_col(&mut conn, "cmt_posts", "title", "hello").await;
+    let mut ids = Vec::new();
+    for body in ["alpha", "bravo", "charlie"] {
+        ids.push(
+            repo.add_comment(post, author, body, None)
+                .await
+                .expect(body)
+                .id,
+        );
+    }
+    drop(conn);
+
+    let config = autumn_web::commentable::CommentsConfig::default().page_size(1);
+    let (status, body) = call_with_author(
+        comment_app(pool, config),
+        form_post(
+            &format!("/comments/CmtPost/{post}"),
+            &format!("body=%20%20&reply_to={}", ids[2]),
+        ),
+        author,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("charlie"), "the target's page: {body}");
+    assert!(!body.contains("alpha"), "{body}");
+    assert!(body.contains(r#"role="alert""#), "{body}");
 }
