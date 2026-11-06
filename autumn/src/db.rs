@@ -1692,24 +1692,7 @@ impl DatabaseTopology {
 static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Optional `SQLite` read tuning for each pooled connection. `0` turns a
-/// setting off. See `docs/guide/sqlite-in-production.md`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SqliteTuning {
-    /// `PRAGMA mmap_size`, in bytes.
-    pub mmap_size: u64,
-    /// `PRAGMA cache_size = -N`, in KiB.
-    pub cache_size_kib: u64,
-}
-
-impl SqliteTuning {
-    /// No tuning: `SQLite`'s own defaults.
-    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-    pub(crate) const OFF: Self = Self {
-        mmap_size: 0,
-        cache_size_kib: 0,
-    };
-}
+pub(crate) use crate::config::SqliteTuning;
 
 /// The per-connection pragma batch a pooled `SQLite` connection is set up with.
 ///

@@ -12085,8 +12085,8 @@ impl DatabaseFleetConfig {
     }
 
     /// The read tuning of each fleet database connection.
-    pub(crate) const fn sqlite_tuning(&self) -> crate::db::SqliteTuning {
-        crate::db::SqliteTuning {
+    pub(crate) const fn sqlite_tuning(&self) -> SqliteTuning {
+        SqliteTuning {
             mmap_size: self.mmap_size,
             cache_size_kib: self.cache_size_kib,
         }
@@ -12164,6 +12164,25 @@ const fn default_fleet_max_open() -> usize {
     256
 }
 
+/// Optional `SQLite` read tuning for each pooled connection. `0` turns a
+/// setting off. See `docs/guide/sqlite-in-production.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SqliteTuning {
+    /// `PRAGMA mmap_size`, in bytes.
+    pub mmap_size: u64,
+    /// `PRAGMA cache_size = -N`, in KiB.
+    pub cache_size_kib: u64,
+}
+
+impl SqliteTuning {
+    /// No tuning: `SQLite`'s own defaults.
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) const OFF: Self = Self {
+        mmap_size: 0,
+        cache_size_kib: 0,
+    };
+}
+
 /// The largest `mmap_size` the bundled `SQLite` uses (`SQLITE_MAX_MMAP_SIZE`).
 /// `SQLite` uses this value in place of a larger value. It does not return an
 /// error.
@@ -12176,7 +12195,7 @@ const MMAP_ADDRESS_BUDGET_32_BIT: u64 = 1 << 30;
 /// the most connections that can map the file at once.
 fn check_sqlite_tuning(
     prefix: &str,
-    tuning: crate::db::SqliteTuning,
+    tuning: SqliteTuning,
     connections: usize,
 ) -> Result<(), ConfigError> {
     // SQLite reads `mmap_size` as a signed 64-bit integer.
@@ -12536,8 +12555,8 @@ pub fn database_backend_consistency(
 
 impl DatabaseConfig {
     /// The read tuning of each pooled `SQLite` connection. Not the fleet's.
-    pub(crate) const fn sqlite_tuning(&self) -> crate::db::SqliteTuning {
-        crate::db::SqliteTuning {
+    pub(crate) const fn sqlite_tuning(&self) -> SqliteTuning {
+        SqliteTuning {
             mmap_size: self.mmap_size,
             cache_size_kib: self.cache_size_kib,
         }
@@ -22513,7 +22532,7 @@ path = "/healthz"
         let db = DatabaseConfig::default();
         assert_eq!(db.mmap_size, 0, "mmap is off by default");
         assert_eq!(db.cache_size_kib, 0, "SQLite's own cache by default");
-        assert_eq!(db.sqlite_tuning(), crate::db::SqliteTuning::OFF);
+        assert_eq!(db.sqlite_tuning(), SqliteTuning::OFF);
 
         let config: AutumnConfig = toml::from_str(
             "[database]\nurl = \"sqlite:///var/lib/app/app.db\"\n\
@@ -22524,7 +22543,7 @@ path = "/healthz"
         assert_eq!(config.database.cache_size_kib, 65_536);
         assert_eq!(
             config.database.sqlite_tuning(),
-            crate::db::SqliteTuning {
+            SqliteTuning {
                 mmap_size: 268_435_456,
                 cache_size_kib: 65_536,
             }
@@ -22569,11 +22588,11 @@ path = "/healthz"
         // The control value does not reach the fleet.
         assert_eq!(fleet.mmap_size, 0);
         assert_eq!(fleet.cache_size_kib, 0);
-        assert_eq!(fleet.sqlite_tuning(), crate::db::SqliteTuning::OFF);
+        assert_eq!(fleet.sqlite_tuning(), SqliteTuning::OFF);
         let fleet = parse("mmap_size = 4194304\ncache_size_kib = 512");
         assert_eq!(
             fleet.sqlite_tuning(),
-            crate::db::SqliteTuning {
+            SqliteTuning {
                 mmap_size: 4_194_304,
                 cache_size_kib: 512,
             }
