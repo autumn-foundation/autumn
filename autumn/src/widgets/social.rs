@@ -798,13 +798,13 @@ impl CommentThread {
     /// The no-JS address of the page after `after` (the first page when
     /// `None`): the host page when there is one, else the router.
     fn page_href(&self, after: Option<i64>) -> String {
-        with_page_cursor(self.return_to.as_deref().unwrap_or(&self.action), after)
+        super::with_page_cursor(self.return_to.as_deref().unwrap_or(&self.action), after)
     }
 
     /// The htmx address of the page after `after`: always the router. It
     /// carries `return_to`, so the forms it renders keep it.
     fn page_hx_get(&self, after: Option<i64>) -> String {
-        let mut url = with_page_cursor(&self.action, after);
+        let mut url = super::with_page_cursor(&self.action, after);
         if let Some(return_to) = &self.return_to {
             let encoded = percent_encoding::utf8_percent_encode(
                 return_to,
@@ -835,35 +835,6 @@ impl CommentThread {
 fn with_query(path: &str, key: &str, value: &str) -> String {
     let separator = if path.contains('?') { '&' } else { '?' };
     format!("{path}{separator}{key}={value}")
-}
-
-/// `url` with its comment-page cursor set to `after`.
-///
-/// The function removes each `after` pair that `url` has, then adds
-/// `after={after}` when `after` is `Some`. A `#fragment` stays at the end.
-/// Thus a host page can pass its current address as `return_to`.
-pub(crate) fn with_page_cursor(url: &str, after: Option<i64>) -> String {
-    let (address, fragment) = match url.split_once('#') {
-        Some((address, fragment)) => (address, Some(fragment)),
-        None => (url, None),
-    };
-    let (path, query) = address.split_once('?').unwrap_or((address, ""));
-    let cursor = after.map(|after| format!("after={after}"));
-    let pairs: Vec<&str> = query
-        .split('&')
-        .filter(|pair| !pair.is_empty() && *pair != "after" && !pair.starts_with("after="))
-        .chain(cursor.as_deref())
-        .collect();
-    let mut out = path.to_owned();
-    if !pairs.is_empty() {
-        out.push('?');
-        out.push_str(&pairs.join("&"));
-    }
-    if let Some(fragment) = fragment {
-        out.push('#');
-        out.push_str(fragment);
-    }
-    out
 }
 
 /// The default deepest level offering a reply form, matching
@@ -1867,7 +1838,11 @@ mod tests {
             ("/p#comments", Some(4), "/p?after=4#comments"),
             ("/p?x=1&after=2#c", Some(5), "/p?x=1&after=5#c"),
         ] {
-            assert_eq!(with_page_cursor(url, after), expected, "{url}");
+            assert_eq!(
+                super::super::with_page_cursor(url, after),
+                expected,
+                "{url}"
+            );
         }
     }
 

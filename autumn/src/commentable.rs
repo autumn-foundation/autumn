@@ -3417,59 +3417,17 @@ async fn post_comment(
     // rejection it shows the page of the comment the visitor replied to, so
     // the draft returns to that form. Else it shows the first page.
     let focus = created.as_ref().map(|comment| comment.id).or(reply_to);
-    let page = if redirecting {
-        // No-JS: send the browser to the host page that shows the comment. A
-        // failed lookup costs only the position, so it is not an error.
-        let after = match focus {
-            Some(focus) => page_after_containing(
-                &mut db,
-                spec,
-                &commentable_type,
-                parent_id,
-                focus,
-                config.page_size,
-                tenant.as_deref(),
-            )
-            .await
-            .unwrap_or(None),
-            None => None,
-        };
-        Ok(ThreadPage {
-            nodes: Vec::new(),
-            after,
-            next: None,
-        })
-    } else {
-        match focus {
-            Some(focus) => {
-                thread_page_containing(
-                    &mut db,
-                    spec,
-                    &commentable_type,
-                    parent_id,
-                    focus,
-                    config.page_size,
-                    tenant.as_deref(),
-                    // The router has no repository. Use the registry rule (#2284).
-                    None,
-                )
-                .await
-            }
-            None => {
-                comment_thread_page(
-                    &mut db,
-                    spec,
-                    &commentable_type,
-                    parent_id,
-                    None,
-                    config.page_size,
-                    tenant.as_deref(),
-                    None,
-                )
-                .await
-            }
-        }
-    };
+    let page = page_after_post(
+        &mut db,
+        &config,
+        spec,
+        &commentable_type,
+        parent_id,
+        focus,
+        redirecting,
+        tenant.as_deref(),
+    )
+    .await;
 
     // Release the checkout before awaiting the hook. `on_comment` is documented
     // as the place for a database-backed side effect -- a notification that
@@ -3545,6 +3503,76 @@ async fn post_comment(
         draft,
     )
     .into_response())
+}
+
+/// The page the `POST` response shows: the page that holds `focus`, else
+/// the first page. For a no-JS redirect it reads only the cursor.
+#[cfg(all(feature = "db", feature = "widgets-social"))]
+#[allow(clippy::too_many_arguments)] // The post's own request state, passed
+// through from the handler.
+async fn page_after_post(
+    db: &mut RuntimeConnection,
+    config: &CommentsConfig,
+    spec: &CommentableSpec,
+    commentable_type: &str,
+    parent_id: i64,
+    focus: Option<i64>,
+    redirecting: bool,
+    tenant: Option<&str>,
+) -> AutumnResult<ThreadPage> {
+    if redirecting {
+        // No-JS: send the browser to the host page that shows the comment. A
+        // failed lookup costs only the position, so it is not an error.
+        let after = match focus {
+            Some(focus) => page_after_containing(
+                db,
+                spec,
+                commentable_type,
+                parent_id,
+                focus,
+                config.page_size,
+                tenant,
+            )
+            .await
+            .unwrap_or(None),
+            None => None,
+        };
+        Ok(ThreadPage {
+            nodes: Vec::new(),
+            after,
+            next: None,
+        })
+    } else {
+        match focus {
+            Some(focus) => {
+                thread_page_containing(
+                    db,
+                    spec,
+                    commentable_type,
+                    parent_id,
+                    focus,
+                    config.page_size,
+                    tenant,
+                    // The router has no repository. Use the registry rule (#2284).
+                    None,
+                )
+                .await
+            }
+            None => {
+                comment_thread_page(
+                    db,
+                    spec,
+                    commentable_type,
+                    parent_id,
+                    None,
+                    config.page_size,
+                    tenant,
+                    None,
+                )
+                .await
+            }
+        }
+    }
 }
 
 /// Whether the refreshed thread will render a reply form for `target`.

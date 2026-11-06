@@ -703,7 +703,7 @@ async fn seed_dual(pool: &SqlitePool) -> i64 {
     .await
 }
 
-/// SQLite stores `CURRENT_TIMESTAMP` to the second, so these comments share
+/// `SQLite` stores `CURRENT_TIMESTAMP` to the second, so these comments share
 /// one `created_at`. The cursor must then order on the id.
 #[tokio::test]
 async fn comment_thread_page_pages_on_sqlite() {
