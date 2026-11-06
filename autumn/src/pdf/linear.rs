@@ -20,7 +20,7 @@ const MAX_RATIO: f64 = 8.0;
 ///
 /// # Panics
 ///
-/// If the ratio is above [`MAX_RATIO`].
+/// If [`verdict`] finds the ratio too high.
 pub fn assert_linear<T, R>(
     what: &str,
     n: usize,
@@ -40,24 +40,64 @@ pub fn assert_linear<T, R>(
     };
     let (small, _) = best(&make(n / 4));
     let (large, output) = best(&make(n));
-    if large > FAST_ENOUGH {
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
-        assert!(
-            ratio <= MAX_RATIO,
-            "{what} took {large:?} at {n} and {small:?} at {}: {ratio:.1} times for 4 times \
-             the input. That looks quadratic again.",
-            n / 4
-        );
+    if let Some(message) = verdict(what, n, small, large) {
+        panic!("{message}");
     }
     output
 }
 
+/// The failure message when `large` (at `n`) is more than [`MAX_RATIO`]
+/// times `small` (at `n / 4`), or `None`. A `large` under [`FAST_ENOUGH`]
+/// passes.
+fn verdict(what: &str, n: usize, small: Duration, large: Duration) -> Option<String> {
+    if large < FAST_ENOUGH {
+        return None;
+    }
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+    (ratio > MAX_RATIO).then(|| {
+        format!(
+            "{what} took {large:?} at {n} and {small:?} at {}: {ratio:.1} times for 4 times \
+             the input. That looks quadratic again.",
+            n / 4
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::assert_linear;
+    use std::time::Duration;
+
+    use super::{assert_linear, verdict};
+
+    const fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
 
     #[test]
-    fn a_linear_run_passes() {
+    fn a_linear_ratio_passes() {
+        assert_eq!(verdict("parse", 400, ms(100), ms(400)), None);
+        assert_eq!(verdict("parse", 400, ms(100), ms(800)), None);
+    }
+
+    #[test]
+    fn a_quadratic_ratio_fails() {
+        let message = verdict("parse", 400, ms(100), ms(1600)).expect("a failure");
+        assert!(message.contains("16.0 times"), "{message}");
+        assert!(message.contains("looks quadratic again"), "{message}");
+    }
+
+    #[test]
+    fn a_fast_large_run_passes_at_any_ratio() {
+        assert_eq!(verdict("parse", 400, ms(1), ms(40)), None);
+    }
+
+    #[test]
+    fn a_zero_small_run_does_not_divide_by_zero() {
+        assert!(verdict("parse", 400, Duration::ZERO, ms(100)).is_some());
+    }
+
+    #[test]
+    fn assert_linear_returns_the_output_of_the_large_run() {
         let sum = assert_linear(
             "sum",
             4_000_000,
@@ -65,24 +105,5 @@ mod tests {
             |v| v.iter().sum::<u64>(),
         );
         assert_eq!(sum, 4_000_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "looks quadratic again")]
-    fn a_quadratic_run_fails() {
-        assert_linear(
-            "pairs",
-            8_000,
-            |k| vec![1_u64; k],
-            |v| {
-                let mut total = 0_u64;
-                for a in v {
-                    for b in v {
-                        total = total.wrapping_add(std::hint::black_box(a ^ b));
-                    }
-                }
-                total
-            },
-        );
     }
 }
