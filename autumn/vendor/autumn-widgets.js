@@ -249,6 +249,8 @@
     var group = groupOf(item, list);
     item.setAttribute('aria-expanded', open ? 'true' : 'false');
     if (group) group.hidden = !open;
+    // New visible items take focus by click or script. The tab stop stays.
+    if (open) listItems(list).forEach(function (el) { if (!el.hasAttribute('tabindex')) el.tabIndex = -1; });
     emit(item, open ? 'autumn:expand' : 'autumn:collapse', item);
   }
 

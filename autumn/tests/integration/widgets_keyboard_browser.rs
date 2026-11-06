@@ -1662,6 +1662,16 @@ async fn tree_right_opens_a_branch_then_moves_to_its_first_child() {
         )
         .await
     );
+    // A new visible item takes focus by script, and the tab stop stays.
+    assert_eq!(attr(&page, "t-lib", "tabindex").await, "-1");
+    assert_eq!(attr(&page, "t-src", "tabindex").await, "0");
+    focus(&page, "t-lib").await;
+    assert_eq!(
+        attr(&page, "t-lib", "tabindex").await,
+        "0",
+        "focus moves the tab stop"
+    );
+    focus(&page, "t-src").await;
     press(&page, "ArrowRight").await;
     assert_eq!(active_id(&page).await, "t-lib");
     // Right on an end node does nothing.
