@@ -7,12 +7,18 @@
 # With no framework, measures all six. Run it from benchmarks/runtime after
 # `docker compose build`, with the db service up. For each framework it records:
 #
-#   image_mb        `docker image inspect` size of the built image
+#   image_mb        `docker image inspect` size of the running container's image
 #   cold_start_s    `docker compose up -d <fw>` on a removed container until the
-#                   first 200 from /health (includes migrations and pool setup)
-#   warm_restart_s  `docker compose restart <fw>` (SIGTERM, then start) until
-#                   the first 200 from /health
+#                   first 200 from the health route (includes migrations and
+#                   pool setup)
+#   stop_s          `docker compose stop <fw>`: SIGTERM until the process exits
+#                   (graceful drain; Docker sends SIGKILL after 10 s)
+#   restart_s       `docker compose start <fw>` until the first 200
+#   warm_restart_s  stop_s + restart_s
 #   idle_rss_mb     `docker stats` memory after --idle-wait seconds (default 30)
+#
+# Health routes: /health everywhere except Loco, which serves its built-in
+# /_health.
 #
 # Memory under load is sampled separately by load/sample-mem.sh while k6 runs.
 # Output is a CSV (default results/resources_<timestamp>.csv) and a table.
@@ -31,6 +37,10 @@ declare -A PORTS=(
   [autumn]=8001 [spring-boot]=8002 [rails]=8003
   [django]=8004 [phoenix]=8005 [loco]=8006
 )
+declare -A HEALTH=(
+  [autumn]=/health [spring-boot]=/health [rails]=/health
+  [django]=/health [phoenix]=/health [loco]=/_health
+)
 ORDER=(autumn spring-boot rails django phoenix loco)
 
 while [[ $# -gt 0 ]]; do
@@ -47,13 +57,13 @@ done
 
 now() { date +%s.%N; }
 
-# Seconds from $1 (epoch) until /health on port $2 answers 200; 120 s timeout.
+# Seconds from $1 (epoch) until http://localhost:$2$3 answers 200; 120 s timeout.
 wait_healthy() {
-  local start="$1" port="$2"
+  local start="$1" port="$2" path="$3"
   local deadline
   deadline=$(echo "$start + 120" | bc)
   while :; do
-    if curl -sf -o /dev/null --max-time 1 "http://localhost:$port/health"; then
+    if curl -sf -o /dev/null --max-time 1 "http://localhost:$port$path"; then
       echo "$(now) - $start" | bc
       return 0
     fi
@@ -79,28 +89,36 @@ print(round(n * scale, 1))'
 }
 
 mkdir -p "$(dirname "$OUT")"
-echo "framework,image_mb,cold_start_s,warm_restart_s,idle_rss_mb" > "$OUT"
+# Two decimals, or the word "timeout" unchanged.
+fmt() { [[ "$1" == timeout ]] && echo timeout || printf '%.2f' "$1"; }
+
+echo "framework,image_mb,cold_start_s,stop_s,restart_s,warm_restart_s,idle_rss_mb" > "$OUT"
 
 for fw in "${TARGETS[@]}"; do
   port="${PORTS[$fw]}"
+  path="${HEALTH[$fw]}"
   echo "==> $fw"
-
-  image=$(docker compose config --images "$fw" | head -1)
-  image_mb=$(docker image inspect -f '{{.Size}}' "$image" | awk '{printf "%.1f", $1 / 1048576}')
 
   docker compose rm -sf "$fw" >/dev/null 2>&1
   start=$(now)
   docker compose up -d --no-build "$fw" >/dev/null 2>&1
-  cold=$(wait_healthy "$start" "$port") || true
+  cold=$(wait_healthy "$start" "$port" "$path") || true
+
+  image=$(docker inspect -f '{{.Image}}' "$(docker compose ps -q "$fw")")
+  image_mb=$(docker image inspect -f '{{.Size}}' "$image" | awk '{printf "%.1f", $1 / 1048576}')
 
   start=$(now)
-  docker compose restart "$fw" >/dev/null 2>&1
-  warm=$(wait_healthy "$start" "$port") || true
+  docker compose stop "$fw" >/dev/null 2>&1
+  stop=$(echo "$(now) - $start" | bc)
+  start=$(now)
+  docker compose start "$fw" >/dev/null 2>&1
+  restart=$(wait_healthy "$start" "$port" "$path") || true
+  if [[ "$restart" == timeout ]]; then warm=timeout; else warm=$(echo "$stop + $restart" | bc); fi
 
   sleep "$IDLE_WAIT"
   idle=$(mem_mb "$fw")
 
-  printf '%s,%s,%.2f,%.2f,%s\n' "$fw" "$image_mb" "$cold" "$warm" "$idle" | tee -a "$OUT"
+  echo "$fw,$image_mb,$(fmt "$cold"),$(fmt "$stop"),$(fmt "$restart"),$(fmt "$warm"),$idle" | tee -a "$OUT"
 done
 
 echo ""

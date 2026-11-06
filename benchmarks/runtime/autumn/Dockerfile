@@ -33,7 +33,9 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=builder /workspace/benchmarks/runtime/autumn/target/release/bench-autumn /app/bench-autumn
-COPY --from=builder /workspace/benchmarks/runtime/autumn /app/bench-autumn-src
+# Only the config is read at runtime (migrations are embedded in the binary).
+# Copying the whole app directory would ship the builder's target/ too.
+COPY --from=builder /workspace/benchmarks/runtime/autumn/autumn.toml /app/bench-autumn-src/autumn.toml
 
 ENV AUTUMN_MANIFEST_DIR=/app/bench-autumn-src
 ENV AUTUMN_SERVER__HOST=0.0.0.0
