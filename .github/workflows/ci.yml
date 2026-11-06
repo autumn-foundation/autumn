@@ -1015,6 +1015,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      # The macOS build ran out of disk while it linked `integration_tests`
+      # ("No space left on device"). A cold build can also lose the runner.
+      # Remove SDKs the Rust build does not use. Keep Xcode: the linker is
+      # Xcode's.
+      - name: Free disk space (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          df -h /
+          xcrun simctl delete all || true
+          sudo rm -rf \
+            "${HOME}/Library/Android" \
+            /usr/local/share/dotnet \
+            "${HOME}/.dotnet" \
+            /Library/Developer/CoreSimulator/Profiles/Runtimes \
+            "${HOME}/Library/Developer/CoreSimulator" \
+            || true
+          df -h /
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: ./.github/actions/kache
         continue-on-error: true
