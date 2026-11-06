@@ -2882,6 +2882,9 @@ mod tests {
         tweak(&mut config);
         DatabaseFleet::builder(config)
             .min_residency(Duration::ZERO)
+            // A loaded CI runner can take more than the default 5 s to open a
+            // database and run its migrations.
+            .connect_timeout_secs(30)
             .migrations(
                 "version-history",
                 crate::version_history::VERSION_HISTORY_MIGRATIONS,
