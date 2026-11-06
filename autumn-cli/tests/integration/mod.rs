@@ -5,6 +5,7 @@ mod binary_lookup_build_target;
 mod build_script_target_dir;
 mod cloud_native_scaffold;
 mod console;
+mod contracts_check;
 mod db;
 mod db_backup_sqlite;
 mod db_pull;
