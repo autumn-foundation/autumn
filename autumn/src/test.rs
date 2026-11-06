@@ -2312,7 +2312,7 @@ impl TestApp {
         });
 
         #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
-        let mut state = AppState {
+        let mut state: crate::state::AppState = crate::state::AppStateInner {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -2395,7 +2395,8 @@ impl TestApp {
                 .entropy
                 .unwrap_or_else(|| std::sync::Arc::new(crate::entropy::OsEntropy)),
             app_id: crate::state::AppState::next_app_id(),
-        };
+        }
+        .into();
 
         // Mirror `App::run`'s failure-capsule clock wiring (#1598): the layer
         // itself is installed by the shared router builder, but the recording
