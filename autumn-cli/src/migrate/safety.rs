@@ -114,13 +114,13 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
     // tables when we encounter their CREATE INDEX statements below.
     let newly_created: Vec<String> = stmts
         .iter()
-        .filter(|s| !has_review_suppression(s))
+        .filter(|s| !has_review_suppression(backend, s))
         .filter_map(|s| extract_created_table_name(&normalize_statement(backend, s)))
         .collect();
 
     stmts
         .iter()
-        .filter(|stmt| !has_review_suppression(stmt))
+        .filter(|stmt| !has_review_suppression(backend, stmt))
         .flat_map(|stmt| {
             let normalized = normalize_statement(backend, stmt);
             let mut findings = classify_statement(backend, &normalized, &newly_created);
@@ -139,12 +139,18 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
 /// Returns `true` if the raw (un-normalized) statement carries an operator
 /// acknowledgement marker (`-- autumn-safety: reviewed`).
 ///
-/// The check is done on the raw text before comment-stripping so the marker
-/// is not accidentally erased.
-fn has_review_suppression(stmt: &str) -> bool {
-    stmt.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("--") && trimmed.contains("autumn-safety: reviewed")
+/// The marker is a `--` comment at the start of a line. Only white space can
+/// come before it on the line. The same text in a quoted span is not a marker.
+fn has_review_suppression(backend: DatabaseBackend, stmt: &str) -> bool {
+    let mut line_start = true;
+    tokens(backend, stmt).any(|(kind, text)| {
+        let marker = kind == TokenKind::LineComment
+            && line_start
+            && text.contains("autumn-safety: reviewed");
+        line_start = kind == TokenKind::Plain
+            && text.starts_with(is_sql_space)
+            && (line_start || text == "\n");
+        marker
     })
 }
 
@@ -229,7 +235,7 @@ pub fn split_statements(backend: DatabaseBackend, sql: &str) -> Vec<String> {
     let mut current = String::new();
     for (kind, text) in tokens(backend, sql) {
         if kind == TokenKind::Plain && text == ";" {
-            let trimmed = current.trim();
+            let trimmed = current.trim_matches(is_sql_space);
             if !trimmed.is_empty() {
                 statements.push(trimmed.to_owned());
             }
@@ -239,7 +245,7 @@ pub fn split_statements(backend: DatabaseBackend, sql: &str) -> Vec<String> {
             current.push_str(text);
         }
     }
-    let trimmed = current.trim();
+    let trimmed = current.trim_matches(is_sql_space);
     if !trimmed.is_empty() {
         statements.push(trimmed.to_owned());
     }
@@ -264,7 +270,7 @@ fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&s
         .take_while(|&(kind, text)| !(kind == TokenKind::Plain && text == " "))
         .map(|(_, text)| text.len())
         .sum();
-    let subcommands = rest[name_len..].trim_start();
+    let subcommands = rest[name_len..].trim_start_matches(is_sql_space);
 
     let mut result = Vec::new();
     let mut depth: i32 = 0;
@@ -276,7 +282,7 @@ fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&s
                 "(" => depth += 1,
                 ")" => depth -= 1,
                 "," if depth == 0 => {
-                    result.push(subcommands[start..i].trim());
+                    result.push(subcommands[start..i].trim_matches(is_sql_space));
                     start = i + 1;
                 }
                 _ => {}
@@ -284,7 +290,7 @@ fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&s
         }
         i += text.len();
     }
-    let last = subcommands[start..].trim();
+    let last = subcommands[start..].trim_matches(is_sql_space);
     if !last.is_empty() {
         result.push(last);
     }
@@ -376,18 +382,18 @@ const CREATE_INDEX_PG_OP: &str = "CREATE INDEX (non-concurrent)";
 /// so "non-concurrent" would be a meaningless qualifier there.
 const CREATE_INDEX_SQLITE_OP: &str = "CREATE INDEX";
 
-/// The value of an `add column` subcommand's `DEFAULT` clause, lowercased, or
-/// `None` when the subcommand carries no default.
+/// The value of an `add column` subcommand's `DEFAULT` clause, or `None` when
+/// the subcommand carries no default. The subcommand is normalized text.
 ///
 /// The keyword is matched at a word boundary, so `DEFAULT(0)` — valid SQL with
 /// no space — is read, while a column named `defaulted` is not.
 ///
-/// Three shapes are read whole rather than split on whitespace: a parenthesized
+/// Three shapes are read whole rather than split on white space: a parenthesized
 /// expression (`(lower(x))`), a quoted literal including one with spaces
 /// (`'a b'`, with `''` as the escaped quote), and a signed number (`-1`).
 /// A `DEFAULT` inside a foreign-key action (`ON UPDATE SET DEFAULT`) is not a
 /// column default and is skipped.
-fn add_column_default_token(subcommand: &str) -> Option<String> {
+fn add_column_default_token(backend: DatabaseBackend, subcommand: &str) -> Option<String> {
     let mut from = 0;
     let rest = loop {
         let at = subcommand[from..].find(" default")? + from;
@@ -400,22 +406,27 @@ fn add_column_default_token(subcommand: &str) -> Option<String> {
         };
         // `SET DEFAULT` here is an FK action, not this column's default.
         if let Some(value) = value
-            && !subcommand[..at].trim_end().ends_with(" set")
+            && !subcommand[..at]
+                .trim_end_matches(is_sql_space)
+                .ends_with(" set")
         {
-            break value.trim_start();
+            break value.trim_start_matches(is_sql_space);
         }
         from = at + " default".len();
     };
     if rest.starts_with('(') {
+        // A `(` or `)` in a quoted span is text.
         let mut depth = 0usize;
-        for (i, c) in rest.char_indices() {
-            match c {
-                '(' => depth += 1,
-                // `depth` is at least 1 here: the first character is `(`.
-                ')' => {
+        let mut end = 0;
+        for (kind, text) in tokens(backend, rest) {
+            end += text.len();
+            match (kind, text) {
+                (TokenKind::Plain, "(") => depth += 1,
+                // `depth` is at least 1 here: the first token is `(`.
+                (TokenKind::Plain, ")") => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(rest[..=i].to_owned());
+                        return Some(rest[..end].to_owned());
                     }
                 }
                 _ => {}
@@ -439,7 +450,7 @@ fn add_column_default_token(subcommand: &str) -> Option<String> {
         return Some(rest.to_owned());
     }
     Some(
-        rest.split_whitespace()
+        rest.split(is_sql_space)
             .next()
             .unwrap_or_default()
             .trim_end_matches(',')
@@ -461,12 +472,14 @@ fn is_sqlite_constant_default(default: &str) -> bool {
         .strip_prefix('(')
         .and_then(|d| d.strip_suffix(')'))
         .unwrap_or(default)
-        .trim();
+        .trim_matches(is_sql_space);
     if matches!(inner, "current_time" | "current_date" | "current_timestamp") {
         return false;
     }
-    // A quoted literal is constant whatever it contains.
-    if inner.starts_with('\'') || inner.starts_with("x'") {
+    // A quoted literal or blob is constant whatever it holds, but only when
+    // it is the whole value: `'a' || random()` is an expression.
+    let literal = inner.strip_prefix('x').unwrap_or(inner);
+    if literal.starts_with('\'') && doubled_quote_len(literal, '\'') == literal.len() {
         return true;
     }
     // A number, including exponent form (`1e-3`), whose sign is part of the
@@ -476,7 +489,9 @@ fn is_sqlite_constant_default(default: &str) -> bool {
     }
     // Otherwise: a bare keyword literal. A call or an operator makes it an
     // expression.
-    let unsigned = inner.trim_start_matches(['+', '-']).trim_start();
+    let unsigned = inner
+        .trim_start_matches(['+', '-'])
+        .trim_start_matches(is_sql_space);
     !unsigned.contains(['(', ')', '+', '-', '*', '/', '|', '<', '>', '=', '\''])
 }
 
@@ -751,14 +766,36 @@ enum TokenKind {
 
 /// Split `sql` into tokens for `backend`. Each item is a kind and its text.
 /// The texts join back to `sql`.
+///
+/// Postgres joins a `'..'` to the `E'..'` literal before it when the white
+/// space between them holds a newline. That white space can hold `--`
+/// comments. The joined part is a quoted span of its own, but it keeps the
+/// `E` escape rules: `\'` does not end it.
 fn tokens(backend: DatabaseBackend, sql: &str) -> impl Iterator<Item = (TokenKind, &str)> {
     let mut rest = sql;
     let mut prev = None;
+    // `Some(newline)` after an `E'..'` literal: `newline` tells if the white
+    // space after it holds a newline yet.
+    let mut e_literal: Option<bool> = None;
     std::iter::from_fn(move || {
-        let (kind, len) = token_at(backend, rest, prev)?;
+        let (kind, len) = if e_literal == Some(true) && rest.starts_with('\'') {
+            (TokenKind::Quoted, escape_string_len(rest))
+        } else {
+            token_at(backend, rest, prev)?
+        };
         let (text, tail) = rest.split_at(len);
         rest = tail;
         prev = text.chars().next_back();
+        e_literal = match kind {
+            TokenKind::Quoted if e_literal == Some(true) || text.starts_with(['e', 'E']) => {
+                Some(false)
+            }
+            TokenKind::Plain if text.starts_with(is_sql_space) => {
+                e_literal.map(|newline| newline || matches!(text, "\n" | "\r"))
+            }
+            TokenKind::LineComment => e_literal,
+            _ => None,
+        };
         Some((kind, text))
     })
 }
@@ -780,8 +817,9 @@ fn token_at(
     if let Some(len) = quoted_len(backend, rest, prev) {
         return Some((TokenKind::Quoted, len));
     }
+    // `$` is a name character, so `a$b` is one name. `@`, `:` and `#` are not.
     if backend == DatabaseBackend::Sqlite
-        && prev.is_none_or(|c| !is_identifier_char(c))
+        && (first != '$' || prev.is_none_or(|c| !is_identifier_char(c)))
         && let Some(len) = sqlite_variable_len(rest)
     {
         return Some((TokenKind::Plain, len));
@@ -823,8 +861,15 @@ fn quoted_len(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Optio
 }
 
 /// Whether `c` can be part of an identifier. Postgres and `SQLite` agree.
+/// Each non-ASCII character is a name character. This includes Unicode spaces
+/// such as U+00A0.
 const fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii()
+}
+
+/// Whether `c` is SQL white space. Postgres and `SQLite` use ASCII only.
+const fn is_sql_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
 }
 
 /// Byte length of the span at the start of `rest` that `close` ends.
@@ -926,30 +971,30 @@ fn block_comment_len(backend: DatabaseBackend, rest: &str) -> Option<usize> {
 
 /// Byte length of the `SQLite` variable at the start of `rest`, or `None`.
 ///
-/// A variable is `$`, `@`, `:` or `#`, then name characters. A `(` after the
-/// name runs to `)` or to a space, as in `$a(x)`. A quote in the variable is
-/// text, as in `SQLite`.
+/// A variable is `$`, `@`, `:` or `#`, then name characters. The name can
+/// hold `::`, as in `$a::b`. A `(` after the name runs to `)` or to white
+/// space, as in `$a(x)`. A quote in the variable is text, as in `SQLite`.
 fn sqlite_variable_len(rest: &str) -> Option<usize> {
     let body = rest.strip_prefix(['$', '@', ':', '#'])?;
-    let name_len: usize = body
-        .chars()
-        .take_while(|&c| is_identifier_char(c))
-        .map(char::len_utf8)
-        .sum();
-    if name_len == 0 {
-        return None;
+    let mut has_name = false;
+    let mut i = 0;
+    while let Some(c) = body[i..].chars().next() {
+        if is_identifier_char(c) {
+            has_name = true;
+            i += c.len_utf8();
+        } else if body[i..].starts_with("::") {
+            i += 2;
+        } else if c == '(' && has_name {
+            let args = &body[i..];
+            i += args
+                .find(|c: char| c == ')' || is_sql_space(c))
+                .map_or(args.len(), |p| p + usize::from(args[p..].starts_with(')')));
+            break;
+        } else {
+            break;
+        }
     }
-    let after = &body[name_len..];
-    let args_len = if after.starts_with('(') {
-        after
-            .find(|c: char| c == ')' || c.is_whitespace())
-            .map_or(after.len(), |p| {
-                p + usize::from(after[p..].starts_with(')'))
-            })
-    } else {
-        0
-    };
-    Some(1 + name_len + args_len)
+    has_name.then_some(1 + i)
 }
 
 /// Replace each `/* ... */` block comment in `sql` with one space.
@@ -977,34 +1022,46 @@ fn strip_line_comments(backend: DatabaseBackend, sql: &str) -> String {
         .collect()
 }
 
-/// Strip comments, collapse whitespace, and lowercase a single statement.
+/// Strip comments, collapse white space, and lowercase a single statement.
 ///
 /// Quoted spans stay as they are. A later scan of the result then reads the
 /// same spans: Postgres dollar tags are case-sensitive (`$A$` is not `$a$`).
+/// Only ASCII letters and ASCII white space change, as in Postgres and
+/// `SQLite`: `ÜSERS` and `üsers` are two names, and U+00A0 is part of a name.
 pub fn normalize_statement(backend: DatabaseBackend, stmt: &str) -> String {
     let stripped = strip_line_comments(backend, &strip_block_comments(backend, stmt));
     let mut out = String::with_capacity(stripped.len());
+    // `Some(newline)` in a run of white space after text.
+    let mut space: Option<bool> = None;
+    let mut after_quoted = false;
     for (kind, text) in tokens(backend, &stripped) {
-        if kind == TokenKind::Quoted {
-            out.push_str(text);
+        // A white-space token is one character.
+        if kind == TokenKind::Plain && text.starts_with(is_sql_space) {
+            if !out.is_empty() {
+                let newline = matches!(text, "\n" | "\r");
+                space = Some(space.unwrap_or(false) || newline);
+            }
             continue;
         }
-        for c in text.chars() {
-            if !c.is_whitespace() {
-                out.extend(c.to_lowercase());
-            } else if !out.is_empty() && !out.ends_with(' ') {
-                out.push(' ');
-            }
+        if let Some(newline) = space.take() {
+            // A newline between two quoted spans can join them (see `tokens`).
+            let joins = newline && after_quoted && kind == TokenKind::Quoted;
+            out.push(if joins { '\n' } else { ' ' });
+        }
+        after_quoted = kind == TokenKind::Quoted;
+        if kind == TokenKind::Quoted {
+            out.push_str(text);
+        } else {
+            out.extend(text.chars().map(|c| c.to_ascii_lowercase()));
         }
     }
-    out.truncate(out.trim_end().len());
     out
 }
 
 /// Returns `true` when `sql` contains an executable concurrent index operation
 /// (`CREATE [UNIQUE] INDEX CONCURRENTLY` or `DROP INDEX CONCURRENTLY`).
 ///
-/// Uses the same comment-stripping and whitespace-normalization pipeline as
+/// Uses the same comment-stripping and white-space normalization pipeline as
 /// [`classify_sql_for`] so that concurrent index keywords mentioned only inside a
 /// SQL comment (e.g. `-- CREATE INDEX CONCURRENTLY ...`) are not counted.
 /// `CONCURRENTLY` is Postgres only, so the scan uses the Postgres dialect.
@@ -1026,20 +1083,22 @@ const STABLE_FN_PREFIXES: &[&str] = &["now(", "current_timestamp(", "localtimest
 /// Returns `true` when `default_expr` is a volatile function call that `PostgreSQL`
 /// cannot optimise via the PG 11+ fast-constant-default path.
 ///
-/// Only VOLATILE function calls are flagged.  Grouped constant expressions such as
-/// `(0)` or `('draft')` have `(` as the first non-space character (no identifier
-/// before the parenthesis) and are treated as constants — they use the fast path.
+/// Only VOLATILE function calls are flagged. A call has a name character just
+/// before its first `(`. A `(` in a quoted span is text. A grouped constant such
+/// as `(0)` has nothing or white space before the `(`, so it uses the fast path.
 /// STABLE/IMMUTABLE functions (e.g. `now()`) are also exempt via `STABLE_FN_PREFIXES`.
-fn is_volatile_function_default(default_expr: &str) -> bool {
-    let Some(paren_pos) = default_expr.find('(') else {
+fn is_volatile_function_default(backend: DatabaseBackend, default_expr: &str) -> bool {
+    // A `(` in a quoted span is text: `'a(b'` is a constant.
+    let unquoted = blank_quoted_spans(backend, default_expr);
+    let Some(paren_pos) = unquoted.find('(') else {
         return false; // no parentheses — constant literal
     };
-    // A function call has an identifier character immediately before `(`.
-    // A grouped constant like `(0)` or `('x')` has nothing or whitespace before it.
-    let is_fn_call = default_expr[..paren_pos]
+    // A function call has a name character just before `(`. A grouped
+    // constant like `(0)` has nothing or white space before it.
+    let is_fn_call = unquoted[..paren_pos]
         .chars()
         .next_back()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        .is_some_and(is_identifier_char);
     if !is_fn_call {
         return false; // parenthesized constant — uses the fast-default path
     }
@@ -1260,7 +1319,7 @@ fn classify_statement(
             if subcommand.starts_with("add column ") && subcommand.contains("not null") {
                 // SQLite drops a literal `DEFAULT NULL` before applying the
                 // NOT NULL check, so it is not a default there.
-                let default_token = add_column_default_token(subcommand);
+                let default_token = add_column_default_token(backend, subcommand);
                 let has_default = if sqlite {
                     default_token.as_deref().is_some_and(|d| d != "null")
                 } else {
@@ -1272,8 +1331,9 @@ fn classify_statement(
                 // evaluated once at statement time and do not require a table rewrite.
                 let has_volatile_default = has_default
                     && subcommand.find(" default ").is_some_and(|pos| {
-                        let default_expr = subcommand[pos + " default ".len()..].trim();
-                        is_volatile_function_default(default_expr)
+                        let default_expr =
+                            subcommand[pos + " default ".len()..].trim_matches(is_sql_space);
+                        is_volatile_function_default(backend, default_expr)
                     });
 
                 if !has_default {
@@ -1393,7 +1453,7 @@ fn classify_statement(
                 // `establish_sqlite_migration_connection`), so the statement does
                 // apply on the path this classifier grades.
                 if !fresh_table
-                    && let Some(default) = add_column_default_token(subcommand)
+                    && let Some(default) = add_column_default_token(backend, subcommand)
                     && !is_sqlite_constant_default(&default)
                 {
                     findings.push(SafetyFinding {
@@ -4159,6 +4219,252 @@ mod tests {
                         f.next_action
                     );
                 }
+            }
+        }
+    }
+
+    // ── Non-ASCII text (issue #3530) ─────────────────────────────────────────
+    //
+    // Postgres and `SQLite` read each non-ASCII character as a name character.
+    // This includes Unicode spaces and combining marks. They fold the case of
+    // ASCII letters only.
+
+    /// Non-ASCII characters that are a space, a combining mark or a case
+    /// variant in Unicode.
+    const NON_ASCII_NAME_CHARS: [char; 6] = [
+        '\u{a0}', '\u{2028}', '\u{3000}', '\u{301}', '\u{212a}', '\u{130}',
+    ];
+
+    #[test]
+    fn non_ascii_case_variant_does_not_close_dollar_quote() {
+        // The repro from issue #3530. U+212A (Kelvin sign) lowercases to `k`.
+        // Postgres does not match it to `k`.
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT $k$ $\u{212a}$ $k$, \
+                   ADD COLUMN b int NOT NULL;";
+        assert_eq!(
+            ops(DatabaseBackend::Postgres, sql),
+            ["ADD COLUMN NOT NULL (no default)"]
+        );
+    }
+
+    #[test]
+    fn non_ascii_character_before_dollar_starts_no_quote() {
+        // The character is part of the name `a<c>$x$`, so `$x$` opens nothing.
+        for c in NON_ASCII_NAME_CHARS {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a{c}$x$ int DEFAULT 0, ADD COLUMN b int NOT NULL;"
+            );
+            assert_eq!(
+                ops(DatabaseBackend::Postgres, &sql),
+                ["ADD COLUMN NOT NULL (no default)"],
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ascii_case_is_not_folded() {
+        // `ÜSERS` and `üsers` are two tables.
+        let new_table = "CREATE TABLE \u{dc}SERS (id int); CREATE INDEX i ON \u{dc}SERS (id);";
+        let old_table = "CREATE TABLE \u{dc}SERS (id int); CREATE INDEX i ON \u{fc}sers (id);";
+        for (backend, op) in [
+            (DatabaseBackend::Postgres, CREATE_INDEX_PG_OP),
+            (DatabaseBackend::Sqlite, CREATE_INDEX_SQLITE_OP),
+        ] {
+            assert_eq!(ops(backend, new_table), Vec::<String>::new());
+            assert_eq!(ops(backend, old_table), [op]);
+        }
+    }
+
+    #[test]
+    fn normalize_folds_ascii_case_and_ascii_space_only() {
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            assert_eq!(
+                normalize_statement(backend, "SELECT\t\u{c9}\u{a0}A\n"),
+                "select \u{c9}\u{a0}a"
+            );
+        }
+    }
+
+    #[test]
+    fn default_call_name_may_end_in_any_name_character() {
+        let pg = DatabaseBackend::Postgres;
+        // `\u{a0}(0)` calls a function with the name U+00A0.
+        let calls = ["f$()", "fa\u{301}()", "f\u{a0}()", "\u{a0}(0)"];
+        for call in calls {
+            let sql = format!("ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT {call};");
+            assert_eq!(
+                ops(pg, &sql),
+                ["ADD COLUMN NOT NULL (volatile default)"],
+                "{sql:?}"
+            );
+        }
+        for call in ["f\u{a0}()", "\u{a0}(0)"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT {call};");
+            assert_eq!(
+                ops(DatabaseBackend::Sqlite, &sql),
+                ["ADD COLUMN (non-constant default)"],
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parenthesis_in_quoted_default_is_not_a_call() {
+        let pg = DatabaseBackend::Postgres;
+        for literal in ["'a(b'", "$$(x)$$", "$t$f()$t$", "e'f()'"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b text NOT NULL DEFAULT {literal};");
+            assert_eq!(ops(pg, &sql), Vec::<String>::new(), "{sql:?}");
+        }
+        let sql = "ALTER TABLE t ADD COLUMN b text NOT NULL DEFAULT 'a(b';";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), Vec::<String>::new());
+    }
+
+    #[test]
+    fn sqlite_variable_arguments_end_at_ascii_space() {
+        // `SQLite` ends `$a(..` at `)` or an ASCII space. U+00A0 is text, so the
+        // `'` is part of the variable and opens no literal.
+        assert_eq!(sqlite_variable_len("$a(x\u{a0}y) z"), Some(8));
+        let sql = "SELECT $a(x\u{a0}'y); DROP TABLE t; -- '";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+    }
+
+    #[test]
+    fn quoted_name_before_parenthesis_is_not_a_call() {
+        // The `(` can start a column list (`REFERENCES "u"("id")`).
+        let pg = DatabaseBackend::Postgres;
+        for tail in [
+            "0 REFERENCES \"u\"(\"id\")",
+            "0::\"numeric\"(10,2)",
+            "\"now\"()",
+        ] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b int NOT NULL DEFAULT {tail};");
+            assert!(
+                !ops(pg, &sql).iter().any(|op| op.contains("volatile")),
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_before_non_ascii_space_is_a_type_name() {
+        // `set<U+00A0>` is a type name, so this `DEFAULT` is not `SET DEFAULT`.
+        let sql = "ALTER TABLE t ADD COLUMN b set\u{a0} DEFAULT 1 NOT NULL;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), Vec::<String>::new());
+    }
+
+    #[test]
+    fn e_string_continues_after_a_newline() {
+        // Postgres joins `'..'` after white space with a newline to the
+        // literal before it. The joined part keeps the `E` escape rules.
+        // A comment between the parts stays a comment.
+        let pg = DatabaseBackend::Postgres;
+        let kinds = |sql| {
+            tokens(pg, sql)
+                .filter(|(_, text)| !text.starts_with(is_sql_space))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds("E'\\'' -- c\n '\\'' x"),
+            [
+                (TokenKind::Quoted, "E'\\''"),
+                (TokenKind::LineComment, "-- c"),
+                (TokenKind::Quoted, "'\\''"),
+                (TokenKind::Plain, "x"),
+            ]
+        );
+        // Without a newline, or after a plain literal, `'\''` is not joined.
+        assert_eq!(kinds("E'a' '\\'' x")[1], (TokenKind::Quoted, "'\\'' x"));
+        assert_eq!(kinds("'a'\n'\\'' x")[1], (TokenKind::Quoted, "'\\'' x"));
+        assert_eq!(
+            normalize_statement(pg, "SELECT E'a'\n-- c\n'b'"),
+            "select E'a'\n'b'"
+        );
+        let sql = "SELECT E'a'\n-- create index concurrently\n'b';";
+        assert!(!contains_concurrent_index(sql));
+        for gap in ["\n", " -- c\n", "\r\n\t"] {
+            let sql = format!("SELECT E''{gap}'\\''; DROP TABLE t; --'");
+            assert_eq!(ops(pg, &sql), ["DROP TABLE"], "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn sqlite_variable_name_may_hold_a_double_colon() {
+        assert_eq!(sqlite_variable_len("$a::b(x) y"), Some(8));
+        assert_eq!(sqlite_variable_len("$::(x)"), None);
+        for sql in [
+            "SELECT $a::(x'); DROP TABLE t; --'",
+            "SELECT :a::(x'); DROP TABLE t; --'",
+        ] {
+            assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"], "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn sqlite_variable_may_follow_a_word() {
+        // Only `$` is a name character, so `@`, `:` and `#` start a variable
+        // also right after a word.
+        for sigil in ['@', ':', '#'] {
+            let sql = format!("SELECT{sigil}a(x');DROP TABLE t;--'");
+            assert_eq!(
+                ops(DatabaseBackend::Sqlite, &sql),
+                ["DROP TABLE"],
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_default_is_constant_only_when_it_is_one_value() {
+        let lite = DatabaseBackend::Sqlite;
+        for default in ["('a' || random())", "(')' || random())", "(\u{a0}-1)"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b text DEFAULT {default};");
+            assert_eq!(
+                ops(lite, &sql),
+                ["ADD COLUMN (non-constant default)"],
+                "{sql:?}"
+            );
+        }
+        for default in ["('a')", "(')')", "x'00'", "('a''b')", "(-1)"] {
+            let sql = format!("ALTER TABLE t ADD COLUMN b text DEFAULT {default};");
+            assert_eq!(ops(lite, &sql), Vec::<String>::new(), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn review_marker_in_a_literal_suppresses_nothing() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT 'x\n-- autumn-safety: reviewed\n', \
+                   DROP COLUMN c;";
+        assert_eq!(ops(DatabaseBackend::Postgres, sql), ["DROP COLUMN"]);
+    }
+
+    /// The quoted spans and the other tokens that are not white space in
+    /// `sql`, in order. Text out of a quoted span is lowercased (ASCII).
+    fn non_space_tokens(backend: DatabaseBackend, sql: &str) -> Vec<String> {
+        tokens(backend, sql)
+            .filter(|(_, text)| !text.starts_with(is_sql_space))
+            .map(|(kind, text)| match kind {
+                TokenKind::Quoted => text.to_owned(),
+                _ => text.to_ascii_lowercase(),
+            })
+            .collect()
+    }
+
+    proptest::proptest! {
+        /// A scan of a normalized statement reads the same tokens as a scan of
+        /// the statement. A second normalization changes nothing.
+        #[test]
+        fn normalize_keeps_quoted_spans(
+            sql in r#"[aeEkxK\x{212a}\x{130}\x{a0}\x{301}\x{2028} \t\n\r\x0b\x0c$'"`\[\]\\;,()/*@:#\-]{0,24}"#,
+        ) {
+            for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+                let stripped = strip_line_comments(backend, &strip_block_comments(backend, &sql));
+                let normalized = normalize_statement(backend, &sql);
+                proptest::prop_assert_eq!(
+                    non_space_tokens(backend, &stripped),
+                    non_space_tokens(backend, &normalized)
+                );
+                proptest::prop_assert_eq!(normalize_statement(backend, &normalized), normalized);
             }
         }
     }
