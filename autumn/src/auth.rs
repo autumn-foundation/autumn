@@ -3049,11 +3049,10 @@ mod tests {
     /// the auth session key (the sole field these tests vary). Collapses the
     /// otherwise-identical struct literal that each test would copy verbatim.
     fn test_app_state(auth_session_key: &str) -> crate::state::AppState {
-        crate::state::AppStateInner {
+        crate::state::AppState::from_inner(crate::state::AppStateInner {
             auth_session_key: auth_session_key.into(),
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into()
+        })
     }
 
     #[tokio::test]

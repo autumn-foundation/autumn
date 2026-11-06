@@ -306,14 +306,6 @@ impl std::ops::Deref for AppState {
     }
 }
 
-impl From<AppStateInner> for AppState {
-    fn from(inner: AppStateInner) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-}
-
 impl crate::authorization::ProvideAuthorizationState for AppState {
     fn policy_registry(&self) -> &crate::authorization::PolicyRegistry {
         &self.policy_registry
@@ -337,6 +329,13 @@ impl crate::authorization::ProvideAuthorizationState for AppState {
 }
 
 impl AppState {
+    /// A state that owns these fields.
+    pub(crate) fn from_inner(inner: AppStateInner) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
     /// Mutable access to the fields.
     ///
     /// Copies the fields first when another clone shares them, so the change
@@ -1171,7 +1170,7 @@ impl AppState {
         // one would disagree with the other.
         #[cfg(feature = "presence")]
         let presence = Presence::new(channels.clone());
-        AppStateInner {
+        Self::from_inner(AppStateInner {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
@@ -1206,8 +1205,7 @@ impl AppState {
             clock: Arc::new(SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: Self::next_app_id(),
-        }
-        .into()
+        })
     }
 
     /// Create an `AppState` suitable for testing, with sensible defaults
@@ -1513,7 +1511,7 @@ impl AppState {
     ///
     /// See [`AppStateInner::test_default_fields`].
     pub(crate) fn test_default() -> Self {
-        AppStateInner::test_default_fields().into()
+        Self::from_inner(AppStateInner::test_default_fields())
     }
 }
 
@@ -1580,8 +1578,8 @@ impl AppStateInner {
 
 #[cfg(test)]
 mod tests {
-    /// A clone of the state is one pointer. Each request clones the state
-    /// several times, so a wide struct costs one reference count per field.
+    /// The state is one pointer wide. A request clones the state several
+    /// times. A wide struct would cost one reference count for each field.
     #[test]
     fn app_state_is_one_pointer_wide() {
         assert_eq!(

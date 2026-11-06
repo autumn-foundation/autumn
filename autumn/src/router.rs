@@ -7998,11 +7998,10 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
-        crate::state::AppStateInner {
+        crate::state::AppState::from_inner(crate::state::AppStateInner {
             profile: Some("test".into()),
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into()
+        })
     }
 
     // ── #3057: the prod profile turns load shedding on ───────────────────────

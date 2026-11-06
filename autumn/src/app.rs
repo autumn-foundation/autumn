@@ -5067,21 +5067,22 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
+            state.fields_mut().channels = crate::channels::Channels::with_shared_backend(
+                std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
                     state.channels.backend().clone(),
                     vec![interceptor],
-                ),
-            ));
+                )),
+            );
             #[cfg(feature = "presence")]
             {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
+                state.fields_mut().presence =
+                    crate::presence::Presence::new(state.channels.clone());
                 // The collaboration hub holds the channel registry and the
                 // presence tracker it was built with, so replacing either
                 // leaves it publishing into the old backend (#1806).
                 #[cfg(feature = "collab")]
                 {
-                    state.collab = crate::collab::CollabHub::new(
+                    state.fields_mut().collab = crate::collab::CollabHub::new(
                         state.channels.clone(),
                         state.presence.clone(),
                     );
@@ -7420,21 +7421,22 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
+            state.fields_mut().channels = crate::channels::Channels::with_shared_backend(
+                std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
                     state.channels.backend().clone(),
                     vec![interceptor],
-                ),
-            ));
+                )),
+            );
             #[cfg(feature = "presence")]
             {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
+                state.fields_mut().presence =
+                    crate::presence::Presence::new(state.channels.clone());
                 // The collaboration hub holds the channel registry and the
                 // presence tracker it was built with, so replacing either
                 // leaves it publishing into the old backend (#1806).
                 #[cfg(feature = "collab")]
                 {
-                    state.collab = crate::collab::CollabHub::new(
+                    state.fields_mut().collab = crate::collab::CollabHub::new(
                         state.channels.clone(),
                         state.presence.clone(),
                     );
@@ -9259,21 +9261,22 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
+            state.fields_mut().channels = crate::channels::Channels::with_shared_backend(
+                std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
                     state.channels.backend().clone(),
                     vec![interceptor],
-                ),
-            ));
+                )),
+            );
             #[cfg(feature = "presence")]
             {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
+                state.fields_mut().presence =
+                    crate::presence::Presence::new(state.channels.clone());
                 // The collaboration hub holds the channel registry and the
                 // presence tracker it was built with, so replacing either
                 // leaves it publishing into the old backend (#1806).
                 #[cfg(feature = "collab")]
                 {
-                    state.collab = crate::collab::CollabHub::new(
+                    state.fields_mut().collab = crate::collab::CollabHub::new(
                         state.channels.clone(),
                         state.presence.clone(),
                     );
@@ -17976,7 +17979,7 @@ fn build_state(
     #[cfg(feature = "presence")]
     let presence = crate::presence::Presence::new(channels.clone());
 
-    let state: AppState = crate::state::AppStateInner {
+    let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
         pool: database_topology.map(|topology| topology.primary().clone()),
@@ -18017,8 +18020,7 @@ fn build_state(
         clock: std::sync::Arc::new(crate::time::SystemClock),
         entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
         app_id: AppState::next_app_id(),
-    }
-    .into();
+    });
     state.apply_health_config(&config.health);
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
@@ -19190,11 +19192,10 @@ mod tests {
     /// Helper to build a test router with default config and no database.
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
-        let state = crate::state::AppStateInner {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into();
+        });
         crate::router::build_router(routes, &config, state)
     }
 
@@ -24389,11 +24390,10 @@ mount = ["service"]
 
         // No dynamic route for /docs — only a static file.
         let config = AutumnConfig::default();
-        let state = crate::state::AppStateInner {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into();
+        });
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
             &config,
@@ -24772,11 +24772,10 @@ mount = ["service"]
 
     /// Helper to build a test router with custom config.
     pub fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
-        let state = crate::state::AppStateInner {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into();
+        });
         crate::router::build_router(routes, config, state)
     }
 
@@ -24897,11 +24896,10 @@ mount = ["service"]
         // No manifest.json — just an empty dist/
 
         let config = AutumnConfig::default();
-        let state = crate::state::AppStateInner {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into();
+        });
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
             &config,
@@ -24920,11 +24918,10 @@ mount = ["service"]
     async fn build_router_with_static_none_dist() {
         // When dist_dir is None, return the app router directly.
         let config = AutumnConfig::default();
-        let state = crate::state::AppStateInner {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into();
+        });
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
             &config,
@@ -25172,11 +25169,10 @@ mount = ["service"]
     #[cfg(feature = "ws")]
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_events() {
-        let state = crate::state::AppStateInner {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into();
+        });
 
         let mut rx = state.channels().subscribe("sys:tasks");
 
@@ -25221,11 +25217,10 @@ mount = ["service"]
     #[cfg(feature = "ws")]
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_failure_events() {
-        let state = crate::state::AppStateInner {
+        let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
             ..crate::state::AppStateInner::test_default_fields()
-        }
-        .into();
+        });
 
         let mut rx = state.channels().subscribe("sys:tasks");
 
