@@ -64,6 +64,11 @@ services:
       AUTUMN_SERVER__PORT: "8080"
       AUTUMN_SECURITY__CSRF__ENABLED: "false"
       AUTUMN_SECURITY__SIGNING_SECRET: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      # The prod profile refuses to start without these. The hosts cover k6
+      # on the host network (localhost) and in Docker Desktop
+      # (host.docker.internal); sessions stay in memory, as in the CI gate.
+      AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS: "localhost,127.0.0.1,host.docker.internal"
+      AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION: "true"
       RUST_LOG: "warn"
     ports:
       - "8001:8080"
