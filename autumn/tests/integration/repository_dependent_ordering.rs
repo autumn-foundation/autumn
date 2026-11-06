@@ -53,6 +53,25 @@ fn log_range(prefix: &str, lo: i64, hi: i64) -> Vec<String> {
         .collect()
 }
 
+/// Drain the commit-hook queue until `want` entries in the range are logged.
+/// The dispatcher kick after commit can claim a hook first and run it in the
+/// background, so one drain pass does not run every queued hook.
+async fn drain_until_logged(
+    pool: &Pool<AsyncPgConnection>,
+    prefix: &str,
+    lo: i64,
+    hi: i64,
+    want: usize,
+) {
+    for _ in 0..50 {
+        autumn_web::test::drain_ready_repository_commit_hooks(pool, 16).await;
+        if log_range(prefix, lo, hi).len() >= want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 macro_rules! logging_hooks {
     ($hooks:ident, $model:ident, $new:ident, $update:ident, $tag:literal) => {
         #[derive(Clone, Default)]
@@ -855,8 +874,12 @@ async fn cascaded_child_commit_hook_runs_once_per_child_after_commit() {
         "commit hooks run from the queue, not inline"
     );
 
-    let drained = autumn_web::test::drain_ready_repository_commit_hooks(&pool, 16).await;
-    assert_eq!(drained, 3, "one queued hook per destroyed child");
+    assert_eq!(
+        count(&mut conn, "autumn_repository_commit_hooks").await,
+        3,
+        "one queued hook per destroyed child"
+    );
+    drain_until_logged(&pool, "c", 1, 3, 3).await;
     let mut log = log_range("c", 1, 3);
     log.sort();
     assert_eq!(log, vec!["ccommit:1", "ccommit:2", "ccommit:3"]);
@@ -880,8 +903,8 @@ async fn cascaded_child_commit_hook_runs_once_per_child_on_delete_many() {
 
     let repo = PgCPostRepository::with_pool_untracked(pool.clone());
     repo.delete_many(&[11, 12]).await.expect("delete_many");
-    let drained = autumn_web::test::drain_ready_repository_commit_hooks(&pool, 16).await;
-    assert_eq!(drained, 2);
+    assert_eq!(count(&mut conn, "autumn_repository_commit_hooks").await, 2);
+    drain_until_logged(&pool, "c", 11, 12, 2).await;
     let mut log = log_range("c", 11, 12);
     log.sort();
     assert_eq!(log, vec!["ccommit:11", "ccommit:12"]);
