@@ -22,6 +22,11 @@
   //   data-autumn-dismiss              Escape, outside click or focus-out closes
   //   data-autumn-dismiss="escape"     only Escape closes (a tooltip)
   //
+  // A roving list with role="tree" also gets the APG tree keys: Right
+  // opens or goes to the first child, Left closes or goes to the parent,
+  // `*` opens the siblings. `autumn:expand` and `autumn:collapse` fire on
+  // the item. Items in a hidden subtree are not reachable.
+  //
   // The controller (or trigger) is the element whose aria-controls names the
   // list (or layer). A role="tooltip" layer's trigger names it in
   // aria-describedby or aria-labelledby. Events: `autumn:navigate`
@@ -46,12 +51,21 @@
     el.dispatchEvent(new CustomEvent(name, { bubbles: true, detail: { item: item } }));
   }
 
-  // The items of a list: not disabled, not hidden, not in a nested list.
+  // True when an element between `el` and `list` is hidden.
+  function inHidden(el, list) {
+    for (var p = el.parentElement; p && p !== list; p = p.parentElement) {
+      if (p.hidden) return true;
+    }
+    return false;
+  }
+
+  // The items of a list: not disabled, not hidden, not in a hidden subtree,
+  // not in a nested list.
   function listItems(list) {
     var sel = list.getAttribute('data-autumn-roving') || ITEMS;
     return Array.prototype.filter.call(list.querySelectorAll(sel), function (el) {
       return !el.hidden && el.getAttribute('aria-disabled') !== 'true' &&
-        el.closest(LIST) === list;
+        el.closest(LIST) === list && !inHidden(el, list);
     });
   }
 
@@ -202,10 +216,64 @@
     }
   }
 
+  // ── Tree keys (APG tree view) ──
+  // A parent treeitem holds its role="group" child.
+  function groupOf(item) {
+    for (var i = 0; i < item.children.length; i++) {
+      if (item.children[i].getAttribute('role') === 'group') return item.children[i];
+    }
+    return null;
+  }
+
+  function parentItem(item, list) {
+    var group = item.parentElement && item.parentElement.closest('[role="group"]');
+    var parent = group && list.contains(group) ? group.parentElement : null;
+    return parent && parent.getAttribute('role') === 'treeitem' ? parent : null;
+  }
+
+  function setExpanded(item, open) {
+    var group = groupOf(item);
+    item.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (group) group.hidden = !open;
+    emit(item, open ? 'autumn:expand' : 'autumn:collapse', item);
+  }
+
+  // Right, Left and `*`. Return true when the key belongs to the tree.
+  function treeKey(e, list, all, item) {
+    var rtl = getComputedStyle(list).direction === 'rtl';
+    var open = item.getAttribute('aria-expanded');
+    if (e.key === (rtl ? 'ArrowLeft' : 'ArrowRight')) {
+      if (open === 'false') setExpanded(item, true);
+      else if (open === 'true') {
+        var first = all[all.indexOf(item) + 1];
+        if (first && parentItem(first, list) === item) focusItem(list, first);
+      }
+      return true;
+    }
+    if (e.key === (rtl ? 'ArrowRight' : 'ArrowLeft')) {
+      var parent = parentItem(item, list);
+      if (open === 'true') setExpanded(item, false);
+      else if (parent && all.indexOf(parent) >= 0) focusItem(list, parent);
+      return true;
+    }
+    if (e.key === '*') {
+      Array.prototype.forEach.call(item.parentElement.children, function (el) {
+        if (el.getAttribute('role') === 'treeitem' && el.getAttribute('aria-expanded') === 'false' &&
+          el.getAttribute('aria-disabled') !== 'true') setExpanded(el, true);
+      });
+      return true;
+    }
+    return false;
+  }
+
   function rovingKey(e, list) {
     var all = listItems(list);
     var index = all.indexOf(e.target);
     if (index < 0) return;
+    if (list.getAttribute('role') === 'tree' && treeKey(e, list, all, e.target)) {
+      e.preventDefault();
+      return;
+    }
     var n = nextIndex(list, all.length, index, e.key);
     var item = n >= 0 ? all[n] : null;
     if (!item && e.key.length === 1 && e.key !== ' ' && list.hasAttribute('data-autumn-typeahead')) {

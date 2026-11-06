@@ -245,6 +245,45 @@ async fn submitted_multi(
     format!("color_ids={:?} words={:?}", multi.color_ids, multi.words)
 }
 
+/// An APG tree with nested groups: `src` (`lib.rs`, `bin` (`main.rs`)),
+/// `docs` (`guide.md`), `README.md`. All parents are closed.
+fn file_tree() -> Markup {
+    html! {
+        ul id="t" role="tree" aria-label="Files" data-autumn-roving
+            data-autumn-orientation="vertical" data-autumn-typeahead {
+            li id="t-src" role="treeitem" aria-expanded="false" {
+                span { "src" }
+                ul role="group" hidden {
+                    li id="t-lib" role="treeitem" { "lib.rs" }
+                    li id="t-bin" role="treeitem" aria-expanded="false" {
+                        span { "bin" }
+                        ul role="group" hidden {
+                            li id="t-main" role="treeitem" { "main.rs" }
+                        }
+                    }
+                }
+            }
+            li id="t-docs" role="treeitem" aria-expanded="false" {
+                span { "docs" }
+                ul role="group" hidden {
+                    li id="t-guide" role="treeitem" { "guide.md" }
+                }
+            }
+            li id="t-readme" role="treeitem" { "README.md" }
+        }
+    }
+}
+
+#[get("/tree")]
+async fn tree_page() -> Markup {
+    layout("ltr", &file_tree())
+}
+
+#[get("/tree-rtl")]
+async fn tree_rtl_page() -> Markup {
+    layout("rtl", &file_tree())
+}
+
 async fn runner() -> SystemTestRunner {
     Box::pin(
         SystemTest::new()
@@ -259,7 +298,9 @@ async fn runner() -> SystemTestRunner {
                 colors,
                 colors_create,
                 submitted,
-                submitted_multi
+                submitted_multi,
+                tree_page,
+                tree_rtl_page
             ])
             .build(),
     )
@@ -1505,4 +1546,120 @@ async fn widgets_run_under_the_default_csp_with_no_inline_script() {
     page.expect_no_console_errors()
         .await
         .expect("no CSP errors");
+}
+
+// ── Tree view ───────────────────────────────────────────────────────────
+
+/// Count `autumn:expand` and `autumn:collapse` on the window.
+async fn count_tree_events(page: &Page) {
+    assert!(
+        eval_bool(
+            page,
+            "(() => { window.treeEvents = []; \
+             ['autumn:expand', 'autumn:collapse'].forEach(n => document.addEventListener(n, \
+             e => window.treeEvents.push(n + ' ' + e.target.id + ' ' + e.detail.item.id))); \
+             return true; })()"
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_down_and_up_skip_a_closed_branch() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree").await;
+    assert_eq!(attr(&page, "t-src", "tabindex").await, "0");
+    focus(&page, "t-src").await;
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_id(&page).await, "t-docs");
+    press(&page, "End").await;
+    assert_eq!(active_id(&page).await, "t-readme");
+    press(&page, "ArrowUp").await;
+    assert_eq!(active_id(&page).await, "t-docs");
+    // Typeahead skips `guide.md` in the closed `docs`.
+    press(&page, "g").await;
+    assert_eq!(active_id(&page).await, "t-docs");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_right_opens_a_branch_then_moves_to_its_first_child() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree").await;
+    count_tree_events(&page).await;
+    focus(&page, "t-src").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
+    assert_eq!(active_id(&page).await, "t-src", "Right on a closed node keeps focus");
+    assert!(eval_bool(&page, "!document.querySelector('#t-src > [role=group]').hidden").await);
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "t-lib");
+    // Right on an end node does nothing.
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "t-lib");
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_id(&page).await, "t-bin");
+    assert_eq!(
+        eval_string(&page, "window.treeEvents.join(',')").await,
+        "autumn:expand t-src t-src"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_left_closes_a_branch_then_moves_to_its_parent() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree").await;
+    count_tree_events(&page).await;
+    focus(&page, "t-src").await;
+    press(&page, "ArrowRight").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "t-lib");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "t-src", "Left on a child moves to the parent");
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "false");
+    assert_eq!(active_id(&page).await, "t-src");
+    // Left on a closed root node does nothing.
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "t-src");
+    assert_eq!(
+        eval_string(&page, "window.treeEvents.join(',')").await,
+        "autumn:expand t-src t-src,autumn:collapse t-src t-src"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_star_opens_all_siblings() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree").await;
+    focus(&page, "t-readme").await;
+    press(&page, "*").await;
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
+    assert_eq!(attr(&page, "t-docs", "aria-expanded").await, "true");
+    // Only the siblings: `bin` stays closed.
+    assert_eq!(attr(&page, "t-bin", "aria-expanded").await, "false");
+    assert_eq!(active_id(&page).await, "t-readme");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn rtl_tree_swaps_left_and_right() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree-rtl").await;
+    focus(&page, "t-src").await;
+    press(&page, "ArrowLeft").await;
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "t-lib");
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "t-src");
 }

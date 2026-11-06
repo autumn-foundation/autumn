@@ -262,17 +262,19 @@ async fn tab_problems(page: &Page) -> Result<Vec<String>, SystemTestError> {
 }
 
 /// Mark each visible `data-autumn-roving` list in the preview and return,
-/// for each one, its item count.
+/// for each one, its item count. Items in a hidden subtree do not count, as
+/// in the core.
 const ROVING_LISTS_JS: &str = r#"(() => {
   const ITEMS = '[role="tab"],[role="menuitem"],[role="option"],[role="radio"],[role="treeitem"]';
   const LIST = '[data-autumn-roving],[data-autumn-activedescendant]';
+  const inHidden = (el, list) => { for (let p = el.parentElement; p && p !== list; p = p.parentElement) if (p.hidden) return true; return false; };
   const preview = document.querySelector('.story-preview');
   const lists = preview ? [...preview.querySelectorAll('[data-autumn-roving]')]
     .filter(list => list.checkVisibility({ visibilityProperty: true })) : [];
   return JSON.stringify(lists.map((list, i) => {
     list.setAttribute('data-conformance-list', String(i));
     return [...list.querySelectorAll(list.getAttribute('data-autumn-roving') || ITEMS)]
-      .filter(el => !el.hidden && el.getAttribute('aria-disabled') !== 'true' && el.closest(LIST) === list)
+      .filter(el => !el.hidden && el.getAttribute('aria-disabled') !== 'true' && el.closest(LIST) === list && !inHidden(el, list))
       .length;
   }));
 })()"#;
@@ -285,9 +287,10 @@ const ROVING_LISTS_JS: &str = r#"(() => {
 const FOCUS_LIST_JS: &str = r#"(() => {
   const ITEMS = '[role="tab"],[role="menuitem"],[role="option"],[role="radio"],[role="treeitem"]';
   const LIST = '[data-autumn-roving],[data-autumn-activedescendant]';
+  const inHidden = (el, list) => { for (let p = el.parentElement; p && p !== list; p = p.parentElement) if (p.hidden) return true; return false; };
   const list = document.querySelector('[data-conformance-list="LIST_INDEX"]');
   const items = [...list.querySelectorAll(list.getAttribute('data-autumn-roving') || ITEMS)]
-    .filter(el => !el.hidden && el.getAttribute('aria-disabled') !== 'true' && el.closest(LIST) === list);
+    .filter(el => !el.hidden && el.getAttribute('aria-disabled') !== 'true' && el.closest(LIST) === list && !inHidden(el, list));
   const stop = items.find(el => el.tabIndex === 0);
   if (!stop) return '';
   stop.focus();
