@@ -1726,6 +1726,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // The database is complete here, so a failure below closes the
         // handle and never removes what another opener may be serving.
         if let Err(error) = self.run_on_open(&db).await {
+            // The hooks that started have run `on_close`: a scope that one
+            // of them kept writes nothing more.
+            db.retired.store(true, Ordering::Release);
             db.quiesce_workers(true).await;
             db.closed.cancel();
             let (fleet, closing) = (self.clone(), db.clone());
@@ -1970,6 +1973,12 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let Some(db) = db else {
             return;
         };
+        // A fence, a delete or a restore: the data is not this host's to
+        // ship. A sidecar scope refuses writes from now on, before any wait.
+        let retired = Arc::clone(&db.retired);
+        if !settle {
+            retired.store(true, Ordering::Release);
+        }
         // Workers settle first: their last ack needs a live database.
         db.quiesce_workers(settle).await;
         db.closed.cancel();
@@ -1980,12 +1989,6 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             crate::time::spawn_blocking(move || fleet.inner.engine.close(&closing.handle)).await;
         while self.inner.engine.in_use(&db.handle) {
             tokio::time::sleep(DRAIN_POLL).await;
-        }
-        // A fence, a delete or a restore: the data is not this host's to
-        // ship. A sidecar scope refuses writes from now on.
-        let retired = Arc::clone(&db.retired);
-        if !settle {
-            retired.store(true, Ordering::Release);
         }
         let hooks = self.hooks();
         if !hooks.is_empty() {
