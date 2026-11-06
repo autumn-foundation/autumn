@@ -33,4 +33,6 @@ EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s \
   CMD curl -sf http://localhost:${PORT}/health || exit 1
 
-CMD ["sh", "-c", "bundle exec rails db:migrate && bundle exec puma -C config/puma.rb"]
+# exec: Puma replaces the shell as PID 1, so SIGTERM from `docker stop`
+# reaches it and it shuts down gracefully instead of being killed at 10 s.
+CMD ["sh", "-c", "bundle exec rails db:migrate && exec bundle exec puma -C config/puma.rb"]

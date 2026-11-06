@@ -22,9 +22,11 @@ EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s \
   CMD curl -sf http://localhost:${PORT}/health || exit 1
 
+# exec: Gunicorn replaces the shell as PID 1, so SIGTERM from `docker stop`
+# reaches it and it shuts down gracefully instead of being killed at 10 s.
 CMD ["sh", "-c", \
   "python manage.py migrate --noinput && \
-   gunicorn benchapp.asgi:application \
+   exec gunicorn benchapp.asgi:application \
      --worker-class uvicorn_worker.UvicornWorker \
      --workers 4 \
      --bind 0.0.0.0:${PORT} \
