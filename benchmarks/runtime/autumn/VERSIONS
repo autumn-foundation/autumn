@@ -1,5 +1,5 @@
 framework: autumn-web 0.10.0 (path dependency on this checkout)
-language:  Rust 1.97.0
+language:  Rust 1.97.1 (rust:1.97-bookworm builder; MSRV 1.97.0)
 async-rt:  Tokio 1.54
 http:      Axum 0.8.9 + Hyper 1.12
 db:        Diesel 2.3 + diesel-async 0.9

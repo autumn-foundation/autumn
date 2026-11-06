@@ -7,17 +7,17 @@
 # Port map:
 #   5432  – Postgres
 #   8001  – Autumn      (Rust / Axum)
-#   8002  – Spring Boot (Java 21 / Tomcat)
-#   8003  – Rails       (Ruby 3.3 / Puma)
-#   8004  – Django      (Python 3.12 / Gunicorn + Uvicorn)
-#   8005  – Phoenix     (Elixir 1.17 / Cowboy)
+#   8002  – Spring Boot (Java 25 / Tomcat)
+#   8003  – Rails       (Ruby 4.0 / Puma)
+#   8004  – Django      (Python 3.14 / Gunicorn + Uvicorn)
+#   8005  – Phoenix     (Elixir 1.19 / Bandit)
 #   8006  – Loco        (Rust / Axum)
 #
 # Usage:
 #   docker compose up -d db
 #   docker compose up -d --build autumn spring-boot rails django phoenix loco
 #   # wait for health checks, then run:
-#   # cd load && ./run.sh autumn http://localhost:8001
+#   ./load/run.sh all --vus 50 --duration 60s
 
 x-db-env: &db-env
   DATABASE_URL: postgres://benchmark:benchmark@db:5432/benchmark

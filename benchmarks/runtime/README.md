@@ -39,14 +39,18 @@ the results report. No framework receives shortcuts unavailable to the others
 
 See each framework's `VERSIONS` file for exact versions:
 
-| Framework | Runtime | File |
-|-----------|---------|------|
-| **Autumn** | Rust 1.97 + Axum 0.8 | [`autumn/VERSIONS`](autumn/VERSIONS) |
-| **Spring Boot** | Java 21 + Tomcat | [`spring-boot/VERSIONS`](spring-boot/VERSIONS) |
-| **Rails** | Ruby 3.3 + Puma 6 | [`rails/VERSIONS`](rails/VERSIONS) |
-| **Django** | Python 3.12 + Gunicorn/Uvicorn | [`django/VERSIONS`](django/VERSIONS) |
-| **Phoenix** | Elixir 1.17 + Bandit | [`phoenix/VERSIONS`](phoenix/VERSIONS) |
-| **Loco** | Rust 1.97 + Axum 0.7 | [`loco/VERSIONS`](loco/VERSIONS) |
+| Framework | Version | Runtime | File |
+|-----------|---------|---------|------|
+| **Autumn** | autumn-web 0.10.0 | Rust 1.97 + Axum 0.8 + Diesel 2.3 | [`autumn/VERSIONS`](autumn/VERSIONS) |
+| **Spring Boot** | 4.1.2 | Java 25 + Tomcat 11 + Hibernate 7.4 | [`spring-boot/VERSIONS`](spring-boot/VERSIONS) |
+| **Rails** | 8.1.4.1 | Ruby 4.0 (YJIT) + Puma 8 | [`rails/VERSIONS`](rails/VERSIONS) |
+| **Django** | 6.1.3 | Python 3.14 + Gunicorn 26 / Uvicorn 0.54 (ASGI) | [`django/VERSIONS`](django/VERSIONS) |
+| **Phoenix** | 1.8.16 | Elixir 1.19 / OTP 28 + Bandit 1.14 + Ecto 3.14 | [`phoenix/VERSIONS`](phoenix/VERSIONS) |
+| **Loco** | 1.3.1 | Rust 1.97 + Axum 0.8 + SeaORM 2.0 | [`loco/VERSIONS`](loco/VERSIONS) |
+
+Rails, Phoenix, and Django pin their resolved dependency sets
+(`Gemfile.lock`, `mix.lock`, exact `requirements.txt` pins); the Autumn image
+builds from the workspace `Cargo.lock`.
 
 OS, CPU, memory, and container limits are recorded in the results report
 generated alongside each benchmark run.
@@ -192,7 +196,7 @@ Each framework app can be built from a clean checkout:
 ### Autumn (Rust)
 ```bash
 cd benchmarks/runtime/autumn
-# Requires: Rust 1.97+, libpq (or pq-sys bundled)
+# Requires: Rust 1.97+ (pq-sys builds a bundled libpq)
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
   cargo run --release --bin bench-autumn
 ```
@@ -200,7 +204,7 @@ DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
 ### Spring Boot (Java)
 ```bash
 cd benchmarks/runtime/spring-boot
-# Requires: JDK 21+, Maven 3.9+
+# Requires: JDK 25+, Maven 3.9+
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
   mvn spring-boot:run -Dspring-boot.run.jvmArguments="-Xmx256m"
 ```
@@ -208,7 +212,7 @@ DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
 ### Rails (Ruby)
 ```bash
 cd benchmarks/runtime/rails
-# Requires: Ruby 3.3+, Bundler
+# Requires: Ruby 4.0+, Bundler 4
 bundle install
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
 RAILS_ENV=production SECRET_KEY_BASE=changeme RAILS_MAX_THREADS=20 \
@@ -218,18 +222,18 @@ RAILS_ENV=production SECRET_KEY_BASE=changeme RAILS_MAX_THREADS=20 \
 ### Django (Python)
 ```bash
 cd benchmarks/runtime/django
-# Requires: Python 3.12+
+# Requires: Python 3.14+
 pip install -r requirements.txt
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
 DJANGO_SETTINGS_MODULE=benchapp.settings \
-  python manage.py migrate && gunicorn benchapp.wsgi:application \
-    --worker-class uvicorn.workers.UvicornWorker --workers 4 --bind 0.0.0.0:8080
+  python manage.py migrate --noinput && gunicorn benchapp.asgi:application \
+    --worker-class uvicorn_worker.UvicornWorker --workers 4 --bind 0.0.0.0:8080
 ```
 
 ### Phoenix (Elixir)
 ```bash
 cd benchmarks/runtime/phoenix
-# Requires: Elixir 1.17+, Erlang/OTP 27
+# Requires: Elixir 1.19+, Erlang/OTP 28
 mix deps.get
 DATABASE_URL=ecto://benchmark:benchmark@localhost/benchmark \
 SECRET_KEY_BASE=$(mix phx.gen.secret) \
