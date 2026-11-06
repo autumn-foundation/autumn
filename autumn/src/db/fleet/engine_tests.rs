@@ -413,3 +413,64 @@ async fn a_refused_open_retires_what_an_earlier_hook_kept() {
     let kept = keeper.0.lock().unwrap().take().expect("the first hook ran");
     assert!(kept.retired.load(std::sync::atomic::Ordering::Acquire));
 }
+
+/// A fence retires a database that a close still drains: the close waits
+/// for a user, and the host loses the slot meanwhile.
+#[tokio::test]
+async fn a_fence_retires_a_database_that_is_still_draining() {
+    use crate::db::fleet_ownership::{FleetOwnership, MemoryOwnership, OwnerId, SlotRange};
+    use std::sync::Arc;
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8, 0);
+    let clock = crate::time::TickingClock::starting_at(
+        chrono::DateTime::from_timestamp_millis(1_000_000).unwrap(),
+    );
+    let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
+    let host = |owner: &str| {
+        Arc::new(
+            FleetOwnership::new(
+                Arc::clone(&store) as _,
+                OwnerId::new(owner).unwrap(),
+                vec![SlotRange::ALL],
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+    };
+    let a = host("host-a");
+    assert_eq!(
+        fleet
+            .start_ownership(Arc::clone(&a))
+            .await
+            .unwrap()
+            .claimed
+            .len(),
+        1
+    );
+    let acme = key(&fleet, "acme");
+    let db = fleet.open(&acme).await.unwrap();
+    let busy = db.handle().checkout();
+    let retired = Arc::clone(&db.retired);
+    drop(db);
+    let closing = {
+        let (fleet, acme) = (fleet.clone(), acme.clone());
+        tokio::spawn(async move { fleet.close(&acme).await })
+    };
+    eventually(|| fleet.stats().draining == 1).await;
+    assert!(
+        !retired.load(std::sync::atomic::Ordering::Acquire),
+        "a plain close settles"
+    );
+
+    clock.advance(Duration::from_secs(31));
+    assert_eq!(host("host-b").refresh().await.claimed.len(), 1);
+    assert_eq!(a.refresh().await.lost, [SlotRange::ALL]);
+    assert_eq!(fleet.fence_unowned(), 0, "nothing open to close");
+    assert!(
+        retired.load(std::sync::atomic::Ordering::Acquire),
+        "the fence reaches the drain"
+    );
+    assert!(!closing.is_finished());
+    drop(busy);
+    closing.await.unwrap();
+}

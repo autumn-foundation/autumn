@@ -837,6 +837,9 @@ struct Drain {
     deleting: bool,
     finished: AtomicBool,
     done: Notify,
+    /// The retire flag of the database and the epoch it opened under, so a
+    /// fence can retire a database that is still draining.
+    retire: Option<(Arc<AtomicBool>, Option<crate::lock::FencingToken>)>,
 }
 
 impl Drain {
@@ -1206,6 +1209,15 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             return 0;
         };
         let victims = self.begin_drains(|state| {
+            // A database that already drains (a close waits for its users)
+            // is not open, but its sidecar scopes must stop too.
+            for (key, drain) in &state.draining {
+                if let Some((retired, epoch)) = &drain.retire
+                    && ownership.epoch_for(key.routing_slot()) != *epoch
+                {
+                    retired.store(true, Ordering::Release);
+                }
+            }
             state
                 .open
                 .iter()
@@ -1939,6 +1951,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             deleting,
             finished: AtomicBool::new(false),
             done: Notify::new(),
+            retire: Some((Arc::clone(&db.retired), db.epoch)),
         });
         state.draining.insert(key.clone(), Arc::clone(&drain));
         self.inner.in_flight_drains.fetch_add(1, Ordering::Relaxed);
@@ -2327,6 +2340,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             deleting,
             finished: AtomicBool::new(false),
             done: Notify::new(),
+            retire: entry
+                .as_ref()
+                .and_then(|entry| entry.cell.get())
+                .map(|db| (Arc::clone(&db.retired), db.epoch)),
         });
         state.draining.insert(key.clone(), Arc::clone(&drain));
         drop(state);
