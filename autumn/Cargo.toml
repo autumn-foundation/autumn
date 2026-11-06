@@ -124,6 +124,8 @@ db = [
     "dep:diesel_migrations",
     "dep:libsqlite3-sys",
     "dep:scoped-futures",
+    # The fleet core takes OS file locks on its root (path and volume locks).
+    "dep:fd-lock",
     "diesel/chrono",
     "diesel/serde_json",
     # The repository layer records history, money and retention itself.
@@ -1436,6 +1438,14 @@ path = "tests/sqlite_fleet.rs"
 [[test]]
 name = "sqlite_fleet_sweeper"
 path = "tests/sqlite_fleet_sweeper.rs"
+
+# The fleet conformance kit (`plugin_conformance::fleet`) against the
+# `SQLite` engine, with replication and tombstones. The file is
+# `#![cfg(feature = "sqlite")]`. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_conformance`.
+[[test]]
+name = "sqlite_fleet_conformance"
+path = "tests/sqlite_fleet_conformance.rs"
 
 # Sim-testing W4 SQLite DB lane (issue #1797): proves the job/scheduler drain
 # runs end-to-end against a fresh, migrated, in-process in-memory SQLite substrate

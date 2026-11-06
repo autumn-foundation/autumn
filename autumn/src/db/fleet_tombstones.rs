@@ -32,17 +32,9 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone as _, Utc};
-use diesel::sql_types::{BigInt, Integer, Nullable, Text};
-use diesel_async::RunQueryDsl as _;
-use diesel_async::SimpleAsyncConnection as _;
-use diesel_async::pooled_connection::deadpool::Pool;
-
-use crate::db::RuntimeConnection;
-use crate::time::ClockSource;
 
 /// The tombstone table on the control database.
 pub const TOMBSTONE_TABLE: &str = "_autumn_fleet_tombstones";
@@ -59,21 +51,6 @@ pub const RETRY_CAP: Duration = Duration::from_secs(3600);
 /// A pending row older than this, with its file still there, is from a
 /// delete that did not finish. The retry task drops it.
 pub const STALE_PENDING: Duration = Duration::from_secs(600);
-
-/// The DDL, applied on first use. Times are epoch milliseconds of the app
-/// clock.
-const SCHEMA_SQL: &str = "\
-CREATE TABLE IF NOT EXISTS _autumn_fleet_tombstones (
-    key          TEXT    NOT NULL PRIMARY KEY,
-    deleted_at   BIGINT  NOT NULL,
-    confirmed    INTEGER NOT NULL DEFAULT 0,
-    purge_after  BIGINT  NOT NULL,
-    attempts     INTEGER NOT NULL DEFAULT 0,
-    next_attempt BIGINT  NOT NULL DEFAULT 0,
-    last_error   TEXT,
-    marked       INTEGER NOT NULL DEFAULT 0,
-    owner        TEXT    NOT NULL DEFAULT ''
-);";
 
 // ── Rules ───────────────────────────────────────────────────────────────────
 
@@ -222,8 +199,7 @@ impl Marker {
     }
 }
 
-/// The result of one purge pass. See
-/// [`DatabaseFleet::purge_deleted_replicas`](super::fleet::DatabaseFleet::purge_deleted_replicas).
+/// The result of one purge pass. See `DatabaseFleet::purge_deleted_replicas`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PurgeReport {
     /// Replicas purged.
@@ -241,354 +217,387 @@ pub struct PurgeReport {
     pub last_error: Option<String>,
 }
 
-// ── Store ───────────────────────────────────────────────────────────────────
-
-/// A failure of the tombstone store.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("fleet tombstones: {context}: {detail}")]
-pub struct TombstoneError {
-    context: &'static str,
-    detail: String,
-}
-
-fn store_error(context: &'static str) -> impl Fn(diesel::result::Error) -> TombstoneError {
-    move |error| TombstoneError {
-        context,
-        detail: error.to_string(),
-    }
-}
-
-#[derive(diesel::QueryableByName)]
-struct Row {
-    #[diesel(sql_type = Text)]
-    key: String,
-    #[diesel(sql_type = BigInt)]
-    deleted_at: i64,
-    #[diesel(sql_type = Integer)]
-    confirmed: i32,
-    #[diesel(sql_type = BigInt)]
-    purge_after: i64,
-    #[diesel(sql_type = Integer)]
-    attempts: i32,
-    #[diesel(sql_type = BigInt)]
-    next_attempt: i64,
-    #[diesel(sql_type = Nullable<Text>)]
-    last_error: Option<String>,
-    #[diesel(sql_type = Integer)]
-    marked: i32,
-    #[diesel(sql_type = Text)]
-    owner: String,
-}
-
-impl From<Row> for Tombstone {
-    fn from(row: Row) -> Self {
-        Self {
-            key: row.key,
-            deleted_at: from_millis(row.deleted_at),
-            confirmed: row.confirmed != 0,
-            purge_after: from_millis(row.purge_after),
-            attempts: u32::try_from(row.attempts).unwrap_or(0),
-            next_attempt_at: from_millis(row.next_attempt),
-            last_error: row.last_error,
-            marked: row.marked != 0,
-            owner: row.owner,
-        }
-    }
-}
-
+/// A time from epoch milliseconds. A value out of range is the earliest time.
 fn from_millis(millis: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(millis)
         .single()
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
-const COLUMNS: &str =
-    "key, deleted_at, confirmed, purge_after, attempts, next_attempt, last_error, marked, owner";
+// ── Store ───────────────────────────────────────────────────────────────────
 
-/// A connection to the control database. See
-/// [`FleetTombstones::checkout`].
-pub struct ControlConnection(diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>);
+/// The SQL store. Its statements are `SQLite`: it runs on the control
+/// database of a `SQLite` app.
+#[cfg(feature = "sqlite")]
+mod store {
+    use std::sync::Arc;
 
-impl std::fmt::Debug for ControlConnection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ControlConnection").finish_non_exhaustive()
+    use diesel::sql_types::{BigInt, Integer, Nullable, Text};
+    use diesel_async::RunQueryDsl as _;
+    use diesel_async::SimpleAsyncConnection as _;
+    use diesel_async::pooled_connection::deadpool::Pool;
+
+    use super::*;
+    use crate::db::RuntimeConnection;
+    use crate::time::ClockSource;
+
+    /// The DDL, applied on first use. Times are epoch milliseconds of the app
+    /// clock.
+    const SCHEMA_SQL: &str = "\
+    CREATE TABLE IF NOT EXISTS _autumn_fleet_tombstones (
+        key          TEXT    NOT NULL PRIMARY KEY,
+        deleted_at   BIGINT  NOT NULL,
+        confirmed    INTEGER NOT NULL DEFAULT 0,
+        purge_after  BIGINT  NOT NULL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        next_attempt BIGINT  NOT NULL DEFAULT 0,
+        last_error   TEXT,
+        marked       INTEGER NOT NULL DEFAULT 0,
+        owner        TEXT    NOT NULL DEFAULT ''
+    );";
+
+    /// A failure of the tombstone store.
+    #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+    #[error("fleet tombstones: {context}: {detail}")]
+    pub struct TombstoneError {
+        context: &'static str,
+        detail: String,
     }
-}
 
-/// The tombstone rows on the control database.
-pub struct FleetTombstones {
-    control: Pool<RuntimeConnection>,
-    clock: Arc<dyn ClockSource>,
-    schema: tokio::sync::OnceCell<()>,
-}
-
-impl std::fmt::Debug for FleetTombstones {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FleetTombstones").finish_non_exhaustive()
-    }
-}
-
-impl FleetTombstones {
-    /// Tombstones on the control database behind `control`. The table is
-    /// made on first use.
-    #[must_use]
-    pub fn new(control: Pool<RuntimeConnection>, clock: Arc<dyn ClockSource>) -> Self {
-        Self {
-            control,
-            clock,
-            schema: tokio::sync::OnceCell::new(),
+    fn store_error(context: &'static str) -> impl Fn(diesel::result::Error) -> TombstoneError {
+        move |error| TombstoneError {
+            context,
+            detail: error.to_string(),
         }
     }
 
-    /// The clock that stamps the rows.
-    #[must_use]
-    pub fn now(&self) -> DateTime<Utc> {
-        self.clock.now()
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)]
+        key: String,
+        #[diesel(sql_type = BigInt)]
+        deleted_at: i64,
+        #[diesel(sql_type = Integer)]
+        confirmed: i32,
+        #[diesel(sql_type = BigInt)]
+        purge_after: i64,
+        #[diesel(sql_type = Integer)]
+        attempts: i32,
+        #[diesel(sql_type = BigInt)]
+        next_attempt: i64,
+        #[diesel(sql_type = Nullable<Text>)]
+        last_error: Option<String>,
+        #[diesel(sql_type = Integer)]
+        marked: i32,
+        #[diesel(sql_type = Text)]
+        owner: String,
     }
 
-    /// A connection to the control database, with the table made. A delete
-    /// takes it before the path lock, so the lock waits for one write only.
-    ///
-    /// # Errors
-    ///
-    /// No connection, or the table cannot be made.
-    pub async fn checkout(&self) -> Result<ControlConnection, TombstoneError> {
-        self.conn().await.map(ControlConnection)
+    impl From<Row> for Tombstone {
+        fn from(row: Row) -> Self {
+            Self {
+                key: row.key,
+                deleted_at: from_millis(row.deleted_at),
+                confirmed: row.confirmed != 0,
+                purge_after: from_millis(row.purge_after),
+                attempts: u32::try_from(row.attempts).unwrap_or(0),
+                next_attempt_at: from_millis(row.next_attempt),
+                last_error: row.last_error,
+                marked: row.marked != 0,
+                owner: row.owner,
+            }
+        }
     }
 
-    async fn conn(
-        &self,
-    ) -> Result<diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>, TombstoneError>
-    {
-        let mut conn = self.control.get().await.map_err(|error| TombstoneError {
-            context: "no connection",
-            detail: error.to_string(),
-        })?;
-        self.schema
-            .get_or_try_init(|| async {
-                conn.batch_execute(SCHEMA_SQL)
-                    .await
-                    .map_err(store_error("schema"))
-            })
-            .await?;
-        Ok(conn)
+    const COLUMNS: &str = "key, deleted_at, confirmed, purge_after, attempts, next_attempt, last_error, marked, owner";
+
+    /// A connection to the control database. See
+    /// [`FleetTombstones::checkout`].
+    pub struct ControlConnection(
+        diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>,
+    );
+
+    impl std::fmt::Debug for ControlConnection {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ControlConnection").finish_non_exhaustive()
+        }
     }
 
-    /// Write a pending row before a delete removes the files (`Record` in
-    /// the model). `present`: the file is on disk. Then an existing row is
-    /// stale (a restore or a re-create drops it first), and it is reset.
-    /// Else an existing row is an older or a concurrent delete's, and it
-    /// stays. `owner` names this delete (see
-    /// [`remove_pending`](Self::remove_pending)).
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be written.
-    pub async fn record(
-        &self,
-        key: &str,
-        retention: Duration,
-        present: bool,
-        owner: &str,
-    ) -> Result<(), TombstoneError> {
-        let mut conn = self.checkout().await?;
-        self.record_on(&mut conn, key, retention, present, owner)
+    /// The tombstone rows on the control database.
+    pub struct FleetTombstones {
+        control: Pool<RuntimeConnection>,
+        clock: Arc<dyn ClockSource>,
+        schema: tokio::sync::OnceCell<()>,
+    }
+
+    impl std::fmt::Debug for FleetTombstones {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FleetTombstones").finish_non_exhaustive()
+        }
+    }
+
+    impl FleetTombstones {
+        /// Tombstones on the control database behind `control`. The table is
+        /// made on first use.
+        #[must_use]
+        pub fn new(control: Pool<RuntimeConnection>, clock: Arc<dyn ClockSource>) -> Self {
+            Self {
+                control,
+                clock,
+                schema: tokio::sync::OnceCell::new(),
+            }
+        }
+
+        /// The clock that stamps the rows.
+        #[must_use]
+        pub fn now(&self) -> DateTime<Utc> {
+            self.clock.now()
+        }
+
+        /// A connection to the control database, with the table made. A delete
+        /// takes it before the path lock, so the lock waits for one write only.
+        ///
+        /// # Errors
+        ///
+        /// No connection, or the table cannot be made.
+        pub async fn checkout(&self) -> Result<ControlConnection, TombstoneError> {
+            self.conn().await.map(ControlConnection)
+        }
+
+        async fn conn(
+            &self,
+        ) -> Result<
+            diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>,
+            TombstoneError,
+        > {
+            let mut conn = self.control.get().await.map_err(|error| TombstoneError {
+                context: "no connection",
+                detail: error.to_string(),
+            })?;
+            self.schema
+                .get_or_try_init(|| async {
+                    conn.batch_execute(SCHEMA_SQL)
+                        .await
+                        .map_err(store_error("schema"))
+                })
+                .await?;
+            Ok(conn)
+        }
+
+        /// Write a pending row before a delete removes the files (`Record` in
+        /// the model). `present`: the file is on disk. Then an existing row is
+        /// stale (a restore or a re-create drops it first), and it is reset.
+        /// Else an existing row is an older or a concurrent delete's, and it
+        /// stays. `owner` names this delete (see
+        /// [`remove_pending`](Self::remove_pending)).
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be written.
+        pub async fn record(
+            &self,
+            key: &str,
+            retention: Duration,
+            present: bool,
+            owner: &str,
+        ) -> Result<(), TombstoneError> {
+            let mut conn = self.checkout().await?;
+            self.record_on(&mut conn, key, retention, present, owner)
+                .await
+        }
+
+        /// [`record`](Self::record) on a connection from
+        /// [`checkout`](Self::checkout). A delete holds the path lock here, so
+        /// `present` stays correct until its removal (issue #3516).
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be written.
+        pub async fn record_on(
+            &self,
+            conn: &mut ControlConnection,
+            key: &str,
+            retention: Duration,
+            present: bool,
+            owner: &str,
+        ) -> Result<(), TombstoneError> {
+            let row = Tombstone::new(key, self.now(), retention, false);
+            let conflict = if present {
+                "DO UPDATE SET deleted_at = excluded.deleted_at, confirmed = 0, \
+                 purge_after = excluded.purge_after, attempts = 0, next_attempt = 0, \
+                 last_error = NULL, marked = 0, owner = excluded.owner"
+            } else {
+                "DO NOTHING"
+            };
+            diesel::sql_query(format!(
+                "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, 0, ?, 0, 0, NULL, 0, ?) \
+                 ON CONFLICT (key) {conflict}"
+            ))
+            .bind::<Text, _>(&row.key)
+            .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
+            .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+            .bind::<Text, _>(owner)
+            .execute(&mut *conn.0)
             .await
-    }
+            .map(drop)
+            .map_err(store_error("record"))
+        }
 
-    /// [`record`](Self::record) on a connection from
-    /// [`checkout`](Self::checkout). A delete holds the path lock here, so
-    /// `present` stays correct until its removal (issue #3516).
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be written.
-    pub async fn record_on(
-        &self,
-        conn: &mut ControlConnection,
-        key: &str,
-        retention: Duration,
-        present: bool,
-        owner: &str,
-    ) -> Result<(), TombstoneError> {
-        let row = Tombstone::new(key, self.now(), retention, false);
-        let conflict = if present {
-            "DO UPDATE SET deleted_at = excluded.deleted_at, confirmed = 0, \
-             purge_after = excluded.purge_after, attempts = 0, next_attempt = 0, \
-             last_error = NULL, marked = 0, owner = excluded.owner"
-        } else {
-            "DO NOTHING"
-        };
-        diesel::sql_query(format!(
-            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, 0, ?, 0, 0, NULL, 0, ?) \
-             ON CONFLICT (key) {conflict}"
-        ))
-        .bind::<Text, _>(&row.key)
-        .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
-        .bind::<BigInt, _>(row.purge_after.timestamp_millis())
-        .bind::<Text, _>(owner)
-        .execute(&mut *conn.0)
-        .await
-        .map(drop)
-        .map_err(store_error("record"))
-    }
+        /// Write `row` as it is. An explicit restore puts back the row it took
+        /// when the restore fails.
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be written.
+        pub async fn put(&self, row: &Tombstone) -> Result<(), TombstoneError> {
+            let mut conn = self.conn().await?;
+            diesel::sql_query(format!(
+                "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT (key) DO UPDATE SET deleted_at = excluded.deleted_at, \
+                 confirmed = excluded.confirmed, purge_after = excluded.purge_after, \
+                 attempts = excluded.attempts, next_attempt = excluded.next_attempt, \
+                 last_error = excluded.last_error, marked = excluded.marked, \
+                 owner = excluded.owner"
+            ))
+            .bind::<Text, _>(&row.key)
+            .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
+            .bind::<Integer, _>(i32::from(row.confirmed))
+            .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+            .bind::<Integer, _>(i32::try_from(row.attempts).unwrap_or(i32::MAX))
+            .bind::<BigInt, _>(row.next_attempt_at.timestamp_millis())
+            .bind::<Nullable<Text>, _>(row.last_error.as_deref())
+            .bind::<Integer, _>(i32::from(row.marked))
+            .bind::<Text, _>(&row.owner)
+            .execute(&mut *conn)
+            .await
+            .map(drop)
+            .map_err(store_error("put"))
+        }
 
-    /// Write `row` as it is. An explicit restore puts back the row it took
-    /// when the restore fails.
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be written.
-    pub async fn put(&self, row: &Tombstone) -> Result<(), TombstoneError> {
-        let mut conn = self.conn().await?;
-        diesel::sql_query(format!(
-            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (key) DO UPDATE SET deleted_at = excluded.deleted_at, \
-             confirmed = excluded.confirmed, purge_after = excluded.purge_after, \
-             attempts = excluded.attempts, next_attempt = excluded.next_attempt, \
-             last_error = excluded.last_error, marked = excluded.marked, \
-             owner = excluded.owner"
-        ))
-        .bind::<Text, _>(&row.key)
-        .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
-        .bind::<Integer, _>(i32::from(row.confirmed))
-        .bind::<BigInt, _>(row.purge_after.timestamp_millis())
-        .bind::<Integer, _>(i32::try_from(row.attempts).unwrap_or(i32::MAX))
-        .bind::<BigInt, _>(row.next_attempt_at.timestamp_millis())
-        .bind::<Nullable<Text>, _>(row.last_error.as_deref())
-        .bind::<Integer, _>(i32::from(row.marked))
-        .bind::<Text, _>(&row.owner)
-        .execute(&mut *conn)
-        .await
-        .map(drop)
-        .map_err(store_error("put"))
-    }
+        /// The files are gone: stamp `deleted_at` on the pending row of `key`
+        /// (`Confirm` in the model). `deleted_at` is now, or `floor` when that
+        /// is later: the newest generation of the deleted database, so a clock
+        /// that is behind does not keep it. A confirmed row stays as it is.
+        /// `None` when no row is left: a re-create or a restore took the key,
+        /// and no cutoff may cover its new database.
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be written or read.
+        pub async fn confirm(
+            &self,
+            key: &str,
+            retention: Duration,
+            floor: Option<DateTime<Utc>>,
+        ) -> Result<Option<Tombstone>, TombstoneError> {
+            let now = self.now();
+            // The retention runs from now; the cutoff can be later.
+            let mut row = Tombstone::new(key, now, retention, true);
+            row.deleted_at = floor.map_or(now, |floor| floor.max(now));
+            let mut conn = self.conn().await?;
+            diesel::sql_query(format!(
+                "UPDATE {TOMBSTONE_TABLE} SET deleted_at = ?, confirmed = 1, purge_after = ?, \
+                 attempts = 0, next_attempt = 0, last_error = NULL \
+                 WHERE key = ? AND confirmed = 0"
+            ))
+            .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
+            .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+            .bind::<Text, _>(&row.key)
+            .execute(&mut *conn)
+            .await
+            .map_err(store_error("confirm"))?;
+            drop(conn);
+            self.get(key).await
+        }
 
-    /// The files are gone: stamp `deleted_at` on the pending row of `key`
-    /// (`Confirm` in the model). `deleted_at` is now, or `floor` when that
-    /// is later: the newest generation of the deleted database, so a clock
-    /// that is behind does not keep it. A confirmed row stays as it is.
-    /// `None` when no row is left: a re-create or a restore took the key,
-    /// and no cutoff may cover its new database.
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be written or read.
-    pub async fn confirm(
-        &self,
-        key: &str,
-        retention: Duration,
-        floor: Option<DateTime<Utc>>,
-    ) -> Result<Option<Tombstone>, TombstoneError> {
-        let now = self.now();
-        // The retention runs from now; the cutoff can be later.
-        let mut row = Tombstone::new(key, now, retention, true);
-        row.deleted_at = floor.map_or(now, |floor| floor.max(now));
-        let mut conn = self.conn().await?;
-        diesel::sql_query(format!(
-            "UPDATE {TOMBSTONE_TABLE} SET deleted_at = ?, confirmed = 1, purge_after = ?, \
-             attempts = 0, next_attempt = 0, last_error = NULL \
-             WHERE key = ? AND confirmed = 0"
-        ))
-        .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
-        .bind::<BigInt, _>(row.purge_after.timestamp_millis())
-        .bind::<Text, _>(&row.key)
-        .execute(&mut *conn)
-        .await
-        .map_err(store_error("confirm"))?;
-        drop(conn);
-        self.get(key).await
-    }
-
-    /// Record that the marker object of `key` is written.
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be written.
-    pub async fn set_marked(&self, key: &str) -> Result<(), TombstoneError> {
-        let mut conn = self.conn().await?;
-        diesel::sql_query(format!(
-            "UPDATE {TOMBSTONE_TABLE} SET marked = 1 WHERE key = ?"
-        ))
-        .bind::<Text, _>(key)
-        .execute(&mut *conn)
-        .await
-        .map(drop)
-        .map_err(store_error("mark"))
-    }
-
-    /// The row of `key`.
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be read.
-    pub async fn get(&self, key: &str) -> Result<Option<Tombstone>, TombstoneError> {
-        let mut conn = self.conn().await?;
-        let rows: Vec<Row> = diesel::sql_query(format!(
-            "SELECT {COLUMNS} FROM {TOMBSTONE_TABLE} WHERE key = ?"
-        ))
-        .bind::<Text, _>(key)
-        .load(&mut *conn)
-        .await
-        .map_err(store_error("read"))?;
-        Ok(rows.into_iter().next().map(Tombstone::from))
-    }
-
-    /// At most `limit` rows in key order, after the key `after`. Page with
-    /// the last key of the previous page.
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be read.
-    pub async fn list_after(
-        &self,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Tombstone>, TombstoneError> {
-        let mut conn = self.conn().await?;
-        let rows: Vec<Row> = diesel::sql_query(format!(
-            "SELECT {COLUMNS} FROM {TOMBSTONE_TABLE} WHERE key > ? ORDER BY key LIMIT ?"
-        ))
-        .bind::<Text, _>(after.unwrap_or(""))
-        .bind::<BigInt, _>(i64::try_from(limit).unwrap_or(i64::MAX))
-        .load(&mut *conn)
-        .await
-        .map_err(store_error("list"))?;
-        Ok(rows.into_iter().map(Tombstone::from).collect())
-    }
-
-    /// Drop the row of `key` (a purge, a restore or a re-create).
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be written.
-    pub async fn remove(&self, key: &str) -> Result<(), TombstoneError> {
-        let mut conn = self.conn().await?;
-        diesel::sql_query(format!("DELETE FROM {TOMBSTONE_TABLE} WHERE key = ?"))
+        /// Record that the marker object of `key` is written.
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be written.
+        pub async fn set_marked(&self, key: &str) -> Result<(), TombstoneError> {
+            let mut conn = self.conn().await?;
+            diesel::sql_query(format!(
+                "UPDATE {TOMBSTONE_TABLE} SET marked = 1 WHERE key = ?"
+            ))
             .bind::<Text, _>(key)
             .execute(&mut *conn)
             .await
             .map(drop)
-            .map_err(store_error("remove"))
-    }
+            .map_err(store_error("mark"))
+        }
 
-    /// Drop the row of `key` only while it is pending (`Refused` in the
-    /// model). `owner`: drop it only when this delete wrote it; then a
-    /// delete that found no file keeps the row of a delete that runs at
-    /// once in another process. `None`: drop any pending row (the retry
-    /// task, for a stale one).
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be written.
-    pub async fn remove_pending(
-        &self,
-        key: &str,
-        owner: Option<&str>,
-    ) -> Result<(), TombstoneError> {
-        let mut conn = self.conn().await?;
-        let query =
-            match owner {
+        /// The row of `key`.
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be read.
+        pub async fn get(&self, key: &str) -> Result<Option<Tombstone>, TombstoneError> {
+            let mut conn = self.conn().await?;
+            let rows: Vec<Row> = diesel::sql_query(format!(
+                "SELECT {COLUMNS} FROM {TOMBSTONE_TABLE} WHERE key = ?"
+            ))
+            .bind::<Text, _>(key)
+            .load(&mut *conn)
+            .await
+            .map_err(store_error("read"))?;
+            Ok(rows.into_iter().next().map(Tombstone::from))
+        }
+
+        /// At most `limit` rows in key order, after the key `after`. Page with
+        /// the last key of the previous page.
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be read.
+        pub async fn list_after(
+            &self,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<Tombstone>, TombstoneError> {
+            let mut conn = self.conn().await?;
+            let rows: Vec<Row> = diesel::sql_query(format!(
+                "SELECT {COLUMNS} FROM {TOMBSTONE_TABLE} WHERE key > ? ORDER BY key LIMIT ?"
+            ))
+            .bind::<Text, _>(after.unwrap_or(""))
+            .bind::<BigInt, _>(i64::try_from(limit).unwrap_or(i64::MAX))
+            .load(&mut *conn)
+            .await
+            .map_err(store_error("list"))?;
+            Ok(rows.into_iter().map(Tombstone::from).collect())
+        }
+
+        /// Drop the row of `key` (a purge, a restore or a re-create).
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be written.
+        pub async fn remove(&self, key: &str) -> Result<(), TombstoneError> {
+            let mut conn = self.conn().await?;
+            diesel::sql_query(format!("DELETE FROM {TOMBSTONE_TABLE} WHERE key = ?"))
+                .bind::<Text, _>(key)
+                .execute(&mut *conn)
+                .await
+                .map(drop)
+                .map_err(store_error("remove"))
+        }
+
+        /// Drop the row of `key` only while it is pending (`Refused` in the
+        /// model). `owner`: drop it only when this delete wrote it; then a
+        /// delete that found no file keeps the row of a delete that runs at
+        /// once in another process. `None`: drop any pending row (the retry
+        /// task, for a stale one).
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be written.
+        pub async fn remove_pending(
+            &self,
+            key: &str,
+            owner: Option<&str>,
+        ) -> Result<(), TombstoneError> {
+            let mut conn = self.conn().await?;
+            let query = match owner {
                 Some(owner) => diesel::sql_query(format!(
                     "DELETE FROM {TOMBSTONE_TABLE} WHERE key = ? AND confirmed = 0 AND owner = ?"
                 ))
@@ -605,41 +614,52 @@ impl FleetTombstones {
                     .await
                 }
             };
-        query.map(drop).map_err(store_error("remove"))
-    }
+            query.map(drop).map_err(store_error("remove"))
+        }
 
-    /// Record a failed purge of `tombstone` (`PurgeFailed` in the model).
-    /// Returns the new row.
-    ///
-    /// # Errors
-    ///
-    /// The control database cannot be written.
-    pub async fn record_failure(
-        &self,
-        tombstone: Tombstone,
-        error: &str,
-    ) -> Result<Tombstone, TombstoneError> {
-        let row = tombstone.after_failure(self.now(), error);
-        let mut conn = self.conn().await?;
-        diesel::sql_query(format!(
-            "UPDATE {TOMBSTONE_TABLE} SET attempts = ?, next_attempt = ?, last_error = ? \
-             WHERE key = ?"
-        ))
-        .bind::<Integer, _>(i32::try_from(row.attempts).unwrap_or(i32::MAX))
-        .bind::<BigInt, _>(row.next_attempt_at.timestamp_millis())
-        .bind::<Nullable<Text>, _>(row.last_error.as_deref())
-        .bind::<Text, _>(&row.key)
-        .execute(&mut *conn)
-        .await
-        .map_err(store_error("record failure"))?;
-        Ok(row)
+        /// Record a failed purge of `tombstone` (`PurgeFailed` in the model).
+        /// Returns the new row.
+        ///
+        /// # Errors
+        ///
+        /// The control database cannot be written.
+        pub async fn record_failure(
+            &self,
+            tombstone: Tombstone,
+            error: &str,
+        ) -> Result<Tombstone, TombstoneError> {
+            let row = tombstone.after_failure(self.now(), error);
+            let mut conn = self.conn().await?;
+            diesel::sql_query(format!(
+                "UPDATE {TOMBSTONE_TABLE} SET attempts = ?, next_attempt = ?, last_error = ? \
+                 WHERE key = ?"
+            ))
+            .bind::<Integer, _>(i32::try_from(row.attempts).unwrap_or(i32::MAX))
+            .bind::<BigInt, _>(row.next_attempt_at.timestamp_millis())
+            .bind::<Nullable<Text>, _>(row.last_error.as_deref())
+            .bind::<Text, _>(&row.key)
+            .execute(&mut *conn)
+            .await
+            .map_err(store_error("record failure"))?;
+            Ok(row)
+        }
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "sqlite")]
+pub use store::{ControlConnection, FleetTombstones, TombstoneError};
+
+// The tests use the SQL store, which is `SQLite`.
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
+    use crate::db::RuntimeConnection;
+    use crate::time::ClockSource;
+    use diesel_async::RunQueryDsl as _;
+    use diesel_async::SimpleAsyncConnection as _;
+    use diesel_async::pooled_connection::deadpool::Pool;
     use proptest::prelude::*;
+    use std::sync::Arc;
 
     fn at(ms: i64) -> DateTime<Utc> {
         from_millis(ms)
@@ -1070,6 +1090,7 @@ mod tests {
                 root: setup.volume.join("fleet").display().to_string(),
                 path: None,
                 max_open: 8,
+                max_resident_bytes: 0,
                 pool_size: 2,
                 create_on_demand: Some(create_on_demand),
                 idle_close_secs: 0,
@@ -2124,6 +2145,7 @@ mod tests {
                 root: tmp.path().join("fleet").display().to_string(),
                 path: None,
                 max_open: 8,
+                max_resident_bytes: 0,
                 pool_size: 2,
                 create_on_demand: Some(false),
                 idle_close_secs: 0,
@@ -2192,6 +2214,7 @@ mod tests {
                 root: tmp.path().join("fleet").display().to_string(),
                 path: None,
                 max_open: 8,
+                max_resident_bytes: 0,
                 pool_size: 2,
                 create_on_demand: Some(false),
                 idle_close_secs: 0,

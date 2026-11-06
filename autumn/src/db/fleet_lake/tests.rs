@@ -42,6 +42,7 @@ fn fleet_config(root: &Path, retention: Duration) -> DatabaseFleetConfig {
         root: root.display().to_string(),
         path: None,
         max_open: 8,
+        max_resident_bytes: 0,
         pool_size: 2,
         create_on_demand: Some(true),
         idle_close_secs: 0,

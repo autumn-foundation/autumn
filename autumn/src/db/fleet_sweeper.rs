@@ -1573,6 +1573,7 @@ mod tests {
             root: dir.join("fleet").display().to_string(),
             path: None,
             max_open: 4,
+            max_resident_bytes: 0,
             pool_size: 2,
             create_on_demand: None,
             idle_close_secs: 0,

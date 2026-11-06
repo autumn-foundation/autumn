@@ -176,6 +176,7 @@ fn fleet_with(dir: &FsPath, max_open: usize, migrations: EmbeddedMigrations) -> 
         root: dir.join("fleet").display().to_string(),
         path: None,
         max_open,
+        max_resident_bytes: 0,
         pool_size: 2,
         create_on_demand: Some(true),
         idle_close_secs: 0,

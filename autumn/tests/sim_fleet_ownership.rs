@@ -114,6 +114,7 @@ async fn host(dir: &std::path::Path, name: &str) -> Host {
         root: dir.join(name).display().to_string(),
         path: None,
         max_open: 8,
+        max_resident_bytes: 0,
         pool_size: 2,
         create_on_demand: Some(true),
         idle_close_secs: 0,

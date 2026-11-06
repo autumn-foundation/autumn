@@ -182,6 +182,46 @@ choose.
 
 ---
 
+### Fleet: `DatabaseFleetConfig` and `FleetStats` have new fields
+
+**Why:** a fleet has a memory budget next to `max_open` (issue #3642,
+ADR 0040). `DatabaseFleetConfig` has a new field `max_resident_bytes`.
+`FleetStats` has the new fields `resident_bytes` and `max_resident_bytes`,
+and is now `#[non_exhaustive]`.
+
+**You are affected only if your code builds a `DatabaseFleetConfig` with a
+struct literal and no `..` spread, or builds a `FleetStats`.** TOML and
+`AUTUMN_*` config need no change: the default `0` means no budget.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    // ...every other field...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    max_resident_bytes: 0,
+    // ...every other field...
+}
+```
+
+**Automation:** `manual` — add `max_resident_bytes: 0`. A codemod cannot
+know the budget the app wants. Only the fleet builds a `FleetStats`: read it
+from `DatabaseFleet::stats`.
+
+---
+
 ### Database: `DatabaseConfig` and `DatabaseFleetConfig` have `mmap_size` and `cache_size_kib`
 
 **Why:** an app can turn on SQLite memory-mapped reads and a larger page
@@ -249,6 +289,15 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   in `on_startup` that you do not move behaves as before. See
   [Background work in a plugin](../guide/extensibility.md#background-work-in-a-plugin)
   and [Background tasks for plugins and apps](../guide/jobs.md#background-tasks-for-plugins-and-apps).
+- **New experimental surface (fleet engines, #3642):** `db::fleet_engine`
+  (the `FleetEngine` trait and `DatabaseFleet::with_engine`) and
+  `plugin_conformance::fleet` (`FleetFixture`, `run_fleet_conformance`).
+  Declare them with `uses_experimental`. An engine plugin implements
+  `FleetEngine` and runs the kit in its own CI. `DatabaseFleet`,
+  `FleetDatabase`, `FleetLifecycle` and `BackgroundOpen` take a parameter
+  `E: FleetEngine`. With `sqlite`, `E` defaults to `SqliteEngine`, so
+  `SQLite` code needs no change. A handler of another engine reads
+  `FleetDatabase::handle`. See [ADR 0040](../adr/0040-fleet-engine-seams.md).
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -269,6 +318,9 @@ single most valuable section of the guide — keep it factual and short.
 
 ## Configuration changes
 
+- New key `[database.fleet] max_resident_bytes` (default `0`, no budget),
+  and its variable `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES`.
+
 - `autumn.toml` keys that were renamed, removed, or have new defaults.
 - New `AUTUMN_*` environment variables.
 - Default profile changes.
@@ -276,6 +328,18 @@ single most valuable section of the guide — keep it factual and short.
 If nothing changed, delete this section.
 
 ## Behavior changes
+
+- **Fleet:** an open under an ownership epoch refuses a database that
+  records a newer epoch (`FleetError::NewerEpoch`, `421`). Before, the open
+  served it. The check, the stamp and the write are one transaction. Only
+  a host that lost its slot to a newer owner sees this. A control database
+  made again from nothing restarts its epochs: re-import each database
+  (`DatabaseFleet::import` drops the old stamp).
+- **Fleet:** `/actuator/health` `db:fleet` details now include
+  `resident_bytes` and `max_resident_bytes`.
+- **Fleet:** the fleet core is in every `db` build, Postgres too. The `db`
+  feature now pulls in `fd-lock`, which the `sqlite` feature pulled in
+  before. No new crate.
 
 Changes that still compile but behave differently at runtime. Examples:
 
