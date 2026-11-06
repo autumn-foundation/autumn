@@ -8,17 +8,17 @@
      110,742,722   12.2%  sqlite3BtreeTableMoveto
       48,414,720    5.3%  sqlite3GetVarint
       42,703,028    4.7%  sqlite3BtreeIndexMoveto
-      41,614,706    4.6%  __memcpy_avx_unaligned_erms
+      41,624,470    4.6%  __memcpy_avx_unaligned_erms
       33,832,703    3.7%  moveToChild
-      27,697,598    3.1%  btreeInitPage
+      27,697,598    3.0%  btreeInitPage
       27,307,040    3.0%  vdbeRecordCompareInt
-      24,970,933    2.8%  getPageMMap
+      24,970,933    2.7%  getPageMMap
       18,654,238    2.1%  sqlite3VdbeRecordCompareWithSkip
       17,917,736    2.0%  sqlite3BtreeInsert
       17,507,260    1.9%  moveToRoot
-      17,488,686    1.9%  pthread_mutex_lock@@GLIBC_2.2.5
-      15,862,035    1.7%  __memset_avx2_unaligned_erms
-      12,576,839    1.4%  pthread_mutex_unlock@@GLIBC_2.2.5
+      17,489,214    1.9%  pthread_mutex_lock@@GLIBC_2.2.5
+      15,862,280    1.7%  __memset_avx2_unaligned_erms
+      12,577,283    1.4%  pthread_mutex_unlock@@GLIBC_2.2.5
       12,523,006    1.4%  btreeParseCellPtr
       12,503,362    1.4%  walFindFrame.constprop.0
       11,792,580    1.3%  getPageNormal
@@ -35,4 +35,4 @@
        6,540,800    0.7%  jsonReturnFromBlob
        6,407,397    0.7%  walChecksumBytes
 
-     907,781,245  100.0%  TOTAL
+     909,060,676  100.0%  TOTAL

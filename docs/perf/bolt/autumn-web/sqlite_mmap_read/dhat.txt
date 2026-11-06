@@ -2,9 +2,9 @@
 # unit: whole process (criterion --profile-time: the iteration count is wall-clock bound; read the shares)
 # tool: valgrind --tool=dhat, by first workspace frame
 
-bytes allocated: 17,555,982
-blocks allocated: 25,597
-peak live bytes (whole run): 2,526,951
+bytes allocated: 17,557,648
+blocks allocated: 25,624
+peak live bytes (whole run): 2,527,550
 
          bytes      blocks  site
 
