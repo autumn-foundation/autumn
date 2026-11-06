@@ -93,8 +93,8 @@ Supplementary metrics (collected outside k6):
 
 | Metric | How |
 |--------|-----|
-| Cold start time | `load/resources.sh`: `docker compose up -d <app>` on a removed container; time until first 200 on `/health` |
-| Warm restart time | `load/resources.sh`: `docker compose restart <app>` (SIGTERM, start); time until healthy again |
+| Cold start time | `load/resources.sh`: `docker compose up -d <app>` on a removed container; time until first 200 on the health route (`/health`; Loco's built-in `/_health`) |
+| Warm restart time | `load/resources.sh`: `docker compose stop <app>` (SIGTERM until exit) plus `docker compose start <app>` until healthy again; both halves are recorded |
 | Idle RSS | `load/resources.sh`: `docker stats --no-stream` after 30 s idle |
 | Memory under load | `load/sample-mem.sh <app> out.csv` during a 60 s `json-crud` run; peak and mean |
 | Container image size | `load/resources.sh`: `docker image inspect` size after build |
@@ -147,7 +147,7 @@ cd benchmarks/runtime
 # 1. Build and start Postgres plus all framework apps.
 docker --context default compose up -d --build autumn spring-boot rails django phoenix loco
 
-# 2. Wait for health checks (all apps expose /health).
+# 2. Wait for health checks (/health everywhere; Loco serves /_health).
 docker --context default compose ps
 
 # 3. Run the full suite with Dockerized k6.
@@ -405,17 +405,23 @@ Benchmark results are stored in `results/` and ignored by Git. Each run
 produces a timestamped directory:
 
 ```
-results/docker-k6_20260512_103000/
+results/k6_20261106_175617/
 ├── aggregate.csv
 ├── aggregate-summary.csv
-├── autumn/
-│   ├── json-crud-summary.json
-│   ├── html-page-summary.json
-│   ├── validation-fail-summary.json
-│   └── auth-protected-summary.json
-├── spring-boot/...
-└── ...
+├── run-01/
+│   ├── autumn/
+│   │   ├── json-crud-summary.json
+│   │   ├── html-page-summary.json
+│   │   ├── validation-fail-summary.json
+│   │   └── auth-protected-summary.json
+│   ├── spring-boot/...
+│   └── ...
+├── run-02/...
+└── run-03/...
 ```
 
-A rendered comparison report template lives at
-[`RESULTS.md`](RESULTS.md) — fill it in after each run.
+`aggregate-summary.csv` holds the per-framework, per-scenario medians across
+the `--repeat` runs; `aggregate.csv` holds every run.
+
+The latest six-framework comparison is written up in
+[`RESULTS.md`](RESULTS.md), together with the Autumn CI gate baseline.
