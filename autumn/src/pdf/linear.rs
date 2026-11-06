@@ -10,8 +10,9 @@ const FAST_ENOUGH: Duration = Duration::from_millis(50);
 const SCALE: usize = 8;
 
 /// The highest ratio `assert_linear` accepts. Linear is about 8, quadratic
-/// about 64. The wide gap absorbs the noise of a loaded CI runner.
-const MAX_RATIO: f64 = 24.0;
+/// about 64. A loaded CI runner was seen to slow the large run by up to 3
+/// times, so the limit leaves 4 times above linear.
+const MAX_RATIO: f64 = 32.0;
 
 /// Runs per input. The fastest run counts.
 const RUNS: usize = 3;
@@ -86,9 +87,9 @@ mod tests {
 
     #[test]
     fn a_linear_ratio_passes() {
-        // 8 times is linear. 20 times is linear on a loaded runner.
+        // 8 times is linear. 30 times is linear on a loaded runner.
         assert_eq!(verdict("parse", 800, ms(100), ms(800)), None);
-        assert_eq!(verdict("parse", 800, ms(100), ms(2000)), None);
+        assert_eq!(verdict("parse", 800, ms(100), ms(3000)), None);
     }
 
     #[test]
