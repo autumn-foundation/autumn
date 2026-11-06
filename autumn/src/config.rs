@@ -8241,24 +8241,7 @@ impl AutumnConfig {
                 eprintln!("Warning: AUTUMN_DATABASE__FLEET__MODE={mode:?} is not valid, ignoring");
                 return;
             };
-            self.database.fleet = Some(DatabaseFleetConfig {
-                mode,
-                root,
-                path: None,
-                max_open: default_fleet_max_open(),
-                max_resident_bytes: 0,
-                min_residency: default_fleet_min_residency(),
-                pool_size: default_fleet_pool_size(),
-                create_on_demand: None,
-                idle_close_secs: default_fleet_idle_close_secs(),
-                restore_missing: false,
-                ownership: None,
-                replica_retention_after_delete: std::time::Duration::ZERO,
-                restore_check_sample: default_fleet_restore_check_sample(),
-                replication_workers: default_fleet_replication_workers(),
-                mmap_size: 0,
-                cache_size_kib: 0,
-            });
+            self.database.fleet = Some(default_fleet_section(mode, root));
         }
         let Some(fleet) = self.database.fleet.as_mut() else {
             return;
@@ -12173,6 +12156,32 @@ impl DatabaseFleetConfig {
             )));
         }
         Ok(())
+    }
+}
+
+/// A `[database.fleet]` section with every default, made from the env when
+/// TOML has none.
+const fn default_fleet_section(
+    mode: crate::fleet_layout::FleetMode,
+    root: String,
+) -> DatabaseFleetConfig {
+    DatabaseFleetConfig {
+        mode,
+        root,
+        path: None,
+        max_open: default_fleet_max_open(),
+        max_resident_bytes: 0,
+        min_residency: default_fleet_min_residency(),
+        pool_size: default_fleet_pool_size(),
+        create_on_demand: None,
+        idle_close_secs: default_fleet_idle_close_secs(),
+        restore_missing: false,
+        ownership: None,
+        replica_retention_after_delete: std::time::Duration::ZERO,
+        restore_check_sample: default_fleet_restore_check_sample(),
+        replication_workers: default_fleet_replication_workers(),
+        mmap_size: 0,
+        cache_size_kib: 0,
     }
 }
 
