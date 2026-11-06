@@ -15,4 +15,4 @@
   (#3325). Set the size with `CommentsConfig::page_size` (default 50). After
   a post, it shows the page that holds the new comment. A no-JS post returns
   to `return_to?after=<cursor>#<comment>`. See the
-  [migration guide](../docs/migrations/next.md).
+  [migration guide](docs/migrations/next.md).
