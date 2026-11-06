@@ -572,17 +572,19 @@ pub(crate) struct FleetMigrations {
 }
 
 impl FleetMigrations {
-    /// The sets of `all` that reach the shards and that `keep` accepts. The
-    /// app passes a filter that drops the control-plane framework set.
+    /// The sets of `all` that reach the shards, by
+    /// [`applied_scope`](crate::migrate::applied_scope): a `Control` set and
+    /// the control-plane framework set do not.
     pub(crate) fn new(
         all: &Arc<Vec<crate::migrate::RegisteredMigrations>>,
-        keep: impl Fn(&EmbeddedMigrations) -> bool,
         apply_on_open: bool,
     ) -> Self {
         let sets = all
             .iter()
             .enumerate()
-            .filter(|(_, (_, set, scope, _))| scope.reaches_shards() && keep(set))
+            .filter(|(_, (_, set, scope, _))| {
+                crate::migrate::applied_scope(set, *scope).reaches_shards()
+            })
             .map(|(idx, _)| {
                 FleetSet(Arc::new(SharedEmbedded {
                     all: Arc::clone(all),
@@ -4917,7 +4919,6 @@ pub(crate) fn build_for_app(
     config: &crate::config::AutumnConfig,
     resolved_control_url: Option<&str>,
     all: &Arc<Vec<crate::migrate::RegisteredMigrations>>,
-    keep: impl Fn(&EmbeddedMigrations) -> bool,
 ) -> Result<Option<DatabaseFleet>, String> {
     let Some(fleet_config) = config.database.fleet.as_ref() else {
         return Ok(None);
@@ -4929,10 +4930,9 @@ pub(crate) fn build_for_app(
     );
     // SQLite has no schemas: a set for a Postgres schema must not reach a
     // fleet file, where it would run in the default namespace.
-    if let Some((label, _, _, Some(schema))) = all
-        .iter()
-        .find(|(_, set, scope, schema)| schema.is_some() && scope.reaches_shards() && keep(set))
-    {
+    if let Some((label, _, _, Some(schema))) = all.iter().find(|(_, set, scope, schema)| {
+        schema.is_some() && crate::migrate::applied_scope(set, *scope).reaches_shards()
+    }) {
         return Err(format!(
             "Failed to set up database.fleet: the migration set `{label}` targets the \
              Postgres schema `{schema}`, and a SQLite fleet has no schemas"
@@ -4941,7 +4941,7 @@ pub(crate) fn build_for_app(
     let fleet = DatabaseFleet::from_parts(
         fleet_config,
         config.database.connect_timeout_secs,
-        FleetMigrations::new(all, keep, apply_on_open),
+        FleetMigrations::new(all, apply_on_open),
     )
     .map_err(|e| format!("Failed to set up database.fleet: {e}"))?;
     // The configured control database, and the one a custom pool provider
@@ -5358,7 +5358,7 @@ mod tests {
         let target = tmp.path().join("000/slot-00001.db");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, b"their bytes").unwrap();
-        let migrations = FleetMigrations::new(&Arc::new(Vec::new()), |_| true, true);
+        let migrations = FleetMigrations::new(&Arc::new(Vec::new()), true);
         let created = create_database_file(tmp.path(), &target, "slot:00001", &migrations).unwrap();
         assert!(!created, "the other process won the race");
         assert_eq!(std::fs::read(&target).unwrap(), b"their bytes");
@@ -6268,7 +6268,7 @@ mod tests {
                 ..config(&root, FleetMode::Slot)
             },
             5,
-            FleetMigrations::new(&all, |_| true, false),
+            FleetMigrations::new(&all, false),
         )
         .unwrap();
         boot.open(&FleetDbKey::Slot(1)).await.unwrap();
@@ -7440,7 +7440,7 @@ mod tests {
             })
         };
         held.recv().unwrap();
-        let migrations = FleetMigrations::new(&Arc::new(Vec::new()), |_| true, true);
+        let migrations = FleetMigrations::new(&Arc::new(Vec::new()), true);
         let created = create_database_file(tmp.path(), &target, "slot:00005", &migrations).unwrap();
         publisher.join().unwrap();
         assert!(!created, "the publisher won: this create waited for it");
@@ -7455,7 +7455,7 @@ mod tests {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         let wal = tmp.path().join("000/slot-00003.db-wal");
         std::fs::write(&wal, b"left behind by a crash").unwrap();
-        let migrations = FleetMigrations::new(&Arc::new(Vec::new()), |_| true, true);
+        let migrations = FleetMigrations::new(&Arc::new(Vec::new()), true);
         assert!(create_database_file(tmp.path(), &target, "slot:00003", &migrations).unwrap());
         assert!(!wal.exists(), "a stale -wal would replay onto the new file");
     }
@@ -7468,7 +7468,7 @@ mod tests {
         std::fs::write(&target, b"their bytes").unwrap();
         let wal = tmp.path().join("000/slot-00004.db-wal");
         std::fs::write(&wal, b"their frames").unwrap();
-        let migrations = FleetMigrations::new(&Arc::new(Vec::new()), |_| true, true);
+        let migrations = FleetMigrations::new(&Arc::new(Vec::new()), true);
         assert!(!create_database_file(tmp.path(), &target, "slot:00004", &migrations).unwrap());
         assert_eq!(std::fs::read(&wal).unwrap(), b"their frames");
     }
