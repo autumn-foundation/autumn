@@ -1021,9 +1021,21 @@ jobs:
         with:
           # See `test-build`.
           shared-key: workspace-test
+          # The macOS runner has a 14 GB disk. Since kache reads the S3 store
+          # (#3633), the host loses the runner mid-build ("lost communication
+          # with the server"), on trunk-dev too. The GitHub Actions cache
+          # passed this build before. Windows keeps S3.
+          s3: ${{ runner.os != 'macOS' }}
       - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-nextest@0.9.149
+      - name: Cap the macOS compile at two jobs
+        # The macOS runner has 3 cores and 7 GB, and the build swaps at one
+        # job per core (see the job comment). Two jobs bound the peak, as in
+        # the `lint` job. Windows keeps one job per core.
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - name: Archive the workspace test build
         shell: bash
         run: |
@@ -2637,9 +2649,12 @@ jobs:
           # `db::tests::sim_sqlite_` and `time::tests::sim_spawn_blocking_ungated`
           # measure the ungated SQLite connection setup on a sim runtime. The
           # `sim_` prefix keeps them out of the other `sqlite_` filters.
+          # `migrate::tests::sqlite_sets_` (#3536) measures the apply of more
+          # than one SQLite app set, which only the CLI calls.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
             fleet_layout:: app::fleet_boot_tests db::sqlite_types:: \
+            migrate::tests::sqlite_sets_ \
             mail::db_suppression:: db::tests::sim_sqlite_ \
             time::tests::sim_spawn_blocking_ungated
           # The #1907 durable job queue and lease scheduler are a large slice of
@@ -2967,6 +2982,11 @@ jobs:
             tests::fleet_subcommands db::replica:: \
             | tee "$RUNNER_TEMP/cli-fleet-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
+          # Issue #3536: same gap for `autumn migrate` (the scope directories,
+          # the topology read and the Postgres refusal). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- migrate::tests:: \
+            | tee "$RUNNER_TEMP/cli-migrate-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-migrate-cov.log"
           # Issue #2555: same gap for the generators. The SQLite uuid key and the
           # SQLite scaffold smoke test change `generate::model`, `generate::dsl`,
           # `generate::scaffold` and `generate::admin`, and their unit tests are
@@ -3235,6 +3255,17 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
               || { echo "::error::no autumn fleet test ran (${log})"; exit 1; }
           done
+      - name: Run the autumn migrate suite under sqlite
+        # Issues #2058 and #3536. `autumn migrate` and `migrate down` against a
+        # temporary SQLite file, and the scope directories (`migrations-control/`,
+        # `migrations-shards/`). No Docker. The step checks the pass count,
+        # because a filter that matches nothing exits 0.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --test cli_tests migrate_sqlite | tee "${RUNNER_TEMP}/cli-migrate-sqlite-it.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/cli-migrate-sqlite-it.log" \
+            || { echo "::error::no autumn migrate sqlite test ran"; exit 1; }
       - name: Clippy autumn-search under the sqlite backend
         # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
         # does not have, so the crate did not compile under the flip. It now
