@@ -120,13 +120,13 @@ autumn dev-loop-bench --cold-start --include-db
 
 ### Cold-start budget history
 
-The `Cold-Start Onboarding Gate` (issue #977) began at p95 60s / max 90s. It
-failed every scheduled run from 2026-06-29 through at least 2026-09-14 (issue
-#2309). The root cause: `autumn-macros` had no `[features]` section. A no-DB
+The `Cold-Start Onboarding Gate` began at p95 60s / max 90s. It
+failed every scheduled run from 2026-06-29 through at least 2026-09-14. The root
+cause: `autumn-macros` had no `[features]` section. A no-DB
 app compiled the full `db` codegen (`model.rs` and `repository.rs`, about 40k
 lines), even though it could not reach either macro.
 
-Issue #2309 fixed two problems:
+Two fixes followed:
 
 1. `autumn-macros` now has a `db` feature. `autumn-web` takes the crate with
    `default-features = false` and forwards its own `db` feature. A no-DB app
@@ -138,19 +138,19 @@ Issue #2309 fixed two problems:
    Dropping `http-client` also drops `reqwest` and its TLS stack from the
    build.
 
-Issue #2795 then gated 16 more modules of `autumn-web` behind default-on
+A later change gated 16 more modules of `autumn-web` behind default-on
 features (ADR 0027). The daemon starter turns them off, and `psl` leaves its
 build. A default build does not change. On one 4 vCPU box a cold `hello`
 build fell from 118 s to 101 s. The CI gate budget is unchanged until the
 scheduled run confirms the gain.
 
-Both #2309 fixes are real and measured. Neither brings cold start under the
+Both fixes are real and measured. Neither brings cold start under the
 original 60s/90s target. The reason: `autumn-web`'s own hand-written source
 is now the largest single compile unit, at roughly 43-55s, and no feature
 gates it (unlike the generated macro code above). The budget above (p95 130s
 / max 160s) is recalibrated from real CI numbers. It stops the gate from
 failing on every run, while it still catches a genuine regression. This is a
-stopgap, not a fix: issue #2795 tracks lowering `autumn-web`'s own compile
+stopgap, not a fix: open work tracks lowering `autumn-web`'s own compile
 time and tightening this budget back toward the original target.
 
 ---

@@ -387,8 +387,8 @@ that leg use it. A conflicting `parent_pk` is a compile error.
 ```
 
 A `#[model]` may use any primary-key column: a renamed `#[id]` field, or
-`#[diesel(column_name)]` on the field. `#[repository]` still assumes `id`
-(#3033 follow-up). A `through =` target must still be keyed on `id`.
+`#[diesel(column_name)]` on the field. `#[repository]` still assumes `id`.
+A `through =` target must still be keyed on `id`.
 
 ## Filtered and weighted counts
 
