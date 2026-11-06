@@ -314,3 +314,45 @@ async fn exists_and_list_follow_the_engine() {
         keys
     });
 }
+
+#[test]
+fn sidecar_names_follow_the_rule() {
+    use super::{RESERVED_SIDECAR_NAMES, sidecar_root};
+    let root = "prod/fleet/tenant/acme";
+    assert_eq!(
+        sidecar_root(root, "duckdb").unwrap(),
+        "prod/fleet/tenant/acme/duckdb"
+    );
+    assert!(sidecar_root(root, "a").is_ok());
+    assert!(sidecar_root(root, "duck_db-2").is_ok());
+    assert!(sidecar_root(root, &"a".repeat(32)).is_ok());
+    for bad in [
+        "",
+        "DuckDB",
+        "duck/db",
+        "..",
+        ".",
+        "-duck",
+        "_duck",
+        "duck db",
+        "dück",
+        &"a".repeat(33),
+    ] {
+        assert!(sidecar_root(root, bad).is_err(), "{bad:?}");
+    }
+    for reserved in RESERVED_SIDECAR_NAMES {
+        assert!(sidecar_root(root, reserved).is_err(), "{reserved}");
+    }
+}
+
+#[tokio::test]
+async fn a_fleet_with_no_replica_gives_no_sidecar_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8, 0);
+    let db = fleet.open(&key(&fleet, "acme")).await.unwrap();
+    assert!(db.sidecar_replica("duckdb").unwrap().is_none());
+    assert!(
+        db.sidecar_replica("generations").is_err(),
+        "the name is checked first"
+    );
+}

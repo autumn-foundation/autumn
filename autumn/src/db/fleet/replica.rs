@@ -93,6 +93,14 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         self.inner.replication.get()
     }
 
+    /// The replica of `key`: the destination and its key prefix.
+    pub(super) fn replica_base(&self, key: &FleetDbKey) -> Option<super::ReplicaBase> {
+        self.replication().map(|replication| super::ReplicaBase {
+            destination: Arc::clone(replication.destination()),
+            root: replication.root_for(key),
+        })
+    }
+
     /// Whether the replication has frames it did not ship yet.
     pub(super) fn unshipped(&self) -> bool {
         self.replication().is_some_and(|r| r.closing() > 0)

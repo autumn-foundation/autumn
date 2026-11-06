@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use destination::{DestinationError, FileDestination, ReplicaDestination};
+pub use destination::{DestinationError, FileDestination, ReplicaDestination, ScopedDestination};
 pub use engine::{ReplicationError, ReplicationSettings, Replicator, TickReport};
 pub use restore::{RestoreError, RestoreOutcome, RestorePlan};
 pub use status::{

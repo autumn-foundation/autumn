@@ -193,6 +193,167 @@ pub fn validate_key(key: &str) -> Result<(), DestinationError> {
     Ok(())
 }
 
+/// One prefix of another destination. Each key must be under `root/`.
+///
+/// A fleet gives one to a sidecar engine, so the sidecar ships its own files
+/// next to the primary's replica and cannot write any other key.
+#[derive(Clone)]
+pub struct ScopedDestination {
+    inner: std::sync::Arc<dyn ReplicaDestination>,
+    root: String,
+    /// When set, writes and deletes are refused.
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl fmt::Debug for ScopedDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScopedDestination")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScopedDestination {
+    /// The keys under `root/` of `inner`.
+    ///
+    /// # Errors
+    ///
+    /// [`DestinationError::Rejected`] when `root` is not a valid key.
+    pub fn new(
+        inner: std::sync::Arc<dyn ReplicaDestination>,
+        root: impl Into<String>,
+    ) -> Result<Self, DestinationError> {
+        let root = root.into();
+        validate_key(&root)?;
+        Ok(Self {
+            inner,
+            root,
+            stop: None,
+        })
+    }
+
+    /// Refuse writes and deletes once `stop` is set. Reads still work.
+    #[must_use]
+    pub fn stopped_by(mut self, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    /// Whether the scope refuses writes now.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// The scope, with no `/` at the end. Each key starts with `root/`.
+    #[must_use]
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// The full key of `relative`, under the scope.
+    ///
+    /// # Errors
+    ///
+    /// [`DestinationError::Rejected`] when `relative` is not a valid key.
+    pub fn key(&self, relative: &str) -> Result<String, DestinationError> {
+        validate_key(relative)?;
+        Ok(format!("{}/{relative}", self.root))
+    }
+
+    /// Whether `text` starts with `root/` and has more after it.
+    fn under_root<'a>(&self, text: &'a str) -> Option<&'a str> {
+        text.strip_prefix(self.root.as_str())?
+            .strip_prefix('/')
+            .filter(|rest| !rest.is_empty())
+    }
+
+    fn outside(&self, what: &str, text: &str) -> DestinationError {
+        DestinationError::Rejected {
+            detail: format!("{what} {text:?} is outside the scope {:?}", self.root),
+        }
+    }
+
+    /// A valid key under `root/`. A listing skips a key with `.tmp-`, so a
+    /// purge would not find it: such a key is refused too.
+    fn admit(&self, key: &str) -> Result<(), DestinationError> {
+        validate_key(key)?;
+        if key.contains(".tmp-") {
+            return Err(DestinationError::Rejected {
+                detail: format!("object key {key:?} holds the staging mark \".tmp-\""),
+            });
+        }
+        self.under_root(key)
+            .map(|_| ())
+            .ok_or_else(|| self.outside("object key", key))
+    }
+
+    /// [`admit`](Self::admit), and the scope is not stopped.
+    fn admit_write(&self, key: &str) -> Result<(), DestinationError> {
+        self.admit(key)?;
+        if self.is_stopped() {
+            return Err(DestinationError::Rejected {
+                detail: format!(
+                    "the scope {:?} is stopped: its database closed or lost its slot",
+                    self.root
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// `root/`, or a prefix under it with no `.` or `..` segment.
+    fn admit_prefix(&self, prefix: &str) -> Result<(), DestinationError> {
+        let exact = prefix.strip_prefix(self.root.as_str()) == Some("/");
+        let inside = self
+            .under_root(prefix)
+            .is_some_and(|_| validate_key(prefix.trim_end_matches('/')).is_ok());
+        if exact || inside {
+            Ok(())
+        } else {
+            Err(self.outside("list prefix", prefix))
+        }
+    }
+}
+
+impl ReplicaDestination for ScopedDestination {
+    fn describe(&self) -> String {
+        format!("{} (scope {})", self.inner.describe(), self.root)
+    }
+
+    fn put(&self, key: &str, body: &[u8]) -> Result<(), DestinationError> {
+        self.admit_write(key)?;
+        self.inner.put(key, body)
+    }
+
+    fn put_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
+        self.admit_write(key)?;
+        self.inner.put_file(key, path)
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, DestinationError> {
+        self.admit(key)?;
+        self.inner.get(key)
+    }
+
+    fn get_to_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
+        self.admit(key)?;
+        self.inner.get_to_file(key, path)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>, DestinationError> {
+        self.admit_prefix(prefix)?;
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DestinationError> {
+        self.admit_write(key)?;
+        self.inner.delete(key)
+    }
+}
+
 /// How deep the filesystem destination will walk when listing. Autumn's own
 /// layout is four levels; anything deeper is either a mistake or a planted tree.
 const MAX_LIST_DEPTH: usize = 16;
@@ -483,5 +644,106 @@ mod tests {
             dest.put("../escape", b"x"),
             Err(DestinationError::Rejected { .. })
         ));
+    }
+
+    fn scoped(dir: &Path) -> ScopedDestination {
+        let inner = std::sync::Arc::new(FileDestination::new(dir).expect("dest"));
+        ScopedDestination::new(inner, "prod/fleet/tenant/acme/duckdb").expect("scope")
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "takes the result of a call in place"
+    )]
+    fn rejected<T>(result: Result<T, DestinationError>) -> bool {
+        matches!(result, Err(DestinationError::Rejected { .. }))
+    }
+
+    #[test]
+    fn a_scoped_destination_serves_keys_under_its_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let scope = scoped(tmp.path());
+        assert_eq!(scope.root(), "prod/fleet/tenant/acme/duckdb");
+        let key = scope.key("generations/g1/db").expect("key");
+        assert_eq!(key, "prod/fleet/tenant/acme/duckdb/generations/g1/db");
+        scope.put(&key, b"one").expect("put");
+        assert_eq!(scope.get(&key).expect("get"), b"one");
+        assert_eq!(
+            scope.list("prod/fleet/tenant/acme/duckdb/").expect("list"),
+            std::slice::from_ref(&key)
+        );
+        scope.delete(&key).expect("delete");
+        assert!(
+            scope
+                .describe()
+                .contains("scope prod/fleet/tenant/acme/duckdb")
+        );
+    }
+
+    #[test]
+    fn a_scoped_destination_refuses_keys_outside_its_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let scope = scoped(tmp.path());
+        let outside = [
+            // The primary's replica.
+            "prod/fleet/tenant/acme/generations/g1/snapshot",
+            "prod/fleet/tenant/acme/tombstone",
+            // Another tenant.
+            "prod/fleet/tenant/globex/duckdb/x",
+            // A sibling that shares the text prefix.
+            "prod/fleet/tenant/acme/duckdbx/x",
+            // The root itself, and a way out of it.
+            "prod/fleet/tenant/acme/duckdb",
+            "prod/fleet/tenant/acme/duckdb/../generations/g1/snapshot",
+            "/prod/fleet/tenant/acme/duckdb/x",
+        ];
+        let file = tmp.path().join("body");
+        std::fs::write(&file, b"x").expect("body");
+        for key in outside {
+            assert!(rejected(scope.put(key, b"x")), "put {key}");
+            assert!(rejected(scope.put_file(key, &file)), "put_file {key}");
+            assert!(rejected(scope.get(key)), "get {key}");
+            assert!(rejected(scope.get_to_file(key, &file)), "get_to_file {key}");
+            assert!(rejected(scope.delete(key)), "delete {key}");
+        }
+        for prefix in [
+            "",
+            "prod/fleet/tenant/acme/",
+            "prod/fleet/tenant/acme/duck",
+            "prod/fleet/tenant/acme/duckdb",
+            "prod/fleet/tenant/acme/duckdb/../",
+        ] {
+            assert!(rejected(scope.list(prefix)), "list {prefix:?}");
+        }
+        assert!(rejected(scope.key("../generations")));
+        // A listing skips staging names, so a purge would miss the object.
+        assert!(rejected(
+            scope.put("prod/fleet/tenant/acme/duckdb/x.tmp-1", b"x")
+        ));
+        assert!(rejected(ScopedDestination::new(
+            std::sync::Arc::new(FileDestination::new(tmp.path()).expect("dest")),
+            "a/../b",
+        )));
+    }
+
+    #[test]
+    fn a_stopped_scope_refuses_writes_and_still_reads() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope = scoped(tmp.path()).stopped_by(std::sync::Arc::clone(&stop));
+        let key = scope.key("state").expect("key");
+        scope.put(&key, b"one").expect("put");
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        assert!(scope.is_stopped());
+        let file = tmp.path().join("body");
+        std::fs::write(&file, b"x").expect("body");
+        assert!(rejected(scope.put(&key, b"two")));
+        assert!(rejected(scope.put_file(&key, &file)));
+        assert!(rejected(scope.delete(&key)));
+        assert_eq!(scope.get(&key).expect("get"), b"one");
+        assert_eq!(
+            scope.list("prod/fleet/tenant/acme/duckdb/").expect("list"),
+            [key]
+        );
     }
 }

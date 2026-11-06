@@ -3135,9 +3135,18 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   newer epoch than this host's (`FleetError::NewerEpoch`, `421`).
   Health: `fleet:ownership`. The built-in table is
   on the control database, so it fences the processes of one host only;
-  hosts on different machines implement `SlotOwnershipStore`
-  (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
-  `docs/guide/sqlite-fleet.md`.
+  for hosts on different machines, use
+  `.fleet_ownership_store(PgSlotOwnership::new(pg_pool, clock))` (needs the
+  `postgres` feature next to `sqlite`; one store per fleet) or another
+  `SlotOwnershipStore` (`autumn_web::db::fleet_ownership`). Guide:
+  "Failover: slot ownership" in `docs/guide/sqlite-fleet.md`.
+- An engine plugin (DuckDB, RocksDB) writes its own extractor over
+  `autumn_web::fleet::resolve::<E>(parts, state)`: routing key, owner check
+  (`421`), open, `FleetLease<E>`. Jobs use `resolve_key::<E>(state, id)`.
+  Put the `DatabaseFleet<E>` in the state with `insert_extension`. A sidecar
+  hook ships through `db.sidecar_replica("duckdb")`, a `ScopedDestination`
+  that refuses keys outside `<key prefix>/duckdb/` and writes after a close or
+  a fence. Guide: "Writing a fleet extractor" in `docs/guide/sqlite-fleet.md`.
 - Cross-tenant analytics (0.10.0, issue #3236): query the lake, not the volume.
   `fleet.lake()?.materialize().await?.query(sql)`
   (`autumn_web::db::fleet_lake`) restores each live tenant from its replica
