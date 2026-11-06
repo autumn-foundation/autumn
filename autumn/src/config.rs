@@ -85,6 +85,8 @@
 //! | `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT` | `database.idle_in_transaction_timeout` | duration; empty clears |
 //! | `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` | `database.migration_lock_timeout` | duration; empty is ignored |
 //! | `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES` | `database.migration_lock_retries` | `u32` |
+//! | `AUTUMN_DATABASE__MMAP_SIZE` | `database.mmap_size` | `u64` (bytes; `0` = off) |
+//! | `AUTUMN_DATABASE__CACHE_SIZE_KIB` | `database.cache_size_kib` | `u64` (KiB; `0` = `SQLite` default) |
 //! | `AUTUMN_DATABASE__FLEET__MODE` | `database.fleet.mode` | `tenant` / `slot` |
 //! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
@@ -97,6 +99,8 @@
 //! | `AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE` | `database.fleet.replica_retention_after_delete` | duration; empty is `0` |
 //! | `AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE` | `database.fleet.restore_check_sample` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS` | `database.fleet.replication_workers` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MMAP_SIZE` | `database.fleet.mmap_size` | `u64` (bytes; `0` = off) |
+//! | `AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB` | `database.fleet.cache_size_kib` | `u64` (KiB; `0` = `SQLite` default) |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER` | `database.fleet.ownership.owner` | `String` (creates the section) |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS` | `database.fleet.ownership.slots` | comma-separated `N` / `A-B` |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS` | `database.fleet.ownership.lease_secs` | `u64` |
@@ -7300,6 +7304,8 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__STARTUP_WAIT_SECS` → `database.startup_wait_secs` (u64)
     /// - `AUTUMN_DATABASE__AUTO_MIGRATE` -> `database.auto_migrate` (`Option<bool>`)
     /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
+    /// - `AUTUMN_DATABASE__MMAP_SIZE` -> `database.mmap_size` (u64)
+    /// - `AUTUMN_DATABASE__CACHE_SIZE_KIB` -> `database.cache_size_kib` (u64)
     ///
     /// # Log
     /// - `AUTUMN_LOG__LEVEL` → `log.level` (String, tracing filter directive)
@@ -8089,6 +8095,20 @@ impl AutumnConfig {
         apply_deploy_env_overrides(&mut self.deploy, env);
     }
 
+    /// `database.mmap_size` and `database.cache_size_kib`.
+    fn apply_sqlite_tuning_env_overrides(&mut self, env: &dyn Env) {
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__MMAP_SIZE",
+            &mut self.database.mmap_size,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__CACHE_SIZE_KIB",
+            &mut self.database.cache_size_kib,
+        );
+    }
+
     /// `database.replica_max_lag_ms` and `database.warn_on_pooler` (issue #3065).
     fn apply_replica_lag_and_pooler_env_overrides(&mut self, env: &dyn Env) {
         parse_env_option(
@@ -8149,6 +8169,7 @@ impl AutumnConfig {
             &mut self.database.pin_after_write_secs,
         );
         self.apply_replica_lag_and_pooler_env_overrides(env);
+        self.apply_sqlite_tuning_env_overrides(env);
         parse_env(
             env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
@@ -8233,6 +8254,8 @@ impl AutumnConfig {
                 replica_retention_after_delete: std::time::Duration::ZERO,
                 restore_check_sample: default_fleet_restore_check_sample(),
                 replication_workers: default_fleet_replication_workers(),
+                mmap_size: 0,
+                cache_size_kib: 0,
             });
         }
         let Some(fleet) = self.database.fleet.as_mut() else {
@@ -11770,6 +11793,26 @@ pub struct DatabaseConfig {
     #[serde(default = "default_max_connections_warn_threshold")]
     pub max_connections_warn_threshold: usize,
 
+    /// `SQLite` only: `PRAGMA mmap_size` for each pooled connection, in bytes.
+    /// Default: `0` (off).
+    ///
+    /// Memory-mapped reads can be about two times faster on a large database
+    /// that the app reads often. An I/O error on a mapped file stops the
+    /// process with `SIGBUS`. Read `docs/guide/sqlite-in-production.md`
+    /// before you set it. It does not apply to [`fleet`](Self::fleet).
+    ///
+    /// Override via `AUTUMN_DATABASE__MMAP_SIZE`.
+    #[serde(default)]
+    pub mmap_size: u64,
+
+    /// `SQLite` only: the page cache of each pooled connection, in KiB, set
+    /// as `PRAGMA cache_size = -N`. Default: `0` (the `SQLite` default, about
+    /// 2 MiB). It does not apply to [`fleet`](Self::fleet).
+    ///
+    /// Override via `AUTUMN_DATABASE__CACHE_SIZE_KIB`.
+    #[serde(default)]
+    pub cache_size_kib: u64,
+
     /// A fleet of `SQLite` databases: one file per tenant or one per routing
     /// slot (ADR 0019). `None` (the default) means no fleet.
     ///
@@ -11910,6 +11953,20 @@ pub struct DatabaseFleetConfig {
     /// interval.
     #[serde(default = "default_fleet_replication_workers")]
     pub replication_workers: usize,
+
+    /// `PRAGMA mmap_size` for each fleet database connection, in bytes.
+    /// Default: `0` (off). Separate from `database.mmap_size`.
+    ///
+    /// A fleet file is usually small, and mmap gives it no gain. Each open
+    /// database maps its file once per connection, so the worst case is
+    /// `mmap_size × max_open × pool_size`.
+    #[serde(default)]
+    pub mmap_size: u64,
+
+    /// The page cache of each fleet database connection, in KiB. Default:
+    /// `0` (the `SQLite` default). Separate from `database.cache_size_kib`.
+    #[serde(default)]
+    pub cache_size_kib: u64,
 }
 
 /// `[database.fleet.ownership]`: the slot ranges this host claims on the
@@ -12027,6 +12084,20 @@ impl DatabaseFleetConfig {
             .unwrap_or_else(|| self.mode.default_path())
     }
 
+    /// The read tuning of each fleet database connection.
+    pub(crate) const fn sqlite_tuning(&self) -> crate::db::SqliteTuning {
+        crate::db::SqliteTuning {
+            mmap_size: self.mmap_size,
+            cache_size_kib: self.cache_size_kib,
+        }
+    }
+
+    /// The most fleet connections that can have a map at the same time, at
+    /// `max_open`: `max_open × pool_size`. A burst can open more.
+    pub(crate) const fn sqlite_mmap_connections(&self) -> usize {
+        self.max_open.saturating_mul(self.pool_size)
+    }
+
     /// Whether a missing database is created on first use.
     #[must_use]
     pub fn effective_create_on_demand(&self) -> bool {
@@ -12069,6 +12140,11 @@ impl DatabaseFleetConfig {
                 "database.fleet.replication_workers must be 1 to 64".to_owned(),
             ));
         }
+        check_sqlite_tuning(
+            "database.fleet",
+            self.sqlite_tuning(),
+            self.sqlite_mmap_connections(),
+        )?;
         if let Some(ownership) = &self.ownership {
             ownership.validate()?;
         }
@@ -12086,6 +12162,71 @@ impl DatabaseFleetConfig {
 
 const fn default_fleet_max_open() -> usize {
     256
+}
+
+/// The largest `mmap_size` the bundled `SQLite` uses (`SQLITE_MAX_MMAP_SIZE`).
+/// `SQLite` uses this value in place of a larger value. It does not return an
+/// error.
+const SQLITE_MAX_MMAP_SIZE: u64 = 0x7fff_0000;
+
+/// The address space that `SQLite` memory maps can use on a 32-bit target.
+const MMAP_ADDRESS_BUDGET_32_BIT: u64 = 1 << 30;
+
+/// Check `<prefix>.mmap_size` and `<prefix>.cache_size_kib`. `connections` is
+/// the most connections that can map the file at once.
+fn check_sqlite_tuning(
+    prefix: &str,
+    tuning: crate::db::SqliteTuning,
+    connections: usize,
+) -> Result<(), ConfigError> {
+    // SQLite reads `mmap_size` as a signed 64-bit integer.
+    if tuning.mmap_size > i64::MAX.unsigned_abs() {
+        return Err(ConfigError::Validation(format!(
+            "{prefix}.mmap_size is {}; the maximum is {}",
+            tuning.mmap_size,
+            i64::MAX
+        )));
+    }
+    // SQLite reads `cache_size` as a signed 32-bit integer.
+    if tuning.cache_size_kib > u64::from(i32::MAX.unsigned_abs()) {
+        return Err(ConfigError::Validation(format!(
+            "{prefix}.cache_size_kib is {}; the maximum is {}",
+            tuning.cache_size_kib,
+            i32::MAX
+        )));
+    }
+    check_mmap_address_space(
+        &format!("{prefix}.mmap_size"),
+        mmap_reservation(tuning.mmap_size, connections),
+        usize::BITS,
+    )
+}
+
+/// The address space that `connections` maps of up to `mmap_size` bytes each
+/// can use. `SQLite` caps each map at [`SQLITE_MAX_MMAP_SIZE`].
+fn mmap_reservation(mmap_size: u64, connections: usize) -> u64 {
+    let connections = u64::try_from(connections).unwrap_or(u64::MAX);
+    mmap_size
+        .min(SQLITE_MAX_MMAP_SIZE)
+        .saturating_mul(connections)
+}
+
+/// On a target with `pointer_width` of 32 or less, refuse memory maps that
+/// can use more than [`MMAP_ADDRESS_BUDGET_32_BIT`] in total. A 64-bit target
+/// has address space for any value.
+fn check_mmap_address_space(
+    field: &str,
+    reserved: u64,
+    pointer_width: u32,
+) -> Result<(), ConfigError> {
+    if pointer_width > 32 || reserved <= MMAP_ADDRESS_BUDGET_32_BIT {
+        return Ok(());
+    }
+    Err(ConfigError::Validation(format!(
+        "{field} can map up to {reserved} bytes; on a 32-bit target the total must be \
+         at most {MMAP_ADDRESS_BUDGET_32_BIT} bytes (1 GiB). Decrease the mmap size or \
+         the pool sizes"
+    )))
 }
 
 const fn default_fleet_min_residency() -> std::time::Duration {
@@ -12394,6 +12535,34 @@ pub fn database_backend_consistency(
 }
 
 impl DatabaseConfig {
+    /// The read tuning of each pooled `SQLite` connection. Not the fleet's.
+    pub(crate) const fn sqlite_tuning(&self) -> crate::db::SqliteTuning {
+        crate::db::SqliteTuning {
+            mmap_size: self.mmap_size,
+            cache_size_kib: self.cache_size_kib,
+        }
+    }
+
+    /// The address space that the `SQLite` maps of the control database and
+    /// the fleet can use together.
+    pub(crate) fn sqlite_mmap_reservation(&self) -> u64 {
+        let fleet = self.fleet.as_ref().map_or(0, |fleet| {
+            mmap_reservation(fleet.mmap_size, fleet.sqlite_mmap_connections())
+        });
+        mmap_reservation(self.mmap_size, self.sqlite_mmap_connections()).saturating_add(fleet)
+    }
+
+    /// The most pooled connections that can map the database at once: the
+    /// primary pool, and the replica pool when `replica_url` is set.
+    pub(crate) fn sqlite_mmap_connections(&self) -> usize {
+        let replica = if self.replica_url.is_some() {
+            self.effective_replica_pool_size()
+        } else {
+            0
+        };
+        self.effective_primary_pool_size().saturating_add(replica)
+    }
+
     /// Resolved primary/write database URL.
     #[must_use]
     pub fn effective_primary_url(&self) -> Option<&str> {
@@ -12679,7 +12848,17 @@ impl DatabaseConfig {
             }
         }
         self.resolved_slot_map()?;
+        check_sqlite_tuning(
+            "database",
+            self.sqlite_tuning(),
+            self.sqlite_mmap_connections(),
+        )?;
         self.validate_fleet()?;
+        check_mmap_address_space(
+            "database.mmap_size with database.fleet.mmap_size",
+            self.sqlite_mmap_reservation(),
+            usize::BITS,
+        )?;
         Ok(())
     }
 
@@ -13630,6 +13809,16 @@ fn apply_fleet_replica_env_overrides(fleet: &mut DatabaseFleetConfig, env: &dyn 
         "AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS",
         &mut fleet.replication_workers,
     );
+    parse_env(
+        env,
+        "AUTUMN_DATABASE__FLEET__MMAP_SIZE",
+        &mut fleet.mmap_size,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB",
+        &mut fleet.cache_size_kib,
+    );
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -14093,6 +14282,8 @@ impl Default for DatabaseConfig {
             shards: Vec::new(),
             directory_shard_router: false,
             max_connections_warn_threshold: default_max_connections_warn_threshold(),
+            mmap_size: 0,
+            cache_size_kib: 0,
             fleet: None,
             roles: std::collections::BTreeMap::new(),
         }
@@ -22057,6 +22248,8 @@ path = "/healthz"
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         }
     }
 
@@ -22313,6 +22506,204 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.fleet.unwrap().replication_workers, 2);
+    }
+
+    #[test]
+    fn database_sqlite_tuning_defaults_parse_and_env() {
+        let db = DatabaseConfig::default();
+        assert_eq!(db.mmap_size, 0, "mmap is off by default");
+        assert_eq!(db.cache_size_kib, 0, "SQLite's own cache by default");
+        assert_eq!(db.sqlite_tuning(), crate::db::SqliteTuning::OFF);
+
+        let config: AutumnConfig = toml::from_str(
+            "[database]\nurl = \"sqlite:///var/lib/app/app.db\"\n\
+             mmap_size = 268435456\ncache_size_kib = 65536\n",
+        )
+        .unwrap();
+        assert_eq!(config.database.mmap_size, 268_435_456);
+        assert_eq!(config.database.cache_size_kib, 65_536);
+        assert_eq!(
+            config.database.sqlite_tuning(),
+            crate::db::SqliteTuning {
+                mmap_size: 268_435_456,
+                cache_size_kib: 65_536,
+            }
+        );
+        assert!(config.database.validate().is_ok());
+
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__MMAP_SIZE", "1073741824")
+            .with("AUTUMN_DATABASE__CACHE_SIZE_KIB", "2048");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.mmap_size, 1_073_741_824);
+        assert_eq!(config.database.cache_size_kib, 2048);
+
+        // A negative or non-numeric value is ignored, so the value stays.
+        for bad in ["-1", "lots", "1.5"] {
+            let env = MockEnv::new()
+                .with("AUTUMN_DATABASE__MMAP_SIZE", bad)
+                .with("AUTUMN_DATABASE__CACHE_SIZE_KIB", bad);
+            let mut config = AutumnConfig::default();
+            config.apply_env_overrides_with_env(&env);
+            assert_eq!(config.database.mmap_size, 0, "{bad}");
+            assert_eq!(config.database.cache_size_kib, 0, "{bad}");
+        }
+        // A negative TOML value does not parse.
+        assert!(toml::from_str::<AutumnConfig>("[database]\nmmap_size = -1\n").is_err());
+    }
+
+    #[test]
+    fn fleet_sqlite_tuning_defaults_parse_and_env() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\nmmap_size = 1048576\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+            .unwrap()
+            .database
+            .fleet
+            .unwrap()
+        };
+        let fleet = parse("");
+        // The control value does not reach the fleet.
+        assert_eq!(fleet.mmap_size, 0);
+        assert_eq!(fleet.cache_size_kib, 0);
+        assert_eq!(fleet.sqlite_tuning(), crate::db::SqliteTuning::OFF);
+        let fleet = parse("mmap_size = 4194304\ncache_size_kib = 512");
+        assert_eq!(
+            fleet.sqlite_tuning(),
+            crate::db::SqliteTuning {
+                mmap_size: 4_194_304,
+                cache_size_kib: 512,
+            }
+        );
+        assert!(fleet.validate().is_ok());
+
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "slot")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MMAP_SIZE", "8388608")
+            .with("AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB", "256");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.mmap_size, 0, "the fleet key is separate");
+        let fleet = config.database.fleet.expect("env creates the fleet");
+        assert_eq!(fleet.mmap_size, 8_388_608);
+        assert_eq!(fleet.cache_size_kib, 256);
+    }
+
+    #[test]
+    fn sqlite_tuning_values_sqlite_cannot_read_are_refused() {
+        let db = |mmap_size: u64, cache_size_kib: u64| DatabaseConfig {
+            url: Some("sqlite:///var/lib/app/app.db".to_owned()),
+            mmap_size,
+            cache_size_kib,
+            ..Default::default()
+        };
+        // SQLite reads `mmap_size` as a signed 64-bit and `cache_size` as a
+        // signed 32-bit integer. A 32-bit target also caps the map size.
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            db(i64::MAX.unsigned_abs(), u64::from(i32::MAX.unsigned_abs()))
+                .validate()
+                .is_ok()
+        );
+        assert!(db(0, u64::from(i32::MAX.unsigned_abs())).validate().is_ok());
+        let error = db(i64::MAX.unsigned_abs() + 1, 0)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("database.mmap_size"), "{error}");
+        let error = db(0, u64::from(i32::MAX.unsigned_abs()) + 1)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("database.cache_size_kib"), "{error}");
+
+        let mut fleet = toml::from_str::<AutumnConfig>(
+            "[database.fleet]\nmode = \"slot\"\nroot = \"/data/fleet\"\n",
+        )
+        .unwrap()
+        .database
+        .fleet
+        .unwrap();
+        fleet.mmap_size = u64::MAX;
+        let error = fleet.validate().unwrap_err().to_string();
+        assert!(error.contains("database.fleet.mmap_size"), "{error}");
+        fleet.mmap_size = 0;
+        fleet.cache_size_kib = u64::MAX;
+        let error = fleet.validate().unwrap_err().to_string();
+        assert!(error.contains("database.fleet.cache_size_kib"), "{error}");
+    }
+
+    #[test]
+    fn mmap_address_space_is_capped_on_32_bit_targets_only() {
+        const MIB: u64 = 1024 * 1024;
+        // 64-bit: any value SQLite can read passes.
+        assert!(check_mmap_address_space("database.mmap_size", u64::MAX, 64).is_ok());
+        // 32-bit: the total must fit the budget.
+        assert!(check_mmap_address_space("database.mmap_size", 1024 * MIB, 32).is_ok());
+        let error = check_mmap_address_space("database.mmap_size", 1024 * MIB + 1, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("database.mmap_size"), "{error}");
+        assert!(error.contains("32-bit"), "{error}");
+    }
+
+    #[test]
+    fn mmap_reservation_caps_each_map_and_saturates() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(mmap_reservation(0, usize::MAX), 0);
+        assert_eq!(mmap_reservation(100 * MIB, 10), 1000 * MIB);
+        // SQLite maps at most `SQLITE_MAX_MMAP_SIZE` per connection.
+        assert_eq!(mmap_reservation(1 << 40, 2), 2 * SQLITE_MAX_MMAP_SIZE);
+        assert_eq!(mmap_reservation(u64::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn mmap_reservation_adds_the_control_database_and_the_fleet() {
+        const MIB: u64 = 1024 * 1024;
+        let mut config = toml::from_str::<AutumnConfig>(
+            "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\npool_size = 2\n\
+             mmap_size = 268435456\n\n\
+             [database.fleet]\nmode = \"slot\"\nroot = \"/data/fleet\"\n\
+             max_open = 8\npool_size = 2\nmmap_size = 16777216\n",
+        )
+        .unwrap()
+        .database;
+        // 2 × 256 MiB for the control pool, 8 × 2 × 16 MiB for the fleet.
+        assert_eq!(config.sqlite_mmap_reservation(), 512 * MIB + 256 * MIB);
+        assert!(config.validate().is_ok());
+        config.fleet = None;
+        assert_eq!(config.sqlite_mmap_reservation(), 512 * MIB);
+    }
+
+    #[test]
+    fn mmap_connections_count_every_pool_and_every_fleet_database() {
+        let db = DatabaseConfig {
+            url: Some("sqlite:///var/lib/app/app.db".to_owned()),
+            pool_size: 4,
+            ..Default::default()
+        };
+        assert_eq!(db.sqlite_mmap_connections(), 4);
+        let with_replica = DatabaseConfig {
+            replica_url: Some("sqlite:///var/lib/app/app.db".to_owned()),
+            replica_pool_size: Some(3),
+            ..db
+        };
+        assert_eq!(with_replica.sqlite_mmap_connections(), 7);
+
+        let mut fleet = toml::from_str::<AutumnConfig>(
+            "[database.fleet]\nmode = \"slot\"\nroot = \"/data/fleet\"\nmax_open = 64\npool_size = 2\n",
+        )
+        .unwrap()
+        .database
+        .fleet
+        .unwrap();
+        assert_eq!(fleet.sqlite_mmap_connections(), 128);
+        fleet.max_open = usize::MAX;
+        assert_eq!(fleet.sqlite_mmap_connections(), usize::MAX, "saturates");
     }
 
     #[test]

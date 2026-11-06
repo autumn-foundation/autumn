@@ -1079,6 +1079,8 @@ mod tests {
                 restore_check_sample: 0,
                 replication_workers: 4,
                 min_residency: std::time::Duration::from_secs(2),
+                mmap_size: 0,
+                cache_size_kib: 0,
             })
             // A loaded CI runner can take more than 5 s to open a connection.
             .connect_timeout_secs(60)
@@ -2131,6 +2133,8 @@ mod tests {
                 restore_check_sample: 1,
                 replication_workers: 4,
                 min_residency: std::time::Duration::from_secs(2),
+                mmap_size: 0,
+                cache_size_kib: 0,
             })
             .build()
             .unwrap();
@@ -2197,6 +2201,8 @@ mod tests {
                 restore_check_sample: 0,
                 replication_workers: 4,
                 min_residency: std::time::Duration::from_secs(2),
+                mmap_size: 0,
+                cache_size_kib: 0,
             })
             .build()
             .unwrap();

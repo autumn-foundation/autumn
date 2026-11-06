@@ -821,6 +821,13 @@ name = "ledger_post"
 harness = false
 required-features = ["sqlite"]
 
+# Criterion benches for SQLite memory-mapped reads: point and range reads on a
+# file database, with `mmap_size` off and on. See the file header.
+[[bench]]
+name = "sqlite_mmap_read"
+harness = false
+required-features = ["sqlite"]
+
 # Live-typing workload for the collaborative text CRDT (issue #1806): drives
 # `CollabText::insert_after` one keystroke at a time, the same call
 # `CollabHub`'s message loop makes per op. See the file header for the exact

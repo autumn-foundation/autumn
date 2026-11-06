@@ -180,6 +180,48 @@ let node = GraphNode { /* … */ job: None, background: None };
 **Automation:** `manual` — a new arm needs a label that only the caller can
 choose.
 
+---
+
+### Database: `DatabaseConfig` and `DatabaseFleetConfig` have `mmap_size` and `cache_size_kib`
+
+**Why:** an app can turn on SQLite memory-mapped reads and a larger page
+cache. Both fields are `0` (off) by default. See
+[Memory-mapped reads](../guide/sqlite-in-production.md#memory-mapped-reads-and-the-page-cache).
+
+**You are affected only if your code builds a `DatabaseConfig` with a struct
+literal and no `..Default::default()`, or builds a `DatabaseFleetConfig` with
+a struct literal.** TOML and `AUTUMN_*` config need no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    // ...every other field...
+    replication_workers: 4,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    // ...every other field...
+    replication_workers: 4,
+    mmap_size: 0,
+    cache_size_kib: 0,
+}
+```
+
+Add the same two fields to a `DatabaseConfig` literal, or end it with
+`..Default::default()`.
+
+**Automation:** `manual` — `0` keeps the old behavior, but a codemod cannot
+know if the app wants a different value.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**

@@ -41,6 +41,8 @@ idle_close_secs = 300           # close a database idle this long
 # replica_retention_after_delete = "0s"  # see "Deleting a database's replica"
 # restore_check_sample = 1      # see "Restore check"
 # replication_workers = 4       # see "Replication lag"
+# mmap_size = 0                 # bytes; see "Memory-mapped reads"
+# cache_size_kib = 0            # KiB; 0 = SQLite default
 
 # [database.fleet.ownership]    # see "Failover: slot ownership" below
 # owner = "host-a"
@@ -775,6 +777,29 @@ selects that generation.
 Do not restore the control database to an earlier time while ownership is
 on. If its epoch counter goes back, the next claim after a fence still goes
 above the epoch that the replicator found.
+
+## Memory-mapped reads
+
+`database.fleet.mmap_size` and `database.fleet.cache_size_kib` tune the
+fleet databases. They are separate from `database.mmap_size` and
+`database.cache_size_kib`, which tune only the control database. All four are
+off by default.
+
+For most fleets, keep these values at 0. A fleet file is small. SQLite keeps
+its pages in its cache. A fleet of 384 small files saw no change with
+mmap on.
+
+Turn on `mmap_size` only for a fleet of large, read-heavy files. Read
+[Memory-mapped reads](./sqlite-in-production.md#memory-mapped-reads-and-the-page-cache)
+first: an I/O error on a mapped file stops the process with `SIGBUS`.
+
+Each open database maps its file once for each connection. The worst case is
+`mmap_size` × `max_open` × `pool_size`. `max_open` is a soft limit, so a burst
+can map more. On a 32-bit target, config validation refuses a worst case over
+1 GiB, with the control database included.
+
+Replication, `restore_missing`, LRU close and reopen work with mmap on. A
+close drops the pool, and its connections unmap the file.
 
 ## Limits
 

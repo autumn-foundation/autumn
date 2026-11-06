@@ -370,9 +370,10 @@ async fn open(url: String, link: Option<DbLink>) -> diesel::ConnectionResult<Run
             ));
         }
         let mut conn = diesel::SqliteConnection::establish(&url)?;
-        conn.batch_execute(crate::db::sqlite_connection_pragmas(
+        conn.batch_execute(&crate::db::sqlite_connection_pragmas(
             false,
             crate::db::sqlite_replication_active(),
+            crate::db::SqliteTuning::OFF,
         ))
         .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
         if let Some(link) = link.0 {
