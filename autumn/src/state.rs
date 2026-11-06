@@ -328,6 +328,33 @@ impl crate::authorization::ProvideAuthorizationState for AppState {
     }
 }
 
+#[cfg(feature = "ws")]
+impl AppState {
+    /// Route channel publications through `interceptors`.
+    ///
+    /// Wraps the channel backend. The presence tracker and the collaboration
+    /// hub hold the old channels, so this builds them again on the new ones.
+    pub(crate) fn intercept_channels(
+        &mut self,
+        interceptors: Vec<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    ) {
+        let backend = Arc::new(crate::channels::InterceptedChannelsBackend::new(
+            self.channels.backend().clone(),
+            interceptors,
+        ));
+        self.fields_mut().channels = Channels::with_shared_backend(backend);
+        #[cfg(feature = "presence")]
+        {
+            self.fields_mut().presence = Presence::new(self.channels.clone());
+            #[cfg(feature = "collab")]
+            {
+                self.fields_mut().collab =
+                    CollabHub::new(self.channels.clone(), self.presence.clone());
+            }
+        }
+    }
+}
+
 impl AppState {
     /// A state that owns these fields.
     pub(crate) fn from_inner(inner: AppStateInner) -> Self {
@@ -1594,6 +1621,44 @@ mod tests {
         let state = super::AppState::for_test();
         let clone = state.clone();
         assert!(super::AppState::shares_fields(&state, &clone));
+    }
+
+    /// Counts the publications it sees.
+    #[cfg(feature = "ws")]
+    #[derive(Default)]
+    struct CountPublishes(std::sync::atomic::AtomicUsize);
+
+    #[cfg(feature = "ws")]
+    impl crate::interceptor::ChannelsInterceptor for CountPublishes {
+        fn intercept_publish(
+            &self,
+            topic: &str,
+            msg: &crate::channels::ChannelMessage,
+            next: &dyn Fn(
+                &str,
+                &crate::channels::ChannelMessage,
+            ) -> Result<usize, crate::channels::ChannelPublishError>,
+        ) -> Result<usize, crate::channels::ChannelPublishError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            next(topic, msg)
+        }
+    }
+
+    /// An intercepted state sends each publication through the interceptor.
+    /// The clone taken before keeps its own channels.
+    #[cfg(feature = "ws")]
+    #[test]
+    fn intercept_channels_routes_publications_through_the_interceptor() {
+        let counter = Arc::new(CountPublishes::default());
+        let mut state = super::AppState::for_test();
+        let before = state.clone();
+        state.intercept_channels(vec![counter.clone()]);
+
+        state.channels().publish("topic", "one").expect("publish");
+        before.channels().publish("topic", "two").expect("publish");
+
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!super::AppState::shares_fields(&state, &before));
     }
 
     /// A builder call on a clone changes only that clone.

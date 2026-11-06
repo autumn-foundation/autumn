@@ -2533,25 +2533,7 @@ impl TestApp {
             // AC6: install nothing (and leave production `Channels` untouched)
             // unless at least one interceptor was requested.
             if !interceptors.is_empty() {
-                state.fields_mut().channels = crate::channels::Channels::with_shared_backend(
-                    std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
-                        state.channels.backend().clone(),
-                        interceptors,
-                    )),
-                );
-                #[cfg(feature = "presence")]
-                {
-                    state.fields_mut().presence =
-                        crate::presence::Presence::new(state.channels.clone());
-                    // Same reason as `app.rs`: the hub captured the old pair.
-                    #[cfg(feature = "collab")]
-                    {
-                        state.fields_mut().collab = crate::collab::CollabHub::new(
-                            state.channels.clone(),
-                            state.presence.clone(),
-                        );
-                    }
-                }
+                state.intercept_channels(interceptors);
             }
             recorder_for_client
         };

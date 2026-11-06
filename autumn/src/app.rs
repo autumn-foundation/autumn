@@ -5067,27 +5067,7 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.fields_mut().channels = crate::channels::Channels::with_shared_backend(
-                std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                )),
-            );
-            #[cfg(feature = "presence")]
-            {
-                state.fields_mut().presence =
-                    crate::presence::Presence::new(state.channels.clone());
-                // The collaboration hub holds the channel registry and the
-                // presence tracker it was built with, so replacing either
-                // leaves it publishing into the old backend (#1806).
-                #[cfg(feature = "collab")]
-                {
-                    state.fields_mut().collab = crate::collab::CollabHub::new(
-                        state.channels.clone(),
-                        state.presence.clone(),
-                    );
-                }
-            }
+            state.intercept_channels(vec![interceptor]);
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -7421,27 +7401,7 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.fields_mut().channels = crate::channels::Channels::with_shared_backend(
-                std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                )),
-            );
-            #[cfg(feature = "presence")]
-            {
-                state.fields_mut().presence =
-                    crate::presence::Presence::new(state.channels.clone());
-                // The collaboration hub holds the channel registry and the
-                // presence tracker it was built with, so replacing either
-                // leaves it publishing into the old backend (#1806).
-                #[cfg(feature = "collab")]
-                {
-                    state.fields_mut().collab = crate::collab::CollabHub::new(
-                        state.channels.clone(),
-                        state.presence.clone(),
-                    );
-                }
-            }
+            state.intercept_channels(vec![interceptor]);
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
@@ -9261,27 +9221,7 @@ impl AppBuilder {
         #[cfg(feature = "ws")]
         if let Some(interceptor) = channels_interceptor {
             state.insert_extension(interceptor.clone());
-            state.fields_mut().channels = crate::channels::Channels::with_shared_backend(
-                std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                )),
-            );
-            #[cfg(feature = "presence")]
-            {
-                state.fields_mut().presence =
-                    crate::presence::Presence::new(state.channels.clone());
-                // The collaboration hub holds the channel registry and the
-                // presence tracker it was built with, so replacing either
-                // leaves it publishing into the old backend (#1806).
-                #[cfg(feature = "collab")]
-                {
-                    state.fields_mut().collab = crate::collab::CollabHub::new(
-                        state.channels.clone(),
-                        state.presence.clone(),
-                    );
-                }
-            }
+            state.intercept_channels(vec![interceptor]);
         }
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = http_interceptor {
