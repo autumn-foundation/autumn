@@ -1015,6 +1015,30 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - name: Free disk space (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # A cold build of every workspace test, and the kache store beside
+          # it, fill the macOS runner's disk, as `test-build` notes for
+          # Linux. The runner then stops answering: "The hosted runner lost
+          # communication with the server", with no log. Remove what a Rust
+          # build does not use. Keep the selected Xcode: ld-prime is in it.
+          df -h /
+          selected="$(cd "$(xcode-select -p)/../.." && pwd -P)"
+          for app in /Applications/Xcode*.app; do
+            [ -L "$app" ] && continue
+            [ "$(cd "$app" && pwd -P)" = "$selected" ] && continue
+            sudo rm -rf "$app" &
+          done
+          sudo rm -rf \
+            "$HOME/Library/Android" \
+            "$RUNNER_TOOL_CACHE" \
+            "$HOME/.dotnet" \
+            /usr/local/share/dotnet \
+            /usr/local/lib/node_modules &
+          wait
+          df -h /
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: ./.github/actions/kache
         continue-on-error: true
@@ -1028,10 +1052,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The macOS runner has 3 cores and 7 GB. With one compile job per
-          # core, a cold build swaps until the runner stops answering: "The
-          # hosted runner lost communication with the server", 1h45m to 2h26m
-          # into this step. Two jobs keep the peak inside memory.
+          # The macOS runner has 3 cores and 7 GB. At one compile job per
+          # core, a cold build swaps hard (3.3 GB, see above). Two jobs lower
+          # the memory peak.
           if [ "${RUNNER_OS}" = "macOS" ]; then
             export CARGO_BUILD_JOBS=2
           fi

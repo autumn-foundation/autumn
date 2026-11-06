@@ -1134,6 +1134,12 @@ fn test_shards_partition_the_workspace_nextest_archive() {
         ),
         "`test-archive` must cap the macOS build at two compile jobs"
     );
+    // A cold macOS build fills the disk, and the runner is lost with no log.
+    assert!(
+        ci_job(&ci, "test-archive")
+            .contains("- name: Free disk space (macOS)\n        if: runner.os == 'macOS'\n"),
+        "`test-archive` must free disk space on macOS before the build"
+    );
 
     let doctest = ci_job(&ci, "doctest");
     assert!(
