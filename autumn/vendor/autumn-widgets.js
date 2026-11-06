@@ -22,10 +22,8 @@
   //   data-autumn-dismiss              Escape, outside click or focus-out closes
   //   data-autumn-dismiss="escape"     only Escape closes (a tooltip)
   //
-  // A roving list with role="tree" also gets the APG tree keys: Right
-  // opens or goes to the first child, Left closes or goes to the parent,
-  // `*` opens the siblings. `autumn:expand` and `autumn:collapse` fire on
-  // the item. Items in a hidden subtree are not reachable.
+  // role="tree" adds the APG tree keys (Right, Left, `*`) and fires
+  // `autumn:expand` and `autumn:collapse` on the item.
   //
   // The controller (or trigger) is the element whose aria-controls names the
   // list (or layer). A role="tooltip" layer's trigger names it in
@@ -51,7 +49,6 @@
     el.dispatchEvent(new CustomEvent(name, { bubbles: true, detail: { item: item } }));
   }
 
-  // True when an element between `el` and `list` is hidden.
   function inHidden(el, list) {
     for (var p = el.parentElement; p && p !== list; p = p.parentElement) {
       if (p.hidden) return true;
@@ -59,12 +56,13 @@
     return false;
   }
 
-  // The items of a list: not disabled, not hidden, not in a hidden subtree,
-  // not in a nested list.
+  // The items of a list: not disabled, not hidden (or in a hidden subtree),
+  // not in a nested list. A tree keeps disabled items: they take focus.
   function listItems(list) {
     var sel = list.getAttribute('data-autumn-roving') || ITEMS;
+    var tree = list.getAttribute('role') === 'tree';
     return Array.prototype.filter.call(list.querySelectorAll(sel), function (el) {
-      return !el.hidden && el.getAttribute('aria-disabled') !== 'true' &&
+      return !el.hidden && (tree || el.getAttribute('aria-disabled') !== 'true') &&
         el.closest(LIST) === list && !inHidden(el, list);
     });
   }
@@ -216,13 +214,13 @@
     }
   }
 
-  // ── Tree keys (APG tree view) ──
+  // ── Tree keys ──
   // A parent treeitem holds its role="group", or names it in aria-owns.
-  function groupOf(item) {
+  function groupOf(item, list) {
     var ids = (item.getAttribute('aria-owns') || '').split(/\s+/);
     for (var i = 0; i < ids.length; i++) {
       var owned = ids[i] && document.getElementById(ids[i]);
-      if (owned && owned.getAttribute('role') === 'group') return owned;
+      if (owned && owned.getAttribute('role') === 'group' && list.contains(owned)) return owned;
     }
     for (var j = 0; j < item.children.length; j++) {
       if (item.children[j].getAttribute('role') === 'group') return item.children[j];
@@ -230,37 +228,46 @@
     return null;
   }
 
-  function parentItem(item, list) {
-    var group = item.parentElement && item.parentElement.closest('[role="group"]');
-    if (!group || !list.contains(group)) return null;
-    var owner = group.id && list.querySelector('[aria-owns~="' + CSS.escape(group.id) + '"]');
-    if (owner) return owner;
+  // The treeitem that holds or owns `group`. An owner is often a sibling.
+  function ownerOf(group, list) {
     var parent = group.parentElement;
-    return parent && parent.getAttribute('role') === 'treeitem' ? parent : null;
+    if (parent && parent.getAttribute('role') === 'treeitem') return parent;
+    if (!group.id) return null;
+    var sel = '[role="treeitem"][aria-owns~="' + CSS.escape(group.id) + '"]';
+    for (var i = 0; parent && i < parent.children.length; i++) {
+      if (parent.children[i].matches(sel)) return parent.children[i];
+    }
+    return list.querySelector(sel);
   }
 
-  function setExpanded(item, open) {
-    var group = groupOf(item);
+  function parentItem(item, list) {
+    var group = item.parentElement && item.parentElement.closest('[role="group"]');
+    return group && list.contains(group) ? ownerOf(group, list) : null;
+  }
+
+  function setExpanded(item, list, open) {
+    var group = groupOf(item, list);
     item.setAttribute('aria-expanded', open ? 'true' : 'false');
     if (group) group.hidden = !open;
     emit(item, open ? 'autumn:expand' : 'autumn:collapse', item);
   }
 
-  // Right, Left and `*`. Return true when the key belongs to the tree.
+  // Return true when the tree takes the key.
   function treeKey(e, list, all, item) {
     var rtl = getComputedStyle(list).direction === 'rtl';
     var open = item.getAttribute('aria-expanded');
     if (e.key === (rtl ? 'ArrowLeft' : 'ArrowRight')) {
-      if (open === 'false') setExpanded(item, true);
+      if (open === 'false') setExpanded(item, list, true);
       else if (open === 'true') {
+        var group = groupOf(item, list);
         var first = all[all.indexOf(item) + 1];
-        if (first && parentItem(first, list) === item) focusItem(list, first);
+        if (first && group && group.contains(first)) focusItem(list, first);
       }
       return true;
     }
     if (e.key === (rtl ? 'ArrowRight' : 'ArrowLeft')) {
       var up = parentItem(item, list);
-      if (open === 'true') setExpanded(item, false);
+      if (open === 'true') setExpanded(item, list, false);
       else if (up && all.indexOf(up) >= 0) focusItem(list, up);
       return true;
     }
@@ -268,7 +275,7 @@
       var parent = parentItem(item, list);
       all.forEach(function (el) {
         if (el.getAttribute('aria-expanded') === 'false' && parentItem(el, list) === parent) {
-          setExpanded(el, true);
+          setExpanded(el, list, true);
         }
       });
       return true;

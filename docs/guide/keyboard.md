@@ -17,7 +17,9 @@ The shipped widgets use the core:
 | `autocomplete_input` with `.multiple()` | Combobox, and a roving list of chips | Backspace in an empty input removes the last chip. ArrowLeft moves to the chips. Delete removes one. See [Tags keyboard](active-search-and-autocomplete.md#tags-keyboard). |
 | `NavMenu` in `nav_bar`, `dropdown_menu` | Menu button | Enter, Space, ArrowDown or ArrowUp opens; ArrowDown/ArrowUp, Home/End, a letter, Escape, Tab. See [Popover and Dropdown Menu](popover-and-menu.md). |
 | `tooltip` | Tooltip | Escape hides the text. See [Tooltip](tooltip.md) |
-| `role="tree"` lists, for example the `autumn-plugin-tree` pack | Tree view | ArrowDown/ArrowUp, Home/End, typeahead, ArrowRight/ArrowLeft, `*`. See [Tree keys](#tree-keys). |
+
+A widget pack can use the core too. A `role="tree"` list gets the tree keys.
+See [Tree keys](#tree-keys).
 
 Load the runtime once in your layout:
 
@@ -47,7 +49,8 @@ Rules:
   `data-autumn-roving` to change them. The core skips an item that has
   `aria-disabled="true"`, or that has the `hidden` attribute on it or on an
   element between it and the list. It also skips the items of a nested
-  list.
+  list. A tree keeps its disabled items: they take focus, so their
+  children stay reachable.
 - **Controller and trigger.** The core finds them through `aria-controls`.
   The element whose `aria-controls` names the list is the controller. The
   element whose `aria-controls` names the layer is the trigger. For a
@@ -104,8 +107,8 @@ children, or names the list in `aria-owns`. An end node has no
 | ArrowDown, ArrowUp | Move to the next or the previous visible item. |
 | Home, End | Move to the first or the last visible item. |
 | ArrowRight | On a closed node: open it. On an open node: move to its first child. On an end node: nothing. |
-| ArrowLeft | On an open node: close it. On a child: move to its parent. On a closed root node: nothing. |
-| `*` | Open all sibling nodes. |
+| ArrowLeft | On an open node: close it. On a closed node or an end node: move to its parent. On a closed root node: nothing. |
+| `*` | Open each closed node at the level of the focused node, the focused node too. Focus does not move. |
 | A letter | Typeahead over the visible items. |
 
 To open or close a node, the core sets `aria-expanded` and the `hidden`
@@ -208,8 +211,8 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 61 KiB |
-| `autumn-widgets.js`, gzip level 9 | 18 KiB |
+| `autumn-widgets.js`, raw | 72 KiB |
+| `autumn-widgets.js`, gzip level 9 | 21 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
 above the budget. Raise the budget only with a reason in the PR. Issue
@@ -220,6 +223,10 @@ Issue #3402 added the popover menu runtime. Together they increased them from
 increased them from 44 KiB and 13 KiB. Issue #3411 added the direct upload
 controller. It increased them from 46 KiB and 14 KiB. Issue #3410 added the
 tags mode of the combobox (chips). It increased them from 54 KiB and 16 KiB.
+Issue #3412 added the password reveal, the strength hint and the one-time
+code format. It increased them from 61 KiB and 18 KiB. Issue #3417 added the
+tree keys. It increased them from 70 KiB and 20 KiB. The measure includes
+the search part of the bundle.
 
 ## Tests
 

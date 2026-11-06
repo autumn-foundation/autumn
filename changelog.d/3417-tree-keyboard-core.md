@@ -4,12 +4,13 @@
   `data-autumn-roving` list with `role="tree"`, Right opens a branch or goes
   to its first child, Left closes a branch or goes to its parent, and `*`
   opens the siblings. `autumn:expand` and `autumn:collapse` fire on the
-  item. The `autumn-plugin-tree` widget pack uses them.
+  item. A parent item holds its `role="group"`, or names it in
+  `aria-owns`. Disabled tree items take focus.
 
 ### Fixed
 
-- **widgets:** the keyboard core skips an item in a `hidden` subtree. Down
-  Arrow and typeahead no longer go into a closed branch.
+- **widgets:** the keyboard core skips an item in a `hidden` subtree.
+  ArrowDown and typeahead no longer go into a closed branch.
 - **forms:** `FieldContext::group_item` does not write `required` on a
   checkbox. `required` on a box means "check this box", as
-  `checkbox_group` already says.
+  `checkbox_group` already does.

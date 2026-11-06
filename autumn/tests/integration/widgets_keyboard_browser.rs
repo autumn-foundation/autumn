@@ -302,6 +302,28 @@ fn row_tree() -> Markup {
     }
 }
 
+/// A tree with a disabled parent: `d` (`x`) is disabled, `e` is not.
+fn disabled_tree() -> Markup {
+    html! {
+        ul id="dt" role="tree" aria-label="Files" data-autumn-roving
+            data-autumn-orientation="vertical" {
+            li id="dt-d" role="treeitem" aria-expanded="false" aria-disabled="true" {
+                span { "d" }
+                ul role="group" hidden {
+                    li id="dt-x" role="treeitem" aria-disabled="true" { "x" }
+                    li id="dt-z" role="treeitem" { "z" }
+                }
+            }
+            li id="dt-e" role="treeitem" { "e" }
+        }
+    }
+}
+
+#[get("/tree-disabled")]
+async fn tree_disabled_page() -> Markup {
+    layout("ltr", &disabled_tree())
+}
+
 #[get("/tree-rows")]
 async fn tree_rows_page() -> Markup {
     layout("ltr", &row_tree())
@@ -334,7 +356,8 @@ async fn runner() -> SystemTestRunner {
                 submitted_multi,
                 tree_page,
                 tree_rtl_page,
-                tree_rows_page
+                tree_rows_page,
+                tree_disabled_page
             ])
             .build(),
     )
@@ -1584,7 +1607,7 @@ async fn widgets_run_under_the_default_csp_with_no_inline_script() {
 
 // ── Tree view ───────────────────────────────────────────────────────────
 
-/// Count `autumn:expand` and `autumn:collapse` on the window.
+/// Record each `autumn:expand` and `autumn:collapse` in `window.treeEvents`.
 async fn count_tree_events(page: &Page) {
     assert!(
         eval_bool(
@@ -1749,4 +1772,23 @@ async fn tree_keys_follow_aria_owns_for_row_items() {
     assert_eq!(active_id(&page).await, "r-src");
     press(&page, "*").await;
     assert_eq!(attr(&page, "r-docs", "aria-expanded").await, "true");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_disabled_items_take_focus_so_their_children_stay_reachable() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree-disabled").await;
+    assert_eq!(attr(&page, "dt-d", "tabindex").await, "0");
+    focus(&page, "dt-d").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(attr(&page, "dt-d", "aria-expanded").await, "true");
+    // The first child is disabled. Right still moves to it.
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "dt-x");
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_id(&page).await, "dt-z");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "dt-d");
 }

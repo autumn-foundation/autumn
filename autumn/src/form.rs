@@ -6608,8 +6608,8 @@ impl<'a> FieldContext<'a> {
     /// Write one input of a grouped control, for example one radio.
     ///
     /// The element gets `id="{field}-{suffix}"`, `name` (on a form
-    /// element), `required` (on `input`, `select` and `textarea`, but not
-    /// on a checkbox),
+    /// element), `required` (on `input`, `select` and `textarea`, not on a
+    /// checkbox),
     /// `aria-invalid="true"` when the field has errors, and the
     /// [`FieldOptions`] attributes. Set `type`, `value`, `class` and
     /// `checked` in `attrs`. The method removes the same names from `attrs`
