@@ -324,6 +324,28 @@ async fn tree_disabled_page() -> Markup {
     layout("ltr", &disabled_tree())
 }
 
+/// A tree whose owned group is far from its owner: after the other root
+/// item.
+fn far_owned_tree() -> Markup {
+    html! {
+        ul id="f" role="tree" aria-label="Files" data-autumn-roving
+            data-autumn-orientation="vertical" {
+            li role="none" {
+                div id="f-src" role="treeitem" aria-expanded="false" aria-owns="f-src-group" { "src" }
+            }
+            li role="none" { div id="f-readme" role="treeitem" { "README.md" } }
+            ul id="f-src-group" role="group" hidden {
+                li role="none" { div id="f-lib" role="treeitem" { "lib.rs" } }
+            }
+        }
+    }
+}
+
+#[get("/tree-far")]
+async fn tree_far_page() -> Markup {
+    layout("ltr", &far_owned_tree())
+}
+
 #[get("/tree-rows")]
 async fn tree_rows_page() -> Markup {
     layout("ltr", &row_tree())
@@ -357,7 +379,8 @@ async fn runner() -> SystemTestRunner {
                 tree_page,
                 tree_rtl_page,
                 tree_rows_page,
-                tree_disabled_page
+                tree_disabled_page,
+                tree_far_page
             ])
             .build(),
     )
@@ -1801,4 +1824,19 @@ async fn tree_disabled_items_take_focus_so_their_children_stay_reachable() {
     assert_eq!(active_id(&page).await, "dt-z");
     press(&page, "ArrowLeft").await;
     assert_eq!(active_id(&page).await, "dt-d");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_right_finds_the_first_child_of_a_far_owned_group() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree-far").await;
+    focus(&page, "f-src").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(attr(&page, "f-src", "aria-expanded").await, "true");
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "f-lib");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "f-src");
 }

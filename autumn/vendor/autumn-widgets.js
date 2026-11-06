@@ -261,9 +261,10 @@
     if (e.key === (rtl ? 'ArrowLeft' : 'ArrowRight')) {
       if (open === 'false') setExpanded(item, list, true);
       else if (open === 'true') {
+        // The first visible item in the group. An owned group can be anywhere.
         var group = groupOf(item, list);
-        var first = all[all.indexOf(item) + 1];
-        if (first && group && group.contains(first)) focusItem(list, first);
+        var first = group && all.filter(function (el) { return group.contains(el); })[0];
+        if (first) focusItem(list, first);
       }
       return true;
     }
