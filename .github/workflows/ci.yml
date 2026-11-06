@@ -1024,6 +1024,15 @@ jobs:
       - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-nextest@0.9.149
+      - name: Cap the macOS compile at two jobs
+        # The macOS runner has 3 cores and 7 GB. At one job per core the build
+        # swaps (see the job comment), and since 2026-11-05 the host loses the
+        # runner mid-build ("lost communication with the server"), on
+        # trunk-dev too. Two jobs bound the peak, as in the `lint` job.
+        # Windows keeps one job per core.
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - name: Archive the workspace test build
         shell: bash
         run: |
