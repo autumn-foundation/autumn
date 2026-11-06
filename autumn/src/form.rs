@@ -11816,7 +11816,10 @@ mod custom_control_tests {
             html.contains(r#"<input type="radio" id="due-c" name="due" required value="c">"#),
             "{html}"
         );
-        assert!(html.contains("autumn-field__required"), "the legend keeps the marker: {html}");
+        assert!(
+            html.contains("autumn-field__required"),
+            "the legend keeps the marker: {html}"
+        );
     }
 
     #[test]

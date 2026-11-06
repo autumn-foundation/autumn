@@ -217,17 +217,25 @@
   }
 
   // ── Tree keys (APG tree view) ──
-  // A parent treeitem holds its role="group" child.
+  // A parent treeitem holds its role="group", or names it in aria-owns.
   function groupOf(item) {
-    for (var i = 0; i < item.children.length; i++) {
-      if (item.children[i].getAttribute('role') === 'group') return item.children[i];
+    var ids = (item.getAttribute('aria-owns') || '').split(/\s+/);
+    for (var i = 0; i < ids.length; i++) {
+      var owned = ids[i] && document.getElementById(ids[i]);
+      if (owned && owned.getAttribute('role') === 'group') return owned;
+    }
+    for (var j = 0; j < item.children.length; j++) {
+      if (item.children[j].getAttribute('role') === 'group') return item.children[j];
     }
     return null;
   }
 
   function parentItem(item, list) {
     var group = item.parentElement && item.parentElement.closest('[role="group"]');
-    var parent = group && list.contains(group) ? group.parentElement : null;
+    if (!group || !list.contains(group)) return null;
+    var owner = group.id && list.querySelector('[aria-owns~="' + CSS.escape(group.id) + '"]');
+    if (owner) return owner;
+    var parent = group.parentElement;
     return parent && parent.getAttribute('role') === 'treeitem' ? parent : null;
   }
 
@@ -251,15 +259,17 @@
       return true;
     }
     if (e.key === (rtl ? 'ArrowRight' : 'ArrowLeft')) {
-      var parent = parentItem(item, list);
+      var up = parentItem(item, list);
       if (open === 'true') setExpanded(item, false);
-      else if (parent && all.indexOf(parent) >= 0) focusItem(list, parent);
+      else if (up && all.indexOf(up) >= 0) focusItem(list, up);
       return true;
     }
     if (e.key === '*') {
-      Array.prototype.forEach.call(item.parentElement.children, function (el) {
-        if (el.getAttribute('role') === 'treeitem' && el.getAttribute('aria-expanded') === 'false' &&
-          el.getAttribute('aria-disabled') !== 'true') setExpanded(el, true);
+      var parent = parentItem(item, list);
+      all.forEach(function (el) {
+        if (el.getAttribute('aria-expanded') === 'false' && parentItem(el, list) === parent) {
+          setExpanded(el, true);
+        }
       });
       return true;
     }

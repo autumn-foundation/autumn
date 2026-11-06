@@ -274,6 +274,39 @@ fn file_tree() -> Markup {
     }
 }
 
+/// The same tree with row items: `li role="none"` holds the item and its
+/// group, and the item names the group in `aria-owns`.
+fn row_tree() -> Markup {
+    html! {
+        ul id="r" role="tree" aria-label="Files" data-autumn-roving
+            data-autumn-orientation="vertical" {
+            li role="none" {
+                div id="r-src" role="treeitem" aria-expanded="false" aria-owns="r-src-group" { "src" }
+                ul id="r-src-group" role="group" hidden {
+                    li role="none" { div id="r-lib" role="treeitem" { "lib.rs" } }
+                    li role="none" {
+                        div id="r-bin" role="treeitem" aria-expanded="false" aria-owns="r-bin-group" { "bin" }
+                        ul id="r-bin-group" role="group" hidden {
+                            li role="none" { div id="r-main" role="treeitem" { "main.rs" } }
+                        }
+                    }
+                }
+            }
+            li role="none" {
+                div id="r-docs" role="treeitem" aria-expanded="false" aria-owns="r-docs-group" { "docs" }
+                ul id="r-docs-group" role="group" hidden {
+                    li role="none" { div id="r-guide" role="treeitem" { "guide.md" } }
+                }
+            }
+        }
+    }
+}
+
+#[get("/tree-rows")]
+async fn tree_rows_page() -> Markup {
+    layout("ltr", &row_tree())
+}
+
 #[get("/tree")]
 async fn tree_page() -> Markup {
     layout("ltr", &file_tree())
@@ -300,7 +333,8 @@ async fn runner() -> SystemTestRunner {
                 submitted,
                 submitted_multi,
                 tree_page,
-                tree_rtl_page
+                tree_rtl_page,
+                tree_rows_page
             ])
             .build(),
     )
@@ -1593,8 +1627,18 @@ async fn tree_right_opens_a_branch_then_moves_to_its_first_child() {
     focus(&page, "t-src").await;
     press(&page, "ArrowRight").await;
     assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
-    assert_eq!(active_id(&page).await, "t-src", "Right on a closed node keeps focus");
-    assert!(eval_bool(&page, "!document.querySelector('#t-src > [role=group]').hidden").await);
+    assert_eq!(
+        active_id(&page).await,
+        "t-src",
+        "Right on a closed node keeps focus"
+    );
+    assert!(
+        eval_bool(
+            &page,
+            "!document.querySelector('#t-src > [role=group]').hidden"
+        )
+        .await
+    );
     press(&page, "ArrowRight").await;
     assert_eq!(active_id(&page).await, "t-lib");
     // Right on an end node does nothing.
@@ -1620,7 +1664,11 @@ async fn tree_left_closes_a_branch_then_moves_to_its_parent() {
     press(&page, "ArrowRight").await;
     assert_eq!(active_id(&page).await, "t-lib");
     press(&page, "ArrowLeft").await;
-    assert_eq!(active_id(&page).await, "t-src", "Left on a child moves to the parent");
+    assert_eq!(
+        active_id(&page).await,
+        "t-src",
+        "Left on a child moves to the parent"
+    );
     assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
     press(&page, "ArrowLeft").await;
     assert_eq!(attr(&page, "t-src", "aria-expanded").await, "false");
@@ -1662,4 +1710,43 @@ async fn rtl_tree_swaps_left_and_right() {
     assert_eq!(active_id(&page).await, "t-lib");
     press(&page, "ArrowRight").await;
     assert_eq!(active_id(&page).await, "t-src");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_keys_follow_aria_owns_for_row_items() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree-rows").await;
+    focus(&page, "r-src").await;
+    press(&page, "ArrowDown").await;
+    assert_eq!(
+        active_id(&page).await,
+        "r-docs",
+        "the closed branch is skipped"
+    );
+    press(&page, "ArrowUp").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(attr(&page, "r-src", "aria-expanded").await, "true");
+    assert!(eval_bool(&page, "!document.getElementById('r-src-group').hidden").await);
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "r-lib");
+    press(&page, "ArrowDown").await;
+    // `*` opens each closed node at this level, the focused one too.
+    press(&page, "*").await;
+    assert_eq!(attr(&page, "r-bin", "aria-expanded").await, "true");
+    assert_eq!(active_id(&page).await, "r-bin");
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "r-main");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(
+        active_id(&page).await,
+        "r-bin",
+        "Left follows aria-owns to the parent"
+    );
+    press(&page, "ArrowLeft").await;
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "r-src");
+    press(&page, "*").await;
+    assert_eq!(attr(&page, "r-docs", "aria-expanded").await, "true");
 }

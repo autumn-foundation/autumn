@@ -95,8 +95,9 @@ Example: a plugin listbox. Your code opens it; the core closes it.
 ## Tree keys
 
 A `data-autumn-roving` list with `role="tree"` gets the APG tree view keys.
-A parent `treeitem` has `aria-expanded`, and holds its `role="group"` list
-of children. An end node has no `aria-expanded`.
+A parent `treeitem` has `aria-expanded`. It holds its `role="group"` list of
+children, or names the list in `aria-owns`. An end node has no
+`aria-expanded`.
 
 | Key | Effect |
 |---|---|
