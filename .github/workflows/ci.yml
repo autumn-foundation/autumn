@@ -1028,6 +1028,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The macOS runner has 3 cores and 7 GB. Three rustc jobs swap
+          # (3.3 GB), and the runner can then stop answering ("lost
+          # communication"). Two jobs keep the build in memory.
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            export CARGO_BUILD_JOBS=2
+          fi
           mkdir -p "${RUNNER_TEMP}/nextest-archive"
           cargo nextest archive --workspace \
             --archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
