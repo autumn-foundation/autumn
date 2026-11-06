@@ -1127,6 +1127,13 @@ fn test_shards_partition_the_workspace_nextest_archive() {
         ci_job(&ci, "test-archive").contains("os: [macos-latest, windows-latest]"),
         "`test-archive` must build macOS and Windows"
     );
+    // A cold macOS build at one job per core swaps until the runner is lost.
+    assert!(
+        ci_job(&ci, "test-archive").contains(
+            "if [ \"${RUNNER_OS}\" = \"macOS\" ]; then\n            export CARGO_BUILD_JOBS=2\n"
+        ),
+        "`test-archive` must cap the macOS build at two compile jobs"
+    );
 
     let doctest = ci_job(&ci, "doctest");
     assert!(
