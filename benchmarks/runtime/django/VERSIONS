@@ -1,5 +1,7 @@
-framework: Django 5.1.4
-language:  Python 3.12
-server:    Gunicorn 23.x + Uvicorn workers (ASGI)
-db:        Django ORM + psycopg 3.x
+framework: Django 6.1.3
+language:  Python 3.14.10 (python:3.14-slim-bookworm)
+server:    Gunicorn 26.2.0 + Uvicorn 0.54.0 workers via uvicorn-worker 0.4.0 (ASGI, uvloop 0.23.0 + httptools 0.9.0)
+db:        Django ORM + psycopg 3.3.8 (binary, bundled libpq 18.0.6)
+static:    WhiteNoise 6.12.0
+config:    dj-database-url 3.1.2
 postgres:  16 (benchmark container)
