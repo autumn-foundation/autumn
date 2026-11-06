@@ -14,5 +14,8 @@ EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=5s --start-period=60s \
   CMD wget -qO- http://localhost:8080/health || exit 1
 
-ENTRYPOINT ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=75.0", \
+# Half the 512 MiB limit goes to the heap. The rest holds metaspace, the code
+# cache and up to 200 Tomcat thread stacks; at 75% the cgroup OOM killer
+# stopped the JVM under 200 concurrent clients.
+ENTRYPOINT ["java", "-XX:+UseContainerSupport", "-XX:MaxRAMPercentage=50.0", \
             "-Dspring.profiles.active=prod", "-jar", "app.jar"]
