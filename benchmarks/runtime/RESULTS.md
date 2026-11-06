@@ -103,8 +103,9 @@ docker compose up -d --build
   between 430 and 580. Every app ran the saturation pass with 0% failed requests.
 - **Autumn vs. Loco**, the two Axum stacks: Loco is ahead by 15% on JSON CRUD
   and 9% on HTML at saturation, and has a lower p50 on three of the four
-  50-VU scenarios (Autumn's is lower on JSON CRUD). This run did not profile
-  where the gap comes from.
+  50-VU scenarios (Autumn's is lower on JSON CRUD). Autumn spends 22–37% more
+  CPU per request, and most of the difference is its default middleware
+  stack; see [Where the Autumn–Loco gap comes from](#where-the-autumnloco-gap-comes-from).
 - **Footprint.** Autumn and Loco idle at about 4 MiB and peak under 20 MiB
   under load. The other four idle between 84 and 198 MiB. Autumn and Loco also
   cold-start in about 1 s, migrations included; Spring Boot takes about 9.5 s.
@@ -253,6 +254,66 @@ on 2 vCPU.
 | Django | 414 ms | 591 ms | 705 ms | 427 | 0% |
 | Phoenix | 17.4 ms | 42.8 ms | 57.8 ms | 2,843 | 0% |
 | Loco | 7.34 ms | 28.4 ms | 45.9 ms | 3,260 | 0% |
+
+### Where the Autumn–Loco gap comes from
+
+Both apps were profiled with the same setup:
+- release builds with frame pointers;
+- run on the host, pinned to CPUs 0–1, with k6 and Postgres on CPUs 2–3;
+- `perf record -F 1999 -g` for 20 s of a 200-VU run.
+
+The app's CPU time per request comes from its process counters. Each sample is
+charged to the innermost frame that names a crate or an Autumn module, so
+allocator, `memcpy` and syscall time lands on the code that asked for it.
+
+CPU per request without perf attached:
+
+| Scenario | Autumn | Loco | Autumn costs |
+|----------|--------|------|--------------|
+| JSON CRUD | 274 µs | 224 µs | +50 µs (+22%) |
+| HTML page | 288 µs | 210 µs | +78 µs (+37%) |
+
+Where the HTML page's time goes, in µs per request (perf attached, so both
+columns run higher):
+
+| Bucket | Autumn | Loco | Difference |
+|--------|--------|------|------------|
+| Framework's own layers and services | 55.6 | 3.8 | **+51.8** |
+| tokio I/O, scheduler and their syscalls | 113.2 | 91.6 | +21.6 |
+| `http` / `bytes` (header maps, buffers) | 23.9 | 13.3 | +10.6 |
+| axum routing and extractors | 29.2 | 25.1 | +4.1 |
+| hyper | 11.9 | 8.2 | +3.7 |
+| Handler and template | 17.3 | 13.1 | +4.2 |
+| ORM and driver (Diesel + tokio-postgres; SeaORM + sqlx) | 65.9 | 72.6 | −6.7 |
+
+JSON CRUD shows the same pattern. Autumn's layers cost 51.7 µs against
+Loco's 4.0, and header work is 11 µs higher. Autumn's ORM and handler path is
+14 µs cheaper, which offsets part of that.
+
+So the gap is the middleware stack, not the database path: Autumn's ORM and
+driver cost less than Loco's. No single layer dominates. The 52 µs is spread
+over about 30 layers and services that each cost 0.5–5 µs on every request:
+- the `Db` extractor (8–11 µs: pool checkout and moving a large future);
+- the custom HTTP/1 accept path (`http_server`, about 6 µs);
+- metrics, including formatting each query for `record_db_query` (about 4 µs);
+- `AppState` lookups (3 µs);
+- the session layer (3 µs);
+- `Accept` negotiation for agent documents (`aeo`, 3 µs), and request IDs,
+  the access log and error reporting (2–2.5 µs each);
+- the startup barrier, trusted-host check, request timeout, deadline, load
+  shedding, submit tokens, trusted proxies, the error-page and exception
+  filters, and maintenance mode (0.5–1.7 µs each).
+
+The extra header work is the eleven response headers Autumn writes (the
+security headers, `x-request-id` and `vary: Accept`) against Loco's five.
+
+Two costs come from syscalls rather than code. Both apps make about ten
+syscalls per request, but Autumn's include 2.2 `getrandom` calls that Loco does
+not make:
+- The session layer mints a UUID v4 from the OS for every request without a
+  cookie, even when the session is never written.
+- The request ID is another OS-drawn UUID. Loco also sends a request ID, but it
+  generates it in user space.
 
 ### Memory Under Load (60 s `json-crud`, 50 VUs)
 
