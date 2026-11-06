@@ -1084,7 +1084,7 @@ fn test_shards_partition_the_workspace_nextest_archive() {
     let shards = test_matrix_shards(job);
     assert_eq!(
         shards.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["macos-latest", "ubuntu-latest", "windows-latest"],
+        ["macos-15-intel", "ubuntu-latest", "windows-latest"],
         "`test` must shard every OS; got {shards:?}"
     );
     for (os, list) in &shards {
@@ -1124,15 +1124,15 @@ fn test_shards_partition_the_workspace_nextest_archive() {
         );
     }
     assert!(
-        ci_job(&ci, "test-archive").contains("os: [macos-latest, windows-latest]"),
-        "`test-archive` must build macOS and Windows"
+        ci_job(&ci, "test-archive").contains("os: [macos-15-intel, windows-latest]"),
+        "`test-archive` must build macOS (on the 14 GB Intel image) and Windows"
     );
-    // A cold macOS build at one job per core swaps until the runner is lost.
+    // The `integration_tests` rustc needs about 13.5 GB: it must compile alone.
     assert!(
         ci_job(&ci, "test-archive").contains(
-            "if [ \"${RUNNER_OS}\" = \"macOS\" ]; then\n            export CARGO_BUILD_JOBS=2\n"
+            "if [ \"${RUNNER_OS}\" = \"macOS\" ]; then\n            cargo test --workspace --no-run --test integration_tests\n"
         ),
-        "`test-archive` must cap the macOS build at two compile jobs"
+        "`test-archive` must build `integration_tests` alone on macOS"
     );
     // A cold macOS build fills the disk, and the runner is lost with no log.
     assert!(

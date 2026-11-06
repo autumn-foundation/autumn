@@ -1008,10 +1008,17 @@ jobs:
     # with Xcode's ld-prime and 1956s with the toolchain's rust-lld on the same
     # objects, so ld-prime stays. What the run did show is memory: swap was in
     # use 10 minutes in and reached 3.3 GB by the end.
+    #
+    # macOS builds on `macos-15-intel` (4 cores, 14 GB), not `macos-latest`
+    # (arm64, 3 cores, 7 GB). The rustc of `integration_tests` alone peaks at
+    # about 13.5 GB, with or without debug info and at any codegen-units. On
+    # 7 GB the runner swaps until GitHub loses it: "The hosted runner lost
+    # communication with the server". The `test` macOS shards run on the
+    # same image, because the archive holds x86_64 binaries.
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-15-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -1052,11 +1059,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The macOS runner has 3 cores and 7 GB. At one compile job per
-          # core, a cold build swaps hard (3.3 GB, see above). Two jobs lower
-          # the memory peak.
+          # On macOS, build `integration_tests` first and alone. Its rustc
+          # needs about 13.5 GB of the runner's 14 GB, so no other compile may
+          # run beside it. `--workspace` keeps the feature set of the archive
+          # below, which then reuses the binary.
           if [ "${RUNNER_OS}" = "macOS" ]; then
-            export CARGO_BUILD_JOBS=2
+            cargo test --workspace --no-run --test integration_tests
           fi
           mkdir -p "${RUNNER_TEMP}/nextest-archive"
           cargo nextest archive --workspace \
@@ -1093,11 +1101,11 @@ jobs:
           - { os: windows-latest, shard: "2/3" }
           - { os: windows-latest, shard: "3/3" }
           - { os: windows-latest, shard: sim }
-          - { os: macos-latest, shard: "1/4" }
-          - { os: macos-latest, shard: "2/4" }
-          - { os: macos-latest, shard: "3/4" }
-          - { os: macos-latest, shard: "4/4" }
-          - { os: macos-latest, shard: sim }
+          - { os: macos-15-intel, shard: "1/4" }
+          - { os: macos-15-intel, shard: "2/4" }
+          - { os: macos-15-intel, shard: "3/4" }
+          - { os: macos-15-intel, shard: "4/4" }
+          - { os: macos-15-intel, shard: sim }
     runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
     env:
       # True when this runner checked out at the path the archive was compiled
