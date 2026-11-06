@@ -60,7 +60,7 @@ pub open spec fn admits(root: Seq<u8>, key: Seq<u8>) -> bool {
 
 /// The part of `key` after `p/`.
 pub open spec fn rest(key: Seq<u8>, p: Seq<u8>) -> Seq<u8> {
-    key.subrange(p.len() + 1, key.len() as int)
+    key.subrange(p.len() as int + 1, key.len() as int)
 }
 
 /// When `s` starts with `p`, a byte of `p` is the byte of `s`.
