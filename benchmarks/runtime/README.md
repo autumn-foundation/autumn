@@ -70,7 +70,10 @@ benchmarks/runtime/
     │   ├── html-page.js      # Server-rendered HTML test
     │   ├── validation-fail.js # Validation error path test
     │   └── auth-protected.js # Authenticated route test
-    ├── run.sh                # Local k6 orchestration script
+    ├── run.sh                # k6 runner for bash (Docker or local k6), --repeat
+    ├── aggregate.py          # Summary JSON -> aggregate.csv / aggregate-summary.csv
+    ├── resources.sh          # Image size, cold start, warm restart, idle RSS
+    ├── sample-mem.sh         # Per-second memory sampler for "memory under load"
     └── run-docker.ps1        # Dockerized k6 runner for PowerShell/Windows
 ```
 
@@ -82,20 +85,34 @@ Each k6 run captures:
 - **Sustained throughput** — requests/s before the error rate rises above 1 %.
 - **Error rate under load** — `http_req_failed` rate.
 
-Supplementary metrics (collected manually outside k6):
+Supplementary metrics (collected outside k6):
 
 | Metric | How |
 |--------|-----|
-| Cold start time | `docker compose up <app>`; time until first 200 on `/health` |
-| Warm restart time | Send SIGTERM; time until healthy again |
-| Idle RSS | `docker stats --no-stream` after 30 s idle |
-| Memory under load | `docker stats` during a 60 s k6 run |
-| Container image size | `docker image ls` after build |
-| Build time | `time docker compose build <app>` |
+| Cold start time | `load/resources.sh`: `docker compose up -d <app>` on a removed container; time until first 200 on `/health` |
+| Warm restart time | `load/resources.sh`: `docker compose restart <app>` (SIGTERM, start); time until healthy again |
+| Idle RSS | `load/resources.sh`: `docker stats --no-stream` after 30 s idle |
+| Memory under load | `load/sample-mem.sh <app> out.csv` during a 60 s `json-crud` run; peak and mean |
+| Container image size | `load/resources.sh`: `docker image inspect` size after build |
+| Build time | `time docker compose build --no-cache <app>` |
 
 ## Running the Benchmark
 
 See [Tracks](#tracks) below for the full step-by-step workflow. Quick summary:
+
+```bash
+# Comparable track - all frameworks at once (Linux/macOS, k6 runs in Docker)
+cd benchmarks/runtime
+docker compose up -d --build autumn spring-boot rails django phoenix loco
+docker compose ps
+./load/run.sh all --vus 50 --duration 60s
+
+# Repeat the full matrix 5 times for a more stable sample.
+./load/run.sh all --vus 50 --duration 60s --repeat 5
+
+# Image size, cold start, warm restart, idle RSS.
+./load/resources.sh
+```
 
 ```powershell
 # Comparable track - all frameworks at once
@@ -108,9 +125,13 @@ docker --context default compose ps
 .\load\run-docker.ps1 all -Vus 50 -Duration 60s -Repeat 5
 ```
 
-Results land in `results/docker-k6_<timestamp>/`. `aggregate.csv` keeps one row
-per run/framework/scenario, and `aggregate-summary.csv` reports medians across
-the repeated runs. Fill in [`RESULTS.md`](RESULTS.md) after the run.
+Results land in `results/k6_<timestamp>/` (`run.sh`) or
+`results/docker-k6_<timestamp>/` (`run-docker.ps1`). `aggregate.csv` keeps one
+row per run/framework/scenario, and `aggregate-summary.csv` reports medians
+across the repeated runs. `run.sh` also records p50 and p99 (k6 runs with
+`--summary-trend-stats` including `med` and `p(99)`); `load/aggregate.py`
+writes both CSV files and can be re-run on any results directory. Fill in
+[`RESULTS.md`](RESULTS.md) after the run.
 
 ## Tracks
 
@@ -142,10 +163,15 @@ connection budget and poison later runs.
 ### Running Against a Single Framework
 
 ```bash
-cd benchmarks/runtime/load
-./run.sh autumn http://localhost:8001 --vus 50 --duration 60s
-./run.sh rails  http://localhost:8003 --vus 20 --duration 30s
+cd benchmarks/runtime
+./load/run.sh autumn --vus 50 --duration 60s
+./load/run.sh rails  http://localhost:8003 --vus 20 --duration 30s
+./load/run.sh loco   --k6 local          # use a k6 binary on PATH instead of Docker
 ```
+
+`run.sh` defaults to running k6 from the pinned `grafana/k6` image on the host
+network; `--k6-image` picks another tag. `--scripts json-crud,html-page` runs a
+subset.
 
 ```powershell
 cd benchmarks/runtime
