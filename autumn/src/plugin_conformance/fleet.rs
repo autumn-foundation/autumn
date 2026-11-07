@@ -147,6 +147,8 @@ fn config(root: &Path) -> DatabaseFleetConfig {
         replica_retention_after_delete: Duration::ZERO,
         restore_check_sample: 0,
         replication_workers: 1,
+        mmap_size: 0,
+        cache_size_kib: 0,
     }
 }
 

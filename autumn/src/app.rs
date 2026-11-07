@@ -16805,6 +16805,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .expect("fleet builds");
@@ -16901,6 +16903,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         config
             .database
@@ -16948,6 +16952,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let resolved = format!("sqlite://{}", root.join("control.db").display());
         let Err(err) =
@@ -16997,6 +17003,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let database = setup_database(
             &config,
@@ -17175,6 +17183,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let all = Arc::new(vec![
             (
@@ -17230,6 +17240,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let all = Arc::new(vec![(
             "app",
@@ -17270,6 +17282,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let all = Arc::new(vec![(
             "framework",
@@ -22417,6 +22431,8 @@ mount = ["service"]
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         assert!(!control_is_only_database(&config));
         assert_eq!(control_sets(&scoped, false).count(), 1);

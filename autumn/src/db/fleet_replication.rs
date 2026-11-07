@@ -1488,6 +1488,15 @@ mod tests {
         replicas: &Path,
         restore_missing: bool,
     ) -> (DatabaseFleet, Arc<FleetReplication>) {
+        replicated_fleet_with_mmap(root, replicas, restore_missing, 0)
+    }
+
+    fn replicated_fleet_with_mmap(
+        root: &Path,
+        replicas: &Path,
+        restore_missing: bool,
+        mmap_size: u64,
+    ) -> (DatabaseFleet, Arc<FleetReplication>) {
         let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
             mode: FleetMode::Tenant,
             root: root.display().to_string(),
@@ -1503,6 +1512,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
@@ -1554,6 +1565,88 @@ mod tests {
             .await
             .unwrap()
             .wal_autocheckpoint
+    }
+
+    async fn mmap_size(db: &FleetDatabase) -> i64 {
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct Value {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        let mut conn = db.pool().get().await.unwrap();
+        diesel::sql_query("PRAGMA mmap_size")
+            .get_result::<Value>(&mut *conn)
+            .await
+            .unwrap()
+            .mmap_size
+    }
+
+    const MMAP: u64 = 64 * 1024 * 1024;
+
+    /// Ship, close, lose the file, restore: all with the file mapped.
+    #[tokio::test]
+    async fn a_mapped_database_ships_and_restores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) =
+            replicated_fleet_with_mmap(&tmp.path().join("a"), &replicas, false, MMAP);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&db).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(wal_autocheckpoint(&db).await, 0);
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        for n in 0..200 {
+            exec(
+                &db,
+                &format!("INSERT INTO notes VALUES ('note {n} {}')", "x".repeat(500)),
+            )
+            .await;
+        }
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+        exec(&db, "INSERT INTO notes VALUES ('shipped on close')").await;
+        assert_eq!(count(&db).await, 201);
+        drop(db);
+        fleet.close(&key).await;
+
+        let path = fleet.path_of(&key);
+        std::fs::remove_file(&path).unwrap();
+        for sidecar in crate::fleet_layout::sidecar_paths(&path) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        fleet.restore(&key, None).await.unwrap();
+        let restored = fleet.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&restored).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(count(&restored).await, 201);
+    }
+
+    /// `restore_missing` rebuilds the file before the mapped pool opens it.
+    #[tokio::test]
+    async fn restore_missing_serves_a_mapped_database_from_its_replica() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (old_host, _) =
+            replicated_fleet_with_mmap(&tmp.path().join("old"), &replicas, false, MMAP);
+        let key = old_host.key_for("acme").unwrap();
+        let db = old_host.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('moved with the slot')").await;
+        drop(db);
+        old_host.close_all().await;
+
+        let (new_host, replication) =
+            replicated_fleet_with_mmap(&tmp.path().join("new"), &replicas, true, MMAP);
+        assert!(!new_host.exists(&key));
+        let db = new_host.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&db).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(count(&db).await, 1);
+        assert_eq!(new_host.stats().created_total, 0, "restored, not created");
+        assert_eq!(replication.replicating(), 1);
     }
 
     #[test]
@@ -1657,6 +1750,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
@@ -1973,6 +2068,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
@@ -2233,6 +2330,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
@@ -2815,6 +2914,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();

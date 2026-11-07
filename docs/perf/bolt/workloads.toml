@@ -159,6 +159,14 @@ tower layer-clone cascade (#2830). AGENTS.md forbids profiling it again."""
 
 [[workload]]
 package = "autumn-web"
+bench = "sqlite_mmap_read"
+features = ["sqlite"]
+mode = "criterion"
+args = ["--bench", "--profile-time", "1"]
+env = ["AUTUMN_BENCH_SQLITE_ROWS=8192"]
+
+[[workload]]
+package = "autumn-web"
 bench = "throttle_check"
 mode = "marginal"
 args = ["--iterations", "{n}", "--route", "throttled"]
