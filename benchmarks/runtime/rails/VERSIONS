@@ -1,6 +1,6 @@
-framework: Rails 7.2.x
-language:  Ruby 3.3.6
-server:    Puma 7.x
+framework: Rails 8.1.4.1
+language:  Ruby 4.0.9 (YJIT on: Rails config.yjit default)
+server:    Puma 8.0.2 (single mode)
 runtime:   RAILS_MAX_THREADS=20 (Puma threads and ActiveRecord pool)
-db:        ActiveRecord + pg 1.5.x
+db:        ActiveRecord + pg 1.7.0 (bundled libpq 18)
 postgres:  16 (benchmark container)

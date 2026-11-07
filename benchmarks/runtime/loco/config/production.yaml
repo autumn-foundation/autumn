@@ -1,5 +1,5 @@
 server:
-  port: {{get_env(name="LOCO_APP_PORT", default="8080")}}
+  port: <%= get_env(name="LOCO_APP_PORT", default="8080") %>
   binding: 0.0.0.0
   host: http://localhost
   middlewares:
@@ -9,8 +9,13 @@ server:
     logger:
       enable: false
 
+# No background jobs: run without a queue backend (Loco 1.x refuses to boot
+# in the default BackgroundQueue mode when no `queue` section is configured).
+workers:
+  mode: BackgroundAsync
+
 database:
-  uri: {{get_env(name="DATABASE_URL", default="postgres://benchmark:benchmark@localhost:5432/benchmark")}}
+  uri: <%= get_env(name="DATABASE_URL", default="postgres://benchmark:benchmark@localhost:5432/benchmark") %>
   enable_logging: false
   connect_timeout: 500
   idle_timeout: 500
