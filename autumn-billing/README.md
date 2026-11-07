@@ -214,7 +214,10 @@ let billing = BillingConfig::from_env()
 ```
 
 After a restart the plugin re-arms every pending row from the store. No
-retry is lost. A retry whose provider call fails in transport keeps its
+retry is lost. The re-arm is the background task `billing.dunning_rearm`. It
+runs on the roles that drain the `billing` queue (`combined`, `worker`), not
+on `web`. Set `capabilities = { "billing.dunning" = false }` on a named role to
+turn it off there. A retry whose provider call fails in transport keeps its
 attempt number and runs again 15 minutes later; a row left `running` by a
 crashed process is reclaimed after 10 minutes.
 

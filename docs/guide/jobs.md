@@ -293,7 +293,7 @@ Declare the loop. The framework then places it (#3545):
 ```rust
 use autumn_web::Capability;
 
-app.background_task("media.room_reaper", Capability::Maintenance, |state, shutdown| async move {
+app.background_task("app.cleanup", Capability::Maintenance, |state, shutdown| async move {
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
@@ -400,6 +400,26 @@ app.background(
   roles.
 - `roles` uses the loaded config, with its env overrides. For example, a
   process with `AUTUMN_JOBS__PIN=critical` gives each built-in role that pin.
+
+#### Tasks of the in-repo plugins
+
+| Plugin | Task | Capability | Queues | Default roles |
+|---|---|---|---|---|
+| `autumn-media-plugin` | `media.room_reaper` (`db` store) | `media.maintenance` | | `combined`, `worker` |
+| `autumn-media-plugin` | `media.room_reaper` (`memory` store) | `serves_http` | | `combined`, `web` |
+| `autumn-media-plugin` | `media.recording_retention` | `media.retention` | `media` (or `.queue(...)`) | `combined`, `worker` |
+| `autumn-billing` | `billing.dunning_rearm` (re-arms once per process) | `billing.dunning` | `billing` | `combined`, `worker` |
+| `autumn-plugin-reference` | `reference.heartbeat` | `maintenance` | | `combined`, `worker` |
+
+The `memory` room store is in the memory of the process that serves the room
+routes, so its reaper runs there. The media guide gives the reason for each
+row. The job queues of `autumn-media-plugin`, `autumn-billing` and
+`autumn-search` come from their `JobInfo` lists, so `autumn jobs manifest`
+and the role `pin` include them.
+
+A test in `xtask` (`plugin_spawns`) fails on a spawn that a plugin crate's
+`on_startup` argument reaches, directly or through a function of the same
+crate. Request-scoped spawns go on its allow-list.
 
 `state.role()` returns a `&Role` (exported at `autumn_web::Role`).
 `role.name()` is the role name, for example `"critical"` or `"worker"`.

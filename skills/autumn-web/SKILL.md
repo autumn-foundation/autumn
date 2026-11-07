@@ -2629,6 +2629,19 @@ subset of queues — all config-only, no app-code change:
   switch (wins, with a warning). `/actuator/tasks` (`background_tasks`) and
   `autumn graph` (`background_task` nodes) list the roles that run each task.
   See `docs/guide/jobs.md#background-tasks-for-plugins-and-apps`.
+- **In-repo plugin tasks (issue #3546)** — `autumn-media-plugin` registers
+  `media.room_reaper` (`db` store: `media.maintenance`, on `combined`/`worker`;
+  `memory` store: `serves_http`, on `combined`/`web`) and
+  `media.recording_retention` (`media.retention` + the media queue). For a
+  fleet of only `web` replicas, call `MediaPlugin::room_reaper_on_every_role()`
+  and `retention_on_every_role()`. `autumn-billing` registers
+  `billing.dunning_rearm` (`billing.dunning` + queue `billing`): `web` does
+  not re-arm. Turn one off on a named role with
+  `capabilities = { "media.maintenance" = false }`. `spawn_room_reaper_loop`
+  and `spawn_retention_sweep_loop` are deprecated: call `run_room_reaper` /
+  `run_retention_sweep` from a `background_task`. The xtask test
+  `plugin_spawns` fails on a spawn in a plugin's `on_startup` or
+  `state_initializer`. See `docs/guide/media.md#background-tasks-and-roles`.
 - **Named roles (`[roles.<name>]`, 0.10.0, issue #3543)** — declare a tier once as a
   preset: `base` (`combined`/`web`/`worker`), `pin`, `workers` and capability
   overrides that can only turn a built-in capability off (a plugin capability
