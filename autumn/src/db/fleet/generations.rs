@@ -821,7 +821,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             name: key.name(),
             detail,
         };
-        let files = local_files(scratch, files).map_err(&unavailable)?;
+        let files = local_files(scratch, files).map_err(unavailable)?;
         let (loaded, mut prev) = {
             let track = slot.track();
             (track.loaded, track.prev.clone())
@@ -830,7 +830,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             // After a restore or a takeover: the newest generation holds the
             // files that did not change.
             prev = newest(replication, key, None, true)
-                .map_err(&unavailable)?
+                .map_err(unavailable)?
                 .map(|(_, manifest)| manifest);
             let mut track = slot.track();
             track.prev.clone_from(&prev);
@@ -840,7 +840,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let raw = replication.destination();
         let floor_ms = replication
             .newest_generation(key)
-            .map_err(&unavailable)?
+            .map_err(unavailable)?
             .map(|at| at.timestamp_millis());
         let created_ms = replication
             .now()
@@ -866,7 +866,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                     .map_err(|e| ship_error(key, e))?;
                 Some(epoch)
             }
-            None => replication.newest_epoch(key).map_err(&unavailable)?,
+            None => replication.newest_epoch(key).map_err(unavailable)?,
         };
         if let Some(epoch) = generation_epoch {
             destination
@@ -1003,7 +1003,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         };
         check_contained(self.root(), path)?;
         let (chosen, manifest) = newest(replication, key, target, false)
-            .map_err(&failed)?
+            .map_err(failed)?
             .ok_or_else(|| FleetError::NotFound { name: name.clone() })?;
         if above.is_some_and(|stamp| chosen.epoch <= stamp) {
             return Ok(false);
@@ -1015,10 +1015,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             &manifest,
             &staging,
         );
-        let result = downloaded.map_err(&failed).and_then(|_| {
+        let result = downloaded.map_err(failed).and_then(|_| {
             with_path_lock(self.root(), &name, || {
                 self.inner.engine.remove(key, path)?;
-                if publish(&staging, path).map_err(&failed)? {
+                if publish(&staging, path).map_err(failed)? {
                     Ok(true)
                 } else {
                     Err(FleetError::AlreadyExists { name: name.clone() })
