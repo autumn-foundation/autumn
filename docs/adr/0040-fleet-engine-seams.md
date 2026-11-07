@@ -333,6 +333,29 @@ check needs `ShipMode::Generations` (step 3). An engine crate gives a
 `FleetFixture`: its fleet, a write and a read through a handle, and an
 optional restore. A fixture with no restore skips the restore check.
 
+##### Notes from step 2
+
+Step 2 changed sections 2 to 4 in these ways:
+
+- `resolve` takes `&mut Parts`, because the tenant extraction needs it.
+  It finds the fleet in the app state (`DatabaseFleet<E>`). With `sqlite`,
+  it also finds the fleet of `[database.fleet]`. New errors:
+  `NoRoutingKey` (`400`) and `NoFleet` (`503`).
+- `FleetLease<E>` holds the `FleetDatabase<E>`. That is the lease. It
+  dereferences to the engine handle.
+- The hook signatures do not change. `FleetDatabase::epoch` already gave
+  `on_open` and `on_close` the epoch. `FleetDatabase::sidecar_replica`
+  gives the scoped destination. The names `generations`, `epochs` and
+  `tombstone` are reserved. The scope refuses writes after a close or a
+  fence. A purge dates sidecar objects by `generations/<id>/` in the scope.
+  The fence check before each `put` across hosts comes with step 3. `verification/fleet_sidecar_scope.rs` proves
+  that a sidecar key stays out of the primary's names and other tenants.
+- `SlotOwnershipStore::ensure_schema` has a default, so boot can prepare
+  any store. `PgSlotOwnership` (feature `postgres`) takes an `EXCLUSIVE`
+  lock on the table in each transaction.
+- Boot still runs ownership only for the `SQLite` fleet. A plugin fleet gets
+  the store from `fleet::ownership_store` and starts ownership itself.
+
 ### What does not go in core
 
 | Item | Home |
