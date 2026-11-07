@@ -10181,6 +10181,8 @@ mod tests {
         let mut files = Vec::new();
         collect_rs_files(&src, &mut files);
         let mut missing = BTreeSet::new();
+        let mut parsed_files = Vec::new();
+        let mut test_files = BTreeSet::new();
         for file in files {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
@@ -10188,7 +10190,14 @@ mod tests {
             let Ok(parsed) = syn::parse_file(&text) else {
                 continue;
             };
-            collect_extractor_impls(&parsed.items, &mut missing);
+            collect_test_module_files(&file, &parsed.items, &mut test_files);
+            parsed_files.push((file, parsed));
+        }
+        for (file, parsed) in &parsed_files {
+            // The file of a `#[cfg(test)] mod name;` is test code too.
+            if !test_files.contains(file) {
+                collect_extractor_impls(&parsed.items, &mut missing);
+            }
         }
         missing.retain(|name: &String| {
             !EDGE_SAFE_NAMES.contains(&name.as_str())
@@ -10221,19 +10230,67 @@ mod tests {
                     }
                 }
                 syn::Item::Mod(item_mod) => {
-                    let test_only = item_mod.attrs.iter().any(|attr| match &attr.meta {
-                        syn::Meta::List(list) => {
-                            list.path.is_ident("cfg") && list.tokens.to_string().contains("test")
-                        }
-                        _ => false,
-                    });
-                    if let (false, Some((_, inner))) = (test_only, &item_mod.content) {
+                    if let (false, Some((_, inner))) =
+                        (is_test_only(&item_mod.attrs), &item_mod.content)
+                    {
                         collect_extractor_impls(inner, out);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Whether `attrs` hold a `cfg` that names `test`.
+    fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| match &attr.meta {
+            syn::Meta::List(list) => {
+                list.path.is_ident("cfg") && list.tokens.to_string().contains("test")
+            }
+            _ => false,
+        })
+    }
+
+    /// The files of the `#[cfg(test)] mod name;` declarations in `file`:
+    /// `name.rs` and `name/mod.rs` next to it, or under its own directory.
+    fn collect_test_module_files(file: &Path, items: &[syn::Item], out: &mut BTreeSet<PathBuf>) {
+        let (Some(parent), Some(stem)) = (file.parent(), file.file_stem()) else {
+            return;
+        };
+        let base = if ["mod", "lib", "main"].iter().any(|own| stem == *own) {
+            parent.to_path_buf()
+        } else {
+            parent.join(stem)
+        };
+        for item in items {
+            if let syn::Item::Mod(item_mod) = item
+                && item_mod.content.is_none()
+                && is_test_only(&item_mod.attrs)
+            {
+                let name = item_mod.ident.to_string();
+                out.insert(base.join(format!("{name}.rs")));
+                out.insert(base.join(&name).join("mod.rs"));
+            }
+        }
+    }
+
+    /// A test module in its own file is test code: its extractors are not
+    /// the framework's.
+    #[test]
+    fn an_out_of_line_test_module_is_skipped() {
+        let parent: syn::File = syn::parse_quote! {
+            #[cfg(test)]
+            mod tests;
+            mod real;
+        };
+        let mut files = BTreeSet::new();
+        collect_test_module_files(Path::new("src/fleet.rs"), &parent.items, &mut files);
+        assert!(files.contains(Path::new("src/fleet/tests.rs")));
+        assert!(files.contains(Path::new("src/fleet/tests/mod.rs")));
+        assert!(!files.iter().any(|file| file.ends_with("real.rs")));
+        let mut root = BTreeSet::new();
+        collect_test_module_files(Path::new("src/lib.rs"), &parent.items, &mut root);
+        assert!(root.contains(Path::new("src/tests.rs")));
     }
 
     #[test]
