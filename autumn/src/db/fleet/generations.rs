@@ -412,10 +412,6 @@ pub struct GenerationTrack {
     pub failures: u32,
     /// The error of the last failed ship.
     pub last_error: Option<String>,
-    /// The manifest of the last generation. Read from the replica at the
-    /// first ship.
-    prev: Option<Manifest>,
-    loaded: bool,
 }
 
 impl GenerationTrack {
@@ -426,8 +422,6 @@ impl GenerationTrack {
             last_ok: None,
             failures: 0,
             last_error: None,
-            prev: None,
-            loaded: false,
         }
     }
 }
@@ -774,6 +768,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 },
             ));
         }
+        // One ship at a time across the processes on this volume: each reads
+        // the newest manifest, and no older snapshot lands after a newer one.
+        let _lock = ShipLock::acquire(self.root(), &target.key).await?;
         let scratch =
             ship_scratch(self.root()).join(format!("{:016x}", replication.entropy().next_u64()));
         std::fs::create_dir_all(&scratch).map_err(super::io_error("create ship scratch"))?;
@@ -822,20 +819,11 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             detail,
         };
         let files = local_files(scratch, files).map_err(unavailable)?;
-        let (loaded, mut prev) = {
-            let track = slot.track();
-            (track.loaded, track.prev.clone())
-        };
-        if !loaded {
-            // After a restore or a takeover: the newest generation holds the
-            // files that did not change.
-            prev = newest(replication, key, None, true)
-                .map_err(unavailable)?
-                .map(|(_, manifest)| manifest);
-            let mut track = slot.track();
-            track.prev.clone_from(&prev);
-            track.loaded = true;
-        }
+        // Read under the ship lock, at each ship: another process can have
+        // shipped and pruned since this process shipped last.
+        let prev = newest(replication, key, None, true)
+            .map_err(unavailable)?
+            .map(|(_, manifest)| manifest);
         let root = replication.root_for(key);
         let raw = replication.destination();
         let floor_ms = replication
@@ -909,7 +897,6 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         if let Err(error) = pruned {
             tracing::warn!(database = %key, %error, "fleet generation prune skipped or failed; the next ship tries again");
         }
-        slot.track().prev = Some(manifest);
         Ok(report)
     }
 
@@ -1161,6 +1148,77 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
     }
 }
 
+/// The directory of the ship locks, under the fleet's reserved directory.
+/// A sweep never touches it.
+const SHIP_LOCK_DIR: &str = "ship-locks";
+
+/// How long a ship waits for the ship lock of another process.
+const SHIP_LOCK_WAIT: Duration = Duration::from_mins(1);
+
+/// How often a ship tries the lock again.
+const SHIP_LOCK_POLL: Duration = Duration::from_millis(25);
+
+/// The OS lock that makes one ship of a database run at a time, across the
+/// processes on a volume. Databases share 256 lock files by a hash of the
+/// name. The OS frees the lock when the file closes or the process ends.
+struct ShipLock {
+    _file: std::fs::File,
+}
+
+impl ShipLock {
+    /// Try once. `None` when another ship holds it. Blocking, but fast.
+    fn try_acquire(root: &Path, key: &FleetDbKey) -> std::io::Result<Option<Self>> {
+        let dir = root
+            .join(crate::fleet_layout::RESERVED_DIR)
+            .join(SHIP_LOCK_DIR);
+        std::fs::create_dir_all(&dir)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(format!("{:03}.lock", super::lock_stripe(&key.name()))))?;
+        let mut lock = fd_lock::RwLock::new(file);
+        match lock.try_write() {
+            // Keep it held: closing the file frees it.
+            Ok(guard) => std::mem::forget(guard),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        Ok(Some(Self {
+            _file: lock.into_inner(),
+        }))
+    }
+
+    /// Wait for the lock, for at most [`SHIP_LOCK_WAIT`].
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Unavailable`] when the wait ends, or the lock file
+    /// cannot be opened.
+    async fn acquire(root: &Path, key: &FleetDbKey) -> Result<Self, FleetError> {
+        let unavailable = |detail: String| FleetError::Unavailable {
+            name: key.name(),
+            detail,
+        };
+        let deadline = tokio::time::Instant::now() + SHIP_LOCK_WAIT;
+        loop {
+            match Self::try_acquire(root, key) {
+                Ok(Some(lock)) => return Ok(lock),
+                Ok(None) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(SHIP_LOCK_POLL).await;
+                }
+                Ok(None) => {
+                    return Err(unavailable(
+                        "another process ships this database; the next ship tries again".to_owned(),
+                    ));
+                }
+                Err(error) => return Err(unavailable(format!("the ship lock failed: {error}"))),
+            }
+        }
+    }
+}
+
 /// The scratch directory of the ships of the fleet at `root`.
 pub fn ship_scratch(root: &Path) -> PathBuf {
     root.join(crate::fleet_layout::RESERVED_DIR).join(SHIP_DIR)
@@ -1361,6 +1419,17 @@ mod tests {
             check_shape(["acme.db", "acme.db/x"]).is_err(),
             "a file and a directory"
         );
+    }
+
+    #[test]
+    fn one_ship_lock_holder_at_a_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crate::fleet_layout::FleetDbKey::Slot(7);
+        let held = ShipLock::try_acquire(tmp.path(), &key).unwrap();
+        assert!(held.is_some());
+        assert!(ShipLock::try_acquire(tmp.path(), &key).unwrap().is_none());
+        drop(held);
+        assert!(ShipLock::try_acquire(tmp.path(), &key).unwrap().is_some());
     }
 
     #[test]

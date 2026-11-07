@@ -670,3 +670,29 @@ async fn a_passed_shutdown_cutoff_stops_a_ship() {
     a.replication.set_shutdown_cutoff(None);
     a.fleet.close_all().await;
 }
+
+#[tokio::test]
+async fn two_processes_on_one_volume_ship_restorable_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Two processes on one volume, each with its own fleet.
+    let a = host(tmp.path(), "vol", false);
+    let b = host(tmp.path(), "vol", false);
+    let key = acme(&a.fleet);
+    write(&a, &key, "a1").await;
+    a.fleet.ship_now(&key).await.unwrap();
+    // B ships three generations: the prune removes A's first one.
+    for value in ["b1", "b2", "b3"] {
+        write(&b, &key, value).await;
+        b.fleet.ship_now(&key).await.unwrap();
+    }
+    // A ships again. It reads the newest manifest, not the one it shipped.
+    write(&a, &key, "a2").await;
+    a.fleet.ship_now(&key).await.unwrap();
+    let report = a.fleet.check_replica_sample(1).await.unwrap();
+    assert_eq!(report.passed, [key.name()], "{report:?}");
+    a.fleet.close_all().await;
+    b.fleet.close_all().await;
+    let c = host(tmp.path(), "vol-c", true);
+    assert_eq!(read(&c, &key).await, ["a1", "b1", "b2", "b3", "a2"]);
+    c.fleet.close_all().await;
+}

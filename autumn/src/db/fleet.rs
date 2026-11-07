@@ -188,7 +188,14 @@ mod replica {
             let path = self.path_of(key);
             super::check_contained(self.root(), &path)?;
             // A rebuild replaces a database: it never brings back a deleted
-            // one.
+            // one. The path lock keeps a delete of another process out.
+            let (root, name) = (self.root().to_path_buf(), key.name());
+            let _lock = crate::time::spawn_blocking(move || super::PathLock::acquire(&root, &name))
+                .await
+                .map_err(|error| FleetError::Restore {
+                    name: key.name(),
+                    detail: error.to_string(),
+                })??;
             if !self.inner.engine.exists(&path) {
                 return Err(FleetError::NotFound { name: key.name() });
             }

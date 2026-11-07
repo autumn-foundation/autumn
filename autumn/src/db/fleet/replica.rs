@@ -486,6 +486,15 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         path: &Path,
     ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
         check_contained(self.root(), path)?;
+        // The path lock across the check and the rebuild: a delete in another
+        // process waits, so the rebuild never brings back a deleted database.
+        let (root, name) = (self.root().to_path_buf(), key.name());
+        let _lock = crate::time::spawn_blocking(move || super::PathLock::acquire(&root, &name))
+            .await
+            .map_err(|error| FleetError::Restore {
+                name: key.name(),
+                detail: error.to_string(),
+            })??;
         if !self.inner.engine.exists(path) {
             return Err(FleetError::NotFound { name: key.name() });
         }
