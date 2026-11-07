@@ -1,0 +1,10 @@
+Wire contracts: the current build against the deployed release.
+
+If the callees ship first (new callees, deployed callers): 1 break(s)
+  - catalog.create_item (POST /items): the new callee requires request field `sku`, and caller `mesh-storefront::add_item` does not always send it
+
+If the callers ship first (new callers, deployed callees): ok
+
+Verdict: safe only if the callers ship first.
+  Deploy mesh-storefront before catalog.
+  To declare this order, run with --order caller-first.

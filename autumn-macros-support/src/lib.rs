@@ -15,3 +15,4 @@ pub mod crate_path;
 pub mod graph;
 pub mod naming;
 pub mod schema;
+pub mod wire;

@@ -25,6 +25,9 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Ident, LitStr, Path, Token, bracketed, parenthesized};
 
+use crate::wire::ir::{ClientDescriptor, ClientEndpoint};
+use crate::wire::store;
+
 /// One `catalog::get_item_endpoint(id)` entry.
 struct EndpointEntry {
     path: Path,
@@ -144,9 +147,45 @@ pub fn wire_client_macro(input: TokenStream) -> TokenStream {
     }
 }
 
+/// The JSON descriptor for a client: the marker path behind each method.
+fn client_descriptor(krate: &str, def: &ClientDef) -> syn::Result<ClientDescriptor> {
+    let endpoints = def
+        .endpoints
+        .iter()
+        .map(|entry| {
+            Ok(ClientEndpoint {
+                method: method_ident(&entry.path)?.to_string(),
+                marker: path_text(&entry.path),
+            })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    Ok(ClientDescriptor {
+        krate: krate.to_owned(),
+        name: def.name.to_string(),
+        endpoints,
+    })
+}
+
+/// A path as `a::b::c`, without generic arguments or a leading `::`.
+fn path_text(path: &Path) -> String {
+    path.segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
 fn expand(input: TokenStream) -> Result<TokenStream, syn::Error> {
     let def: ClientDef = syn::parse2(input)?;
     let client = &def.name;
+    let written = store::contract_dir().map_or_else(TokenStream::new, |dir| {
+        let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+        client_descriptor(&krate, &def).map_or_else(
+            |e| e.to_compile_error(),
+            |d| store::write_outcome(store::write_client(&dir, &d)),
+        )
+    });
+    let track = store::track_contract_dir();
 
     let mut methods = Vec::new();
     let mut rows = Vec::new();
@@ -171,6 +210,8 @@ fn expand(input: TokenStream) -> Result<TokenStream, syn::Error> {
     );
 
     Ok(quote! {
+        #track
+        #written
         #(#assertions)*
 
         #[doc = #client_doc]
@@ -388,5 +429,36 @@ mod tests {
             expand_str("name = C, endpoitns = [a::b_endpoint]")
                 .contains("unknown wire_client! key")
         );
+    }
+
+    #[test]
+    fn the_client_descriptor_names_the_marker_behind_each_method() {
+        let def: ClientDef = syn::parse_str(
+            "name = CatalogClient, endpoints = [mesh_catalog::get_item_endpoint(id), \
+             crate::api::create_item_endpoint]",
+        )
+        .expect("parses");
+        let got = client_descriptor("storefront", &def).expect("descriptor");
+        assert_eq!(got.name, "CatalogClient");
+        assert_eq!(
+            got.endpoints,
+            [
+                ClientEndpoint {
+                    method: "get_item".to_owned(),
+                    marker: "mesh_catalog::get_item_endpoint".to_owned(),
+                },
+                ClientEndpoint {
+                    method: "create_item".to_owned(),
+                    marker: "crate::api::create_item_endpoint".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_expansion_tracks_the_contract_dir_variable() {
+        let out = expand_str("name = C, endpoints = [a::get_item_endpoint(id)]");
+        assert!(out.contains("option_env"), "{out}");
+        assert!(out.contains("AUTUMN_CONTRACT_DIR"), "{out}");
     }
 }
