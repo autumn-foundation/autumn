@@ -493,6 +493,8 @@ pub struct FleetDatabase<E: FleetEngine> {
 pub(crate) struct ReplicaBase {
     destination: Arc<dyn crate::replication::ReplicaDestination>,
     root: String,
+    /// The fleet's ownership, so a sidecar write checks the epoch.
+    ownership: Option<Arc<super::fleet_ownership::FleetOwnership>>,
 }
 
 impl<E: FleetEngine> Clone for FleetDatabase<E> {
@@ -554,8 +556,10 @@ impl<E: FleetEngine> FleetDatabase<E> {
     /// key. It removes every other file of the scope.
     ///
     /// The scope refuses writes after the database closes, or after a fence,
-    /// a delete or a restore. Ship the last files in `on_close`. A fenced
-    /// database calls `on_close` with the writes refused.
+    /// a delete or a restore. It also refuses them as soon as this host does
+    /// not hold the slot at the epoch the database opened under. Ship the
+    /// last files in `on_close`. A fenced database calls `on_close` with the
+    /// writes refused.
     ///
     /// # Errors
     ///
@@ -570,11 +574,22 @@ impl<E: FleetEngine> FleetDatabase<E> {
         let Some(replica) = &self.replica else {
             return Ok(None);
         };
+        // Each write checks the flag and the epoch: a fence that has not
+        // reached this database yet still stops its sidecar.
+        let retired = Arc::clone(&self.retired);
+        let fence = replica.ownership.clone().zip(self.epoch);
+        let slot = self.key.routing_slot();
+        let stop = move || {
+            retired.load(Ordering::Acquire)
+                || fence
+                    .as_ref()
+                    .is_some_and(|(ownership, epoch)| ownership.epoch_for(slot) != Some(*epoch))
+        };
         crate::replication::ScopedDestination::new(
             Arc::clone(&replica.destination),
             sidecar_root(&replica.root, engine)?,
         )
-        .map(|scope| Some(scope.stopped_by(Arc::clone(&self.retired))))
+        .map(|scope| Some(scope.stopped_when(Arc::new(stop))))
     }
 
     /// A lease that keeps this database open while it is held. See

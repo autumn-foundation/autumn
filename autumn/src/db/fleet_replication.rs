@@ -1596,6 +1596,57 @@ mod tests {
         );
     }
 
+    /// A sidecar write checks the epoch: it is refused as soon as this host
+    /// loses the slot, before any fence reaches the database.
+    #[tokio::test]
+    async fn a_sidecar_write_is_refused_once_the_slot_is_lost() {
+        use crate::db::fleet_ownership::{FleetOwnership, MemoryOwnership, OwnerId, SlotRange};
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, _replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let clock = crate::time::TickingClock::starting_at(
+            DateTime::from_timestamp_millis(1_000_000).unwrap(),
+        );
+        let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
+        let host = |owner: &str| {
+            Arc::new(
+                FleetOwnership::new(
+                    Arc::clone(&store) as _,
+                    OwnerId::new(owner).unwrap(),
+                    vec![SlotRange::ALL],
+                    Duration::from_secs(30),
+                )
+                .unwrap(),
+            )
+        };
+        let a = host("host-a");
+        assert_eq!(
+            fleet
+                .start_ownership(Arc::clone(&a))
+                .await
+                .unwrap()
+                .claimed
+                .len(),
+            1
+        );
+        let db = fleet.open_for("acme").await.unwrap();
+        let side = db.sidecar_replica("duckdb").unwrap().unwrap();
+        let object = side.key("state.json").unwrap();
+        side.put(&object, b"one").unwrap();
+
+        clock.advance(Duration::from_secs(31));
+        assert_eq!(host("host-b").refresh().await.claimed.len(), 1);
+        assert_eq!(a.refresh().await.lost, [SlotRange::ALL]);
+        // No fence ran: the database is still open here.
+        assert!(fleet.open_keys().contains(db.key()));
+        assert!(side.is_stopped());
+        assert!(matches!(
+            side.put(&object, b"two"),
+            Err(crate::replication::DestinationError::Rejected { .. })
+        ));
+        assert_eq!(side.get(&object).unwrap(), b"one");
+    }
+
     /// A purge after the key got a new database keeps the sidecar files of
     /// the new database and removes the files of the deleted one.
     #[tokio::test]

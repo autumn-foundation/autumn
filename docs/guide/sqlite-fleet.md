@@ -871,7 +871,9 @@ that fleet:
   generations of a newer database with the same key, and removes every
   other object of the scope.
 - The scope refuses writes after the database closes, and after a fence, a
-  delete or a restore. Ship the last files in `on_close`. Reads still work.
+  delete or a restore. Each write also checks the epoch: once this host
+  loses the slot, the scope refuses writes at once. Ship the last files in
+  `on_close`. Reads still work.
 
 ## Limits
 

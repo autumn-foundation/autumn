@@ -201,8 +201,8 @@ pub fn validate_key(key: &str) -> Result<(), DestinationError> {
 pub struct ScopedDestination {
     inner: std::sync::Arc<dyn ReplicaDestination>,
     root: String,
-    /// When set, writes and deletes are refused.
-    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// When it returns `true`, writes and deletes are refused.
+    stop: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl fmt::Debug for ScopedDestination {
@@ -234,7 +234,16 @@ impl ScopedDestination {
 
     /// Refuse writes and deletes once `stop` is set. Reads still work.
     #[must_use]
-    pub fn stopped_by(mut self, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+    pub fn stopped_by(self, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.stopped_when(std::sync::Arc::new(move || {
+            stop.load(std::sync::atomic::Ordering::Acquire)
+        }))
+    }
+
+    /// Refuse writes and deletes while `stop` returns `true`. The scope calls
+    /// it before each write, so keep it fast. Reads still work.
+    #[must_use]
+    pub fn stopped_when(mut self, stop: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.stop = Some(stop);
         self
     }
@@ -242,9 +251,7 @@ impl ScopedDestination {
     /// Whether the scope refuses writes now.
     #[must_use]
     pub fn is_stopped(&self) -> bool {
-        self.stop
-            .as_ref()
-            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire))
+        self.stop.as_ref().is_some_and(|stop| stop())
     }
 
     /// The scope, with no `/` at the end. Each key starts with `root/`.

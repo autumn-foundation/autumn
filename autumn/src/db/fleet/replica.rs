@@ -98,6 +98,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         self.replication().map(|replication| super::ReplicaBase {
             destination: Arc::clone(replication.destination()),
             root: replication.root_for(key),
+            ownership: self.ownership().cloned(),
         })
     }
 

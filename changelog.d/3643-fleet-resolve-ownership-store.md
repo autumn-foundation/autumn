@@ -10,7 +10,7 @@
 - **db:** `FleetDatabase::sidecar_replica(engine)` gives a lifecycle hook a
   `ScopedDestination` (`autumn_web::replication`) at `<key prefix>/<engine>/`,
   next to the primary's replica. It refuses keys outside that prefix, and
-  writes after the database closes or is fenced. A purge after a delete
+  writes after the database closes or this host loses the slot. A purge after a delete
   removes the sidecar's objects. The hooks already see the epoch through
   `FleetDatabase::epoch`.
 - **db:** `AppBuilder::fleet_ownership_store(store)` replaces the SQL store
