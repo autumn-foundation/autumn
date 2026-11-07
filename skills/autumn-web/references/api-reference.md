@@ -2012,6 +2012,10 @@ Frequently used env keys:
 | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` |
 | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` |
 | `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS` | `database.replica_max_lag_ms` |
+| `AUTUMN_DATABASE__MMAP_SIZE` | `database.mmap_size` (SQLite, bytes; `0` = off) |
+| `AUTUMN_DATABASE__CACHE_SIZE_KIB` | `database.cache_size_kib` (SQLite, KiB; `0` = default) |
+| `AUTUMN_DATABASE__FLEET__MMAP_SIZE` | `database.fleet.mmap_size` |
+| `AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB` | `database.fleet.cache_size_kib` |
 | `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS` | `server.http.header_read_timeout_ms` |
 | `AUTUMN_REALTIME__MAX_MESSAGE_BYTES` | `realtime.max_message_bytes` |
 | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` |

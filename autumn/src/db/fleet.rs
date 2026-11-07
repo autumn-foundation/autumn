@@ -3027,6 +3027,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         }
     }
 
@@ -3199,6 +3201,81 @@ mod tests {
         fleet.open(&FleetDbKey::Slot(2)).await.unwrap();
         settle(&fleet).await;
         assert_eq!(fleet.stats().open, 2);
+    }
+
+    /// LRU closes a mapped database. The pool drops, and the connections
+    /// unmap the file. A reopen maps it again and reads every row.
+    #[tokio::test]
+    async fn an_evicted_mapped_database_reopens_with_its_rows() {
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct MmapSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct CacheSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache_size: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        async fn exec(db: &FleetDatabase, sql: &str) {
+            let mut conn = db.pool().get().await.unwrap();
+            diesel::sql_query(sql).execute(&mut *conn).await.unwrap();
+        }
+        async fn state(db: &FleetDatabase) -> (i64, i64, i64) {
+            let mut conn = db.pool().get().await.unwrap();
+            let mmap = diesel::sql_query("PRAGMA mmap_size")
+                .get_result::<MmapSize>(&mut *conn)
+                .await
+                .unwrap()
+                .mmap_size;
+            let cache = diesel::sql_query("PRAGMA cache_size")
+                .get_result::<CacheSize>(&mut *conn)
+                .await
+                .unwrap()
+                .cache_size;
+            let rows = diesel::sql_query("SELECT COUNT(*) AS n FROM notes")
+                .get_result::<Count>(&mut *conn)
+                .await
+                .unwrap()
+                .n;
+            (mmap, cache, rows)
+        }
+
+        const MMAP: u64 = 16 * 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |c| {
+            c.max_open = 1;
+            c.mmap_size = MMAP;
+            c.cache_size_kib = 4096;
+        });
+        let first = fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
+        exec(&first, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        for n in 0..50 {
+            exec(&first, &format!("INSERT INTO notes VALUES ('note {n}')")).await;
+        }
+        assert_eq!(
+            state(&first).await,
+            (i64::try_from(MMAP).unwrap(), -4096, 50)
+        );
+        drop(first);
+
+        fleet.open(&FleetDbKey::Slot(2)).await.unwrap();
+        settle(&fleet).await;
+        assert_eq!(fleet.open_keys(), vec![FleetDbKey::Slot(2)]);
+        assert_eq!(fleet.stats().closes_total, 1, "slot 1 was evicted");
+
+        let reopened = fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
+        exec(&reopened, "INSERT INTO notes VALUES ('after the reopen')").await;
+        assert_eq!(
+            state(&reopened).await,
+            (i64::try_from(MMAP).unwrap(), -4096, 51)
+        );
     }
 
     #[tokio::test]

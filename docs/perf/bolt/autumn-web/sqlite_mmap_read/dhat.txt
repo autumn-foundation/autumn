@@ -1,0 +1,30 @@
+# Bolt profile: autumn-web/sqlite_mmap_read
+# unit: whole process (criterion --profile-time: the iteration count is wall-clock bound; read the shares)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 17,557,648
+blocks allocated: 25,624
+peak live bytes (whole run): 2,527,550
+
+         bytes      blocks  site
+
+    14,082,336       6,368  sqlite3MemMalloc
+     1,528,064       1,524  sqlite_mmap_read::point_keys
+       342,520       1,144  <diesel::sqlite::connection::bind_collector::SqliteBindCollector as diesel::query_builder::bind_collector::MoveableBindCollector>::append_bind_data
+       318,136         382  <diesel::sqlite::connection::bind_collector::OwnedSqliteBindValue as core::convert::From>::from
+       196,992         764  __rustc::__rdl_alloc
+       138,059         226  autumn_web::db::sqlite_connection_setup
+       121,920         762  <tokio::runtime::blocking::task::BlockingTask as core::future::future::Future>::poll
+        97,536         762  <diesel::sqlite::connection::bind_collector::SqliteBindCollector as diesel::query_builder::bind_collector::BindCollector>::push_bound_value
+        97,536         762  <diesel::sqlite::connection::statement_iterator::StatementIterator as core::iter::traits::iterator::Iterator>::next
+        89,136       1,524  <diesel::sqlite::query_builder::SqliteQueryBuilder as diesel::query_builder::QueryBuilder>::push_sql
+        86,106       3,810  <diesel::sqlite::connection::row::SqliteRow as diesel::row::IntoOwnedRow>::into_owned
+        72,000           8  <clap_builder::builder::command::Command>::arg_internal
+        42,375         387  <&str as <alloc::ffi::c_str::CString>::new::SpecNewImpl>::spec_new_impl
+        41,528         382  <tokio::runtime::scheduler::current_thread::Context>::enter
+        36,672         382  <diesel::sqlite::connection::stmt::BoundStatement>::bind_buffers
+        32,816           1  __alloc_dir
+        24,384         762  <diesel::sqlite::connection::bind_collector::SqliteBindCollector as diesel::query_builder::bind_collector::MoveableBindCollector>::moveable
+        24,384         762  <futures_util::future::future::map::Map as core::future::future::Future>::poll
+        21,504          64  <tokio::signal::registry::EventInfo as core::default::Default>::default
+        21,392       1,146  <diesel_async::sync_connection_wrapper::implementation::SyncConnectionWrapper as diesel_async::AsyncConnectionCore>::load
