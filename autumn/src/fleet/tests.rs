@@ -446,3 +446,19 @@ async fn ownership_store_is_the_store_of_the_builder() {
     assert_eq!(grant.epoch.get(), 1);
     assert_eq!(found.rows().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_lease_gives_its_database_and_keeps_it_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8);
+    let state = state(&fleet);
+    let lease = resolve_key::<TextEngine>(&state, "acme").await.unwrap();
+    assert_eq!(lease.database().key(), lease.key());
+    assert!(format!("{lease:?}").contains("acme"));
+    let shard_lease = lease.lease();
+    let copy = lease.clone();
+    let db = lease.into_database();
+    assert_eq!(db.key(), copy.key());
+    assert!(!db.handle().is_closed());
+    drop((db, copy, shard_lease));
+}

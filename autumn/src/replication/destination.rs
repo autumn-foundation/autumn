@@ -753,4 +753,19 @@ mod tests {
             [key]
         );
     }
+
+    #[test]
+    fn a_scoped_destination_streams_files_under_its_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let scope = scoped(tmp.path());
+        let key = scope.key("generations/g1/acme.duckdb").expect("key");
+        let source = tmp.path().join("source");
+        std::fs::write(&source, b"rows").expect("source");
+        scope.put_file(&key, &source).expect("put_file");
+        let target = tmp.path().join("target");
+        scope.get_to_file(&key, &target).expect("get_to_file");
+        assert_eq!(std::fs::read(&target).expect("read"), b"rows");
+        assert!(format!("{scope:?}").contains("prod/fleet/tenant/acme/duckdb"));
+        assert!(!scope.is_stopped(), "no stop: writes are allowed");
+    }
 }
