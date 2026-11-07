@@ -2838,6 +2838,12 @@ jobs:
             --test integration_tests -- --ignored idempotency_ \
             | tee "$RUNNER_TEMP/idempotency-pg-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-cov.log"
+          # The Postgres fleet ownership store (`PgSlotOwnership`) runs only in
+          # these Docker tests of the consolidated binary. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored fleet_ownership_pg:: \
+            | tee "$RUNNER_TEMP/fleet-ownership-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/fleet-ownership-pg-cov.log"
           # Issue #3262: the Postgres experiment store's snapshot, refresh and
           # write paths run only in these Docker tests of the consolidated
           # binary. A filter that matches nothing exits 0, so check the count.
@@ -2845,6 +2851,14 @@ jobs:
             --test integration_tests -- --ignored experiments_pg_integration:: \
             | tee "$RUNNER_TEMP/experiments-pg-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/experiments-pg-cov.log"
+          # Issue #3325: the paged comment read, its page lookup and the
+          # router's page paths run only in these Docker tests of the
+          # consolidated binary. A filter that matches nothing exits 0, so
+          # check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored integration::commentable:: \
+            | tee "$RUNNER_TEMP/commentable-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/commentable-pg-cov.log"
           # Issue #2583: the tracked-status settle after the queue ack on the
           # Postgres and Redis backends runs only in these Docker tests. Check
           # the count: a filter that matches nothing exits 0.

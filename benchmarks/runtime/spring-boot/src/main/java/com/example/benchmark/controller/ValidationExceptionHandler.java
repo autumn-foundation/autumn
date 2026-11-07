@@ -15,7 +15,7 @@ public class ValidationExceptionHandler {
         String message = ex.getBindingResult().getFieldErrors().stream()
             .map(error -> error.getDefaultMessage())
             .collect(Collectors.joining("; "));
-        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_CONTENT)
             .body(Map.of("error", message));
     }
 }

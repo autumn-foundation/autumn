@@ -6608,7 +6608,8 @@ impl<'a> FieldContext<'a> {
     /// Write one input of a grouped control, for example one radio.
     ///
     /// The element gets `id="{field}-{suffix}"`, `name` (on a form
-    /// element), `required` (on `input`, `select` and `textarea`),
+    /// element), `required` (on `input`, `select` and `textarea`, not on a
+    /// checkbox),
     /// `aria-invalid="true"` when the field has errors, and the
     /// [`FieldOptions`] attributes. Set `type`, `value`, `class` and
     /// `checked` in `attrs`. The method removes the same names from `attrs`
@@ -6649,7 +6650,12 @@ impl<'a> FieldContext<'a> {
         if is_form_element(tag) {
             push_attr(&mut out, "name", self.field);
         }
-        if self.is_required() && matches!(tag, "input" | "select" | "textarea") {
+        // `required` on a checkbox means "check this box", so a box in a
+        // group does not get it. The legend shows the marker.
+        let checkbox = attrs
+            .iter()
+            .any(|(name, value)| *name == "type" && value.eq_ignore_ascii_case("checkbox"));
+        if self.is_required() && !checkbox && matches!(tag, "input" | "select" | "textarea") {
             out.push_str(" required");
         }
         if self.is_invalid() {
@@ -11759,6 +11765,60 @@ mod custom_control_tests {
             "Due",
             &BadTag,
             &FieldOptions::new(),
+        );
+    }
+
+    #[test]
+    fn group_item_does_not_mark_a_checkbox_required() {
+        // `required` on a checkbox means "check this box". A group of
+        // boxes shows the marker only, as `checkbox_group` does.
+        struct Boxes;
+
+        impl FieldRenderer for Boxes {
+            fn name(&self) -> &'static str {
+                "boxes"
+            }
+
+            fn grouped(&self) -> bool {
+                true
+            }
+
+            fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+                maud::html! {
+                    (field.group_item("input", "a", &[("type", "checkbox"), ("value", "a")], maud::html! {}))
+                    (field.group_item("input", "b", &[("type", "CheckBox"), ("value", "b")], maud::html! {}))
+                    (field.group_item("input", "c", &[("type", "radio"), ("value", "c")], maud::html! {}))
+                }
+            }
+        }
+
+        let changeset = Changeset::new(Task {
+            due: String::new(),
+            title: String::new(),
+        });
+        let html = custom_input_with(
+            &changeset,
+            "due",
+            "Due",
+            &Boxes,
+            &FieldOptions::new().required(),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"<input type="checkbox" id="due-a" name="due" value="a">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<input type="CheckBox" id="due-b" name="due" value="b">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<input type="radio" id="due-c" name="due" required value="c">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("autumn-field__required"),
+            "the legend keeps the marker: {html}"
         );
     }
 

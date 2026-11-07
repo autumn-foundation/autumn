@@ -298,6 +298,15 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   `E: FleetEngine`. With `sqlite`, `E` defaults to `SqliteEngine`, so
   `SQLite` code needs no change. A handler of another engine reads
   `FleetDatabase::handle`. See [ADR 0040](../adr/0040-fleet-engine-seams.md).
+- **New experimental surface (fleet extractors):** the `fleet` module
+  (`resolve`, `resolve_key`, `FleetLease`, `fleet_of`, `ownership_store`) and
+  `AppBuilder::fleet_ownership_store`. Declare them with
+  `uses_experimental`. An engine plugin writes its own extractor over
+  `fleet::resolve::<E>` and puts its `DatabaseFleet<E>` in the app state with
+  `insert_extension`. A sidecar hook ships through
+  `FleetDatabase::sidecar_replica`. A `SlotOwnershipStore` gets a default
+  `ensure_schema`, so an existing store needs no change. See
+  [Writing a fleet extractor](../guide/sqlite-fleet.md#writing-a-fleet-extractor).
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -348,6 +357,25 @@ Changes that still compile but behave differently at runtime. Examples:
 - A scheduled task now runs on a different worker.
 
 If nothing changed, delete this section.
+
+### Comments: the comment router shows one page (#3325)
+
+`commentable::router` reads one page of a thread, not the whole thread. A
+page holds up to 50 top-level comments and all their replies. After a post,
+the response shows the page that holds the new comment.
+
+What to do:
+
+1. On a host page that renders a thread, call `comment_thread_page` (not
+   `comment_thread`), and pass the page to the widget with
+   `.page(page.after, page.next)`.
+2. Read `?after=<id>` from the host page's query string, and pass it to
+   `comment_thread_page`.
+3. Use the same page size on the host page and in
+   `CommentsConfig::page_size`. Else a no-JS post can return to a page that
+   does not show the new comment.
+4. Index the comments table: `(commentable_type, commentable_id, created_at,
+   id) WHERE parent_id IS NULL AND deleted_at IS NULL`, and `parent_id`.
 
 ## Deprecations retained from `{X.Y}`
 

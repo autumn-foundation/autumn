@@ -700,11 +700,25 @@ the [cell router](cell-isolation.md).
 The ownership table is `_autumn_fleet_slot_owners` on the control database.
 All hosts of the fleet must use the same table. The control database is a
 local SQLite file, so the built-in table fences only the processes of one
-host. For hosts on different machines, implement `SlotOwnershipStore` (in
-`autumn_web::db::fleet_ownership`) on a store that all hosts reach. Then
-start a `FleetOwnership` with `DatabaseFleet::start_ownership` (it takes the
-volume lock, then claims), and start `DatabaseFleet::spawn_ownership` before
-the first request.
+host. For hosts on different machines, give boot a store that all hosts
+reach:
+
+```rust,ignore
+use autumn_web::db::fleet_ownership::PgSlotOwnership;
+
+autumn_web::app()
+    .fleet_ownership_store(PgSlotOwnership::new(pg_pool, clock))
+    .run()
+    .await;
+```
+
+`PgSlotOwnership` keeps the table in Postgres. It needs the `postgres`
+feature next to `sqlite`. Each call is one transaction that locks the table,
+so two hosts that race a claim get one owner. Boot calls `ensure_schema` on
+the store before the first claim. You can also implement
+`SlotOwnershipStore` (in `autumn_web::db::fleet_ownership`) on another
+store. One store holds the ownership of one fleet. Do not give two fleets
+one store: the release of one fleet ends the lease of the other.
 
 ### The failover procedure
 
@@ -808,6 +822,82 @@ can map more. On a 32-bit target, config validation refuses a worst case over
 
 Replication, `restore_missing`, LRU close and reopen work with mmap on. A
 close drops the pool, and its connections unmap the file.
+## Writing a fleet extractor
+
+A plugin that runs a fleet of another engine (DuckDB, RocksDB) writes a
+`FleetEngine` and one extractor. The extractor calls
+`autumn_web::fleet::resolve`. That function runs these steps:
+
+1. It finds the routing key: a `ShardKeyOverride`, then the tenant.
+2. It makes the database key from the routing key.
+3. It checks that this host owns the slot. If not, it returns `421`
+   (`NotOwner`) and does not touch the disk.
+4. It opens the database. If the fleet creates on demand, it makes a
+   missing database.
+
+It returns a `FleetLease`. While the lease lives, the fleet does not close
+the database. The lease drops at the end of the handler, so the fleet can
+then evict the database.
+
+```rust,ignore
+use autumn_web::fleet::FleetLease;
+
+pub struct FleetDuckDb(FleetLease<DuckDbEngine>);
+
+impl FromRequestParts<AppState> for FleetDuckDb {
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, AutumnError> {
+        autumn_web::fleet::resolve::<DuckDbEngine>(parts, state)
+            .await
+            .map(Self)
+            .map_err(AutumnError::from)
+    }
+}
+```
+
+Core has no generic extractor. Each plugin names its own and maps its own
+errors.
+
+- **The fleet.** `resolve::<E>` uses the `DatabaseFleet<E>` in the app
+  state. Put it there with `state.insert_extension(fleet)`, for example in a
+  `state_initializer`. Without it, `resolve` returns `503` (`NoFleet`). With
+  `sqlite`, `resolve::<SqliteEngine>` also finds the fleet of
+  `[database.fleet]`.
+- **Jobs and tasks.** `resolve_key::<E>(state, tenant_id)` is the same path
+  with no request.
+- **No routing key.** A request with no tenant returns `400`
+  (`NoRoutingKey`). An app state with no config returns `503`.
+- **Ownership.** `autumn_web::fleet::ownership_store(state)` returns the store
+  of `fleet_ownership_store`, else the SQL store of the control database.
+  Give it to `FleetOwnership::new`, then call `DatabaseFleet::start_ownership`
+  and `DatabaseFleet::spawn_ownership` before the first request.
+
+### Sidecar engines
+
+A sidecar engine follows the keys of another fleet. For example, it keeps a
+DuckDB file next to each tenant's SQLite file. Install a `FleetLifecycle` on
+that fleet:
+
+- `on_open` and `on_close` get the `FleetDatabase`. `db.epoch()` is the
+  ownership epoch the database opened under.
+- `db.sidecar_replica("duckdb")` gives a `ScopedDestination` at
+  `<key prefix>/duckdb/`, next to the primary's replica. It refuses every key
+  outside that prefix. It is `None` when the fleet does not replicate.
+- A sidecar name is 1 to 32 bytes of `a-z`, `0-9`, `_` and `-`. The names
+  `generations`, `epochs` and `tombstone` are reserved.
+- Put each copy under `generations/<id>/` of the scope. Make the id with
+  `autumn_web::replication::segment::generation_id`.
+- A purge after a delete removes the sidecar's objects. It keeps the
+  generations of a newer database with the same key, and removes every
+  other object of the scope.
+- The scope refuses writes after the database closes, and after a fence, a
+  delete or a restore. Each write also checks the epoch: once this host
+  loses the slot, the scope refuses writes at once. Ship the last files in
+  `on_close`. Reads still work.
 
 ## Limits
 

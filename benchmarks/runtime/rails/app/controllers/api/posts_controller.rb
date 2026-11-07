@@ -16,7 +16,7 @@ module Api
         render json: post, status: :created
       else
         render json: { error: post.errors.full_messages.join(", ") },
-               status: :unprocessable_entity
+               status: :unprocessable_content
       end
     end
 
@@ -25,7 +25,7 @@ module Api
         render json: @post
       else
         render json: { error: @post.errors.full_messages.join(", ") },
-               status: :unprocessable_entity
+               status: :unprocessable_content
       end
     end
 

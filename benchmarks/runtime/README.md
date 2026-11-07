@@ -39,14 +39,18 @@ the results report. No framework receives shortcuts unavailable to the others
 
 See each framework's `VERSIONS` file for exact versions:
 
-| Framework | Runtime | File |
-|-----------|---------|------|
-| **Autumn** | Rust 1.97 + Axum 0.8 | [`autumn/VERSIONS`](autumn/VERSIONS) |
-| **Spring Boot** | Java 21 + Tomcat | [`spring-boot/VERSIONS`](spring-boot/VERSIONS) |
-| **Rails** | Ruby 3.3 + Puma 6 | [`rails/VERSIONS`](rails/VERSIONS) |
-| **Django** | Python 3.12 + Gunicorn/Uvicorn | [`django/VERSIONS`](django/VERSIONS) |
-| **Phoenix** | Elixir 1.17 + Bandit | [`phoenix/VERSIONS`](phoenix/VERSIONS) |
-| **Loco** | Rust 1.97 + Axum 0.7 | [`loco/VERSIONS`](loco/VERSIONS) |
+| Framework | Version | Runtime | File |
+|-----------|---------|---------|------|
+| **Autumn** | autumn-web 0.10.0 | Rust 1.97 + Axum 0.8 + Diesel 2.3 | [`autumn/VERSIONS`](autumn/VERSIONS) |
+| **Spring Boot** | 4.1.2 | Java 25 + Tomcat 11 + Hibernate 7.4 | [`spring-boot/VERSIONS`](spring-boot/VERSIONS) |
+| **Rails** | 8.1.4.1 | Ruby 4.0 (YJIT) + Puma 8 | [`rails/VERSIONS`](rails/VERSIONS) |
+| **Django** | 6.1.3 | Python 3.14 + Gunicorn 26 / Uvicorn 0.54 (ASGI) | [`django/VERSIONS`](django/VERSIONS) |
+| **Phoenix** | 1.8.16 | Elixir 1.19 / OTP 28 + Bandit 1.14 + Ecto 3.14 | [`phoenix/VERSIONS`](phoenix/VERSIONS) |
+| **Loco** | 1.3.1 | Rust 1.97 + Axum 0.8 + SeaORM 2.0 | [`loco/VERSIONS`](loco/VERSIONS) |
+
+Rails, Phoenix, and Django pin their resolved dependency sets
+(`Gemfile.lock`, `mix.lock`, exact `requirements.txt` pins); the Autumn image
+builds from the workspace `Cargo.lock`.
 
 OS, CPU, memory, and container limits are recorded in the results report
 generated alongside each benchmark run.
@@ -70,7 +74,10 @@ benchmarks/runtime/
     │   ├── html-page.js      # Server-rendered HTML test
     │   ├── validation-fail.js # Validation error path test
     │   └── auth-protected.js # Authenticated route test
-    ├── run.sh                # Local k6 orchestration script
+    ├── run.sh                # k6 runner for bash (Docker or local k6), --repeat
+    ├── aggregate.py          # Summary JSON -> aggregate.csv / aggregate-summary.csv
+    ├── resources.sh          # Image size, cold start, warm restart, idle RSS
+    ├── sample-mem.sh         # Per-second memory sampler for "memory under load"
     └── run-docker.ps1        # Dockerized k6 runner for PowerShell/Windows
 ```
 
@@ -82,20 +89,34 @@ Each k6 run captures:
 - **Sustained throughput** — requests/s before the error rate rises above 1 %.
 - **Error rate under load** — `http_req_failed` rate.
 
-Supplementary metrics (collected manually outside k6):
+Supplementary metrics (collected outside k6):
 
 | Metric | How |
 |--------|-----|
-| Cold start time | `docker compose up <app>`; time until first 200 on `/health` |
-| Warm restart time | Send SIGTERM; time until healthy again |
-| Idle RSS | `docker stats --no-stream` after 30 s idle |
-| Memory under load | `docker stats` during a 60 s k6 run |
-| Container image size | `docker image ls` after build |
-| Build time | `time docker compose build <app>` |
+| Cold start time | `load/resources.sh`: `docker compose up -d <app>` on a removed container; time until first 200 on the health route (`/health`; Loco's built-in `/_health`) |
+| Warm restart time | `load/resources.sh`: `docker compose stop <app>` (SIGTERM until exit) plus `docker compose start <app>` until healthy again; both halves are recorded |
+| Idle RSS | `load/resources.sh`: `docker stats --no-stream` after 30 s idle |
+| Memory under load | `load/sample-mem.sh <app> out.csv` during a 60 s `json-crud` run; peak and mean |
+| Container image size | `load/resources.sh`: `docker image inspect` size after build |
+| Build time | `time docker compose build --no-cache <app>` |
 
 ## Running the Benchmark
 
 See [Tracks](#tracks) below for the full step-by-step workflow. Quick summary:
+
+```bash
+# Comparable track - all frameworks at once (Linux/macOS, k6 runs in Docker)
+cd benchmarks/runtime
+docker compose up -d --build autumn spring-boot rails django phoenix loco
+docker compose ps
+./load/run.sh all --vus 50 --duration 60s
+
+# Repeat the full matrix 5 times for a more stable sample.
+./load/run.sh all --vus 50 --duration 60s --repeat 5
+
+# Image size, cold start, warm restart, idle RSS.
+./load/resources.sh
+```
 
 ```powershell
 # Comparable track - all frameworks at once
@@ -108,9 +129,13 @@ docker --context default compose ps
 .\load\run-docker.ps1 all -Vus 50 -Duration 60s -Repeat 5
 ```
 
-Results land in `results/docker-k6_<timestamp>/`. `aggregate.csv` keeps one row
-per run/framework/scenario, and `aggregate-summary.csv` reports medians across
-the repeated runs. Fill in [`RESULTS.md`](RESULTS.md) after the run.
+Results land in `results/k6_<timestamp>/` (`run.sh`) or
+`results/docker-k6_<timestamp>/` (`run-docker.ps1`). `aggregate.csv` keeps one
+row per run/framework/scenario, and `aggregate-summary.csv` reports medians
+across the repeated runs. `run.sh` also records p50 and p99 (k6 runs with
+`--summary-trend-stats` including `med` and `p(99)`); `load/aggregate.py`
+writes both CSV files and can be re-run on any results directory. Fill in
+[`RESULTS.md`](RESULTS.md) after the run.
 
 ## Tracks
 
@@ -122,7 +147,7 @@ cd benchmarks/runtime
 # 1. Build and start Postgres plus all framework apps.
 docker --context default compose up -d --build autumn spring-boot rails django phoenix loco
 
-# 2. Wait for health checks (all apps expose /health).
+# 2. Wait for health checks (/health everywhere; Loco serves /_health).
 docker --context default compose ps
 
 # 3. Run the full suite with Dockerized k6.
@@ -142,10 +167,15 @@ connection budget and poison later runs.
 ### Running Against a Single Framework
 
 ```bash
-cd benchmarks/runtime/load
-./run.sh autumn http://localhost:8001 --vus 50 --duration 60s
-./run.sh rails  http://localhost:8003 --vus 20 --duration 30s
+cd benchmarks/runtime
+./load/run.sh autumn --vus 50 --duration 60s
+./load/run.sh rails  http://localhost:8003 --vus 20 --duration 30s
+./load/run.sh loco   --k6 local          # use a k6 binary on PATH instead of Docker
 ```
+
+`run.sh` defaults to running k6 from the pinned `grafana/k6` image on the host
+network; `--k6-image` picks another tag. `--scripts json-crud,html-page` runs a
+subset.
 
 ```powershell
 cd benchmarks/runtime
@@ -166,7 +196,7 @@ Each framework app can be built from a clean checkout:
 ### Autumn (Rust)
 ```bash
 cd benchmarks/runtime/autumn
-# Requires: Rust 1.97+, libpq (or pq-sys bundled)
+# Requires: Rust 1.97+ (pq-sys builds a bundled libpq)
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
   cargo run --release --bin bench-autumn
 ```
@@ -174,7 +204,7 @@ DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
 ### Spring Boot (Java)
 ```bash
 cd benchmarks/runtime/spring-boot
-# Requires: JDK 21+, Maven 3.9+
+# Requires: JDK 25+, Maven 3.9+
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
   mvn spring-boot:run -Dspring-boot.run.jvmArguments="-Xmx256m"
 ```
@@ -182,7 +212,7 @@ DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
 ### Rails (Ruby)
 ```bash
 cd benchmarks/runtime/rails
-# Requires: Ruby 3.3+, Bundler
+# Requires: Ruby 4.0+, Bundler 4
 bundle install
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
 RAILS_ENV=production SECRET_KEY_BASE=changeme RAILS_MAX_THREADS=20 \
@@ -192,18 +222,18 @@ RAILS_ENV=production SECRET_KEY_BASE=changeme RAILS_MAX_THREADS=20 \
 ### Django (Python)
 ```bash
 cd benchmarks/runtime/django
-# Requires: Python 3.12+
+# Requires: Python 3.14+
 pip install -r requirements.txt
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
 DJANGO_SETTINGS_MODULE=benchapp.settings \
-  python manage.py migrate && gunicorn benchapp.wsgi:application \
-    --worker-class uvicorn.workers.UvicornWorker --workers 4 --bind 0.0.0.0:8080
+  python manage.py migrate --noinput && gunicorn benchapp.asgi:application \
+    --worker-class uvicorn_worker.UvicornWorker --workers 4 --bind 0.0.0.0:8080
 ```
 
 ### Phoenix (Elixir)
 ```bash
 cd benchmarks/runtime/phoenix
-# Requires: Elixir 1.17+, Erlang/OTP 27
+# Requires: Elixir 1.19+, Erlang/OTP 28
 mix deps.get
 DATABASE_URL=ecto://benchmark:benchmark@localhost/benchmark \
 SECRET_KEY_BASE=$(mix phx.gen.secret) \
@@ -375,17 +405,23 @@ Benchmark results are stored in `results/` and ignored by Git. Each run
 produces a timestamped directory:
 
 ```
-results/docker-k6_20260512_103000/
+results/k6_20261106_175617/
 ├── aggregate.csv
 ├── aggregate-summary.csv
-├── autumn/
-│   ├── json-crud-summary.json
-│   ├── html-page-summary.json
-│   ├── validation-fail-summary.json
-│   └── auth-protected-summary.json
-├── spring-boot/...
-└── ...
+├── run-01/
+│   ├── autumn/
+│   │   ├── json-crud-summary.json
+│   │   ├── html-page-summary.json
+│   │   ├── validation-fail-summary.json
+│   │   └── auth-protected-summary.json
+│   ├── spring-boot/...
+│   └── ...
+├── run-02/...
+└── run-03/...
 ```
 
-A rendered comparison report template lives at
-[`RESULTS.md`](RESULTS.md) — fill it in after each run.
+`aggregate-summary.csv` holds the per-framework, per-scenario medians across
+the `--repeat` runs; `aggregate.csv` holds every run.
+
+The latest six-framework comparison is written up in
+[`RESULTS.md`](RESULTS.md), together with the Autumn CI gate baseline.

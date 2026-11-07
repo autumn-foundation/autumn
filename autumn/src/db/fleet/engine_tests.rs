@@ -316,3 +316,163 @@ async fn exists_and_list_follow_the_engine() {
         keys
     });
 }
+
+#[test]
+fn sidecar_names_follow_the_rule() {
+    use super::{RESERVED_SIDECAR_NAMES, sidecar_root};
+    let root = "prod/fleet/tenant/acme";
+    assert_eq!(
+        sidecar_root(root, "duckdb").unwrap(),
+        "prod/fleet/tenant/acme/duckdb"
+    );
+    assert!(sidecar_root(root, "a").is_ok());
+    assert!(sidecar_root(root, "duck_db-2").is_ok());
+    assert!(sidecar_root(root, &"a".repeat(32)).is_ok());
+    for bad in [
+        "",
+        "DuckDB",
+        "duck/db",
+        "..",
+        ".",
+        "-duck",
+        "_duck",
+        "duck db",
+        "dück",
+        &"a".repeat(33),
+    ] {
+        assert!(sidecar_root(root, bad).is_err(), "{bad:?}");
+    }
+    for reserved in RESERVED_SIDECAR_NAMES {
+        assert!(sidecar_root(root, reserved).is_err(), "{reserved}");
+    }
+}
+
+#[tokio::test]
+async fn a_fleet_with_no_replica_gives_no_sidecar_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8, 0);
+    let db = fleet.open(&key(&fleet, "acme")).await.unwrap();
+    assert!(db.sidecar_replica("duckdb").unwrap().is_none());
+    assert!(
+        db.sidecar_replica("generations").is_err(),
+        "the name is checked first"
+    );
+}
+
+/// A delete retires the database before it waits for its users, so a
+/// sidecar scope stops writing at once.
+#[tokio::test]
+async fn a_delete_retires_the_database_before_it_waits_for_users() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8, 0);
+    let acme = key(&fleet, "acme");
+    let db = fleet.open(&acme).await.unwrap();
+    let busy = db.handle().checkout();
+    let retired = std::sync::Arc::clone(&db.retired);
+    drop(db);
+    let deleting = {
+        let (fleet, acme) = (fleet.clone(), acme.clone());
+        tokio::spawn(async move { fleet.delete(&acme).await })
+    };
+    eventually(|| retired.load(std::sync::atomic::Ordering::Acquire)).await;
+    assert!(
+        !deleting.is_finished(),
+        "the delete still waits for the user"
+    );
+    drop(busy);
+    assert!(deleting.await.unwrap().unwrap());
+}
+
+/// Keeps the database it saw in `on_open`.
+#[derive(Default)]
+struct Keeper(std::sync::Mutex<Option<super::FleetDatabase<TextEngine>>>);
+
+impl super::FleetLifecycle<TextEngine> for Keeper {
+    fn on_open(&self, db: &super::FleetDatabase<TextEngine>) -> Result<(), String> {
+        *self.0.lock().unwrap() = Some(db.clone());
+        Ok(())
+    }
+}
+
+struct Refuse;
+
+impl super::FleetLifecycle<TextEngine> for Refuse {
+    fn on_open(&self, _: &super::FleetDatabase<TextEngine>) -> Result<(), String> {
+        Err("no".to_owned())
+    }
+}
+
+/// A refused open retires the database that an earlier hook kept.
+#[tokio::test]
+async fn a_refused_open_retires_what_an_earlier_hook_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8, 0);
+    let keeper = std::sync::Arc::new(Keeper::default());
+    fleet.add_lifecycle(std::sync::Arc::clone(&keeper) as _);
+    fleet.add_lifecycle(std::sync::Arc::new(Refuse));
+    let error = fleet.open(&key(&fleet, "acme")).await.unwrap_err();
+    assert!(matches!(error, FleetError::Unavailable { .. }), "{error}");
+    let kept = keeper.0.lock().unwrap().take().expect("the first hook ran");
+    assert!(kept.retired.load(std::sync::atomic::Ordering::Acquire));
+}
+
+/// A fence retires a database that a close still drains: the close waits
+/// for a user, and the host loses the slot meanwhile.
+#[tokio::test]
+async fn a_fence_retires_a_database_that_is_still_draining() {
+    use crate::db::fleet_ownership::{FleetOwnership, MemoryOwnership, OwnerId, SlotRange};
+    use std::sync::Arc;
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8, 0);
+    let clock = crate::time::TickingClock::starting_at(
+        chrono::DateTime::from_timestamp_millis(1_000_000).unwrap(),
+    );
+    let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
+    let host = |owner: &str| {
+        Arc::new(
+            FleetOwnership::new(
+                Arc::clone(&store) as _,
+                OwnerId::new(owner).unwrap(),
+                vec![SlotRange::ALL],
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        )
+    };
+    let a = host("host-a");
+    assert_eq!(
+        fleet
+            .start_ownership(Arc::clone(&a))
+            .await
+            .unwrap()
+            .claimed
+            .len(),
+        1
+    );
+    let acme = key(&fleet, "acme");
+    let db = fleet.open(&acme).await.unwrap();
+    let busy = db.handle().checkout();
+    let retired = Arc::clone(&db.retired);
+    drop(db);
+    let closing = {
+        let (fleet, acme) = (fleet.clone(), acme.clone());
+        tokio::spawn(async move { fleet.close(&acme).await })
+    };
+    eventually(|| fleet.stats().draining == 1).await;
+    assert!(
+        !retired.load(std::sync::atomic::Ordering::Acquire),
+        "a plain close settles"
+    );
+
+    clock.advance(Duration::from_secs(31));
+    assert_eq!(host("host-b").refresh().await.claimed.len(), 1);
+    assert_eq!(a.refresh().await.lost, [SlotRange::ALL]);
+    assert_eq!(fleet.fence_unowned(), 0, "nothing open to close");
+    assert!(
+        retired.load(std::sync::atomic::Ordering::Acquire),
+        "the fence reaches the drain"
+    );
+    assert!(!closing.is_finished());
+    drop(busy);
+    closing.await.unwrap();
+}

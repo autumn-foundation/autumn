@@ -3,7 +3,6 @@ defmodule BenchmarkWeb.Router do
 
   pipeline :browser do
     plug :accepts, ["html"]
-    plug :put_root_layout, html: {BenchmarkWeb.Layouts, :root}
   end
 
   pipeline :api do
@@ -12,8 +11,8 @@ defmodule BenchmarkWeb.Router do
 
   scope "/", BenchmarkWeb do
     pipe_through :browser
-    get "/posts",      PostHtmlController, :index
-    get "/posts/:id",  PostHtmlController, :show
+    get "/posts",      PostController, :index
+    get "/posts/:id",  PostController, :show
     get "/health",     HealthController, :index
   end
 
