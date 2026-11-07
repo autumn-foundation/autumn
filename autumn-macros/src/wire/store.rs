@@ -9,14 +9,37 @@
 //!    `[workspace]`.
 //! 3. `<CARGO_MANIFEST_DIR>/target/autumn-contracts` otherwise.
 //!
-//! Writing is best effort. A read-only or sandboxed build must still compile,
-//! so every I/O error here is swallowed: the artifact only ever *enriches* a
-//! diagnostic, and the const assertion `#[contract_checked]` emits alongside it
-//! is what actually holds the contract.
+//! Writing is best effort in a normal build. A read-only or sandboxed build
+//! must still compile: the artifact only *enriches* a diagnostic, and the
+//! const assertion `#[contract_checked]` emits holds the contract. The
+//! `autumn contracts export` pass sets `AUTUMN_CONTRACT_STRICT`, and a failed
+//! write is then a compile error.
 
 use std::path::{Path, PathBuf};
 
-use crate::wire::ir::{EndpointDescriptor, ResolvedEndpoint, TypeDescriptor, WireTypeDescriptor};
+use proc_macro2::TokenStream;
+use quote::quote;
+
+use crate::wire::ir::{
+    CallerDescriptor, ClientDescriptor, EndpointDescriptor, ResolvedEndpoint, TypeDescriptor,
+    WireTypeDescriptor,
+};
+
+/// The environment variable that names the contract directory.
+pub const CONTRACT_DIR_ENV: &str = "AUTUMN_CONTRACT_DIR";
+
+/// A const item that reads `AUTUMN_CONTRACT_DIR` through `option_env!`.
+///
+/// rustc then records the variable in the crate's dep-info, and cargo rebuilds
+/// the crate when the value changes. `autumn contracts export` sets a new
+/// directory for each pass, so every wire macro runs again and writes its
+/// descriptor. A crate restored from a build cache cannot skip the write.
+#[must_use]
+pub fn track_contract_dir() -> TokenStream {
+    quote! {
+        const _: ::core::option::Option<&str> = ::core::option_env!("AUTUMN_CONTRACT_DIR");
+    }
+}
 
 /// Resolve the contract directory from the given environment.
 ///
@@ -45,7 +68,7 @@ pub fn contract_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    let explicit = std::env::var_os("AUTUMN_CONTRACT_DIR");
+    let explicit = std::env::var_os(CONTRACT_DIR_ENV);
     if explicit.as_ref().is_some_and(|dir| dir.is_empty()) {
         return None;
     }
@@ -79,14 +102,37 @@ fn declares_workspace(manifest: &str) -> bool {
     })
 }
 
-/// Write one endpoint's descriptor. Best effort — errors are swallowed.
-pub fn write_endpoint(dir: &Path, descriptor: &EndpointDescriptor) {
-    write_json(dir, &descriptor.artifact_file_name(), descriptor);
+/// Write one endpoint's descriptor.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn write_endpoint(dir: &Path, descriptor: &EndpointDescriptor) -> Result<(), String> {
+    write_json(dir, &descriptor.artifact_file_name(), descriptor)
 }
 
-/// Write one DTO's descriptor. Best effort — errors are swallowed.
-pub fn write_type(dir: &Path, descriptor: &TypeDescriptor) {
-    write_json(dir, &descriptor.artifact_file_name(), descriptor);
+/// Write one DTO's descriptor.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn write_type(dir: &Path, descriptor: &TypeDescriptor) -> Result<(), String> {
+    write_json(dir, &descriptor.artifact_file_name(), descriptor)
+}
+
+/// Write one client's descriptor.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn write_client(dir: &Path, descriptor: &ClientDescriptor) -> Result<(), String> {
+    write_json(dir, &descriptor.artifact_file_name(), descriptor)
+}
+
+/// Write one caller's descriptor. `key` keeps two same-named functions in
+/// one crate apart.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn write_caller(dir: &Path, descriptor: &CallerDescriptor, key: &str) -> Result<(), String> {
+    write_json(dir, &descriptor.artifact_file_name(key), descriptor)
 }
 
 /// Whether `file_name` is a plain file name that cannot escape its directory.
@@ -99,25 +145,43 @@ fn is_plain_file_name(file_name: &str) -> bool {
 }
 
 /// Serialize `value` to `dir/file_name`, or give up quietly.
-fn write_json<T: serde::Serialize>(dir: &Path, file_name: &str, value: &T) {
+fn write_json<T: serde::Serialize>(dir: &Path, file_name: &str, value: &T) -> Result<(), String> {
     if !is_plain_file_name(file_name) {
-        return;
+        return Err(format!("`{file_name}` is not a plain file name"));
     }
-    let Ok(json) = serde_json::to_vec_pretty(value) else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
+    let json = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+    let fail = |e: std::io::Error| format!("{}: {e}", dir.join(file_name).display());
+    std::fs::create_dir_all(dir).map_err(fail)?;
     // Two compilations of the same crate (different feature sets, a test
     // target alongside the lib) can race on one path. Write elsewhere and
     // rename, so a reader never sees a half-written file.
     let temp_path = dir.join(format!("{file_name}.{}.tmp", std::process::id()));
-    if std::fs::write(&temp_path, &json).is_err() {
-        return;
-    }
-    if std::fs::rename(&temp_path, dir.join(file_name)).is_err() {
+    std::fs::write(&temp_path, &json).map_err(fail)?;
+    std::fs::rename(&temp_path, dir.join(file_name)).map_err(|e| {
         let _ = std::fs::remove_file(&temp_path);
+        fail(e)
+    })
+}
+
+/// Whether a failed descriptor write must fail the build.
+///
+/// `autumn contracts export` sets `AUTUMN_CONTRACT_STRICT`: a lost descriptor
+/// there makes a smaller bundle, and a smaller bundle can pass a check that
+/// must fail. A normal build keeps writes best effort.
+fn strict() -> bool {
+    std::env::var_os("AUTUMN_CONTRACT_STRICT").is_some_and(|v| !v.is_empty())
+}
+
+/// The tokens for a write result: a `compile_error!` when a strict write
+/// failed, else nothing.
+#[must_use]
+pub fn write_outcome(result: Result<(), String>) -> TokenStream {
+    match result {
+        Err(error) if strict() => {
+            let message = format!("autumn contracts: cannot write a wire descriptor: {error}");
+            quote! { ::core::compile_error!(#message); }
+        }
+        _ => TokenStream::new(),
     }
 }
 
@@ -195,6 +259,7 @@ mod tests {
             path: "/items/{id}".to_owned(),
             request_type: "NoBody".to_owned(),
             response_type: "Item".to_owned(),
+            ..EndpointDescriptor::default()
         }
     }
 
@@ -225,8 +290,8 @@ mod tests {
     #[test]
     fn an_endpoint_round_trips_with_its_type_shapes_joined_in() {
         let dir = scratch("rt");
-        write_endpoint(&dir, &endpoint("catalog", "get_item"));
-        write_type(&dir, &item_type("catalog"));
+        write_endpoint(&dir, &endpoint("catalog", "get_item")).expect("writes");
+        write_type(&dir, &item_type("catalog")).expect("writes");
         let got = find_by_ident(&dir, "get_item_endpoint");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].response.serialized[0].rust_name, "id");
@@ -237,7 +302,7 @@ mod tests {
     #[test]
     fn an_unresolvable_type_yields_an_empty_shape_rather_than_a_guess() {
         let dir = scratch("unres");
-        write_endpoint(&dir, &endpoint("catalog", "get_item"));
+        write_endpoint(&dir, &endpoint("catalog", "get_item")).expect("writes");
         let got = find_by_ident(&dir, "get_item_endpoint");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].response.serialized, [] as [WireFieldDescriptor; 0]);
@@ -247,11 +312,11 @@ mod tests {
     #[test]
     fn a_type_from_the_endpoints_own_crate_wins_over_a_same_named_one() {
         let dir = scratch("samename");
-        write_endpoint(&dir, &endpoint("catalog", "get_item"));
-        write_type(&dir, &item_type("warehouse"));
+        write_endpoint(&dir, &endpoint("catalog", "get_item")).expect("writes");
+        write_type(&dir, &item_type("warehouse")).expect("writes");
         let mut mine = item_type("catalog");
         mine.shape.serialized[0].rust_name = "sku".to_owned();
-        write_type(&dir, &mine);
+        write_type(&dir, &mine).expect("writes");
         let got = find_by_ident(&dir, "get_item_endpoint");
         assert_eq!(got[0].response.serialized[0].rust_name, "sku");
         let _ = std::fs::remove_dir_all(&dir);
@@ -260,8 +325,8 @@ mod tests {
     #[test]
     fn an_ident_defined_by_two_crates_returns_both_so_the_caller_can_refuse_to_guess() {
         let dir = scratch("dup");
-        write_endpoint(&dir, &endpoint("catalog", "get_item"));
-        write_endpoint(&dir, &endpoint("warehouse", "get_item"));
+        write_endpoint(&dir, &endpoint("catalog", "get_item")).expect("writes");
+        write_endpoint(&dir, &endpoint("warehouse", "get_item")).expect("writes");
         assert_eq!(find_by_ident(&dir, "get_item_endpoint").len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -277,7 +342,7 @@ mod tests {
         let dir = scratch("escape");
         let mut descriptor = endpoint("catalog", "get_item");
         descriptor.krate = "../..".to_owned();
-        write_endpoint(&dir, &descriptor);
+        assert!(write_endpoint(&dir, &descriptor).is_err());
         assert_eq!(
             find_by_ident(&dir, "get_item_endpoint"),
             [] as [ResolvedEndpoint; 0]
@@ -338,5 +403,22 @@ mod tests {
         assert!(!declares_workspace(
             "[dependencies]\nworkspace-hack = \"1\"\n"
         ));
+    }
+
+    #[test]
+    fn a_failed_write_is_quiet_outside_the_export_pass() {
+        temp_env::with_var_unset("AUTUMN_CONTRACT_STRICT", || {
+            assert!(write_outcome(Err("disk full".to_owned())).is_empty());
+        });
+        assert!(write_outcome(Ok(())).is_empty());
+    }
+
+    #[test]
+    fn a_failed_write_is_a_compile_error_in_the_export_pass() {
+        temp_env::with_var("AUTUMN_CONTRACT_STRICT", Some("1"), || {
+            let out = write_outcome(Err("disk full".to_owned())).to_string();
+            assert!(out.contains("compile_error"), "{out}");
+            assert!(out.contains("disk full"), "{out}");
+        });
     }
 }

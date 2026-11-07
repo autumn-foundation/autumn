@@ -54,7 +54,13 @@ inputs:
   s3:
     description: >
       Set to false to use the GitHub Actions cache even when S3 is set up.
-      For a job whose runner cannot hold the S3 store's local copy.
+    required: false
+    default: "true"
+  warm:
+    description: >
+      Set to false to stop the S3 prefetch of this build's manifest. kache
+      then downloads an artifact only when a compile asks for it. For a
+      runner with little memory or disk. No effect on the GitHub cache.
     required: false
     default: "true"
 
@@ -70,6 +76,7 @@ runs:
         set -euo pipefail
         workflow=$(printf '%s' "$GITHUB_WORKFLOW" | tr -c 'A-Za-z0-9._-' '-')
         rustc_id=$(rustc -vV | awk '/^release:/ { r = $2 } /^commit-hash:/ { c = substr($2, 1, 12) } END { print r "-" c }')
+        host=$(rustc -vV | awk '/^host:/ { print $2 }' | tr -d '\r')
         if [ -n "$SHARED_KEY" ]; then
           scope="$SHARED_KEY"
         else
@@ -77,6 +84,10 @@ runs:
         fi
         echo "scope=$workflow-$scope-$rustc_id" >> "$GITHUB_OUTPUT"
         echo "prefix=kache-$workflow-$scope-$rustc_id" >> "$GITHUB_OUTPUT"
+        # The S3 manifest has no OS part of its own. Without the host, the
+        # Linux, macOS and Windows legs of one shared-key write one manifest,
+        # and each leg prefetches the artifacts of the last OS to save it.
+        echo "manifest=$workflow-$scope-$host-$rustc_id" >> "$GITHUB_OUTPUT"
     - id: backend
       shell: bash
       env:
@@ -124,9 +135,10 @@ runs:
         # `s3` is true, so the inner `||` never falls through to the other key.
         s3-access-key-id: ${{ steps.backend.outputs.s3 == 'true' && (steps.backend.outputs.write == 'true' && env.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || env.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID) || '' }}
         s3-secret-access-key: ${{ steps.backend.outputs.s3 == 'true' && (steps.backend.outputs.write == 'true' && env.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || env.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY) || '' }}
-        # One prefetch manifest per build variant, so lanes do not overwrite
-        # each other's. The store itself is shared.
-        manifest-key: ${{ steps.key.outputs.scope }}
+        # One prefetch manifest per build variant and host, so lanes and OSes
+        # do not overwrite each other's. The store itself is shared.
+        manifest-key: ${{ steps.key.outputs.manifest }}
+        warm: ${{ inputs.warm }}
         # aws-lc-sys and other build scripts compile C through the cc crate.
         # Without this, those compiles miss on every run. Off on Windows: with
         # no CC set, the action swaps MSVC cl.exe for clang-cl there, which

@@ -55,6 +55,14 @@ Cargo file, and about half changed autumn-web or autumn-macros source.
     protected branch, or nothing is ever written.
   - Every other run, PRs included, gets a read-only token and passes
     `save-cache: false`, which sets `KACHE_REMOTE_READONLY` for the daemon.
+  - kache does not download the whole store. It downloads an artifact when a
+    compile asks for it, and it prefetches the expensive artifacts that the
+    last protected run of the same build recorded in a manifest. The manifest
+    key is the workflow, the job scope, the host triple and the exact rustc.
+    The host is in the key because the Linux, macOS and Windows legs of one
+    `shared-key` would otherwise write one manifest, and each leg would
+    prefetch artifacts built for another OS. A job on a small runner passes
+    `warm: false` to stop the prefetch; the macOS test archive does.
   - A composite action cannot read `secrets` or `vars`, so each workflow maps
     them into its env as `AUTUMN_KACHE_S3_*`. The bucket, endpoint and region
     are repository variables or secrets; a variable wins when both are set.

@@ -62,6 +62,53 @@ What is deliberately *not* an error: adding an ordinary required field to
 `NewItem`. Both services share the type, so the storefront's
 `..Default::default()` sends a default value for it and the body is complete.
 
+## Two releases
+
+`contracts/release-1.json` is the contract of this example as it is now. It is
+release 1, the deployed release. Make a change, then check it as release 2:
+
+```bash
+autumn contracts check --against examples/mesh-storefront/contracts/release-1.json \
+  -p mesh-catalog -p mesh-storefront
+```
+
+Add a field to `Item` and read it in `show_item`:
+
+```diff
+ pub struct Item {
+     …
+     pub price_cents: u32,
++    pub badge: Option<String>,
+ }
+```
+
+```diff
+         h1 { (item.name) }
++        p { (item.badge.clone().unwrap_or_default()) }
+```
+
+Both builds pass. But the release-2 storefront reads `badge`, and a release-1
+catalog does not produce it. So the order matters:
+
+```
+If the callers ship first (new callers, deployed callees): 1 break(s)
+  - catalog.get_item (GET /items/{id}): caller `mesh-storefront::show_item` reads response field `badge`, which the deployed callee does not produce
+
+Verdict: safe only if the callees ship first.
+  Deploy catalog before mesh-storefront.
+```
+
+The check exits 3. Ship the catalog first, or run with `--order callee-first`
+to declare that order. Remove `subtitle`, which no caller reads, and the check
+exits 0. Change the `get_item` path, and the check exits 1: no order is safe.
+
+To make a new release 1, export it again:
+
+```bash
+autumn contracts export -p mesh-catalog -p mesh-storefront \
+  --out examples/mesh-storefront/contracts/release-1.json
+```
+
 ## Prove it across a mutation set
 
 ```bash
@@ -70,7 +117,9 @@ python3 scripts/wire-contract-sweep.py
 
 The script applies each seeded mutation to `mesh-catalog`, rebuilds, and reports
 how many wire-breaking changes turned the build red and how many compatible
-changes were falsely rejected. It restores the file when it finishes.
+changes were falsely rejected. Then it runs the two-release cases against
+`contracts/release-1.json`, and exports the tree twice to show the bundle bytes
+do not change. It restores the files when it finishes.
 
 ## Further reading
 

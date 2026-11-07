@@ -28,9 +28,13 @@ pub fn derive_wire_shape(input: &DeriveInput) -> Result<TokenStream, syn::Error>
     let serialized = field_tokens(&shape.serialized);
     let deserialized = field_tokens(&shape.deserialized);
     let type_name = &shape.name;
-    write_descriptor(&shape);
+    let written = write_descriptor(&shape);
+    let track = store::track_contract_dir();
 
     Ok(quote! {
+        #track
+        #written
+
         impl ::autumn_web::wire::WireShape for #name {
             const TYPE_NAME: &'static str = #type_name;
             const SERIALIZED: &'static [::autumn_web::wire::WireField] = &[#(#serialized),*];
@@ -43,17 +47,17 @@ pub fn derive_wire_shape(input: &DeriveInput) -> Result<TokenStream, syn::Error>
 ///
 /// Best effort: the descriptor only enriches a diagnostic, so a build that
 /// cannot write it still holds the contract through the const tables above.
-fn write_descriptor(shape: &WireTypeDescriptor) {
+fn write_descriptor(shape: &WireTypeDescriptor) -> TokenStream {
     let Some(dir) = store::contract_dir() else {
-        return;
+        return TokenStream::new();
     };
-    store::write_type(
+    store::write_outcome(store::write_type(
         &dir,
         &TypeDescriptor {
             krate: std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
             shape: shape.clone(),
         },
-    );
+    ))
 }
 
 /// Read a type's serde-visible shape, or say why it cannot be read.
@@ -521,5 +525,14 @@ mod tests {
         assert!(out.contains("const SERIALIZED"), "{out}");
         assert!(out.contains("const DESERIALIZED"), "{out}");
         assert!(out.contains("\"id\""), "{out}");
+    }
+
+    #[test]
+    fn the_derive_tracks_the_contract_dir_variable() {
+        let input: DeriveInput =
+            syn::parse_str("struct Item { id: String }").expect("fixture parses");
+        let out = derive_wire_shape(&input).expect("derives").to_string();
+        assert!(out.contains("option_env"), "{out}");
+        assert!(out.contains("AUTUMN_CONTRACT_DIR"), "{out}");
     }
 }
