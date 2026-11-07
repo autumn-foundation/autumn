@@ -161,6 +161,7 @@ mod tests {
                 path: "/items".to_owned(),
                 request_type: "NewItem".to_owned(),
                 response_type: "Item".to_owned(),
+                ..EndpointDescriptor::default()
             },
             request: WireTypeDescriptor {
                 name: "NewItem".to_owned(),

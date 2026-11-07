@@ -147,13 +147,40 @@ mod imp {
     use autumn_web::db::fleet_replication::{FleetReplication, replica_root};
     use autumn_web::db::fleet_tombstones::FleetTombstones;
     use autumn_web::fleet_layout::FleetDbKey;
+    use autumn_web::migrate::MigrationScope;
     use autumn_web::replication::ReplicationSettings;
 
     use super::FleetCommand;
     use crate::db::replica;
 
-    /// The app's migration directory, relative to the app directory.
-    const MIGRATIONS_DIR: &str = "migrations";
+    /// The scopes whose directories a fleet database gets, as at boot:
+    /// `migrations/` and `migrations-shards/`. Never `migrations-control/`.
+    const FLEET_SCOPES: [MigrationScope; 2] = [MigrationScope::Everywhere, MigrationScope::Shards];
+
+    /// The migration sets of a fleet database, read from disk: each
+    /// directory of [`FLEET_SCOPES`] that exists, in that order. One of them
+    /// must exist.
+    fn fleet_sources() -> Result<Vec<diesel_migrations::FileBasedMigrations>, String> {
+        let mut sources = Vec::new();
+        for scope in FLEET_SCOPES {
+            let dir = Path::new(scope.directory());
+            if !dir.is_dir() {
+                continue;
+            }
+            sources.push(
+                diesel_migrations::FileBasedMigrations::from_path(dir)
+                    .map_err(|e| format!("could not read {}/: {e}", dir.display()))?,
+            );
+        }
+        if sources.is_empty() {
+            return Err(format!(
+                "Migrations directory not found: {}/\n  Run this command from the app \
+                 directory.",
+                MigrationScope::Everywhere.directory()
+            ));
+        }
+        Ok(sources)
+    }
 
     pub fn run(command: &FleetCommand) -> Result<(), String> {
         match command {
@@ -271,20 +298,23 @@ mod imp {
             ))
         }
 
-        /// The fleet, with `migrations` when given. An open never migrates.
+        /// The fleet, with `migrations` and the framework sets when
+        /// `migrations` is not empty. An open never migrates.
         fn build(
             &self,
-            migrations: Option<diesel_migrations::FileBasedMigrations>,
+            migrations: Vec<diesel_migrations::FileBasedMigrations>,
         ) -> Result<DatabaseFleet, String> {
             self.require_root()?;
             let mut builder = DatabaseFleet::builder(self.fleet.clone())
                 .connect_timeout_secs(self.config.database.connect_timeout_secs)
                 .apply_migrations_on_open(false);
-            if let Some(migrations) = migrations {
+            if !migrations.is_empty() {
+                for source in migrations {
+                    builder = builder.migration_source("app", source);
+                }
                 // The check of `refuse_unknown_versions` again, on the file
                 // each run migrates: another process can replace it between.
                 builder = builder
-                    .migration_source("app", migrations)
                     .framework_migrations()
                     .refuse_unknown_migrations(true);
             }
@@ -342,7 +372,7 @@ mod imp {
 
     /// What the `--open` columns compare a database with.
     struct AppView {
-        /// The versions in `migrations/`, as named on disk.
+        /// The versions in [`fleet_sources`], as named on disk.
         versions: Vec<String>,
         /// Every version the CLI's sets record, sorted.
         known: Vec<String>,
@@ -351,16 +381,19 @@ mod imp {
         exact: bool,
     }
 
-    /// The app view, or `None` when `migrations/` cannot be read.
+    /// The app view, or `None` when [`fleet_sources`] cannot be read.
     fn app_view(target: &Target) -> Option<AppView> {
-        let source = diesel_migrations::FileBasedMigrations::from_path(MIGRATIONS_DIR).ok()?;
-        let versions =
-            diesel::migration::MigrationSource::<diesel::sqlite::Sqlite>::migrations(&source)
-                .ok()?
-                .iter()
-                .map(|m| m.name().version().to_string())
-                .collect();
-        let fleet = target.build(Some(source)).ok()?;
+        let sources = fleet_sources().ok()?;
+        let mut versions = Vec::new();
+        for source in &sources {
+            versions.extend(
+                diesel::migration::MigrationSource::<diesel::sqlite::Sqlite>::migrations(source)
+                    .ok()?
+                    .iter()
+                    .map(|m| m.name().version().to_string()),
+            );
+        }
+        let fleet = target.build(sources).ok()?;
         Some(AppView {
             versions,
             known: fleet.known_migration_versions(),
@@ -393,7 +426,7 @@ mod imp {
     }
 
     fn list(target: &Target, open: bool, json: bool) -> Result<(), String> {
-        let fleet = target.build(None)?;
+        let fleet = target.build(Vec::new())?;
         let rt = runtime()?;
         let keys = rt.block_on(fleet.list()).map_err(|e| e.to_string())?;
         eprintln!("  \u{2139} root: {}", fleet.root().display());
@@ -484,16 +517,7 @@ mod imp {
 
     fn migrate(target: &Target, concurrency: usize, key: Option<&str>) -> Result<(), String> {
         target.require_root()?;
-        let dir = Path::new(MIGRATIONS_DIR);
-        if !dir.is_dir() {
-            return Err(format!(
-                "Migrations directory not found: {MIGRATIONS_DIR}/\n  Run this command from \
-                 the app directory."
-            ));
-        }
-        let source = diesel_migrations::FileBasedMigrations::from_path(dir)
-            .map_err(|e| format!("could not read {MIGRATIONS_DIR}/: {e}"))?;
-        let fleet = target.build(Some(source))?;
+        let fleet = target.build(fleet_sources()?)?;
         // A shared version gets a substitute that depends on every set the app
         // registers. This command does not have them all, so it could record
         // other versions than boot does.
@@ -585,15 +609,17 @@ mod imp {
             return Ok(checked);
         }
         Err(format!(
-            "These databases record migrations that are not in {MIGRATIONS_DIR}/ or the \
-             framework sets:\n  {}\n  A plugin set probably applied them. Run the app once \
-             with AUTUMN_MIGRATE=1 instead.",
+            "These databases record migrations that are not in {}/, {}/ or the framework \
+             sets:\n  {}\n  A plugin set probably applied them. Run the app once with \
+             AUTUMN_MIGRATE=1 instead.",
+            MigrationScope::Everywhere.directory(),
+            MigrationScope::Shards.directory(),
             found.join("\n  ")
         ))
     }
 
     fn backup(target: &Target, key: &str, dest: &Path) -> Result<(), String> {
-        let fleet = target.build(None)?;
+        let fleet = target.build(Vec::new())?;
         let key = parse_key(&fleet, key)?;
         let taken = || {
             format!(
@@ -707,16 +733,7 @@ mod imp {
             return Err(format!("{} is not a file.", source.display()));
         }
         target.require_root()?;
-        let dir = Path::new(MIGRATIONS_DIR);
-        if !dir.is_dir() {
-            return Err(format!(
-                "Migrations directory not found: {MIGRATIONS_DIR}/\n  Run this command from \
-                 the app directory."
-            ));
-        }
-        let migrations = diesel_migrations::FileBasedMigrations::from_path(dir)
-            .map_err(|e| format!("could not read {MIGRATIONS_DIR}/: {e}"))?;
-        let fleet = target.build(Some(migrations))?;
+        let fleet = target.build(fleet_sources()?)?;
         let remapped = fleet.remapped_migrations();
         if !remapped.is_empty() {
             return Err(format!(
@@ -771,7 +788,7 @@ mod imp {
     }
 
     fn delete(target: &Target, key: &str, force: bool) -> Result<(), String> {
-        let fleet = target.build(None)?;
+        let fleet = target.build(Vec::new())?;
         let key = parse_key(&fleet, key)?;
         let path = fleet.path_of(&key);
         if !force {
@@ -920,7 +937,7 @@ mod imp {
         }
         let at = replica::parse_timestamp(timestamp).map_err(|e| e.to_string())?;
         let loaded = validated_replication(target)?;
-        let fleet = target.build(None)?;
+        let fleet = target.build(Vec::new())?;
         let key = parse_key(&fleet, key)?;
         let prefix = replica_root(&loaded.root(), &key);
         // The restore also drops the tombstone of a deleted database.
@@ -1269,6 +1286,7 @@ mod imp {
                 root: tmp.path().display().to_string(),
                 path: None,
                 max_open: 1,
+                max_resident_bytes: 0,
                 pool_size: 1,
                 create_on_demand: None,
                 idle_close_secs: 0,

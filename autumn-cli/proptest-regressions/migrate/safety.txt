@@ -4,4 +4,5 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+cc 1ef7917cca8c2f79d5dfb3613fdd77a21f9bc687ed2b38790612481cbe6fd13e # shrinks to body = "", doubled = false, continued = true
 cc be7d1a423c0b76272eed591260302164c64c287f379ac85797a13e054db8cd39 # shrinks to sql = "'\t"

@@ -1,0 +1,7 @@
+Wire contracts: the current build against the deployed release.
+
+If the callees ship first (new callees, deployed callers): ok
+
+If the callers ship first (new callers, deployed callees): ok
+
+Verdict: safe in any deploy order.

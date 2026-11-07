@@ -115,6 +115,7 @@ mod sqlite {
                 root: self.root().display().to_string(),
                 path: None,
                 max_open: 8,
+                max_resident_bytes: 0,
                 pool_size: 2,
                 create_on_demand: None,
                 idle_close_secs: 0,
@@ -334,6 +335,51 @@ mod sqlite {
             boot.open(&boot.key_for("globex").unwrap()).await.unwrap();
             boot.close_all().await;
         });
+    }
+
+    /// Write one migration under `dir/<sub>/`.
+    fn write_migration(dir: &Path, sub: &str, name: &str, table: &str) {
+        let migration = dir.join(sub).join(name);
+        std::fs::create_dir_all(&migration).unwrap();
+        std::fs::write(
+            migration.join("up.sql"),
+            format!("CREATE TABLE {table} (id INTEGER);"),
+        )
+        .unwrap();
+        std::fs::write(migration.join("down.sql"), format!("DROP TABLE {table};")).unwrap();
+    }
+
+    /// `migrations-shards/` reaches each fleet database, as a
+    /// `MigrationScope::Shards` set does at boot. `migrations-control/` does
+    /// not, as a `MigrationScope::Control` set does not.
+    #[test]
+    fn fleet_migrate_applies_the_shard_directory_and_never_the_control_directory() {
+        let app = App::new("");
+        app.provision(&app.bare_fleet(), &["acme"], 0);
+        write_migration(
+            &app.dir,
+            "migrations-shards",
+            "20260102000000_create_orders",
+            "orders",
+        );
+        write_migration(
+            &app.dir,
+            "migrations-control",
+            "20260103000000_create_tenants",
+            "tenants",
+        );
+
+        run_ok(&app.dir, &["fleet", "migrate"]);
+        let path = app.path("acme");
+        assert!(has_table(&path, "notes"));
+        assert!(has_table(&path, "orders"));
+        assert!(!has_table(&path, "tenants"), "a control set stays off");
+
+        // `fleet list --open` counts the shard directory, and a second
+        // migrate is clean: the check of unknown versions knows it.
+        let (stdout, _) = run_ok(&app.dir, &["fleet", "list", "--open", "--json"]);
+        assert!(stdout.contains("\"pending\":0"), "{stdout}");
+        run_ok(&app.dir, &["fleet", "migrate"]);
     }
 
     #[test]

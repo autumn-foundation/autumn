@@ -9,6 +9,9 @@ use autumn_web::prelude::*;
 /// A catalog item, as the service puts it on the wire.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, WireShape)]
 pub struct Item {
+    /// Shelf label. Optional, and no caller reads it, so a later release may
+    /// remove it.
+    pub subtitle: Option<String>,
     /// Stable item identifier.
     pub id: String,
     /// Display name.
@@ -41,6 +44,7 @@ impl Item {
     /// change is a one-line edit.
     fn sample(id: String, name: String, price_cents: u32) -> Self {
         Self {
+            subtitle: None,
             id,
             name,
             price_cents,

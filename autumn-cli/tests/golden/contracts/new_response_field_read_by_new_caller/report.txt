@@ -1,0 +1,10 @@
+Wire contracts: the current build against the deployed release.
+
+If the callees ship first (new callees, deployed callers): ok
+
+If the callers ship first (new callers, deployed callees): 1 break(s)
+  - catalog.get_item (GET /items/{id}): caller `mesh-storefront::show_item` reads response field `badge`, which the deployed callee does not produce
+
+Verdict: safe only if the callees ship first.
+  Deploy catalog before mesh-storefront.
+  To declare this order, run with --order callee-first.

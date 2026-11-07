@@ -1,0 +1,274 @@
+//! The wire descriptors: what one service endpoint puts on, and takes off,
+//! the wire.
+//!
+//! The wire macros write these as JSON build artifacts. `#[contract_checked]`
+//! reads them back to name a field in a diagnostic. `autumn contracts export`
+//! joins them into one release bundle, and `autumn contracts check` compares
+//! two bundles.
+//!
+//! Field names are recorded twice. `rust_name` is what a caller writes in
+//! source; `wire_name` is what serde puts in the JSON. They differ under
+//! `#[serde(rename)]` / `#[serde(rename_all)]`. A check inside one build keys
+//! on `rust_name`. A check across two releases keys on `wire_name`.
+
+use serde::{Deserialize, Serialize};
+
+/// One field of a request or response type, as serde treats it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WireFieldDescriptor {
+    /// The field's Rust identifier — what a call site writes.
+    pub rust_name: String,
+    /// The JSON key serde uses. Equals `rust_name` unless renamed.
+    pub wire_name: String,
+    /// The field's type, as written in the struct.
+    pub ty: String,
+    /// Whether the field must be present on the wire in this direction.
+    ///
+    /// For a request: the callee rejects a body that omits it. For a response:
+    /// the callee always produces it, so a caller may read it unconditionally.
+    pub required: bool,
+    /// Extra keys `#[serde(alias = "…")]` also accepts, deserialize side only.
+    ///
+    /// Carried so a later version diff reads a rename-plus-alias — the standard
+    /// non-breaking field rename — as the compatible change it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+/// The serde-visible shape of one request or response type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+pub struct WireTypeDescriptor {
+    /// The type's Rust name.
+    pub name: String,
+    /// Fields this type puts on the wire when serialized.
+    pub serialized: Vec<WireFieldDescriptor>,
+    /// Fields this type accepts off the wire when deserialized.
+    pub deserialized: Vec<WireFieldDescriptor>,
+    /// Whether `#[serde(deny_unknown_fields)]` closes the object.
+    ///
+    /// Adding it is a breaking change across a deploy window — an older
+    /// caller's extra key starts being rejected — so the artifact records it.
+    #[serde(default)]
+    pub closed: bool,
+}
+
+impl WireTypeDescriptor {
+    /// The serialized field with this Rust name, if the type produces one.
+    #[must_use]
+    pub fn produced(&self, rust_name: &str) -> Option<&WireFieldDescriptor> {
+        self.serialized.iter().find(|f| f.rust_name == rust_name)
+    }
+
+    /// The deserialized field with this Rust name, if the type accepts one.
+    #[must_use]
+    pub fn accepted(&self, rust_name: &str) -> Option<&WireFieldDescriptor> {
+        self.deserialized.iter().find(|f| f.rust_name == rust_name)
+    }
+}
+
+/// One service endpoint's contract, as `#[endpoint]` wrote it.
+///
+/// Field shapes are not inlined here. A type is described once, in its own
+/// `TypeDescriptor` artifact, and referenced by name — the same DTO usually
+/// serves several endpoints, and one description keeps them from drifting.
+/// A reader joins the two into a [`ResolvedEndpoint`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointDescriptor {
+    /// The service this endpoint belongs to, from `#[endpoint(service = "…")]`.
+    pub service: String,
+    /// The endpoint name — the handler's function name unless overridden.
+    pub name: String,
+    /// The marker type `#[endpoint]` generates, e.g. `get_item_endpoint`.
+    pub endpoint_ident: String,
+    /// The crate the endpoint is defined in.
+    pub krate: String,
+    /// HTTP method, uppercase.
+    pub method: String,
+    /// Route path, with `{param}` placeholders intact.
+    pub path: String,
+    /// Rust name of the request body type, or `NoBody`.
+    pub request_type: String,
+    /// Rust name of the response body type.
+    pub response_type: String,
+    /// Whether the handler reads a JSON request body. `Json<NoBody>` reads
+    /// one, so the type name alone cannot tell.
+    #[serde(default)]
+    pub has_body: bool,
+    /// Whether the request body is a JSON array of `request_type`.
+    #[serde(default)]
+    pub request_list: bool,
+    /// Whether the response body is a JSON array of `response_type`.
+    #[serde(default)]
+    pub response_list: bool,
+}
+
+impl EndpointDescriptor {
+    /// `service.name` — how a diagnostic names this endpoint.
+    #[must_use]
+    pub fn id(&self) -> String {
+        format!("{}.{}", self.service, self.name)
+    }
+
+    /// The artifact file name for this endpoint, unique within a workspace.
+    #[must_use]
+    pub fn artifact_file_name(&self) -> String {
+        format!(
+            "endpoint.{}.{}.{}.json",
+            self.krate, self.service, self.name
+        )
+    }
+}
+
+/// One DTO's shape, as `#[derive(WireShape)]` wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeDescriptor {
+    /// The crate the type is defined in.
+    pub krate: String,
+    /// The type's shape.
+    #[serde(flatten)]
+    pub shape: WireTypeDescriptor,
+}
+
+impl TypeDescriptor {
+    /// The artifact file name for this type, unique within a workspace.
+    #[must_use]
+    pub fn artifact_file_name(&self) -> String {
+        format!("type.{}.{}.json", self.krate, self.shape.name)
+    }
+}
+
+/// An endpoint with both of its type shapes filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEndpoint {
+    /// The endpoint itself.
+    pub endpoint: EndpointDescriptor,
+    /// What the endpoint accepts in its request body.
+    pub request: WireTypeDescriptor,
+    /// What the endpoint produces in its response body.
+    pub response: WireTypeDescriptor,
+}
+
+/// One `wire_client!` client: the endpoint marker behind each method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDescriptor {
+    /// The crate that declares the client.
+    pub krate: String,
+    /// The client type's name, e.g. `CatalogClient`.
+    pub name: String,
+    /// One entry per generated method.
+    pub endpoints: Vec<ClientEndpoint>,
+}
+
+/// One method of a generated client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientEndpoint {
+    /// The method name, e.g. `get_item`.
+    pub method: String,
+    /// The marker path as written, e.g. `mesh_catalog::get_item_endpoint`.
+    pub marker: String,
+}
+
+impl ClientDescriptor {
+    /// The artifact file name for this client, unique within a crate.
+    #[must_use]
+    pub fn artifact_file_name(&self) -> String {
+        format!("client.{}.{}.json", self.krate, self.name)
+    }
+}
+
+/// One `#[contract_checked]` function and the calls it makes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerDescriptor {
+    /// The crate that holds the function.
+    pub krate: String,
+    /// The function's name.
+    pub function: String,
+    /// Every client call in the function, in source order.
+    pub calls: Vec<CallerCall>,
+}
+
+/// One call through a generated client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerCall {
+    /// The client type's path, as `#[contract_checked(client = …)]` gives
+    /// it, e.g. `CatalogClient` or `shared::CatalogClient`.
+    pub client: String,
+    /// The client method called. It is also the endpoint's name.
+    pub method: String,
+    /// Response fields the caller reads, by Rust name, sorted.
+    pub reads: Vec<String>,
+    /// Request fields the call site sets, by Rust name, sorted. `None` when
+    /// the request is not an inline struct literal.
+    pub writes: Option<Vec<String>>,
+}
+
+impl CallerDescriptor {
+    /// The artifact file name for this function.
+    ///
+    /// Two functions in one crate can have the same name. `key` makes the
+    /// name unique; the caller derives it from the function's tokens.
+    #[must_use]
+    pub fn artifact_file_name(&self, key: &str) -> String {
+        format!("caller.{}.{}.{key}.json", self.krate, self.function)
+    }
+}
+
+/// A stable 64-bit FNV-1a hash, as 16 hex digits.
+///
+/// Use it for file names that must be the same on every build. The standard
+/// hasher is random per process, so it cannot do this.
+#[must_use]
+pub fn stable_key(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_key_is_the_same_for_the_same_text() {
+        assert_eq!(stable_key("fn a() {}"), stable_key("fn a() {}"));
+        assert_ne!(stable_key("fn a() {}"), stable_key("fn b() {}"));
+        assert_eq!(stable_key(""), "cbf29ce484222325");
+    }
+
+    #[test]
+    fn a_caller_descriptor_round_trips_through_json() {
+        let caller = CallerDescriptor {
+            krate: "storefront".to_owned(),
+            function: "show_item".to_owned(),
+            calls: vec![CallerCall {
+                client: "CatalogClient".to_owned(),
+                method: "get_item".to_owned(),
+                reads: vec!["name".to_owned()],
+                writes: None,
+            }],
+        };
+        let json = serde_json::to_string(&caller).expect("serializes");
+        let back: CallerDescriptor = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back, caller);
+        assert_eq!(
+            caller.artifact_file_name("k"),
+            "caller.storefront.show_item.k.json"
+        );
+    }
+
+    #[test]
+    fn a_client_descriptor_names_its_file_after_the_crate_and_client() {
+        let client = ClientDescriptor {
+            krate: "storefront".to_owned(),
+            name: "CatalogClient".to_owned(),
+            endpoints: Vec::new(),
+        };
+        assert_eq!(
+            client.artifact_file_name(),
+            "client.storefront.CatalogClient.json"
+        );
+    }
+}

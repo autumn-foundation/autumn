@@ -1,0 +1,78 @@
+name: Wire contracts
+
+# Runs `scripts/wire-contract-sweep.py` over `examples/mesh-catalog` and
+# `examples/mesh-storefront`:
+#
+#   * Seeded mutations: each wire-breaking change must fail the storefront
+#     build with a caller-named error. No compatible change may fail it.
+#   * Two releases: each release-2 case runs `autumn contracts check` against
+#     the committed `examples/mesh-storefront/contracts/release-1.json`. The
+#     exit code and the named deploy order must match.
+#   * Byte stability: two real exports must give the same bytes as the
+#     committed bundle. An edit to the examples that changes the contract
+#     must also export the bundle again.
+#
+# The path filter keeps this job off PRs that do not touch wire code.
+
+on:
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn-macros/src/wire/**"
+      - "autumn-macros-support/src/wire.rs"
+      - "autumn/src/wire/**"
+      - "autumn-cli/src/contracts/**"
+      - "examples/mesh-catalog/**"
+      - "examples/mesh-storefront/**"
+      - "scripts/wire-contract-sweep.py"
+      - ".github/workflows/wire-contracts.yml"
+  push:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn-macros/src/wire/**"
+      - "autumn-macros-support/src/wire.rs"
+      - "autumn/src/wire/**"
+      - "autumn-cli/src/contracts/**"
+      - "examples/mesh-catalog/**"
+      - "examples/mesh-storefront/**"
+      - "scripts/wire-contract-sweep.py"
+      - ".github/workflows/wire-contracts.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wire-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # kache S3 remote (.github/actions/kache). Unset variables keep the GitHub
+  # Actions cache. The write token is mapped only on a protected ref.
+  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET || secrets.AUTUMN_KACHE_S3_BUCKET }}
+  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT || secrets.AUTUMN_KACHE_S3_ENDPOINT }}
+  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION || secrets.AUTUMN_KACHE_S3_REGION }}
+  AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID: ${{ secrets.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
+  AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY: ${{ secrets.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY }}
+  AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || '' }}
+  AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || '' }}
+
+jobs:
+  sweep:
+    name: Wire-contract sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: ./.github/actions/kache
+        continue-on-error: true
+        with:
+          key: wire-contracts
+      - name: Build the autumn CLI
+        run: cargo build -p autumn-cli
+      - name: Run the sweep
+        env:
+          AUTUMN_BIN: target/debug/autumn
+        run: python3 scripts/wire-contract-sweep.py

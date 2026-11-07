@@ -71,7 +71,10 @@ sha256() {
 fetch() {
   local url="$1" sha="$2" dest="${tools_dir}/$3"
   if [[ ! -f "${dest}" ]]; then
-    curl -fsSL --retry 3 -o "${dest}.part" "${url}"
+    # A release host can answer 5xx for a minute. Retry every error with a
+    # delay, for up to two minutes, and name a failed download as such.
+    curl -fsSL --retry 8 --retry-delay 10 --retry-all-errors --retry-max-time 120 \
+      -o "${dest}.part" "${url}" || fail "could not download ${url}"
     mv "${dest}.part" "${dest}"
   fi
   if [[ "$(sha256 "${dest}")" != "${sha}" ]]; then

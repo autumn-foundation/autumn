@@ -33,6 +33,7 @@ mode = "tenant"                 # or "slot"
 root = "/var/lib/app/fleet"     # on the host's local volume
 # path = "{bucket}/{tenant}.db" # default for mode = "tenant"
 max_open = 256                  # soft limit on open databases (LRU past this)
+# max_resident_bytes = 0        # soft memory budget; 0 is off (LRU past this)
 # min_residency = "2s"          # LRU does not close a database used this recently
 pool_size = 2                   # connections per open database
 idle_close_secs = 300           # close a database idle this long
@@ -310,25 +311,45 @@ migrations expand-then-contract.
 ### Control-only and tenant-only sets
 
 `AppBuilder::migrations` sends a set to the control database and to every
-fleet database. To keep a set on one side, use `migrations_for`:
+fleet database. To keep a set on one side, use `migrations_for`, or
+`plugin_migrations_for` in a plugin:
 
 ```rust
 use autumn_web::migrate::{EmbeddedMigrations, MigrationScope, embed_migrations};
 
+const SHARED: EmbeddedMigrations = embed_migrations!("migrations");
 const CONTROL: EmbeddedMigrations = embed_migrations!("migrations-control");
-const TENANT: EmbeddedMigrations = embed_migrations!("migrations");
+const TENANT: EmbeddedMigrations = embed_migrations!("migrations-shards");
 
 autumn_web::app()
+    .migrations(SHARED)                               // every database
     .migrations_for(MigrationScope::Control, CONTROL) // control database only
     .migrations_for(MigrationScope::Shards, TENANT)   // each fleet database only
 ```
 
-Boot and `AUTUMN_MIGRATE=1` obey the scope. `autumn migrate` and
-`autumn fleet migrate` read `migrations/` and do not know a scope. Keep the
-tenant set in `migrations/` and the control set in its own directory. Then
-`autumn fleet migrate` is correct for the fleet. Do not run `autumn migrate`
-on this app: it applies `migrations/` to the control database. Use
-`AUTUMN_MIGRATE=1`.
+Boot and `AUTUMN_MIGRATE=1` obey the scope. The framework control-plane set
+(`FRAMEWORK_MIGRATIONS`) always applies as `Control`.
+
+The CLI reads the scope from the directory name
+(`MigrationScope::directory`). Embed each directory with its scope, as
+above:
+
+| Directory | Scope | `autumn migrate` | `autumn fleet migrate` |
+| --- | --- | --- | --- |
+| `migrations/` | `Everywhere` | control database | each fleet database |
+| `migrations-control/` | `Control` | control database | no |
+| `migrations-shards/` | `Shards` | no | each fleet database |
+
+With no `[database.fleet]` and no `[[database.shards]]`, the one database
+gets every scope, at boot and from `autumn migrate`. Thus a plugin can
+register `Control` or `Shards` and not check the topology.
+
+`autumn migrate` applies the scope directories to a SQLite database only.
+On a Postgres target that takes one, it stops: run the app once with
+`AUTUMN_MIGRATE=1`. `autumn migrate check` scans all three directories.
+`autumn migrate down` reads `migrations/` only, so it stops when a scope
+directory exists. Plugin sets are not on disk: `AUTUMN_MIGRATE=1` applies
+them.
 
 ## Opening and closing
 
@@ -346,6 +367,12 @@ on this app: it applies `migrations/` to the control database. Use
   12 seconds after the burst.
 - A lower `min_residency` keeps the count nearer to `max_open` during a burst.
   A request can then reopen a database that it used a moment before.
+- `max_resident_bytes` is a soft memory budget, with the same rules as
+  `max_open`. The `SQLite` engine counts about 2 MB of page cache for each
+  open connection. Above the budget, the least recently used idle database
+  closes. The fleet keeps one database open, also when it alone is above
+  the budget. `0` (the default) turns the budget off. `/actuator/health`
+  reports `resident_bytes` under `db:fleet`.
 - A new database is built and migrated in a private staging file, then
   published in one step: it is absent or complete, never half made. When two
   processes on one volume create the same database, both end up on one file.
@@ -661,6 +688,7 @@ the [cell router](cell-isolation.md).
 | Claim | At boot, before the first request. If the range is free, or each lease on it ended, the host gets a new epoch. If the host already has the same range, it keeps its epoch. A live lease on any slot of the range refuses the claim, also a lease of the same owner on a range of another shape. |
 | Renew | Every `lease_secs / 3`. The host renews all ranges at the same time. Each call has `lease_secs / 3` to answer. A slow range fails alone; the other ranges keep their leases. A slow call keeps running, so the range makes no new call until it ends. If the row has another owner or epoch, the host loses the range. |
 | Serve | `open` checks the slot first. If the host does not own the slot, `open` returns `421 Misdirected Request` and does not touch the disk. So `restore_missing` runs only for an owned key. |
+| Stamp | Each file records the newest epoch it was opened under. An open under an older epoch is refused with `421` (`NewerEpoch`), and the file does not change. The check and the stamp are one transaction. |
 | Lose | The host closes every open database of the range. The close does not wait for workers, but it waits for connections that are in use. The sweeper and the fan-outs skip the range. |
 | Lease length | A lease never ends earlier than an older call set it. If you make `lease_secs` shorter, the new length applies when the old lease ends. |
 | Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after it sent its last renew. This is before the lease in the table ends. |

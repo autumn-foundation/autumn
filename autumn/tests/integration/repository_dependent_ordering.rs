@@ -53,27 +53,23 @@ fn log_range(prefix: &str, lo: i64, hi: i64) -> Vec<String> {
         .collect()
 }
 
-/// Drain the commit-hook queue until `want` entries of `prefix` in `lo..=hi`
-/// are in the log, for at most five seconds. Return those entries.
-///
-/// The dispatcher kick after a commit can claim a hook before the drain. The
-/// drain then skips it, and the hook writes the log a moment later. So wait
-/// for the log, not for the drain count.
+/// Drain the commit-hook queue until `want` entries in the range are logged.
+/// The dispatcher kick after commit can claim a hook first and run it in the
+/// background, so one drain pass does not run every queued hook.
 async fn drain_until_logged(
     pool: &Pool<AsyncPgConnection>,
     prefix: &str,
     lo: i64,
     hi: i64,
     want: usize,
-) -> Vec<String> {
+) {
     for _ in 0..50 {
         autumn_web::test::drain_ready_repository_commit_hooks(pool, 16).await;
         if log_range(prefix, lo, hi).len() >= want {
-            break;
+            return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    log_range(prefix, lo, hi)
 }
 
 macro_rules! logging_hooks {
@@ -883,7 +879,8 @@ async fn cascaded_child_commit_hook_runs_once_per_child_after_commit() {
         3,
         "one queued hook per destroyed child"
     );
-    let mut log = drain_until_logged(&pool, "c", 1, 3, 3).await;
+    drain_until_logged(&pool, "c", 1, 3, 3).await;
+    let mut log = log_range("c", 1, 3);
     log.sort();
     assert_eq!(log, vec!["ccommit:1", "ccommit:2", "ccommit:3"]);
 }
@@ -906,12 +903,9 @@ async fn cascaded_child_commit_hook_runs_once_per_child_on_delete_many() {
 
     let repo = PgCPostRepository::with_pool_untracked(pool.clone());
     repo.delete_many(&[11, 12]).await.expect("delete_many");
-    assert_eq!(
-        count(&mut conn, "autumn_repository_commit_hooks").await,
-        2,
-        "one queued hook per destroyed child"
-    );
-    let mut log = drain_until_logged(&pool, "c", 11, 12, 2).await;
+    assert_eq!(count(&mut conn, "autumn_repository_commit_hooks").await, 2);
+    drain_until_logged(&pool, "c", 11, 12, 2).await;
+    let mut log = log_range("c", 11, 12);
     log.sort();
     assert_eq!(log, vec!["ccommit:11", "ccommit:12"]);
 }

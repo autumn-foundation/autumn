@@ -23,6 +23,7 @@ mod check;
 mod cold_start_driver;
 mod config;
 mod console;
+mod contracts;
 mod credentials;
 mod data;
 mod data_capsule;
@@ -607,6 +608,75 @@ pub struct OpenApiExportArgs {
 pub enum OpenApiSubcommands {
     /// Emit the app's `OpenAPI` 3.1 document without booting it.
     Export(OpenApiExportArgs),
+}
+
+/// The crates and features the wire-contract pass checks.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+pub struct ContractsPassArgs {
+    /// Check only this package (repeatable). The default is the workspace.
+    #[arg(long = "package", short = 'p', value_name = "PACKAGE")]
+    package: Vec<String>,
+    /// Extra Cargo features (comma- or space-separated; repeatable).
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build with `--all-features`.
+    #[arg(long)]
+    all_features: bool,
+    /// Build with `--no-default-features`.
+    #[arg(long)]
+    no_default_features: bool,
+}
+
+impl ContractsPassArgs {
+    fn into_pass(self) -> contracts::PassOptions {
+        contracts::PassOptions {
+            packages: self.package,
+            features: routes::CargoFeatures {
+                features: self.features,
+                all: self.all_features,
+                no_default: self.no_default_features,
+            },
+        }
+    }
+}
+
+/// Subcommands for `autumn contracts`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum ContractsSubcommands {
+    /// Write the wire-contract bundle of the current build.
+    ///
+    /// Runs a dedicated `cargo check` pass, so a cached build cannot leave a
+    /// descriptor out. The bundle is sorted JSON. Two exports of the same
+    /// source give the same bytes. Store it with each release.
+    Export {
+        /// Write the bundle to this file. The default is stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        pass: ContractsPassArgs,
+    },
+    /// Compare the current build with a deployed release.
+    ///
+    /// Checks both deploy windows: new callees with deployed callers, and new
+    /// callers with deployed callees. Exit 0: safe in the declared order.
+    /// Exit 1: not safe. Exit 3: safe only in the order the report names.
+    /// Exit 4: the check could not run.
+    Check {
+        /// The deployed release: a bundle file, an http(s) URL, or a git ref.
+        #[arg(long, value_name = "BUNDLE|URL|GIT-REF")]
+        against: String,
+        /// Use this bundle for the current build. The default runs the pass.
+        #[arg(long, value_name = "PATH")]
+        current: Option<PathBuf>,
+        /// The deploy order you plan. `any` needs both windows to be safe.
+        #[arg(long, value_enum, default_value_t = contracts::compat::Order::Any)]
+        order: contracts::compat::Order,
+        /// Accept a plain `http://` URL for `--against`.
+        #[arg(long)]
+        allow_http: bool,
+        #[command(flatten)]
+        pass: ContractsPassArgs,
+    },
 }
 
 /// Subcommands for `autumn aeo`.
@@ -2511,6 +2581,20 @@ enum Commands {
     ///   autumn openapi export --check openapi.json --strict
     #[command(subcommand, verbatim_doc_comment)]
     Openapi(OpenApiSubcommands),
+    /// Publish and check wire contracts across releases.
+    ///
+    /// `export` writes the bundle of the current build. `check` compares the
+    /// current build with a deployed bundle, in both deploy windows, and names
+    /// the safe deploy order when only one exists.
+    ///
+    /// # Examples
+    ///
+    ///   autumn contracts export --out target/contracts.json
+    ///   autumn contracts check --against deployed.json
+    ///   autumn contracts check --against origin/main
+    ///   autumn contracts check --against deployed.json --order callee-first
+    #[command(subcommand, verbatim_doc_comment)]
+    Contracts(ContractsSubcommands),
     /// Emit the classified-data flow manifest (#1654).
     ///
     /// Compiles the app and reads back the manifest the framework assembles from
@@ -3557,12 +3641,14 @@ enum FleetCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Apply pending migrations from `migrations/` to every database.
+    /// Apply pending migrations from `migrations/` and `migrations-shards/`
+    /// to every database.
     ///
     /// Each database also gets the framework tables a fleet database gets at
-    /// boot. Plugin migrations are not applied: run the app once with
-    /// `AUTUMN_MIGRATE=1` for them. A failure on one database does not stop the
-    /// others. The command exits non-zero when one or more fail.
+    /// boot. `migrations-control/` is for the control database only, so it
+    /// is not applied. Plugin migrations are not applied: run the app once
+    /// with `AUTUMN_MIGRATE=1` for them. A failure on one database does not
+    /// stop the others. The command exits non-zero when one or more fail.
     Migrate {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
@@ -6049,6 +6135,27 @@ fn run_command(command: Commands) {
             });
         }
         Commands::Graph(command) => run_graph(command),
+        Commands::Contracts(ContractsSubcommands::Export { out, pass }) => {
+            contracts::run_export(&contracts::ExportOptions {
+                out,
+                pass: pass.into_pass(),
+            });
+        }
+        Commands::Contracts(ContractsSubcommands::Check {
+            against,
+            current,
+            order,
+            allow_http,
+            pass,
+        }) => {
+            contracts::run_check(&contracts::CheckOptions {
+                against,
+                current,
+                order,
+                allow_http,
+                pass: pass.into_pass(),
+            });
+        }
         Commands::DataFlow(args) => {
             let features = routes::CargoFeatures {
                 features: args.features,
@@ -10440,6 +10547,57 @@ mod tests {
             }
             _ => panic!("expected Openapi export subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_contracts_export_defaults_to_the_workspace_and_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "contracts", "export"]).expect("parses");
+        match cli.command {
+            Commands::Contracts(ContractsSubcommands::Export { out, pass }) => {
+                assert!(out.is_none());
+                assert!(pass.package.is_empty());
+            }
+            _ => panic!("expected contracts export"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_check_with_order_and_packages() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "check",
+            "--against",
+            "deployed.json",
+            "--order",
+            "caller-first",
+            "-p",
+            "mesh-catalog",
+            "-p",
+            "mesh-storefront",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Contracts(ContractsSubcommands::Check {
+                against,
+                current,
+                order,
+                allow_http,
+                pass,
+            }) => {
+                assert!(!allow_http, "https only by default");
+                assert_eq!(against, "deployed.json");
+                assert!(current.is_none());
+                assert_eq!(order, contracts::compat::Order::CallerFirst);
+                assert_eq!(pass.package, ["mesh-catalog", "mesh-storefront"]);
+            }
+            _ => panic!("expected contracts check"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_check_needs_against() {
+        assert!(Cli::try_parse_from(["autumn", "contracts", "check"]).is_err());
     }
 
     #[test]
