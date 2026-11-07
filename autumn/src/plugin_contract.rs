@@ -152,6 +152,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Replace the rendered error pages — a tier-1 subsystem seam (requires the `maud` feature). The plugin crate needs its own `maud` dependency: `html!` expands to absolute `::maud::` paths, which no re-export can satisfy.",
     },
     PluginSurface {
+        name: "AppBuilder::fleet_ownership_store",
+        tier: SurfaceTier::Experimental,
+        note: "Keep fleet slot ownership in a plugin's `SlotOwnershipStore` (requires the `db` feature). Experimental while the fleet seams land (ADR 0040).",
+    },
+    PluginSurface {
         name: "AppBuilder::merge",
         tier: SurfaceTier::Stable,
         note: "Merge a raw axum router at the root. Pair it with `declare_plugin_routes` so the routes stay attributable.",
@@ -280,6 +285,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "db::fleet_engine",
         tier: SurfaceTier::Experimental,
         note: "`FleetEngine` and `DatabaseFleet::with_engine`: one database engine of a fleet (requires the `db` feature). Experimental: the trait may change in any release while the fleet seams land (ADR 0040).",
+    },
+    PluginSurface {
+        name: "fleet",
+        tier: SurfaceTier::Experimental,
+        note: "`resolve`, `resolve_key`, `FleetLease`, `fleet_of` and `ownership_store`: the request path an engine plugin's fleet extractor calls. Also `FleetDatabase::sidecar_replica` and `replication::ScopedDestination` for a sidecar engine (requires the `db` feature). Experimental while the fleet seams land (ADR 0040).",
     },
     PluginSurface {
         name: "form::FieldRenderer",

@@ -166,6 +166,8 @@ mod fault_injection;
 mod feature_flags_integration;
 mod feed;
 mod fleet_failover_guide;
+#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+mod fleet_ownership_pg;
 mod fleet_slot_guide;
 #[cfg(feature = "maud")]
 mod form_field_options;
