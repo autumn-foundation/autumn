@@ -313,13 +313,22 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                     restore_in_place(self.root(), replication, key, None, path)?;
                 }
                 ShipMode::Generations { .. } => {
-                    match self.restore_generation_in_place(replication, key, None, path) {
-                        // The newer owner wrote its marker but no generation:
-                        // the file on disk is the newest data.
-                        Err(FleetError::NotFound { .. }) => {
+                    // Only a generation above the stamp holds newer data. The
+                    // newer owner can have written its marker and no
+                    // generation: then the file on disk is the newest data.
+                    match self.restore_generation_in_place(
+                        replication,
+                        key,
+                        None,
+                        path,
+                        Some(stamp),
+                    ) {
+                        Ok(false) | Err(FleetError::NotFound { .. }) => {
                             tracing::warn!(database = %name, "fleet database: the newer epoch has no generation; the file on disk stays");
                         }
-                        other => other?,
+                        other => {
+                            other?;
+                        }
                     }
                 }
                 // No replica holds the data.
@@ -430,8 +439,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                                 &task_key,
                                 target,
                                 &task_path,
+                                None,
                             )
-                            .map(|()| None)
+                            .map(|_| None)
                     } else {
                         restore_in_place(fleet.root(), &replication, &task_key, target, &task_path)
                             .map(Some)

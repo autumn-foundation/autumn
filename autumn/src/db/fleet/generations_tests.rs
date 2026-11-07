@@ -631,3 +631,42 @@ async fn a_new_owner_writes_its_epoch_marker_at_open() {
     drop(db);
     a.fleet.close_all().await;
 }
+
+#[tokio::test]
+async fn a_fail_back_keeps_a_file_newer_than_every_generation_above_its_stamp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let store = Arc::new(MemoryOwnership::new(Arc::new(crate::time::SystemClock)));
+    let _ownership = own(&a, &store, "a").await;
+    let key = acme(&a.fleet);
+    write(&a, &key, "a1").await;
+    a.fleet.ship_now(&key).await.unwrap();
+    // A write after the last generation, of epoch 1.
+    write(&a, &key, "a2").await;
+    let path = a.fleet.path_of(&key);
+    // The only generation is of epoch 1, the stamp of the file: it is
+    // older than the file, so the file stays.
+    let replaced = a
+        .fleet
+        .restore_generation_in_place(&a.replication, &key, None, &path, Some(1))
+        .unwrap();
+    assert!(!replaced);
+    assert_eq!(read(&a, &key).await, ["a1", "a2"]);
+    a.fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn a_passed_shutdown_cutoff_stops_a_ship() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let key = acme(&a.fleet);
+    write(&a, &key, "plan").await;
+    #[allow(clippy::disallowed_methods, reason = "a cutoff in the past")]
+    let past = std::time::Instant::now();
+    a.replication.set_shutdown_cutoff(Some(past));
+    let refused = a.fleet.ship_now(&key).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(complete(&a, &key).is_empty());
+    a.replication.set_shutdown_cutoff(None);
+    a.fleet.close_all().await;
+}

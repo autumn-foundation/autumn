@@ -918,18 +918,26 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     /// at the epoch the database opened under.
     fn ship_destination(
         &self,
-        replication: &FleetReplication,
+        replication: &Arc<FleetReplication>,
         target: &ShipTarget<E>,
         epoch: Option<u64>,
     ) -> FencedDestination {
         let retired = Arc::clone(&target.retired);
         let fence = self.ownership().cloned().zip(target.epoch);
         let slot = target.key.routing_slot();
+        // A passed shutdown cutoff stops the writes too: a large generation
+        // does not hold the shutdown past its flush budget.
+        let shutdown = Arc::downgrade(replication);
         let stop = move || {
             retired.load(Ordering::Acquire)
                 || fence
                     .as_ref()
                     .is_some_and(|(ownership, epoch)| ownership.epoch_for(slot) != Some(*epoch))
+                || shutdown.upgrade().is_some_and(|replication| {
+                    replication
+                        .shutdown_cutoff()
+                        .is_some_and(crate::db::fleet_replication::cutoff_passed)
+                })
         };
         FencedDestination::new(
             Arc::clone(replication.destination()),
@@ -971,6 +979,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     /// before `target`. The tombstone marker does not apply: the caller
     /// took the row. Blocking.
     ///
+    /// With `above`, only a generation of an epoch above it replaces the
+    /// database: an older generation can lack writes of the file on disk.
+    /// Returns `false` when it kept the database.
+    ///
     /// # Errors
     ///
     /// [`FleetError::NotFound`] when no generation is there.
@@ -982,16 +994,20 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         key: &FleetDbKey,
         target: Option<DateTime<Utc>>,
         path: &Path,
-    ) -> Result<(), FleetError> {
+        above: Option<u64>,
+    ) -> Result<bool, FleetError> {
         let name = key.name();
         let failed = |detail: String| FleetError::Restore {
             name: name.clone(),
             detail,
         };
         check_contained(self.root(), path)?;
-        let (_, manifest) = newest(replication, key, target, false)
+        let (chosen, manifest) = newest(replication, key, target, false)
             .map_err(&failed)?
             .ok_or_else(|| FleetError::NotFound { name: name.clone() })?;
+        if above.is_some_and(|stamp| chosen.epoch <= stamp) {
+            return Ok(false);
+        }
         let staging = staging_path(path, "restoring")?;
         let downloaded = download(
             replication.destination().as_ref(),
@@ -1003,7 +1019,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             with_path_lock(self.root(), &name, || {
                 self.inner.engine.remove(key, path)?;
                 if publish(&staging, path).map_err(&failed)? {
-                    Ok(())
+                    Ok(true)
                 } else {
                     Err(FleetError::AlreadyExists { name: name.clone() })
                 }
