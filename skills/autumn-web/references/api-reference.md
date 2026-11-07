@@ -1204,13 +1204,14 @@ in **Typed accessible primitives** above.)
 | `StoryGallery::stylesheet(href)` / `.script(src)` / `.merge(other)` | Extra assets each gallery page links. |
 | `form::FieldRenderer` (`name`, `render`, `multipart`, `grouped`) | Plugin form control. `FieldControl::custom(r)`, `custom_input_with(&cs, field, label, &r, &opts)`. |
 | `form::FieldContext::control(tag, attrs, body)` | Writes the control with `id`/`name`/`value`/`required`/`aria-*` + passthrough; drops owned names, `on*`/`hx-on*`, `style`; never pre-fills password/file/checkbox/radio. |
-| `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required`, `aria-invalid`, passthrough. |
+| `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required` (not on a checkbox: check "one or more" on the server), `aria-invalid`, passthrough. |
 | `widget_pack::element(tag, attrs, &FieldOptions, body)` | Root of a non-input widget with the app `data-*`/`hx-*` passthrough. |
 | `plugin_conformance::run_conformance(&ConformanceConfig::new(name).contract(c).no_routes(), &routes)` | For a plugin that mounts no routes (cache, background runtime): no route under the config name or the contract's `plugin`/`registered_as` skips `route-attribution`; such a route fails it. Take the contract from `builder.plugin_contracts()` (it carries `registered_as`); without that, every plugin route fails. Do not set a `prefix` with it. Library counterpart of `autumn plugin-check --no-routes`. |
 | `plugin_conformance::widgets::run_widget_conformance(&pack)` | Static: `widget-pack-name`, `widget-stories`, `widget-class-names`, `widget-markup-csp`, `widget-tokens`, `widget-scripts`. |
 | `plugin_conformance::widgets::browser::run_widget_browser_conformance(&pack, axe_src).await` | Feature `system-tests`: `widget-axe` (light + dark), `widget-console`, `widget-keyboard`. |
 | `Page::axe_violations(axe_src)` / `SystemTest::plugin_assets(&ASSETS)` | Shared axe check; serve a bundle in a system test. |
 | `autumn:init` event | Fires on `document` at `DOMContentLoaded` and on each htmx-swapped root, before roving init. |
+| Tree keys (`role="tree"` + `data-autumn-roving`) | The keyboard core gives the APG tree keys: ArrowRight opens or goes to the first child, ArrowLeft closes or goes to the parent, `*` opens the siblings; typeahead and arrows skip items in a `hidden` subtree; disabled tree items take focus. A parent `treeitem` has `aria-expanded` and holds its `role="group"` or names it in `aria-owns`. Fires `autumn:expand` / `autumn:collapse` on the item (load lazy children there). Pack JS adds no arrow-key code (`docs/guide/keyboard.md#tree-keys`). |
 
 ## Cache read-through (0.6.0)
 

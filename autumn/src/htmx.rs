@@ -862,9 +862,11 @@ mod tests {
     /// them from 54 KiB and 16 KiB.
     /// Issue #3412 added the password reveal, the strength hint and the
     /// one-time code format. It increased them from 61 KiB and 18 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 70 * 1024;
+    /// Issue #3417 added the tree keys and the hidden-subtree skip. It
+    /// increased them from 70 KiB and 20 KiB.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 72 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 20 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 21 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.
@@ -940,6 +942,8 @@ mod tests {
             "autumn:navigate",
             "autumn:dismiss",
             "autumn:init",
+            "autumn:expand",
+            "autumn:collapse",
             "aria-activedescendant",
             "Home",
             "End",
