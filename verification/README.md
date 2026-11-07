@@ -111,6 +111,9 @@ It proves these properties:
   epoch it held.
 - A restore never selects a generation of an older epoch, and a fenced
   replicator stops.
+- Shipping is its own step. A put that the fence admits (`may_put`) is a
+  ship that `may_ship` admits. After a newer epoch marker, or a newer epoch
+  this host saw, each put of the old owner is refused. A grant can put.
 - An open refuses a file stamped by a newer owner. After the new owner opens
   the file, the old owner cannot open it. The owner can open it again, and a
   new grant can open any file the table stamped (`may_open`).
@@ -141,6 +144,40 @@ It proves these properties:
 
 The unit tests in `destination.rs` and `db/fleet/engine_tests.rs` check the
 same rules on the runtime.
+
+## Fleet generations
+
+`fleet_generations.rs` models generation shipping (`ShipMode::Generations`
+in `autumn/src/db/fleet_engine.rs`, the shipper in
+`autumn/src/db/fleet/generations.rs`, and the fence in
+`autumn/src/replication/fence.rs`). Verify it with:
+
+```sh
+verus verification/fleet_generations.rs
+```
+
+It proves these properties:
+
+- The fence does not depend on the ship mode. A newer epoch at the
+  destination, a newer epoch this host saw, or a retired database refuses
+  each put. The current owner can put. `Rebuild` puts nothing.
+- A file whose hash the previous generation holds is not shipped again.
+  Each file of a new generation is shipped now or held already.
+- A holder is the new generation or a holder of the previous one, and it is
+  never newer than the generation that names it.
+- A prune keeps the newest generations and each holder that their
+  manifests name. So a restore of a kept generation finds every file.
+- A restore takes the greatest (epoch, time). The tombstone rules are the
+  rules of `fleet_replica_tombstones.rs`: after a delete, a restore is
+  refused. A purge at or after the newest generation removes every holder,
+  and keeps a newer database of the same key.
+
+The unit tests in `generations.rs` and `db/fleet/generations_tests.rs`, the
+kit checks `fleet-fenced-ship` and `fleet-unchanged-files`, and the takeover
+test in `tests/sqlite_fleet/generations.rs` check the runtime. The TLA+ spec
+needs no change: a list and a put are still two steps, so the witness
+`StaleGenerationLandsLate` still holds, and the (epoch, time) order is still
+required.
 
 ## Fleet replica tombstones
 

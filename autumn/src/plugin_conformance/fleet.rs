@@ -18,8 +18,12 @@
 //! | `fleet-delete` | A delete leaves the database, or its data comes back in a new database. |
 //! | `fleet-delete-restore` | The fixture's restore fails before the delete, or brings the database back after it. Skipped without a restore. |
 //! | `fleet-budget` | An open database reports no memory, or the budget does not close the oldest idle one. |
+//! | `fleet-fenced-ship` | A ship after a newer epoch marker is not refused, writes an object, or leaves this host the slot. Skipped with no replica. |
+//! | `fleet-unchanged-files` | A ship with no write puts an object. `Generations` only: skipped in the other modes. |
 //!
-//! Each check uses its own fleet root under the scratch directory.
+//! Each check uses its own fleet root under the scratch directory. The ship
+//! checks need a fixture that installs replication
+//! ([`DatabaseFleet::install_replication`]).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -80,6 +84,16 @@ pub trait FleetFixture: Send + Sync {
 /// skips the check.
 type Outcome = Result<Option<String>, String>;
 
+/// Why the restore check skips.
+const NO_RESTORE: &str = "the fixture has no replica restore";
+
+/// Why the fenced ship check skips.
+const NO_SHIP: &str = "the fixture installs no replication, or its engine is in `Rebuild` mode";
+
+/// Why the unchanged files check skips.
+const NO_FILES: &str =
+    "the fixture installs no replication, or its engine is not in `Generations` mode";
+
 /// Runs every check against `fixture`. `name` names the engine in the
 /// report. `scratch` holds the fleet roots: use an empty temporary
 /// directory.
@@ -90,36 +104,46 @@ pub async fn run_fleet_conformance<F: FleetFixture>(
     scratch: &Path,
 ) -> ConformanceReport {
     let mut checks = vec![
-        check("fleet-identity", identity(fixture, scratch)).await,
-        check("fleet-epoch", epoch(fixture, scratch)).await,
-        check("fleet-reopen", reopen(fixture, scratch)).await,
-        check("fleet-snapshot-restore", snapshot_restore(fixture, scratch)).await,
+        check("fleet-identity", NO_RESTORE, identity(fixture, scratch)).await,
+        check("fleet-epoch", NO_RESTORE, epoch(fixture, scratch)).await,
+        check("fleet-reopen", NO_RESTORE, reopen(fixture, scratch)).await,
+        check(
+            "fleet-snapshot-restore",
+            NO_RESTORE,
+            snapshot_restore(fixture, scratch),
+        )
+        .await,
     ];
     let (deleted, restored) = delete(fixture, scratch).await;
-    checks.push(result("fleet-delete", deleted));
-    checks.push(result("fleet-delete-restore", restored));
-    checks.push(check("fleet-budget", budget(fixture, scratch)).await);
+    checks.push(result("fleet-delete", NO_RESTORE, deleted));
+    checks.push(result("fleet-delete-restore", NO_RESTORE, restored));
+    checks.push(check("fleet-budget", NO_RESTORE, budget(fixture, scratch)).await);
+    checks.push(check("fleet-fenced-ship", NO_SHIP, fenced_ship(fixture, scratch)).await);
+    checks.push(
+        check(
+            "fleet-unchanged-files",
+            NO_FILES,
+            unchanged_files(fixture, scratch),
+        )
+        .await,
+    );
     ConformanceReport {
         plugin_name: name.to_owned(),
         checks,
     }
 }
 
-async fn check(name: &str, outcome: impl Future<Output = Outcome>) -> CheckResult {
+async fn check(name: &str, skipped: &str, outcome: impl Future<Output = Outcome>) -> CheckResult {
     let outcome = tokio::time::timeout(CHECK_TIMEOUT, outcome)
         .await
         .unwrap_or_else(|_| Err(format!("the check did not end in {CHECK_TIMEOUT:?}")));
-    result(name, outcome)
+    result(name, skipped, outcome)
 }
 
-fn result(name: &str, outcome: Outcome) -> CheckResult {
+fn result(name: &str, skipped: &str, outcome: Outcome) -> CheckResult {
     let (status, message, diagnostics) = match outcome {
         Ok(Some(message)) => (CheckStatus::Pass, message, Vec::new()),
-        Ok(None) => (
-            CheckStatus::Skip,
-            "the fixture has no replica restore".to_owned(),
-            Vec::new(),
-        ),
+        Ok(None) => (CheckStatus::Skip, skipped.to_owned(), Vec::new()),
         Err(problem) => (CheckStatus::Fail, problem.clone(), vec![problem]),
     };
     CheckResult {
@@ -484,6 +508,167 @@ async fn budget<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
     Ok(Some(
         "over the budget the oldest idle database closes".to_owned(),
     ))
+}
+
+/// Every object of the replica of `key`.
+#[cfg(feature = "sqlite")]
+fn replica_objects(
+    replication: &crate::db::fleet_replication::FleetReplication,
+    key: &FleetDbKey,
+) -> Result<Vec<String>, String> {
+    replication
+        .destination()
+        .list(&format!("{}/", replication.root_for(key)))
+        .map_err(|e| format!("the replica cannot be listed: {e}"))
+}
+
+#[cfg(not(feature = "sqlite"))]
+#[allow(clippy::unused_async, clippy::unnecessary_wraps)]
+async fn fenced_ship<F: FleetFixture>(_: &F, _: &Path) -> Outcome {
+    Ok(None)
+}
+
+/// A newer epoch marker at the destination refuses the next ship.
+#[cfg(feature = "sqlite")]
+async fn fenced_ship<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
+    use std::sync::Arc;
+
+    use crate::db::fleet_ownership::{FleetOwnership, MemoryOwnership, OwnerId, SlotRange};
+
+    let fleet = fleet(fixture, scratch, "fenced", 0).await?;
+    let Some(replication) = fleet.replication().cloned() else {
+        return Ok(None);
+    };
+    if matches!(
+        fleet.engine().ship_mode(),
+        crate::db::fleet_engine::ShipMode::Rebuild
+    ) {
+        return Ok(None);
+    }
+    let store = Arc::new(MemoryOwnership::new(Arc::new(crate::time::SystemClock)));
+    let ownership = Arc::new(
+        FleetOwnership::new(
+            store,
+            OwnerId::new("conformance-a").map_err(|e| e.to_string())?,
+            vec![SlotRange::ALL],
+            Duration::from_secs(30),
+        )
+        .map_err(|e| e.to_string())?,
+    );
+    fleet
+        .start_ownership(Arc::clone(&ownership))
+        .await
+        .map_err(|e| format!("ownership did not start: {e}"))?;
+    let key = key(&fleet, "conformance-fenced")?;
+    let outcome = async {
+        let db = fleet.open(&key).await.map_err(fail("open failed"))?;
+        let epoch = db
+            .epoch()
+            .ok_or("the database opened with no epoch under ownership")?
+            .get();
+        fixture.write(db.handle(), "first").await?;
+        fleet
+            .ship_now(&key)
+            .await
+            .map_err(fail("the ship before the fence failed"))?;
+        // Another host took the slot and wrote its epoch marker.
+        let newer = epoch + 1;
+        replication
+            .destination()
+            .put(
+                &crate::replication::segment::epoch_marker_key(&replication.root_for(&key), newer),
+                b"{}",
+            )
+            .map_err(|e| format!("the kit could not write the epoch marker: {e}"))?;
+        fixture.write(db.handle(), "late").await?;
+        let before = replica_objects(&replication, &key)?;
+        let shipped = fleet.ship_now(&key).await;
+        let after = replica_objects(&replication, &key)?;
+        drop(db);
+        match shipped {
+            Err(FleetError::Fenced { newest, .. }) if newest == newer => {}
+            Err(other) => {
+                return Err(format!(
+                    "the fenced ship failed, but not with `Fenced {{ newest: {newer} }}`: {other}"
+                ));
+            }
+            Ok(report) => return Err(format!("a fenced ship was accepted: {report:?}")),
+        }
+        if let Some(new) = after.iter().find(|object| !before.contains(object)) {
+            return Err(format!("the fenced ship wrote {new}"));
+        }
+        if ownership.epoch_for(key.routing_slot()).is_some() {
+            return Err("after the fence this host still holds the slot".to_owned());
+        }
+        Ok(Some(
+            "a ship after a newer epoch marker is refused and writes nothing".to_owned(),
+        ))
+    }
+    .await;
+    fleet.close_all().await;
+    let _ = fleet.release_ownership().await;
+    outcome
+}
+
+#[cfg(not(feature = "sqlite"))]
+#[allow(clippy::unused_async, clippy::unnecessary_wraps)]
+async fn unchanged_files<F: FleetFixture>(_: &F, _: &Path) -> Outcome {
+    Ok(None)
+}
+
+/// A ship with no write since the last one writes nothing.
+#[cfg(feature = "sqlite")]
+async fn unchanged_files<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
+    let fleet = fleet(fixture, scratch, "unchanged", 0).await?;
+    let Some(replication) = fleet.replication().cloned() else {
+        return Ok(None);
+    };
+    if !matches!(
+        fleet.engine().ship_mode(),
+        crate::db::fleet_engine::ShipMode::Generations { .. }
+    ) {
+        return Ok(None);
+    }
+    let key = key(&fleet, "conformance-unchanged")?;
+    let outcome = async {
+        let db = fleet.open(&key).await.map_err(fail("open failed"))?;
+        fixture.write(db.handle(), "first").await?;
+        let first = fleet
+            .ship_now(&key)
+            .await
+            .map_err(fail("the first ship failed"))?;
+        if first.generation.is_none() || first.shipped == 0 {
+            return Err(format!("the first ship shipped nothing: {first:?}"));
+        }
+        let before = replica_objects(&replication, &key)?;
+        let again = fleet
+            .ship_now(&key)
+            .await
+            .map_err(fail("the second ship failed"))?;
+        let after = replica_objects(&replication, &key)?;
+        if let Some(new) = after.iter().find(|object| !before.contains(object)) {
+            return Err(format!(
+                "a ship with no write wrote {new}: make a snapshot of unchanged data the same \
+                 bytes"
+            ));
+        }
+        fixture.write(db.handle(), "second").await?;
+        let changed = fleet
+            .ship_now(&key)
+            .await
+            .map_err(fail("the ship after a write failed"))?;
+        drop(db);
+        if changed.generation.is_none() {
+            return Err("a ship after a write made no generation".to_owned());
+        }
+        Ok(Some(format!(
+            "a ship with no write writes nothing ({} file(s) held); a write ships again",
+            again.reused
+        )))
+    }
+    .await;
+    fleet.close_all().await;
+    outcome
 }
 
 #[cfg(test)]

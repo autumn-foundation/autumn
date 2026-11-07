@@ -123,12 +123,21 @@ async fn the_sqlite_engine_passes_the_fleet_conformance_kit() {
     let report = run_fleet_conformance("sqlite", &SqliteFixture, tmp.path()).await;
     assert!(report.passed(), "{}", report.to_text_report());
     for check in &report.checks {
-        assert_eq!(
-            check.status,
-            autumn_web::plugin_conformance::CheckStatus::Pass,
-            "{}: {}",
-            check.name,
-            check.message
-        );
+        // Continuous shipping ships changes, not files.
+        let expected = if check.name == "fleet-unchanged-files" {
+            autumn_web::plugin_conformance::CheckStatus::Skip
+        } else {
+            autumn_web::plugin_conformance::CheckStatus::Pass
+        };
+        assert_eq!(check.status, expected, "{}: {}", check.name, check.message);
     }
+    // Every check of the kit ran, the fenced ship too.
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "fleet-fenced-ship"),
+        "{}",
+        report.to_text_report()
+    );
 }

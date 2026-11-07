@@ -25,23 +25,110 @@
 //!   path.
 //! - `remove` deletes the database at the path and its sidecars. Core holds
 //!   the path lock and has closed the database in this process.
+//! - In [`ShipMode::Generations`], the snapshot of a database with no change
+//!   must be the same bytes. Core then ships nothing.
+//!
+//! # Shipping
+//!
+//! Core owns every write to the replica of a database: the generations, the
+//! `epoch-<n>` markers, the tombstone marker and the restores. An engine
+//! gives files to core (`snapshot`) and never writes the replica itself.
+//! Core checks the fence before each `put`, in every mode. See
+//! [`FencedDestination`](crate::replication::FencedDestination).
 
+use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::fleet::FleetError;
 use crate::fleet_layout::FleetDbKey;
 use crate::lock::FencingToken;
 
 /// How the databases of an engine get to object storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum ShipMode {
-    /// The engine streams its changes through a lifecycle hook, for
-    /// example `SQLite` WAL shipping.
-    Continuous,
-    /// No replica. The engine rebuilds the data from its source.
+    /// The engine streams its changes. Core drives the shipper and fences
+    /// each `put`. Core has one continuous shipper: `SQLite` WAL shipping.
+    Continuous(Arc<dyn ContinuousShipper>),
+    /// Core calls [`FleetEngine::snapshot`] every `every` while the
+    /// database is open, and once at close. It ships only the files whose
+    /// content hash is not in the previous generation. The RPO is `every`.
+    Generations {
+        /// How often core ships a generation. Zero means one second.
+        every: Duration,
+    },
+    /// No replica. A restore calls [`FleetEngine::rebuild`]. No RPO: the
+    /// data is derived from a source.
     Rebuild,
+}
+
+impl ShipMode {
+    /// The name for health and stats: `continuous`, `generations` or
+    /// `rebuild`.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Continuous(_) => "continuous",
+            Self::Generations { .. } => "generations",
+            Self::Rebuild => "rebuild",
+        }
+    }
+
+    /// The interval of `Generations`, at least one second. `None` in the
+    /// other modes.
+    #[must_use]
+    pub const fn every(&self) -> Option<Duration> {
+        match self {
+            Self::Generations { every } if every.is_zero() => Some(Duration::from_secs(1)),
+            Self::Generations { every } => Some(*every),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for ShipMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Continuous(shipper) => {
+                f.debug_tuple("Continuous").field(&shipper.name()).finish()
+            }
+            Self::Generations { every } => {
+                f.debug_struct("Generations").field("every", every).finish()
+            }
+            Self::Rebuild => f.write_str("Rebuild"),
+        }
+    }
+}
+
+mod sealed {
+    /// Only core implements [`ContinuousShipper`](super::ContinuousShipper).
+    pub trait Sealed {}
+}
+
+/// A shipper that streams the changes of a database. Core drives it and
+/// fences each `put`. The trait is sealed: core has one, `SQLite` WAL
+/// shipping. An engine plugin uses [`ShipMode::Generations`].
+pub trait ContinuousShipper: sealed::Sealed + Send + Sync + 'static {
+    /// The name of the shipper, for health and logs.
+    fn name(&self) -> &'static str;
+}
+
+/// `SQLite` WAL shipping: the continuous shipper of `SqliteEngine`.
+#[cfg(feature = "sqlite")]
+#[derive(Debug)]
+pub(crate) struct WalShipper;
+
+#[cfg(feature = "sqlite")]
+impl sealed::Sealed for WalShipper {}
+
+#[cfg(feature = "sqlite")]
+impl ContinuousShipper for WalShipper {
+    fn name(&self) -> &'static str {
+        "sqlite-wal"
+    }
 }
 
 /// One database engine of a fleet. See the module docs for the contract.
@@ -122,5 +209,38 @@ pub trait FleetEngine: Send + Sync + 'static {
     /// Schema migrations the engine applied since boot. Default: `0`.
     fn migrations_applied(&self) -> u64 {
         0
+    }
+
+    /// The epoch stamp of the database at `path`. Runs on a blocking
+    /// thread. Default: `None`, unknown.
+    ///
+    /// Core reads it before an open under ownership. When the replica holds
+    /// a newer epoch of another owner, core restores the database from the
+    /// replica first. With `None`, core keeps the database on disk.
+    ///
+    /// # Errors
+    ///
+    /// A [`FleetError`] when the stamp cannot be read.
+    fn epoch_stamp(&self, key: &FleetDbKey, path: &Path) -> Result<Option<u64>, FleetError> {
+        let _ = (key, path);
+        Ok(None)
+    }
+
+    /// Builds the database of `key` at `path` again from its source. For
+    /// [`ShipMode::Rebuild`]: core calls it for a restore. Core has closed
+    /// the database and keeps new opens out. Stamp the key, as `open` does.
+    /// Default: [`FleetError::NotReplicated`].
+    ///
+    /// # Errors
+    ///
+    /// A [`FleetError`] when the rebuild fails.
+    fn rebuild(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+    ) -> impl Future<Output = Result<(), FleetError>> + Send {
+        let _ = path;
+        let name = key.name();
+        async move { Err(FleetError::NotReplicated { name }) }
     }
 }

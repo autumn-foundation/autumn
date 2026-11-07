@@ -14,6 +14,9 @@
 
 use std::path::Path as FsPath;
 
+#[path = "sqlite_fleet/generations.rs"]
+mod generations;
+
 use autumn_web::config::{AutumnConfig, DatabaseConfig, DatabaseFleetConfig};
 use autumn_web::db::fleet::DatabaseFleet;
 use autumn_web::db::{RuntimeConnection, create_pool};
