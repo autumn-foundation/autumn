@@ -166,6 +166,10 @@ pub trait FleetEngine: Send + Sync + 'static {
     /// Writes a consistent copy of the database at `path` into `dir`, as
     /// `dir/<file name of path>`. Returns every file it wrote.
     ///
+    /// In [`ShipMode::Generations`], core also calls it with a closed
+    /// `handle`, for the last generation of a close. Every use has ended:
+    /// copy the files at `path`.
+    ///
     /// # Errors
     ///
     /// A [`FleetError`] when the copy fails.
@@ -216,7 +220,9 @@ pub trait FleetEngine: Send + Sync + 'static {
     ///
     /// Core reads it before an open under ownership. When the replica holds
     /// a newer epoch of another owner, core restores the database from the
-    /// replica first. With `None`, core keeps the database on disk.
+    /// replica first. With `None`, in [`ShipMode::Generations`], core
+    /// counts the stamp as 0: it restores at each new epoch that another
+    /// owner wrote. In the other modes it keeps the database on disk.
     ///
     /// # Errors
     ///
@@ -227,8 +233,9 @@ pub trait FleetEngine: Send + Sync + 'static {
     }
 
     /// Builds the database of `key` at `path` again from its source. For
-    /// [`ShipMode::Rebuild`]: core calls it for a restore. Core has closed
-    /// the database and keeps new opens out. Stamp the key, as `open` does.
+    /// [`ShipMode::Rebuild`]: core calls it for a restore of a database that
+    /// is on disk. A deleted database is not rebuilt. Core has closed the
+    /// database and keeps new opens out. Stamp the key, as `open` does.
     /// Default: [`FleetError::NotReplicated`].
     ///
     /// # Errors

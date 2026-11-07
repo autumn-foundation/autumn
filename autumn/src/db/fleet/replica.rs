@@ -100,7 +100,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     ///
     /// # Errors
     ///
-    /// The replication that is already installed, when called twice.
+    /// Gives `replication` back when a replication is already installed.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "the error gives the replication back, as the earlier API did"
@@ -130,6 +130,11 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 }
             }
             ShipMode::Generations { .. } => {
+                // A process that died during a ship leaves its scratch.
+                sweep_scratch(
+                    &super::generations::ship_scratch(self.root()),
+                    replication.now(),
+                );
                 let every = mode.every().unwrap_or(Duration::from_secs(1));
                 self.add_lifecycle(Arc::new(super::generations::GenerationShipper::new(
                     self,
@@ -262,9 +267,14 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             epoch,
             found,
         };
-        // An engine that does not know its stamp keeps its file.
-        let Some(stamp) = self.inner.engine.epoch_stamp(key, path)? else {
-            return Ok(());
+        let mode = self.inner.engine.ship_mode();
+        // A stamp the engine does not know: in `generations` mode it counts
+        // as 0, so a newer epoch of another owner in the replica replaces the
+        // file. In the other modes the file stays.
+        let stamp = match self.inner.engine.epoch_stamp(key, path)? {
+            Some(stamp) => stamp,
+            None if matches!(mode, ShipMode::Generations { .. }) => 0,
+            None => return Ok(()),
         };
         if stamp > epoch {
             return Err(newer(stamp));
@@ -298,12 +308,19 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 hook.release(key);
             }
             check_contained(self.root(), path)?;
-            match self.inner.engine.ship_mode() {
+            match mode {
                 ShipMode::Continuous(_) => {
                     restore_in_place(self.root(), replication, key, None, path)?;
                 }
                 ShipMode::Generations { .. } => {
-                    self.restore_generation_in_place(replication, key, None, path)?;
+                    match self.restore_generation_in_place(replication, key, None, path) {
+                        // The newer owner wrote its marker but no generation:
+                        // the file on disk is the newest data.
+                        Err(FleetError::NotFound { .. }) => {
+                            tracing::warn!(database = %name, "fleet database: the newer epoch has no generation; the file on disk stays");
+                        }
+                        other => other?,
+                    }
                 }
                 // No replica holds the data.
                 _ => {}
@@ -359,7 +376,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             }
             ShipMode::Generations { .. } => {
                 let db = self.get_open(key).ok_or_else(not_open)?;
-                self.ship_generation(&replication, &db).await
+                self.ship_generation(&replication, db).await
             }
             _ => Err(FleetError::NotReplicated { name }),
         }
@@ -395,10 +412,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         };
         let path = self.path_of(key);
         let restored = match (&mode, &replication) {
-            (ShipMode::Rebuild, _) => {
-                check_contained(self.root(), &path)?;
-                self.inner.engine.rebuild(key, &path).await.map(|()| None)
-            }
+            (ShipMode::Rebuild, _) => self.rebuild_in_place(key, &path).await,
             (_, Some(replication)) => {
                 let (fleet, replication, task_key, task_path) = (
                     self.clone(),
@@ -447,6 +461,25 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             }
         }
         restored
+    }
+
+    /// Rebuild the database at `path` from its source. A rebuild replaces a
+    /// database: it never brings back a deleted one.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::NotFound`] when no database is at `path`, or the error
+    /// of [`FleetEngine::rebuild`].
+    pub(super) async fn rebuild_in_place(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+    ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
+        check_contained(self.root(), path)?;
+        if !self.inner.engine.exists(path) {
+            return Err(FleetError::NotFound { name: key.name() });
+        }
+        self.inner.engine.rebuild(key, path).await.map(|()| None)
     }
 
     /// An explicit restore of `key` starts: take its tombstone row, so the

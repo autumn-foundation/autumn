@@ -25,8 +25,9 @@ use autumn_web::time::{ClockSource, TickingClock};
 
 use super::{control_pool, header_tenancy};
 
-/// The lease of the test: the shortest the fleet takes.
-const TTL: Duration = autumn_web::db::fleet_ownership::MIN_LEASE_TTL;
+/// The lease of the test. Long, so a slow runner does not lose A's local
+/// lease in real time. Only the store's clock moves past it.
+const TTL: Duration = Duration::from_mins(1);
 
 /// A directory database engine.
 #[derive(Debug, Default)]
@@ -365,10 +366,14 @@ async fn a_generations_engine_survives_a_takeover_with_no_volume_on_the_new_host
         "B serves the replica, not the lost tail"
     );
 
-    // B writes and ships. The schema did not change: B does not ship it again.
-    post(&b, "takeover").await;
-    let report = b.fleet.ship_now(&key).await.unwrap();
-    assert!(report.reused >= 1, "{report:?}");
+    // B writes and ships. The schema did not change: B does not ship it
+    // again, and a prune keeps A's generation, which holds it.
+    for value in ["takeover", "b2", "b3"] {
+        post(&b, value).await;
+        let report = b.fleet.ship_now(&key).await.unwrap();
+        assert!(report.reused >= 1, "{report:?}");
+        assert!(report.shipped >= 1, "{report:?}");
+    }
     assert_eq!(holder(tmp.path(), &key, "schema"), first);
 
     // A comes back with its old lease. Every ship of A is refused.
@@ -390,7 +395,7 @@ async fn a_generations_engine_survives_a_takeover_with_no_volume_on_the_new_host
         .send()
         .await
         .json();
-    assert_eq!(read, ["plan", "ship", "takeover"]);
+    assert_eq!(read, ["plan", "ship", "takeover", "b2", "b3"]);
     c.fleet.close_all().await;
     a.fleet.close_all().await;
 }

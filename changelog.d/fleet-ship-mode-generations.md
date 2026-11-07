@@ -17,12 +17,13 @@
   a fail-back. `FleetStats` reports `ship_mode` and `rpo_secs`, and the
   `replication:fleet` health indicator reports `ship_mode`, `rpo_seconds` and
   the lag of each generation.
-- **plugins:** the fleet conformance kit adds `fleet-fenced-ship` and
-  `fleet-unchanged-files`.
+- **plugins:** the fleet conformance kit adds `fleet-fenced-ship`,
+  `fleet-unchanged-files` and `fleet-epoch-stamp`.
 
 ### Breaking Changes
 
 - **Breaking:** `ShipMode::Continuous` carries an `Arc<dyn
-  ContinuousShipper>`, and `ShipMode` is no longer `Copy` or `Eq`. Match
-  with `ShipMode::Continuous(_)`. `ContinuousShipper` is sealed
+  ContinuousShipper>`, and `ShipMode` is no longer `Copy`, `PartialEq` or
+  `Eq`. Match with `ShipMode::Continuous(_)`. `ContinuousShipper` is sealed:
+  a plugin engine returns `ShipMode::Generations { every }`
   ([migration guide](docs/migrations/next.md)).

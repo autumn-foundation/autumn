@@ -74,7 +74,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, OnceCell};
 use tokio_util::sync::CancellationToken;
 
-pub use super::fleet_engine::{FleetEngine, ShipMode};
+pub use super::fleet_engine::{ContinuousShipper, FleetEngine, ShipMode};
 use crate::config::DatabaseFleetConfig;
 use crate::error::AutumnError;
 use crate::fleet_layout::{FleetDbKey, FleetLayoutError, FleetMode, FleetPathTemplate, TenantDbId};
@@ -187,6 +187,11 @@ mod replica {
             }
             let path = self.path_of(key);
             super::check_contained(self.root(), &path)?;
+            // A rebuild replaces a database: it never brings back a deleted
+            // one.
+            if !self.inner.engine.exists(&path) {
+                return Err(FleetError::NotFound { name: key.name() });
+            }
             self.inner.engine.rebuild(key, &path).await.map(|()| None)
         }
     }
@@ -847,8 +852,8 @@ pub struct FleetStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct ShipReport {
-    /// The new generation, `generations` mode. `None` when nothing changed,
-    /// or in `continuous` mode.
+    /// The id of the new generation in `generations` mode. `None` when
+    /// nothing changed, or in `continuous` mode.
     pub generation: Option<String>,
     /// Objects with new data: files of a generation, or WAL segments and a
     /// base snapshot.
@@ -1890,7 +1895,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             for hook in &hooks {
                 if let Err(detail) = hook.on_open(&opened) {
                     // Undo the hooks that did start (a replicator that
-                    // registered) before refusing the open.
+                    // registered) before refusing the open. The open is
+                    // refused: a hook must ship nothing of it.
+                    opened.retired.store(true, Ordering::Release);
                     // Stop the workers first, as `drain` does.
                     tokio::runtime::Handle::current().block_on(opened.quiesce_workers(true));
                     for hook in started {
@@ -2630,7 +2637,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     /// [`FleetError::NotReplicated`] with no replica, or in `rebuild` mode.
     /// [`FleetError::Fenced`] when a newer epoch owns the replica.
     /// [`FleetError::Unavailable`] when the database is not open in this
-    /// process, or the ship failed.
+    /// process, or the ship failed. The error of [`FleetEngine::snapshot`].
     pub async fn ship_now(&self, key: &FleetDbKey) -> Result<ShipReport, FleetError> {
         self.check_key(key)?;
         self.ship_replica(key).await
@@ -2649,9 +2656,12 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     /// # Errors
     ///
     /// [`FleetError::NotReplicated`] with no replica (and not `rebuild`),
-    /// [`FleetError::NotFound`] when nothing was shipped for the key,
+    /// [`FleetError::NotFound`] when nothing was shipped for the key (in
+    /// `rebuild` mode: when no database is on disk),
     /// [`FleetError::Deleting`] during a delete, [`FleetError::Unavailable`]
-    /// once a shutdown has begun, or [`FleetError::Restore`].
+    /// once a shutdown has begun, [`FleetError::InUseElsewhere`] when
+    /// another process has the database open, or [`FleetError::Restore`].
+    /// In `rebuild` mode, the error of [`FleetEngine::rebuild`].
     pub async fn restore_latest(&self, key: &FleetDbKey) -> Result<(), FleetError> {
         self.restore_to_point(key, None).await.map(drop)
     }

@@ -320,6 +320,11 @@ async fn a_delete_purges_the_generations_and_a_restore_is_refused() {
         complete(&a, &key).is_empty(),
         "the purge removed the generations"
     );
+    let left = objects(&a, &key);
+    assert!(
+        left.iter().all(|object| !object.contains("/generations/")),
+        "the purge removed every file and marker of a generation: {left:?}"
+    );
     let restored = a.fleet.restore_latest(&key).await;
     assert!(
         matches!(restored, Err(FleetError::NotFound { .. })),
@@ -427,6 +432,7 @@ async fn stats_and_health_report_the_ship_mode_and_the_rpo() {
     write(&a, &key, "plan").await;
     a.fleet.ship_now(&key).await.unwrap();
     let health = a.replication.indicator().check().await;
+    assert_eq!(health.status, crate::actuator::HealthStatus::Up);
     let details = health.details;
     assert_eq!(details["ship_mode"], "generations");
     assert_eq!(details["rpo_seconds"], HOUR.as_secs());
@@ -459,11 +465,20 @@ async fn restore_latest_rebuilds_a_rebuild_engine() {
     let db = fleet.open(&key).await.unwrap();
     assert_eq!(TextEngine::read(db.handle()).unwrap(), ["rebuilt"]);
     drop(db);
-    fleet.close_all().await;
     assert!(matches!(
         fleet.ship_now(&key).await,
         Err(FleetError::NotReplicated { .. })
     ));
+    // A rebuild never brings back a deleted database.
+    fleet.close(&key).await;
+    assert!(fleet.delete(&key).await.unwrap());
+    let refused = fleet.restore_latest(&key).await;
+    assert!(
+        matches!(refused, Err(FleetError::NotFound { .. })),
+        "{refused:?}"
+    );
+    assert!(!fleet.exists(&key));
+    fleet.close_all().await;
 }
 
 #[tokio::test]
@@ -486,6 +501,133 @@ async fn a_sidecar_scope_is_fenced_by_a_newer_epoch_at_the_destination() {
         scope.put(&object, b"2"),
         Err(crate::replication::DestinationError::Fenced { .. })
     ));
+    drop(db);
+    a.fleet.close_all().await;
+}
+
+#[test]
+fn a_zero_interval_ships_every_second() {
+    use super::ShipMode;
+    let mode = ShipMode::Generations {
+        every: Duration::ZERO,
+    };
+    assert_eq!(mode.every(), Some(Duration::from_secs(1)));
+    assert_eq!(ShipMode::Rebuild.every(), None);
+    assert_eq!(mode.name(), "generations");
+}
+
+#[tokio::test]
+async fn a_failed_ship_shows_in_health() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let store = Arc::new(MemoryOwnership::new(Arc::new(crate::time::SystemClock)));
+    let _ownership = own(&a, &store, "a").await;
+    let key = acme(&a.fleet);
+    write(&a, &key, "plan").await;
+    let root = a.replication.root_for(&key);
+    a.replication
+        .destination()
+        .put(&segment::epoch_marker_key(&root, 9), b"{}")
+        .unwrap();
+    assert!(a.fleet.ship_now(&key).await.is_err());
+    let details = a.replication.indicator().check().await.details;
+    assert_eq!(details["generations"]["failing"], 1, "{details:?}");
+    assert!(details["generations"]["last_error"].is_string());
+    a.fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn the_restore_check_restores_a_generation_and_finds_a_bad_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let key = acme(&a.fleet);
+    write(&a, &key, "plan").await;
+    a.fleet.ship_now(&key).await.unwrap();
+    let report = a.fleet.check_replica_sample(1).await.unwrap();
+    assert_eq!(report.passed, [key.name()]);
+    // Damage the one file of the generation.
+    let file = objects(&a, &key)
+        .into_iter()
+        .find(|object| object.contains("/files/"))
+        .unwrap();
+    a.replication.destination().put(&file, b"damaged").unwrap();
+    let report = a.fleet.check_replica_sample(1).await.unwrap();
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    a.fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn a_tombstone_row_on_a_shared_control_database_blocks_another_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host_with(
+        tmp.path(),
+        "vol-a",
+        "control.db",
+        generations_engine(HOUR),
+        false,
+        HOUR,
+    );
+    let key = acme(&a.fleet);
+    write(&a, &key, "kept").await;
+    a.fleet.ship_now(&key).await.unwrap();
+    a.fleet.close(&key).await;
+    assert!(a.fleet.delete(&key).await.unwrap());
+    // B shares the control database, so it reads the row itself.
+    let b = host_with(
+        tmp.path(),
+        "vol-b",
+        "control.db",
+        generations_engine(HOUR),
+        true,
+        HOUR,
+    );
+    let opened = b.fleet.open(&key).await;
+    assert!(
+        matches!(opened, Err(FleetError::Deleting { .. })),
+        "{opened:?}"
+    );
+    assert!(!b.fleet.exists(&key), "the row blocks the restore");
+    a.fleet.close_all().await;
+    b.fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn a_delete_ships_nothing_and_drops_the_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let key = acme(&a.fleet);
+    write(&a, &key, "gone").await;
+    assert!(a.replication.current_generation_slot(&key).is_some());
+    assert!(a.fleet.delete(&key).await.unwrap());
+    assert!(
+        a.replication.current_generation_slot(&key).is_none(),
+        "the close dropped the slot"
+    );
+    assert!(complete(&a, &key).is_empty(), "a delete ships nothing");
+    a.fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn a_new_owner_writes_its_epoch_marker_at_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let store = Arc::new(MemoryOwnership::new(Arc::new(crate::time::SystemClock)));
+    let _ownership = own(&a, &store, "a").await;
+    let key = acme(&a.fleet);
+    let db = a.fleet.open(&key).await.unwrap();
+    let root = a.replication.root_for(&key);
+    let marker = segment::epoch_marker_key(&root, 1);
+    for _ in 0..200 {
+        if objects(&a, &key).contains(&marker) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        objects(&a, &key).contains(&marker),
+        "no ship yet, but a marker"
+    );
+    assert!(complete(&a, &key).is_empty());
     drop(db);
     a.fleet.close_all().await;
 }

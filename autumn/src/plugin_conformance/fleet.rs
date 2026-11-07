@@ -18,8 +18,9 @@
 //! | `fleet-delete` | A delete leaves the database, or its data comes back in a new database. |
 //! | `fleet-delete-restore` | The fixture's restore fails before the delete, or brings the database back after it. Skipped without a restore. |
 //! | `fleet-budget` | An open database reports no memory, or the budget does not close the oldest idle one. |
-//! | `fleet-fenced-ship` | A ship after a newer epoch marker is not refused, writes an object, or leaves this host the slot. Skipped with no replica. |
+//! | `fleet-fenced-ship` | A ship after a newer epoch marker is not refused, writes an object, or leaves this host the slot. Skipped with no replica, or in `Rebuild` mode. |
 //! | `fleet-unchanged-files` | A ship with no write puts an object. `Generations` only: skipped in the other modes. |
+//! | `fleet-epoch-stamp` | `epoch_stamp` reports another epoch than the open stamped. Skipped when the engine reports none. |
 //!
 //! Each check uses its own fleet root under the scratch directory. The ship
 //! checks need a fixture that installs replication
@@ -88,11 +89,14 @@ type Outcome = Result<Option<String>, String>;
 const NO_RESTORE: &str = "the fixture has no replica restore";
 
 /// Why the fenced ship check skips.
-const NO_SHIP: &str = "the fixture installs no replication, or its engine is in `Rebuild` mode";
+const NO_SHIP: &str = "the fixture installs no replication, its engine is in `Rebuild` mode, or the build has no `sqlite` feature";
+
+/// Why the epoch stamp check skips.
+const NO_STAMP: &str = "the engine reports no epoch stamp: in `Generations` mode core restores \
+                        from the replica at each new epoch of another owner";
 
 /// Why the unchanged files check skips.
-const NO_FILES: &str =
-    "the fixture installs no replication, or its engine is not in `Generations` mode";
+const NO_FILES: &str = "the fixture installs no replication, its engine is not in `Generations` mode, or the build has no `sqlite` feature";
 
 /// Runs every check against `fixture`. `name` names the engine in the
 /// report. `scratch` holds the fleet roots: use an empty temporary
@@ -119,6 +123,7 @@ pub async fn run_fleet_conformance<F: FleetFixture>(
     checks.push(result("fleet-delete-restore", NO_RESTORE, restored));
     checks.push(check("fleet-budget", NO_RESTORE, budget(fixture, scratch)).await);
     checks.push(check("fleet-fenced-ship", NO_SHIP, fenced_ship(fixture, scratch)).await);
+    checks.push(check("fleet-epoch-stamp", NO_STAMP, epoch_stamp(fixture, scratch)).await);
     checks.push(
         check(
             "fleet-unchanged-files",
@@ -510,6 +515,29 @@ async fn budget<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
     ))
 }
 
+/// `epoch_stamp` reports the epoch an open stamped.
+async fn epoch_stamp<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcome {
+    let fleet = fleet(fixture, scratch, "stamp", 0).await?;
+    let engine = fleet.engine();
+    let key = key(&fleet, "conformance-stamp")?;
+    let path = fleet.path_of(&key);
+    let handle = engine
+        .open(&key, &path, Some(token(5)?))
+        .await
+        .map_err(fail("open under epoch 5 failed"))?;
+    engine.close(&handle);
+    let read = engine.epoch_stamp(&key, &path);
+    fleet.close_all().await;
+    match read {
+        Ok(None) => Ok(None),
+        Ok(Some(5)) => Ok(Some("the stamp is the epoch of the open".to_owned())),
+        Ok(Some(other)) => Err(format!(
+            "after an open under epoch 5 the engine reports the stamp {other}"
+        )),
+        Err(error) => Err(format!("the stamp cannot be read: {error}")),
+    }
+}
+
 /// Every object of the replica of `key`.
 #[cfg(feature = "sqlite")]
 fn replica_objects(
@@ -646,6 +674,9 @@ async fn unchanged_files<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcom
             .await
             .map_err(fail("the second ship failed"))?;
         let after = replica_objects(&replication, &key)?;
+        if after == before && (again.shipped != 0 || again.generation.is_some()) {
+            return Err(format!("a ship with no write reports a ship: {again:?}"));
+        }
         if let Some(new) = after.iter().find(|object| !before.contains(object)) {
             return Err(format!(
                 "a ship with no write wrote {new}: make a snapshot of unchanged data the same \

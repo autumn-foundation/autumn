@@ -224,15 +224,18 @@ from `DatabaseFleet::stats`.
 
 ### Fleet: `ShipMode::Continuous` carries a shipper
 
-**Why:** core ships every engine and checks the fence before each write
+**Why:** core ships the databases of every engine and checks the fence
+before each write
 (ADR 0040 §5). `ShipMode` has a new mode, `Generations { every }`.
 `Continuous` carries the shipper that core drives, an `Arc<dyn
 ContinuousShipper>`. So `ShipMode` is no longer `Copy`, `PartialEq` or `Eq`.
 `ContinuousShipper` is sealed: only `SqliteEngine` uses `Continuous`.
 
-**You are affected only if your code matches or compares a `ShipMode`.** An
-engine plugin that returned `ShipMode::Rebuild` needs no change. An engine
-that ships files returns `ShipMode::Generations { every }`.
+**You are affected only if your code matches or compares a `ShipMode`, or
+your engine returned `ShipMode::Continuous`.** An engine plugin that returned
+`ShipMode::Rebuild` needs no change. An engine that returned
+`ShipMode::Continuous` must return `ShipMode::Generations { every }`. Core
+does not let a plugin give a continuous shipper.
 
 **Before (`{X.Y}`):**
 

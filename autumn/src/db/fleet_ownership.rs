@@ -1365,7 +1365,7 @@ impl FleetOwnership {
     /// The newest epoch a replicator or a fence saw at the destination for
     /// `slot`. `0` when none did.
     #[must_use]
-    pub fn fence_floor(&self, slot: u16) -> u64 {
+    pub(crate) fn fence_floor(&self, slot: u16) -> u64 {
         self.ranges
             .iter()
             .zip(&self.fence_floors)

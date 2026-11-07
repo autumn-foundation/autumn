@@ -100,7 +100,9 @@ pub struct LocalFile {
     pub path: String,
     /// Where the file is now.
     pub file: PathBuf,
+    /// Lowercase hex SHA-256 of the content.
     pub sha256: String,
+    /// The length in bytes.
     pub len: u64,
 }
 
@@ -109,6 +111,7 @@ pub struct LocalFile {
 pub struct Planned<'a> {
     /// The files to put: one per new hash.
     pub put: Vec<&'a LocalFile>,
+    /// Every file of the new manifest.
     pub files: Vec<ManifestFile>,
 }
 
@@ -168,7 +171,9 @@ pub fn plan_ship<'a>(
 pub struct Complete {
     /// The epoch of the generation, 0 for none.
     pub epoch: u64,
+    /// When the generation was made, epoch milliseconds.
     pub created_ms: i64,
+    /// The generation id.
     pub id: String,
 }
 
@@ -198,6 +203,7 @@ pub fn complete_generations(root: &str, keys: &[String]) -> Vec<Complete> {
 /// The generations a prune keeps.
 #[derive(Debug, Default)]
 pub struct Keep {
+    /// The ids of the generations to keep.
     pub ids: BTreeSet<String>,
     /// The (epoch, time) of the oldest kept generation of the newest. A
     /// prune removes only what is older.
@@ -291,6 +297,31 @@ pub fn check_hash(sha256: &str) -> Result<(), String> {
     }
 }
 
+/// Refuse a set of snapshot paths that is not one database: two parts of
+/// it must not share a path, every path starts with the same name, and a
+/// one-part path (a database file) stands alone.
+pub fn check_shape<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let paths: Vec<&str> = paths.into_iter().collect();
+    let mut seen = HashSet::new();
+    let mut first = None;
+    for path in &paths {
+        if !seen.insert(*path) {
+            return Err(format!("the snapshot has the path {path:?} twice"));
+        }
+        let name = path.split('/').next().unwrap_or_default();
+        if *first.get_or_insert(name) != name {
+            return Err(format!(
+                "the snapshot holds more than one entry ({:?} and {name:?})",
+                first.unwrap_or_default()
+            ));
+        }
+    }
+    if paths.len() > 1 && paths.iter().any(|path| !path.contains('/')) {
+        return Err("the snapshot holds a database file and other files".to_owned());
+    }
+    Ok(())
+}
+
 /// Refuse a manifest of another layout, generation or shape.
 fn check_manifest(manifest: &Manifest, id: &str) -> Result<(), String> {
     if manifest.version != MANIFEST_VERSION {
@@ -315,7 +346,7 @@ fn check_manifest(manifest: &Manifest, id: &str) -> Result<(), String> {
             return Err(format!("the holder {:?} is not a generation", file.holder));
         }
     }
-    Ok(())
+    check_shape(manifest.files.iter().map(|f| f.path.as_str()))
 }
 
 /// The SHA-256 and the length of `path`. Blocking.
@@ -365,10 +396,12 @@ fn local_files(dir: &Path, files: &[PathBuf]) -> Result<Vec<LocalFile>, String> 
     if out.is_empty() {
         return Err("the snapshot wrote no file".to_owned());
     }
+    check_shape(out.iter().map(|f| f.path.as_str()))?;
     Ok(out)
 }
 
-/// The ship state of one open database.
+/// The ship state of one open database. Its lock is held only for a short
+/// read or write, so health never waits for an upload.
 #[derive(Debug)]
 pub struct GenerationTrack {
     /// When the database opened.
@@ -377,6 +410,7 @@ pub struct GenerationTrack {
     pub last_ok: Option<DateTime<Utc>>,
     /// Failed ships in a row.
     pub failures: u32,
+    /// The error of the last failed ship.
     pub last_error: Option<String>,
     /// The manifest of the last generation. Read from the replica at the
     /// first ship.
@@ -385,6 +419,7 @@ pub struct GenerationTrack {
 }
 
 impl GenerationTrack {
+    /// The track of a database that opened at `now`.
     pub const fn new(now: DateTime<Utc>) -> Self {
         Self {
             registered_at: now,
@@ -397,24 +432,34 @@ impl GenerationTrack {
     }
 }
 
-/// The ship turn and the track of one database. A ship holds `turn` for its
-/// snapshot and its upload, and `track` for its upload.
+/// The ship locks and the track of one open database.
 #[derive(Debug)]
 pub struct GenerationSlot {
-    pub turn: tokio::sync::Mutex<()>,
-    pub track: Mutex<GenerationTrack>,
+    /// Held for a whole ship, the snapshot too: one ship at a time.
+    turn: tokio::sync::Mutex<()>,
+    /// Held for the blocking part of a ship. A delete waits on it.
+    upload: Mutex<()>,
+    track: Mutex<GenerationTrack>,
 }
 
 impl GenerationSlot {
+    /// The slot of a database that opened at `now`.
     pub fn new(now: DateTime<Utc>) -> Self {
         Self {
             turn: tokio::sync::Mutex::new(()),
+            upload: Mutex::new(()),
             track: Mutex::new(GenerationTrack::new(now)),
         }
     }
 
+    /// The track. Hold it only for a short read or write.
     pub fn track(&self) -> std::sync::MutexGuard<'_, GenerationTrack> {
         self.track.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wait until no upload runs. Blocking.
+    pub fn wait_upload(&self) {
+        drop(self.upload.lock().unwrap_or_else(PoisonError::into_inner));
     }
 }
 
@@ -580,6 +625,8 @@ pub struct ShipTarget<E: FleetEngine> {
     handle: E::Handle,
     epoch: Option<crate::lock::FencingToken>,
     retired: Arc<std::sync::atomic::AtomicBool>,
+    /// The slot of this open. A ship never makes one.
+    slot: Arc<GenerationSlot>,
 }
 
 impl<E: FleetEngine> Clone for ShipTarget<E> {
@@ -590,85 +637,84 @@ impl<E: FleetEngine> Clone for ShipTarget<E> {
             handle: self.handle.clone(),
             epoch: self.epoch,
             retired: Arc::clone(&self.retired),
+            slot: Arc::clone(&self.slot),
         }
     }
 }
 
 impl<E: FleetEngine> ShipTarget<E> {
-    fn of(db: &FleetDatabase<E>) -> Self {
+    /// The target of `db`, with the slot of its open. It holds no lease.
+    pub fn of(db: &FleetDatabase<E>, slot: Arc<GenerationSlot>) -> Self {
         Self {
             key: db.key.clone(),
             path: db.path.to_path_buf(),
             handle: db.handle.clone(),
             epoch: db.epoch,
             retired: Arc::clone(&db.retired),
+            slot,
         }
     }
 }
 
 impl<E: FleetEngine> DatabaseFleet<E> {
-    /// Ship one generation of the open database `db`.
+    /// Ship one generation of the open database `db` now. The ship holds no
+    /// lease.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Unavailable`] when `db` ships no generations in this
+    /// process. Else see [`ship_target`](Self::ship_target).
     pub(super) async fn ship_generation(
         &self,
         replication: &Arc<FleetReplication>,
-        db: &FleetDatabase<E>,
+        db: FleetDatabase<E>,
     ) -> Result<ShipReport, FleetError> {
-        self.ship_target(replication, &ShipTarget::of(db)).await
+        let slot = replication
+            .current_generation_slot(db.key())
+            .ok_or_else(|| FleetError::Unavailable {
+                name: db.key().name(),
+                detail: "the database ships no generations in this process".to_owned(),
+            })?;
+        let target = ShipTarget::of(&db, slot);
+        drop(db);
+        self.ship_target(replication, &target).await
     }
 
-    /// Ship one generation of `target`: snapshot, hash, put, prune.
+    /// Ship one generation of `target`: snapshot, hash, put, prune. The
+    /// ship runs in an owned task: a dropped caller does not stop it half
+    /// way, and the turn stays held until it ends.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Fenced`] when a newer epoch owns the replica.
+    /// [`FleetError::Unavailable`] when the database is retired or a put
+    /// failed. The error of [`FleetEngine::snapshot`].
     async fn ship_target(
         &self,
         replication: &Arc<FleetReplication>,
         target: &ShipTarget<E>,
     ) -> Result<ShipReport, FleetError> {
-        let slot = replication.generation_slot(&target.key);
+        let (fleet, replication, target) = (self.clone(), Arc::clone(replication), target.clone());
+        let name = target.key.name();
+        tokio::spawn(async move { fleet.ship_owned(&replication, &target).await })
+            .await
+            .map_err(|e| FleetError::Unavailable {
+                name,
+                detail: format!("the ship task failed: {e}"),
+            })?
+    }
+
+    async fn ship_owned(
+        &self,
+        replication: &Arc<FleetReplication>,
+        target: &ShipTarget<E>,
+    ) -> Result<ShipReport, FleetError> {
         // One ship at a time per database: a later snapshot never lands
         // before an earlier one.
-        let _turn = slot.turn.lock().await;
-        if target.retired.load(Ordering::Acquire) {
-            return Err(ship_error(
-                &target.key,
-                DestinationError::Rejected {
-                    detail: "the database is closed".to_owned(),
-                },
-            ));
-        }
-        let scratch = self
-            .root()
-            .join(crate::fleet_layout::RESERVED_DIR)
-            .join(SHIP_DIR)
-            .join(format!("{:016x}", replication.entropy().next_u64()));
-        std::fs::create_dir_all(&scratch).map_err(super::io_error("create ship scratch"))?;
-        let files = self
-            .inner
-            .engine
-            .snapshot(&target.handle, &target.path, &scratch)
-            .await;
-        let shipped = match files {
-            Ok(files) => {
-                let (fleet, replication, owned, slot, scratch) = (
-                    self.clone(),
-                    Arc::clone(replication),
-                    target.clone(),
-                    Arc::clone(&slot),
-                    scratch.clone(),
-                );
-                crate::time::spawn_blocking(move || {
-                    fleet.ship_blocking(&replication, &owned, &slot, &scratch, &files)
-                })
-                .await
-                .map_err(|e| FleetError::Unavailable {
-                    name: target.key.name(),
-                    detail: format!("the ship task failed: {e}"),
-                })
-                .and_then(|r| r)
-            }
-            Err(error) => Err(error),
-        };
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _turn = target.slot.turn.lock().await;
+        let shipped = self.ship_locked(replication, target).await;
         let now = replication.now();
-        let mut track = slot.track();
+        let mut track = target.slot.track();
         match &shipped {
             Ok(_) => {
                 track.last_ok = Some(now);
@@ -683,28 +729,111 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         shipped
     }
 
-    /// The blocking part of a ship, under the track lock.
+    /// Write the epoch marker of `target`, through the fence. A newer owner
+    /// writes it at open, so an old owner is fenced before the first
+    /// generation of the new owner.
+    async fn mark_epoch(&self, replication: &Arc<FleetReplication>, target: &ShipTarget<E>) {
+        let Some(epoch) = target.epoch.map(crate::lock::FencingToken::get) else {
+            return;
+        };
+        let (fleet, owned, replication) = (self.clone(), target.clone(), Arc::clone(replication));
+        let marked = crate::time::spawn_blocking(move || {
+            let _upload = owned
+                .slot
+                .upload
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let root = replication.root_for(&owned.key);
+            fleet
+                .ship_destination(&replication, &owned, Some(epoch))
+                .put(&segment::epoch_marker_key(&root, epoch), b"{}")
+        })
+        .await;
+        match marked {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(database = %target.key, %error, "fleet generation: could not write the epoch marker; the first ship writes it");
+            }
+            Err(error) => {
+                tracing::warn!(database = %target.key, %error, "fleet generation: the epoch marker task failed");
+            }
+        }
+    }
+
+    /// A ship, under the turn.
+    async fn ship_locked(
+        &self,
+        replication: &Arc<FleetReplication>,
+        target: &ShipTarget<E>,
+    ) -> Result<ShipReport, FleetError> {
+        if target.retired.load(Ordering::Acquire) {
+            return Err(ship_error(
+                &target.key,
+                DestinationError::Rejected {
+                    detail: "the database is retired".to_owned(),
+                },
+            ));
+        }
+        let scratch =
+            ship_scratch(self.root()).join(format!("{:016x}", replication.entropy().next_u64()));
+        std::fs::create_dir_all(&scratch).map_err(super::io_error("create ship scratch"))?;
+        let files = self
+            .inner
+            .engine
+            .snapshot(&target.handle, &target.path, &scratch)
+            .await;
+        let shipped = match files {
+            Ok(files) => {
+                let (fleet, replication, owned, scratch) = (
+                    self.clone(),
+                    Arc::clone(replication),
+                    target.clone(),
+                    scratch.clone(),
+                );
+                crate::time::spawn_blocking(move || {
+                    fleet.ship_blocking(&replication, &owned, &scratch, &files)
+                })
+                .await
+                .map_err(|e| FleetError::Unavailable {
+                    name: target.key.name(),
+                    detail: format!("the ship task failed: {e}"),
+                })
+                .and_then(|r| r)
+            }
+            Err(error) => Err(error),
+        };
+        let _ = std::fs::remove_dir_all(&scratch);
+        shipped
+    }
+
+    /// The blocking part of a ship, under the upload lock.
     fn ship_blocking(
         &self,
         replication: &Arc<FleetReplication>,
         target: &ShipTarget<E>,
-        slot: &GenerationSlot,
         scratch: &Path,
         files: &[PathBuf],
     ) -> Result<ShipReport, FleetError> {
         let key = &target.key;
+        let slot = &target.slot;
+        let _upload = slot.upload.lock().unwrap_or_else(PoisonError::into_inner);
         let unavailable = |detail: String| FleetError::Unavailable {
             name: key.name(),
             detail,
         };
-        let mut track = slot.track();
         let files = local_files(scratch, files).map_err(&unavailable)?;
-        if !track.loaded {
+        let (loaded, mut prev) = {
+            let track = slot.track();
+            (track.loaded, track.prev.clone())
+        };
+        if !loaded {
             // After a restore or a takeover: the newest generation holds the
             // files that did not change.
-            track.prev = newest(replication, key, None, true)
+            prev = newest(replication, key, None, true)
                 .map_err(&unavailable)?
                 .map(|(_, manifest)| manifest);
+            let mut track = slot.track();
+            track.prev.clone_from(&prev);
             track.loaded = true;
         }
         let root = replication.root_for(key);
@@ -718,7 +847,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             .timestamp_millis()
             .max(floor_ms.map_or(i64::MIN, |ms| ms.saturating_add(1)));
         let id = segment::generation_id(created_ms, replication.entropy().next_u64());
-        let Some(planned) = plan_ship(track.prev.as_ref(), &files, &id) else {
+        let Some(planned) = plan_ship(prev.as_ref(), &files, &id) else {
             return Ok(ShipReport {
                 generation: None,
                 shipped: 0,
@@ -770,11 +899,17 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             bytes,
         };
         tracing::debug!(database = %key, generation = ?report.generation, shipped = report.shipped, reused = report.reused, "fleet generation shipped");
-        track.prev = Some(manifest);
-        drop(track);
-        if let Err(error) = prune(raw.as_ref(), &root, slot) {
-            tracing::warn!(database = %key, %error, "fleet generation prune failed; the next ship tries again");
+        // A retired or fenced host prunes nothing: the new owner can name
+        // these files.
+        let pruned = destination
+            .fence()
+            .check()
+            .map_err(|e| e.to_string())
+            .and_then(|()| prune(raw.as_ref(), &root, &manifest));
+        if let Err(error) = pruned {
+            tracing::warn!(database = %key, %error, "fleet generation prune skipped or failed; the next ship tries again");
         }
+        slot.track().prev = Some(manifest);
         Ok(report)
     }
 
@@ -880,11 +1015,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
 }
 
 /// Remove the generations a prune does not keep. Blocking, after a ship.
-fn prune(
-    destination: &dyn ReplicaDestination,
-    root: &str,
-    slot: &GenerationSlot,
-) -> Result<(), String> {
+/// `last` is the manifest the ship just wrote.
+fn prune(destination: &dyn ReplicaDestination, root: &str, last: &Manifest) -> Result<(), String> {
     let keys = destination
         .list(&segment::generations_prefix(root))
         .map_err(|e| e.to_string())?;
@@ -894,13 +1026,8 @@ fn prune(
     }
     let mut manifests = HashMap::new();
     for generation in complete.iter().rev().take(KEEP_GENERATIONS) {
-        let known = slot
-            .track()
-            .prev
-            .clone()
-            .filter(|prev| prev.generation == generation.id);
-        let manifest = if let Some(manifest) = known {
-            manifest
+        let manifest = if last.generation == generation.id {
+            last.clone()
         } else {
             let body = destination
                 .get(&manifest_key(root, &generation.id))
@@ -940,21 +1067,6 @@ impl<E: FleetEngine> GenerationShipper<E> {
     }
 }
 
-/// Drops the slot of a database when its worker ends, unless a newer open
-/// put another slot in its place.
-struct SlotGuard {
-    replication: Arc<FleetReplication>,
-    key: FleetDbKey,
-    slot: Arc<GenerationSlot>,
-}
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        self.replication
-            .forget_generation_slot(&self.key, &self.slot);
-    }
-}
-
 impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
     fn restore_missing(&self, key: &FleetDbKey, path: &Path) -> Result<bool, String> {
         if !self.replication.restores_missing() {
@@ -964,22 +1076,23 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
     }
 
     fn on_open(&self, db: &FleetDatabase<E>) -> Result<(), String> {
+        // The slot lives until `on_close`: the last ship needs it.
         let slot = self.replication.open_generation_slot(db.key());
-        let guard = SlotGuard {
-            replication: Arc::clone(&self.replication),
-            key: db.key().clone(),
-            slot,
-        };
-        let (fleet, replication, target, every) = (
+        let target = ShipTarget::of(db, slot);
+        let (fleet, replication, every) = (
             self.fleet.clone(),
             Arc::clone(&self.replication),
-            ShipTarget::of(db),
             self.every,
         );
         let stop = CancellationToken::new();
         let stopped = stop.clone();
-        let handle = tokio::runtime::Handle::current().spawn(async move {
-            let _guard = guard;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
+        let handle = runtime.spawn(async move {
+            // The epoch marker first: an old owner that still ships is
+            // fenced from now on, also before the first generation.
+            if let Some(fleet) = fleet.upgrade().map(|inner| DatabaseFleet { inner }) {
+                fleet.mark_epoch(&replication, &target).await;
+            }
             let start = tokio::time::Instant::now() + every;
             let mut tick = tokio::time::interval_at(start, every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -996,18 +1109,45 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
                     }
                 }
             }
-            // A close: ship the last generation while the database still
-            // serves. A delete, a restore or a fence retired it first.
-            if !target.retired.load(Ordering::Acquire)
-                && let Some(fleet) = fleet.upgrade().map(|inner| DatabaseFleet { inner })
-                && let Err(error) = fleet.ship_target(&replication, &target).await
-            {
-                tracing::warn!(database = %target.key, %error, "fleet generation ship at close failed");
-            }
         });
         db.register_worker(stop, handle);
         Ok(())
     }
+
+    /// The last generation of a close. It runs after every use ended, so it
+    /// holds every write. A delete, a restore, a fence or a refused open
+    /// retires the database first: then it ships nothing.
+    fn on_close(&self, db: &FleetDatabase<E>) {
+        let Some(slot) = self.replication.current_generation_slot(db.key()) else {
+            return;
+        };
+        let late = self
+            .replication
+            .shutdown_cutoff()
+            .is_some_and(crate::db::fleet_replication::cutoff_passed);
+        if late {
+            tracing::warn!(database = %db.key(), "fleet generation ship at close skipped: the shutdown cutoff passed");
+        }
+        let fleet = self.fleet.upgrade().map(|inner| DatabaseFleet { inner });
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        if let (false, false, Some(fleet), Some(runtime)) =
+            (db.retired.load(Ordering::Acquire), late, fleet, runtime)
+        {
+            let target = ShipTarget::of(db, Arc::clone(&slot));
+            if let Err(error) = runtime.block_on(fleet.ship_target(&self.replication, &target)) {
+                tracing::warn!(database = %db.key(), %error, "fleet generation ship at close failed");
+            }
+        }
+        // A ship of a retired database may still upload: wait, so a purge
+        // after a delete sees every object it wrote.
+        slot.wait_upload();
+        self.replication.forget_generation_slot(db.key(), &slot);
+    }
+}
+
+/// The scratch directory of the ships of the fleet at `root`.
+pub fn ship_scratch(root: &Path) -> PathBuf {
+    root.join(crate::fleet_layout::RESERVED_DIR).join(SHIP_DIR)
 }
 
 #[cfg(test)]
@@ -1193,6 +1333,18 @@ mod tests {
         assert!(check_hash(&"a".repeat(64)).is_ok());
         assert!(check_hash("../x").is_err());
         assert!(check_hash(&"A".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn a_snapshot_must_be_one_database() {
+        assert!(check_shape(["acme.db"]).is_ok());
+        assert!(check_shape(["acme.rocks/1.sst", "acme.rocks/CURRENT"]).is_ok());
+        assert!(check_shape(["acme.db", "acme.db"]).is_err(), "a path twice");
+        assert!(check_shape(["a/x", "b/x"]).is_err(), "two entries");
+        assert!(
+            check_shape(["acme.db", "acme.db/x"]).is_err(),
+            "a file and a directory"
+        );
     }
 
     #[test]

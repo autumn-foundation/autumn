@@ -141,3 +141,40 @@ async fn the_sqlite_engine_passes_the_fleet_conformance_kit() {
         report.to_text_report()
     );
 }
+
+/// WAL shipping is the `continuous` mode. Its RPO is the sync interval, and
+/// `ship_now` ships one tick through the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sqlite_engine_ships_continuously() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = DatabaseFleetConfig {
+        mode: autumn_web::fleet_layout::FleetMode::Tenant,
+        root: tmp.path().join("fleet").display().to_string(),
+        path: None,
+        max_open: 4,
+        max_resident_bytes: 0,
+        min_residency: Duration::ZERO,
+        pool_size: 2,
+        create_on_demand: Some(true),
+        idle_close_secs: 0,
+        restore_missing: false,
+        ownership: None,
+        replica_retention_after_delete: Duration::ZERO,
+        restore_check_sample: 0,
+        replication_workers: 1,
+        mmap_size: 0,
+        cache_size_kib: 0,
+    };
+    let fleet = SqliteFixture.fleet(config).await.unwrap();
+    let stats = fleet.stats();
+    assert_eq!(stats.ship_mode, "continuous");
+    assert_eq!(stats.rpo_secs, Some(1));
+    let key = fleet.key_for("acme").unwrap();
+    let db = fleet.open(&key).await.unwrap();
+    SqliteFixture.write(db.handle(), "plan").await.unwrap();
+    let report = fleet.ship_now(&key).await.unwrap();
+    assert!(report.shipped >= 1, "{report:?}");
+    assert_eq!(report.generation, None);
+    drop(db);
+    fleet.close_all().await;
+}

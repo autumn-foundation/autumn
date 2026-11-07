@@ -326,15 +326,16 @@ and the replication path both check it.
   generations by (epoch, time). The sweep never removes a generation without
   `snapshot.json` that is newer than the floor (an upload in progress). A
   replicator with no epoch records the newest epoch at the destination, so
-  turning ownership off does not order new generations below old ones. The
-  replicator lists `<root>/epochs/` at each new generation and every 60 s. A
-  newer epoch stops it (`ReplicationError::Fenced`), and the host loses the
-  range. A replica with no markers is epoch 0, so old replicas restore as
+  turning ownership off does not order new generations below old ones. Core
+  lists `<root>/epochs/` before each put to the replica (ADR 0040, "Notes
+  from step 3"). A newer epoch refuses the put and stops the replicator
+  (`ReplicationError::Fenced`), and the host loses the range. A replica with no markers is epoch 0, so old replicas restore as
   before.
 - **One replicator per database (#3230).** The epoch is the election token
   across hosts: only the owner of the current epoch opens the database. An
-  old replicator can still ship for up to 60 s, into its old epoch's
-  generation; the restore order makes that harmless. The lock file still
+  old replicator can still land one put that was in flight when the newer
+  marker landed, into its old epoch's generation; the restore order makes
+  that harmless. The lock file still
   elects one process inside the host. A parked replicator that reopens under
   a new epoch starts a new generation.
 

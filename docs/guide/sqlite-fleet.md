@@ -908,13 +908,14 @@ storage. Core does every write to the replica. The engine only gives files.
 
 | Mode | What core does | RPO |
 | --- | --- | --- |
-| `Continuous(_)` | Ships the changes as they commit. Only `SqliteEngine` (WAL shipping). The trait is sealed. | `sync_interval` |
+| `Continuous(_)` | Ships the changes as they commit. Only `SqliteEngine` (WAL shipping). `ContinuousShipper` is sealed. | `sync_interval` |
 | `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
 | `Rebuild` | Ships nothing. `restore_latest` calls `FleetEngine::rebuild`. | none |
 
 Install replication as for `SQLite`:
 `fleet.install_replication(Arc::new(FleetReplication::new(..)))`. The mode
-decides what it starts. `FleetStats` and the `replication:fleet` health
+decides what it starts. Replication needs the `sqlite` feature: it keeps
+the tombstones on the `SQLite` control database. `FleetStats` and the `replication:fleet` health
 indicator report `ship_mode` and the RPO (`rpo_secs`, `rpo_seconds`).
 
 A generation of `Generations` mode is these objects:
@@ -941,7 +942,13 @@ A generation of `Generations` mode is these objects:
   blocks the restore.
 - **Fail-back.** Return the stamp from `FleetEngine::epoch_stamp`. When the
   replica holds a newer epoch of another owner, core restores the database
-  before the open. With `None`, core keeps the file on disk.
+  before the open. With `None`, core counts the stamp as 0: it restores at
+  each new epoch that another owner wrote.
+- **Epoch marker.** A new owner writes its epoch marker when it opens the
+  database, before its first generation. From then on, each write of the
+  old owner is refused.
+- **Snapshot shape.** A snapshot is one database: one file, or one
+  directory of files. Core refuses two paths that are the same.
 - **Operators.** `DatabaseFleet::ship_now(key)` ships an open database now.
   `DatabaseFleet::restore_latest(key)` restores from the newest replica, in
   every mode. Within the retention, it undoes a delete.

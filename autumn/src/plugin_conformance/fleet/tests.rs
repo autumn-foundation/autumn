@@ -150,6 +150,7 @@ async fn a_correct_engine_passes() {
     assert_eq!(status(&report, "fleet-delete-restore"), CheckStatus::Skip);
     assert_eq!(status(&report, "fleet-fenced-ship"), CheckStatus::Skip);
     assert_eq!(status(&report, "fleet-unchanged-files"), CheckStatus::Skip);
+    assert_eq!(status(&report, "fleet-epoch-stamp"), CheckStatus::Pass);
 }
 
 #[cfg(feature = "sqlite")]

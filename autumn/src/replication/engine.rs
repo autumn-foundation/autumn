@@ -578,8 +578,8 @@ impl Replicator {
     /// point, so lag keeps growing until shipping works again.
     pub fn tick(&mut self) -> Result<TickReport, ReplicationError> {
         let result = self.tick_inner();
-        // A fence that refused a put stops this replicator for good, as a
-        // fence that its own check found.
+        // When the fence refuses a put, this replicator stops permanently.
+        // Its own fence check does the same.
         if let Err(ReplicationError::Fenced { newest, .. }) = &result
             && self.epoch.is_some()
         {

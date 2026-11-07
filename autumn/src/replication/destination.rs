@@ -72,7 +72,7 @@ pub enum DestinationError {
         /// Why.
         detail: String,
     },
-    /// A newer ownership epoch writes to this replica. The fence refused the
+    /// A newer ownership epoch owns this replica. The fence refused the
     /// write before it was sent.
     Fenced {
         /// The epoch of the writer.

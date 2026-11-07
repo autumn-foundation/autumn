@@ -111,9 +111,9 @@ It proves these properties:
   epoch it held.
 - A restore never selects a generation of an older epoch, and a fenced
   replicator stops.
-- Shipping is its own step. A put that the fence admits (`may_put`) is a
-  ship that `may_ship` admits. After a newer epoch marker, or a newer epoch
-  this host saw, each put of the old owner is refused. A grant can put.
+- Shipping is its own step. When `may_put` admits a put, `may_ship` admits
+  it too. After a newer epoch marker, or a newer epoch this host saw, each
+  put of the old owner is refused. After a new grant, the new owner can put.
 - An open refuses a file stamped by a newer owner. After the new owner opens
   the file, the old owner cannot open it. The owner can open it again, and a
   new grant can open any file the table stamped (`may_open`).
@@ -175,9 +175,9 @@ It proves these properties:
 The unit tests in `generations.rs` and `db/fleet/generations_tests.rs`, the
 kit checks `fleet-fenced-ship` and `fleet-unchanged-files`, and the takeover
 test in `tests/sqlite_fleet/generations.rs` check the runtime. The TLA+ spec
-needs no change: a list and a put are still two steps, so the witness
-`StaleGenerationLandsLate` still holds, and the (epoch, time) order is still
-required.
+needs no change. A list and a put are still two steps. So the witness
+`StaleGenerationLandsLate` still holds. The (epoch, time) order is still
+necessary.
 
 ## Fleet replica tombstones
 

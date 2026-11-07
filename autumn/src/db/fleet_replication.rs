@@ -283,8 +283,8 @@ pub struct FleetReplication {
     unshipped: Mutex<Vec<String>>,
     /// When shutdown must be done. Close-time shipping stops at it.
     shutdown_cutoff: Mutex<Option<std::time::Instant>>,
-    /// Told when a replicator sees a newer epoch (issue #3233). Shared
-    /// with the fence of each replica.
+    /// Told when a replicator sees a newer epoch. Shared with the fence of
+    /// each replica.
     fence_hook: Arc<Mutex<Option<FenceHook>>>,
     /// The newest epoch this host saw for a database. Shared with the fence
     /// of each replica.
@@ -551,7 +551,7 @@ impl FleetReplication {
     /// The RPO of the fleet: the sync interval of `continuous`, the
     /// interval of `generations`, none for `rebuild`.
     #[must_use]
-    pub fn rpo(&self) -> Option<Duration> {
+    pub(crate) fn rpo(&self) -> Option<Duration> {
         let info = self.ship_info();
         match info.mode {
             "continuous" => Some(self.settings.sync_interval),
@@ -565,13 +565,10 @@ impl FleetReplication {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The ship slot of `key`, made when it is not there.
-    pub(crate) fn generation_slot(&self, key: &FleetDbKey) -> Arc<GenerationSlot> {
-        Arc::clone(
-            self.slots()
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(GenerationSlot::new(self.clock.now()))),
-        )
+    /// The ship slot of the open database of `key`, if it ships
+    /// generations in this process.
+    pub(crate) fn current_generation_slot(&self, key: &FleetDbKey) -> Option<Arc<GenerationSlot>> {
+        self.slots().get(key).cloned()
     }
 
     /// A new ship slot for `key`, at an open. It replaces the slot of an
@@ -817,11 +814,12 @@ impl FleetReplication {
         if let Some(replica) = released.and_then(|weak| weak.upgrade()) {
             drop(lock_replicator(&replica, &|| None));
         }
-        // A generation ship in flight holds the track. Its database is
-        // retired, so a later put is refused.
-        let slot = self.slots().remove(key);
+        // A generation ship in flight holds the upload lock. Its database
+        // is retired, so a later put is refused. The slot stays: only the
+        // worker of its open drops it.
+        let slot = self.current_generation_slot(key);
         if let Some(slot) = slot {
-            drop(slot.track());
+            slot.wait_upload();
         }
     }
 
@@ -1663,6 +1661,11 @@ fn ship_until_caught_up(
         }
     }
     Err(format!("still behind after {FINAL_SHIP_MAX_TICKS} ticks"))
+}
+
+/// Whether the shutdown `cutoff` has passed.
+pub(crate) fn cutoff_passed(cutoff: std::time::Instant) -> bool {
+    expired(Some(cutoff))
 }
 
 /// Whether `cutoff` has passed. Real time on purpose: the flush bounds

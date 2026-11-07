@@ -284,7 +284,7 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
     PluginSurface {
         name: "db::fleet_engine",
         tier: SurfaceTier::Experimental,
-        note: "`FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`install_replication`, `ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040).",
+        note: "`FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. `install_replication` and `ShipMode::Generations` need the `sqlite` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040).",
     },
     PluginSurface {
         name: "fleet",
