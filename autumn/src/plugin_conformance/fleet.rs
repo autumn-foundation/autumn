@@ -24,7 +24,7 @@
 //!
 //! Each check uses its own fleet root under the scratch directory. The ship
 //! checks need a fixture that installs replication
-//! ([`DatabaseFleet::install_replication`]).
+//! (`DatabaseFleet::install_replication`, with the `sqlite` feature).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
