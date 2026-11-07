@@ -1,6 +1,6 @@
 # ADR 0040: Fleet Engine Seams
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-05
 - Deciders: Autumn maintainers
 - Tags: fleet, plugins, sqlite, duckdb, rocksdb
@@ -119,22 +119,38 @@ pub trait FleetEngine: Send + Sync + 'static {
     type Handle: Clone + Send + Sync + 'static;
 
     /// Opens or creates the database at `path`. Stamps the key and epoch
-    /// on a new database. Refuses a database that names another key or a
-    /// newer epoch. Runs on a blocking thread.
+    /// on a new database. Refuses a database that names another key
+    /// (`Misplaced`) or a newer epoch (`NewerEpoch`).
     fn open(&self, key: &FleetDbKey, path: &Path, epoch: Option<FencingToken>)
-        -> Result<Self::Handle, EngineError>;
+        -> impl Future<Output = Result<Self::Handle, FleetError>> + Send;
 
-    /// Closes the handle. Every user of it has let go.
+    /// Closes the handle. New use fails. Runs on a blocking thread.
     fn close(&self, handle: &Self::Handle);
 
-    /// Writes a consistent copy of the database into `dir`.
-    fn snapshot(&self, handle: &Self::Handle, dir: &Path) -> Result<Vec<PathBuf>, EngineError>;
+    /// Whether a user still holds part of the handle. Core does not evict
+    /// a database in use, and waits for this after `close`.
+    fn in_use(&self, handle: &Self::Handle) -> bool;
+
+    /// Writes a consistent copy of the database at `path` into `dir`, as
+    /// `dir/<file name of path>`.
+    fn snapshot(&self, handle: &Self::Handle, path: &Path, dir: &Path)
+        -> impl Future<Output = Result<Vec<PathBuf>, FleetError>> + Send;
+
+    /// Deletes the database at `path`. Refuses when another process has it
+    /// open. Runs on a blocking thread, under the path lock.
+    fn remove(&self, key: &FleetDbKey, path: &Path) -> Result<bool, FleetError>;
 
     /// The memory the open database holds, for the fleet budget.
     fn resident_bytes(&self, handle: &Self::Handle) -> u64;
 
     /// How the database gets to object storage.
     fn ship_mode(&self) -> ShipMode;
+
+    /// Files beside the database (a `-wal`). Default: none.
+    fn sidecars(&self, path: &Path) -> Vec<PathBuf> { Vec::new() }
+
+    /// Migrations applied since boot, for `FleetStats`. Default: 0.
+    fn migrations_applied(&self) -> u64 { 0 }
 }
 ```
 
@@ -144,13 +160,42 @@ pub trait FleetEngine: Send + Sync + 'static {
   `{bucket}` stays a directory of 64 slots in the path template, so every
   engine gets the same one-directory cell handoff.
 - `DatabaseFleet` becomes `DatabaseFleet<E: FleetEngine>`.
-  `DatabaseFleet<SqliteEngine>` keeps the current API. A `sqlite`-gated type
-  alias keeps the name `DatabaseFleet` for existing apps.
+  `DatabaseFleet<SqliteEngine>` keeps the current API. With `sqlite`, a
+  default type parameter keeps the name `DatabaseFleet` for existing apps.
 - The opener, the path lock, single-flight opens, eviction and leases stay
   in core. They work on `E::Handle`.
 - **Memory budget.** Core adds `max_resident_bytes`. Eviction counts
   `resident_bytes`, not only `max_open`. An engine with its own buffer pool
   cannot then push a host out of memory one tenant at a time.
+
+##### Notes from the first implementation
+
+Issue #3642 changed the sketch in these ways:
+
+- `open` and `snapshot` are `async`. The `SQLite` open checks the key on
+  the first pooled connection, which also sets WAL. A blocking check on its
+  own connection would checkpoint at close, before the replicator starts.
+  A blocking engine runs its work with `spawn_blocking`.
+- The errors are `FleetError`. A new variant, `NewerEpoch` (`421`), is the
+  epoch refusal. A separate `EngineError` would only map back to it.
+- `in_use`, `remove`, `exists`, `sidecars` and `migrations_applied` were
+  added. Core needs them for eviction, drains and deletes. `exists` keeps
+  the `SQLite` rule that a database is a file.
+- The memory budget keeps one database open, and closes only a database
+  that holds memory.
+- An open checks and writes the epoch stamp in one transaction.
+- `ShipMode` has `Continuous` and `Rebuild`. Step 3 adds `Generations`. The
+  enum is `#[non_exhaustive]`.
+- The name `DatabaseFleet` stays through a default type parameter, not a
+  type alias. An alias cannot have the name of the generic type in the same
+  module. With `sqlite`, `DatabaseFleet` is `DatabaseFleet<SqliteEngine>`.
+- The SQL stores of the control database (`SqlSlotOwnership`,
+  `FleetTombstones`) keep `cfg(feature = "sqlite")`. Their statements are
+  `SQLite`. The rules, the store trait and `FleetOwnership` moved to `db`.
+  Step 2 adds the Postgres store.
+- WAL shipping, the lake and the sweeper stay with `SqliteEngine`. They work
+  inside `SQLite` files. The core reaches replication through a small set of
+  replica steps, which do nothing without `sqlite`.
 
 #### 2. Resolution for extractors
 
@@ -283,6 +328,11 @@ checks:
 Each plugin runs the kit in its own CI. The proofs cover core. The kit
 covers the engine side of the contract.
 
+The kit implements every check above but "a fenced ship refused". That
+check needs `ShipMode::Generations` (step 3). An engine crate gives a
+`FleetFixture`: its fleet, a write and a read through a handle, and an
+optional restore. A fixture with no restore skips the restore check.
+
 ### What does not go in core
 
 | Item | Home |
@@ -324,6 +374,7 @@ Notes for the plugins. These are not part of this decision:
 
 1. Move the fleet core out of `cfg(sqlite)` behind `FleetEngine`.
    `SqliteEngine` keeps today's behaviour. Add the conformance kit.
+   Done in issue #3642.
 2. Add `resolve`, `resolve_key`, the hook context and
    `fleet_ownership_store`. Then the DuckDB plugin adds `FleetDuckDb` as a
    sidecar.

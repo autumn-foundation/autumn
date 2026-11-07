@@ -2428,7 +2428,14 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
 - `#[derive(WireShape)]` refuses generics, enums, tuple structs,
   `#[serde(flatten)]` and split renames rather than describing them wrongly.
 
-First slice: one workspace, sync request/response, JSON over HTTP. Guide:
+- Across releases: `autumn contracts export --out contracts.json` writes a
+  sorted, byte-stable bundle; store it with each release.
+  `autumn contracts check --against <bundle|url|git-ref>` checks both deploy
+  windows (new callees with deployed callers, new callers with deployed
+  callees). Exit 0 safe, 1 not safe, 3 safe in one order only (the report
+  names it; `--order callee-first|caller-first` declares it), 4 tool error.
+
+Limits: one workspace, sync request/response, JSON over HTTP. Guide:
 `docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +
 `examples/mesh-storefront`.
 
@@ -3090,6 +3097,10 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `min_residency` (default `"2s"`) is not closed, and an open never waits.
   A burst can open far more files than `max_open`. Size `ulimit -n` for the
   peak (about `2 × pool_size + 1` fds per open database).
+- `max_resident_bytes` (default `0`, off) is a soft memory budget with the
+  same rules as `max_open`. The SQLite engine counts about 2 MB per open
+  connection. The fleet keeps one database open. `db:fleet` reports
+  `resident_bytes`.
 - Control-only or tenant-only tables: `.migrations_for(MigrationScope::Control,
   SET)` / `.migrations_for(MigrationScope::Shards, SET)`
   (`autumn_web::migrate::MigrationScope`), not one set for both.
@@ -3127,7 +3138,8 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `restore_missing`. Replication is asynchronous: a takeover loses the
   unshipped writes (`rpo_secs` in steady state), and a fail-back does not
   recover them. A crash costs up to `lease_secs + lease_secs / 3` of outage.
-  Guide: "What a failover costs".
+  Guide: "What a failover costs". An open refuses a file stamped with a
+  newer epoch than this host's (`FleetError::NewerEpoch`, `421`).
   Health: `fleet:ownership`. The built-in table is
   on the control database, so it fences the processes of one host only;
   hosts on different machines implement `SlotOwnershipStore`
@@ -3144,6 +3156,15 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   no atomic snapshot. CLI: `autumn fleet lake q.sql --out q.csv`. Never
   pass request input as the SQL. Guide: "Query the lake".
 - The control database lives outside `root` (validation refuses it inside).
+- Another engine (ADR 0040): the fleet core is `DatabaseFleet<E: FleetEngine>`
+  (`autumn_web::db::fleet_engine`, experimental surface). With `sqlite`,
+  `DatabaseFleet` means `DatabaseFleet<SqliteEngine>`, so SQLite code does
+  not change. An engine plugin implements `FleetEngine` (async `open` that
+  stamps the key and the epoch, `close`, `in_use`, `snapshot`, `remove`,
+  `resident_bytes`, `ship_mode`), builds with
+  `DatabaseFleet::with_engine(&config, engine)`, reads `db.handle()`, and
+  runs `plugin_conformance::fleet::run_fleet_conformance` with a
+  `FleetFixture` in its CI. Engines go in their plugin, never in core.
 - Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
   databases, also closed ones (issue #3234). Write outbox rows in a
   transaction on the tenant connection: the write records the database in

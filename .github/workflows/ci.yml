@@ -1015,17 +1015,35 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      # The macOS build ran out of disk while it linked `integration_tests`
+      # ("No space left on device"). A cold build can also lose the runner.
+      # Remove SDKs the Rust build does not use. Keep Xcode: the linker is
+      # Xcode's.
+      - name: Free disk space (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          df -h /
+          xcrun simctl delete all || true
+          sudo rm -rf \
+            "${HOME}/Library/Android" \
+            /usr/local/share/dotnet \
+            "${HOME}/.dotnet" \
+            /Library/Developer/CoreSimulator/Profiles/Runtimes \
+            "${HOME}/Library/Developer/CoreSimulator" \
+            || true
+          df -h /
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: ./.github/actions/kache
         continue-on-error: true
         with:
           # See `test-build`.
           shared-key: workspace-test
-          # The macOS runner has a 14 GB disk. Since kache reads the S3 store
-          # (#3633), the host loses the runner mid-build ("lost communication
-          # with the server"), on trunk-dev too. The GitHub Actions cache
-          # passed this build before. Windows keeps S3.
-          s3: ${{ runner.os != 'macOS' }}
+          # The macOS runner has 7 GB of memory. With S3 and one manifest for
+          # all OSes, it prefetched Linux or Windows artifacts that it cannot
+          # use; that is the likely cause of the lost runner. The manifest is
+          # now per host, and macOS downloads only what a compile asks for.
+          warm: ${{ runner.os != 'macOS' }}
       - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-nextest@0.9.149
@@ -1040,6 +1058,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The macOS runner has 3 cores and 7 GB. Three rustc jobs swap
+          # (3.3 GB), and the runner can then stop answering ("lost
+          # communication"). Two jobs keep the build in memory.
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            export CARGO_BUILD_JOBS=2
+          fi
           mkdir -p "${RUNNER_TEMP}/nextest-archive"
           cargo nextest archive --workspace \
             --archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
@@ -2698,6 +2722,10 @@ jobs:
           # rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet_sweeper
+          # The fleet conformance kit against the SQLite engine.
+          # Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_fleet_conformance
           # Issue #3062: the outbox writers and the SQL webhook store
           # (`webhook_outbound/sql_store.rs`). Same features, so no rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
@@ -2961,6 +2989,16 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- table_boundaries_cli \
             | tee "$RUNNER_TEMP/cli-boundaries-e2e-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-boundaries-e2e-cov.log"
+          # Same gap for `contracts::` and `autumn contracts`. The `cli_tests`
+          # filter runs the real binary over the golden bundles. Check the
+          # count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- contracts:: \
+            tests::parse_contracts \
+            | tee "$RUNNER_TEMP/cli-contracts-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-contracts-cov.log"
+          cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- contracts_check \
+            | tee "$RUNNER_TEMP/cli-contracts-e2e-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-contracts-e2e-cov.log"
           # No other coverage lane runs the grants and database-role tests.
           # `grep` fails the step when a filter matches no test.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::grants:: \
@@ -3293,6 +3331,7 @@ jobs:
             --test sqlite_transactional_url_pool \
             --test sqlite_fleet \
             --test sqlite_fleet_sweeper \
+            --test sqlite_fleet_conformance \
             --test sqlite_version_history \
             --test sqlite_ledger \
             --test sqlite_ledger_out_of_band \
@@ -3644,6 +3683,7 @@ jobs:
         run: |
           cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
           cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_sweeper
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_conformance
 
   windows-tier1:
     name: Windows Tier 1 journey

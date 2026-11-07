@@ -23,7 +23,9 @@
 //! # Known limitations
 //!
 //! - In a plain `'..'` literal, `\` does not escape a quote. This is Postgres
-//!   with `standard_conforming_strings = on`, the default since 9.1.
+//!   with `standard_conforming_strings = on`, the default since 9.1. The
+//!   scanner does not track changes to the setting. A statement that can
+//!   change it is [`RiskLevel::ManualReview`] (#3528).
 
 use std::fmt;
 
@@ -381,6 +383,8 @@ const CREATE_INDEX_PG_OP: &str = "CREATE INDEX (non-concurrent)";
 /// Operation label for a `SQLite` index build. `SQLite` has no `CONCURRENTLY`,
 /// so "non-concurrent" would be a meaningless qualifier there.
 const CREATE_INDEX_SQLITE_OP: &str = "CREATE INDEX";
+/// Operation label for a change to `standard_conforming_strings` (#3528).
+const STRING_ESCAPE_MODE_OP: &str = "standard_conforming_strings change";
 
 /// The value of an `add column` subcommand's `DEFAULT` clause, or `None` when
 /// the subcommand carries no default. The subcommand is normalized text.
@@ -1075,6 +1079,186 @@ pub fn contains_concurrent_index(sql: &str) -> bool {
     })
 }
 
+/// The Postgres setting that controls how `\` works in `'..'` text.
+const STANDARD_CONFORMING_STRINGS: &str = "standard_conforming_strings";
+
+/// A [`RiskLevel::ManualReview`] finding when a Postgres statement can change
+/// `standard_conforming_strings` (#3528).
+fn string_escape_mode_finding(normalized: &str) -> Option<SafetyFinding> {
+    changes_string_escape_mode(normalized).then(|| SafetyFinding {
+        operation: STRING_ESCAPE_MODE_OP.to_owned(),
+        risk: RiskLevel::ManualReview,
+        why: "With standard_conforming_strings off, `\\'` does not end '..' text. Autumn \
+              reads '..' text with the setting on. Autumn possibly misses a risky statement \
+              after this one.",
+        next_action: "Remove this statement. Use E'..' text for backslash escapes. If you must \
+                      keep it, examine the statements after it manually, also in later \
+                      migrations. Then add `-- autumn-safety: reviewed` above this statement.",
+    })
+}
+
+/// Whether a Postgres statement can change `standard_conforming_strings`.
+/// The scanner reads `'..'` text with the setting on.
+///
+/// These forms match, also in a `DO` body or a function body. Text data,
+/// such as `DEFAULT 'SET ..'`, does not match.
+///
+/// - `SET` or `RESET` before the name, as in `ALTER ROLE r SET ..`.
+/// - A `SET` or `RESET` of a `U&".."` name.
+/// - A `set_config` call, unless its first argument is a plain `'..'` name
+///   of a different setting.
+/// - An `UPDATE` of `pg_settings`.
+/// - `RESET ALL` or `DISCARD ALL`. The reset value of the setting can be off.
+///
+/// A `SET` to an explicit true value does not match. Dynamic SQL can build
+/// the name in other ways. The scanner does not find those.
+fn changes_string_escape_mode(normalized: &str) -> bool {
+    let lower = normalized.to_ascii_lowercase();
+    if sets_standard_conforming_strings_on(&lower) {
+        return false;
+    }
+    // Text data does not run. The text body of a `DO` block or a function
+    // can run.
+    let text_body_runs = strip_word_prefix(&lower, "do").is_some()
+        || (lower.starts_with("create ")
+            && (lower.contains(" function ") || lower.contains(" procedure ")));
+    let code = if text_body_runs {
+        lower.clone()
+    } else {
+        // Dollar tags are case-sensitive, so scan before lowercasing.
+        blank_text_literals(normalized).to_ascii_lowercase()
+    };
+    code.match_indices(STANDARD_CONFORMING_STRINGS)
+        .any(|(i, _)| ends_with_set_keyword(&code[..i]))
+        || code
+            .match_indices("u&\"")
+            .any(|(i, _)| ends_with_set_keyword(&code[..i]))
+        || set_config_can_change_it(&code, &lower)
+        || resets_all(&code)
+        || code.contains("update pg_settings")
+        || code.contains("update pg_catalog.pg_settings")
+}
+
+/// `sql` with the text of each `'..'` and `E'..'` literal replaced by
+/// spaces. The byte offsets do not change.
+fn blank_text_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    for (kind, text) in tokens(DatabaseBackend::Postgres, sql) {
+        let open = match text.as_bytes() {
+            [b'\'', ..] => 1,
+            [b'e' | b'E', b'\'', ..] => 2,
+            _ => 0,
+        };
+        if kind == TokenKind::Quoted && open > 0 {
+            out.push_str(&text[..open]);
+            out.extend(std::iter::repeat_n(' ', text.len() - open));
+        } else {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// Whether `lower` holds `RESET ALL` or `DISCARD ALL`.
+fn resets_all(lower: &str) -> bool {
+    lower.match_indices("all").any(|(i, word)| {
+        let before = &lower[..i];
+        let word_end = lower[i + word.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_identifier_char(c));
+        word_end
+            && before.ends_with(char::is_whitespace)
+            && ["reset", "discard"]
+                .iter()
+                .any(|k| strip_word_suffix(before.trim_end(), k).is_some())
+    })
+}
+
+/// Whether `before` ends with `SET` or `RESET`, then an optional `SESSION`
+/// or `LOCAL`, then an optional `"`. `before` is lowercase.
+fn ends_with_set_keyword(before: &str) -> bool {
+    let rest = before.trim_end().trim_end_matches('"').trim_end();
+    let rest = ["session", "local"]
+        .iter()
+        .find_map(|w| strip_word_suffix(rest, w))
+        .map_or(rest, str::trim_end);
+    ["set", "reset"]
+        .iter()
+        .any(|w| strip_word_suffix(rest, w).is_some())
+}
+
+/// `text` without the word `word` at its start, or `None`. The character
+/// after `word` must not be an identifier character, as in `DO'..'`.
+fn strip_word_prefix<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(word)?;
+    rest.chars()
+        .next()
+        .is_none_or(|c| !is_identifier_char(c))
+        .then_some(rest)
+}
+
+/// `text` without the word `word` at its end, or `None`. The character
+/// before `word` must not be an identifier character.
+fn strip_word_suffix<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.strip_suffix(word)?;
+    rest.chars()
+        .next_back()
+        .is_none_or(|c| !is_identifier_char(c))
+        .then_some(rest)
+}
+
+/// Whether a `set_config` call in `code` can name
+/// `standard_conforming_strings`. A call does not when its first argument is
+/// only a plain `'..'` literal with a different name. `lower` is `code` with
+/// its literal text, at the same byte offsets.
+fn set_config_can_change_it(code: &str, lower: &str) -> bool {
+    code.match_indices("set_config").any(|(i, word)| {
+        // A quoted name such as `"set_config"` is the same function.
+        let after = &lower[i + word.len()..];
+        let after = after.strip_prefix('"').unwrap_or(after);
+        let Some(args) = after.trim_start().strip_prefix('(') else {
+            return false;
+        };
+        let Some(literal) = args.trim_start().strip_prefix('\'') else {
+            return true;
+        };
+        // Only `'name' ,` is a known name: not `'a''b'` or `'a' || 'b'`.
+        literal.find('\'').is_none_or(|end| {
+            !literal[end + 1..].trim_start().starts_with(',')
+                || &literal[..end] == STANDARD_CONFORMING_STRINGS
+        })
+    })
+}
+
+/// Whether `lower` is `SET [SESSION | LOCAL] standard_conforming_strings` to
+/// an explicit true value, for example `= on` or `TO 'true'`.
+fn sets_standard_conforming_strings_on(lower: &str) -> bool {
+    let Some(rest) = lower.strip_prefix("set ") else {
+        return false;
+    };
+    let rest = ["session ", "local "]
+        .iter()
+        .find_map(|p| rest.strip_prefix(p))
+        .unwrap_or(rest);
+    let Some(rest) = rest
+        .strip_prefix(STANDARD_CONFORMING_STRINGS)
+        .or_else(|| rest.strip_prefix("\"standard_conforming_strings\""))
+    else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(value) = rest.strip_prefix('=').or_else(|| rest.strip_prefix("to ")) else {
+        return false;
+    };
+    let value = value.trim();
+    let value = value
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .unwrap_or(value);
+    ["on", "true", "yes", "1"].contains(&value)
+}
+
 /// `PostgreSQL` STABLE/IMMUTABLE function prefixes that are safe as NOT NULL column
 /// defaults: Postgres evaluates them once at statement time and stores the result as
 /// a constant, so the PG 11+ fast-default path applies — no table rewrite needed.
@@ -1136,6 +1320,9 @@ fn classify_statement(
     }
 
     let mut findings = Vec::new();
+    if !sqlite && let Some(f) = string_escape_mode_finding(normalized) {
+        findings.push(f);
+    }
     // Some SQLite ADD COLUMN restrictions apply only to a table that already has
     // rows: NOT NULL without a usable default, a non-constant default, and a
     // STORED generated column. A table this same migration creates has none, so
@@ -2981,7 +3168,156 @@ mod tests {
         assert_eq!(texts, ["a", "$", "b", "("]);
     }
 
-    mod quoted_identifier_proptest {
+    #[test]
+    fn issue_3528_repros_hide_no_statement() {
+        // Issue #3528. Each text ends before the `;`.
+        let pg = DatabaseBackend::Postgres;
+        for sql in [
+            r"ALTER TABLE t ADD COLUMN a text DEFAULT e'\''; DROP TABLE users;",
+            "ALTER TABLE t ADD COLUMN a$$ int; DROP TABLE users; -- $$",
+            r#"ALTER TABLE t ADD COLUMN "a'b" int; DROP TABLE users; -- '"#,
+        ] {
+            let stmts = split_statements(pg, &strip_block_comments(pg, sql));
+            assert_eq!(
+                stmts.get(1).map(String::as_str),
+                Some("DROP TABLE users"),
+                "{sql}: {stmts:?}"
+            );
+            assert_eq!(ops(pg, sql), ["DROP TABLE"], "{sql}");
+        }
+        // The same text does not merge two ALTER TABLE subcommands.
+        for (backend, sql) in [
+            (
+                pg,
+                r"ALTER TABLE t ADD COLUMN a text DEFAULT e'\'', ADD COLUMN z int NOT NULL;",
+            ),
+            (
+                pg,
+                "ALTER TABLE t ADD COLUMN a$$ int, ADD COLUMN z int NOT NULL; -- $$",
+            ),
+            (
+                pg,
+                r#"ALTER TABLE t ADD COLUMN "a'b" int, ADD COLUMN z int NOT NULL; -- '"#,
+            ),
+            (
+                DatabaseBackend::Sqlite,
+                r#"ALTER TABLE t ADD COLUMN "a'b" int; DROP TABLE users; -- '"#,
+            ),
+            (
+                DatabaseBackend::Sqlite,
+                "ALTER TABLE t ADD COLUMN a$$ int; DROP TABLE users; -- $$",
+            ),
+        ] {
+            let want = if sql.contains("DROP TABLE") {
+                "DROP TABLE"
+            } else {
+                "ADD COLUMN NOT NULL (no default)"
+            };
+            assert_eq!(ops(backend, sql), [want], "{backend:?} {sql}");
+        }
+    }
+
+    #[test]
+    fn escape_string_continuation_hides_no_statement() {
+        // Issue #3528. Postgres joins two `'..'` strings when a line end
+        // separates them. The second part keeps the `E'..'` escape rules.
+        let pg = DatabaseBackend::Postgres;
+        for gap in ["\n", " \t\n  ", "\r\n", " -- c\n", "\n-- c\n\x0b"] {
+            let sql = format!("SELECT E'a'{gap}'\\''; DROP TABLE users; --';");
+            assert_eq!(ops(pg, &sql), ["DROP TABLE"], "{sql:?}");
+        }
+        // A plain first part keeps the plain rules.
+        let sql = "SELECT 'a'\n'\\'; DROP TABLE users; --';";
+        assert_eq!(ops(pg, sql), ["DROP TABLE"]);
+        // `SQLite` has no `E'..'` strings.
+        let sql = "SELECT E'a'\n'\\'; DROP TABLE users; --';";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+    }
+
+    #[test]
+    fn string_escape_mode_change_requires_manual_review() {
+        // Issue #3528. With the setting off, `\'` does not end `'..'` text.
+        // The scanner then possibly misreads later statements.
+        let pg = DatabaseBackend::Postgres;
+        for sql in [
+            "SET standard_conforming_strings = off;",
+            "set standard_conforming_strings to 'off';",
+            "SET LOCAL standard_conforming_strings = false;",
+            "SET SESSION \"standard_conforming_strings\" TO 0;",
+            "SET standard_conforming_strings=off;",
+            "SET standard_conforming_strings TO DEFAULT;",
+            "RESET standard_conforming_strings;",
+            "SELECT set_config('standard_conforming_strings', 'off', false);",
+            "SELECT set_config('Standard_Conforming_Strings', 'off', true);",
+            "DO $$ BEGIN EXECUTE 'SET standard_conforming_strings = off'; END $$;",
+            "DO $$ BEGIN PERFORM SET_CONFIG('standard_conforming_strings', 'off', false); END $$;",
+            "SET standard_conforming_strings = on, off;",
+            "SET standard_conforming_strings = 't';",
+            "ALTER ROLE app SET standard_conforming_strings = off;",
+            "ALTER DATABASE d RESET standard_conforming_strings;",
+            // Indirect spellings of the name.
+            r#"SET U&"\0073tandard_conforming_strings" = off;"#,
+            r"SELECT set_config(U&'standard\005fconforming_strings', 'off', false);",
+            r"SELECT set_config(E'standard\_conforming_strings', 'off', false);",
+            "SELECT set_config('standard_' || 'conforming_strings', 'off', false);",
+            "SELECT pg_catalog.set_config ( $n$standard_conforming_strings$n$, 'off', false);",
+            "SELECT set_config('it''s', 'off', false);",
+            "UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_' || 'conforming_strings';",
+            "UPDATE pg_catalog.pg_settings SET setting = 'off';",
+            r#"SELECT pg_catalog."set_config"('standard_conforming_strings', 'off', false);"#,
+            // A reset value can be off.
+            "RESET ALL;",
+            "DISCARD ALL;",
+            "DO $$ BEGIN RESET ALL; END $$;",
+            // A plain-text body can run.
+            "DO 'BEGIN RESET ALL; END';",
+            "DO'BEGIN SET standard_conforming_strings = off; END';",
+            "DO E'BEGIN RESET ALL; END';",
+            "CREATE FUNCTION f() RETURNS void AS 'SET standard_conforming_strings = off' LANGUAGE sql;",
+        ] {
+            let findings = classify_sql_for(pg, sql);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.operation == STRING_ESCAPE_MODE_OP
+                        && f.risk == RiskLevel::ManualReview),
+                "{sql}: {findings:?}"
+            );
+            assert!(has_unsafe_findings(&findings), "{sql}");
+        }
+        // These statements make no finding.
+        for sql in [
+            "SET standard_conforming_strings = on;",
+            "SET LOCAL standard_conforming_strings TO 'ON';",
+            "set standard_conforming_strings=true;",
+            "SET \"standard_conforming_strings\" = on;",
+            "SET statement_timeout = 0;",
+            "SELECT set_config('search_path', 'app', false);",
+            "SHOW standard_conforming_strings;",
+            "SELECT current_setting('standard_conforming_strings');",
+            "CREATE TABLE settings (standard_conforming_strings boolean);",
+            "SELECT a FROM x UNION ALL SELECT a FROM y;",
+            "CREATE TABLE t (reset allowed);",
+            // Text data does not run.
+            "SELECT 'SET standard_conforming_strings = off';",
+            "CREATE TABLE t (m text DEFAULT 'SET standard_conforming_strings = off');",
+            "SELECT 'RESET ALL', E'update pg_settings', 'set_config(x)';",
+            "SELECT 'é RESET ALL', set_config('search_path', 'app', false);",
+            "SELECT $A$ $a$ $A$, 'RESET ALL';",
+            "done 'RESET ALL';",
+            "-- autumn-safety: reviewed\nSET standard_conforming_strings = off;",
+        ] {
+            assert_eq!(ops(pg, sql), Vec::<String>::new(), "{sql:?}");
+        }
+        // `SQLite` has no such setting.
+        let sql = "SET standard_conforming_strings = off;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), Vec::<String>::new());
+        // The finding stays when the later text hides a statement.
+        let sql = r"SET standard_conforming_strings = off; SELECT 'a\''; DROP TABLE users; --';";
+        assert_eq!(ops(pg, sql), [STRING_ESCAPE_MODE_OP]);
+    }
+
+    mod scanner_proptest {
         use super::*;
         use proptest::prelude::*;
 
@@ -3000,6 +3336,32 @@ mod tests {
                 };
                 let sql = format!("CREATE TABLE {ident} (id int); DROP TABLE x;");
                 prop_assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{}", sql);
+            }
+
+            /// Issue #3528. No `E'..'` text hides a later statement. Each part
+            /// is one quoted token, also when the text continues on a new line.
+            #[test]
+            fn escape_string_hides_no_statement(
+                body in "[a-z;'\\\\$/*\\- \n]{0,12}",
+                doubled in any::<bool>(),
+                continued in any::<bool>(),
+            ) {
+                let pg = DatabaseBackend::Postgres;
+                let quote = if doubled { "''" } else { "\\'" };
+                let body = body.replace('\\', "\\\\").replace('\'', quote);
+                let part = format!("'{body}'");
+                let (lit, parts) = if continued {
+                    (format!("E'x'\n{part}"), vec!["E'x'".to_owned(), part])
+                } else {
+                    (format!("E{part}"), vec![format!("E{part}")])
+                };
+                let quoted: Vec<_> = tokens(pg, &lit)
+                    .filter(|(kind, _)| *kind == TokenKind::Quoted)
+                    .map(|(_, text)| text.to_owned())
+                    .collect();
+                prop_assert_eq!(quoted, parts);
+                let sql = format!("SELECT {lit}; DROP TABLE x;");
+                prop_assert_eq!(ops(pg, &sql), ["DROP TABLE"], "{}", sql);
             }
 
             /// The token texts join back to the input.

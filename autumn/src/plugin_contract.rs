@@ -277,6 +277,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature).",
     },
     PluginSurface {
+        name: "db::fleet_engine",
+        tier: SurfaceTier::Experimental,
+        note: "`FleetEngine` and `DatabaseFleet::with_engine`: one database engine of a fleet (requires the `db` feature). Experimental: the trait may change in any release while the fleet seams land (ADR 0040).",
+    },
+    PluginSurface {
         name: "form::FieldRenderer",
         tier: SurfaceTier::Stable,
         note: "Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature).",
@@ -285,6 +290,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "plugin_conformance",
         tier: SurfaceTier::Stable,
         note: "The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack.",
+    },
+    PluginSurface {
+        name: "plugin_conformance::fleet",
+        tier: SurfaceTier::Experimental,
+        note: "`run_fleet_conformance` and `FleetFixture`: the conformance kit of a fleet engine (requires the `db` feature). Experimental: checks may change in any release with the engine trait.",
     },
     PluginSurface {
         name: "plugin_contract",

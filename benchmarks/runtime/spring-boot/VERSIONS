@@ -1,7 +1,9 @@
-framework: Spring Boot 3.3.x
-language:  Java 21
-build:     Maven 3.9.x
-http:      Tomcat (embedded)
-db:        Spring Data JPA + Hibernate 6.x + HikariCP
-migrations: Flyway 10.x
+framework: Spring Boot 4.1.2 (Spring Framework 7.0.10, Spring Security 7.1.2)
+language:  Java 25 (Eclipse Temurin 25.0.5 LTS)
+build:     Maven 3.10.0
+http:      Tomcat 11.0.27 (embedded)
+db:        Spring Data JPA 4.1.2 + Hibernate 7.4.13 + HikariCP 7.0.2 (pgjdbc 42.7.14)
+json:      Jackson 3.1.7
+views:     Thymeleaf 3.1.5
+migrations: Flyway 12.4.0
 postgres:  16 (benchmark container)

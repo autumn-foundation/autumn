@@ -20,6 +20,8 @@ pr_description.md
 !scripts/lib/*.sh
 !scripts/self-hosted-runner/*.sh
 !.claude/skills/**/*.sh
+!benchmarks/runtime/load/*.sh
+!benchmarks/runtime/load/*.py
 
 # Failure capsules (docs/guide/failure-capsules.md). A capsule holds a real
 # request and, for a route that touches the database, real rows — treat the
