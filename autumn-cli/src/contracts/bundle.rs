@@ -373,28 +373,58 @@ fn resolve_event<'a>(
             .collect()
     };
     let own = listener.krate.replace('-', "_");
-    let mut preferred = match segments.as_slice() {
-        [first, _, ..] if !["crate", "self", "super"].contains(first) => in_crate(first),
-        _ => Vec::new(),
-    };
-    if preferred.is_empty() {
-        preferred = in_crate(&own);
-    }
     let at = format!(
         "`{}::{}` consumes `{}`",
         listener.krate, listener.function, listener.event
     );
+    // A first segment that names no crate in the pass is a local module
+    // (`events::Created`) or a renamed dependency (`contracts::Created`). The
+    // path cannot tell them apart. With an event of that name both in the
+    // consumer's own crate and in another crate, it refuses to guess.
+    let unknown_prefix = match segments.as_slice() {
+        [first, _, ..] if !["crate", "self", "super"].contains(first) => {
+            let prefixed = in_crate(first);
+            if !prefixed.is_empty() {
+                return pick(&prefixed, &at, name).map(Some);
+            }
+            true
+        }
+        _ => false,
+    };
+    let preferred = in_crate(&own);
+    if unknown_prefix
+        && !preferred.is_empty()
+        && named.iter().any(|e| e.krate.replace('-', "_") != own)
+    {
+        return Err(format!(
+            "{at}, and `{}` names no crate in the pass, so the event is ambiguous; write \
+             `crate::…` for an event in this crate, or the package name of the dependency",
+            segments[0]
+        ));
+    }
     match (preferred.as_slice(), named.as_slice()) {
-        ([one], _) | ([], [one]) => Ok(Some(*one)),
         (_, []) => Ok(None),
-        ([first, ..], _) => Err(format!(
-            "{at}, and crate `{}` has more than one `#[event]` named `{name}`; give each \
-             another type name, for example `{name}V2`",
-            first.krate
-        )),
+        ([], [one]) => Ok(Some(*one)),
         ([], _) => Err(format!(
             "{at}, and more than one crate defines an `#[event]` named `{name}`; write the \
              crate in the path"
+        )),
+        (preferred, _) => pick(preferred, &at, name).map(Some),
+    }
+}
+
+/// The one event among `candidates`, all from one crate.
+fn pick<'a>(
+    candidates: &[&'a EventDescriptor],
+    at: &str,
+    name: &str,
+) -> Result<&'a EventDescriptor, String> {
+    match candidates {
+        [one] => Ok(*one),
+        _ => Err(format!(
+            "{at}, and crate `{}` has more than one `#[event]` named `{name}`; give each \
+             another type name, for example `{name}V2`",
+            candidates.first().map_or("", |e| e.krate.as_str())
         )),
     }
 }
@@ -1101,7 +1131,10 @@ mod tests {
 
     #[test]
     fn a_path_whose_first_segment_is_a_module_falls_back_to_the_own_crate() {
+        // Only the consumer's own crate has the event, so `events::` is a
+        // local module.
         let dir = event_fixture();
+        std::fs::remove_file(dir.path().join("event.core.ContactUpdated.json")).expect("rm");
         let mut own = contact_event("marketing", 1);
         own.name = Some("marketing.contact".to_owned());
         write(dir.path(), "event.marketing.ContactUpdated.json", &own);
@@ -1109,6 +1142,21 @@ mod tests {
             dir.path(),
             "listener.marketing.on_contact.1.json",
             &listener("on_contact", "events::ContactUpdated", &["id"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.listeners[0].topic, "marketing.contact");
+    }
+
+    #[test]
+    fn a_crate_relative_path_picks_the_own_crate_beside_a_dependency() {
+        let dir = event_fixture();
+        let mut own = contact_event("marketing", 1);
+        own.name = Some("marketing.contact".to_owned());
+        write(dir.path(), "event.marketing.ContactUpdated.json", &own);
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "crate::events::ContactUpdated", &["id"]),
         );
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert_eq!(bundle.listeners[0].topic, "marketing.contact");
@@ -1147,6 +1195,36 @@ mod tests {
         );
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert_eq!(bundle.listeners[0].topic, "marketing.contact");
+    }
+
+    #[test]
+    fn a_renamed_dependency_path_is_not_taken_for_a_local_event() {
+        // `contracts::ContactUpdated` where `contracts` is a renamed `core`,
+        // and the consumer's own crate has a `ContactUpdated` too.
+        let dir = event_fixture();
+        let mut own = contact_event("marketing", 1);
+        own.name = Some("marketing.contact".to_owned());
+        write(dir.path(), "event.marketing.ContactUpdated.json", &own);
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "contracts::ContactUpdated", &["id"]),
+        );
+        let err = Bundle::from_dir(dir.path()).expect_err("refused");
+        assert!(err.contains("`contracts` names no crate"), "{err}");
+        assert!(err.contains("crate::"), "{err}");
+    }
+
+    #[test]
+    fn a_renamed_dependency_path_resolves_when_only_one_crate_has_the_event() {
+        let dir = event_fixture();
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "contracts::ContactUpdated", &["id"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.listeners[0].topic, "contact.updated");
     }
 
     #[test]

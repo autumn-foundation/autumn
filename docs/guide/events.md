@@ -290,6 +290,13 @@ across releases. See [Events across releases](wire-contracts.md#events-across-re
   check names them, and then it does not say that a version can be dropped.
 - Two `#[event]` types with one type name in one crate (`v1::OrderPlaced`
   and `v2::OrderPlaced`) stop the export. Give each its own type name.
+- An `#[event]` type writes an `event.*` descriptor only, not a `type.*`
+  one. Do not use it as the body of an `#[endpoint]`: use a separate DTO.
+- The bundle finds a consumer's event by its type name and the first
+  segment of its path. When that segment names no crate in the pass (a
+  module or a renamed dependency), and both the consumer's crate and
+  another crate have an event of that name, the export stops. Write
+  `crate::…` for a local event, or the package name of the dependency.
 
 ## Out of scope (today)
 

@@ -24,25 +24,23 @@ struct Direction {
 
 pub fn derive_wire_shape(input: &DeriveInput) -> Result<TokenStream, syn::Error> {
     let shape = wire_type_descriptor(input)?;
-    Ok(wire_shape_tokens(&input.ident, &shape))
+    let written = write_descriptor(&shape);
+    let track = store::track_contract_dir();
+    let shape_impl = wire_shape_tokens(&input.ident, &shape);
+    Ok(quote! { #track #written #shape_impl })
 }
 
-/// The `WireShape` impl and the descriptor write for a shape already read.
+/// The `WireShape` impl for a shape already read. It writes no descriptor.
 ///
-/// `#[event]` reads the shape once and uses it here and in its own
-/// descriptor.
+/// `#[event]` uses it alone: its own `event.*` descriptor carries the shape,
+/// and a `type.*` file would share its name with an HTTP DTO of the same type
+/// name in another module.
 #[must_use]
 pub fn wire_shape_tokens(name: &syn::Ident, shape: &WireTypeDescriptor) -> TokenStream {
     let serialized = field_tokens(&shape.serialized);
     let deserialized = field_tokens(&shape.deserialized);
     let type_name = &shape.name;
-    let written = write_descriptor(shape);
-    let track = store::track_contract_dir();
-
     quote! {
-        #track
-        #written
-
         impl ::autumn_web::wire::WireShape for #name {
             const TYPE_NAME: &'static str = #type_name;
             const SERIALIZED: &'static [::autumn_web::wire::WireField] = &[#(#serialized),*];
