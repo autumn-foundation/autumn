@@ -648,18 +648,13 @@ impl<'a> Analyzer<'a> {
             return;
         }
         let mut reads = Vec::new();
-        let shadowed = macro_bound_idents(&mac.tokens);
         scan_tokens(
             &mac.tokens,
-            &|name| {
-                if shadowed.contains(name) {
-                    return None;
-                }
-                match self.lookup(name) {
-                    Some(Bound::Response(index)) => Some(index),
-                    _ => None,
-                }
+            &|name| match self.lookup(name) {
+                Some(Bound::Response(index)) => Some(index),
+                _ => None,
             },
+            &std::collections::BTreeSet::new(),
             &mut reads,
         );
         for (index, field, span) in reads {
@@ -852,55 +847,79 @@ fn request_write_set(arg: Option<&Expr>) -> Option<Vec<String>> {
     )
 }
 
-/// Names a macro body binds for itself — `@for item in …`, `|item|`.
+/// A name a macro body binds for itself, and the token range it covers.
 ///
-/// A macro can introduce names the surrounding scope knows nothing about, and
-/// reading a field off one of those is not a read of a response that happens to
-/// share the name.
-fn macro_bound_idents(tokens: &proc_macro2::TokenStream) -> std::collections::BTreeSet<String> {
-    let mut bound = std::collections::BTreeSet::new();
-    collect_macro_bound(tokens, &mut bound);
-    bound
+/// A closure's parameters (`|item| …`) cover its body: the tokens up to the
+/// next `,` at the same level, or the end of the group. A `for item in … { }`
+/// binding covers its `{ }` block. Outside that range the name keeps its outer
+/// meaning, so a read of the payload there is still a read.
+struct MacroBinding {
+    names: Vec<String>,
+    from: usize,
+    to: usize,
 }
 
-fn collect_macro_bound(
-    tokens: &proc_macro2::TokenStream,
-    bound: &mut std::collections::BTreeSet<String>,
-) {
-    let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
-    let mut in_closure_params = false;
-    for (i, tt) in tts.iter().enumerate() {
-        match tt {
-            proc_macro2::TokenTree::Group(group) => collect_macro_bound(&group.stream(), bound),
-            proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '|' => {
-                // A `|` after an operand is `a | b` or `a || b`, not the start
-                // of a closure's parameters. `move |x|` is a closure.
-                let prev = i.checked_sub(1).and_then(|p| tts.get(p));
-                let after_operand = match prev {
-                    // The second `|` of `a || b` follows the first one.
-                    Some(proc_macro2::TokenTree::Punct(p))
-                        if p.as_char() == '|' && !in_closure_params =>
-                    {
-                        is_operand(i.checked_sub(2).and_then(|p| tts.get(p)))
-                    }
-                    other => is_operand(other),
-                };
-                if in_closure_params || !after_operand {
-                    in_closure_params = !in_closure_params;
-                }
-            }
-            proc_macro2::TokenTree::Ident(ident) => {
-                if in_closure_params {
-                    bound.insert(ident.to_string());
-                } else if ident == "for"
-                    && let Some(proc_macro2::TokenTree::Ident(name)) = tts.get(i + 1)
+/// The bindings one level of a macro body makes. Nested groups are scanned
+/// on their own.
+fn macro_bindings(tts: &[proc_macro2::TokenTree]) -> Vec<MacroBinding> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tts.len() {
+        match &tts[i] {
+            proc_macro2::TokenTree::Punct(p) if p.as_char() == '|' && opens_closure(tts, i) => {
+                let mut names = Vec::new();
+                let mut j = i + 1;
+                while j < tts.len()
+                    && !matches!(&tts[j], proc_macro2::TokenTree::Punct(p) if p.as_char() == '|')
                 {
-                    bound.insert(name.to_string());
+                    if let proc_macro2::TokenTree::Ident(id) = &tts[j] {
+                        names.push(id.to_string());
+                    }
+                    j += 1;
                 }
+                let to = (j + 1..tts.len())
+                    .find(|&k| matches!(&tts[k], proc_macro2::TokenTree::Punct(p) if p.as_char() == ','))
+                    .unwrap_or(tts.len());
+                out.push(MacroBinding {
+                    names,
+                    from: j + 1,
+                    to,
+                });
+                i = j + 1;
             }
-            proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => {}
+            proc_macro2::TokenTree::Ident(id) if id == "for" => {
+                if let Some(proc_macro2::TokenTree::Ident(name)) = tts.get(i + 1)
+                    && let Some(body) = (i + 2..tts.len()).find(|&k| {
+                        matches!(&tts[k], proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace)
+                    })
+                {
+                    out.push(MacroBinding {
+                        names: vec![name.to_string()],
+                        from: body,
+                        to: body + 1,
+                    });
+                }
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
+    out
+}
+
+/// Whether the `|` at `i` opens a closure's parameters.
+///
+/// A `|` after an operand is `a | b`, and the second `|` of `a || b` follows
+/// the first. `move |x|` and a `|` at the start of an expression open one.
+fn opens_closure(tts: &[proc_macro2::TokenTree], i: usize) -> bool {
+    let prev = i.checked_sub(1).and_then(|p| tts.get(p));
+    let after_operand = match prev {
+        Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '|' => {
+            is_operand(i.checked_sub(2).and_then(|p| tts.get(p)))
+        }
+        other => is_operand(other),
+    };
+    !after_operand
 }
 
 /// Whether `token` ends an operand: an identifier (not `move`), a literal or
@@ -923,12 +942,19 @@ fn is_operand(token: Option<&proc_macro2::TokenTree>) -> bool {
 fn scan_tokens(
     tokens: &proc_macro2::TokenStream,
     resolve: &dyn Fn(&str) -> Option<usize>,
+    shadowed: &std::collections::BTreeSet<String>,
     reads: &mut Vec<(usize, String, Span)>,
 ) {
     let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
+    let bindings = macro_bindings(&tts);
     for (i, tt) in tts.iter().enumerate() {
+        // The names the macro binds over this token, on top of the outer ones.
+        let mut here = shadowed.clone();
+        for b in bindings.iter().filter(|b| (b.from..b.to).contains(&i)) {
+            here.extend(b.names.iter().cloned());
+        }
         if let proc_macro2::TokenTree::Group(group) = tt {
-            scan_tokens(&group.stream(), resolve, reads);
+            scan_tokens(&group.stream(), resolve, &here, reads);
             continue;
         }
         let proc_macro2::TokenTree::Ident(base) = tt else {
@@ -936,6 +962,9 @@ fn scan_tokens(
         };
         if matches!(tts.get(i.wrapping_sub(1)), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '.')
         {
+            continue;
+        }
+        if here.contains(&base.to_string()) {
             continue;
         }
         let Some(index) = resolve(&base.to_string()) else {

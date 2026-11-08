@@ -272,6 +272,18 @@ mod tests {
     }
 
     #[test]
+    fn a_closure_parameter_shadows_only_inside_the_closure() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 assert!(event.email.is_some() && rows.iter().any(|event| event.enabled)); \
+                 tracing::info!(a = event.id, b = f(|event| event.other), c = event.name); Ok(()) }"
+            ),
+            ["email", "id", "name"]
+        );
+    }
+
+    #[test]
     fn a_method_call_on_the_payload_is_not_a_read() {
         assert_eq!(
             listener(
