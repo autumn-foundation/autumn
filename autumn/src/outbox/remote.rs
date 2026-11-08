@@ -530,17 +530,17 @@ mod tests {
 
     #[tokio::test]
     async fn only_an_acknowledged_200_marks_a_message_sent() {
-        send_to(200, serde_json::json!({ "status": "accepted" }))
+        Box::pin(send_to(200, serde_json::json!({ "status": "accepted" })))
             .await
             .expect("accepted");
-        send_to(200, serde_json::json!({ "status": "duplicate" }))
+        Box::pin(send_to(200, serde_json::json!({ "status": "duplicate" })))
             .await
             .expect("duplicate");
-        let error = send_to(200, serde_json::json!({ "ok": true }))
+        let error = Box::pin(send_to(200, serde_json::json!({ "ok": true })))
             .await
             .expect_err("not an acknowledgement");
         assert!(error.to_string().contains("marketing"), "{error}");
-        let error = send_to(409, serde_json::json!({}))
+        let error = Box::pin(send_to(409, serde_json::json!({})))
             .await
             .expect_err("a failure");
         assert!(error.to_string().contains("409"), "{error}");
