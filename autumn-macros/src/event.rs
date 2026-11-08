@@ -73,18 +73,7 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // A refusal still emits the struct, its serde derives and its `Event`
     // impl, so the uses of the type add no errors of their own.
-    let mut refusal = TokenStream::new();
-    if attrs.version > 1
-        && let Some(name) = &attrs.name
-        && has_version_suffix(name)
-    {
-        let message = format!(
-            "#[event] name `{name}` already ends in a version. Write the base name: \
-             `version = {}` adds `.v{}`",
-            attrs.version, attrs.version
-        );
-        refusal = syn::Error::new(proc_macro2::Span::call_site(), message).to_compile_error();
-    }
+    let mut refusal = version_refusal(&attrs);
 
     let ident = &input.ident;
     let ident_str = ident.to_string();
@@ -109,46 +98,7 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
-    // The payload's wire shape. An opaque event has none; the refusals are
-    // the ones `#[derive(WireShape)]` makes, plus a pointer to the opt-out.
-    let (wire, shape_const, shape) = if attrs.opaque {
-        (
-            TokenStream::new(),
-            TokenStream::new(),
-            WireTypeDescriptor::default(),
-        )
-    } else {
-        match shape::wire_type_descriptor(&input) {
-            Ok(described) => (
-                shape::wire_shape_tokens(ident, &described),
-                quote! {
-                    const SHAPE: ::std::option::Option<::autumn_web::wire::EventShape> =
-                        ::std::option::Option::Some(::autumn_web::wire::EventShape {
-                            serialized: <Self as ::autumn_web::wire::WireShape>::SERIALIZED,
-                            deserialized: <Self as ::autumn_web::wire::WireShape>::DESERIALIZED,
-                        });
-                },
-                described,
-            ),
-            Err(err) => {
-                refusal.extend(
-                    syn::Error::new(
-                        err.span(),
-                        format!(
-                            "{err}. To publish this payload without a wire contract, write \
-                             `#[event(opaque)]`."
-                        ),
-                    )
-                    .to_compile_error(),
-                );
-                (
-                    TokenStream::new(),
-                    TokenStream::new(),
-                    WireTypeDescriptor::default(),
-                )
-            }
-        }
-    };
+    let (wire, shape_const, shape) = payload_shape(&attrs, &input, &mut refusal);
     let key = autumn_macros_support::wire::stable_key(&quote!(#input).to_string());
     // A refused event writes no descriptor: the build fails anyway.
     let written = if refusal.is_empty() {
@@ -192,6 +142,70 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             const NAME: &'static str = #name_const;
             const VERSION: u32 = #version;
             #shape_const
+        }
+    }
+}
+
+/// The error for a `name` that already ends in `.vN` while `version` adds
+/// one, else nothing.
+fn version_refusal(attrs: &EventAttrs) -> TokenStream {
+    match &attrs.name {
+        Some(name) if attrs.version > 1 && has_version_suffix(name) => {
+            let message = format!(
+                "#[event] name `{name}` already ends in a version. Write the base name: \
+                 `version = {}` adds `.v{}`",
+                attrs.version, attrs.version
+            );
+            syn::Error::new(proc_macro2::Span::call_site(), message).to_compile_error()
+        }
+        _ => TokenStream::new(),
+    }
+}
+
+/// The payload's wire shape: the `WireShape` tokens, the `SHAPE` const, and
+/// the descriptor shape.
+///
+/// An opaque event has none. A shape `#[derive(WireShape)]` refuses adds its
+/// error, with a pointer to the opt-out, to `refusal`, and has none either.
+fn payload_shape(
+    attrs: &EventAttrs,
+    input: &DeriveInput,
+    refusal: &mut TokenStream,
+) -> (TokenStream, TokenStream, WireTypeDescriptor) {
+    let none = || {
+        (
+            TokenStream::new(),
+            TokenStream::new(),
+            WireTypeDescriptor::default(),
+        )
+    };
+    if attrs.opaque {
+        return none();
+    }
+    match shape::wire_type_descriptor(input) {
+        Ok(described) => (
+            shape::wire_shape_tokens(&input.ident, &described),
+            quote! {
+                const SHAPE: ::std::option::Option<::autumn_web::wire::EventShape> =
+                    ::std::option::Option::Some(::autumn_web::wire::EventShape {
+                        serialized: <Self as ::autumn_web::wire::WireShape>::SERIALIZED,
+                        deserialized: <Self as ::autumn_web::wire::WireShape>::DESERIALIZED,
+                    });
+            },
+            described,
+        ),
+        Err(err) => {
+            refusal.extend(
+                syn::Error::new(
+                    err.span(),
+                    format!(
+                        "{err}. To publish this payload without a wire contract, write \
+                         `#[event(opaque)]`."
+                    ),
+                )
+                .to_compile_error(),
+            );
+            none()
         }
     }
 }

@@ -98,6 +98,15 @@ fn the_event_shape_is_its_wire_shape() {
         ContactUpdated::SHAPE,
         "internal"
     ));
+    // The skipped field is not on the wire, so a round trip drops it.
+    let sent = ContactUpdated {
+        id: 1,
+        email: "a@example.com".to_owned(),
+        internal: "secret".to_owned(),
+    };
+    let json = autumn_web::reexports::serde_json::to_value(&sent).expect("serializes");
+    assert!(json.get("internal").is_none(), "{json}");
+    assert_eq!(sent.internal, "secret");
     let v2 = ContactUpdatedV2::SHAPE.expect("an event has a shape");
     assert_eq!(v2.serialized[1].wire_name, "emailAddress");
 }
