@@ -160,8 +160,39 @@ pub use nav::*;
 pub use search::*;
 #[cfg(feature = "widgets-social")]
 pub use social::*;
+
 #[cfg(feature = "widgets-workflow")]
 pub use workflow::*;
+
+/// `url` with its comment-page cursor set to `after`.
+///
+/// The function removes each `after` pair that `url` has, then adds
+/// `after={after}` when `after` is `Some`. A `#fragment` stays at the end.
+/// Thus a host page can pass its current address as `return_to`.
+#[cfg(feature = "widgets-social")]
+pub(crate) fn with_page_cursor(url: &str, after: Option<i64>) -> String {
+    let (address, fragment) = match url.split_once('#') {
+        Some((address, fragment)) => (address, Some(fragment)),
+        None => (url, None),
+    };
+    let (path, query) = address.split_once('?').unwrap_or((address, ""));
+    let cursor = after.map(|after| format!("after={after}"));
+    let pairs: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && *pair != "after" && !pair.starts_with("after="))
+        .chain(cursor.as_deref())
+        .collect();
+    let mut out = path.to_owned();
+    if !pairs.is_empty() {
+        out.push('?');
+        out.push_str(&pairs.join("&"));
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
 
 // The toast constants need no `maud`, as before the split: an app without
 // `maud` can still target the region in an OOB swap or an `HX-Trigger`.

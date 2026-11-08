@@ -2622,6 +2622,24 @@ impl AppBuilder {
         self
     }
 
+    /// Keep fleet slot ownership in `store`, not in the SQL store of the
+    /// control database (ADR 0040 §4).
+    ///
+    /// With `sqlite`, boot uses it for `[database.fleet.ownership]`, and calls its
+    /// [`ensure_schema`](crate::db::fleet_ownership::SlotOwnershipStore::ensure_schema)
+    /// first. An engine plugin gets it from
+    /// [`fleet::ownership_store`](crate::fleet::ownership_store). Every host of
+    /// a fleet must use the same store.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn fleet_ownership_store<S>(self, store: S) -> Self
+    where
+        S: crate::db::fleet_ownership::SlotOwnershipStore,
+    {
+        let store: Arc<dyn crate::db::fleet_ownership::SlotOwnershipStore> = Arc::new(store);
+        self.state_initializer(move |state| crate::fleet::install_ownership_store(state, store))
+    }
+
     /// Route tenants through the control-plane `_autumn_shard_directory` table
     /// via a [`DirectoryShardRouter`](crate::sharding::DirectoryShardRouter).
     ///
@@ -11928,7 +11946,7 @@ fn unfreeze_adopted_live_state(state: &AppState) {
     }
 }
 
-fn run_state_initializers(initializers: Vec<StateInitializer>, state: &AppState) {
+pub(crate) fn run_state_initializers(initializers: Vec<StateInitializer>, state: &AppState) {
     for initializer in initializers {
         initializer(state);
     }
@@ -14760,17 +14778,12 @@ async fn start_fleet_ownership(
     state: &AppState,
     fleet: &crate::db::fleet::DatabaseFleet,
 ) -> Result<Option<FleetOwnershipRuntime>, String> {
-    use crate::db::fleet_ownership::{
-        FleetOwnership, OWNERSHIP_INDICATOR, OwnerId, SlotRange, SqlSlotOwnership,
-    };
+    use crate::db::fleet_ownership::{FleetOwnership, OWNERSHIP_INDICATOR, OwnerId, SlotRange};
     let Some(config) = state.config().database.fleet.and_then(|f| f.ownership) else {
         return Ok(None);
     };
-    let control = state
-        .pool()
-        .cloned()
-        .ok_or("fleet ownership needs a control database")?;
-    let store = SqlSlotOwnership::new(control, state.clock_arc());
+    let store = crate::fleet::ownership_store(state)
+        .ok_or("fleet ownership needs a control database or a fleet_ownership_store")?;
     store.ensure_schema().await.map_err(|e| e.to_string())?;
     let ranges = config
         .ranges()?
@@ -14781,7 +14794,7 @@ async fn start_fleet_ownership(
     let owner = OwnerId::new(config.owner.as_str()).map_err(|e| e.to_string())?;
     let ownership = Arc::new(
         FleetOwnership::new(
-            Arc::new(store),
+            store,
             owner,
             ranges,
             std::time::Duration::from_secs(config.lease_secs),
@@ -16805,6 +16818,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .expect("fleet builds");
@@ -16901,6 +16916,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         config
             .database
@@ -16948,6 +16965,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let resolved = format!("sqlite://{}", root.join("control.db").display());
         let Err(err) =
@@ -16997,6 +17016,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let database = setup_database(
             &config,
@@ -17175,6 +17196,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let all = Arc::new(vec![
             (
@@ -17230,6 +17253,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let all = Arc::new(vec![(
             "app",
@@ -17270,6 +17295,8 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         let all = Arc::new(vec![(
             "framework",
@@ -17377,6 +17404,90 @@ mod fleet_boot_tests {
             rows[0].lease_expires_ms <= state.clock().now().timestamp_millis(),
             "released at shutdown"
         );
+    }
+
+    /// `AppBuilder::fleet_ownership_store`: boot prepares and claims on the
+    /// installed store, and makes no ownership table on the control database.
+    #[tokio::test]
+    async fn the_fleet_runtime_claims_on_the_installed_ownership_store() {
+        use crate::db::fleet_ownership::MemoryOwnership;
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut config, fleet, state) = booted(tmp.path());
+        if let Some(fleet_config) = config.database.fleet.as_mut() {
+            fleet_config.ownership = Some(crate::config::FleetOwnershipConfig {
+                owner: "host-a".to_owned(),
+                slots: vec![crate::config::SlotSpec::Range("0-16383".to_owned())],
+                lease_secs: 30,
+            });
+        }
+        state.insert_extension(config);
+        let builder = super::app().fleet_ownership_store(MemoryOwnership::new(state.clock_arc()));
+        super::run_state_initializers(builder.state_initializers, &state);
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let runtime = start_fleet_runtime(&state, shutdown.clone(), None)
+            .await
+            .expect("the app has a fleet");
+        let db = fleet.open_for("acme").await.unwrap();
+        assert_eq!(db.epoch().map(crate::lock::FencingToken::get), Some(1));
+        drop(db);
+        let store = crate::fleet::ownership_store(&state).expect("installed");
+        let rows = store.rows().await.unwrap();
+        assert_eq!(rows.len(), 1, "the claim is on the installed store");
+        assert_eq!(rows[0].owner.as_str(), "host-a");
+
+        let mut conn = state.pool().unwrap().get().await.unwrap();
+        let tables: Count = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = '_autumn_fleet_slot_owners'",
+        )
+        .get_result(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            tables.n, 0,
+            "no SQL ownership table on the control database"
+        );
+        drop(conn);
+
+        shutdown.cancel();
+        runtime.maintenance.await.unwrap();
+        runtime.ownership.expect("ownership runs").finish().await;
+        let rows = store.rows().await.unwrap();
+        assert!(
+            rows[0].lease_expires_ms <= state.clock().now().timestamp_millis(),
+            "released on the installed store"
+        );
+    }
+
+    /// `resolve::<SqliteEngine>` finds the fleet of `[database.fleet]`.
+    #[tokio::test]
+    async fn resolve_finds_the_sqlite_fleet_of_the_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_config, fleet, state) = booted(tmp.path());
+        let found = crate::fleet::fleet_of::<crate::db::fleet::SqliteEngine>(&state)
+            .expect("the shard-set fleet");
+        assert_eq!(found.root(), fleet.root());
+        let lease = crate::fleet::resolve_key::<crate::db::fleet::SqliteEngine>(&state, "acme")
+            .await
+            .unwrap();
+        assert_eq!(lease.key(), &fleet.key_for("acme").unwrap());
+        let mut parts = http::Request::builder()
+            .uri("/")
+            .extension(crate::sharding::ShardKeyOverride("acme".to_owned()))
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let lease = crate::fleet::resolve::<crate::db::fleet::SqliteEngine>(&mut parts, &state)
+            .await
+            .unwrap();
+        assert!(lease.status().max_size > 0, "derefs to the pool");
     }
 
     /// The fleet did not close within the shutdown budget: renewals stop, but
@@ -22457,6 +22568,8 @@ mount = ["service"]
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         });
         assert!(!control_is_only_database(&config));
         assert_eq!(control_sets(&scoped, false).count(), 1);

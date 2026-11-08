@@ -115,6 +115,7 @@ the framework almost certainly already generates or ships it:
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. Sweeps run on Postgres and SQLite. See `docs/guide/data-retention.md` |
 | A hand-written script that copies production data and masks PII for staging, on Postgres or SQLite | `autumn db scrub` (`--check`, `--dry-run`, `--artifact`, `--output`). A `sqlite://` target or `.sqlite` backup scrubs in one transaction, then `VACUUM`s. An unclassified column aborts the run; declare columns in `scrub.toml`. `--sample` is Postgres-only. See `docs/guide/data-scrubbing.md` |
+| A `custom_setup` hook or raw `PRAGMA mmap_size` / `PRAGMA cache_size` to speed up reads on a large SQLite file | `[database] mmap_size` (bytes) and `cache_size_kib` (KiB), both `0` = off; `[database.fleet]` has its own pair. Env `AUTUMN_DATABASE__MMAP_SIZE`, `..._CACHE_SIZE_KIB`. mmap halves random and range reads on a large, read-heavy file, does nothing for small fleet files, and turns an I/O error into `SIGBUS`. See `docs/guide/sqlite-in-production.md` ("Memory-mapped reads and the page cache") |
 | A hand-written GDPR export job that zips CSV/JSON a user cannot open, verify, or import again | `GdprRegistry::capsule(CapsuleModel::new(table, subject_column).belongs_to(..))` + `autumn data capsule export --subject <id> --out <dir>` (issue #1811) — one signed directory with records, a `manifest.json`, blobs, and an offline HTML viewer; `autumn data capsule import` verifies every file, then imports with no loss of data. Use `.exclude(column)` for secrets. See `docs/guide/data-capsules.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0); `.stale_if_error(window)` serves the last value when a fill fails |
 | Calling `cache.invalidate(key)` by hand after a repository write | `#[repository(Model, invalidates(cached_fn))]`: each generated write drops the read after it commits (#3056). Async code uses `Cache::invalidate_async`, which returns the error |
@@ -3155,9 +3156,18 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   newer epoch than this host's (`FleetError::NewerEpoch`, `421`).
   Health: `fleet:ownership`. The built-in table is
   on the control database, so it fences the processes of one host only;
-  hosts on different machines implement `SlotOwnershipStore`
-  (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
-  `docs/guide/sqlite-fleet.md`.
+  for hosts on different machines, use
+  `.fleet_ownership_store(PgSlotOwnership::new(pg_pool, clock))` (needs the
+  `postgres` feature next to `sqlite`; one store per fleet) or another
+  `SlotOwnershipStore` (`autumn_web::db::fleet_ownership`). Guide:
+  "Failover: slot ownership" in `docs/guide/sqlite-fleet.md`.
+- An engine plugin (DuckDB, RocksDB) writes its own extractor over
+  `autumn_web::fleet::resolve::<E>(parts, state)`: routing key, owner check
+  (`421`), open, `FleetLease<E>`. Jobs use `resolve_key::<E>(state, id)`.
+  Put the `DatabaseFleet<E>` in the state with `insert_extension`. A sidecar
+  hook ships through `db.sidecar_replica("duckdb")`, a `ScopedDestination`
+  that refuses keys outside `<key prefix>/duckdb/` and writes after a close or
+  a fence. Guide: "Writing a fleet extractor" in `docs/guide/sqlite-fleet.md`.
 - Cross-tenant analytics (0.10.0, issue #3236): query the lake, not the volume.
   `fleet.lake()?.materialize().await?.query(sql)`
   (`autumn_web::db::fleet_lake`) restores each live tenant from its replica
@@ -3169,6 +3179,10 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   no atomic snapshot. CLI: `autumn fleet lake q.sql --out q.csv`. Never
   pass request input as the SQL. Guide: "Query the lake".
 - The control database lives outside `root` (validation refuses it inside).
+- `[database.fleet] mmap_size` / `cache_size_kib` tune fleet files on their
+  own; `[database] mmap_size` does not reach the fleet. Keep them `0` for
+  small tenant files. Guide: "Memory-mapped reads" in
+  `docs/guide/sqlite-fleet.md`.
 - Another engine (ADR 0040): the fleet core is `DatabaseFleet<E: FleetEngine>`
   (`autumn_web::db::fleet_engine`, experimental surface). With `sqlite`,
   `DatabaseFleet` means `DatabaseFleet<SqliteEngine>`, so SQLite code does

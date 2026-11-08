@@ -1,20 +1,24 @@
-FROM hexpm/elixir:1.17.3-erlang-27.1.1-debian-bookworm-20240926-slim AS builder
+FROM elixir:1.19.7-otp-28-slim AS builder
 ENV MIX_ENV=prod
 WORKDIR /app
 
 RUN mix local.hex --force && mix local.rebar --force
 
-COPY mix.exs mix.lock* ./
-RUN mix deps.get --only prod && mix deps.compile
+COPY mix.exs mix.lock ./
+RUN mix deps.get --only prod --check-locked && mix deps.compile
 
 COPY config/config.exs config/prod.exs config/runtime.exs config/
 COPY lib ./lib
-RUN mix compile && mix release
+RUN mix compile --warnings-as-errors && mix release
 
-FROM debian:bookworm-slim
+# Same Debian release (trixie) as the builder, so the ERTS in the release
+# links against the libssl3t64 / libtinfo6 / libstdc++6 it was built with.
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 libncurses6 curl \
+    libssl3t64 libncurses6 libstdc++6 curl \
     && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 WORKDIR /app
 COPY --from=builder /app/_build/prod/rel/benchmark ./

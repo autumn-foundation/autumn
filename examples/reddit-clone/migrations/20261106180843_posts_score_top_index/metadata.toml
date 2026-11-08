@@ -1,0 +1,3 @@
+# `CREATE/DROP INDEX CONCURRENTLY` cannot run in a transaction block. This
+# tells diesel_migrations to run this migration outside one.
+run_in_transaction = false

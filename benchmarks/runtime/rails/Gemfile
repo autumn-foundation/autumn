@@ -1,13 +1,13 @@
 source "https://rubygems.org"
 
-ruby "3.3.6"
+ruby "4.0.9"
 
-gem "rails",       "~> 7.2.0"
-gem "pg",          "~> 1.5"
-gem "puma",        "~> 7.2"
-gem "jbuilder",    "~> 2.12"
-gem "bootsnap",    ">= 1.4.4", require: false
+gem "rails",    "~> 8.1.4"
+gem "pg",       "~> 1.7"
+gem "puma",     "~> 8.0"
+gem "jbuilder"
+gem "bootsnap", require: false
 
 group :development, :test do
-  gem "debug", platforms: %i[mri windows]
+  gem "debug", platforms: %i[mri windows], require: "debug/prelude"
 end

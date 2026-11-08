@@ -120,6 +120,28 @@ clock bound in the guide. The epoch makes a late write of the old owner
 harmless to the replicas. The proptest `the_table_keeps_its_invariants`
 checks the same rules on the runtime table.
 
+## Fleet sidecar scope
+
+`fleet_sidecar_scope.rs` models the replica scope of a fleet sidecar engine
+(`ScopedDestination` in `autumn/src/replication/destination.rs` and
+`sidecar_root` in `autumn/src/db/fleet.rs`). Verify it with:
+
+```sh
+verus verification/fleet_sidecar_scope.rs
+```
+
+It proves these properties:
+
+- A key the scope admits is under the database's replica prefix, so a purge
+  of the database also removes it.
+- A key the scope of engine `e` admits is not under `<prefix>/<r>/` and is
+  not `<prefix>/<r>`, for any other name `r` with no `/`. So a sidecar
+  cannot write the primary's `generations`, `epochs` or `tombstone`.
+- A sidecar key of one tenant is not under the prefix of another tenant.
+
+The unit tests in `destination.rs` and `db/fleet/engine_tests.rs` check the
+same rules on the runtime.
+
 ## Fleet replica tombstones
 
 `fleet_replica_tombstones.rs` models the replica tombstones of a SQLite fleet

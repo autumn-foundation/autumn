@@ -130,6 +130,10 @@ mod replica {
 
         pub(super) const fn wire_fence_hook(&self) {}
 
+        pub(super) const fn replica_base(&self, _: &FleetDbKey) -> Option<super::ReplicaBase> {
+            None
+        }
+
         pub(super) async fn check_epoch_stamp(
             &self,
             _: &FleetDbKey,
@@ -343,6 +347,19 @@ pub enum FleetError {
         /// Why the source was refused.
         detail: String,
     },
+    /// The request names no routing key (`400`): no tenant, and no
+    /// `ShardKeyOverride`.
+    #[error("no fleet routing key: {detail}")]
+    NoRoutingKey {
+        /// Why no key was found.
+        detail: String,
+    },
+    /// The app has no fleet of this engine (`503`).
+    #[error("no fleet of engine {engine} is installed")]
+    NoFleet {
+        /// The engine type.
+        engine: &'static str,
+    },
     /// A file operation failed (`500`).
     #[error("fleet {op}: {detail}")]
     Io {
@@ -361,7 +378,7 @@ impl FleetError {
     pub const fn http_status(&self) -> http::StatusCode {
         use http::StatusCode;
         match self {
-            Self::InvalidKey(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidKey(_) | Self::NoRoutingKey { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidSource { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::AlreadyExists { .. } | Self::InUseElsewhere { .. } => StatusCode::CONFLICT,
@@ -371,10 +388,56 @@ impl FleetError {
             | Self::Migration { .. }
             | Self::Unavailable { .. }
             | Self::Restore { .. }
-            | Self::NotReplicated { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::NotReplicated { .. }
+            | Self::NoFleet { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Misplaced { .. } | Self::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+}
+
+/// Names in the replica of a database that a sidecar must not take.
+pub const RESERVED_SIDECAR_NAMES: [&str; 3] = ["generations", "epochs", "tombstone"];
+
+/// The key prefix of sidecar `engine` under the replica prefix `root`:
+/// `<root>/<engine>`.
+///
+/// A sidecar name is 1 to 32 bytes of `a-z`, `0-9`, `_` and `-`. It starts
+/// with a letter or a digit, and it is not in [`RESERVED_SIDECAR_NAMES`].
+///
+/// # Errors
+///
+/// [`DestinationError::Rejected`](crate::replication::DestinationError::Rejected)
+/// for any other name.
+pub fn sidecar_root(
+    root: &str,
+    engine: &str,
+) -> Result<String, crate::replication::DestinationError> {
+    check_sidecar_name(engine)?;
+    Ok(format!("{root}/{engine}"))
+}
+
+/// See [`sidecar_root`].
+fn check_sidecar_name(engine: &str) -> Result<(), crate::replication::DestinationError> {
+    let starts_well = engine
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let valid = starts_well
+        && engine.len() <= 32
+        && engine
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        && !RESERVED_SIDECAR_NAMES.contains(&engine);
+    if !valid {
+        return Err(crate::replication::DestinationError::Rejected {
+            detail: format!(
+                "sidecar name {engine:?} is not 1 to 32 bytes of a-z, 0-9, _ and -, or is \
+                 reserved ({})",
+                RESERVED_SIDECAR_NAMES.join(", ")
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn io_error(op: &'static str) -> impl FnOnce(std::io::Error) -> FleetError {
@@ -417,7 +480,21 @@ pub struct FleetDatabase<E: FleetEngine> {
     /// Background work to stop before the database closes. `None` once the
     /// stop has begun: a later registration is stopped at once.
     workers: Arc<Mutex<Option<Vec<Worker>>>>,
+    /// The replica of this database: the destination and the key prefix.
+    /// `None` when the fleet does not replicate.
+    replica: Option<Arc<ReplicaBase>>,
+    /// Set when the database closes, or is fenced, deleted or restored. A
+    /// sidecar scope then refuses writes.
+    retired: Arc<AtomicBool>,
 }
+}
+
+/// Where the replica of one database is: a destination and a key prefix.
+pub(crate) struct ReplicaBase {
+    destination: Arc<dyn crate::replication::ReplicaDestination>,
+    root: String,
+    /// The fleet's ownership, so a sidecar write checks the epoch.
+    ownership: Option<Arc<super::fleet_ownership::FleetOwnership>>,
 }
 
 impl<E: FleetEngine> Clone for FleetDatabase<E> {
@@ -430,6 +507,8 @@ impl<E: FleetEngine> Clone for FleetDatabase<E> {
             lease: Arc::clone(&self.lease),
             epoch: self.epoch,
             workers: Arc::clone(&self.workers),
+            replica: self.replica.clone(),
+            retired: Arc::clone(&self.retired),
         }
     }
 }
@@ -464,6 +543,53 @@ impl<E: FleetEngine> FleetDatabase<E> {
     #[must_use]
     pub const fn handle(&self) -> &E::Handle {
         &self.handle
+    }
+
+    /// The replica destination of a sidecar engine: the keys under
+    /// `<key prefix>/<engine>/`, next to this database's replica. A sidecar
+    /// follows this database's key, so it ships its own files there.
+    /// `Ok(None)` when the fleet does not replicate.
+    ///
+    /// Put each copy under `generations/<id>/` of the scope, with an id of
+    /// [`generation_id`](crate::replication::segment::generation_id). A purge
+    /// after a delete keeps the generations of a newer database of the same
+    /// key. It removes every other file of the scope.
+    ///
+    /// The scope refuses writes after the database closes, or after a fence,
+    /// a delete or a restore. It also refuses them as soon as this host does
+    /// not hold the slot at the epoch the database opened under. Ship the
+    /// last files in `on_close`. A fenced database calls `on_close` with the
+    /// writes refused.
+    ///
+    /// # Errors
+    ///
+    /// [`DestinationError::Rejected`](crate::replication::DestinationError::Rejected)
+    /// when `engine` is not a valid sidecar name. See [`sidecar_root`].
+    pub fn sidecar_replica(
+        &self,
+        engine: &str,
+    ) -> Result<Option<crate::replication::ScopedDestination>, crate::replication::DestinationError>
+    {
+        check_sidecar_name(engine)?;
+        let Some(replica) = &self.replica else {
+            return Ok(None);
+        };
+        // Each write checks the flag and the epoch: a fence that has not
+        // reached this database yet still stops its sidecar.
+        let retired = Arc::clone(&self.retired);
+        let fence = replica.ownership.clone().zip(self.epoch);
+        let slot = self.key.routing_slot();
+        let stop = move || {
+            retired.load(Ordering::Acquire)
+                || fence
+                    .as_ref()
+                    .is_some_and(|(ownership, epoch)| ownership.epoch_for(slot) != Some(*epoch))
+        };
+        crate::replication::ScopedDestination::new(
+            Arc::clone(&replica.destination),
+            sidecar_root(&replica.root, engine)?,
+        )
+        .map(|scope| Some(scope.stopped_when(Arc::new(stop))))
     }
 
     /// A lease that keeps this database open while it is held. See
@@ -726,6 +852,9 @@ struct Drain {
     deleting: bool,
     finished: AtomicBool,
     done: Notify,
+    /// The retire flag of the database and the epoch it opened under, so a
+    /// fence can retire a database that is still draining.
+    retire: Option<(Arc<AtomicBool>, Option<crate::lock::FencingToken>)>,
 }
 
 impl Drain {
@@ -1095,6 +1224,15 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             return 0;
         };
         let victims = self.begin_drains(|state| {
+            // A database that already drains (a close waits for its users)
+            // is not open, but its sidecar scopes must stop too.
+            for (key, drain) in &state.draining {
+                if let Some((retired, epoch)) = &drain.retire
+                    && ownership.epoch_for(key.routing_slot()) != *epoch
+                {
+                    retired.store(true, Ordering::Release);
+                }
+            }
             state
                 .open
                 .iter()
@@ -1600,6 +1738,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // The engine makes a missing database, stamps the key and the epoch,
         // and refuses a database of another key or a newer epoch.
         let handle = self.inner.engine.open(&key, &path, epoch).await?;
+        let replica = self.replica_base(&key).map(Arc::new);
         let db = FleetDatabase {
             key,
             path: Arc::from(path.as_path()),
@@ -1608,10 +1747,15 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             lease: Arc::new(()),
             epoch,
             workers: Arc::new(Mutex::new(Some(Vec::new()))),
+            replica,
+            retired: Arc::new(AtomicBool::new(false)),
         };
         // The database is complete here, so a failure below closes the
         // handle and never removes what another opener may be serving.
         if let Err(error) = self.run_on_open(&db).await {
+            // The hooks that started have run `on_close`: a scope that one
+            // of them kept writes nothing more.
+            db.retired.store(true, Ordering::Release);
             db.quiesce_workers(true).await;
             db.closed.cancel();
             let (fleet, closing) = (self.clone(), db.clone());
@@ -1822,6 +1966,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             deleting,
             finished: AtomicBool::new(false),
             done: Notify::new(),
+            retire: Some((Arc::clone(&db.retired), db.epoch)),
         });
         state.draining.insert(key.clone(), Arc::clone(&drain));
         self.inner.in_flight_drains.fetch_add(1, Ordering::Relaxed);
@@ -1856,6 +2001,12 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let Some(db) = db else {
             return;
         };
+        // A fence, a delete or a restore: the data is not this host's to
+        // ship. A sidecar scope refuses writes from now on, before any wait.
+        let retired = Arc::clone(&db.retired);
+        if !settle {
+            retired.store(true, Ordering::Release);
+        }
         // Workers settle first: their last ack needs a live database.
         db.quiesce_workers(settle).await;
         db.closed.cancel();
@@ -1876,6 +2027,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             })
             .await;
         }
+        // Closed: a clone that a sidecar keeps writes nothing more.
+        retired.store(true, Ordering::Release);
         self.inner.counters.closes.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(database = %key, "fleet database closed");
     }
@@ -2202,6 +2355,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             deleting,
             finished: AtomicBool::new(false),
             done: Notify::new(),
+            retire: entry
+                .as_ref()
+                .and_then(|entry| entry.cell.get())
+                .map(|db| (Arc::clone(&db.retired), db.epoch)),
         });
         state.draining.insert(key.clone(), Arc::clone(&drain));
         drop(state);
@@ -2870,6 +3027,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         }
     }
 
@@ -3042,6 +3201,81 @@ mod tests {
         fleet.open(&FleetDbKey::Slot(2)).await.unwrap();
         settle(&fleet).await;
         assert_eq!(fleet.stats().open, 2);
+    }
+
+    /// LRU closes a mapped database. The pool drops, and the connections
+    /// unmap the file. A reopen maps it again and reads every row.
+    #[tokio::test]
+    async fn an_evicted_mapped_database_reopens_with_its_rows() {
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct MmapSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct CacheSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache_size: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        async fn exec(db: &FleetDatabase, sql: &str) {
+            let mut conn = db.pool().get().await.unwrap();
+            diesel::sql_query(sql).execute(&mut *conn).await.unwrap();
+        }
+        async fn state(db: &FleetDatabase) -> (i64, i64, i64) {
+            let mut conn = db.pool().get().await.unwrap();
+            let mmap = diesel::sql_query("PRAGMA mmap_size")
+                .get_result::<MmapSize>(&mut *conn)
+                .await
+                .unwrap()
+                .mmap_size;
+            let cache = diesel::sql_query("PRAGMA cache_size")
+                .get_result::<CacheSize>(&mut *conn)
+                .await
+                .unwrap()
+                .cache_size;
+            let rows = diesel::sql_query("SELECT COUNT(*) AS n FROM notes")
+                .get_result::<Count>(&mut *conn)
+                .await
+                .unwrap()
+                .n;
+            (mmap, cache, rows)
+        }
+
+        const MMAP: u64 = 16 * 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |c| {
+            c.max_open = 1;
+            c.mmap_size = MMAP;
+            c.cache_size_kib = 4096;
+        });
+        let first = fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
+        exec(&first, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        for n in 0..50 {
+            exec(&first, &format!("INSERT INTO notes VALUES ('note {n}')")).await;
+        }
+        assert_eq!(
+            state(&first).await,
+            (i64::try_from(MMAP).unwrap(), -4096, 50)
+        );
+        drop(first);
+
+        fleet.open(&FleetDbKey::Slot(2)).await.unwrap();
+        settle(&fleet).await;
+        assert_eq!(fleet.open_keys(), vec![FleetDbKey::Slot(2)]);
+        assert_eq!(fleet.stats().closes_total, 1, "slot 1 was evicted");
+
+        let reopened = fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
+        exec(&reopened, "INSERT INTO notes VALUES ('after the reopen')").await;
+        assert_eq!(
+            state(&reopened).await,
+            (i64::try_from(MMAP).unwrap(), -4096, 51)
+        );
     }
 
     #[tokio::test]

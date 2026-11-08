@@ -9,9 +9,7 @@ defmodule BenchmarkWeb do
 
   def controller do
     quote do
-      use Phoenix.Controller,
-        formats: [:html, :json],
-        layouts: [html: BenchmarkWeb.Layouts]
+      use Phoenix.Controller, formats: [:html, :json]
       import Plug.Conn
     end
   end
@@ -26,8 +24,7 @@ defmodule BenchmarkWeb do
 
   defp html_helpers do
     quote do
-      use Phoenix.HTML
-      import Phoenix.HTML.Form
+      import Phoenix.HTML
     end
   end
 

@@ -220,6 +220,48 @@ DatabaseFleetConfig {
 know the budget the app wants. Only the fleet builds a `FleetStats`: read it
 from `DatabaseFleet::stats`.
 
+---
+
+### Database: `DatabaseConfig` and `DatabaseFleetConfig` have `mmap_size` and `cache_size_kib`
+
+**Why:** an app can turn on SQLite memory-mapped reads and a larger page
+cache. Both fields are `0` (off) by default. See
+[Memory-mapped reads](../guide/sqlite-in-production.md#memory-mapped-reads-and-the-page-cache).
+
+**You are affected only if your code builds a `DatabaseConfig` with a struct
+literal and no `..Default::default()`, or builds a `DatabaseFleetConfig` with
+a struct literal.** TOML and `AUTUMN_*` config need no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    // ...every other field...
+    replication_workers: 4,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    // ...every other field...
+    replication_workers: 4,
+    mmap_size: 0,
+    cache_size_kib: 0,
+}
+```
+
+Add the same two fields to a `DatabaseConfig` literal, or end it with
+`..Default::default()`.
+
+**Automation:** `manual` — `0` keeps the old behavior, but a codemod cannot
+know if the app wants a different value.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -264,6 +306,15 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   `E: FleetEngine`. With `sqlite`, `E` defaults to `SqliteEngine`, so
   `SQLite` code needs no change. A handler of another engine reads
   `FleetDatabase::handle`. See [ADR 0040](../adr/0040-fleet-engine-seams.md).
+- **New experimental surface (fleet extractors):** the `fleet` module
+  (`resolve`, `resolve_key`, `FleetLease`, `fleet_of`, `ownership_store`) and
+  `AppBuilder::fleet_ownership_store`. Declare them with
+  `uses_experimental`. An engine plugin writes its own extractor over
+  `fleet::resolve::<E>` and puts its `DatabaseFleet<E>` in the app state with
+  `insert_extension`. A sidecar hook ships through
+  `FleetDatabase::sidecar_replica`. A `SlotOwnershipStore` gets a default
+  `ensure_schema`, so an existing store needs no change. See
+  [Writing a fleet extractor](../guide/sqlite-fleet.md#writing-a-fleet-extractor).
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -322,6 +373,25 @@ If nothing changed, delete this section.
   replicas needs a `worker`, or `MediaPlugin::room_reaper_on_every_role()`
   and `MediaPlugin::retention_on_every_role()`. See
   [Media: background tasks and roles](../guide/media.md#background-tasks-and-roles).
+
+### Comments: the comment router shows one page (#3325)
+
+`commentable::router` reads one page of a thread, not the whole thread. A
+page holds up to 50 top-level comments and all their replies. After a post,
+the response shows the page that holds the new comment.
+
+What to do:
+
+1. On a host page that renders a thread, call `comment_thread_page` (not
+   `comment_thread`), and pass the page to the widget with
+   `.page(page.after, page.next)`.
+2. Read `?after=<id>` from the host page's query string, and pass it to
+   `comment_thread_page`.
+3. Use the same page size on the host page and in
+   `CommentsConfig::page_size`. Else a no-JS post can return to a page that
+   does not show the new comment.
+4. Index the comments table: `(commentable_type, commentable_id, created_at,
+   id) WHERE parent_id IS NULL AND deleted_at IS NULL`, and `parent_id`.
 
 ## Deprecations retained from `{X.Y}`
 

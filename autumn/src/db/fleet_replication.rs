@@ -130,6 +130,16 @@ fn millis_since(started: std::time::Instant) -> u64 {
 /// No pass has run yet.
 const NO_PASS: u64 = u64::MAX;
 
+/// The sidecar scope `<root>/<name>` of `object`, when `object` is under the
+/// scope of a sidecar engine.
+fn sidecar_scope(root: &str, object: &str) -> Option<String> {
+    let (name, _) = object
+        .strip_prefix(root)?
+        .strip_prefix('/')?
+        .split_once('/')?;
+    (!super::fleet::RESERVED_SIDECAR_NAMES.contains(&name)).then(|| format!("{root}/{name}"))
+}
+
 /// The destination key prefix of one fleet database, under the control
 /// database's replication root.
 #[must_use]
@@ -578,7 +588,13 @@ impl FleetReplication {
         unshipped
     }
 
-    fn root_for(&self, key: &FleetDbKey) -> String {
+    /// Where the replicas go.
+    pub(crate) const fn destination(&self) -> &Arc<dyn ReplicaDestination> {
+        &self.destination
+    }
+
+    /// The key prefix of the replica of `key`.
+    pub(crate) fn root_for(&self, key: &FleetDbKey) -> String {
         replica_root(&self.settings.root, key)
     }
 
@@ -690,10 +706,17 @@ impl FleetReplication {
             .destination
             .list(&format!("{root}/"))
             .map_err(|e| e.to_string())?;
-        let created = |object: &str| {
-            segment::generation_of_key(&root, object)
+        let dated = |scope: &str, object: &str| {
+            segment::generation_of_key(scope, object)
                 .and_then(|generation| segment::parse_generation_id(&generation))
                 .and_then(|info| DateTime::from_timestamp_millis(info.created_ms))
+        };
+        // A sidecar object is dated by its own `generations/<id>/`. An
+        // object with no date can be of the deleted database: it goes.
+        let created = |object: &str| {
+            dated(&root, object).or_else(|| {
+                sidecar_scope(&root, object).map(|scope| dated(&scope, object).unwrap_or(cutoff))
+            })
         };
         let newer = objects
             .iter()
@@ -1488,6 +1511,15 @@ mod tests {
         replicas: &Path,
         restore_missing: bool,
     ) -> (DatabaseFleet, Arc<FleetReplication>) {
+        replicated_fleet_with_mmap(root, replicas, restore_missing, 0)
+    }
+
+    fn replicated_fleet_with_mmap(
+        root: &Path,
+        replicas: &Path,
+        restore_missing: bool,
+        mmap_size: u64,
+    ) -> (DatabaseFleet, Arc<FleetReplication>) {
         let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
             mode: FleetMode::Tenant,
             root: root.display().to_string(),
@@ -1503,6 +1535,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
@@ -1518,6 +1552,142 @@ mod tests {
         assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
         assert!(fleet.install_replication(Arc::clone(&replication)).is_err());
         (fleet, replication)
+    }
+
+    /// A sidecar gets the keys under `<key prefix>/<engine>/`, no other key,
+    /// and its objects go with a delete of the database.
+    #[tokio::test]
+    async fn a_sidecar_ships_next_to_the_primary_and_goes_with_a_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        let side = db
+            .sidecar_replica("duckdb")
+            .unwrap()
+            .expect("the fleet replicates");
+        assert_eq!(side.root(), "app/test/fleet/tenant/acme/duckdb");
+        let object = side.key("generations/g1/acme.duckdb").unwrap();
+        side.put(&object, b"rows").unwrap();
+        for outside in [
+            "app/test/fleet/tenant/acme/epochs/00000000000000000009",
+            "app/test/fleet/tenant/acme/tombstone",
+            "app/test/fleet/tenant/globex/duckdb/x",
+        ] {
+            assert!(
+                matches!(
+                    side.put(outside, b"x"),
+                    Err(crate::replication::DestinationError::Rejected { .. })
+                ),
+                "{outside}"
+            );
+        }
+        let destination = Arc::clone(replication.destination());
+        assert_eq!(destination.get(&object).unwrap(), b"rows");
+        // A clone kept past the close writes nothing more.
+        let kept = side.clone();
+        drop((side, db));
+        fleet.close(&key).await;
+        assert!(kept.is_stopped());
+        assert!(matches!(
+            kept.put(&object, b"late"),
+            Err(crate::replication::DestinationError::Rejected { .. })
+        ));
+        assert_eq!(kept.get(&object).unwrap(), b"rows", "reads still work");
+        let reopened = fleet.open(&key).await.unwrap();
+        let side = reopened.sidecar_replica("duckdb").unwrap().unwrap();
+        assert!(!side.is_stopped(), "a new open gives a new scope");
+        drop((side, reopened));
+        assert!(fleet.delete(&key).await.unwrap());
+        let left = destination.list("app/test/fleet/tenant/acme/").unwrap();
+        assert!(
+            !left.contains(&object),
+            "the purge takes the sidecar: {left:?}"
+        );
+    }
+
+    /// A sidecar write checks the epoch: it is refused as soon as this host
+    /// loses the slot, before any fence reaches the database.
+    #[tokio::test]
+    async fn a_sidecar_write_is_refused_once_the_slot_is_lost() {
+        use crate::db::fleet_ownership::{FleetOwnership, MemoryOwnership, OwnerId, SlotRange};
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, _replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let clock = crate::time::TickingClock::starting_at(
+            DateTime::from_timestamp_millis(1_000_000).unwrap(),
+        );
+        let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
+        let host = |owner: &str| {
+            Arc::new(
+                FleetOwnership::new(
+                    Arc::clone(&store) as _,
+                    OwnerId::new(owner).unwrap(),
+                    vec![SlotRange::ALL],
+                    Duration::from_secs(30),
+                )
+                .unwrap(),
+            )
+        };
+        let a = host("host-a");
+        assert_eq!(
+            fleet
+                .start_ownership(Arc::clone(&a))
+                .await
+                .unwrap()
+                .claimed
+                .len(),
+            1
+        );
+        let db = fleet.open_for("acme").await.unwrap();
+        let side = db.sidecar_replica("duckdb").unwrap().unwrap();
+        let object = side.key("state.json").unwrap();
+        side.put(&object, b"one").unwrap();
+
+        clock.advance(Duration::from_secs(31));
+        assert_eq!(host("host-b").refresh().await.claimed.len(), 1);
+        assert_eq!(a.refresh().await.lost, [SlotRange::ALL]);
+        // No fence ran: the database is still open here.
+        assert!(fleet.open_keys().contains(db.key()));
+        assert!(side.is_stopped());
+        assert!(matches!(
+            side.put(&object, b"two"),
+            Err(crate::replication::DestinationError::Rejected { .. })
+        ));
+        assert_eq!(side.get(&object).unwrap(), b"one");
+    }
+
+    /// A purge after the key got a new database keeps the sidecar files of
+    /// the new database and removes the files of the deleted one.
+    #[tokio::test]
+    async fn a_purge_dates_sidecar_files_by_their_generation() {
+        use crate::replication::segment::generation_id;
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let key = fleet.key_for("acme").unwrap();
+        let root = "app/test/fleet/tenant/acme";
+        let cutoff = DateTime::from_timestamp_millis(2_000_000).unwrap();
+        let (old, new) = (generation_id(1_000_000, 1), generation_id(3_000_000, 2));
+        let destination = Arc::clone(replication.destination());
+        let objects = [
+            (format!("{root}/generations/{new}/snapshot"), true),
+            (format!("{root}/duckdb/generations/{new}/acme.duckdb"), true),
+            (
+                format!("{root}/duckdb/generations/{old}/acme.duckdb"),
+                false,
+            ),
+            (format!("{root}/duckdb/state.json"), false),
+        ];
+        for (object, _) in &objects {
+            destination.put(object, b"x").unwrap();
+        }
+        replication.purge_replica(&key, cutoff).unwrap();
+        let left = destination.list(&format!("{root}/")).unwrap();
+        for (object, kept) in &objects {
+            assert_eq!(left.contains(object), *kept, "{object}: {left:?}");
+        }
     }
 
     async fn exec(db: &FleetDatabase, sql: &str) {
@@ -1554,6 +1724,88 @@ mod tests {
             .await
             .unwrap()
             .wal_autocheckpoint
+    }
+
+    async fn mmap_size(db: &FleetDatabase) -> i64 {
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct Value {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        let mut conn = db.pool().get().await.unwrap();
+        diesel::sql_query("PRAGMA mmap_size")
+            .get_result::<Value>(&mut *conn)
+            .await
+            .unwrap()
+            .mmap_size
+    }
+
+    const MMAP: u64 = 64 * 1024 * 1024;
+
+    /// Ship, close, lose the file, restore: all with the file mapped.
+    #[tokio::test]
+    async fn a_mapped_database_ships_and_restores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) =
+            replicated_fleet_with_mmap(&tmp.path().join("a"), &replicas, false, MMAP);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&db).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(wal_autocheckpoint(&db).await, 0);
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        for n in 0..200 {
+            exec(
+                &db,
+                &format!("INSERT INTO notes VALUES ('note {n} {}')", "x".repeat(500)),
+            )
+            .await;
+        }
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+        exec(&db, "INSERT INTO notes VALUES ('shipped on close')").await;
+        assert_eq!(count(&db).await, 201);
+        drop(db);
+        fleet.close(&key).await;
+
+        let path = fleet.path_of(&key);
+        std::fs::remove_file(&path).unwrap();
+        for sidecar in crate::fleet_layout::sidecar_paths(&path) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        fleet.restore(&key, None).await.unwrap();
+        let restored = fleet.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&restored).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(count(&restored).await, 201);
+    }
+
+    /// `restore_missing` rebuilds the file before the mapped pool opens it.
+    #[tokio::test]
+    async fn restore_missing_serves_a_mapped_database_from_its_replica() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (old_host, _) =
+            replicated_fleet_with_mmap(&tmp.path().join("old"), &replicas, false, MMAP);
+        let key = old_host.key_for("acme").unwrap();
+        let db = old_host.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('moved with the slot')").await;
+        drop(db);
+        old_host.close_all().await;
+
+        let (new_host, replication) =
+            replicated_fleet_with_mmap(&tmp.path().join("new"), &replicas, true, MMAP);
+        assert!(!new_host.exists(&key));
+        let db = new_host.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&db).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(count(&db).await, 1);
+        assert_eq!(new_host.stats().created_total, 0, "restored, not created");
+        assert_eq!(replication.replicating(), 1);
     }
 
     #[test]
@@ -1657,6 +1909,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
@@ -1973,6 +2227,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
@@ -2233,6 +2489,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
@@ -2815,6 +3073,8 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .unwrap();
