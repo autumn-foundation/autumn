@@ -65,8 +65,8 @@ pub struct LocalRestoreOutcome {
     pub rekeyed_from: Option<String>,
     /// Migrations applied to the copy.
     pub migrations_applied: usize,
-    /// The restore purged the old replica and dropped the tombstone. `false`
-    /// when the purge failed: the replica task drops the row later.
+    /// The restore dropped the tombstone and purged the old replica. `false`
+    /// when the purge failed: the old objects stay, older than the new base.
     pub tombstone_cleared: bool,
     /// The ship of the new base snapshot. `None` without replication, or
     /// when the ship failed.
@@ -238,31 +238,50 @@ impl DatabaseFleet {
                 let _ = crate::time::spawn_blocking(move || worker.quiesce_released(&task_key))
                     .await;
             }
+            // Take the row before the swap: the replica task drops a row
+            // next to a live file without the purge.
+            let taken = if tombstoned {
+                self.take_tombstone(key).await?
+            } else {
+                None
+            };
             let (root, path, task_staging, name) = (
                 self.root().to_path_buf(),
                 self.path_of(key),
                 staging.to_path_buf(),
                 key.name(),
             );
-            let replaced = crate::time::spawn_blocking(move || {
+            let swapped = crate::time::spawn_blocking(move || {
                 check_contained(&root, &path)?;
                 swap_in_staged(&root, &path, &name, &task_staging)
             })
             .await
-            .map_err(task_failed(&key.name(), "restore"))??;
+            .map_err(task_failed(&key.name(), "restore"))
+            .and_then(|r| r);
+            let replaced = match swapped {
+                Ok(replaced) => replaced,
+                Err(error) => {
+                    // The undo replica stays, so the row goes back.
+                    if let Some(row) = &taken {
+                        self.put_back_tombstone(key, row).await;
+                    }
+                    return Err(error);
+                }
+            };
             // A provision that has not reported its creation did not make
             // this file.
             self.lock_state().unacknowledged.remove(key);
-            // After the swap: a failed swap keeps the undo replica. The new
-            // file has not shipped yet, so the purge cannot reach it.
-            let cleared = tombstoned
-                && match self.purge_before_create(key, true).await {
+            // The new file has not shipped yet, so the purge cannot reach it.
+            let cleared = match &taken {
+                Some(row) => match self.purge_taken(key, row).await {
                     Ok(()) => true,
                     Err(error) => {
-                        tracing::warn!(database = %key, %error, "fleet restore: the old replica is not purged; the replica task drops the tombstone later");
+                        tracing::warn!(database = %key, %error, "fleet restore: the old replica is not purged; its objects are older than the new base");
                         false
                     }
-                };
+                },
+                None => false,
+            };
             Ok((replaced, cleared))
         })
         .await

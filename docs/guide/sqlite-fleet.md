@@ -616,8 +616,9 @@ A tombstone stops the restore of a deleted database:
   tombstone. They take the row first, and drop the marker after the
   restore. If the restore fails, the row goes back.
 - `fleet.restore_from_file` refuses a key that has a row, unless
-  `clear_tombstone` is set. Then it purges the old replica and drops the
-  row after the new file is in place.
+  `clear_tombstone` is set. Then it takes the row before the swap, and
+  puts it back if the swap fails. It purges the old replica after the new
+  file is in place.
 
 Use the retention as an undo window:
 

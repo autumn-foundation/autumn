@@ -687,6 +687,11 @@ async fn a_tombstoned_key_is_refused_unless_the_caller_clears_the_tombstone() {
     host.fleet.close(&key).await;
     assert!(host.fleet.delete(&key).await.unwrap());
     assert!(host.tombstones.get(&key.name()).await.unwrap().is_some());
+    let marker = tmp
+        .path()
+        .join("replicas/app/local-restore/fleet/tenant/acme")
+        .join(crate::db::fleet_tombstones::MARKER_OBJECT);
+    assert!(marker.exists(), "the delete wrote its marker");
 
     let refused = restore(&host.fleet, &key, &backup, LocalRestore::new())
         .await
@@ -709,6 +714,7 @@ async fn a_tombstoned_key_is_refused_unless_the_caller_clears_the_tombstone() {
     assert!(outcome.tombstone_cleared);
     assert!(outcome.shipped.is_some());
     assert!(host.tombstones.get(&key.name()).await.unwrap().is_none());
+    assert!(!marker.exists(), "the purge took the marker of the delete");
     let db = host.fleet.open(&key).await.unwrap();
     assert_eq!(bodies(&db).await, ["kept"]);
     drop(db);

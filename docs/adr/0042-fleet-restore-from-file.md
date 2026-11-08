@@ -54,9 +54,11 @@ after the migrations, because a trigger on another table can change it.
 Tombstone: option 3. The tombstone keeps the replica of a deleted database
 for undo. A silent clear would purge that replica. With
 `LocalRestore::clear_tombstone`, the restore purges the old replica and
-drops the row, as `provision` and `import` do. It does this after the swap:
-a failed swap keeps the undo replica. The new file has not shipped yet, so
-the purge cannot reach it.
+drops the row, as `provision` and `import` do. It takes the row under the
+purge turn before the swap, because the replica task drops a row next to a
+live file without the purge. It puts the row back when the swap fails, so
+the undo replica stays. It purges after the swap. The new file has not
+shipped yet, so the purge cannot reach it.
 
 Migrations: option 2. Pending migrations refuse the restore when opens do
 not apply them, and the live file stays. `LocalRestore::apply_migrations`
