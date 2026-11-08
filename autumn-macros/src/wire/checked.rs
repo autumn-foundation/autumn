@@ -806,11 +806,22 @@ fn peel(expr: &Expr) -> &Expr {
         Expr::Unary(e) if matches!(e.op, syn::UnOp::Deref(_)) => peel(&e.expr),
         // Methods that hand back the same value: `.unwrap()` on a call's
         // result is still that call's result, and `catalog.clone()` is still
-        // that client.
+        // that client. An adapter that changes only the error, or only wraps
+        // the value (`.map_err(f)`, `.context(…)`, `.ok()`), keeps it too.
         Expr::MethodCall(e)
             if matches!(
                 e.method.to_string().as_str(),
-                "unwrap" | "expect" | "clone" | "to_owned"
+                "unwrap"
+                    | "expect"
+                    | "clone"
+                    | "to_owned"
+                    | "map_err"
+                    | "inspect_err"
+                    | "context"
+                    | "with_context"
+                    | "ok"
+                    | "ok_or"
+                    | "ok_or_else"
             ) =>
         {
             peel(&e.receiver)

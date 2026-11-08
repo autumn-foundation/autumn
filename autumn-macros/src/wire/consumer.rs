@@ -284,6 +284,17 @@ mod tests {
     }
 
     #[test]
+    fn an_error_adapter_keeps_the_payload() {
+        let reads = consumer(
+            "async fn h(m: OutboxMessage) -> R { \
+             let event = m.payload_as::<ContactUpdated>().map_err(convert)?; let _ = event.email; \
+             let c = m.payload_as::<ContactUpdated>().context(\"decode\")?; let _ = c.id; \
+             if let Some(o) = m.payload_as::<ContactUpdated>().ok() { let _ = o.name; } Ok(()) }",
+        );
+        assert_eq!(names(&reads), ["email", "id", "name"]);
+    }
+
+    #[test]
     fn a_method_call_on_the_payload_is_not_a_read() {
         assert_eq!(
             listener(
