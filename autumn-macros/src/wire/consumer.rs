@@ -224,6 +224,18 @@ mod tests {
     }
 
     #[test]
+    fn a_read_inside_matches_is_a_read_and_one_inside_stringify_is_not() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 let _ = matches!(event.email, Some(_)); \
+                 let _ = stringify!(event.phone); Ok(()) }"
+            ),
+            ["email"]
+        );
+    }
+
+    #[test]
     fn a_method_call_on_the_payload_is_not_a_read() {
         assert_eq!(
             listener(

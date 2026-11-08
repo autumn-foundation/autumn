@@ -213,8 +213,9 @@ const CLIENT_OWN_METHODS: [&str; 6] = ["new", "base_url", "clone", "to_owned", "
 const CLIENT_WRAPPERS: [&str; 5] = ["Arc", "Rc", "Box", "State", "Extension"];
 
 /// Macros whose tokens are never evaluated, so a field named inside one is not
-/// a read.
-const UNEVALUATED_MACROS: [&str; 3] = ["stringify", "quote", "matches"];
+/// a read. `matches!` is not one: it evaluates its first argument, and its
+/// pattern cannot hold a `binding.field` read.
+const UNEVALUATED_MACROS: [&str; 2] = ["stringify", "quote"];
 
 /// One ordered walk of the function, tracking what each name in scope holds.
 ///
