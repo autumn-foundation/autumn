@@ -261,33 +261,47 @@ async fn tab_problems(page: &Page) -> Result<Vec<String>, SystemTestError> {
     Ok(problems)
 }
 
-/// Mark each visible `data-autumn-roving` list in the preview and return,
-/// for each one, its item count.
-const ROVING_LISTS_JS: &str = r#"(() => {
+/// `itemsOf(list)`: the items of a roving list, as the core reads them.
+/// An item in a hidden subtree does not count. A tree keeps its disabled
+/// items.
+macro_rules! items_of_js {
+    () => {
+        r#"
   const ITEMS = '[role="tab"],[role="menuitem"],[role="option"],[role="radio"],[role="treeitem"]';
   const LIST = '[data-autumn-roving],[data-autumn-activedescendant]';
-  const preview = document.querySelector('.story-preview');
+  const inHidden = (el, list) => { for (let p = el.parentElement; p && p !== list; p = p.parentElement) if (p.hidden) return true; return false; };
+  const itemsOf = list => [...list.querySelectorAll(list.getAttribute('data-autumn-roving') || ITEMS)]
+    .filter(el => !el.hidden && (list.getAttribute('role') === 'tree' || el.getAttribute('aria-disabled') !== 'true')
+      && el.closest(LIST) === list && !inHidden(el, list));
+"#
+    };
+}
+
+/// Mark each visible `data-autumn-roving` list in the preview and return,
+/// for each one, its item count.
+const ROVING_LISTS_JS: &str = concat!(
+    "(() => {",
+    items_of_js!(),
+    r#"  const preview = document.querySelector('.story-preview');
   const lists = preview ? [...preview.querySelectorAll('[data-autumn-roving]')]
     .filter(list => list.checkVisibility({ visibilityProperty: true })) : [];
   return JSON.stringify(lists.map((list, i) => {
     list.setAttribute('data-conformance-list', String(i));
-    return [...list.querySelectorAll(list.getAttribute('data-autumn-roving') || ITEMS)]
-      .filter(el => !el.hidden && el.getAttribute('aria-disabled') !== 'true' && el.closest(LIST) === list)
-      .length;
+    return itemsOf(list).length;
   }));
-})()"#;
+})()"#
+);
 
 /// Focus and mark the tab stop of list `LIST_INDEX`.
 ///
 /// Return the arrow key to press: forward, or back when the stop is the
 /// last item of a list that does not wrap. A right-to-left list swaps
 /// `ArrowLeft` and `ArrowRight`. Return `""` when the list has no tab stop.
-const FOCUS_LIST_JS: &str = r#"(() => {
-  const ITEMS = '[role="tab"],[role="menuitem"],[role="option"],[role="radio"],[role="treeitem"]';
-  const LIST = '[data-autumn-roving],[data-autumn-activedescendant]';
-  const list = document.querySelector('[data-conformance-list="LIST_INDEX"]');
-  const items = [...list.querySelectorAll(list.getAttribute('data-autumn-roving') || ITEMS)]
-    .filter(el => !el.hidden && el.getAttribute('aria-disabled') !== 'true' && el.closest(LIST) === list);
+const FOCUS_LIST_JS: &str = concat!(
+    "(() => {",
+    items_of_js!(),
+    r#"  const list = document.querySelector('[data-conformance-list="LIST_INDEX"]');
+  const items = itemsOf(list);
   const stop = items.find(el => el.tabIndex === 0);
   if (!stop) return '';
   stop.focus();
@@ -300,7 +314,8 @@ const FOCUS_LIST_JS: &str = r#"(() => {
   const rtl = getComputedStyle(list).direction === 'rtl';
   if (horizontal) return back !== rtl ? 'ArrowLeft' : 'ArrowRight';
   return back ? 'ArrowUp' : 'ArrowDown';
-})()"#;
+})()"#
+);
 
 /// `true` when focus moved to another item of list `LIST_INDEX`, and that item
 /// is now the tab stop.

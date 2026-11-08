@@ -368,7 +368,9 @@ impl Plugin for BillingPlugin {
         let app = app
             .nest(&config.route_prefix, routes::router())
             .declare_plugin_routes(routes::route_infos(&config));
-        let app = app.jobs(dunning::job_infos());
+        let app = app
+            .jobs(dunning::job_infos())
+            .background(dunning::rearm_task());
         #[cfg(feature = "db")]
         let app = app.plugin_migrations("autumn-billing", MIGRATIONS);
 
@@ -384,8 +386,7 @@ impl Plugin for BillingPlugin {
                 let provider = Self::resolve_provider(&state, &config, provider)?;
                 let store = Self::resolve_store(&state, &config, store)?;
                 verify_webhook_endpoint(&state, &config, provider.as_ref())?;
-                // `insert_extension` wraps the value in its own `Arc`, keyed
-                // by `BillingService`; read that handle back for the re-arm.
+                // The re-arm is the background task `dunning::REARM_TASK`.
                 state.insert_extension(BillingService {
                     provider,
                     store,
@@ -394,8 +395,6 @@ impl Plugin for BillingPlugin {
                     hooks,
                     checkouts_in_flight: std::sync::Mutex::default(),
                 });
-                let service = BillingService::require(&state)?;
-                dunning::rearm_pending(state.clone(), service);
                 Ok(())
             }
         })

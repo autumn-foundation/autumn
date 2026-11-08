@@ -583,6 +583,7 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `AppBuilder::config_section` | stable | Declare a plugin-owned top-level config root so `server.strict_config` treats it as known-and-opaque. |
 | `AppBuilder::declare_plugin_routes` | stable | Make routes mounted through an opaque `nest`/`merge` router visible to `autumn routes` and the conformance harness. |
 | `AppBuilder::error_pages` | stable | Replace the rendered error pages — a tier-1 subsystem seam (requires the `maud` feature). The plugin crate needs its own `maud` dependency: `html!` expands to absolute `::maud::` paths, which no re-export can satisfy. |
+| `AppBuilder::fleet_ownership_store` | experimental | Keep fleet slot ownership in a plugin's `SlotOwnershipStore` (requires the `db` feature). Experimental while the fleet seams land (ADR 0040). |
 | `AppBuilder::merge` | stable | Merge a raw axum router at the root. Pair it with `declare_plugin_routes` so the routes stay attributable. |
 | `AppBuilder::nest` | stable | Mount a raw axum router under a prefix. Pair it with `declare_plugin_routes` so the routes stay attributable. |
 | `AppBuilder::on_shutdown` | stable | Register an async shutdown hook that runs during graceful drain. |
@@ -608,7 +609,8 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `autumn_edge::host` | experimental | Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790). |
 | `background` | stable | `BackgroundTask`, `PluginCapability`, `BackgroundCapability` and `Role::runs_plugin`: role-aware background work. |
 | `db::Pool` | stable | The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature). |
-| `db::fleet_engine` | experimental | `FleetEngine` and `DatabaseFleet::with_engine`: one database engine of a fleet (requires the `db` feature). Experimental: the trait may change in any release while the fleet seams land (ADR 0040). |
+| `db::fleet_engine` | experimental | `FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. `install_replication` and `ShipMode::Generations` need the `sqlite` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040). |
+| `fleet` | experimental | `resolve`, `resolve_key`, `FleetLease`, `fleet_of` and `ownership_store`: the request path an engine plugin's fleet extractor calls. Also `FleetDatabase::sidecar_replica` and `replication::ScopedDestination` for a sidecar engine (requires the `db` feature). Experimental while the fleet seams land (ADR 0040). |
 | `form::FieldRenderer` | stable | Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature). |
 | `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack. |
 | `plugin_conformance::fleet` | experimental | `run_fleet_conformance` and `FleetFixture`: the conformance kit of a fleet engine (requires the `db` feature). Experimental: checks may change in any release with the engine trait. |

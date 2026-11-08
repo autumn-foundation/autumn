@@ -679,3 +679,116 @@ async fn each_repository_applies_its_own_soft_delete_rule_on_sqlite() {
     );
     assert_eq!(dual_counter(&pool, target).await, 0);
 }
+
+// ── #3325: paged thread reads on SQLite ─────────────────────────────────────
+
+/// The bodies of a page's top-level comments, in order.
+fn roots(nodes: &[autumn_web::commentable::CommentNode]) -> Vec<String> {
+    nodes.iter().map(|node| node.comment.body.clone()).collect()
+}
+
+/// Insert one live `sqc_duals` row.
+async fn seed_dual(pool: &SqlitePool) -> i64 {
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query("INSERT INTO sqc_duals (title) VALUES ('live')")
+            .execute(&mut *conn)
+            .await
+            .expect("seed a live parent");
+    }
+    count(
+        pool,
+        "SELECT id AS n FROM sqc_duals ORDER BY id DESC LIMIT 1",
+    )
+    .await
+}
+
+/// `SQLite` stores `CURRENT_TIMESTAMP` to the second, so these comments share
+/// one `created_at`. The cursor must then order on the id.
+#[tokio::test]
+async fn comment_thread_page_pages_on_sqlite() {
+    let pool = boot_pool("sqc_commentable_paging").await;
+    let repo = PgSqcDualRepository::with_pool_untracked(pool.clone());
+    let author = seed_user(&pool, "ada").await;
+    let target = seed_dual(&pool).await;
+
+    let a = repo
+        .add_comment(target, author, "a", None)
+        .await
+        .expect("a");
+    let b = repo
+        .add_comment(target, author, "b", None)
+        .await
+        .expect("b");
+    repo.add_comment(target, author, "c", None)
+        .await
+        .expect("c");
+    repo.add_comment(target, author, "a1", Some(a.id))
+        .await
+        .expect("a1");
+    let gone = repo
+        .add_comment(target, author, "gone", None)
+        .await
+        .expect("gone");
+    repo.delete_comment(target, gone.id).await.expect("delete");
+
+    let first = repo
+        .comment_thread_page(target, None, 2)
+        .await
+        .expect("first page");
+    assert_eq!(roots(&first.nodes), vec!["a", "b"]);
+    assert_eq!(first.nodes[0].replies.len(), 1, "a1 stays under a");
+    assert_eq!(first.next, Some(b.id));
+
+    let second = repo
+        .comment_thread_page(target, first.next, 2)
+        .await
+        .expect("second page");
+    assert_eq!(roots(&second.nodes), vec!["c"]);
+    assert_eq!(second.next, None, "the deleted comment is not counted");
+
+    let spec = SqcDual::commentable_spec();
+    let mut conn = pool.get().await.expect("conn");
+    let page = autumn_web::commentable::thread_page_containing(
+        &mut conn,
+        spec,
+        SqcDual::COMMENTABLE_TYPE,
+        target,
+        a.id,
+        1,
+        None,
+        Some(true),
+    )
+    .await
+    .expect("page containing a");
+    assert_eq!(roots(&page.nodes), vec!["a"]);
+    assert_eq!(page.after, None);
+
+    // `c` is past the first page: the page ends at it.
+    let c = second.nodes[0].comment.id;
+    let page = autumn_web::commentable::thread_page_containing(
+        &mut conn,
+        spec,
+        SqcDual::COMMENTABLE_TYPE,
+        target,
+        c,
+        1,
+        None,
+        Some(true),
+    )
+    .await
+    .expect("page containing c");
+    assert_eq!(roots(&page.nodes), vec!["c"]);
+    assert_eq!(page.after, Some(b.id));
+
+    // A cursor from another record gives an empty page. The pool has one
+    // connection, so release it first.
+    drop(conn);
+    let other = seed_dual(&pool).await;
+    let foreign = repo.add_comment(other, author, "x", None).await.expect("x");
+    let page = repo
+        .comment_thread_page(target, Some(foreign.id), 5)
+        .await
+        .expect("foreign cursor");
+    assert!(page.nodes.is_empty());
+}

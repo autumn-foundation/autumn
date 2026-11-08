@@ -193,6 +193,10 @@ pub mod db;
 pub(crate) mod db_ping;
 pub mod db_roles;
 pub(crate) mod db_url;
+// `fleet` has its own `//!` docs. An outer doc here would make rustdoc
+// resolve its links in this module.
+#[cfg(feature = "db")]
+pub mod fleet;
 pub mod fleet_layout;
 // Request deadlines (issue #3058). The module carries its own `//!` docs.
 pub mod deadline;

@@ -18,6 +18,9 @@ The shipped widgets use the core:
 | `NavMenu` in `nav_bar`, `dropdown_menu` | Menu button | Enter, Space, ArrowDown or ArrowUp opens; ArrowDown/ArrowUp, Home/End, a letter, Escape, Tab. See [Popover and Dropdown Menu](popover-and-menu.md). |
 | `tooltip` | Tooltip | Escape hides the text. See [Tooltip](tooltip.md) |
 
+A widget pack can use the core too. A `role="tree"` list gets the tree keys.
+See [Tree keys](#tree-keys).
+
 Load the runtime once in your layout:
 
 ```html
@@ -43,9 +46,11 @@ Rules:
 
 - **Items.** The default items are `[role=tab]`, `[role=menuitem]`,
   `[role=option]`, `[role=radio]` and `[role=treeitem]`. Give a selector to
-  `data-autumn-roving` to change them. The core skips an item that has its
-  own `hidden` attribute or `aria-disabled="true"`. It also skips the items
-  of a nested list.
+  `data-autumn-roving` to change them. The core skips an item that has
+  `aria-disabled="true"`, or that has the `hidden` attribute on it or on an
+  element between it and the list. It also skips the items of a nested
+  list. A tree keeps its disabled items: they take focus, so their
+  children stay reachable.
 - **Controller and trigger.** The core finds them through `aria-controls`.
   The element whose `aria-controls` names the list is the controller. The
   element whose `aria-controls` names the layer is the trigger. For a
@@ -75,6 +80,8 @@ Events (they bubble):
 | `autumn:navigate` | the list | `{ item }`, the new active item |
 | `autumn:dismiss` | the layer | `{ item: null }` |
 | `autumn:init` | `document` or the new root | none |
+| `autumn:expand` | the tree item | `{ item }`, the item |
+| `autumn:collapse` | the tree item | `{ item }`, the item |
 
 Example: a plugin listbox. Your code opens it; the core closes it.
 
@@ -85,6 +92,43 @@ Example: a plugin listbox. Your code opens it; the core closes it.
     data-autumn-typeahead data-autumn-dismiss>
   <li role="option">Apple</li>
   <li role="option">Banana</li>
+</ul>
+```
+
+## Tree keys
+
+A `data-autumn-roving` list with `role="tree"` gets the APG tree view keys.
+A parent `treeitem` has `aria-expanded`. It holds its `role="group"` list of
+children, or names the list in `aria-owns`. An end node has no
+`aria-expanded`. Put an owned group just after its owner, as the APG
+navigation tree does: ArrowUp, ArrowDown, Home, End and typeahead move in
+DOM order.
+
+| Key | Effect |
+|---|---|
+| ArrowDown, ArrowUp | Move to the next or the previous visible item. |
+| Home, End | Move to the first or the last visible item. |
+| ArrowRight | On a closed node: open it. On an open node: move to its first child. On an end node: nothing. |
+| ArrowLeft | On an open node: close it. On a closed node or an end node: move to its parent. On a closed root node: nothing. |
+| `*` | Open each closed node at the level of the focused node, the focused node too. Focus does not move. |
+| A letter | Typeahead over the visible items. |
+
+To open or close a node, the core sets `aria-expanded` and the `hidden`
+attribute of its group. Then it fires `autumn:expand` or `autumn:collapse`
+on the item. In a right-to-left tree, ArrowLeft and ArrowRight change
+places. Enter, Space and selection are not in the core. The widget does
+them.
+
+```html
+<ul role="tree" aria-label="Files" data-autumn-roving
+    data-autumn-orientation="vertical" data-autumn-typeahead>
+  <li role="treeitem" aria-expanded="false">
+    <span>src</span>
+    <ul role="group" hidden>
+      <li role="treeitem">lib.rs</li>
+    </ul>
+  </li>
+  <li role="treeitem">README.md</li>
 </ul>
 ```
 
@@ -169,8 +213,8 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 61 KiB |
-| `autumn-widgets.js`, gzip level 9 | 18 KiB |
+| `autumn-widgets.js`, raw | 72 KiB |
+| `autumn-widgets.js`, gzip level 9 | 21 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
 above the budget. Raise the budget only with a reason in the PR. Issue
@@ -181,6 +225,10 @@ Issue #3402 added the popover menu runtime. Together they increased them from
 increased them from 44 KiB and 13 KiB. Issue #3411 added the direct upload
 controller. It increased them from 46 KiB and 14 KiB. Issue #3410 added the
 tags mode of the combobox (chips). It increased them from 54 KiB and 16 KiB.
+Issue #3412 added the password reveal, the strength hint and the one-time
+code format. It increased them from 61 KiB and 18 KiB. Issue #3417 added the
+tree keys. It increased them from 70 KiB and 20 KiB. The measure includes
+the search part of the bundle.
 
 ## Tests
 

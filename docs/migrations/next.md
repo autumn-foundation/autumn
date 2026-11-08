@@ -222,6 +222,88 @@ from `DatabaseFleet::stats`.
 
 ---
 
+### Fleet: `ShipMode::Continuous` carries a shipper
+
+**Why:** core ships the databases of every engine and checks the fence
+before each write
+(ADR 0040 §5). `ShipMode` has a new mode, `Generations { every }`.
+`Continuous` carries the shipper that core drives, an `Arc<dyn
+ContinuousShipper>`. So `ShipMode` is no longer `Copy`, `PartialEq` or `Eq`.
+`ContinuousShipper` is sealed: only `SqliteEngine` uses `Continuous`.
+
+**You are affected only if your code matches or compares a `ShipMode`, or
+your engine returned `ShipMode::Continuous`.** An engine plugin that returned
+`ShipMode::Rebuild` needs no change. An engine that returned
+`ShipMode::Continuous` must return `ShipMode::Generations { every }`. Core
+does not let a plugin give a continuous shipper.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+if engine.ship_mode() == ShipMode::Continuous {
+    // ...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+if matches!(engine.ship_mode(), ShipMode::Continuous(_)) {
+    // ...
+}
+```
+
+`DatabaseFleet::install_replication` now works for any engine, and its
+signature does not change. `FleetStats` has the new fields `ship_mode` and
+`rpo_secs`; it is `#[non_exhaustive]`, so a read needs no change.
+
+**Automation:** `manual` — a codemod cannot know which comparison the code
+wants.
+
+---
+
+### Database: `DatabaseConfig` and `DatabaseFleetConfig` have `mmap_size` and `cache_size_kib`
+
+**Why:** an app can turn on SQLite memory-mapped reads and a larger page
+cache. Both fields are `0` (off) by default. See
+[Memory-mapped reads](../guide/sqlite-in-production.md#memory-mapped-reads-and-the-page-cache).
+
+**You are affected only if your code builds a `DatabaseConfig` with a struct
+literal and no `..Default::default()`, or builds a `DatabaseFleetConfig` with
+a struct literal.** TOML and `AUTUMN_*` config need no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    // ...every other field...
+    replication_workers: 4,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    // ...every other field...
+    replication_workers: 4,
+    mmap_size: 0,
+    cache_size_kib: 0,
+}
+```
+
+Add the same two fields to a `DatabaseConfig` literal, or end it with
+`..Default::default()`.
+
+**Automation:** `manual` — `0` keeps the old behavior, but a codemod cannot
+know if the app wants a different value.
+
+---
+
 ### State: `AppState` getters are no longer `const fn`
 
 **Why:** `AppState` holds its fields behind one `Arc`, so a clone is one
@@ -280,6 +362,14 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   in `on_startup` that you do not move behaves as before. See
   [Background work in a plugin](../guide/extensibility.md#background-work-in-a-plugin)
   and [Background tasks for plugins and apps](../guide/jobs.md#background-tasks-for-plugins-and-apps).
+- **In-repo plugins on background tasks (#3546):** `autumn-media-plugin`
+  and `autumn-billing` start no loop from `on_startup` now. The reference
+  plugin shows the pattern: one-time setup in `on_startup`, the loop in
+  `background_task`. A test in `xtask` (`plugin_spawns`) fails on a spawn
+  that an `on_startup` or `state_initializer` argument of a plugin crate
+  reaches. `spawn_room_reaper_loop` and `spawn_retention_sweep_loop` are
+  deprecated. Call `run_room_reaper` or `run_retention_sweep` from a
+  `background_task`.
 - **New experimental surface (fleet engines, #3642):** `db::fleet_engine`
   (the `FleetEngine` trait and `DatabaseFleet::with_engine`) and
   `plugin_conformance::fleet` (`FleetFixture`, `run_fleet_conformance`).
@@ -289,6 +379,15 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   `E: FleetEngine`. With `sqlite`, `E` defaults to `SqliteEngine`, so
   `SQLite` code needs no change. A handler of another engine reads
   `FleetDatabase::handle`. See [ADR 0040](../adr/0040-fleet-engine-seams.md).
+- **New experimental surface (fleet extractors):** the `fleet` module
+  (`resolve`, `resolve_key`, `FleetLease`, `fleet_of`, `ownership_store`) and
+  `AppBuilder::fleet_ownership_store`. Declare them with
+  `uses_experimental`. An engine plugin writes its own extractor over
+  `fleet::resolve::<E>` and puts its `DatabaseFleet<E>` in the app state with
+  `insert_extension`. A sidecar hook ships through
+  `FleetDatabase::sidecar_replica`. A `SlotOwnershipStore` gets a default
+  `ensure_schema`, so an existing store needs no change. See
+  [Writing a fleet extractor](../guide/sqlite-fleet.md#writing-a-fleet-extractor).
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -339,6 +438,33 @@ Changes that still compile but behave differently at runtime. Examples:
 - A scheduled task now runs on a different worker.
 
 If nothing changed, delete this section.
+
+- **Media and billing loops follow the role (#3546).** The `db` room reaper
+  and the recording retention sweep do not run on `web`. The `memory` room
+  reaper runs on `combined` and `web`, not on `worker`. The dunning re-arm
+  runs on `combined` and `worker`, not on `web`. A fleet of only `web`
+  replicas needs a `worker`, or `MediaPlugin::room_reaper_on_every_role()`
+  and `MediaPlugin::retention_on_every_role()`. See
+  [Media: background tasks and roles](../guide/media.md#background-tasks-and-roles).
+
+### Comments: the comment router shows one page (#3325)
+
+`commentable::router` reads one page of a thread, not the whole thread. A
+page holds up to 50 top-level comments and all their replies. After a post,
+the response shows the page that holds the new comment.
+
+What to do:
+
+1. On a host page that renders a thread, call `comment_thread_page` (not
+   `comment_thread`), and pass the page to the widget with
+   `.page(page.after, page.next)`.
+2. Read `?after=<id>` from the host page's query string, and pass it to
+   `comment_thread_page`.
+3. Use the same page size on the host page and in
+   `CommentsConfig::page_size`. Else a no-JS post can return to a page that
+   does not show the new comment.
+4. Index the comments table: `(commentable_type, commentable_id, created_at,
+   id) WHERE parent_id IS NULL AND deleted_at IS NULL`, and `parent_id`.
 
 ## Deprecations retained from `{X.Y}`
 

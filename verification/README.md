@@ -111,6 +111,9 @@ It proves these properties:
   epoch it held.
 - A restore never selects a generation of an older epoch, and a fenced
   replicator stops.
+- Shipping is its own step. When `may_put` admits a put, `may_ship` admits
+  it too. After a newer epoch marker, or a newer epoch this host saw, each
+  put of the old owner is refused. After a new grant, the new owner can put.
 - An open refuses a file stamped by a newer owner. After the new owner opens
   the file, the old owner cannot open it. The owner can open it again, and a
   new grant can open any file the table stamped (`may_open`).
@@ -119,6 +122,62 @@ It does not prove that two hosts never serve at once. That depends on the
 clock bound in the guide. The epoch makes a late write of the old owner
 harmless to the replicas. The proptest `the_table_keeps_its_invariants`
 checks the same rules on the runtime table.
+
+## Fleet sidecar scope
+
+`fleet_sidecar_scope.rs` models the replica scope of a fleet sidecar engine
+(`ScopedDestination` in `autumn/src/replication/destination.rs` and
+`sidecar_root` in `autumn/src/db/fleet.rs`). Verify it with:
+
+```sh
+verus verification/fleet_sidecar_scope.rs
+```
+
+It proves these properties:
+
+- A key the scope admits is under the database's replica prefix, so a purge
+  of the database also removes it.
+- A key the scope of engine `e` admits is not under `<prefix>/<r>/` and is
+  not `<prefix>/<r>`, for any other name `r` with no `/`. So a sidecar
+  cannot write the primary's `generations`, `epochs` or `tombstone`.
+- A sidecar key of one tenant is not under the prefix of another tenant.
+
+The unit tests in `destination.rs` and `db/fleet/engine_tests.rs` check the
+same rules on the runtime.
+
+## Fleet generations
+
+`fleet_generations.rs` models generation shipping (`ShipMode::Generations`
+in `autumn/src/db/fleet_engine.rs`, the shipper in
+`autumn/src/db/fleet/generations.rs`, and the fence in
+`autumn/src/replication/fence.rs`). Verify it with:
+
+```sh
+verus verification/fleet_generations.rs
+```
+
+It proves these properties:
+
+- The fence does not depend on the ship mode. A newer epoch at the
+  destination, a newer epoch this host saw, or a retired database refuses
+  each put. The current owner can put. `Rebuild` puts nothing.
+- A file whose hash the previous generation holds is not shipped again.
+  Each file of a new generation is shipped now or held already.
+- A holder is the new generation or a holder of the previous one, and it is
+  never newer than the generation that names it.
+- A prune keeps the newest generations and each holder that their
+  manifests name. So a restore of a kept generation finds every file.
+- A restore takes the greatest (epoch, time). The tombstone rules are the
+  rules of `fleet_replica_tombstones.rs`: after a delete, a restore is
+  refused. A purge at or after the newest generation removes every holder,
+  and keeps a newer database of the same key.
+
+The unit tests in `generations.rs` and `db/fleet/generations_tests.rs`, the
+kit checks `fleet-fenced-ship` and `fleet-unchanged-files`, and the takeover
+test in `tests/sqlite_fleet/generations.rs` check the runtime. The TLA+ spec
+needs no change. A list and a put are still two steps. So the witness
+`StaleGenerationLandsLate` still holds. The (epoch, time) order is still
+necessary.
 
 ## Fleet replica tombstones
 

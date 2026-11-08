@@ -1,14 +1,13 @@
 //! The replica steps of the fleet core.
 //!
-//! Tombstones, restores from the replica, and purges. They work when
-//! `SQLite` replication is installed. Without it each step does nothing.
-//! Without the `sqlite` feature, the no-op steps in `fleet.rs` take their
-//! place.
+//! Tombstones, restores from the replica, purges and ships. They work when
+//! replication is installed. Without it each step does nothing. Without the
+//! `sqlite` feature, the no-op steps in `fleet.rs` take their place.
 
-use super::sqlite::{read_epoch_stamp, restore_in_place};
+use super::sqlite::restore_in_place;
 use super::{
     Arc, CancellationToken, DatabaseFleet, Duration, FleetDbKey, FleetEngine, FleetError, Path,
-    check_contained,
+    ShipMode, ShipReport, SqliteEngine, check_contained,
 };
 use crate::db::fleet_tombstones::{ControlConnection, FleetTombstones, TombstoneError};
 
@@ -87,10 +86,86 @@ impl DeleteRecord {
 }
 
 impl<E: FleetEngine> DatabaseFleet<E> {
+    /// Replicate every database this fleet opens from now on (ADR 0019 §5,
+    /// ADR 0040 §5). The engine's [`ShipMode`] decides how:
+    ///
+    /// - `Continuous`: `SQLite` WAL shipping. Databases open with
+    ///   `wal_autocheckpoint = 0`, and `replication` is their only
+    ///   checkpointer.
+    /// - `Generations`: core ships a generation of each open database every
+    ///   `every`, and at close.
+    /// - `Rebuild`: nothing ships. The tombstones still apply.
+    ///
+    /// Install before the first open, once.
+    ///
+    /// # Errors
+    ///
+    /// Gives `replication` back when a replication is already installed.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the error gives the replication back, as the earlier API did"
+    )]
+    pub fn install_replication(
+        &self,
+        replication: Arc<crate::db::fleet_replication::FleetReplication>,
+    ) -> Result<(), Arc<crate::db::fleet_replication::FleetReplication>> {
+        let mode = self.inner.engine.ship_mode();
+        self.inner.replication.set(Arc::clone(&replication))?;
+        replication.set_ship_info(crate::db::fleet_replication::ShipInfo {
+            mode: mode.name(),
+            every: mode.every(),
+        });
+        match mode {
+            ShipMode::Continuous(shipper) => {
+                // The trait is sealed: its one shipper is the `SQLite` WAL.
+                let sqlite =
+                    (self as &dyn std::any::Any).downcast_ref::<DatabaseFleet<SqliteEngine>>();
+                if let Some(sqlite) = sqlite {
+                    sqlite.attach_wal_shipping(Arc::clone(&replication));
+                } else {
+                    tracing::error!(
+                        shipper = shipper.name(),
+                        "fleet replication: core drives no continuous shipper for this engine; nothing ships"
+                    );
+                }
+            }
+            ShipMode::Generations { .. } => {
+                // A process that died during a ship leaves its scratch.
+                sweep_scratch(
+                    &super::generations::ship_scratch(self.root()),
+                    replication.now(),
+                );
+                let every = mode.every().unwrap_or(Duration::from_secs(1));
+                self.add_lifecycle(Arc::new(super::generations::GenerationShipper::new(
+                    self,
+                    Arc::clone(&replication),
+                    every,
+                )));
+            }
+            ShipMode::Rebuild => {}
+        }
+        self.wire_fence_hook();
+        Ok(())
+    }
+
+    /// The RPO of the replica. `None` with no replica, or in `rebuild` mode.
+    pub(super) fn rpo(&self) -> Option<Duration> {
+        self.replication().and_then(|replication| replication.rpo())
+    }
+
     /// The installed replication, if any.
     #[must_use]
     pub fn replication(&self) -> Option<&Arc<crate::db::fleet_replication::FleetReplication>> {
         self.inner.replication.get()
+    }
+
+    /// The replica of `key`: the destination and its key prefix.
+    pub(super) fn replica_base(&self, key: &FleetDbKey) -> Option<super::ReplicaBase> {
+        self.replication().map(|replication| super::ReplicaBase {
+            destination: Arc::clone(replication.destination()),
+            root: replication.root_for(key),
+            ownership: self.ownership().cloned(),
+        })
     }
 
     /// Whether the replication has frames it did not ship yet.
@@ -133,6 +208,12 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let (Some(replication), Some(ownership)) = (self.replication(), self.ownership()) else {
             return;
         };
+        let known = Arc::downgrade(ownership);
+        replication.set_known_hook(Arc::new(move |key: &FleetDbKey| {
+            known
+                .upgrade()
+                .map_or(0, |ownership| ownership.fence_floor(key.routing_slot()))
+        }));
         let ownership = Arc::downgrade(ownership);
         replication.set_fence_hook(Arc::new(move |key: &FleetDbKey, newest: u64| {
             let newer = i64::try_from(newest)
@@ -155,8 +236,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         path: &Path,
         epoch: crate::lock::FencingToken,
     ) -> Result<(), FleetError> {
-        // No replica: nothing newer to compare with. Replication is only
-        // installed on a `SQLite` fleet, so the file is a `SQLite` file.
+        // No replica: nothing newer to compare with.
         if self.replication().is_none() {
             return Ok(());
         }
@@ -187,7 +267,15 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             epoch,
             found,
         };
-        let stamp = read_epoch_stamp(path, &name)?;
+        let mode = self.inner.engine.ship_mode();
+        // A stamp the engine does not know: in `generations` mode it counts
+        // as 0, so a newer epoch of another owner in the replica replaces the
+        // file. In the other modes the file stays.
+        let stamp = match self.inner.engine.epoch_stamp(key, path)? {
+            Some(stamp) => stamp,
+            None if matches!(mode, ShipMode::Generations { .. }) => 0,
+            None => return Ok(()),
+        };
         if stamp > epoch {
             return Err(newer(stamp));
         }
@@ -220,9 +308,240 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 hook.release(key);
             }
             check_contained(self.root(), path)?;
-            restore_in_place(self.root(), replication, key, None, path)?;
+            match mode {
+                ShipMode::Continuous(_) => {
+                    restore_in_place(self.root(), replication, key, None, path)?;
+                }
+                ShipMode::Generations { .. } => {
+                    // Only a generation above the stamp holds newer data. The
+                    // newer owner can have written its marker and no
+                    // generation: then the file on disk is the newest data.
+                    match self.restore_generation_in_place(
+                        replication,
+                        key,
+                        None,
+                        path,
+                        Some(stamp),
+                    ) {
+                        Ok(false) | Err(FleetError::NotFound { .. }) => {
+                            tracing::warn!(database = %name, "fleet database: the newer epoch has no generation; the file on disk stays");
+                        }
+                        other => {
+                            other?;
+                        }
+                    }
+                }
+                // No replica holds the data.
+                _ => {}
+            }
         }
         Ok(())
+    }
+
+    /// Ship the open database of `key` now. See
+    /// [`ship_now`](Self::ship_now).
+    pub(super) async fn ship_replica(&self, key: &FleetDbKey) -> Result<ShipReport, FleetError> {
+        let name = key.name();
+        let replication = self
+            .replication()
+            .cloned()
+            .ok_or_else(|| FleetError::NotReplicated { name: name.clone() })?;
+        let not_open = || FleetError::Unavailable {
+            name: name.clone(),
+            detail: "the database is not open in this process, or another process ships it"
+                .to_owned(),
+        };
+        match self.inner.engine.ship_mode() {
+            ShipMode::Continuous(_) => {
+                let (worker, task_key) = (Arc::clone(&replication), key.clone());
+                let ticked = crate::time::spawn_blocking(move || worker.ship_one(&task_key))
+                    .await
+                    .map_err(|error| FleetError::Unavailable {
+                        name: name.clone(),
+                        detail: error.to_string(),
+                    })?;
+                match ticked {
+                    Ok(Some(report)) => Ok(ShipReport {
+                        generation: None,
+                        shipped: usize::try_from(report.segments)
+                            .unwrap_or(usize::MAX)
+                            .saturating_add(usize::from(report.snapshot_taken)),
+                        reused: 0,
+                        bytes: report.bytes,
+                    }),
+                    Ok(None) => Err(not_open()),
+                    Err(crate::replication::ReplicationError::Fenced { epoch, newest }) => {
+                        Err(FleetError::Fenced {
+                            name,
+                            epoch,
+                            newest,
+                        })
+                    }
+                    Err(error) => Err(FleetError::Unavailable {
+                        name,
+                        detail: error.to_string(),
+                    }),
+                }
+            }
+            ShipMode::Generations { .. } => {
+                let db = self.get_open(key).ok_or_else(not_open)?;
+                self.ship_generation(&replication, db).await
+            }
+            _ => Err(FleetError::NotReplicated { name }),
+        }
+    }
+
+    /// Replace the closed database of `key` from its replica, or rebuild it.
+    /// The caller holds the drain of `key`. See
+    /// [`restore_latest`](Self::restore_latest).
+    pub(super) async fn replace_from_replica(
+        &self,
+        key: &FleetDbKey,
+        target: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
+        let mode = self.inner.engine.ship_mode();
+        let replication = self.replication().cloned();
+        if !matches!(mode, ShipMode::Rebuild) && replication.is_none() {
+            return Err(FleetError::NotReplicated { name: key.name() });
+        }
+        if let Some(replication) = &replication {
+            // A ship still in flight writes nothing more: wait for it.
+            let (worker, task_key) = (Arc::clone(replication), key.clone());
+            let _ = crate::time::spawn_blocking(move || worker.quiesce_released(&task_key)).await;
+        }
+        // Take the tombstone first, under the purge turn: the retry task
+        // then cannot purge the replica this restore reads.
+        let _turn = match &replication {
+            Some(replication) => Some(replication.purge_turn().lock().await),
+            None => None,
+        };
+        let claimed = match &replication {
+            Some(replication) => self.claim_tombstone(replication, key).await?,
+            None => None,
+        };
+        let path = self.path_of(key);
+        let restored = match (&mode, &replication) {
+            (ShipMode::Rebuild, _) => self.rebuild_in_place(key, &path).await,
+            (_, Some(replication)) => {
+                let (fleet, replication, task_key, task_path) = (
+                    self.clone(),
+                    Arc::clone(replication),
+                    key.clone(),
+                    path.clone(),
+                );
+                let generations = matches!(mode, ShipMode::Generations { .. });
+                crate::time::spawn_blocking(move || {
+                    check_contained(fleet.root(), &task_path)?;
+                    if generations {
+                        fleet
+                            .restore_generation_in_place(
+                                &replication,
+                                &task_key,
+                                target,
+                                &task_path,
+                                None,
+                            )
+                            .map(|_| None)
+                    } else {
+                        restore_in_place(fleet.root(), &replication, &task_key, target, &task_path)
+                            .map(Some)
+                    }
+                })
+                .await
+                .map_err(|error| FleetError::Restore {
+                    name: key.name(),
+                    detail: error.to_string(),
+                })
+                .and_then(|r| r)
+            }
+            (_, None) => Err(FleetError::NotReplicated { name: key.name() }),
+        };
+        if let Some(replication) = &replication {
+            match (&restored, claimed) {
+                (Ok(_), _) => self.forget_marker(replication, key).await,
+                // Nothing came back: the tombstone stays.
+                (Err(_), Some(row)) => {
+                    if let Some(tombstones) = replication.tombstones()
+                        && let Err(error) = tombstones.put(&row).await
+                    {
+                        tracing::error!(database = %key, %error, "fleet restore failed and its tombstone could not be put back");
+                    }
+                }
+                (Err(_), None) => {}
+            }
+        }
+        restored
+    }
+
+    /// Rebuild the database at `path` from its source. A rebuild replaces a
+    /// database: it never brings back a deleted one.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::NotFound`] when no database is at `path`, or the error
+    /// of [`FleetEngine::rebuild`].
+    pub(super) async fn rebuild_in_place(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+    ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
+        check_contained(self.root(), path)?;
+        // The path lock across the check and the rebuild: a delete in another
+        // process waits, so the rebuild never brings back a deleted database.
+        let (root, name) = (self.root().to_path_buf(), key.name());
+        let _lock = crate::time::spawn_blocking(move || super::PathLock::acquire(&root, &name))
+            .await
+            .map_err(|error| FleetError::Restore {
+                name: key.name(),
+                detail: error.to_string(),
+            })??;
+        if !self.inner.engine.exists(path) {
+            return Err(FleetError::NotFound { name: key.name() });
+        }
+        self.inner.engine.rebuild(key, path).await.map(|()| None)
+    }
+
+    /// An explicit restore of `key` starts: take its tombstone row, so the
+    /// retry task does not purge the replica meanwhile. The caller puts it
+    /// back if the restore fails.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Restore`] when the row cannot be read or dropped. The
+    /// restore does not start: a row left next to the restored file would
+    /// block its later restore.
+    async fn claim_tombstone(
+        &self,
+        replication: &crate::db::fleet_replication::FleetReplication,
+        key: &FleetDbKey,
+    ) -> Result<Option<crate::db::fleet_tombstones::Tombstone>, FleetError> {
+        let Some(tombstones) = replication.tombstones() else {
+            return Ok(None);
+        };
+        let name = key.name();
+        let failed = |error: crate::db::fleet_tombstones::TombstoneError| FleetError::Restore {
+            name: name.clone(),
+            detail: format!("could not take the tombstone: {error}"),
+        };
+        let row = tombstones.get(&name).await.map_err(failed)?;
+        if row.is_some() {
+            tombstones.remove(&name).await.map_err(failed)?;
+        }
+        Ok(row)
+    }
+
+    /// An explicit restore brought `key` back: remove its marker, so other
+    /// hosts restore it again.
+    async fn forget_marker(
+        &self,
+        replication: &Arc<crate::db::fleet_replication::FleetReplication>,
+        key: &FleetDbKey,
+    ) {
+        let (worker, marker_key) = (Arc::clone(replication), key.clone());
+        let removed = crate::time::spawn_blocking(move || worker.delete_marker(&marker_key)).await;
+        if let Ok(Err(error)) = removed {
+            tracing::warn!(database = %key, %error, "fleet restore: could not remove the tombstone marker");
+        }
     }
 
     /// Before the shutdown closes the databases: bound the final ship of
@@ -649,13 +968,19 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             .join(crate::fleet_layout::RESERVED_DIR)
             .join(RESTORE_CHECK_DIR);
         let checker = Arc::clone(&replication);
+        let generations = matches!(self.inner.engine.ship_mode(), ShipMode::Generations { .. });
         let now = replication.now();
         let mut report = crate::time::spawn_blocking(move || {
             // A process that died during a check leaves its files.
             sweep_scratch(&scratch, now);
             let mut report = crate::db::fleet_replication::RestoreCheckReport::default();
             for key in keys {
-                match checker.check_restore(&key, &scratch) {
+                let outcome = if generations {
+                    super::generations::check_restore(&checker, &key, &scratch)
+                } else {
+                    checker.check_restore(&key, &scratch)
+                };
+                match outcome {
                     crate::db::fleet_replication::RestoreCheck::Passed => {
                         report.passed.push(key.name());
                     }

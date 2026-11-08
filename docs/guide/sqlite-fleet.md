@@ -42,6 +42,8 @@ idle_close_secs = 300           # close a database idle this long
 # replica_retention_after_delete = "0s"  # see "Deleting a database's replica"
 # restore_check_sample = 1      # see "Restore check"
 # replication_workers = 4       # see "Replication lag"
+# mmap_size = 0                 # bytes; see "Memory-mapped reads"
+# cache_size_kib = 0            # KiB; 0 = SQLite default
 
 # [database.fleet.ownership]    # see "Failover: slot ownership" below
 # owner = "host-a"
@@ -692,17 +694,31 @@ the [cell router](cell-isolation.md).
 | Lose | The host closes every open database of the range. The close does not wait for workers, but it waits for connections that are in use. The sweeper and the fan-outs skip the range. |
 | Lease length | A lease never ends earlier than an older call set it. If you make `lease_secs` shorter, the new length applies when the old lease ends. |
 | Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after it sent its last renew. This is before the lease in the table ends. |
-| Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. A replicator reads the epochs at the destination at each new generation and every 60 s. If it finds a newer epoch, it stops, and the host loses the range. |
+| Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. Before each write to the replica, core reads the epochs at the destination: one list for each put. If it finds a newer epoch, the write is refused, the replicator stops, and the host loses the range. |
 | Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped. The next owner can then claim them at once. In all other cases, the leases end on their own. |
 
 The ownership table is `_autumn_fleet_slot_owners` on the control database.
 All hosts of the fleet must use the same table. The control database is a
 local SQLite file, so the built-in table fences only the processes of one
-host. For hosts on different machines, implement `SlotOwnershipStore` (in
-`autumn_web::db::fleet_ownership`) on a store that all hosts reach. Then
-start a `FleetOwnership` with `DatabaseFleet::start_ownership` (it takes the
-volume lock, then claims), and start `DatabaseFleet::spawn_ownership` before
-the first request.
+host. For hosts on different machines, give boot a store that all hosts
+reach:
+
+```rust,ignore
+use autumn_web::db::fleet_ownership::PgSlotOwnership;
+
+autumn_web::app()
+    .fleet_ownership_store(PgSlotOwnership::new(pg_pool, clock))
+    .run()
+    .await;
+```
+
+`PgSlotOwnership` keeps the table in Postgres. It needs the `postgres`
+feature next to `sqlite`. Each call is one transaction that locks the table,
+so two hosts that race a claim get one owner. Boot calls `ensure_schema` on
+the store before the first claim. You can also implement
+`SlotOwnershipStore` (in `autumn_web::db::fleet_ownership`) on another
+store. One store holds the ownership of one fleet. Do not give two fleets
+one store: the release of one fleet ends the lease of the other.
 
 ### The failover procedure
 
@@ -783,6 +799,162 @@ selects that generation.
 Do not restore the control database to an earlier time while ownership is
 on. If its epoch counter goes back, the next claim after a fence still goes
 above the epoch that the replicator found.
+
+## Memory-mapped reads
+
+`database.fleet.mmap_size` and `database.fleet.cache_size_kib` tune the
+fleet databases. They are separate from `database.mmap_size` and
+`database.cache_size_kib`, which tune only the control database. All four are
+off by default.
+
+For most fleets, keep these values at 0. A fleet file is small. SQLite keeps
+its pages in its cache. A fleet of 384 small files saw no change with
+mmap on.
+
+Turn on `mmap_size` only for a fleet of large, read-heavy files. Read
+[Memory-mapped reads](./sqlite-in-production.md#memory-mapped-reads-and-the-page-cache)
+first: an I/O error on a mapped file stops the process with `SIGBUS`.
+
+Each open database maps its file once for each connection. The worst case is
+`mmap_size` × `max_open` × `pool_size`. `max_open` is a soft limit, so a burst
+can map more. On a 32-bit target, config validation refuses a worst case over
+1 GiB, with the control database included.
+
+Replication, `restore_missing`, LRU close and reopen work with mmap on. A
+close drops the pool, and its connections unmap the file.
+## Writing a fleet extractor
+
+A plugin that runs a fleet of another engine (DuckDB, RocksDB) writes a
+`FleetEngine` and one extractor. The extractor calls
+`autumn_web::fleet::resolve`. That function runs these steps:
+
+1. It finds the routing key: a `ShardKeyOverride`, then the tenant.
+2. It makes the database key from the routing key.
+3. It checks that this host owns the slot. If not, it returns `421`
+   (`NotOwner`) and does not touch the disk.
+4. It opens the database. If the fleet creates on demand, it makes a
+   missing database.
+
+It returns a `FleetLease`. While the lease lives, the fleet does not close
+the database. The lease drops at the end of the handler, so the fleet can
+then evict the database.
+
+```rust,ignore
+use autumn_web::fleet::FleetLease;
+
+pub struct FleetDuckDb(FleetLease<DuckDbEngine>);
+
+impl FromRequestParts<AppState> for FleetDuckDb {
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, AutumnError> {
+        autumn_web::fleet::resolve::<DuckDbEngine>(parts, state)
+            .await
+            .map(Self)
+            .map_err(AutumnError::from)
+    }
+}
+```
+
+Core has no generic extractor. Each plugin names its own and maps its own
+errors.
+
+- **The fleet.** `resolve::<E>` uses the `DatabaseFleet<E>` in the app
+  state. Put it there with `state.insert_extension(fleet)`, for example in a
+  `state_initializer`. Without it, `resolve` returns `503` (`NoFleet`). With
+  `sqlite`, `resolve::<SqliteEngine>` also finds the fleet of
+  `[database.fleet]`.
+- **Jobs and tasks.** `resolve_key::<E>(state, tenant_id)` is the same path
+  with no request.
+- **No routing key.** A request with no tenant returns `400`
+  (`NoRoutingKey`). An app state with no config returns `503`.
+- **Ownership.** `autumn_web::fleet::ownership_store(state)` returns the store
+  of `fleet_ownership_store`, else the SQL store of the control database.
+  Give it to `FleetOwnership::new`, then call `DatabaseFleet::start_ownership`
+  and `DatabaseFleet::spawn_ownership` before the first request.
+
+### Sidecar engines
+
+A sidecar engine follows the keys of another fleet. For example, it keeps a
+DuckDB file next to each tenant's SQLite file. Install a `FleetLifecycle` on
+that fleet:
+
+- `on_open` and `on_close` get the `FleetDatabase`. `db.epoch()` is the
+  ownership epoch the database opened under.
+- `db.sidecar_replica("duckdb")` gives a `ScopedDestination` at
+  `<key prefix>/duckdb/`, next to the primary's replica. It refuses every key
+  outside that prefix. It is `None` when the fleet does not replicate.
+- A sidecar name is 1 to 32 bytes of `a-z`, `0-9`, `_` and `-`. The names
+  `generations`, `epochs` and `tombstone` are reserved.
+- Put each copy under `generations/<id>/` of the scope. Make the id with
+  `autumn_web::replication::segment::generation_id`.
+- A purge after a delete removes the sidecar's objects. It keeps the
+  generations of a newer database with the same key, and removes every
+  other object of the scope.
+- The scope refuses writes after the database closes, and after a fence, a
+  delete or a restore. Each write also checks the epoch: once this host
+  loses the slot, the scope refuses writes at once. Before each write, the
+  scope also reads the epoch markers of the primary's replica. A newer
+  marker refuses the write with `DestinationError::Fenced`. Ship the last
+  files in `on_close`. Reads still work.
+
+### Shipping a plugin engine
+
+`FleetEngine::ship_mode` tells core how the databases get to object
+storage. Core does every write to the replica. The engine only gives files.
+
+| Mode | What core does | RPO |
+| --- | --- | --- |
+| `Continuous(_)` | Ships the changes as they commit. Only `SqliteEngine` (WAL shipping). `ContinuousShipper` is sealed. | `sync_interval` |
+| `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
+| `Rebuild` | Ships nothing. `restore_latest` calls `FleetEngine::rebuild`. | none |
+
+Install replication as for `SQLite`:
+`fleet.install_replication(Arc::new(FleetReplication::new(..)))`. The mode
+decides what it starts. Replication needs the `sqlite` feature: it keeps
+the tombstones on the `SQLite` control database. `FleetStats` and the `replication:fleet` health
+indicator report `ship_mode` and the RPO (`rpo_secs`, `rpo_seconds`).
+
+A generation of `Generations` mode is these objects:
+
+```text
+<key prefix>/epochs/<epoch>                    the epochs that wrote here
+<key prefix>/generations/<id>/epoch-<epoch>
+<key prefix>/generations/<id>/files/<sha256>   files new in this generation
+<key prefix>/generations/<id>/manifest.json    written last
+```
+
+- **Unchanged files.** The manifest names, for each file, the generation
+  that holds its content. A file with no change is not shipped again. A
+  snapshot with no change ships nothing. So a snapshot of unchanged data
+  must be the same bytes.
+- **Prune.** Core keeps the two newest generations, and each generation
+  that their manifests name.
+- **Fence.** Before each write, core reads the epoch markers. A newer
+  epoch refuses the write (`FleetError::Fenced`, `421`), and this host
+  loses the slot. This holds in every mode.
+- **Restore.** A missing database with `restore_missing` takes the newest
+  generation, by epoch and then by time. Core checks the SHA-256 and the
+  length of each file. The tombstone rules apply as for `SQLite`: a delete
+  blocks the restore.
+- **Fail-back.** Return the stamp from `FleetEngine::epoch_stamp`. When the
+  replica holds a newer epoch of another owner, core restores the database
+  before the open. With `None`, core counts the stamp as 0: it restores at
+  each new epoch that another owner wrote.
+- **Epoch marker.** A new owner writes its epoch marker when it opens the
+  database, before its first generation. From then on, each write of the
+  old owner is refused.
+- **Snapshot shape.** A snapshot is one database: one file, or one
+  directory of files. Core refuses two paths that are the same.
+- **Operators.** `DatabaseFleet::ship_now(key)` ships an open database now.
+  `DatabaseFleet::restore_latest(key)` restores from the newest replica, in
+  every mode. Within the retention, it undoes a delete.
+
+`plugin_conformance::fleet` checks the engine side. `fleet-fenced-ship`
+and `fleet-unchanged-files` need a fixture that installs replication.
 
 ## Limits
 

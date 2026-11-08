@@ -53,6 +53,9 @@ const CREATE_SCHEMA: &str = include_str!("../migrations/20260419000000_create_re
 const ADD_AVATAR: &str = include_str!("../migrations/20260427000000_add_user_avatar/up.sql");
 const POLYMORPHIC_COMMENTS: &str =
     include_str!("../migrations/20260820000000_polymorphic_comments/up.sql");
+// The top-level comment index the paged read uses (#3325).
+const TOP_LEVEL_INDEX: &str =
+    include_str!("../migrations/20261106180844_comments_top_level_index/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
@@ -119,6 +122,9 @@ async fn setup_schema(conn: &mut AsyncPgConnection) {
     conn.batch_execute(POLYMORPHIC_COMMENTS)
         .await
         .expect("make comments polymorphic");
+    conn.batch_execute(TOP_LEVEL_INDEX)
+        .await
+        .expect("add the top-level comment index");
 }
 
 async fn seed_user(conn: &mut AsyncPgConnection, username: &str) -> i64 {
@@ -552,4 +558,49 @@ async fn the_migration_backfills_existing_post_comments() {
         vec![(0, "old one".to_owned()), (0, "old two".to_owned())],
         "pre-migration comments must survive the re-key"
     );
+}
+
+/// #3325: the post page reads its thread one page of top-level comments at a
+/// time. A page holds every reply under its comments, and `next` names the
+/// page after it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn post_thread_reads_in_pages() {
+    let (_pg, pool) = start_postgres().await;
+    let mut conn = pool.get().await.expect("conn");
+    setup_schema(&mut conn).await;
+    let ada = seed_user(&mut conn, "ada").await;
+    let sub = seed_subreddit(&mut conn, ada).await;
+    let post = seed_post(&mut conn, ada, sub).await;
+
+    let posts = PgPostRepository::with_pool_untracked(pool.clone());
+    let first_root = posts
+        .add_comment(post, ada, "one", None)
+        .await
+        .expect("one");
+    posts
+        .add_comment(post, ada, "two", None)
+        .await
+        .expect("two");
+    posts
+        .add_comment(post, ada, "a reply", Some(first_root.id))
+        .await
+        .expect("reply");
+
+    let first = posts
+        .comment_thread_page(post, None, 1)
+        .await
+        .expect("first page");
+    assert_eq!(
+        flatten(&first.nodes),
+        vec![(0, "one".to_owned()), (1, "a reply".to_owned())]
+    );
+    assert_eq!(first.next, Some(first_root.id));
+
+    let second = posts
+        .comment_thread_page(post, first.next, 1)
+        .await
+        .expect("second page");
+    assert_eq!(flatten(&second.nodes), vec![(0, "two".to_owned())]);
+    assert_eq!(second.next, None);
 }

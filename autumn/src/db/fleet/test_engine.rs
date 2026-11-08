@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::db::fleet::FleetError;
 use crate::db::fleet_engine::{FleetEngine, ShipMode};
@@ -14,6 +15,10 @@ use crate::lock::FencingToken;
 
 /// A file engine. Each open database holds `bytes` of memory.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag breaks one rule for the kit"
+)]
 pub struct TextEngine {
     pub bytes: u64,
     /// When set, `open` does not check the key. A broken engine for the kit.
@@ -22,7 +27,13 @@ pub struct TextEngine {
     pub skip_epoch: bool,
     /// When set, `remove` removes nothing.
     pub keep_on_remove: bool,
+    /// When set, each snapshot adds a new line, also with no write.
+    pub noisy_snapshot: bool,
+    /// `Some`: `ShipMode::Generations` with this interval. `None`:
+    /// `ShipMode::Rebuild`.
+    pub every: Option<Duration>,
     pub opens: AtomicU64,
+    pub snapshots: AtomicU64,
 }
 
 impl TextEngine {
@@ -32,7 +43,10 @@ impl TextEngine {
             skip_identity: false,
             skip_epoch: false,
             keep_on_remove: false,
+            noisy_snapshot: false,
+            every: None,
             opens: AtomicU64::new(0),
+            snapshots: AtomicU64::new(0),
         }
     }
 
@@ -164,6 +178,15 @@ impl FleetEngine for TextEngine {
         })?;
         let copy = dir.join(file);
         std::fs::copy(path, &copy).map_err(io("snapshot database"))?;
+        let n = self.snapshots.fetch_add(1, Ordering::Relaxed);
+        if self.noisy_snapshot {
+            let mut text = std::fs::read_to_string(&copy).map_err(io("snapshot database"))?;
+            {
+                use std::fmt::Write as _;
+                let _ = writeln!(text, "noise {n}");
+            }
+            std::fs::write(&copy, text).map_err(io("snapshot database"))?;
+        }
         Ok(vec![copy])
     }
 
@@ -183,6 +206,22 @@ impl FleetEngine for TextEngine {
     }
 
     fn ship_mode(&self) -> ShipMode {
-        ShipMode::Rebuild
+        self.every
+            .map_or(ShipMode::Rebuild, |every| ShipMode::Generations { every })
+    }
+
+    fn epoch_stamp(&self, _key: &FleetDbKey, path: &Path) -> Result<Option<u64>, FleetError> {
+        let text = std::fs::read_to_string(path).map_err(io("read database"))?;
+        Ok(Some(
+            text.lines().nth(1).unwrap_or("0").parse().unwrap_or(0),
+        ))
+    }
+
+    /// Writes a database that holds one value, `rebuilt`.
+    async fn rebuild(&self, key: &FleetDbKey, path: &Path) -> Result<(), FleetError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(io("create directory"))?;
+        }
+        std::fs::write(path, format!("{}\n0\nrebuilt\n", key.name())).map_err(io("rebuild"))
     }
 }

@@ -6,10 +6,10 @@
 use diesel_async::pooled_connection::deadpool::Pool;
 
 use super::{
-    Arc, AtomicBool, AtomicU64, DatabaseFleet, DatabaseFleetConfig, DrainGuard, Duration,
-    FleetDatabase, FleetDbKey, FleetEngine, FleetError, HashMap, MutationGuard, Ordering, Path,
-    PathBuf, ShipMode, check_contained, discard_staging, fmt, io_error, prune_empty_dirs,
-    removal_error, staging_path, with_path_lock,
+    Arc, AtomicBool, AtomicU64, DatabaseFleet, DatabaseFleetConfig, Duration, FleetDatabase,
+    FleetDbKey, FleetEngine, FleetError, HashMap, MutationGuard, Ordering, Path, PathBuf, ShipMode,
+    check_contained, discard_staging, fmt, io_error, prune_empty_dirs, removal_error, staging_path,
+    with_path_lock,
 };
 use crate::db::RuntimeConnection;
 use crate::migrate::EmbeddedMigrations;
@@ -38,6 +38,8 @@ pub struct SqliteEngine {
     root: PathBuf,
     pool_size: usize,
     connect_timeout_secs: u64,
+    /// `mmap_size` and `cache_size` of each database connection.
+    tuning: crate::db::SqliteTuning,
     migrations: Arc<FleetMigrations>,
     replicating: AtomicBool,
     migrations_applied: AtomicU64,
@@ -57,12 +59,14 @@ impl SqliteEngine {
         root: &Path,
         pool_size: usize,
         connect_timeout_secs: u64,
+        tuning: crate::db::SqliteTuning,
         migrations: FleetMigrations,
     ) -> Self {
         Self {
             root: root.to_path_buf(),
             pool_size: pool_size.max(1),
             connect_timeout_secs,
+            tuning,
             migrations: Arc::new(migrations),
             replicating: AtomicBool::new(false),
             migrations_applied: AtomicU64::new(0),
@@ -165,6 +169,7 @@ impl FleetEngine for SqliteEngine {
             self.pool_size,
             self.connect_timeout_secs,
             crate::db::SqliteCheckpointOwner::Fleet(self.replicating.load(Ordering::Acquire)),
+            self.tuning,
         )
         .map_err(|e| FleetError::Unavailable {
             name: name.clone(),
@@ -228,7 +233,11 @@ impl FleetEngine for SqliteEngine {
     }
 
     fn ship_mode(&self) -> ShipMode {
-        ShipMode::Continuous
+        ShipMode::Continuous(Arc::new(crate::db::fleet_engine::WalShipper))
+    }
+
+    fn epoch_stamp(&self, key: &FleetDbKey, path: &Path) -> Result<Option<u64>, FleetError> {
+        read_epoch_stamp(path, &key.name()).map(Some)
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -615,7 +624,13 @@ impl DatabaseFleet<SqliteEngine> {
         migrations: FleetMigrations,
     ) -> Result<Self, FleetError> {
         Self::from_config(config, |root| {
-            SqliteEngine::new(root, config.pool_size, connect_timeout_secs, migrations)
+            SqliteEngine::new(
+                root,
+                config.pool_size,
+                connect_timeout_secs,
+                config.sqlite_tuning(),
+                migrations,
+            )
         })
     }
 
@@ -625,24 +640,15 @@ impl DatabaseFleet<SqliteEngine> {
         self.inner.engine.pool_size
     }
 
-    /// Replicate every database this fleet opens from now on (ADR 0019 §5).
-    ///
-    /// Databases open with `wal_autocheckpoint = 0` and `replication` is
-    /// their only checkpointer; it registers on open and ships the last frames
-    /// on close. Install before the first open, once.
-    ///
-    /// # Errors
-    ///
-    /// The replication that is already installed, when called twice.
-    pub fn install_replication(
+    /// Start WAL shipping: databases open with `wal_autocheckpoint = 0`,
+    /// and `replication` is their only checkpointer. It registers on open
+    /// and ships the last frames on close.
+    pub(super) fn attach_wal_shipping(
         &self,
         replication: Arc<crate::db::fleet_replication::FleetReplication>,
-    ) -> Result<(), Arc<crate::db::fleet_replication::FleetReplication>> {
-        self.inner.replication.set(Arc::clone(&replication))?;
+    ) {
         self.inner.engine.replicating.store(true, Ordering::Release);
         self.add_lifecycle(replication);
-        self.wire_fence_hook();
-        Ok(())
     }
 
     /// A lake over this fleet's replicas (issue #3236). It carries the
@@ -927,125 +933,12 @@ impl DatabaseFleet<SqliteEngine> {
         key: &FleetDbKey,
         target: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<crate::replication::RestoreOutcome, FleetError> {
-        self.check_key(key)?;
-        let (fleet, key, name) = (self.clone(), key.clone(), key.name());
-        let counted = self.admit_mutation(&key)?;
-        tokio::spawn(async move {
-            let _counted = counted;
-            fleet.restore_owned(&key, target).await
-        })
-        .await
-        .map_err(|error| FleetError::Restore {
-            name,
-            detail: error.to_string(),
-        })?
-    }
-
-    async fn restore_owned(
-        &self,
-        key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<crate::replication::RestoreOutcome, FleetError> {
-        let replication = self
-            .inner
-            .replication
-            .get()
-            .cloned()
-            .ok_or_else(|| FleetError::NotReplicated { name: key.name() })?;
-        loop {
-            if let Some((key, entry, drain)) = self.begin_exclusive(key, false)? {
-                let _finish = DrainGuard {
-                    fleet: self,
-                    key: key.clone(),
-                    drain,
-                };
-                let db = self.take_database(entry).await;
-                self.drain(&key, db, false).await;
-                for hook in self.hooks() {
-                    hook.release(&key);
-                }
-                let path = self.path_of(&key);
-                let root = self.inner.root.clone();
-                let restore_key = key.clone();
-                // Take the tombstone first, under the purge turn: the retry
-                // task then cannot purge the replica this restore reads.
-                let _turn = replication.purge_turn().lock().await;
-                let claimed = self.claim_tombstone(&replication, &key).await?;
-                let restore_from = Arc::clone(&replication);
-                // The guard finishes the drain whatever fails: an error that
-                // skipped it would strand every later opener of this key.
-                let restored = crate::time::spawn_blocking(move || {
-                    check_contained(&root, &path)?;
-                    restore_in_place(&root, &restore_from, &restore_key, target, &path)
-                })
-                .await
-                .map_err(|error| FleetError::Restore {
-                    name: key.name(),
-                    detail: error.to_string(),
-                })
-                .and_then(|r| r);
-                match (&restored, claimed) {
-                    (Ok(_), _) => self.forget_marker(&replication, &key).await,
-                    // Nothing came back: the tombstone stays.
-                    (Err(_), Some(row)) => {
-                        if let Some(tombstones) = replication.tombstones()
-                            && let Err(error) = tombstones.put(&row).await
-                        {
-                            tracing::error!(database = %key, %error, "fleet restore failed and its tombstone could not be put back");
-                        }
-                    }
-                    (Err(_), None) => {}
-                }
-                return restored;
-            }
-            let pending = self.lock_state().draining.get(key).cloned();
-            if let Some(pending) = pending {
-                pending.wait().await;
-            }
-        }
-    }
-
-    /// An explicit restore of `key` starts: take its tombstone row, so the
-    /// retry task does not purge the replica meanwhile. The caller puts it
-    /// back if the restore fails.
-    ///
-    /// # Errors
-    ///
-    /// [`FleetError::Restore`] when the row cannot be read or dropped. The
-    /// restore does not start: a row left next to the restored file would
-    /// block its later restore.
-    async fn claim_tombstone(
-        &self,
-        replication: &crate::db::fleet_replication::FleetReplication,
-        key: &FleetDbKey,
-    ) -> Result<Option<crate::db::fleet_tombstones::Tombstone>, FleetError> {
-        let Some(tombstones) = replication.tombstones() else {
-            return Ok(None);
-        };
-        let name = key.name();
-        let failed = |error: crate::db::fleet_tombstones::TombstoneError| FleetError::Restore {
-            name: name.clone(),
-            detail: format!("could not take the tombstone: {error}"),
-        };
-        let row = tombstones.get(&name).await.map_err(failed)?;
-        if row.is_some() {
-            tombstones.remove(&name).await.map_err(failed)?;
-        }
-        Ok(row)
-    }
-
-    /// An explicit restore brought `key` back: remove its marker, so other
-    /// hosts restore it again.
-    async fn forget_marker(
-        &self,
-        replication: &Arc<crate::db::fleet_replication::FleetReplication>,
-        key: &FleetDbKey,
-    ) {
-        let (worker, marker_key) = (Arc::clone(replication), key.clone());
-        let removed = crate::time::spawn_blocking(move || worker.delete_marker(&marker_key)).await;
-        if let Ok(Err(error)) = removed {
-            tracing::warn!(database = %key, %error, "fleet restore: could not remove the tombstone marker");
-        }
+        self.restore_to_point(key, target)
+            .await?
+            .ok_or_else(|| FleetError::Restore {
+                name: key.name(),
+                detail: "the restore wrote no SQLite database".to_owned(),
+            })
     }
 
     /// Apply pending migrations to every database on disk, at most
