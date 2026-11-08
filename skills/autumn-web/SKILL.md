@@ -3178,6 +3178,16 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   tombstone source: `markers_only()`. Each tenant is consistent on its own;
   no atomic snapshot. CLI: `autumn fleet lake q.sql --out q.csv`. Never
   pass request input as the SQL. Guide: "Query the lake".
+- Another lake format (ADR 0040 §6): implement `LakeSink` and call
+  `fleet.lake()?.load(sink)`. Core runs the inclusion rule, restores, and
+  checks the identity row. The sink gets `add(LakeMember { key, generation,
+  file })` and gives its lake from `finish()`. To keep a lake between
+  loads, return `true` from `has(key, generation)`: core calls `keep` and
+  restores nothing. At `finish`, drop each member that got neither `add`
+  nor `keep`. `LakeGeneration` holds the WAL position, so compare all of
+  it. `TAKES_SLOTS = true` gets slot databases. Keep the catalog in files
+  under the sink's own prefix, never under `<base>/fleet/`. Guide: "Lake
+  sinks".
 - The control database lives outside `root` (validation refuses it inside).
 - `[database.fleet] mmap_size` / `cache_size_kib` tune fleet files on their
   own; `[database] mmap_size` does not reach the fleet. Keep them `0` for
