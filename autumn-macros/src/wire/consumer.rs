@@ -322,6 +322,16 @@ mod tests {
     }
 
     #[test]
+    fn a_block_that_is_only_its_tail_holds_the_payload() {
+        let reads = consumer(
+            "async fn h(m: OutboxMessage, event: Local) -> R { \
+             let decoded = { m.payload_as::<ContactUpdated>()? }; let _ = decoded.email; \
+             let other = { let event = local(); event }; let _ = other.not_payload; Ok(()) }",
+        );
+        assert_eq!(names(&reads), ["email"]);
+    }
+
+    #[test]
     fn a_method_call_on_the_payload_is_not_a_read() {
         assert_eq!(
             listener(

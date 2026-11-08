@@ -584,6 +584,13 @@ impl<'a> Analyzer<'a> {
                     .map(Bound::Response)
             }
             Expr::Match(m) => self.match_passes_through(m).map(Bound::Response),
+            // `{ m.payload_as::<E>()? }`: a block that is only its tail. A
+            // block with more statements can rebind a name the tail uses, so
+            // it is not looked into.
+            Expr::Block(b) => match b.block.stmts.as_slice() {
+                [Stmt::Expr(tail, None)] => self.bound_of(tail),
+                _ => None,
+            },
             _ => None,
         }
     }
