@@ -302,6 +302,39 @@ Add the same two fields to a `DatabaseConfig` literal, or end it with
 **Automation:** `manual` — `0` keeps the old behavior, but a codemod cannot
 know if the app wants a different value.
 
+---
+
+### State: `AppState` getters are no longer `const fn`
+
+**Why:** `AppState` holds its fields behind one `Arc`, so a clone is one
+reference count (issue #3168). A `const fn` cannot read through an `Arc`.
+These getters lost `const`: `pool`, `replica_pool`, `shards`, `metrics`,
+`log_levels`, `task_registry`, `job_registry`, `config_props`,
+`metrics_source_registry`, `health_indicator_registry`, `probes`,
+`policy_registry`, `forbidden_response`, `with_forbidden_response`, `role`,
+`capabilities`, `channels`, `presence` and `collab`.
+
+**You are affected only if your code calls one of them from a `const fn`.**
+No `AppState` value can exist in a const context, so such a call cannot run.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+const fn metrics_of(state: &AppState) -> &MetricsCollector {
+    state.metrics()
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+fn metrics_of(state: &AppState) -> &MetricsCollector {
+    state.metrics()
+}
+```
+
+**Automation:** `manual` — remove `const` from the caller.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**

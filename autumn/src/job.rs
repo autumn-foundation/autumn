@@ -13470,7 +13470,7 @@ impl ShardJobWorkers {
         // control survey sets. Shard runs use a registry of their own, so
         // they do not change those gauges.
         let mut shard_state = self.state.clone();
-        shard_state.job_registry = crate::actuator::JobRegistry::new();
+        shard_state.fields_mut().job_registry = crate::actuator::JobRegistry::new();
         for job in self
             .jobs_by_name
             .read()

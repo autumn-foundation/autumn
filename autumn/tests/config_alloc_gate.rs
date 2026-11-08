@@ -91,19 +91,10 @@ fn config_arc_allocates_nothing_in_the_no_config_fallback() {
 
 /// `AppState::clone()` allocation gate.
 ///
-/// `AppState` is `Clone` and gets cloned on every hop of the ingress tower
-/// stack (`Route::call` deep-clones the boxed service beneath it, per
-/// #2193/#2198), so anything owned directly on the struct — as opposed to
-/// shared behind an `Arc` or living in the `extensions` map — is paid once
-/// per traversal, not once per request. `profile: Option<String>` and
-/// `auth_session_key: String` were the two fields still doing that: measured
-/// with a `TestApp`-built state (`profile = "test"`, `auth_session_key =
-/// "user_id"`, the same shape `per_request_allocations_stay_under_the_ceiling`
-/// below exercises), 100 clones allocate exactly 200 blocks / 1100 bytes — 2
-/// blocks per clone, one per field, deterministic across runs. Neither field
-/// is ever mutated on a live `AppState` outside the builder methods that
-/// construct one, so sharing them behind an `Arc<str>` costs nothing a
-/// request-scoped clone needs back.
+/// A request clones `AppState` several times. A clone is one reference
+/// count on the shared fields, so it must allocate nothing. This test uses a
+/// `TestApp`-built state with a profile and an auth session key, which were
+/// owned `String`s that each clone copied.
 #[test]
 fn appstate_clone_allocates_nothing_for_profile_and_auth_session_key() {
     use autumn_web::routes;
