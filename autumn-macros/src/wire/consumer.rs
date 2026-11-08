@@ -310,6 +310,18 @@ mod tests {
     }
 
     #[test]
+    fn a_struct_pattern_in_matches_reads_its_fields() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 let _ = matches!(event, ContactUpdated { email: Some(_), .. }); \
+                 let _ = matches!(&event, ContactUpdated { id, .. } if *id > event.age); Ok(()) }"
+            ),
+            ["age", "email", "id"]
+        );
+    }
+
+    #[test]
     fn a_method_call_on_the_payload_is_not_a_read() {
         assert_eq!(
             listener(

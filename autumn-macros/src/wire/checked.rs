@@ -570,7 +570,11 @@ impl<'a> Analyzer<'a> {
         if self.is_payload_turbofish(expr) {
             return Some(Bound::Response(0));
         }
-        match peel(expr) {
+        let recorded = |call: &syn::ExprMethodCall| {
+            let node = std::ptr::from_ref(call);
+            self.calls.iter().any(|c| c.node == node)
+        };
+        match peel_until(expr, &recorded) {
             Expr::Path(path) => self.lookup(&field_name(path.path.get_ident()?)),
             Expr::MethodCall(call) => {
                 let node = std::ptr::from_ref(call);
@@ -671,6 +675,25 @@ impl<'a> Analyzer<'a> {
             .last()
             .is_some_and(|s| UNEVALUATED_MACROS.contains(&s.ident.to_string().as_str()))
         {
+            return;
+        }
+        // `matches!(value, Pattern { field, .. })` is an `if let`: the
+        // pattern reads the fields it names.
+        if mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "matches")
+            && let Ok((value, pat, guard)) = mac.parse_body_with(parse_matches)
+        {
+            self.visit_expr(&value);
+            self.scopes.push(BTreeMap::new());
+            let bound = self.response_bound(&value);
+            self.bind_pattern(&pat, bound);
+            if let Some(guard) = guard {
+                self.visit_expr(&guard);
+            }
+            self.scopes.pop();
             return;
         }
         let mut reads = Vec::new();
@@ -821,6 +844,25 @@ fn field_name(ident: &Ident) -> String {
     raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
 }
 
+/// The arguments of `matches!(value, pattern if guard)`.
+fn parse_matches(
+    input: syn::parse::ParseStream<'_>,
+) -> syn::Result<(Expr, syn::Pat, Option<Expr>)> {
+    let value: Expr = input.parse()?;
+    input.parse::<Token![,]>()?;
+    let pat = syn::Pat::parse_multi_with_leading_vert(input)?;
+    let guard = if input.peek(Token![if]) {
+        input.parse::<Token![if]>()?;
+        Some(input.parse::<Expr>()?)
+    } else {
+        None
+    };
+    if input.peek(Token![,]) {
+        input.parse::<Token![,]>()?;
+    }
+    Ok((value, pat, guard))
+}
+
 /// The one name a pattern binds to the whole value: `x`, `Ok(x)`, `Some(x)`.
 fn bound_name(pat: &syn::Pat) -> Option<String> {
     match pat {
@@ -862,7 +904,16 @@ fn diverges(expr: &Expr) -> bool {
 
 /// Peel the wrappers that sit between a call and the value it produces.
 fn peel(expr: &Expr) -> &Expr {
+    peel_until(expr, &|_| false)
+}
+
+/// [`peel`], but stop at a method call `stop` accepts. A recorded endpoint
+/// call named like an adapter (`catalog.context(…)`) is a call, not an
+/// adapter.
+fn peel_until<'e>(expr: &'e Expr, stop: &dyn Fn(&syn::ExprMethodCall) -> bool) -> &'e Expr {
+    let peel = |e: &'e Expr| peel_until(e, stop);
     match expr {
+        Expr::MethodCall(e) if stop(e) => expr,
         Expr::Await(e) => peel(&e.base),
         Expr::Try(e) => peel(&e.expr),
         Expr::Paren(e) => peel(&e.expr),
@@ -1266,6 +1317,20 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].reads, ["name"]);
+    }
+
+    #[test]
+    fn an_endpoint_named_like_an_adapter_is_still_a_call() {
+        // `context` and `ok` are adapter names to `peel`, but here they are
+        // the client's own endpoints.
+        let calls = calls_of(
+            "async fn page(catalog: CatalogClient) -> Result<()> { \
+             let response = catalog.context(NoBody).await?; let _ = response.email; \
+             let other = catalog.ok(NoBody).await.unwrap(); let _ = other.name; Ok(()) }",
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].reads, ["email"]);
+        assert_eq!(calls[1].reads, ["name"]);
     }
 
     #[test]
