@@ -71,8 +71,10 @@ Each workload sets `AUTUMN_ROLE` to its role. A preset reads its `pin`,
 `workers` and `mount` from `autumn.toml`, so the manifests do not repeat
 them. The image runs with `autumn.production.toml.example` as its
 `autumn.toml`. For a split app, the generator copies your `[roles.*]` presets
-into that file. It also sets `[jobs] backend`: your backend, or `postgres`
-when yours is `local`. A split role does not boot on `local`.
+and your `[jobs]` table into that file. It does not copy `jobs.redis.url`,
+because the URL can hold a password: set `AUTUMN_JOBS__REDIS__URL`. When your
+backend is `local`, it writes `postgres`: a split role does not boot on
+`local`.
 
 Only a role that serves HTTP (base `combined` or `web`) gets a Service, an
 Ingress, an Argo `Rollout` or a Flagger `Canary`. A worker serves only the

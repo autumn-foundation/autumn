@@ -90,25 +90,37 @@ pub fn runtime_role_config(dir: &Path, roles: &[ManifestRole]) -> Result<String,
         Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
         Err(_) => toml::Table::new(),
     };
-    // A split role on the in-process `local` queue does not boot.
-    let backend = table
+    // The whole `[jobs]` table of the project: queues, pins and the backend
+    // settings. A split role on the in-process `local` queue does not boot.
+    let mut jobs = table
         .get("jobs")
-        .and_then(|jobs| jobs.get("backend"))
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let backend = jobs
+        .get("backend")
         .and_then(toml::Value::as_str)
         .filter(|backend| *backend != "local")
-        .unwrap_or("postgres");
+        .unwrap_or("postgres")
+        .to_owned();
+    jobs.insert("backend".to_owned(), toml::Value::String(backend.clone()));
+    // The Redis URL can hold a password. The env var sets it.
+    if let Some(redis) = jobs.get_mut("redis").and_then(toml::Value::as_table_mut) {
+        redis.remove("url");
+    }
     let mut out = String::from(
         "\n# Process roles. Each workload sets AUTUMN_ROLE to one of them. A split\n\
-         # topology needs a jobs backend that every process shares.\n[jobs]\n",
+         # topology needs a jobs backend that every process shares.\n",
     );
-    let _ = writeln!(out, "backend = \"{backend}\"");
-    if let Some(presets) = table.get("roles") {
-        let mut wrapper = toml::Table::new();
-        wrapper.insert("roles".to_owned(), presets.clone());
-        let text = toml::to_string(&wrapper).map_err(|e| e.to_string())?;
-        out.push('\n');
-        out.push_str(&text);
+    if backend == "redis" {
+        out.push_str("# Set the Redis URL with AUTUMN_JOBS__REDIS__URL.\n");
     }
+    let mut wrapper = toml::Table::new();
+    wrapper.insert("jobs".to_owned(), toml::Value::Table(jobs));
+    if let Some(presets) = table.get("roles") {
+        wrapper.insert("roles".to_owned(), presets.clone());
+    }
+    out.push_str(&toml::to_string(&wrapper).map_err(|e| e.to_string())?);
     Ok(out)
 }
 
@@ -382,6 +394,46 @@ mod tests {
                 assert_eq!(roles.len(), expected, "{roles:?}");
             }
         }
+    }
+
+    /// The image config keeps the whole `[jobs]` table of the project, but not
+    /// the Redis URL: it can hold a password.
+    #[test]
+    fn runtime_config_keeps_the_jobs_settings_but_not_the_redis_url() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[jobs]\nbackend = \"redis\"\nqueues = [\"default\", \"critical\"]\n\
+             [jobs.redis]\nurl = \"redis://user:secret@cache:6379\"\nkey_prefix = \"shop:\"\n\
+             [roles.critical]\nbase = \"worker\"\npin = [\"critical\"]\n",
+        )
+        .unwrap();
+        let p = read_presets(dir.path()).unwrap();
+        let roles = manifest_roles(&p, &[], false).unwrap();
+        let text = runtime_role_config(dir.path(), &roles).unwrap();
+        assert!(!text.contains("secret"), "{text}");
+        assert!(text.contains("AUTUMN_JOBS__REDIS__URL"), "{text}");
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(table["jobs"]["backend"].as_str(), Some("redis"));
+        assert_eq!(table["jobs"]["redis"]["key_prefix"].as_str(), Some("shop:"));
+        assert!(table["jobs"]["redis"].get("url").is_none());
+        assert_eq!(table["jobs"]["queues"].as_array().map(Vec::len), Some(2));
+        assert!(table["roles"]["critical"]["pin"].is_array());
+    }
+
+    #[test]
+    fn runtime_config_replaces_a_local_jobs_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[jobs]\nbackend = \"local\"\nworkers = 4\n",
+        )
+        .unwrap();
+        let roles = manifest_roles(&BTreeMap::new(), &[], true).unwrap();
+        let text = runtime_role_config(dir.path(), &roles).unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(table["jobs"]["backend"].as_str(), Some("postgres"));
+        assert_eq!(table["jobs"]["workers"].as_integer(), Some(4));
     }
 
     #[test]
