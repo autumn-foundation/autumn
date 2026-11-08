@@ -1517,12 +1517,10 @@ pub fn render_app_unit(
     slot: &str,
 ) -> String {
     let unit = render_app_unit_base(cfg, release_dir, app_port, slot);
-    if cfg.role.is_none() {
-        return unit;
-    }
-    // A group host reads its role from the release dir, after the shared env
-    // file, so the role wins. A rollback then runs the release with the role it
-    // shipped with. `-`: a release with no role file runs the configured role.
+    // A host reads its role from the release dir, after the shared env file,
+    // so the role wins. A rollback then runs the release with the role it
+    // shipped with, also when the config has no groups now. `-`: a release with
+    // no role file runs the configured role.
     let shared = format!("EnvironmentFile={}\n", cfg.env_file());
     unit.replacen(
         &shared,
@@ -7198,13 +7196,11 @@ mod tests {
         let at_role = unit.find(role).expect("role file");
         assert!(at_shared < at_role, "the role file must win: {unit}");
 
+        // A host with no group still reads the role file of its release, so a
+        // rollback to a release from a grouped deploy keeps that role.
         let plain = ResolvedFleet::resolve(&fleet_cfg(&["a", "b"]), "myapp").unwrap();
         let plain_unit = render_app_unit(&plain.hosts[0], release_dir, 3001, "blue");
-        assert!(!plain_unit.contains("role.env"), "{plain_unit}");
-        assert_eq!(
-            plain_unit,
-            render_app_unit_base(&plain.hosts[0], release_dir, 3001, "blue")
-        );
+        assert!(plain_unit.contains(role), "{plain_unit}");
     }
 
     #[test]

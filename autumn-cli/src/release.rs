@@ -580,11 +580,21 @@ pub fn plan_output(
         Vec::new()
     };
 
+    let runtime_roles = if role_set.is_empty() {
+        String::new()
+    } else {
+        crate::release_roles::runtime_role_config(dir, &role_set).map_err(ReleaseError::Roles)?
+    };
     let mut files: Vec<(String, String)> = planned_files(target)
         .into_iter()
         .map(|(name, template)| {
             let content = render(template, project_name, embed, split_workers);
-            let content = crate::release_roles::fill_role_blocks(&content, &role_set, project_name);
+            let mut content =
+                crate::release_roles::fill_role_blocks(&content, &role_set, project_name);
+            // The image runs with this file as its autumn.toml.
+            if name == "autumn.production.toml.example" {
+                content.push_str(&runtime_roles);
+            }
             (name.to_owned(), content)
         })
         .collect();
@@ -11704,6 +11714,48 @@ esac
     fn fly_needs_a_role_that_serves_http() {
         let err = render_demo(Target::Fly, None, false, &["worker"]).unwrap_err();
         assert!(err.to_string().contains("serves HTTP"), "{err}");
+    }
+
+    /// The image copies the production example to `/app/autumn.toml`, so it
+    /// must declare the presets the workloads name, and a shared queue.
+    #[test]
+    fn the_runtime_config_declares_the_roles_of_the_workloads() {
+        for target in [Target::Kubernetes, Target::Fly] {
+            let toml_text = format!("{GOLDEN_ROLES_TOML}[jobs]\nbackend = \"redis\"\n");
+            let files = render_demo(target, Some(&toml_text), false, &[]).unwrap();
+            let example = kubernetes_file(&files, "autumn.production.toml.example");
+            let table: toml::Table = toml::from_str(&example).expect("example parses");
+            let presets: std::collections::BTreeMap<String, autumn_web::config::RolePreset> =
+                table["roles"].clone().try_into().expect("roles parse");
+            assert_eq!(
+                presets["marketing"].base,
+                autumn_web::config::ProcessRole::Web
+            );
+            assert_eq!(
+                presets["marketing"].mount.as_deref(),
+                Some(&["marketing".to_owned()][..])
+            );
+            assert_eq!(
+                table["jobs"]["backend"].as_str(),
+                Some("redis"),
+                "{example}"
+            );
+        }
+        let split = render_demo(Target::Kubernetes, None, true, &[]).unwrap();
+        let example = kubernetes_file(&split, "autumn.production.toml.example");
+        let table: toml::Table = toml::from_str(&example).expect("example parses");
+        assert_eq!(
+            table["jobs"]["backend"].as_str(),
+            Some("postgres"),
+            "a split app needs a shared queue"
+        );
+        let combined = render_demo(Target::Kubernetes, None, false, &[]).unwrap();
+        let plain = render_demo(Target::Default, None, false, &[]).unwrap();
+        assert_eq!(
+            kubernetes_file(&combined, "autumn.production.toml.example"),
+            kubernetes_file(&plain, "autumn.production.toml.example"),
+            "a combined app keeps the example as it is"
+        );
     }
 
     #[test]

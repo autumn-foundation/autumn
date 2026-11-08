@@ -7,7 +7,8 @@
   Service, an Ingress, an Argo Rollout or a Flagger Canary. The Kustomize base
   lists one component per role. `--target fly` writes one `[processes]` entry
   per role. The role set comes from `[roles.*]`, `--split-workers` or the new
-  `--roles`. See [Kubernetes](docs/guide/kubernetes.md#one-workload-per-role).
+  `--roles`. For a split app, `autumn.production.toml.example` (the image
+  config) gets the `[roles.*]` presets and a shared `[jobs] backend`. See [Kubernetes](docs/guide/kubernetes.md#one-workload-per-role).
 - **deploy:** `[[deploy.groups]]` puts a role on a group of fleet hosts. Each
   release dir gets a `role.env` with `AUTUMN_ROLE`, so a rollback runs the old
   release with its own role. Preflight fails an undeclared role, and a split

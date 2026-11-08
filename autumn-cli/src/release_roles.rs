@@ -72,6 +72,46 @@ pub fn read_presets(dir: &Path) -> Result<BTreeMap<String, RolePreset>, String> 
     Ok(presets)
 }
 
+/// The config the image needs to run the workload roles. The image copies
+/// the production example to `/app/autumn.toml`, so the example must declare
+/// each `[roles.<name>]` preset and a jobs backend that every process shares.
+///
+/// A `combined` app alone gets no text.
+///
+/// # Errors
+///
+/// Returns a message when `autumn.toml` does not parse.
+pub fn runtime_role_config(dir: &Path, roles: &[ManifestRole]) -> Result<String, String> {
+    if roles.len() == 1 && roles[0].name == "combined" {
+        return Ok(String::new());
+    }
+    let path = dir.join("autumn.toml");
+    let table: toml::Table = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(_) => toml::Table::new(),
+    };
+    // A split role on the in-process `local` queue does not boot.
+    let backend = table
+        .get("jobs")
+        .and_then(|jobs| jobs.get("backend"))
+        .and_then(toml::Value::as_str)
+        .filter(|backend| *backend != "local")
+        .unwrap_or("postgres");
+    let mut out = String::from(
+        "\n# Process roles. Each workload sets AUTUMN_ROLE to one of them. A split\n\
+         # topology needs a jobs backend that every process shares.\n[jobs]\n",
+    );
+    let _ = writeln!(out, "backend = \"{backend}\"");
+    if let Some(presets) = table.get("roles") {
+        let mut wrapper = toml::Table::new();
+        wrapper.insert("roles".to_owned(), presets.clone());
+        let text = toml::to_string(&wrapper).map_err(|e| e.to_string())?;
+        out.push('\n');
+        out.push_str(&text);
+    }
+    Ok(out)
+}
+
 /// The role set for the manifests.
 ///
 /// # Errors
