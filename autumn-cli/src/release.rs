@@ -501,11 +501,12 @@ pub fn init(
     init_with_roles(dir, project_name, force, target, split_workers, &[])
 }
 
-/// [`init`] with an explicit role list (`--roles`).
+/// Write the release files for `target`, with an explicit role list (`--roles`).
 ///
 /// # Errors
 ///
-/// As `init`, and [`ReleaseError::Roles`] when the role set is not valid.
+/// [`ReleaseError::FileExists`] when a file exists and `force` is `false`,
+/// [`ReleaseError::Roles`] when the role set is not valid, and I/O errors.
 pub fn init_with_roles(
     dir: &Path,
     project_name: &str,
