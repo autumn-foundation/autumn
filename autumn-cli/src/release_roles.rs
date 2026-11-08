@@ -262,11 +262,10 @@ pub fn fill_role_blocks(content: &str, roles: &[ManifestRole], project_name: &st
         let _ = writeln!(out, "  - ../components/{}", role.dns);
         out
     });
-    content
-        .replace("{{helm_roles}}\n", &helm_roles_yaml(roles))
-        .replace("{{kustomize_components}}\n", &components)
-        .replace("{{fly_processes}}\n", &processes)
-        .replace("{{fly_http_processes}}", &http_processes)
+    let content = replace_line(content, "{{helm_roles}}", &helm_roles_yaml(roles));
+    let content = replace_line(&content, "{{kustomize_components}}", &components);
+    let content = replace_line(&content, "{{fly_processes}}", &processes);
+    content.replace("{{fly_http_processes}}", &http_processes)
 }
 
 /// The public host of a role in the Kustomize output. Overlays replace it.
@@ -278,6 +277,30 @@ fn kustomize_host(app: &str, role: &ManifestRole) -> String {
     } else {
         format!("{app}.example.com")
     }
+}
+
+/// Replace a placeholder that fills its own line, with its line end. A
+/// Windows checkout gives the templates CRLF line ends, so both count.
+fn replace_line(text: &str, placeholder: &str, with: &str) -> String {
+    text.replace(&format!("{placeholder}\r\n"), with)
+        .replace(&format!("{placeholder}\n"), with)
+}
+
+/// Fill the role placeholders of one Kustomize component template.
+fn fill_component(template: &str, role: &ManifestRole, app: &str, resources: &str) -> String {
+    replace_line(template, "{{component_resources}}", resources)
+        .replace("{{role_object}}", &object_name(app, role))
+        .replace("{{role_host}}", &kustomize_host(app, role))
+        .replace("{{replicas}}", if role.serves_http { "2" } else { "1" })
+        .replace(
+            "{{worker_note}}",
+            if role.serves_http {
+                ""
+            } else {
+                " It serves only the probes and the actuator."
+            },
+        )
+        .replace("{{role}}", &role.name)
 }
 
 /// The Kustomize component of each role, as `(path, template)`. The release
@@ -300,28 +323,15 @@ pub fn kustomize_files(roles: &[ManifestRole], app: &str) -> Vec<(String, String
             let _ = writeln!(out, "  - {name}");
             out
         });
-        let fill = |template: &str| {
-            template
-                .replace("{{component_resources}}\n", &resources)
-                .replace("{{role_object}}", &object_name(app, role))
-                .replace("{{role_host}}", &kustomize_host(app, role))
-                .replace("{{replicas}}", if role.serves_http { "2" } else { "1" })
-                .replace(
-                    "{{worker_note}}",
-                    if role.serves_http {
-                        ""
-                    } else {
-                        " It serves only the probes and the actuator."
-                    },
-                )
-                .replace("{{role}}", &role.name)
-        };
         files.push((
             format!("{dir}/kustomization.yaml"),
-            fill(templates::KUSTOMIZE_COMPONENT),
+            fill_component(templates::KUSTOMIZE_COMPONENT, role, app, &resources),
         ));
         for (name, template) in parts {
-            files.push((format!("{dir}/{name}"), fill(template)));
+            files.push((
+                format!("{dir}/{name}"),
+                fill_component(template, role, app, &resources),
+            ));
         }
     }
     files
@@ -533,6 +543,26 @@ mod tests {
         assert_eq!(fly_blocks(&roles, "shop"), (String::new(), String::new()));
     }
 
+    /// A Windows checkout gives the templates CRLF line ends.
+    #[test]
+    fn placeholders_on_crlf_lines_are_filled() {
+        let template = "roles:\r\n{{helm_roles}}\r\ncomponents:\r\n{{kustomize_components}}\r\n\
+                        a\r\n{{fly_processes}}\r\n[http_service]\r\n{{fly_http_processes}}  x\r\n";
+        let out = fill_role_blocks(template, &split_roles(), "shop");
+        assert!(!out.contains("{{"), "{out}");
+        assert!(out.contains("  web:\n"), "{out}");
+        for (name, text) in kustomize_files(&split_roles(), "shop") {
+            assert!(!text.contains("{{component_resources}}"), "{name}");
+        }
+        let crlf_component = crate::release::templates::KUSTOMIZE_COMPONENT
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n");
+        let filled = fill_component(&crlf_component, &split_roles()[0], "shop", "  - a.yaml\n");
+        assert!(!filled.contains("{{component_resources}}"), "{filled}");
+        assert!(!filled.contains("{{role"), "{filled}");
+        assert!(filled.contains("  - a.yaml\n"), "{filled}");
+    }
+
     #[test]
     fn fill_role_blocks_leaves_other_templates_alone() {
         let text = "a: 1\n";
@@ -541,7 +571,11 @@ mod tests {
 
     #[test]
     fn kustomize_component_per_role_with_service_only_for_http() {
-        let files = kustomize_files(&split_roles(), "shop");
+        // A Windows checkout gives the templates CRLF line ends.
+        let files: Vec<(String, String)> = kustomize_files(&split_roles(), "shop")
+            .into_iter()
+            .map(|(name, text)| (name, text.replace("\r\n", "\n")))
+            .collect();
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"deploy/kustomize/components/web/service.yaml"));
         assert!(names.contains(&"deploy/kustomize/components/web/ingress.yaml"));

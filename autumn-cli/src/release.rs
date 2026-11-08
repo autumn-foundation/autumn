@@ -11501,7 +11501,13 @@ esac
             fs::write(dir.join("autumn.toml"), text).unwrap();
         }
         let roles: Vec<String> = roles.iter().map(|r| (*r).to_owned()).collect();
-        plan_output(&dir, "demo_app", target, split, &roles)
+        // A Windows checkout gives the templates CRLF line ends.
+        plan_output(&dir, "demo_app", target, split, &roles).map(|files| {
+            files
+                .into_iter()
+                .map(|(name, content)| (name, content.replace("\r\n", "\n")))
+                .collect()
+        })
     }
 
     fn golden_root() -> std::path::PathBuf {
