@@ -926,13 +926,18 @@ fn scan_tokens(
         if field == "await" {
             continue;
         }
-        // A call, a turbofish, or a macro — none of them a field read.
+        // A call, a turbofish, or a macro — none of them a field read. The
+        // `!` of `!=` is joined to its `=`: that is a comparison, so a read.
         let next = tts.get(i + 3);
-        if matches!(
-            next,
-            Some(proc_macro2::TokenTree::Group(g))
-                if g.delimiter() == proc_macro2::Delimiter::Parenthesis
-        ) || matches!(next, Some(proc_macro2::TokenTree::Punct(p)) if matches!(p.as_char(), ':' | '!'))
+        let not_equal = matches!(next, Some(proc_macro2::TokenTree::Punct(p))
+            if p.as_char() == '!' && p.spacing() == proc_macro2::Spacing::Joint)
+            && matches!(tts.get(i + 4), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '=');
+        if !not_equal
+            && (matches!(
+                next,
+                Some(proc_macro2::TokenTree::Group(g))
+                    if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+            ) || matches!(next, Some(proc_macro2::TokenTree::Punct(p)) if matches!(p.as_char(), ':' | '!')))
         {
             continue;
         }

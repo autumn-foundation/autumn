@@ -236,6 +236,18 @@ mod tests {
     }
 
     #[test]
+    fn a_read_before_not_equal_in_a_macro_is_a_read() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 assert!(event.email != None); \
+                 assert!(event.id == 1); Ok(()) }"
+            ),
+            ["email", "id"]
+        );
+    }
+
+    #[test]
     fn a_method_call_on_the_payload_is_not_a_read() {
         assert_eq!(
             listener(
