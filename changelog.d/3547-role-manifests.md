@@ -33,3 +33,10 @@
 
 - **Breaking:** `DeployConfig` has the public field `groups`. A struct
   literal must set it ([migration guide](docs/migrations/next.md)).
+
+### Fixed
+
+- **setup:** `autumn setup` and `autumn assets` now retry a download that
+  gets a 5xx or 429 answer, not only a dropped connection. They try five
+  times, with a wait of 2, 4, 8 and 16 s, so a short outage of a release
+  host does not stop the quickstart.
