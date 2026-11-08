@@ -24,11 +24,11 @@
 //! #2830, #3076) have taken it to the floor. #2830 stopped the tower
 //! layer-clone cascade at a shared pointer and removed the boxed futures of
 //! the default ingress layers: a request now allocates 98 blocks, not 133
-//! (`tests/config_alloc_gate.rs`). What remains is `AppState::clone`
-//! (all-`Arc` fields), the clones of the outer `Route` levels down to that
-//! pointer, and vendored `http`/`axum`/`sha2` internals. A shared pointer at
-//! the start of the merged tuple saves 3 more blocks, but it adds 223 MB of
-//! debug info to each app binary (#2830). Profile another
+//! (`tests/config_alloc_gate.rs`). `AppState` is one `Arc`, so a clone of it
+//! is one reference count. What remains is the clones of the outer `Route`
+//! levels down to that pointer, and vendored `http`/`axum`/`sha2` internals.
+//! A shared pointer at the start of the merged tuple saves 3 more blocks, but
+//! it adds 223 MB of debug info to each app binary (#2830). Profile another
 //! `autumn/benches/*` target instead (`collab_edit`, `ledger_post`,
 //! `markdown_render`, `pdf_render`, …).
 //!

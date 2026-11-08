@@ -154,7 +154,7 @@ ledger = "postgres"
 package = "autumn-web"
 bench = "request_pipeline"
 exempt = """Exhausted: repeated callgrind and dhat passes took it to the floor \
-(about 95.2M Ir at --iterations 300). The rest is allocator cost from the \
+(about 84.9M Ir at --iterations 300). The rest is allocator cost from the \
 tower layer-clone cascade (#2830). AGENTS.md forbids profiling it again."""
 
 [[workload]]
