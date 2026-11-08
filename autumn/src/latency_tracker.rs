@@ -6,7 +6,8 @@
 //!
 //! Samples land in log-linear buckets: four per power of two of microseconds,
 //! so a reported quantile is at most 25 % above the true value and never
-//! below it. Recording is one atomic add. Memory is fixed (128 counters), no
+//! below it. Under 4 µs the buckets are one microsecond wide, so a quantile
+//! there is rounded up to the next whole microsecond. Recording is one atomic add. Memory is fixed (128 counters), no
 //! matter how many samples arrive. Call [`LatencyTracker::decay`] on a timer
 //! to let old samples fade so the quantile tracks the recent past.
 //!
@@ -164,12 +165,21 @@ mod tests {
 
     #[test]
     fn every_bucket_bound_covers_its_samples() {
-        for micros in [1u64, 2, 3, 7, 8, 100, 1_023, 1_024, 999_999, 5_000_000] {
+        for micros in [4u64, 7, 8, 100, 1_023, 1_024, 999_999, 5_000_000] {
             let t = LatencyTracker::new();
             t.record(Duration::from_micros(micros));
             let got = u64::try_from(t.quantile(1.0).unwrap().as_micros()).unwrap();
             assert!(got >= micros, "{micros}µs reported as {got}µs");
-            assert!(got * 4 <= micros * 5 + 4, "{micros}µs reported as {got}µs");
+            assert!(got * 4 <= micros * 5, "{micros}µs reported as {got}µs");
+        }
+    }
+
+    #[test]
+    fn sub_four_micro_samples_round_up_to_the_next_microsecond() {
+        for micros in [1u64, 2, 3] {
+            let t = LatencyTracker::new();
+            t.record(Duration::from_micros(micros));
+            assert_eq!(t.quantile(1.0), Some(Duration::from_micros(micros + 1)));
         }
     }
 
