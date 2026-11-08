@@ -959,8 +959,9 @@ fn peel_until<'e>(expr: &'e Expr, stop: &dyn Fn(&syn::ExprMethodCall) -> bool) -
         Expr::Unary(e) if matches!(e.op, syn::UnOp::Deref(_)) => peel(&e.expr),
         // Methods that hand back the same value: `.unwrap()` on a call's
         // result is still that call's result, and `catalog.clone()` is still
-        // that client. An adapter that changes only the error, or only wraps
-        // the value (`.map_err(f)`, `.context(…)`, `.ok()`), keeps it too.
+        // that client. An adapter that changes only the error, only wraps the
+        // value, or only borrows it (`.map_err(f)`, `.context(…)`, `.ok()`,
+        // `.as_ref()`), keeps it too.
         Expr::MethodCall(e)
             if matches!(
                 e.method.to_string().as_str(),
@@ -975,6 +976,10 @@ fn peel_until<'e>(expr: &'e Expr, stop: &dyn Fn(&syn::ExprMethodCall) -> bool) -
                     | "ok"
                     | "ok_or"
                     | "ok_or_else"
+                    | "as_ref"
+                    | "as_mut"
+                    | "as_deref"
+                    | "as_deref_mut"
             ) =>
         {
             peel(&e.receiver)

@@ -337,10 +337,11 @@ mod tests {
             "async fn h(m: OutboxMessage) -> R { \
              let _ = m.payload_as::<ContactUpdated>().map(|event| event.email); \
              let _ = m.payload_as::<ContactUpdated>().map_or(0, |c| c.id); \
+             let _ = m.payload_as::<ContactUpdated>().as_ref().map(|event| event.name.clone()); \
              let _ = m.payload_as::<ContactUpdated>().map_err(|e| e.kind); \
              let _ = rows.iter().map(|event| event.not_payload); Ok(()) }",
         );
-        assert_eq!(names(&reads), ["email", "id"]);
+        assert_eq!(names(&reads), ["email", "id", "name"]);
     }
 
     #[test]
