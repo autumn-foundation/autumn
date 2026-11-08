@@ -21,8 +21,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::wire::ir::{
-    CallerDescriptor, ClientDescriptor, EndpointDescriptor, ResolvedEndpoint, TypeDescriptor,
-    WireTypeDescriptor,
+    CallerDescriptor, ClientDescriptor, EndpointDescriptor, EventDescriptor, ListenerDescriptor,
+    ResolvedEndpoint, TypeDescriptor, WireTypeDescriptor,
 };
 
 /// The environment variable that names the contract directory.
@@ -132,6 +132,28 @@ pub fn write_client(dir: &Path, descriptor: &ClientDescriptor) -> Result<(), Str
 /// # Errors
 /// The file cannot be written.
 pub fn write_caller(dir: &Path, descriptor: &CallerDescriptor, key: &str) -> Result<(), String> {
+    write_json(dir, &descriptor.artifact_file_name(key), descriptor)
+}
+
+/// Write one event's descriptor. `key` keeps two events with one type name
+/// in one crate apart.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn write_event(dir: &Path, key: &str, descriptor: &EventDescriptor) -> Result<(), String> {
+    write_json(dir, &descriptor.artifact_file_name(key), descriptor)
+}
+
+/// Write one event consumer's descriptor. `key` keeps two same-named
+/// functions in one crate apart.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn write_listener(
+    dir: &Path,
+    descriptor: &ListenerDescriptor,
+    key: &str,
+) -> Result<(), String> {
     write_json(dir, &descriptor.artifact_file_name(key), descriptor)
 }
 

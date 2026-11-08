@@ -58,6 +58,17 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Stable identifier used to route the event to its listeners and to name
     /// the durable listener jobs.
     const NAME: &'static str;
+
+    /// The payload's schema version, from `#[event(version = N)]`. Default 1.
+    ///
+    /// A version above 1 adds `.vN` to [`Event::NAME`], so two versions of
+    /// one event live side by side on the bus.
+    const VERSION: u32 = 1;
+
+    /// The payload's wire shape. `#[event]` sets it. It is `None` for
+    /// `#[event(opaque)]` and for a hand-written impl: a `#[listener]` then
+    /// has no table to check its reads against.
+    const SHAPE: Option<crate::wire::EventShape> = None;
 }
 
 /// How a listener is dispatched when its event is published.

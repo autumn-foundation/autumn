@@ -1743,6 +1743,9 @@ pub use autumn_macros::ws;
 
 /// Declare a typed domain event. See [`mod@events`] module.
 pub use autumn_macros::event;
+/// Check a function that reads an `#[event]` payload, such as an outbox
+/// topic handler. See [`mod@events`] module.
+pub use autumn_macros::event_consumer;
 /// Declare an on-demand background job. See [`mod@job`] module.
 pub use autumn_macros::job;
 /// Declare an event listener. See [`mod@events`] module.

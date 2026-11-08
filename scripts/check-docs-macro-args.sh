@@ -318,6 +318,8 @@ OWNERS = {
     "edge": "edge.rs",
     "endpoint": "wire/endpoint.rs",
     "event": "event.rs",
+    # One positional argument, the event type. No keys.
+    "event_consumer": "wire/consumer.rs",
     "feature_flag": "feature_flag.rs",
     "get": ("route.rs", "parse.rs"),
     "inbound_mail": "inbound_mail.rs",

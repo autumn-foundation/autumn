@@ -1,0 +1,13 @@
+error[E0609]: no field `email` on type `ContactUpdated`
+  --> tests/compile-fail/event_listener_reads_missing_field.rs:12:19
+   |
+12 |     let _ = event.email;
+   |                   ^^^^^ unknown field
+   |
+   = note: available field is: `id`
+
+error[E0080]: evaluation panicked: event contract broken in `sync_marketing`: reads field `email` of event `ContactUpdated`, which the event does not send
+  --> tests/compile-fail/event_listener_reads_missing_field.rs:12:19
+   |
+12 |     let _ = event.email;
+   |                   ^^^^^ evaluation of `sync_marketing::{closure#0}::_` failed here

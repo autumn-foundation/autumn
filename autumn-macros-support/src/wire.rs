@@ -213,6 +213,93 @@ impl CallerDescriptor {
     }
 }
 
+/// One `#[event]` payload, as the macro wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventDescriptor {
+    /// The crate that defines the event.
+    pub krate: String,
+    /// The event type's Rust name.
+    pub type_name: String,
+    /// The name from `#[event(name = "…")]`, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The schema version from `#[event(version = N)]`. Default 1.
+    pub version: u32,
+    /// `#[event(opaque)]`: the payload has no wire shape to check.
+    #[serde(default)]
+    pub opaque: bool,
+    /// A unit struct (`struct Ping;`): the payload is JSON `null`, not an
+    /// object. Its shape is empty, like an object with no fields, so this
+    /// flag tells the two apart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unit: bool,
+    /// The payload's shape. Empty when `opaque`.
+    pub shape: WireTypeDescriptor,
+}
+
+impl EventDescriptor {
+    /// The topic without its version suffix: the `name`.
+    ///
+    /// `None` for an event without `name`. It routes on `module_path!()`,
+    /// which a macro cannot see, so the bundle does not know its topic.
+    #[must_use]
+    pub fn base_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The topic: the base name, plus `.vN` when the version is above 1.
+    #[must_use]
+    pub fn topic(&self) -> Option<String> {
+        self.base_name()
+            .map(|base| versioned_topic(base, self.version))
+    }
+
+    /// The artifact file name for this event. `key` keeps two events with
+    /// one type name in one crate apart.
+    #[must_use]
+    pub fn artifact_file_name(&self, key: &str) -> String {
+        format!(
+            "event.{}.{}.v{}.{key}.json",
+            self.krate, self.type_name, self.version
+        )
+    }
+}
+
+/// `base` for version 1, else `base.vN`.
+///
+/// Version 1 keeps the bare name, so an event that adds `version` keeps its
+/// topic.
+#[must_use]
+pub fn versioned_topic(base: &str, version: u32) -> String {
+    if version > 1 {
+        format!("{base}.v{version}")
+    } else {
+        base.to_owned()
+    }
+}
+
+/// One consumer of an event: a `#[listener]` or an `#[event_consumer]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerDescriptor {
+    /// The crate that holds the consumer.
+    pub krate: String,
+    /// The consumer function's name.
+    pub function: String,
+    /// The event type's path, as the attribute gives it.
+    pub event: String,
+    /// Payload fields the consumer reads, by Rust name, sorted.
+    pub reads: Vec<String>,
+}
+
+impl ListenerDescriptor {
+    /// The artifact file name for this consumer. `key` keeps two functions
+    /// with one name in one crate apart.
+    #[must_use]
+    pub fn artifact_file_name(&self, key: &str) -> String {
+        format!("listener.{}.{}.{key}.json", self.krate, self.function)
+    }
+}
+
 /// A stable 64-bit FNV-1a hash, as 16 hex digits.
 ///
 /// Use it for file names that must be the same on every build. The standard
@@ -256,6 +343,73 @@ mod tests {
         assert_eq!(
             caller.artifact_file_name("k"),
             "caller.storefront.show_item.k.json"
+        );
+    }
+
+    fn event(name: Option<&str>, version: u32) -> EventDescriptor {
+        EventDescriptor {
+            krate: "core-app".to_owned(),
+            type_name: "ContactUpdated".to_owned(),
+            name: name.map(str::to_owned),
+            version,
+            opaque: false,
+            unit: false,
+            shape: WireTypeDescriptor::default(),
+        }
+    }
+
+    #[test]
+    fn version_one_keeps_the_bare_topic() {
+        assert_eq!(
+            event(Some("contact.updated"), 1).topic().as_deref(),
+            Some("contact.updated")
+        );
+    }
+
+    #[test]
+    fn a_later_version_adds_a_suffix_to_the_topic() {
+        assert_eq!(
+            event(Some("contact.updated"), 2).topic().as_deref(),
+            Some("contact.updated.v2")
+        );
+        assert_eq!(
+            event(Some("contact.updated"), 2).base_name(),
+            Some("contact.updated")
+        );
+    }
+
+    #[test]
+    fn an_event_without_a_name_has_no_known_topic() {
+        assert_eq!(event(None, 1).topic(), None);
+        assert_eq!(event(None, 3).topic(), None);
+    }
+
+    #[test]
+    fn an_event_descriptor_round_trips_and_names_its_file() {
+        let e = event(Some("contact.updated"), 2);
+        let json = serde_json::to_string(&e).expect("serializes");
+        let back: EventDescriptor = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back, e);
+        assert_eq!(
+            e.artifact_file_name("k"),
+            "event.core-app.ContactUpdated.v2.k.json"
+        );
+    }
+
+    #[test]
+    fn a_listener_descriptor_round_trips_and_names_its_file() {
+        let l = ListenerDescriptor {
+            krate: "marketing".to_owned(),
+            function: "on_contact_updated".to_owned(),
+            event: "core_app::ContactUpdated".to_owned(),
+            reads: vec!["email".to_owned()],
+        };
+        let json = serde_json::to_string(&l).expect("serializes");
+        let back: ListenerDescriptor = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back, l);
+        assert_eq!(
+            l.artifact_file_name("k"),
+            "listener.marketing.on_contact_updated.k.json"
         );
     }
 

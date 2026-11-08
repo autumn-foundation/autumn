@@ -174,6 +174,130 @@ async fn signup_publishes_event() {
 Recording happens synchronously at publish time, so `assert_event_published`
 works whether or not the listeners have run.
 
+## Wire contracts
+
+An event is a contract between a producer and its consumers. After a service
+split, the producer and the consumer ship at different times. So `#[event]`
+records the wire shape of the payload. Each consumer is checked against it,
+as `#[contract_checked]` checks an HTTP caller. See
+[Wire contracts](wire-contracts.md).
+
+### Name and version
+
+```rust,ignore
+#[event(name = "contact.updated")]
+pub struct ContactUpdated {
+    pub id: i64,
+    pub email: String,
+}
+
+#[event(name = "contact.updated", version = 2)]
+pub struct ContactUpdatedV2 {
+    pub id: i64,
+    pub email_address: String,
+}
+```
+
+- `name` is the topic. Set it on an event that crosses a service boundary.
+  The default name holds the module path, so a module move changes it. The
+  cross-release check covers only events with a `name`.
+- `version` is the schema version. The default is 1. Version 1 keeps the bare
+  name. A later version adds `.vN`: the topic of `ContactUpdatedV2` is
+  `contact.updated.v2`. So both versions can be on the bus at the same time.
+- With `version` above 1, write the base name only. `#[event(name =
+  "contact.updated.v2", version = 2)]` is an error.
+
+`Event::NAME` is the topic and `Event::VERSION` is the version.
+
+### The payload shape
+
+`#[event]` also derives `WireShape`. Do not derive it a second time. It
+refuses the [same shapes](wire-contracts.md#refusals): generics, enums, tuple
+structs, `#[serde(flatten)]`, `#[serde(transparent)]`, `#[serde(into)]` and
+the other shapes the macro cannot read.
+
+To publish a payload that `WireShape` refuses, write `#[event(opaque)]`. An
+opaque event has no shape. Its consumers are not checked.
+
+### Checked consumers
+
+A `#[listener]` reads fields off its event. Each field it reads must be one
+the event sends. If it is not, the build fails at the read:
+
+```rust,ignore
+#[event(name = "contact.updated")]
+pub struct ContactUpdated {
+    pub id: i64,
+    #[serde(skip_serializing)]
+    pub email: String,
+}
+
+#[listener(ContactUpdated)]
+async fn sync_marketing(_state: AppState, event: ContactUpdated) -> AutumnResult<()> {
+    let _ = event.email; // error: the event does not send `email`
+    Ok(())
+}
+```
+
+```text
+error[E0080]: evaluation panicked: event contract broken in `sync_marketing`:
+reads field `email` of event `ContactUpdated`, which the event does not send
+```
+
+The check sees `event.email`, a struct pattern (in a `let`, a parameter, an
+`if let` or a `match`), and a macro body such as
+`format!("{}", event.email)`. The field must be in both tables of the event.
+A `skip_serializing` field does not arrive. A `skip_deserializing` field
+reads as its default value.
+
+For an outbox topic handler, or any function that decodes a payload, use
+`#[event_consumer]`:
+
+```rust,ignore
+#[event_consumer(OrderPlaced)]
+async fn post_to_ledger(state: AppState, message: OutboxMessage) -> AutumnResult<()> {
+    let order: OrderPlaced = message.payload_as()?;
+    record(&state, order.total_cents).await
+}
+```
+
+`#[event_consumer]` finds the payload by its type: a parameter
+(`order: OrderPlaced`), a typed `let`, a struct pattern
+(`let OrderPlaced { total_cents, .. } = …`), or a turbofish
+(`payload_as::<OrderPlaced>()`). Write the type as the attribute writes it,
+or shorter: `legacy::OrderPlaced` is another type. If the macro finds no
+payload, it refuses, because a check that sees no payload checks nothing.
+
+`#[event_consumer]` also works on a method in an `impl` block.
+
+### Descriptors and the cross-release check
+
+`#[event]` writes an `event.*.json` descriptor, and each consumer writes a
+`listener.*.json` descriptor with its read-set. `autumn contracts export`
+puts both in the release bundle. `autumn contracts check` then checks events
+across releases. See [Events across releases](wire-contracts.md#events-across-releases).
+
+### Limits
+
+- The check sees only the fields that the consumer names. It does not see
+  reads in a function that gets the whole payload.
+- A hand-written `impl Event` has no shape. Its consumers are not checked.
+- An event without `name` and its consumers are not in the release bundle.
+  The compile-time check still applies to them.
+- A consumer that names its event through an alias (`use x::ContactUpdated
+  as Updated`) is not in the bundle. Use the event's own type name.
+  `autumn contracts export` warns about each consumer it cannot place. The
+  check names them, and then it does not say that a version can be dropped.
+- Two `#[event]` types with one type name in one crate (`v1::OrderPlaced`
+  and `v2::OrderPlaced`) stop the export. Give each its own type name.
+- An `#[event]` type writes an `event.*` descriptor only, not a `type.*`
+  one. Do not use it as the body of an `#[endpoint]`: use a separate DTO.
+- The bundle finds a consumer's event by its type name and the first
+  segment of its path. When that segment names no crate in the pass (a
+  module or a renamed dependency), and both the consumer's crate and
+  another crate have an event of that name, the export stops. Write
+  `crate::…` for a local event, or the package name of the dependency.
+
 ## Out of scope (today)
 
 - Cross-process delivery via an external broker (Kafka/NATS). Durable fan-out

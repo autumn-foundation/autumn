@@ -51,6 +51,8 @@ WIRE_BREAKING = [
  ("optional request field became required and omittable", [("    /// Optional note. Absent from a request body is fine.\n    #[serde(default)]\n    pub note: Option<String>,", "    /// Now required, and dropped when empty.\n    #[serde(skip_serializing_if = \"String::is_empty\")]\n    pub note: String,")]),
  ("route path parameter renamed", [('#[get("/items/{id}")]', '#[get("/items/{item_id}")]')]),
  ("route path gained a parameter", [('#[get("/items/{id}")]', '#[get("/tenants/{tenant}/items/{id}")]')]),
+ ("event field the listener reads skip_serializing", [("    /// New price in cents.\n    pub price_cents: u32,", "    /// New price in cents.\n    #[serde(skip_serializing)]\n    pub price_cents: u32,")]),
+ ("event field the listener reads skip_deserializing", [("    /// New price in cents.\n    pub price_cents: u32,", "    /// New price in cents.\n    #[serde(skip_deserializing)]\n    pub price_cents: u32,")]),
 ]
 
 COMPATIBLE = [
@@ -73,6 +75,8 @@ COMPATIBLE = [
  ("skip_serializing_if on a new response field", [("    /// Price in cents.\n    pub price_cents: u32,\n}", '    /// Price in cents.\n    pub price_cents: u32,\n    /// Sometimes absent.\n    #[serde(skip_serializing_if = "Option::is_none")]\n    pub badge: Option<String>,\n}'),
                                                   ("            price_cents,\n        }", "            price_cents,\n            badge: None,\n        }")]),
  ("response field type widened in place", [("    /// Stable item identifier.\n    pub id: String,", "    /// Stable item identifier.\n    pub id: std::string::String,")]),
+ ("new event field", [("    /// New price in cents.\n    pub price_cents: u32,", "    /// New price in cents.\n    pub price_cents: u32,\n    /// Currency code. Added later.\n    pub currency: Option<String>,")]),
+ ("event renamed on the wire, listener reads the Rust name", [("    /// New price in cents.\n    pub price_cents: u32,", "    /// New price in cents.\n    #[serde(rename = \"priceCents\")]\n    pub price_cents: u32,")]),
  ("a new endpoint added", [("/// The catalog service's routes.", '/// Count items.\n#[endpoint(service = "catalog")]\n#[get("/items")]\n#[public]\npub async fn count_items() -> AutumnResult<Json<Item>> {\n    Ok(Json(Item::sample("n".to_owned(), "n".to_owned(), 0)))\n}\n\n/// The catalog service\'s routes.')]),
 ]
 
@@ -81,6 +85,11 @@ COMPATIBLE = [
 # only in the order the report names.
 DEPLOY_CALLERS_FIRST = 'Deploy mesh-storefront before catalog'
 DEPLOY_CALLEES_FIRST = 'Deploy catalog before mesh-storefront'
+# An event's crate has endpoints, so the order names its service.
+EVENT_CONSUMERS_FIRST = DEPLOY_CALLERS_FIRST
+EVENT_PRODUCERS_FIRST = DEPLOY_CALLEES_FIRST
+EVENT = "    /// New price in cents.\n    pub price_cents: u32,\n}"
+LISTENER_READ = "    let _price = (event.id, event.price_cents);\n"
 CROSS_RELEASE = [
  ("unchanged release", [], 0, 'safe in any deploy order'),
  ("unread optional response field removed", [
@@ -115,6 +124,25 @@ CROSS_RELEASE = [
  ("method changed", [
     (LIB, '#[get("/items/{id}")]', '#[post("/items/{id}")]'),
  ], 1, 'not safe in any deploy order'),
+ ("event field a listener reads removed, listener stops reading it", [
+    (LIB, EVENT, "}"),
+    (MAIN, LISTENER_READ, "    let _price = event.id;\n"),
+ ], 3, EVENT_CONSUMERS_FIRST),
+ ("new event field the new listener reads", [
+    (LIB, EVENT, "    /// New price in cents.\n    pub price_cents: u32,\n    /// Currency code. Required.\n    pub currency: String,\n}"),
+    (MAIN, LISTENER_READ, "    let _price = (event.id, event.price_cents, event.currency);\n"),
+ ], 3, EVENT_PRODUCERS_FIRST),
+ ("new optional event field", [
+    (LIB, EVENT, "    /// New price in cents.\n    pub price_cents: u32,\n    /// Currency code. Optional.\n    pub currency: Option<String>,\n}"),
+ ], 0, 'safe in any deploy order'),
+ # The new listener reads only v2, and the deployed catalog sends only v1:
+ # the catalog ships first, or v1 events are lost.
+ ("event v2 beside v1, listener moves to v2", [
+    (LIB, "impl Item {", "/// Version 2: the price carries its currency.\n#[event(name = \"catalog.item_repriced\", version = 2)]\npub struct ItemRepricedV2 {\n    /// Stable item identifier.\n    pub id: String,\n    /// New price in minor units.\n    pub amount: u32,\n    /// Currency code.\n    pub currency: String,\n}\n\nimpl Item {"),
+    (MAIN, "#[listener(mesh_catalog::ItemRepriced)]", "#[listener(mesh_catalog::ItemRepricedV2)]"),
+    (MAIN, "event: mesh_catalog::ItemRepriced)", "event: mesh_catalog::ItemRepricedV2)"),
+    (MAIN, LISTENER_READ, "    let _price = (event.id, event.amount, event.currency);\n"),
+ ], 3, EVENT_PRODUCERS_FIRST),
  ("path parameter renamed", [
     (LIB, '#[get("/items/{id}")]\n#[public]\npub async fn get_item(id: Path<String>)', '#[get("/items/{item_id}")]\n#[public]\npub async fn get_item(item_id: Path<String>)'),
     (LIB, "        id.to_string(),\n        format!(\"Item {}\", *id),", "        item_id.to_string(),\n        format!(\"Item {}\", *item_id),"),
@@ -125,7 +153,7 @@ CROSS_RELEASE = [
 def build():
     out = subprocess.run(['cargo','build','-p','mesh-storefront'], capture_output=True, text=True)
     text = out.stdout + out.stderr
-    if 'wire contract broken' in text: return 'caught'
+    if 'wire contract broken' in text or 'event contract broken' in text: return 'caught'
     if any(l.startswith('error') for l in text.splitlines()): return 'rustc-only'
     return 'green'
 

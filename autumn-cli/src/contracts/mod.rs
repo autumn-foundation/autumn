@@ -110,10 +110,15 @@ pub fn run_export(opts: &ExportOptions) {
     }
     std::fs::write(path, &bytes)
         .unwrap_or_else(|e| fail(&format!("write {}: {e}", path.display())));
+    for unresolved in &bundle.unresolved {
+        eprintln!("warning: event consumer not in the bundle: {unresolved}");
+    }
     eprintln!(
-        "Wrote {} endpoint(s) and {} call(s) to {}.",
+        "Wrote {} endpoint(s), {} call(s), {} event(s) and {} event consumer(s) to {}.",
         bundle.endpoints.len(),
         bundle.callers.len(),
+        bundle.events.len(),
+        bundle.listeners.len(),
         path.display()
     );
 }
