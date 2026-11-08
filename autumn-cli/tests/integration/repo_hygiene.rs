@@ -1979,8 +1979,8 @@ fn benchmark_runtime_startup_applies_packaged_migrations() {
     let rails_dockerfile = std::fs::read_to_string(&rails_dockerfile_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", rails_dockerfile_path.display()));
     assert!(
-        rails_dockerfile.contains("bundle exec rails db:migrate && bundle exec puma"),
-        "{} must run Rails migrations before starting Puma",
+        rails_dockerfile.contains("bundle exec rails db:migrate && exec bundle exec puma"),
+        "{} must run Rails migrations before starting Puma (exec'd so it receives SIGTERM)",
         rails_dockerfile_path.display(),
     );
 

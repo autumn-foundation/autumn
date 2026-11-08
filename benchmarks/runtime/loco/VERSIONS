@@ -1,6 +1,6 @@
-framework: Loco 0.14.1
-language:  Rust 1.97.0
-async-rt:  Tokio 1.x
-http:      Axum 0.8.x
-db:        SeaORM 1.x + sea-orm-migration
+framework: Loco 1.3.1
+language:  Rust 1.97.1
+async-rt:  Tokio 1.54.1
+http:      Axum 0.8.9
+db:        SeaORM 2.0.4 + sea-orm-migration 2.0.4 (SQLx 0.9.0)
 postgres:  16 (benchmark container)

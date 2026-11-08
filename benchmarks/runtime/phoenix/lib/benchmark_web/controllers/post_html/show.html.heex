@@ -1,10 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title><%= @post.title %></title></head>
-<body>
-<h1><%= @post.title %></h1>
-<p>By <%= @post.author %></p>
-<%= if !@post.published, do: raw("<em>Draft</em>") %>
-<div><%= @post.body %></div>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <title>{@post.title}</title>
+  </head>
+  <body>
+    <h1>{@post.title}</h1>
+    <p>By {@post.author}</p>
+    <em :if={!@post.published}>Draft</em>
+    <div>{@post.body}</div>
+  </body>
 </html>

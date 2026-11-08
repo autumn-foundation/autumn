@@ -63,8 +63,76 @@ Enable the runtime by building the application with the `sqlite` cargo feature (
 
 - **Connection type.** A `RuntimeConnection` alias abstracts the backend: `diesel_async::AsyncPgConnection` by default, and a `SyncConnectionWrapper<SqliteConnection>` under the `sqlite` feature. Generated repositories and hand-written queries take `&mut RuntimeConnection`, so they compile against either backend.
 - **Pool pragmas.** Each pooled connection is set up with `PRAGMA busy_timeout = 5000` (first, so later statements queue on it), `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA foreign_keys = ON`. A read-only SQLite target skips the two writing pragmas (WAL + `synchronous`). An in-memory database is pinned to a single pooled connection.
+- **Read tuning (opt-in).** `database.mmap_size` and `database.cache_size_kib` add `PRAGMA mmap_size` and `PRAGMA cache_size`. Both are off by default. See [Memory-mapped reads](#memory-mapped-reads-and-the-page-cache).
 - **Migrations.** Startup migrations run through diesel's `MigrationHarness` on a plain `SqliteConnection` with **no advisory lock** (SQLite is single-writer, so there is nothing to coordinate). Only `busy_timeout` is set on the migration connection — `foreign_keys = ON` is deliberately *omitted* there because it breaks table-recreating migrations. This applies to **file-backed** SQLite only: an **in-memory** target (`sqlite::memory:` / `:memory:` / `file::memory:`, including `cache=shared`) with registered startup migrations is **refused at boot** (`std::process::exit(1)`), because the schema is applied on a transient migration connection and is lost before the runtime pool anchors it. An in-memory target with *no* registered migrations is unaffected (it is the default test-harness configuration).
 - **Repository CRUD.** Generated `#[repository]` / `#[model]` CRUD targets SQLite via two seams: `maybe_for_update!` expands to a plain read on SQLite (which has no `SELECT … FOR UPDATE`), so a pessimistic-lock read degrades to a plain read while write-write correctness still rests on the optimistic `lock_version` check plus the pool `busy_timeout`; and `backend_select! { pg => {…}, sqlite => {…} }` picks backend-specific SQL for the shapes that differ (multi-row batch insert vs. per-row loop, batched `ON CONFLICT` upsert vs. per-row upsert, and `RETURNING` handling). Tenant scoping and `lock_version` semantics are preserved on both backends.
+
+## Memory-mapped reads and the page cache
+
+By default, SQLite reads each page with `read()` into a private page cache of
+about 2 MiB for each connection. Autumn does not change this default.
+
+Two settings can make reads faster on a large database that the app reads
+often. Both are off by default. Both apply only to SQLite. A Postgres pool
+ignores them and logs a warning.
+
+```toml
+[database]
+mmap_size = 268435456   # bytes; 0 = off. AUTUMN_DATABASE__MMAP_SIZE
+cache_size_kib = 0      # KiB; 0 = SQLite default. AUTUMN_DATABASE__CACHE_SIZE_KIB
+```
+
+- **`mmap_size`** sets `PRAGMA mmap_size` on each pooled connection. SQLite
+  then reads pages from a memory map of the file. The memory is the shared OS
+  page cache, not heap memory. A full scan does not get faster.
+- **`cache_size_kib`** sets `PRAGMA cache_size = -<value>`. This sets the
+  size of the private page cache of each connection. Use it where mmap is not
+  safe. It is slower than mmap. It uses heap memory for each connection.
+
+Autumn applies both settings to read-only connections too. They do not write
+to the file. The bundled SQLite caps `mmap_size` at 2147418112 bytes (about
+2 GiB). SQLite uses the cap for a larger value. It does not return an error.
+
+### When mmap helps
+
+- Use it for one large database that gets many random or range reads.
+- Do not use it for small files. Each file is a few pages, and SQLite has
+  those pages in its cache already. A tenant fleet saw no change.
+- Measure first. This bench compares mmap off and on with the bundled
+  SQLite:
+
+  ```sh
+  cargo bench -p autumn-web --features sqlite --bench sqlite_mmap_read
+  ```
+
+The bench result on a 90 MB file (1 KiB rows, 4-CPU Linux, OS cache warm):
+
+| Query | mmap off | mmap on (1 GiB) |
+| --- | ---: | ---: |
+| 256 random index lookups | 1.10 ms | 0.63 ms |
+| Index range over 10% of the rows | 12.3 ms | 5.1 ms |
+
+### Risks of mmap
+
+- **An I/O error stops the process.** With mmap, a read error kills the
+  process with `SIGBUS`. Causes are a disk error, a full disk on a sparse
+  file, or a file that another process truncates. Without mmap, SQLite
+  returns an error and the request fails. Turn mmap on only where you accept
+  this risk.
+- **Local storage only.** Do not put a mapped database on a network file
+  system. SQLite file locks are not safe there. mmap increases the risk.
+- **Address space.** SQLite maps the file once for each connection, up to
+  the smaller of `mmap_size` and the file size. On a 64-bit target this is
+  not a problem. On a 32-bit target, the total is `mmap_size` × (primary
+  pool size + replica pool size), plus the fleet total. Config validation
+  refuses a total over 1 GiB.
+- **SQLite limits.** Config validation refuses a `mmap_size` over
+  `i64::MAX` and a `cache_size_kib` over `i32::MAX`. SQLite cannot read
+  those values.
+
+Continuous replication works with mmap on. The replicator can checkpoint a
+mapped database. A restore gets all the rows. A fleet
+has its own keys: see [SQLite Database Fleet](./sqlite-fleet.md#memory-mapped-reads).
 
 ## When to choose SQLite vs Postgres
 

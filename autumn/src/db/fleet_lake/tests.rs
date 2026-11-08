@@ -52,6 +52,8 @@ fn fleet_config(root: &Path, retention: Duration) -> DatabaseFleetConfig {
         restore_check_sample: 0,
         replication_workers: 4,
         min_residency: Duration::from_secs(2),
+        mmap_size: 0,
+        cache_size_kib: 0,
     }
 }
 

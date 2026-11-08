@@ -1689,9 +1689,11 @@ impl DatabaseTopology {
 static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+pub(crate) use crate::config::SqliteTuning;
+
 /// The per-connection pragma batch a pooled `SQLite` connection is set up with.
 ///
-/// Pure over its two inputs so the decision is unit-testable without a pool, a
+/// Pure over its inputs so the decision is unit-testable without a pool, a
 /// database, or the process-global replication latch.
 ///
 /// * A **read-only** target gets the non-writing pragmas only: `journal_mode =
@@ -1707,9 +1709,17 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 ///   without invoking the busy handler at all (the pool does not wire
 ///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
 ///   harmless, not harmful (issue #2881).
+/// * A non-zero [`SqliteTuning`] value adds `mmap_size` or `cache_size` at the
+///   end, in every variant. Neither writes to the file.
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-pub(crate) const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
-    if read_only {
+pub(crate) fn sqlite_connection_pragmas(
+    read_only: bool,
+    replicating: bool,
+    tuning: SqliteTuning,
+) -> String {
+    use std::fmt::Write as _;
+
+    let base = if read_only {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA foreign_keys = ON;"
     } else if replicating {
@@ -1723,7 +1733,23 @@ pub(crate) const fn sqlite_connection_pragmas(read_only: bool, replicating: bool
          PRAGMA journal_mode = WAL; \
          PRAGMA synchronous = NORMAL; \
          PRAGMA foreign_keys = ON;"
+    };
+    let mut pragmas = String::from(base);
+    // Writing to a `String` cannot fail. Config validation refuses values
+    // that SQLite cannot read. A config built in code skips it, so clamp:
+    // SQLite sets `cache_size` to 0 when its value overflows.
+    if tuning.mmap_size > 0 {
+        let mmap_size = tuning.mmap_size.min(i64::MAX.unsigned_abs());
+        let _ = write!(pragmas, " PRAGMA mmap_size = {mmap_size};");
     }
+    if tuning.cache_size_kib > 0 {
+        let kib = tuning
+            .cache_size_kib
+            .min(u64::from(i32::MAX.unsigned_abs()));
+        // A negative value is a size in KiB, not a page count.
+        let _ = write!(pragmas, " PRAGMA cache_size = -{kib};");
+    }
+    pragmas
 }
 
 /// Declare that continuous replication is active in this process.
@@ -1786,6 +1812,7 @@ fn build_pool(
     url: &str,
     pool_size: usize,
     connect_timeout_secs: u64,
+    tuning: SqliteTuning,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
     #[cfg(feature = "ledger-capture")]
     crate::ledger_capture::install();
@@ -1797,7 +1824,7 @@ fn build_pool(
     // expression — no `return` needed.
     #[cfg(feature = "sqlite")]
     {
-        build_sqlite_pool(url, pool_size, connect_timeout_secs)
+        build_sqlite_pool(url, pool_size, connect_timeout_secs, tuning)
     }
 
     // Default (Postgres) build. A SQLite target is recognized here but its
@@ -1818,6 +1845,7 @@ fn build_pool(
 
     #[cfg(not(feature = "sqlite"))]
     {
+        warn_if_sqlite_tuning_on_postgres(tuning);
         let _ = crate::lock::pooler::warn_if_pooled(url);
         let timeout = Duration::from_secs(connect_timeout_secs);
         let config = pg_manager_config(url);
@@ -1830,6 +1858,22 @@ fn build_pool(
             .runtime(deadpool::Runtime::Tokio1)
             .build()?)
     }
+}
+
+/// Log a warning when a Postgres pool gets `SQLite` read tuning: Postgres has
+/// no such pragmas, so the pool ignores it. Returns `true` when it warns.
+#[cfg(not(feature = "sqlite"))]
+fn warn_if_sqlite_tuning_on_postgres(tuning: SqliteTuning) -> bool {
+    if tuning == SqliteTuning::OFF {
+        return false;
+    }
+    tracing::warn!(
+        mmap_size = tuning.mmap_size,
+        cache_size_kib = tuning.cache_size_kib,
+        "database.mmap_size and database.cache_size_kib apply only to SQLite; \
+         this Postgres pool ignores them"
+    );
+    true
 }
 
 /// Normalize a configured `SQLite` target into the filename token diesel's
@@ -2064,12 +2108,14 @@ fn build_sqlite_pool(
     url: &str,
     pool_size: usize,
     connect_timeout_secs: u64,
+    tuning: SqliteTuning,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
     build_sqlite_pool_with(
         url,
         pool_size,
         connect_timeout_secs,
         SqliteCheckpointOwner::ProcessLatch,
+        tuning,
     )
 }
 
@@ -2104,6 +2150,7 @@ pub(crate) fn build_sqlite_pool_with(
     pool_size: usize,
     connect_timeout_secs: u64,
     checkpoint_owner: SqliteCheckpointOwner,
+    tuning: SqliteTuning,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
     // Under the `sqlite` feature the runtime targets SQLite, so the URL must
     // actually NAME a SQLite target. Everything past this point treats the
@@ -2238,7 +2285,7 @@ pub(crate) fn build_sqlite_pool_with(
         // the gate never opens, so each new connection waited 2 s and counted
         // a give-up. The setup touches no sim state.
         let setup = crate::time::spawn_blocking_ungated(move || {
-            sqlite_connection_setup(&url, checkpoint_owner)
+            sqlite_connection_setup(&url, checkpoint_owner, tuning)
         });
         async move {
             let conn = setup.await.map_err(|e| {
@@ -2268,6 +2315,7 @@ pub(crate) fn build_sqlite_pool_with(
 fn sqlite_connection_setup(
     url: &str,
     checkpoint_owner: SqliteCheckpointOwner,
+    tuning: SqliteTuning,
 ) -> diesel::ConnectionResult<diesel::SqliteConnection> {
     use diesel::connection::{Connection as _, SimpleConnection as _};
 
@@ -2275,8 +2323,9 @@ fn sqlite_connection_setup(
     let pragmas = sqlite_connection_pragmas(
         sqlite_target_is_read_only(url),
         checkpoint_owner.replicating(),
+        tuning,
     );
-    apply_sqlite_pragmas(&mut conn, pragmas)
+    apply_sqlite_pragmas(&mut conn, &pragmas)
         .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
     // #1910 FTS5 capability probe. Searchable repositories emit FTS5 virtual
     // tables and `bm25()` ranking, and the `AddSearch` migration's `CREATE
@@ -2379,6 +2428,7 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
         url,
         config.effective_primary_pool_size(),
         config.connect_timeout_secs,
+        config.sqlite_tuning(),
     )?;
 
     Ok(Some(pool))
@@ -2407,7 +2457,12 @@ pub fn create_role_pools(config: &DatabaseConfig) -> Result<crate::db_roles::Rol
         let size = role.pool_size.unwrap_or(config.pool_size);
         pools.insert(
             name.clone(),
-            build_pool(&url, size, config.connect_timeout_secs)?,
+            build_pool(
+                &url,
+                size,
+                config.connect_timeout_secs,
+                config.sqlite_tuning(),
+            )?,
         );
     }
     Ok(crate::db_roles::RolePools::new(pools))
@@ -2566,6 +2621,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
         primary_url,
         config.effective_primary_pool_size(),
         config.connect_timeout_secs,
+        config.sqlite_tuning(),
     )?;
 
     #[cfg(feature = "sqlite")]
@@ -2581,6 +2637,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
                 url,
                 config.effective_replica_pool_size(),
                 config.connect_timeout_secs,
+                config.sqlite_tuning(),
             )
         })
         .transpose()?;
@@ -2610,6 +2667,7 @@ pub fn create_shard_topology(
         &shard.primary_url,
         shard.effective_primary_pool_size(defaults),
         defaults.connect_timeout_secs,
+        defaults.sqlite_tuning(),
     )?;
 
     // A per-shard `replica_url` is subject to the same SQLite-replica rule as the
@@ -2630,6 +2688,7 @@ pub fn create_shard_topology(
                 url,
                 shard.effective_replica_pool_size(defaults),
                 defaults.connect_timeout_secs,
+                defaults.sqlite_tuning(),
             )
         })
         .transpose()?;
@@ -4812,6 +4871,7 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
                         url,
                         config.effective_replica_pool_size(),
                         config.connect_timeout_secs,
+                        config.sqlite_tuning(),
                     )
                 })
                 .transpose()?;
@@ -5266,11 +5326,11 @@ mod tests {
     fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
         // Continuous replication (#1628) needs the replicator to be the only
         // component that ever checkpoints.
-        let plain = super::sqlite_connection_pragmas(false, false);
-        let replicating = super::sqlite_connection_pragmas(false, true);
+        let plain = super::sqlite_connection_pragmas(false, false, SqliteTuning::OFF);
+        let replicating = super::sqlite_connection_pragmas(false, true, SqliteTuning::OFF);
         assert!(!plain.contains("wal_autocheckpoint"));
         assert!(replicating.contains("PRAGMA wal_autocheckpoint = 0"));
-        for pragmas in [plain, replicating] {
+        for pragmas in [&plain, &replicating] {
             assert!(pragmas.contains("journal_mode = WAL"));
             assert!(pragmas.contains("foreign_keys = ON"));
             assert!(pragmas.contains("busy_timeout = 5000"));
@@ -5279,11 +5339,228 @@ mod tests {
         // A read-only target still gets no writing pragmas — including under
         // replication, which cannot apply to a database nothing writes to.
         for replicating in [false, true] {
-            let read_only = super::sqlite_connection_pragmas(true, replicating);
+            let read_only = super::sqlite_connection_pragmas(true, replicating, SqliteTuning::OFF);
             assert!(!read_only.contains("journal_mode"));
             assert!(!read_only.contains("wal_autocheckpoint"));
             assert!(read_only.contains("foreign_keys = ON"));
         }
+    }
+
+    /// The pragma batch of each variant: default, replicating, read-only.
+    fn pragma_variants(tuning: SqliteTuning) -> [String; 3] {
+        [
+            super::sqlite_connection_pragmas(false, false, tuning),
+            super::sqlite_connection_pragmas(false, true, tuning),
+            super::sqlite_connection_pragmas(true, false, tuning),
+        ]
+    }
+
+    #[test]
+    fn the_tuning_pragmas_are_absent_when_off() {
+        assert_eq!(SqliteTuning::default(), SqliteTuning::OFF);
+        for pragmas in pragma_variants(SqliteTuning::OFF) {
+            assert!(!pragmas.contains("mmap_size"), "{pragmas}");
+            assert!(!pragmas.contains("cache_size"), "{pragmas}");
+        }
+    }
+
+    #[test]
+    fn mmap_size_is_in_every_variant_only_when_set() {
+        let tuning = SqliteTuning {
+            mmap_size: 268_435_456,
+            cache_size_kib: 0,
+        };
+        for pragmas in pragma_variants(tuning) {
+            assert!(
+                pragmas.contains("PRAGMA mmap_size = 268435456;"),
+                "{pragmas}"
+            );
+            assert!(!pragmas.contains("cache_size"), "{pragmas}");
+            // `busy_timeout` stays first: it covers the statements after it.
+            assert!(
+                pragmas.starts_with("PRAGMA busy_timeout = 5000;"),
+                "{pragmas}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_size_kib_is_a_negative_cache_size_only_when_set() {
+        let tuning = SqliteTuning {
+            mmap_size: 0,
+            cache_size_kib: 524_288,
+        };
+        for pragmas in pragma_variants(tuning) {
+            // A negative `cache_size` is in KiB, not in pages.
+            assert!(
+                pragmas.contains("PRAGMA cache_size = -524288;"),
+                "{pragmas}"
+            );
+            assert!(!pragmas.contains("mmap_size"), "{pragmas}");
+        }
+    }
+
+    #[test]
+    fn the_tuning_pragmas_clamp_values_sqlite_cannot_read() {
+        // A config built in code skips validation. SQLite reads `cache_size`
+        // as a 32-bit integer and sets 0 on overflow, so clamp it.
+        let tuning = SqliteTuning {
+            mmap_size: u64::MAX,
+            cache_size_kib: u64::MAX,
+        };
+        for pragmas in pragma_variants(tuning) {
+            assert!(
+                pragmas.contains(&format!("PRAGMA mmap_size = {};", i64::MAX)),
+                "{pragmas}"
+            );
+            assert!(
+                pragmas.contains(&format!("PRAGMA cache_size = -{};", i32::MAX)),
+                "{pragmas}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn a_postgres_pool_warns_only_when_sqlite_tuning_is_set() {
+        assert!(!warn_if_sqlite_tuning_on_postgres(SqliteTuning::OFF));
+        assert!(warn_if_sqlite_tuning_on_postgres(SqliteTuning {
+            mmap_size: 1,
+            cache_size_kib: 0,
+        }));
+        assert!(warn_if_sqlite_tuning_on_postgres(SqliteTuning {
+            mmap_size: 0,
+            cache_size_kib: 1,
+        }));
+    }
+
+    #[test]
+    fn the_tuning_pragmas_run_on_a_real_connection() {
+        use diesel::connection::{Connection as _, SimpleConnection as _};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tuned.db");
+        let mut conn = diesel::SqliteConnection::establish(&path.display().to_string()).unwrap();
+        let tuning = SqliteTuning {
+            mmap_size: 64 * 1024 * 1024,
+            cache_size_kib: 4096,
+        };
+        conn.batch_execute(&super::sqlite_connection_pragmas(false, false, tuning))
+            .unwrap();
+        assert_eq!(
+            sqlite_pragma_value(&mut conn, "mmap_size"),
+            64 * 1024 * 1024
+        );
+        assert_eq!(sqlite_pragma_value(&mut conn, "cache_size"), -4096);
+    }
+
+    /// Read `mmap_size` or `cache_size` from a plain connection.
+    fn sqlite_pragma_value(conn: &mut diesel::SqliteConnection, pragma: &str) -> i64 {
+        use diesel::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct MmapSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct CacheSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache_size: i64,
+        }
+        let query = diesel::sql_query(format!("PRAGMA {pragma}"));
+        match pragma {
+            "mmap_size" => query.get_result::<MmapSize>(conn).unwrap().mmap_size,
+            "cache_size" => query.get_result::<CacheSize>(conn).unwrap().cache_size,
+            other => panic!("no reader for PRAGMA {other}"),
+        }
+    }
+
+    /// Continuous replication with mmap on. The replicator checkpoints, which
+    /// writes the main file, while the app connection has it mapped. The app
+    /// must read the checkpointed rows, and a restore must hold every row.
+    #[test]
+    fn replication_ships_and_restores_with_mmap_on() {
+        use crate::replication::{
+            FileDestination, ReplicaDestination, ReplicationSettings, ReplicationStatus,
+            Replicator, restore, segment,
+        };
+        use diesel::RunQueryDsl as _;
+        use diesel::connection::{Connection as _, SimpleConnection as _};
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            v: String,
+        }
+        fn rows(conn: &mut diesel::SqliteConnection) -> Vec<String> {
+            diesel::sql_query("SELECT v FROM t ORDER BY id")
+                .load::<Row>(conn)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.v)
+                .collect()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("app.db");
+        let tuning = SqliteTuning {
+            mmap_size: 256 * 1024 * 1024,
+            cache_size_kib: 0,
+        };
+        let mut app = diesel::SqliteConnection::establish(&db.display().to_string()).unwrap();
+        app.batch_execute(&super::sqlite_connection_pragmas(false, true, tuning))
+            .unwrap();
+        assert_eq!(
+            sqlite_pragma_value(&mut app, "mmap_size"),
+            256 * 1024 * 1024
+        );
+        app.batch_execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+            .unwrap();
+
+        let destination: Arc<dyn ReplicaDestination> =
+            Arc::new(FileDestination::new(tmp.path().join("replica")).unwrap());
+        let settings = ReplicationSettings {
+            database_path: db,
+            root: segment::root_prefix(None, "mmap"),
+            sync_interval: Duration::from_secs(1),
+            snapshot_interval: Duration::from_secs(3600),
+            // Checkpoint often: each one writes the mapped main file.
+            max_wal_bytes: 4096,
+            retention: Duration::from_hours(24),
+            verify_interval: None,
+        };
+        let root = settings.root.clone();
+        let status = Arc::new(ReplicationStatus::new(destination.describe()));
+        let mut replicator = Replicator::new(settings, Arc::clone(&destination), status);
+
+        let mut expected = Vec::new();
+        let mut checkpoints = 0;
+        for round in 0..40 {
+            let value = format!("row-{round}-{}", "x".repeat(200));
+            diesel::sql_query(format!("INSERT INTO t (v) VALUES ('{value}')"))
+                .execute(&mut app)
+                .unwrap();
+            expected.push(value);
+            if replicator.tick().unwrap().checkpointed {
+                checkpoints += 1;
+            }
+        }
+        assert!(
+            checkpoints > 0,
+            "no checkpoint ran; the test proves nothing"
+        );
+        // The mapped connection reads what the checkpoints wrote.
+        assert_eq!(rows(&mut app), expected);
+
+        drop(app);
+        drop(replicator);
+        let restored = tmp.path().join("restored.db");
+        restore::restore(destination.as_ref(), &root, None, &restored).unwrap();
+        let mut conn =
+            diesel::SqliteConnection::establish(&restored.display().to_string()).unwrap();
+        conn.batch_execute(&super::sqlite_connection_pragmas(false, false, tuning))
+            .unwrap();
+        assert_eq!(rows(&mut conn), expected);
     }
 
     use super::*;
@@ -6237,8 +6514,14 @@ mod tests {
         holder
             .batch_execute("BEGIN EXCLUSIVE")
             .expect("take the exclusive lock");
-        let pool = build_sqlite_pool_with(&url, 1, 0, SqliteCheckpointOwner::ProcessLatch)
-            .expect("the pool builds");
+        let pool = build_sqlite_pool_with(
+            &url,
+            1,
+            0,
+            SqliteCheckpointOwner::ProcessLatch,
+            SqliteTuning::OFF,
+        )
+        .expect("the pool builds");
         let Err(err) = pool.get().await else {
             panic!("a zero create limit must time out");
         };
@@ -6253,8 +6536,14 @@ mod tests {
         // next connection, with a real limit, opens the same file.
         holder.batch_execute("COMMIT").expect("release the lock");
         drop(holder);
-        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
-            .expect("the pool builds");
+        let pool = build_sqlite_pool_with(
+            &url,
+            1,
+            5,
+            SqliteCheckpointOwner::ProcessLatch,
+            SqliteTuning::OFF,
+        )
+        .expect("the pool builds");
         drop(pool.get().await.expect("a real limit opens the file"));
     }
 
@@ -6292,8 +6581,14 @@ mod tests {
     async fn sqlite_setup_finishes_while_the_runtime_thread_is_blocked() {
         let tmp = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}", tmp.path().join("hook.db").display());
-        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
-            .expect("the pool builds");
+        let pool = build_sqlite_pool_with(
+            &url,
+            1,
+            5,
+            SqliteCheckpointOwner::ProcessLatch,
+            SqliteTuning::OFF,
+        )
+        .expect("the pool builds");
         let handle = tokio::runtime::Handle::current();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -6310,6 +6605,137 @@ mod tests {
         got.expect("the connection opens");
     }
 
+    /// Read `mmap_size` and `cache_size` from one pooled connection.
+    #[cfg(feature = "sqlite")]
+    async fn pooled_tuning(pool: &Pool<RuntimeConnection>) -> (i64, i64) {
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct MmapSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct CacheSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache_size: i64,
+        }
+        let mut conn = pool.get().await.expect("a pooled connection");
+        let mmap = diesel::sql_query("PRAGMA mmap_size")
+            .get_result::<MmapSize>(&mut *conn)
+            .await
+            .expect("read mmap_size")
+            .mmap_size;
+        let cache = diesel::sql_query("PRAGMA cache_size")
+            .get_result::<CacheSize>(&mut *conn)
+            .await
+            .expect("read cache_size")
+            .cache_size;
+        (mmap, cache)
+    }
+
+    /// `[database] mmap_size` and `cache_size_kib` reach the primary and the
+    /// replica pool. A role pool is Postgres only.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pools_apply_the_configured_tuning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("tuned.db").display());
+        let config = DatabaseConfig {
+            url: Some(url.clone()),
+            replica_url: Some(url.clone()),
+            mmap_size: 128 * 1024 * 1024,
+            cache_size_kib: 8192,
+            ..Default::default()
+        };
+        let expected = (128 * 1024 * 1024, -8192);
+
+        let pool = create_pool(&config).unwrap().expect("a primary pool");
+        assert_eq!(pooled_tuning(&pool).await, expected);
+
+        let topology = create_topology(&config).unwrap().expect("a topology");
+        assert_eq!(pooled_tuning(topology.primary()).await, expected);
+        let replica = topology.replica().expect("a replica pool");
+        assert_eq!(pooled_tuning(replica).await, expected);
+
+        // A shard takes the `[database]` values.
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: url.clone(),
+            replica_url: Some(url.clone()),
+            ..Default::default()
+        };
+        let topology = create_shard_topology(&shard, &config).unwrap();
+        assert_eq!(pooled_tuning(topology.primary()).await, expected);
+        let replica = topology.replica().expect("a shard replica pool");
+        assert_eq!(pooled_tuning(replica).await, expected);
+    }
+
+    /// With the defaults, a pool keeps SQLite's own values: no mmap, and the
+    /// default page cache.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pools_keep_sqlite_defaults_when_tuning_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("plain.db").display());
+        let pool = create_pool(&DatabaseConfig {
+            url: Some(url),
+            ..Default::default()
+        })
+        .unwrap()
+        .expect("a primary pool");
+        let (mmap, cache) = pooled_tuning(&pool).await;
+        assert_eq!(mmap, 0, "mmap is off by default");
+        assert_eq!(cache, -2000, "SQLite's default cache_size");
+    }
+
+    /// A read-only target gets the tuning pragmas too: they do not write.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_read_only_pools_apply_the_tuning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ref.db");
+        drop(
+            build_sqlite_pool_with(
+                &format!("sqlite://{}", path.display()),
+                1,
+                5,
+                SqliteCheckpointOwner::ProcessLatch,
+                SqliteTuning::OFF,
+            )
+            .unwrap()
+            .get()
+            .await
+            .expect("create the file"),
+        );
+        let tuning = SqliteTuning {
+            mmap_size: 32 * 1024 * 1024,
+            cache_size_kib: 1024,
+        };
+        let url = format!("sqlite://file:{}?mode=ro", path.display());
+        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch, tuning)
+            .unwrap();
+        assert_eq!(pooled_tuning(&pool).await, (32 * 1024 * 1024, -1024));
+    }
+
+    /// SQLite caps `mmap_size` at its compile-time limit and does not fail.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_caps_an_mmap_size_above_its_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("big.db").display());
+        let tuning = SqliteTuning {
+            mmap_size: 1 << 40,
+            cache_size_kib: 0,
+        };
+        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch, tuning)
+            .unwrap();
+        let (mmap, _) = pooled_tuning(&pool).await;
+        assert_eq!(
+            mmap, 0x7fff_0000,
+            "SQLITE_MAX_MMAP_SIZE of the bundled build"
+        );
+    }
+
     // The same blocked runtime thread on a sim runtime, with a sim alive. The
     // runtime thread cannot park, so gated blocking work waits for the 2 s
     // give-up and counts a give-up, and the run is then not sure to replay.
@@ -6324,8 +6750,14 @@ mod tests {
         seat.take();
         let before = crate::sim::gate::give_ups();
         rt.block_on(async {
-            let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
-                .expect("the pool builds");
+            let pool = build_sqlite_pool_with(
+                &url,
+                1,
+                5,
+                SqliteCheckpointOwner::ProcessLatch,
+                SqliteTuning::OFF,
+            )
+            .expect("the pool builds");
             let handle = tokio::runtime::Handle::current();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {

@@ -38,6 +38,8 @@ pub struct SqliteEngine {
     root: PathBuf,
     pool_size: usize,
     connect_timeout_secs: u64,
+    /// `mmap_size` and `cache_size` of each database connection.
+    tuning: crate::db::SqliteTuning,
     migrations: Arc<FleetMigrations>,
     replicating: AtomicBool,
     migrations_applied: AtomicU64,
@@ -57,12 +59,14 @@ impl SqliteEngine {
         root: &Path,
         pool_size: usize,
         connect_timeout_secs: u64,
+        tuning: crate::db::SqliteTuning,
         migrations: FleetMigrations,
     ) -> Self {
         Self {
             root: root.to_path_buf(),
             pool_size: pool_size.max(1),
             connect_timeout_secs,
+            tuning,
             migrations: Arc::new(migrations),
             replicating: AtomicBool::new(false),
             migrations_applied: AtomicU64::new(0),
@@ -165,6 +169,7 @@ impl FleetEngine for SqliteEngine {
             self.pool_size,
             self.connect_timeout_secs,
             crate::db::SqliteCheckpointOwner::Fleet(self.replicating.load(Ordering::Acquire)),
+            self.tuning,
         )
         .map_err(|e| FleetError::Unavailable {
             name: name.clone(),
@@ -615,7 +620,13 @@ impl DatabaseFleet<SqliteEngine> {
         migrations: FleetMigrations,
     ) -> Result<Self, FleetError> {
         Self::from_config(config, |root| {
-            SqliteEngine::new(root, config.pool_size, connect_timeout_secs, migrations)
+            SqliteEngine::new(
+                root,
+                config.pool_size,
+                connect_timeout_secs,
+                config.sqlite_tuning(),
+                migrations,
+            )
         })
     }
 

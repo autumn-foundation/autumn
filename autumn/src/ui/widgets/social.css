@@ -264,3 +264,24 @@
     border-radius: var(--radius);
     color: var(--danger);
 }
+
+/* Page links of a paged thread (#3325). "More" is the last item of the
+   top-level list. "Earlier" comes before the list. */
+.autumn-comments-more {
+    list-style: none;
+}
+
+.autumn-comments-earlier {
+    margin: 0;
+}
+
+.autumn-comments-more a,
+.autumn-comments-earlier a {
+    color: var(--primary);
+}
+
+.autumn-comments-more a:focus-visible,
+.autumn-comments-earlier a:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}

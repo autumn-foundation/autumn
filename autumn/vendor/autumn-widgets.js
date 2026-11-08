@@ -22,6 +22,9 @@
   //   data-autumn-dismiss              Escape, outside click or focus-out closes
   //   data-autumn-dismiss="escape"     only Escape closes (a tooltip)
   //
+  // role="tree" adds the APG tree keys (Right, Left, `*`) and fires
+  // `autumn:expand` and `autumn:collapse` on the item.
+  //
   // The controller (or trigger) is the element whose aria-controls names the
   // list (or layer). A role="tooltip" layer's trigger names it in
   // aria-describedby or aria-labelledby. Events: `autumn:navigate`
@@ -46,12 +49,21 @@
     el.dispatchEvent(new CustomEvent(name, { bubbles: true, detail: { item: item } }));
   }
 
-  // The items of a list: not disabled, not hidden, not in a nested list.
+  function inHidden(el, list) {
+    for (var p = el.parentElement; p && p !== list; p = p.parentElement) {
+      if (p.hidden) return true;
+    }
+    return false;
+  }
+
+  // The items of a list: not disabled, not hidden (or in a hidden subtree),
+  // not in a nested list. A tree keeps disabled items: they take focus.
   function listItems(list) {
     var sel = list.getAttribute('data-autumn-roving') || ITEMS;
+    var tree = list.getAttribute('role') === 'tree';
     return Array.prototype.filter.call(list.querySelectorAll(sel), function (el) {
-      return !el.hidden && el.getAttribute('aria-disabled') !== 'true' &&
-        el.closest(LIST) === list;
+      return !el.hidden && (tree || el.getAttribute('aria-disabled') !== 'true') &&
+        el.closest(LIST) === list && !inHidden(el, list);
     });
   }
 
@@ -202,10 +214,86 @@
     }
   }
 
+  // ── Tree keys ──
+  // A parent treeitem holds its role="group", or names it in aria-owns.
+  function groupOf(item, list) {
+    var ids = (item.getAttribute('aria-owns') || '').split(/\s+/);
+    for (var i = 0; i < ids.length; i++) {
+      var owned = ids[i] && document.getElementById(ids[i]);
+      if (owned && owned.getAttribute('role') === 'group' && list.contains(owned)) return owned;
+    }
+    for (var j = 0; j < item.children.length; j++) {
+      if (item.children[j].getAttribute('role') === 'group') return item.children[j];
+    }
+    return null;
+  }
+
+  // The treeitem that holds or owns `group`. An owner is often a sibling.
+  function ownerOf(group, list) {
+    var parent = group.parentElement;
+    if (parent && parent.getAttribute('role') === 'treeitem') return parent;
+    if (!group.id) return null;
+    var sel = '[role="treeitem"][aria-owns~="' + CSS.escape(group.id) + '"]';
+    for (var i = 0; parent && i < parent.children.length; i++) {
+      if (parent.children[i].matches(sel)) return parent.children[i];
+    }
+    return list.querySelector(sel);
+  }
+
+  function parentItem(item, list) {
+    var group = item.parentElement && item.parentElement.closest('[role="group"]');
+    return group && list.contains(group) ? ownerOf(group, list) : null;
+  }
+
+  function setExpanded(item, list, open) {
+    var group = groupOf(item, list);
+    item.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (group) group.hidden = !open;
+    // New visible items take focus by click or script. The tab stop stays.
+    if (open) listItems(list).forEach(function (el) { if (!el.hasAttribute('tabindex')) el.tabIndex = -1; });
+    emit(item, open ? 'autumn:expand' : 'autumn:collapse', item);
+  }
+
+  // Return true when the tree takes the key.
+  function treeKey(e, list, all, item) {
+    var rtl = getComputedStyle(list).direction === 'rtl';
+    var open = item.getAttribute('aria-expanded');
+    if (e.key === (rtl ? 'ArrowLeft' : 'ArrowRight')) {
+      if (open === 'false') setExpanded(item, list, true);
+      else if (open === 'true') {
+        // The first visible item in the group. An owned group can be anywhere.
+        var group = groupOf(item, list);
+        var first = group && all.filter(function (el) { return group.contains(el); })[0];
+        if (first) focusItem(list, first);
+      }
+      return true;
+    }
+    if (e.key === (rtl ? 'ArrowRight' : 'ArrowLeft')) {
+      var up = parentItem(item, list);
+      if (open === 'true') setExpanded(item, list, false);
+      else if (up && all.indexOf(up) >= 0) focusItem(list, up);
+      return true;
+    }
+    if (e.key === '*') {
+      var parent = parentItem(item, list);
+      all.forEach(function (el) {
+        if (el.getAttribute('aria-expanded') === 'false' && parentItem(el, list) === parent) {
+          setExpanded(el, list, true);
+        }
+      });
+      return true;
+    }
+    return false;
+  }
+
   function rovingKey(e, list) {
     var all = listItems(list);
     var index = all.indexOf(e.target);
     if (index < 0) return;
+    if (list.getAttribute('role') === 'tree' && treeKey(e, list, all, e.target)) {
+      e.preventDefault();
+      return;
+    }
     var n = nextIndex(list, all.length, index, e.key);
     var item = n >= 0 ? all[n] : null;
     if (!item && e.key.length === 1 && e.key !== ' ' && list.hasAttribute('data-autumn-typeahead')) {
