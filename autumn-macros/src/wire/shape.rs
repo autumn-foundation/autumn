@@ -99,18 +99,7 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
         }
     };
 
-    // A serde attribute behind `cfg_attr` is not expanded yet: the shape it
-    // gives depends on a cfg the macro cannot see.
-    if let Some(attr) = cfg_attr_serde(&input.attrs) {
-        return Err(cfg_attr_refusal(attr));
-    }
-    if let Some(attr) = named
-        .into_iter()
-        .flat_map(|fields| fields.named.iter())
-        .find_map(|field| cfg_attr_serde(&field.attrs))
-    {
-        return Err(cfg_attr_refusal(attr));
-    }
+    refuse_cfg(input, named)?;
 
     // A container attribute that replaces or reshapes the object makes every
     // field row below a fiction. The module's rule is to refuse what it cannot
@@ -174,6 +163,37 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
         deserialized: deserialized.fields,
         closed,
     })
+}
+
+/// Refuse what depends on a cfg the macro cannot see: a `serde(…)` behind
+/// `cfg_attr`, on the container or a field, and a field behind `cfg`.
+fn refuse_cfg(input: &DeriveInput, named: Option<&FieldsNamed>) -> Result<(), syn::Error> {
+    // A serde attribute behind `cfg_attr` is not expanded yet: the shape it
+    // gives depends on a cfg the macro cannot see.
+    if let Some(attr) = cfg_attr_serde(&input.attrs) {
+        return Err(cfg_attr_refusal(attr));
+    }
+    if let Some(attr) = named
+        .into_iter()
+        .flat_map(|fields| fields.named.iter())
+        .find_map(|field| cfg_attr_serde(&field.attrs))
+    {
+        return Err(cfg_attr_refusal(attr));
+    }
+    // A field behind `#[cfg(…)]` is on the wire in one build and gone in
+    // another, and the macro cannot see which.
+    if let Some(attr) = named
+        .into_iter()
+        .flat_map(|fields| fields.named.iter())
+        .find_map(|field| field.attrs.iter().find(|a| a.path().is_ident("cfg")))
+    {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "#[derive(WireShape)] refuses a field behind `#[cfg(…)]`: the macro cannot see the \
+             cfg, so the descriptor could list a field the build does not have",
+        ));
+    }
+    Ok(())
 }
 
 /// The first `#[cfg_attr(…, serde(…))]` in `attrs`, if any.
@@ -541,6 +561,10 @@ mod tests {
                 "#[cfg_attr(test, serde(rename_all = \"camelCase\"))] struct Item { a: String }"
             )
             .contains("cfg_attr")
+        );
+        assert!(
+            refusal("struct Item { #[cfg(feature = \"details\")] details: String }")
+                .contains("#[cfg(")
         );
         // A cfg_attr that adds no serde attribute is fine.
         let s = shape("struct Item { #[cfg_attr(test, allow(dead_code))] a: String }");
