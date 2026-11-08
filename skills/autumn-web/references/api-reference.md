@@ -700,6 +700,12 @@ delete actions remain last-write-wins.
   (up to `n`, default 1). It returns the first output and drops the rest.
   `allow` is asked before each extra copy; return `false` (for example from a
   retry budget) to stop hedging. Only hedge calls that are safe to run twice.
+- `LatencyTracker` (`autumn_web::latency_tracker`) is a lock-free, fixed-memory
+  latency histogram. `record(duration)` counts a sample, `quantile(0.95)`
+  returns the p95 (never below the true value, at most 25 % above), `decay()`
+  halves the counts so recent traffic wins, `reset()` clears it.
+  `HedgePolicy::from_tracker(&tracker, 0.95, fallback)` sets the hedge delay
+  from the measured p95, or `fallback` until there are samples.
 
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
