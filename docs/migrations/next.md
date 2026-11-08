@@ -302,6 +302,71 @@ Add the same two fields to a `DatabaseConfig` literal, or end it with
 **Automation:** `manual` — `0` keeps the old behavior, but a codemod cannot
 know if the app wants a different value.
 
+### Deploy: `DeployConfig` has a `groups` field
+
+**Why:** `[[deploy.groups]]` puts a role on a group of fleet hosts. The
+field is empty by default. See
+[Per-group roles](../guide/fleet-deploys.md#per-group-roles).
+
+**You are affected only if your code builds a `DeployConfig` with a struct
+literal and no `..Default::default()`.** TOML and `AUTUMN_*` config need no
+change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DeployConfig {
+    host: Some("10.0.0.1".to_owned()),
+    // ...every other field...
+    bake: DeployBakeConfig::default(),
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DeployConfig {
+    host: Some("10.0.0.1".to_owned()),
+    // ...every other field...
+    bake: DeployBakeConfig::default(),
+    groups: Vec::new(),
+}
+```
+
+**Automation:** `manual` — an empty list keeps the old behavior.
+
+### Release: regenerated Kubernetes output has one workload per role
+
+**Why:** `autumn release init --target kubernetes` now writes one workload per
+role. See [One workload per role](../guide/kubernetes.md#one-workload-per-role).
+
+**You are affected only if you run `autumn release init --target kubernetes
+--force` again over an earlier output.** Files you do not regenerate keep
+working.
+
+- Object names change from `<name>` to `<name>-<role>`, for example
+  `shop-combined`. An upgrade replaces the Deployment and the Service. Point
+  an Ingress or a `flagger.ingressRef` outside the chart at the new Service.
+- The Helm value `replicaCount` moved to `roles.<name>.replicaCount`. The
+  chart refuses to render when a values file still sets `replicaCount`. Move
+  the value:
+
+  ```yaml
+  # Before
+  replicaCount: 5
+  # After
+  roles:
+    combined:
+      replicaCount: 5
+  ```
+
+- The Kustomize `deployment.yaml`, `service.yaml` and `pdb.yaml` moved from
+  `base/` to `components/<role>/`. Change the target names in your overlay
+  patches, for example `shop` to `shop-combined`.
+
+**Automation:** `manual` — the generator cannot see your overlays and values
+files.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**

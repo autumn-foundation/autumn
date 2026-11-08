@@ -766,14 +766,17 @@ jobs:
         #
         #   helm lint --strict, and helm template | kubeconform -strict, for
         #   the default values and each opt-in mode (Argo Rollouts, Flagger,
-        #   PodMonitor); kustomize build | kubeconform -strict;
-        #   kubeconform on the golden CRD objects; and promtool check/test
-        #   rules on the golden rules, with an injected 5xx spike.
+        #   PodMonitor, Ingress, autoscaling); one workload per role;
+        #   kustomize build | kubeconform -strict; kubeconform on the golden
+        #   CRD objects; and promtool check/test rules on the golden rules,
+        #   with an injected 5xx spike.
         #
-        # No Rust toolchain: the script renders the templates itself. A Rust
-        # test keeps its placeholder list complete. The script pins the tool
-        # versions and the schema commits, and checks each tool tarball's
-        # SHA-256 on every run, also from the cache. Self-test first.
+        # No Rust toolchain: the script checks the golden copies in
+        # autumn-cli/tests/golden/release/ (web, worker and a named role; and
+        # combined). A Rust test keeps them equal to the generator output.
+        # The script pins the tool versions and the schema commits, and checks
+        # each tool tarball's SHA-256 on every run, also from the cache.
+        # Self-test first.
         run: ./scripts/check-k8s-manifests.sh --self-test && ./scripts/check-k8s-manifests.sh
 
   migration-collisions:

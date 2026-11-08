@@ -3411,7 +3411,13 @@ duration_secs = 300   # or: autumn deploy up --bake-secs 300
 Kubernetes: `autumn release init --target kubernetes` writes a Helm chart
 (`deploy/helm/`, set `trustedHosts`) and a Kustomize base with probes, a
 `preStop` hook, a safe grace period, a PDB, and opt-in Argo Rollouts or Flagger
-canaries. See `docs/guide/slo.md` and `docs/guide/kubernetes.md`.
+canaries. Each role gets its own workload (`roles:` in `values.yaml`, one
+Kustomize component per role); only HTTP roles get a Service and an Ingress.
+`--roles` picks the roles. `--target fly` writes one `[processes]` entry per
+role. A fleet sets a role per host group with a `[[deploy.groups]]` table
+(`role = "worker"` and `hosts = ["10.0.0.3"]`). `autumn doctor` warns when a
+manifest names an undeclared role. See `docs/guide/slo.md`, `docs/guide/kubernetes.md` and
+`docs/guide/fleet-deploys.md`.
 
 ## Shadow (differential) deploys
 

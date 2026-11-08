@@ -7,7 +7,7 @@ use crate::git_root::find_git_root;
 use std::fs;
 use std::path::Path;
 
-mod templates {
+pub mod templates {
     pub const DOCKERFILE: &str = include_str!("templates/release/Dockerfile.tmpl");
     pub const DOCKERIGNORE: &str = include_str!("templates/release/.dockerignore.tmpl");
     pub const PRODUCTION_CONFIG: &str =
@@ -65,6 +65,10 @@ mod templates {
         include_str!("templates/release/kubernetes/helm/templates/canary.yaml.tmpl");
     pub const HELM_SERVICE: &str =
         include_str!("templates/release/kubernetes/helm/templates/service.yaml.tmpl");
+    pub const HELM_INGRESS: &str =
+        include_str!("templates/release/kubernetes/helm/templates/ingress.yaml.tmpl");
+    pub const HELM_HPA: &str =
+        include_str!("templates/release/kubernetes/helm/templates/hpa.yaml.tmpl");
     pub const HELM_PDB: &str =
         include_str!("templates/release/kubernetes/helm/templates/pdb.yaml.tmpl");
     pub const HELM_POD_MONITOR: &str =
@@ -79,6 +83,10 @@ mod templates {
         include_str!("templates/release/kubernetes/kustomize/service.yaml.tmpl");
     pub const KUSTOMIZE_PDB: &str =
         include_str!("templates/release/kubernetes/kustomize/pdb.yaml.tmpl");
+    pub const KUSTOMIZE_INGRESS: &str =
+        include_str!("templates/release/kubernetes/kustomize/ingress.yaml.tmpl");
+    pub const KUSTOMIZE_COMPONENT: &str =
+        include_str!("templates/release/kubernetes/kustomize/component.yaml.tmpl");
 }
 
 /// First `autumn-cli` release that ships the issue #1615 supply-chain surface:
@@ -208,6 +216,9 @@ pub enum ReleaseError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    Roles(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,14 +265,18 @@ const fn is_terraform_target(target: Target) -> bool {
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum ReleaseAction {
     Init {
         force: bool,
         target: Target,
         /// Scaffold a separate `worker` service (docker-compose target) that runs
-        /// the app's worker role alongside a web-only `app` service.
+        /// the app's worker role alongside a web-only `app` service. For the
+        /// kubernetes and fly targets: a `web` and a `worker` workload.
         split_workers: bool,
+        /// The roles that get a workload (`--roles`). Empty: see
+        /// [`crate::release_roles::manifest_roles`].
+        roles: Vec<String>,
     },
 }
 
@@ -278,13 +293,14 @@ pub fn run(action: ReleaseAction) {
             force,
             target,
             split_workers,
+            roles,
         } => {
             let project_name = read_project_name(&cwd).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             });
 
-            match init(&cwd, &project_name, force, target, split_workers) {
+            match init_with_roles(&cwd, &project_name, force, target, split_workers, &roles) {
                 Ok(files) => {
                     for f in &files {
                         println!("  Created {f}");
@@ -474,6 +490,7 @@ fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Op
 ///
 /// Returns the list of file names written. Returns [`ReleaseError::FileExists`]
 /// if any output file already exists and `force` is `false`.
+#[cfg(test)]
 pub fn init(
     dir: &Path,
     project_name: &str,
@@ -481,12 +498,28 @@ pub fn init(
     target: Target,
     split_workers: bool,
 ) -> Result<Vec<String>, ReleaseError> {
-    let files = planned_files(target);
+    init_with_roles(dir, project_name, force, target, split_workers, &[])
+}
+
+/// [`init`] with an explicit role list (`--roles`).
+///
+/// # Errors
+///
+/// As `init`, and [`ReleaseError::Roles`] when the role set is not valid.
+pub fn init_with_roles(
+    dir: &Path,
+    project_name: &str,
+    force: bool,
+    target: Target,
+    split_workers: bool,
+    roles: &[String],
+) -> Result<Vec<String>, ReleaseError> {
+    let files = plan_output(dir, project_name, target, split_workers, roles)?;
 
     if !force {
         for (name, _) in &files {
             if dir.join(name).exists() {
-                return Err(ReleaseError::FileExists(name.to_string()));
+                return Err(ReleaseError::FileExists(name.clone()));
             }
         }
     }
@@ -500,26 +533,74 @@ pub fn init(
         ensure_terraform_gitignore_entries(dir)?;
     }
 
-    // Embed assets into the binary only when the project opts in via the
-    // `embed-assets` feature (as `autumn new` generates). Pre-existing apps
-    // without that feature get the disk-based build (`cargo build --release`
-    // plus `COPY static`), so their Docker builds keep working.
-    let embed = project_has_embed_assets(dir);
-
     let mut created = Vec::new();
-    for (name, template) in files {
-        let path = dir.join(name);
+    for (name, content) in files {
+        let path = dir.join(&name);
         // Most planned files sit at the project root, but some targets (e.g.
         // azure-container-apps' `.github/workflows/...`) nest under a
         // subdirectory that a fresh project won't have yet.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, render(template, project_name, embed, split_workers))?;
-        created.push(name.to_string());
+        fs::write(&path, content)?;
+        created.push(name);
     }
 
     Ok(created)
+}
+
+/// Every file `init` writes for `target`, as `(path, content)`. Writes
+/// nothing.
+///
+/// # Errors
+///
+/// [`ReleaseError::Roles`] when the role set is not valid.
+pub fn plan_output(
+    dir: &Path,
+    project_name: &str,
+    target: Target,
+    split_workers: bool,
+    roles: &[String],
+) -> Result<Vec<(String, String)>, ReleaseError> {
+    // Embed assets into the binary only when the project opts in via the
+    // `embed-assets` feature (as `autumn new` generates). Pre-existing apps
+    // without that feature get the disk-based build (`cargo build --release`
+    // plus `COPY static`), so their Docker builds keep working.
+    let embed = project_has_embed_assets(dir);
+    if !roles.is_empty() && !matches!(target, Target::Kubernetes | Target::Fly) {
+        return Err(ReleaseError::Roles(
+            "--roles works only with --target kubernetes or --target fly".to_owned(),
+        ));
+    }
+    let role_set = if matches!(target, Target::Kubernetes | Target::Fly) {
+        let presets = crate::release_roles::read_presets(dir).map_err(ReleaseError::Roles)?;
+        crate::release_roles::manifest_roles(&presets, roles, split_workers)
+            .map_err(ReleaseError::Roles)?
+    } else {
+        Vec::new()
+    };
+
+    let mut files: Vec<(String, String)> = planned_files(target)
+        .into_iter()
+        .map(|(name, template)| {
+            let content = render(template, project_name, embed, split_workers);
+            let content = crate::release_roles::fill_role_blocks(&content, &role_set, project_name);
+            (name.to_owned(), content)
+        })
+        .collect();
+    if target == Target::Fly && !role_set.iter().any(|role| role.serves_http) {
+        return Err(ReleaseError::Roles(
+            "the fly target needs at least one role that serves HTTP".to_owned(),
+        ));
+    }
+    if target == Target::Kubernetes {
+        for (name, template) in
+            crate::release_roles::kustomize_files(&role_set, &k8s_name(project_name))
+        {
+            files.push((name, render(&template, project_name, embed, split_workers)));
+        }
+    }
+    Ok(files)
 }
 
 /// Terraform state (`*.tfstate*`) holds every secret value in plaintext —
@@ -823,8 +904,10 @@ fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
     files
 }
 
-/// The Kubernetes target's files: a Helm chart and a Kustomize base (#3069).
-const KUBERNETES_FILES: [(&str, &str); 15] = [
+/// The fixed files of the Kubernetes target: a Helm chart and a Kustomize
+/// base. Each role also gets a Kustomize component; see
+/// [`crate::release_roles::kustomize_files`].
+const KUBERNETES_FILES: [(&str, &str); 14] = [
     ("deploy/helm/Chart.yaml", templates::HELM_CHART),
     ("deploy/helm/values.yaml", templates::HELM_VALUES),
     ("deploy/helm/.helmignore", templates::HELM_IGNORE),
@@ -845,6 +928,11 @@ const KUBERNETES_FILES: [(&str, &str); 15] = [
         "deploy/helm/templates/service.yaml",
         templates::HELM_SERVICE,
     ),
+    (
+        "deploy/helm/templates/ingress.yaml",
+        templates::HELM_INGRESS,
+    ),
+    ("deploy/helm/templates/hpa.yaml", templates::HELM_HPA),
     ("deploy/helm/templates/pdb.yaml", templates::HELM_PDB),
     (
         "deploy/helm/templates/podmonitor.yaml",
@@ -855,15 +943,6 @@ const KUBERNETES_FILES: [(&str, &str); 15] = [
         "deploy/kustomize/base/kustomization.yaml",
         templates::KUSTOMIZATION,
     ),
-    (
-        "deploy/kustomize/base/deployment.yaml",
-        templates::KUSTOMIZE_DEPLOYMENT,
-    ),
-    (
-        "deploy/kustomize/base/service.yaml",
-        templates::KUSTOMIZE_SERVICE,
-    ),
-    ("deploy/kustomize/base/pdb.yaml", templates::KUSTOMIZE_PDB),
 ];
 
 /// The Kubernetes part of the next steps. Helm rejects a release name with
@@ -11072,14 +11151,14 @@ esac
     fn render_target(target: Target, split_workers: bool) -> Vec<(String, String)> {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, target, split_workers).unwrap();
-        planned_files(target)
+        init(&dir, "my-app", false, target, split_workers)
+            .unwrap()
             .into_iter()
-            .map(|(name, _)| {
-                let content = fs::read_to_string(dir.join(name))
+            .map(|name| {
+                let content = fs::read_to_string(dir.join(&name))
                     .unwrap_or_else(|err| panic!("read generated {name}: {err}"))
                     .replace("\r\n", "\n");
-                (name.to_owned(), content)
+                (name, content)
             })
             .collect()
     }
@@ -11185,7 +11264,7 @@ esac
 
     // ── kubernetes target (issue #3069) ──────────────────────────────────────
 
-    const KUSTOMIZE_DEPLOYMENT: &str = "deploy/kustomize/base/deployment.yaml";
+    const KUSTOMIZE_DEPLOYMENT: &str = "deploy/kustomize/components/combined/deployment.yaml";
     const HELM_VALUES: &str = "deploy/helm/values.yaml";
 
     fn kubernetes_file(files: &[(String, String)], name: &str) -> String {
@@ -11219,13 +11298,17 @@ esac
             "deploy/helm/templates/rollout.yaml",
             "deploy/helm/templates/canary.yaml",
             "deploy/helm/templates/service.yaml",
+            "deploy/helm/templates/ingress.yaml",
+            "deploy/helm/templates/hpa.yaml",
             "deploy/helm/templates/pdb.yaml",
             "deploy/helm/templates/podmonitor.yaml",
             "deploy/helm/templates/NOTES.txt",
             "deploy/kustomize/base/kustomization.yaml",
+            "deploy/kustomize/components/combined/kustomization.yaml",
             KUSTOMIZE_DEPLOYMENT,
-            "deploy/kustomize/base/service.yaml",
-            "deploy/kustomize/base/pdb.yaml",
+            "deploy/kustomize/components/combined/service.yaml",
+            "deploy/kustomize/components/combined/ingress.yaml",
+            "deploy/kustomize/components/combined/pdb.yaml",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
@@ -11255,41 +11338,33 @@ esac
         let chart = fs::read_to_string(dir.join("deploy/helm/Chart.yaml")).unwrap();
         // Compare whole lines: a Windows checkout gives the templates CRLF.
         assert!(chart.lines().any(|l| l == "name: my-shop"), "{chart}");
-        let pdb = fs::read_to_string(dir.join("deploy/kustomize/base/pdb.yaml")).unwrap();
-        assert!(pdb.lines().any(|l| l.trim() == "name: my-shop"), "{pdb}");
+        let pdb =
+            fs::read_to_string(dir.join("deploy/kustomize/components/combined/pdb.yaml")).unwrap();
+        assert!(
+            pdb.lines().any(|l| l.trim() == "name: my-shop-combined"),
+            "{pdb}"
+        );
     }
 
-    /// The raw templates use only the placeholders that
-    /// `scripts/check-k8s-manifests.sh` replaces before `helm lint`.
+    /// The generated files keep no release placeholder. Helm actions have a
+    /// space or a dash after the braces, so they do not match.
     #[test]
-    fn kubernetes_templates_use_only_placeholders_the_ci_check_knows() {
-        for (name, template) in planned_files(Target::Kubernetes)
-            .into_iter()
-            .filter(|(name, _)| name.starts_with("deploy/"))
-        {
-            let mut rest = template;
-            while let Some(start) = rest.find("{{") {
-                let after = &rest[start + 2..];
-                let end = after.find("}}").unwrap_or(after.len());
-                let token = &after[..end];
-                if token.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+    fn kubernetes_output_keeps_no_placeholder() {
+        for split in [false, true] {
+            for (name, content) in render_target(Target::Kubernetes, split) {
+                let mut rest = content.as_str();
+                while let Some(start) = rest.find("{{") {
+                    let after = &rest[start + 2..];
+                    let end = after.find("}}").unwrap_or(after.len());
+                    let token = &after[..end];
                     assert!(
-                        token == "k8s_name" || token == "project_name",
-                        "{name}: unknown placeholder {{{{{token}}}}}"
+                        token.is_empty()
+                            || !token.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                        "{name} kept {{{{{token}}}}}"
                     );
+                    rest = &after[end..];
                 }
-                rest = &after[end..];
             }
-        }
-        for (name, content) in render_target(Target::Kubernetes, false) {
-            assert!(
-                !content.contains("{{k8s_name}}"),
-                "{name} kept a placeholder"
-            );
-            assert!(
-                !content.contains("{{project_name}}"),
-                "{name} kept a placeholder"
-            );
         }
     }
 
@@ -11325,7 +11400,8 @@ esac
         ));
         assert!(helpers.contains("fail \"shutdown.bufferSeconds must be 1 or more"));
         assert!(
-            helpers.contains("terminationGracePeriodSeconds: {{ include \"app.gracePeriod\" . }}")
+            helpers
+                .contains("terminationGracePeriodSeconds: {{ include \"app.gracePeriod\" $root }}")
         );
         assert!(helpers.contains("AUTUMN_SERVER__PRESTOP_GRACE_SECS"));
         assert!(helpers.contains("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS"));
@@ -11360,14 +11436,17 @@ esac
         let files = render_target(Target::Kubernetes, false);
         for name in [
             "deploy/helm/templates/pdb.yaml",
-            "deploy/kustomize/base/pdb.yaml",
+            "deploy/kustomize/components/combined/pdb.yaml",
         ] {
             let pdb = kubernetes_file(&files, name);
             assert!(pdb.contains("kind: PodDisruptionBudget"), "{name}");
             assert!(pdb.contains("maxUnavailable:"), "{name}");
         }
-        let kustomization = kubernetes_file(&files, "deploy/kustomize/base/kustomization.yaml");
-        assert!(kustomization.contains("- pdb.yaml"), "{kustomization}");
+        let component = kubernetes_file(
+            &files,
+            "deploy/kustomize/components/combined/kustomization.yaml",
+        );
+        assert!(component.contains("- pdb.yaml"), "{component}");
     }
 
     /// The chart reads the keys that `autumn slo generate` writes to
@@ -11381,16 +11460,275 @@ esac
         }
         let rollout = kubernetes_file(&files, "deploy/helm/templates/rollout.yaml");
         assert!(rollout.contains("kind: Rollout"));
-        assert!(rollout.contains(".Values.analysis.templateName"));
+        assert!(rollout.contains("$.Values.analysis.templateName"));
         assert!(rollout.contains("name: canary-hash"));
         assert!(rollout.contains("podTemplateHashValue: Latest"));
         let helpers = kubernetes_file(&files, "deploy/helm/templates/_helpers.tpl");
         assert!(helpers.contains("fieldPath: metadata.labels['rollouts-pod-template-hash']"));
         let canary = kubernetes_file(&files, "deploy/helm/templates/canary.yaml");
         assert!(canary.contains("kind: Canary"));
-        assert!(canary.contains("range .Values.analysis.metricTemplates"));
+        assert!(canary.contains("range $.Values.analysis.metricTemplates"));
         assert!(canary.contains("max: {{ $.Values.analysis.maxBurnRate }}"));
         let deployment = kubernetes_file(&files, "deploy/helm/templates/deployment.yaml");
         assert!(deployment.contains("fail \"set rollout.enabled or flagger.enabled, not both\""));
+    }
+    // ── one workload per role ────────────────────────────────────────────────
+
+    /// The app of the golden copy: `web`, `worker` and the `marketing` preset.
+    const GOLDEN_ROLES_TOML: &str = "[roles.marketing]\nbase = \"web\"\nmount = [\"marketing\"]\n";
+
+    /// Render `target` for a project named `demo_app` with `autumn_toml`.
+    fn render_demo(
+        target: Target,
+        autumn_toml: Option<&str>,
+        split: bool,
+        roles: &[&str],
+    ) -> Result<Vec<(String, String)>, ReleaseError> {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "demo_app");
+        if let Some(text) = autumn_toml {
+            fs::write(dir.join("autumn.toml"), text).unwrap();
+        }
+        let roles: Vec<String> = roles.iter().map(|r| (*r).to_owned()).collect();
+        plan_output(&dir, "demo_app", target, split, &roles)
+    }
+
+    fn golden_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/release")
+    }
+
+    /// Compare the `deploy/` files with `tests/golden/release/<case>`. Set
+    /// `UPDATE_GOLDEN=1` to write them.
+    fn assert_matches_golden(case: &str, files: &[(String, String)]) {
+        let dir = golden_root().join(case);
+        let deploy: Vec<&(String, String)> = files
+            .iter()
+            .filter(|(n, _)| n.starts_with("deploy/"))
+            .collect();
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            let _ = fs::remove_dir_all(&dir);
+            for (name, content) in &deploy {
+                let path = dir.join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, content).unwrap();
+            }
+        }
+        for (name, content) in &deploy {
+            let path = dir.join(name);
+            let golden = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing golden {}: {e}", path.display()))
+                .replace("\r\n", "\n");
+            assert_eq!(
+                content.replace("\r\n", "\n"),
+                golden,
+                "{name} differs from its golden file. If the change is intended, run \
+                 `UPDATE_GOLDEN=1 cargo test -p autumn-cli golden` and review the diff."
+            );
+        }
+        let mut on_disk = Vec::new();
+        let mut stack = vec![dir.clone()];
+        while let Some(at) = stack.pop() {
+            for entry in fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(&dir).unwrap();
+                    on_disk.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        for name in on_disk {
+            assert!(
+                deploy.iter().any(|(n, _)| *n == name),
+                "golden {case}/{name} is no longer generated; remove it"
+            );
+        }
+    }
+
+    #[test]
+    fn kubernetes_golden_web_worker_and_a_named_role() {
+        let files = render_demo(Target::Kubernetes, Some(GOLDEN_ROLES_TOML), false, &[]).unwrap();
+        assert_matches_golden("kubernetes-roles", &files);
+    }
+
+    #[test]
+    fn kubernetes_golden_combined() {
+        let files = render_demo(Target::Kubernetes, None, false, &[]).unwrap();
+        assert_matches_golden("kubernetes-combined", &files);
+    }
+
+    #[test]
+    fn kubernetes_presets_give_one_workload_per_role() {
+        let files = render_demo(Target::Kubernetes, Some(GOLDEN_ROLES_TOML), false, &[]).unwrap();
+        let values = kubernetes_file(&files, HELM_VALUES);
+        for (role, http) in [("web", true), ("worker", false), ("marketing", true)] {
+            assert!(
+                values.contains(&format!(
+                    "  {role}:\n    enabled: true\n    servesHttp: {http}\n"
+                )),
+                "{role}: {values}"
+            );
+        }
+        assert!(!values.contains("combined:"), "{values}");
+        let base = kubernetes_file(&files, "deploy/kustomize/base/kustomization.yaml");
+        assert!(
+            base.contains(
+                "components:\n  - ../components/web\n  - ../components/worker\n  - \
+                 ../components/marketing\n"
+            ),
+            "{base}"
+        );
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"deploy/kustomize/components/marketing/service.yaml"));
+        assert!(!names.contains(&"deploy/kustomize/components/worker/service.yaml"));
+        let worker = kubernetes_file(&files, "deploy/kustomize/components/worker/deployment.yaml");
+        assert!(worker.contains("value: worker\n"), "{worker}");
+        assert!(
+            worker.contains("path: /live"),
+            "a worker keeps its liveness probe"
+        );
+        assert!(
+            worker.contains("path: /ready"),
+            "a worker keeps its readiness probe"
+        );
+    }
+
+    #[test]
+    fn kubernetes_default_app_gets_one_combined_role() {
+        let files = render_demo(Target::Kubernetes, None, false, &[]).unwrap();
+        let values = kubernetes_file(&files, HELM_VALUES);
+        assert!(values.contains("roles:\n  combined:\n    enabled: true\n    servesHttp: true\n"));
+        let base = kubernetes_file(&files, "deploy/kustomize/base/kustomization.yaml");
+        assert!(
+            base.contains("components:\n  - ../components/combined\n"),
+            "{base}"
+        );
+    }
+
+    #[test]
+    fn kubernetes_split_workers_gives_web_and_worker() {
+        let files = render_demo(Target::Kubernetes, None, true, &[]).unwrap();
+        let values = kubernetes_file(&files, HELM_VALUES);
+        assert!(values.contains("  web:\n"), "{values}");
+        assert!(values.contains("  worker:\n"), "{values}");
+        assert!(!values.contains("combined:"), "{values}");
+    }
+
+    #[test]
+    fn kubernetes_explicit_roles_win() {
+        let files = render_demo(
+            Target::Kubernetes,
+            Some(GOLDEN_ROLES_TOML),
+            false,
+            &["marketing"],
+        )
+        .unwrap();
+        let base = kubernetes_file(&files, "deploy/kustomize/base/kustomization.yaml");
+        assert!(
+            base.contains("components:\n  - ../components/marketing\nimages:"),
+            "{base}"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_role_is_refused_before_any_file_is_written() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "demo_app");
+        let err = init_with_roles(
+            &dir,
+            "demo_app",
+            false,
+            Target::Kubernetes,
+            false,
+            &["critical".to_owned()],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReleaseError::Roles(_)), "{err}");
+        assert!(!dir.join("Dockerfile").exists());
+    }
+
+    #[test]
+    fn helm_templates_give_http_objects_only_to_http_roles() {
+        let files = render_demo(Target::Kubernetes, None, false, &[]).unwrap();
+        for name in [
+            "deploy/helm/templates/service.yaml",
+            "deploy/helm/templates/ingress.yaml",
+            "deploy/helm/templates/canary.yaml",
+        ] {
+            let template = kubernetes_file(&files, name);
+            assert!(template.contains("$role.servesHttp"), "{name}");
+        }
+        let helpers = kubernetes_file(&files, "deploy/helm/templates/_helpers.tpl");
+        assert!(helpers.contains("and .root.Values.rollout.enabled .role.servesHttp"));
+        assert!(helpers.contains("- name: AUTUMN_ROLE"));
+        assert!(helpers.contains("- name: AUTUMN_JOBS__PIN"));
+        assert!(helpers.contains("app.kubernetes.io/component: {{ .name }}"));
+    }
+
+    #[test]
+    fn fly_split_roles_get_one_process_group_each() {
+        let files = render_demo(Target::Fly, Some(GOLDEN_ROLES_TOML), false, &[]).unwrap();
+        let fly = kubernetes_file(&files, "fly.toml");
+        assert!(fly.contains("[processes]\n"), "{fly}");
+        assert!(
+            fly.contains("  web = \"env AUTUMN_ROLE=web /usr/local/bin/demo_app\"\n"),
+            "{fly}"
+        );
+        assert!(fly.contains("  worker = \"env AUTUMN_ROLE=worker /usr/local/bin/demo_app\"\n"));
+        assert!(
+            fly.contains("  marketing = \"env AUTUMN_ROLE=marketing"),
+            "{fly}"
+        );
+        assert!(
+            fly.contains("[http_service]\n  processes = [\"web\"]\n  internal_port"),
+            "{fly}"
+        );
+        assert!(fly.contains("# marketing serves HTTP too."), "{fly}");
+    }
+
+    #[test]
+    fn fly_combined_app_has_no_process_groups() {
+        let files = render_demo(Target::Fly, None, false, &[]).unwrap();
+        let fly = kubernetes_file(&files, "fly.toml");
+        assert!(!fly.contains("[processes]"), "{fly}");
+        assert!(!fly.contains("processes ="), "{fly}");
+        assert!(
+            fly.contains(
+                "# release_command = \"autumn migrate\"\n\n[http_service]\n  internal_port"
+            )
+        );
+    }
+
+    #[test]
+    fn fly_needs_a_role_that_serves_http() {
+        let err = render_demo(Target::Fly, None, false, &["worker"]).unwrap_err();
+        assert!(err.to_string().contains("serves HTTP"), "{err}");
+    }
+
+    #[test]
+    fn roles_flag_is_refused_on_other_targets() {
+        let err = render_demo(Target::DockerCompose, None, false, &["web"]).unwrap_err();
+        assert!(err.to_string().contains("--roles"), "{err}");
+    }
+
+    #[test]
+    fn helm_chart_refuses_a_top_level_replica_count() {
+        let files = render_demo(Target::Kubernetes, None, false, &[]).unwrap();
+        let helpers = kubernetes_file(&files, "deploy/helm/templates/_helpers.tpl");
+        assert!(helpers.contains("replicaCount moved to roles.<name>.replicaCount"));
+        let values = kubernetes_file(&files, HELM_VALUES);
+        assert!(
+            !values.lines().any(|l| l.starts_with("replicaCount:")),
+            "{values}"
+        );
+    }
+
+    #[test]
+    fn other_targets_ignore_the_roles() {
+        let files =
+            render_demo(Target::DockerCompose, Some(GOLDEN_ROLES_TOML), false, &[]).unwrap();
+        let compose = kubernetes_file(&files, "docker-compose.yml");
+        assert!(!compose.contains("AUTUMN_ROLE"), "{compose}");
     }
 }

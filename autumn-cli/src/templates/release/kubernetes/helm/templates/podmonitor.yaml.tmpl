@@ -12,6 +12,9 @@ spec:
   # job = the release name, on primary and canary pods alike. Use it in
   # `autumn slo generate --selector 'job="<release>"'`.
   jobLabel: app.kubernetes.io/instance
+  # Each series gets the role of its pod.
+  podTargetLabels:
+    - app.kubernetes.io/component
   selector:
     matchLabels:
       # Only the instance label. Flagger changes app.kubernetes.io/name on its

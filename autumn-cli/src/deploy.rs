@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_web::alerts::{Alert, AlertChannel, AlertCondition};
-use autumn_web::config::{AutumnConfig, DeployConfig, Env};
+use autumn_web::config::{AutumnConfig, DeployConfig, DeployGroupHost, Env};
 use proxy::ProxyController;
 use serde::Deserialize;
 
@@ -396,6 +396,12 @@ pub struct ResolvedDeployConfig {
     /// [`classify_sqlite_data_file`] also applies a filesystem-independent rule,
     /// so an empty list never leaves the common names unguarded.
     pub release_payloads: Vec<String>,
+    /// The role of this host, from `[[deploy.groups]]`. Its env file sets
+    /// `AUTUMN_ROLE` to it. `None`: the role in `autumn.toml`.
+    pub role: Option<String>,
+    /// Every `[[deploy.groups]]` host and its role. Empty without groups.
+    /// [`ResolvedFleet::from_targets`] reads it to set [`Self::role`].
+    pub group_roles: Vec<DeployGroupHost>,
 }
 
 /// What a deploy must do to keep the app's `SQLite` data file (issue #1909).
@@ -538,6 +544,8 @@ impl ResolvedDeployConfig {
             install_proxy: cfg.install_proxy,
             sqlite_data: SqliteDataPlacement::None,
             release_payloads: Vec::new(),
+            role: None,
+            group_roles: cfg.group_hosts()?,
         })
     }
 
@@ -689,6 +697,10 @@ impl ResolvedDeployConfig {
 // `pub(crate)` as redundant; it is kept to document the intended visibility.
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn deploy_host_list(cfg: &DeployConfig) -> Result<Vec<String>, String> {
+    // `[[deploy.groups]]`: the group order, then the host order.
+    if !cfg.groups.is_empty() {
+        return Ok(cfg.group_hosts()?.into_iter().map(|g| g.host).collect());
+    }
     let host = cfg
         .host
         .as_deref()
@@ -794,7 +806,7 @@ fn select_hosts(configured: &[String], only: &[String]) -> Result<Vec<String>, S
 /// An ordered fleet of deploy targets, each a fully-resolved
 /// [`ResolvedDeployConfig`] (issue #1621, AC-1).
 ///
-/// The elements differ **only** in `host`: the shared shape (the `app_name` →
+/// The elements differ **only** in `host` and its group `role`: the shared shape (the `app_name` →
 /// `app_dir` → `service_name` chain, the TLS-requires-host rejection, profile
 /// trimming) is resolved ONCE through [`ResolvedDeployConfig::resolve`] and then
 /// cloned per host. That is what makes a one-entry `hosts` list byte-for-byte the
@@ -846,17 +858,31 @@ impl ResolvedFleet {
     /// Build a fleet from an ALREADY-resolved shared config plus the ordered
     /// address list from [`deploy_host_list`].
     ///
-    /// The elements differ only in `host`, so a one-entry list is byte-for-byte
+    /// The elements differ only in `host` and `role`, so a one-entry list is byte-for-byte
     /// today's single-server deploy **by construction**. An empty or single-entry
     /// list keeps `shared` verbatim — including a `None` host — so a config with no
     /// target still flows into the normal preflight report rather than being
     /// special-cased here.
+    ///
+    /// Each host gets its `[[deploy.groups]]` role from
+    /// [`ResolvedDeployConfig::group_roles`].
     #[must_use]
     pub fn from_targets(shared: &ResolvedDeployConfig, addresses: &[String]) -> Self {
+        let role_of = |host: Option<&str>| {
+            host.and_then(|host| {
+                shared
+                    .group_roles
+                    .iter()
+                    .find(|g| g.host == host)
+                    .map(|g| g.role.clone())
+            })
+        };
         if addresses.len() <= 1 {
+            let host = addresses.first().cloned().or_else(|| shared.host.clone());
             return Self {
                 hosts: vec![ResolvedDeployConfig {
-                    host: addresses.first().cloned().or_else(|| shared.host.clone()),
+                    role: role_of(host.as_deref()),
+                    host,
                     ..shared.clone()
                 }],
             };
@@ -866,6 +892,7 @@ impl ResolvedFleet {
                 .iter()
                 .map(|host| ResolvedDeployConfig {
                     host: Some(host.clone()),
+                    role: role_of(Some(host)),
                     ..shared.clone()
                 })
                 .collect(),
@@ -1484,6 +1511,55 @@ pub fn render_systemd_unit(cfg: &ResolvedDeployConfig) -> String {
 /// `{service}-{slot}.service` (see [`exec::slot_unit_name`]).
 #[must_use]
 pub fn render_app_unit(
+    cfg: &ResolvedDeployConfig,
+    release_dir: &str,
+    app_port: u16,
+    slot: &str,
+) -> String {
+    let unit = render_app_unit_base(cfg, release_dir, app_port, slot);
+    if cfg.role.is_none() {
+        return unit;
+    }
+    // A group host reads its role from the release dir, after the shared env
+    // file, so the role wins. A rollback then runs the release with the role it
+    // shipped with. `-`: a release with no role file runs the configured role.
+    let shared = format!("EnvironmentFile={}\n", cfg.env_file());
+    unit.replacen(
+        &shared,
+        &format!("{shared}EnvironmentFile=-{}\n", role_env_path(release_dir)),
+        1,
+    )
+}
+
+/// The role file of a release: `AUTUMN_ROLE=<role>`.
+fn role_env_path(release_dir: &str) -> String {
+    format!("{release_dir}/{ROLE_ENV_FILE}")
+}
+
+/// The name of the role file in a release dir.
+const ROLE_ENV_FILE: &str = "role.env";
+
+/// Add the op that writes the role file of a group host. It goes after the
+/// binary upload, so the release dir exists, and before the unit starts.
+fn push_role_env_op(ops: &mut Vec<exec::DeployOp>, release_dir: &str, role: Option<&str>) {
+    let Some(role) = role else {
+        return;
+    };
+    let op = exec::DeployOp::WriteFile {
+        label: "write-role-env",
+        contents: exec::FileContents::Plain(format!("AUTUMN_ROLE={role}\n")),
+        remote_path: role_env_path(release_dir),
+        mode: Some(0o644),
+    };
+    let at = ops
+        .iter()
+        .position(|op| op.label() == "upload-binary")
+        .map_or(0, |i| i + 1);
+    ops.insert(at, op);
+}
+
+/// [`render_app_unit`] without the role file.
+fn render_app_unit_base(
     cfg: &ResolvedDeployConfig,
     release_dir: &str,
     app_port: u16,
@@ -2889,6 +2965,19 @@ fn collect_fleet_preflight(
     checks
 }
 
+/// The preflight of `deploy up` and `deploy check`: [`collect_fleet_preflight`]
+/// plus `deploy_group_roles`. A rollback does not run the role check: it
+/// starts a release with the role file that release shipped with.
+fn collect_rollout_preflight(
+    config: &AutumnConfig,
+    fleet: &ResolvedFleet,
+    configured_host_count: usize,
+) -> Vec<PreflightCheck> {
+    let mut checks = collect_fleet_preflight(config, fleet, configured_host_count);
+    checks.extend(grade_group_roles(config, fleet));
+    checks
+}
+
 /// Whether the active profile is production, matching the exact rule the app boot
 /// path uses in `fail_fast_on_invalid_signing_secret`
 /// (`matches!(config.profile.as_deref(), Some("prod" | "production"))`).
@@ -3001,7 +3090,7 @@ fn run_check(
     eprintln!("\u{1F342} autumn deploy check\n");
 
     let fleet = ResolvedFleet::from_targets(resolved, hosts);
-    let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
+    let checks = collect_rollout_preflight(config, &fleet, configured_host_count);
     let failed = report_preflight(&checks);
 
     // Mirror `deploy up`'s config-manifest signal here too (#1952 check/up
@@ -3060,6 +3149,10 @@ fn print_plan(
         for line in fleet::fleet_plan_lines(hosts) {
             println!("{line}");
         }
+    }
+    // The `[[deploy.groups]]` role of each host. Printed only with groups.
+    for line in fleet::fleet_role_lines(&ResolvedFleet::from_targets(resolved, hosts).hosts) {
+        println!("{line}");
     }
 
     // MediaMTX host provisioning (issue #1974, Slice 7): only when the
@@ -3210,6 +3303,74 @@ fn build_env_file(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> exe
         body.push('\n');
     }
     exec::Secret::new(body)
+}
+
+/// The `deploy_group_roles` check: each `[[deploy.groups]]` role is declared,
+/// and a split role has a shared jobs backend. `None` without groups.
+fn grade_group_roles(config: &AutumnConfig, fleet: &ResolvedFleet) -> Option<PreflightCheck> {
+    const NAME: &str = "deploy_group_roles";
+    let shared = fleet.hosts.first()?;
+    if shared.group_roles.is_empty() {
+        return None;
+    }
+    // The roles in group order, each with its hosts.
+    let mut roles: Vec<(&str, Vec<&str>)> = Vec::new();
+    for group in &shared.group_roles {
+        match roles.iter_mut().find(|(role, _)| *role == group.role) {
+            Some((_, hosts)) => hosts.push(&group.host),
+            None => roles.push((&group.role, vec![&group.host])),
+        }
+    }
+    for (name, _) in &roles {
+        let role = name
+            .parse::<autumn_web::config::RoleName>()
+            .map_err(|e| e.to_string())
+            .and_then(|n| {
+                autumn_web::config::resolve_role(&n, &config.roles).map_err(|e| e.to_string())
+            });
+        let role = match role {
+            Ok(role) => role,
+            Err(e) => {
+                return Some(PreflightCheck::fail(
+                    NAME,
+                    format!("[[deploy.groups]] role {name:?}: {e}"),
+                    "Declare the role as [roles.<name>] in autumn.toml, or use combined, web or worker",
+                ));
+            }
+        };
+        let backend = config.jobs.backend.as_str();
+        let db_url = resolve_writable_db_url(&config.database);
+        if autumn_web::config::split_role_requires_file_backed_sqlite(
+            role.guard_base(),
+            backend,
+            db_url,
+        ) {
+            return Some(PreflightCheck::fail(
+                NAME,
+                format!(
+                    "[[deploy.groups]] role {name:?} on jobs.backend = \"sqlite\" with an \
+                     in-memory database: the app does not boot"
+                ),
+                "Point database.url at a sqlite:// file, or run the combined role",
+            ));
+        }
+        if autumn_web::config::split_role_requires_durable_backend(role.guard_base(), backend) {
+            return Some(PreflightCheck::fail(
+                NAME,
+                format!(
+                    "[[deploy.groups]] role {name:?} on jobs.backend = \"{backend}\": a split \
+                     role needs a queue that other processes share, and the app does not boot"
+                ),
+                "Set [jobs] backend = \"postgres\" or \"redis\", or run the combined role",
+            ));
+        }
+    }
+    let detail = roles
+        .iter()
+        .map(|(role, hosts)| format!("{role}: {}", hosts.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(PreflightCheck::pass(NAME, detail))
 }
 
 /// Resolve the local path to the pre-built release binary this deploy uploads.
@@ -3822,7 +3983,7 @@ fn run_up(
     // Fail fast: run the full preflight and abort BEFORE any remote call. Every
     // host is graded here, so an unreachable host in position 3 is reported before
     // host 1 is touched.
-    let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
+    let checks = collect_rollout_preflight(config, &fleet, configured_host_count);
     refuse_if_preflight_failed(&checks)?;
 
     let binary = resolve_release_binary(resolved)?;
@@ -4405,6 +4566,8 @@ where
                 reregister_options: &state.reregister_options,
             },
         );
+        // A group host gets its role file in the release dir.
+        push_role_env_op(&mut ops, &release_dir, cfg.role.as_deref());
         // Host preparation (#1607, AC-1): this host has no usable reverse-proxy binary,
         // so install one as the first op of its turn, ahead of the proxy unit that
         // supervises it and ahead of everything else. Running it here rather than during
@@ -6938,6 +7101,247 @@ mod tests {
         .expect("declining host prep resolves");
         assert!(!declined.install_proxy);
         assert_eq!(provisioning(&declined), exec::ProxyProvisioning::Disabled);
+    }
+
+    // ── per-group roles ───────────────────────────────────────────
+
+    fn group_cfg(groups: &[(&str, &[&str])]) -> DeployConfig {
+        DeployConfig {
+            groups: groups
+                .iter()
+                .map(|(role, hosts)| autumn_web::config::DeployGroup {
+                    role: (*role).to_owned(),
+                    hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+                })
+                .collect(),
+            ..DeployConfig::default()
+        }
+    }
+
+    fn app_config(toml_text: &str) -> AutumnConfig {
+        toml::from_str(toml_text).expect("app config parses")
+    }
+
+    #[test]
+    fn group_hosts_flatten_in_group_order() {
+        let cfg = group_cfg(&[
+            ("web", &["10.0.0.1", "10.0.0.2"]),
+            ("worker", &["10.0.0.3"]),
+        ]);
+        assert_eq!(
+            deploy_host_list(&cfg).unwrap(),
+            ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+        );
+    }
+
+    #[test]
+    fn group_hosts_refuse_hosts_and_a_shared_host() {
+        let mixed = DeployConfig {
+            hosts: vec!["10.0.0.9".to_owned()],
+            ..group_cfg(&[("web", &["10.0.0.1"])])
+        };
+        let err = deploy_host_list(&mixed).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        let shared = group_cfg(&[("web", &["10.0.0.1"]), ("worker", &["10.0.0.1"])]);
+        let err = deploy_host_list(&shared).unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn each_fleet_host_gets_its_group_role() {
+        let cfg = group_cfg(&[("web", &["10.0.0.1", "10.0.0.2"]), ("jobs", &["10.0.0.3"])]);
+        let fleet = ResolvedFleet::resolve(&cfg, "myapp").unwrap();
+        let roles: Vec<(Option<&str>, Option<&str>)> = fleet
+            .hosts
+            .iter()
+            .map(|h| (h.host.as_deref(), h.role.as_deref()))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                (Some("10.0.0.1"), Some("web")),
+                (Some("10.0.0.2"), Some("web")),
+                (Some("10.0.0.3"), Some("worker")),
+            ]
+        );
+        let narrowed = ResolvedFleet::from_targets(&fleet.hosts[0], &["10.0.0.3".to_owned()]);
+        assert_eq!(
+            narrowed.hosts[0].role.as_deref(),
+            Some("worker"),
+            "--only keeps the role"
+        );
+    }
+
+    #[test]
+    fn a_single_group_host_still_gets_its_role() {
+        let cfg = group_cfg(&[("worker", &["10.0.0.3"])]);
+        let fleet = ResolvedFleet::resolve(&cfg, "myapp").unwrap();
+        assert!(fleet.is_single());
+        assert_eq!(fleet.hosts[0].role.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn hosts_without_groups_get_no_role() {
+        let fleet = ResolvedFleet::resolve(&fleet_cfg(&["a", "b"]), "myapp").unwrap();
+        assert!(fleet.hosts.iter().all(|h| h.role.is_none()));
+    }
+
+    #[test]
+    fn a_group_host_reads_its_role_from_the_release_dir() {
+        let cfg = group_cfg(&[("worker", &["10.0.0.3"])]);
+        let fleet = ResolvedFleet::resolve(&cfg, "myapp").unwrap();
+        let release_dir = "/srv/autumn/myapp/releases/r2";
+        let unit = render_app_unit(&fleet.hosts[0], release_dir, 3001, "blue");
+        let shared = format!("EnvironmentFile={}\n", fleet.hosts[0].env_file());
+        let role = "EnvironmentFile=-/srv/autumn/myapp/releases/r2/role.env\n";
+        let at_shared = unit.find(&shared).expect("shared env file");
+        let at_role = unit.find(role).expect("role file");
+        assert!(at_shared < at_role, "the role file must win: {unit}");
+
+        let plain = ResolvedFleet::resolve(&fleet_cfg(&["a", "b"]), "myapp").unwrap();
+        let plain_unit = render_app_unit(&plain.hosts[0], release_dir, 3001, "blue");
+        assert!(!plain_unit.contains("role.env"), "{plain_unit}");
+        assert_eq!(
+            plain_unit,
+            render_app_unit_base(&plain.hosts[0], release_dir, 3001, "blue")
+        );
+    }
+
+    #[test]
+    fn the_role_file_is_written_after_the_binary_upload() {
+        let cfg = group_cfg(&[("worker", &["10.0.0.3"])]);
+        let fleet = ResolvedFleet::resolve(&cfg, "myapp").unwrap();
+        let host = &fleet.hosts[0];
+        let release_dir = "/srv/autumn/myapp/releases/r2";
+        let unit = render_app_unit(host, release_dir, 3001, "blue");
+        let mut ops = exec::first_deploy_ops(
+            host,
+            &proxy::KamalProxyController::new(60),
+            &unit,
+            exec::Secret::new("AUTUMN_ENV=prod\n"),
+            Path::new("/local/myapp"),
+            &[],
+            "r2",
+            &exec::SlotPlan::first(3000),
+            exec::MigrateStep::Run,
+        );
+        let before = ops.len();
+        push_role_env_op(&mut ops, release_dir, host.role.as_deref());
+        assert_eq!(ops.len(), before + 1);
+        let labels: Vec<&str> = ops.iter().map(exec::DeployOp::label).collect();
+        let upload = labels.iter().position(|l| *l == "upload-binary").unwrap();
+        assert_eq!(labels[upload + 1], "write-role-env", "{labels:?}");
+        let start = labels
+            .iter()
+            .position(|l| l.contains("start"))
+            .unwrap_or(labels.len());
+        assert!(upload + 1 < start, "{labels:?}");
+        match &ops[upload + 1] {
+            exec::DeployOp::WriteFile {
+                contents,
+                remote_path,
+                ..
+            } => {
+                assert_eq!(remote_path, "/srv/autumn/myapp/releases/r2/role.env");
+                assert!(
+                    matches!(contents, exec::FileContents::Plain(t) if t == "AUTUMN_ROLE=worker\n")
+                );
+            }
+            other => panic!("not a write: {other:?}"),
+        }
+        let mut plain = Vec::new();
+        push_role_env_op(&mut plain, release_dir, None);
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn group_roles_check_passes_declared_roles_on_a_shared_backend() {
+        let config =
+            app_config("[jobs]\nbackend = \"postgres\"\n[roles.critical]\nbase = \"worker\"\n");
+        let cfg = group_cfg(&[("web", &["a"]), ("worker", &["b"]), ("critical", &["c"])]);
+        let fleet = ResolvedFleet::resolve(&cfg, "myapp").unwrap();
+        let check = grade_group_roles(&config, &fleet).expect("groups get a check");
+        assert_eq!(check.name, "deploy_group_roles");
+        assert!(check.passed, "{}", check.detail);
+        assert!(check.detail.contains("web: a"), "{}", check.detail);
+        assert!(check.detail.contains("critical: c"), "{}", check.detail);
+    }
+
+    #[test]
+    fn group_roles_check_refuses_an_undeclared_role() {
+        let config = app_config("[jobs]\nbackend = \"postgres\"\n");
+        let fleet = ResolvedFleet::resolve(&group_cfg(&[("critical", &["c"])]), "myapp").unwrap();
+        let check = grade_group_roles(&config, &fleet).expect("groups get a check");
+        assert!(!check.passed);
+        assert!(check.detail.contains("critical"), "{}", check.detail);
+        assert!(check.blocking());
+    }
+
+    #[test]
+    fn group_roles_check_refuses_a_split_role_on_the_local_backend() {
+        let config = app_config("");
+        let fleet =
+            ResolvedFleet::resolve(&group_cfg(&[("web", &["a"]), ("worker", &["b"])]), "myapp")
+                .unwrap();
+        let check = grade_group_roles(&config, &fleet).expect("groups get a check");
+        assert!(!check.passed);
+        assert!(check.detail.contains("local"), "{}", check.detail);
+    }
+
+    #[test]
+    fn group_roles_check_refuses_a_split_role_on_in_memory_sqlite() {
+        let config = app_config(
+            "[jobs]\nbackend = \"sqlite\"\n[database]\nprimary_url = \"sqlite::memory:\"\n",
+        );
+        let fleet = ResolvedFleet::resolve(&group_cfg(&[("worker", &["b"])]), "myapp").unwrap();
+        let check = grade_group_roles(&config, &fleet).expect("groups get a check");
+        assert!(!check.passed);
+        assert!(check.detail.contains("in-memory"), "{}", check.detail);
+    }
+
+    #[test]
+    fn group_roles_check_is_absent_without_groups() {
+        let fleet = ResolvedFleet::resolve(&fleet_cfg(&["a", "b"]), "myapp").unwrap();
+        assert!(grade_group_roles(&app_config(""), &fleet).is_none());
+    }
+
+    #[test]
+    fn fleet_preflight_carries_the_group_roles_check() {
+        let config = app_config("");
+        let fleet = ResolvedFleet::resolve(&group_cfg(&[("worker", &["b"])]), "myapp").unwrap();
+        let checks = collect_rollout_preflight(&config, &fleet, 1);
+        let check = checks
+            .iter()
+            .find(|c| c.name == "deploy_group_roles")
+            .expect("the single-host path runs the check too");
+        assert!(!check.passed, "worker on the local backend must fail");
+        let rollback = collect_fleet_preflight(&config, &fleet, 1);
+        assert!(
+            !rollback.iter().any(|c| c.name == "deploy_group_roles"),
+            "a rollback does not grade the working-tree roles"
+        );
+    }
+
+    #[test]
+    fn plan_lists_each_host_with_its_role() {
+        let fleet = ResolvedFleet::resolve(
+            &group_cfg(&[("web", &["a", "b"]), ("worker", &["c"])]),
+            "myapp",
+        )
+        .unwrap();
+        let lines = fleet::fleet_role_lines(&fleet.hosts);
+        assert!(
+            lines.iter().any(|l| l.contains('a') && l.contains("web")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains('c') && l.contains("worker")),
+            "{lines:?}"
+        );
+        let plain = ResolvedFleet::resolve(&fleet_cfg(&["a", "b"]), "myapp").unwrap();
+        assert!(fleet::fleet_role_lines(&plain.hosts).is_empty());
     }
 
     // ── fleet host list (#1621) ───────────────────────────────────

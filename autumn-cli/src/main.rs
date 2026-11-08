@@ -65,6 +65,7 @@ mod plugin_sandbox;
 mod posture;
 mod process;
 mod release;
+mod release_roles;
 mod replay;
 mod retention;
 mod routes;
@@ -4466,8 +4467,9 @@ enum ReleaseCommands {
     ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
     ///                                   connector, opt-in Memorystore Redis).
     /// --target kubernetes             : also emits a Helm chart (deploy/helm/) and a
-    ///                                   Kustomize base (deploy/kustomize/base/) with
-    ///                                   /startup, /live and /ready probes, a `preStop`
+    ///                                   Kustomize base (deploy/kustomize/base/). Each
+    ///                                   role gets its own workload (see --roles). Both
+    ///                                   have /startup, /live and /ready probes, a `preStop`
     ///                                   hook, a grace period longer than the drain
     ///                                   window, a `PodDisruptionBudget`, and opt-in
     ///                                   Argo Rollouts or Flagger canaries.
@@ -4479,13 +4481,19 @@ enum ReleaseCommands {
         /// aws-ecs | gcp-cloud-run | kubernetes (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
-        /// Scaffold a separate worker-role service in the generated
-        /// docker-compose.yml (opt-in split topology). The `app` service runs
-        /// the web role and a new `worker` service runs jobs+scheduler, both on
-        /// the shared `postgres` jobs backend. Only affects `--target
-        /// docker-compose`; the default output is a single combined service.
+        /// Scaffold a split topology. For `--target docker-compose`: the `app`
+        /// service runs the web role and a new `worker` service runs jobs and
+        /// the scheduler, both on the shared `postgres` jobs backend. For
+        /// `--target kubernetes` and `--target fly`: a `web` and a `worker`
+        /// workload. The default output is one combined service.
         #[arg(long)]
         split_workers: bool,
+        /// The roles that get a workload. Only for `--target kubernetes` and
+        /// `--target fly`. Each is a built-in role or a `[roles.<name>]`
+        /// preset in autumn.toml. Default: `combined`. With presets or
+        /// `--split-workers`: `web`, `worker`, then each preset.
+        #[arg(long, value_name = "ROLE", value_delimiter = ',')]
+        roles: Vec<String>,
     },
 }
 
@@ -7049,6 +7057,7 @@ fn run_release_command(cmd: ReleaseCommands) {
             force,
             target,
             split_workers,
+            roles,
         } => {
             let t = target.as_deref().map_or(release::Target::Default, |s| {
                 s.parse().unwrap_or_else(|e| {
@@ -7060,6 +7069,7 @@ fn run_release_command(cmd: ReleaseCommands) {
                 force,
                 target: t,
                 split_workers,
+                roles,
             });
         }
     }
@@ -11105,6 +11115,35 @@ mod tests {
             panic!("expected release init");
         };
         assert!(!split_workers, "split_workers must default to false");
+    }
+
+    #[test]
+    fn parse_release_init_with_roles() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "release",
+            "init",
+            "--target",
+            "kubernetes",
+            "--roles",
+            "web,worker",
+            "--roles",
+            "critical",
+        ])
+        .unwrap();
+        let Commands::Release(ReleaseCommands::Init { roles, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(roles, ["web", "worker", "critical"]);
+    }
+
+    #[test]
+    fn parse_release_init_roles_default_empty() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { roles, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert!(roles.is_empty());
     }
 
     #[test]

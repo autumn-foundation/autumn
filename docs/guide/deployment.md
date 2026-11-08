@@ -352,6 +352,9 @@ host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
 # keep_releases = 3               # prior releases retained for rollback (default: 3)
 # install_proxy = false           # decline host preparation — you install
 #                                 # kamal-proxy yourself (default: true)
+# [[deploy.groups]]               # a role per group of hosts. Remove `host`
+# role = "worker"                 # and `hosts` when you use groups (see the
+# hosts = ["10.0.0.3"]            # fleet deploys guide, "Per-group roles")
 ```
 
 Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
@@ -2054,6 +2057,27 @@ fly secrets set AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/mya
 fly secrets set AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 fly deploy
 ```
+
+**Split roles.** With `[roles.*]` presets in `autumn.toml`, `--split-workers`
+or `--roles`, the generator writes one process group per role:
+
+```toml
+# fly.toml
+[processes]
+  web = "env AUTUMN_ROLE=web /usr/local/bin/myapp"
+  worker = "env AUTUMN_ROLE=worker /usr/local/bin/myapp"
+
+[http_service]
+  processes = ["web"]
+```
+
+Fly balances `[http_service]` over its groups with no path routing. So only
+one group gets it: `web` or `combined`, else the first role that serves HTTP.
+A comment names each other HTTP role. Give such a role its own `[[services]]`
+block, or its own Fly app. The `/live` check runs on every group. Scale each
+group with `fly scale count web=2 worker=1`. A split role needs a shared jobs
+backend (`[jobs] backend = "postgres"`). An app with only the `combined` role
+gets no `[processes]` block.
 
 **Using a database?** Uncomment the `release_command` line in `fly.toml` before
 the first `fly deploy`:

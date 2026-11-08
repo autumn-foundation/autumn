@@ -9891,8 +9891,9 @@ fn capacity_contract_scheduled_probe_uses_declared_defaults() {
     }
 }
 
-/// CI lints the Kubernetes release templates and the golden SLO files with
-/// the real tools (issue #3069): `helm lint`, `kubeconform` and `promtool`.
+/// CI lints the golden Kubernetes release output and the golden SLO files
+/// with the real tools (issue #3069): `helm lint`, `kubeconform`, `kustomize`
+/// and `promtool`. One golden app has the web, worker and a named role.
 #[test]
 fn ci_lints_the_kubernetes_manifests_and_slo_files() {
     let root = workspace_root();
@@ -9915,7 +9916,9 @@ fn ci_lints_the_kubernetes_manifests_and_slo_files() {
     for needle in [
         "lint --strict",
         "kubeconform",
-        "build \"${rendered}/kustomize\"",
+        "build \"${app}/kustomize/base\"",
+        "autumn-cli/tests/golden/release/kubernetes-roles/deploy",
+        "autumn-cli/tests/golden/release/kubernetes-combined/deploy",
         "check rules",
         "test rules",
         "checksum mismatch",

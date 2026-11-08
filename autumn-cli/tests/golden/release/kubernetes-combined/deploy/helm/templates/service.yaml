@@ -1,0 +1,24 @@
+{{- if not .Values.flagger.enabled }}
+{{- range $name, $role := .Values.roles }}
+{{- $ctx := dict "root" $ "name" $name "role" $role }}
+{{- /* Only a role that serves HTTP gets a Service. */}}
+{{- if and $role.enabled $role.servesHttp }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "app.roleName" $ctx }}
+  labels:
+    {{- include "app.roleLabels" $ctx | nindent 4 }}
+spec:
+  type: {{ $.Values.service.type }}
+  ports:
+    - name: http
+      port: {{ $.Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "app.roleSelectorLabels" $ctx | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}
