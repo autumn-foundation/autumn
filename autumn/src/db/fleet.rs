@@ -345,7 +345,8 @@ pub enum FleetError {
         /// The database name.
         name: String,
     },
-    /// Restoring the database from its replica failed (`503`).
+    /// A restore from the replica failed, or a restore from a local file
+    /// refused its file or the key (`503`).
     #[error("fleet database {name}: restore failed: {detail}")]
     Restore {
         /// The database name.
@@ -2710,8 +2711,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     }
 
     /// Run `work` while `key` is out of service for a restore. Openers wait.
-    /// The open database is closed first, and the hooks let go of its files.
-    /// `work` starts only then.
+    /// It closes the open database first. The hooks release its files. Then
+    /// `work` starts.
     async fn with_exclusive<T>(
         &self,
         key: &FleetDbKey,

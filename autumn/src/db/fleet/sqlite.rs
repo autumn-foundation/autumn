@@ -897,14 +897,14 @@ impl DatabaseFleet<SqliteEngine> {
         })?
     }
 
-    /// Copy `src` into a staging file beside the database of `key`, then
+    /// Copy `source` into a staging file beside the database of `key`, then
     /// check and migrate it, for [`restore_from_file`](Self::restore_from_file).
     /// Blocking. A refused source is [`FleetError::Restore`]. Migrations run
     /// when `migrate` is set or when opens apply them.
     pub(super) fn stage_restore(
         &self,
         key: &FleetDbKey,
-        src: &Path,
+        source: &Path,
         rekey: bool,
         migrate: bool,
         epoch: Option<u64>,
@@ -919,9 +919,9 @@ impl DatabaseFleet<SqliteEngine> {
         };
         let invalid = |detail: String| FleetError::Restore {
             name: name.clone(),
-            detail: format!("cannot restore {}: {detail}", src.display()),
+            detail: format!("{}: {detail}", source.display()),
         };
-        stage_file(&path, &name, src, migrations, epoch, rules, invalid)
+        stage_file(&path, &name, source, migrations, epoch, rules, invalid)
     }
 
     /// Count migrations a restore applied.
@@ -1807,12 +1807,6 @@ pub(super) fn stage_import(
     use diesel::RunQueryDsl as _;
     use diesel::connection::SimpleConnection as _;
 
-    #[derive(diesel::QueryableByName)]
-    struct Kind {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        kind: String,
-    }
-
     let unavailable = |detail: String| FleetError::Unavailable {
         name: name.to_owned(),
         detail,
@@ -1842,28 +1836,7 @@ pub(super) fn stage_import(
             .map_err(|e| unavailable(e.to_string()))?;
         crate::replication::sqlite::integrity_check(&mut conn)
             .map_err(|e| invalid(e.to_string()))?;
-        // The identity and epoch must be plain tables: a view with a trigger
-        // could answer any name.
-        let kinds: Vec<Kind> = diesel::sql_query(format!(
-            "SELECT name || ':' || type AS kind FROM sqlite_master \
-             WHERE name IN ('{IDENTITY_TABLE}', '{EPOCH_TABLE}')"
-        ))
-        .load(&mut conn)
-        .map_err(|e| unavailable(e.to_string()))?;
-        if kinds.iter().any(|row| !row.kind.ends_with(":table")) {
-            return Err(invalid(
-                "its identity or epoch is not a plain table".to_owned(),
-            ));
-        }
-        if !kinds
-            .iter()
-            .any(|row| row.kind == format!("{IDENTITY_TABLE}:table"))
-        {
-            return Err(invalid(
-                "it records no identity row; only a file that a fleet made can be imported"
-                    .to_owned(),
-            ));
-        }
+        check_fleet_tables(&mut conn, &unavailable, &invalid)?;
         // The copy has no history in this fleet: set its epoch, never keep
         // the source's.
         conn.batch_execute(&format!("DROP TABLE IF EXISTS {EPOCH_TABLE};"))
@@ -1898,22 +1871,89 @@ pub(super) fn stage_import(
     if let Some(epoch) = epoch {
         write_epoch_stamp(staging, name, epoch)?;
     }
+    // A trigger on another table can change the identity row while the
+    // migrations run. Read it again.
+    if read_identity(staging, name)?.as_deref() != Some(name) {
+        return Err(invalid(
+            "its identity row changed while it was migrated".to_owned(),
+        ));
+    }
     Ok((applied, rekeyed_from))
 }
 
+/// Refuse a copy whose identity or epoch is not a plain table, that records
+/// no identity table, or that has a trigger on these tables.
+fn check_fleet_tables(
+    conn: &mut diesel::SqliteConnection,
+    unavailable: &impl Fn(String) -> FleetError,
+    invalid: &impl Fn(String) -> FleetError,
+) -> Result<(), FleetError> {
+    use diesel::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct Kind {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        kind: String,
+    }
+
+    // The identity and epoch must be plain tables: a view with a trigger
+    // could answer any name.
+    let kinds: Vec<Kind> = diesel::sql_query(format!(
+        "SELECT name || ':' || type AS kind FROM sqlite_master \
+         WHERE name IN ('{IDENTITY_TABLE}', '{EPOCH_TABLE}')"
+    ))
+    .load(conn)
+    .map_err(|e| unavailable(e.to_string()))?;
+    if kinds.iter().any(|row| !row.kind.ends_with(":table")) {
+        return Err(invalid(
+            "its identity or epoch is not a plain table".to_owned(),
+        ));
+    }
+    if !kinds
+        .iter()
+        .any(|row| row.kind == format!("{IDENTITY_TABLE}:table"))
+    {
+        return Err(invalid(
+            "it records no identity row; only a file that a fleet made is accepted".to_owned(),
+        ));
+    }
+    // A trigger on these tables could block or undo a write to them.
+    let triggers: Vec<Kind> = diesel::sql_query(format!(
+        "SELECT name AS kind FROM sqlite_master WHERE type = 'trigger' \
+         AND lower(tbl_name) IN ('{IDENTITY_TABLE}', '{EPOCH_TABLE}')"
+    ))
+    .load(conn)
+    .map_err(|e| unavailable(e.to_string()))?;
+    if !triggers.is_empty() {
+        return Err(invalid(
+            "it has a trigger on its identity or epoch table".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Write `name` into the identity row of the file at `path`. Blocking.
+/// Exactly one row must change.
 fn write_identity(path: &Path, name: &str) -> Result<(), FleetError> {
     use diesel::RunQueryDsl as _;
+    use diesel::connection::SimpleConnection as _;
     let unavailable = |detail: String| FleetError::Unavailable {
         name: name.to_owned(),
         detail,
     };
     let mut conn = crate::db::establish_sqlite_migration_connection(&SqliteEngine::url_of(path))
         .map_err(|e| unavailable(e.to_string()))?;
-    diesel::sql_query(format!("UPDATE {IDENTITY_TABLE} SET name = ? WHERE id = 1"))
+    conn.batch_execute("PRAGMA trusted_schema = OFF;")
+        .map_err(|e| unavailable(e.to_string()))?;
+    let changed = diesel::sql_query(format!("UPDATE {IDENTITY_TABLE} SET name = ? WHERE id = 1"))
         .bind::<diesel::sql_types::Text, _>(name)
         .execute(&mut conn)
         .map_err(|e| unavailable(e.to_string()))?;
+    if changed != 1 {
+        return Err(unavailable(format!(
+            "the identity row did not change ({changed} rows)"
+        )));
+    }
     Ok(())
 }
 

@@ -326,17 +326,21 @@ async fn a_bad_file_is_refused_and_the_live_database_stays() {
         &format!("CREATE VIEW {IDENTITY_TABLE} AS SELECT 1 AS id, 'tenant:acme' AS name;"),
     );
 
-    for source in [junk, corrupt, plain, forged, tmp.path().join("absent.db")] {
-        let refused = restore(&fleet, &key, &source, LocalRestore::new())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(refused, FleetError::Restore { .. }),
-            "{}: {refused}",
-            source.display()
-        );
-        let db = fleet.open(&key).await.unwrap();
-        assert_eq!(bodies(&db).await, ["kept", "later"], "the live file stays");
+    let sources = [junk, corrupt, plain, forged, tmp.path().join("absent.db")];
+    // `allow_rekey` accepts another key, never a file with no identity.
+    for opts in [LocalRestore::new(), LocalRestore::new().allow_rekey(true)] {
+        for source in &sources {
+            let refused = restore(&fleet, &key, source, opts.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(refused, FleetError::Restore { .. }),
+                "{}: {refused}",
+                source.display()
+            );
+            let db = fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db).await, ["kept", "later"], "the live file stays");
+        }
     }
     assert!(no_staging_files(fleet.root()));
     fleet.close_all().await;
@@ -612,6 +616,17 @@ fn control(
 /// A replicated fleet with tombstones. `retention` keeps a deleted key's
 /// replica and its tombstone row.
 fn replicated(dir: &Path, retention: Duration) -> Replicated {
+    let destination: Arc<dyn ReplicaDestination> =
+        Arc::new(FileDestination::new(dir.join("replicas")).unwrap());
+    replicated_to(dir, retention, destination)
+}
+
+/// [`replicated`] with its own destination.
+fn replicated_to(
+    dir: &Path,
+    retention: Duration,
+    destination: Arc<dyn ReplicaDestination>,
+) -> Replicated {
     let fleet = DatabaseFleet::builder(config(&dir.join("fleet"), retention))
         .min_residency(Duration::ZERO)
         .connect_timeout_secs(30)
@@ -619,8 +634,6 @@ fn replicated(dir: &Path, retention: Duration) -> Replicated {
         .unwrap();
     let clock: Arc<dyn crate::time::ClockSource> = Arc::new(crate::time::SystemClock);
     let tombstones = Arc::new(FleetTombstones::new(control(dir), Arc::clone(&clock)));
-    let destination: Arc<dyn ReplicaDestination> =
-        Arc::new(FileDestination::new(dir.join("replicas")).unwrap());
     let replication = Arc::new(
         FleetReplication::new(
             destination,
@@ -729,4 +742,250 @@ async fn a_refused_backup_keeps_the_tombstone_and_the_replica() {
     assert_eq!(bodies(&db).await, ["kept"]);
     drop(db);
     host.fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn a_failed_swap_keeps_the_tombstone_and_the_replica() {
+    use diesel::connection::SimpleConnection as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let host = replicated(tmp.path(), Duration::from_secs(3600));
+    let (key, backup) = backed_up(&host.fleet, "acme", tmp.path()).await;
+    host.fleet.close(&key).await;
+    assert!(host.fleet.delete(&key).await.unwrap());
+    // A file another process holds open: the swap must refuse.
+    let path = host.fleet.path_of(&key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::copy(&backup, &path).unwrap();
+    let mut other =
+        crate::db::establish_sqlite_migration_connection(&format!("sqlite://{}", path.display()))
+            .unwrap();
+    // A fleet file is in WAL mode. There the guard sees another reader.
+    other
+        .batch_execute("PRAGMA journal_mode = WAL; SELECT 1 FROM notes;")
+        .unwrap();
+
+    let refused = restore(
+        &host.fleet,
+        &key,
+        &backup,
+        LocalRestore::new().clear_tombstone(true),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(refused, FleetError::InUseElsewhere { .. }),
+        "{refused}"
+    );
+    assert!(
+        host.tombstones.get(&key.name()).await.unwrap().is_some(),
+        "the tombstone stays"
+    );
+    drop(other);
+    std::fs::remove_file(&path).unwrap();
+    // The replica still undoes the delete.
+    host.fleet.restore_latest(&key).await.unwrap();
+    let db = host.fleet.open(&key).await.unwrap();
+    assert_eq!(bodies(&db).await, ["kept"]);
+    drop(db);
+    host.fleet.close_all().await;
+}
+
+/// A file destination whose writes fail while `failing` is set.
+struct Flaky {
+    inner: FileDestination,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl Flaky {
+    fn fail(&self) -> Result<(), crate::replication::DestinationError> {
+        if std::sync::atomic::AtomicBool::load(&self.failing, std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::replication::DestinationError::Io {
+                op: "put",
+                detail: "the destination is down".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ReplicaDestination for Flaky {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn put(&self, key: &str, body: &[u8]) -> Result<(), crate::replication::DestinationError> {
+        self.fail()?;
+        self.inner.put(key, body)
+    }
+    fn put_file(&self, key: &str, path: &Path) -> Result<(), crate::replication::DestinationError> {
+        self.fail()?;
+        self.inner.put_file(key, path)
+    }
+    fn get(&self, key: &str) -> Result<Vec<u8>, crate::replication::DestinationError> {
+        self.inner.get(key)
+    }
+    fn get_to_file(
+        &self,
+        key: &str,
+        path: &Path,
+    ) -> Result<(), crate::replication::DestinationError> {
+        self.inner.get_to_file(key, path)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, crate::replication::DestinationError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> Result<(), crate::replication::DestinationError> {
+        self.inner.delete(key)
+    }
+}
+
+#[tokio::test]
+async fn a_failed_ship_reports_the_error_and_keeps_the_restored_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let flaky = Arc::new(Flaky {
+        inner: FileDestination::new(tmp.path().join("replicas")).unwrap(),
+        failing: std::sync::atomic::AtomicBool::new(false),
+    });
+    let host = replicated_to(tmp.path(), Duration::ZERO, Arc::clone(&flaky) as _);
+    let (key, backup) = backed_up(&host.fleet, "acme", tmp.path()).await;
+    write_later(&host.fleet, &key).await;
+    host.fleet.close(&key).await;
+    flaky
+        .failing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let outcome = restore(&host.fleet, &key, &backup, LocalRestore::new())
+        .await
+        .expect("the restore succeeds: the file is in place");
+
+    assert!(outcome.replaced);
+    assert_eq!(outcome.shipped, None);
+    assert!(outcome.ship_error.is_some(), "{outcome:?}");
+    let db = host.fleet.open(&key).await.unwrap();
+    assert_eq!(bodies(&db).await, ["kept"]);
+    drop(db);
+    flaky
+        .failing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    host.fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn a_slot_this_host_does_not_own_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = fleet(&tmp.path().join("source"));
+    let (key, backup) = backed_up(&source, "acme", tmp.path()).await;
+    source.close_all().await;
+    let other = u16::from(key.routing_slot() == 0);
+    let fleet = fleet(&tmp.path().join("fleet"));
+    let store = Arc::new(MemoryOwnership::new(Arc::new(crate::time::SystemClock)));
+    let ownership = Arc::new(
+        FleetOwnership::new(
+            Arc::clone(&store) as _,
+            OwnerId::new("host-a").unwrap(),
+            vec![SlotRange::new(other, other).unwrap()],
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    fleet.start_ownership(ownership).await.unwrap();
+
+    let refused = restore(&fleet, &key, &backup, LocalRestore::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(refused, FleetError::NotOwner { .. }), "{refused}");
+    assert!(!fleet.exists(&key));
+    fleet.close_all().await;
+}
+
+/// A provision that has not reported its creation must not report the
+/// restored file as its own.
+#[tokio::test]
+async fn the_restore_takes_the_creation_mark_of_a_provision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(&tmp.path().join("fleet"));
+    let (key, backup) = backed_up(&fleet, "acme", tmp.path()).await;
+    fleet.lock_state().unacknowledged.insert(key.clone());
+
+    restore(&fleet, &key, &backup, LocalRestore::new())
+        .await
+        .unwrap();
+
+    assert!(!fleet.lock_state().unacknowledged.contains(&key));
+    assert!(matches!(
+        fleet.provision(&key).await,
+        Err(FleetError::AlreadyExists { .. })
+    ));
+    fleet.close_all().await;
+}
+
+// ── Triggers ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_trigger_on_the_identity_table_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(&tmp.path().join("fleet"));
+    let (_, backup) = backed_up(&fleet, "acme", tmp.path()).await;
+    // It would block the write of the new key.
+    sqlite_exec(
+        &backup,
+        &format!(
+            "CREATE TRIGGER keep BEFORE UPDATE ON {IDENTITY_TABLE} \
+             BEGIN SELECT RAISE(IGNORE); END;"
+        ),
+    );
+    let (globex, _) = backed_up(&fleet, "globex", tmp.path()).await;
+
+    let refused = restore(
+        &fleet,
+        &globex,
+        &backup,
+        LocalRestore::new().allow_rekey(true),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(&refused, FleetError::Restore { detail, .. } if detail.contains("trigger")),
+        "{refused}"
+    );
+    let db = fleet.open(&globex).await.unwrap();
+    assert_eq!(bodies(&db).await, ["kept"], "the live file stays");
+    assert_eq!(
+        fleet.inspect(&globex).await.unwrap().identity.as_deref(),
+        Some("tenant:globex")
+    );
+    drop(db);
+    fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn an_identity_that_a_migration_trigger_changes_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backup = bare_backup(tmp.path(), "acme").await;
+    // The trigger fires when the restore records a migration.
+    sqlite_exec(
+        &backup,
+        &format!(
+            "CREATE TABLE IF NOT EXISTS __diesel_schema_migrations (\
+                 version VARCHAR(50) PRIMARY KEY NOT NULL, \
+                 run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP); \
+             CREATE TRIGGER rename AFTER INSERT ON __diesel_schema_migrations \
+             BEGIN UPDATE {IDENTITY_TABLE} SET name = 'tenant:other'; END;"
+        ),
+    );
+    let fleet = fleet(&tmp.path().join("fleet"));
+    let key = fleet.key_for("acme").unwrap();
+
+    let refused = restore(&fleet, &key, &backup, LocalRestore::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&refused, FleetError::Restore { detail, .. } if detail.contains("identity")),
+        "{refused}"
+    );
+    assert!(!fleet.exists(&key));
+    assert!(no_staging_files(fleet.root()));
 }

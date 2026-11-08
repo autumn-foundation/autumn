@@ -3708,11 +3708,13 @@ enum FleetCommands {
         #[arg(long)]
         force: bool,
     },
-    /// Rebuild one database from its `[replication]` replica.
+    /// Rebuild one database from its `[replication]` replica, or replace it
+    /// with a local file.
     ///
-    /// Verifies the chain before it replaces the file, as
-    /// `autumn db replica restore` does. Refused when another process has the
-    /// file open.
+    /// From the replica, it verifies the chain before it replaces the file,
+    /// as `autumn db replica restore` does. With `--from`, it replaces the
+    /// file with a local backup, and replication is not needed. Refused when
+    /// another process has the file open.
     Restore {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
@@ -3724,7 +3726,8 @@ enum FleetCommands {
         #[arg(long, value_name = "RFC3339", conflicts_with = "from")]
         timestamp: Option<String>,
         /// Restore from this local file (a `fleet backup`) instead of the
-        /// replica. Replication is not needed.
+        /// replica. Replication is not needed. The command applies pending
+        /// migrations to the copy.
         #[arg(long, value_name = "FILE")]
         from: Option<std::path::PathBuf>,
         /// With `--from`: accept a backup of another key, and write this key

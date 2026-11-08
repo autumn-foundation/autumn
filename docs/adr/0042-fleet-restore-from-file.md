@@ -43,16 +43,20 @@ For migrations:
 
 API: option 2. `import` keeps its rule that it never replaces a file. The
 new call uses the import checks (`VACUUM INTO` copy, integrity check, plain
-identity table, identity row, migrations, epoch) on a staging file. Then it
-swaps the file with the swap step of the replica restore: path lock,
-exclusive guard, old sidecars out, link in. The key is out of service for
-the whole swap, so an opener waits and then sees the new file.
+identity table, no trigger on the identity or epoch table, identity row,
+migrations, epoch) on a staging file. The copy does not read the live file,
+so it runs before the key goes out of service. Then the fleet swaps the
+file with the swap step of the replica restore: path lock, exclusive guard,
+old sidecars out, link in. The key is out of service for the whole swap, so
+an opener waits and then sees the new file. The identity row is read again
+after the migrations, because a trigger on another table can change it.
 
 Tombstone: option 3. The tombstone keeps the replica of a deleted database
 for undo. A silent clear would purge that replica. With
 `LocalRestore::clear_tombstone`, the restore purges the old replica and
-drops the row, as `provision` and `import` do. It does this only after the
-file passes its checks.
+drops the row, as `provision` and `import` do. It does this after the swap:
+a failed swap keeps the undo replica. The new file has not shipped yet, so
+the purge cannot reach it.
 
 Migrations: option 2. Pending migrations refuse the restore when opens do
 not apply them, and the live file stays. `LocalRestore::apply_migrations`
@@ -72,8 +76,10 @@ snapshot. A later replica restore then finds the restored data.
 - The staging file sits beside the database, not under
   `RESTORE_CHECK_DIR`. A hard link needs one file system, and the
   database directory is on it.
-- A ship that fails after the swap answers `FleetError::Restore`, and the
-  file stays in place. The caller must call `ship_now` before a replica
-  restore.
+- A ship that fails after the swap does not fail the call. The file is in
+  place, and `LocalRestoreOutcome::ship_error` says why. The key must ship
+  before any replica restore.
+- The ship runs after the drain ends. A replica restore of the same key in
+  that gap brings back the replica. Run restores of one key one at a time.
 - `autumn fleet restore --from` stops when ownership is on: it holds no
   slot lease. The app calls `restore_from_file` instead.

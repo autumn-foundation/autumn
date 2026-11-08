@@ -214,31 +214,35 @@ let outcome = fleet.restore_from_file(&key, &archive, LocalRestore::new()).await
 
 The steps:
 
-1. The key goes out of service. Openers wait. The open database closes.
+1. A key with a tombstone is refused, unless `clear_tombstone` is set.
 2. The fleet copies `src` into a staging file with `VACUUM INTO`. The copy
    must pass `PRAGMA integrity_check`. Its identity row must record `key`.
-3. The fleet applies pending migrations when opens apply them
-   (`auto_migrate`). Otherwise pending migrations refuse the restore.
-4. With ownership, the copy gets this host's epoch. Without ownership, the
-   copy has no epoch.
-5. The copy goes in place of the old file in one step, under the path lock.
+   A trigger on the identity or epoch table is refused.
+3. The fleet applies pending migrations to the copy when opens apply them
+   (`apply_migrations_on_open`, set by `database.auto_migrate`). Otherwise
+   pending migrations refuse the restore.
+4. With ownership, the copy gets the epoch of this host. Without ownership,
+   the copy has no epoch.
+5. The key goes out of service. Openers wait. The open database closes.
+6. The copy goes in place of the old file in one step, under the path lock.
    The old `-wal` and `-shm` go.
-6. Openers continue. They see the restored file.
-7. With replication, the fleet opens the database and ships a new base
-   snapshot. Thus a later replica restore does not roll the database back
-   past the local restore.
+7. With `clear_tombstone`, the old replica and the tombstone go.
+8. Openers continue. They see the restored file.
+9. With replication, the fleet opens the database and ships a new base
+   snapshot. A later replica restore then finds the restored data.
 
-A failure before step 5 changes nothing. A refused file answers
-`FleetError::Restore` (`503`). This includes a file that is missing, is not
-a database, is corrupt, or records another key. Another process that has
-the file open gives `409`, and nothing changes.
+Steps 2 to 4 do not touch the live file, so openers keep working while the
+copy runs. An error before step 6 changes nothing. A refused file or key
+answers `FleetError::Restore` (`503`). This includes a file that is missing,
+is not a database, is corrupt, or records another key. Another process that
+has the file open gives `409`, and nothing changes.
 
 Each option makes the restore accept more. All are off by default:
 
 | `LocalRestore` | Does |
 | --- | --- |
 | `allow_rekey(true)` | accept a backup of another key, and write `key` into its identity row. Use it to copy a tenant to a new key |
-| `clear_tombstone(true)` | restore a deleted key that has a tombstone. The old replica and the tombstone go, as with `provision`. This ends the undo window |
+| `clear_tombstone(true)` | restore a deleted key that has a tombstone. After the swap, the old replica and the tombstone go, as with `provision`. This ends the undo window |
 | `apply_migrations(true)` | apply pending migrations even when opens do not |
 
 A deleted key that has a tombstone is refused by default. The tombstone
@@ -248,10 +252,13 @@ Use `fleet.restore_latest(&key)` to undo the delete from the replica. Use
 replication there are no tombstones: a deleted key is restored at once.
 
 `LocalRestoreOutcome` tells what changed: `replaced` (a file was there),
-`rekeyed_from`, `migrations_applied`, `tombstone_cleared`, and `shipped`
-(the ship of the new base snapshot, or `None` without replication). When
-the ship fails, the call answers `FleetError::Restore` and the file is in
-place. Call `fleet.ship_now(&key)` before any replica restore then.
+`rekeyed_from`, `migrations_applied`, `tombstone_cleared`, `shipped` (the
+ship of the new base snapshot, `None` without replication) and
+`ship_error`. A failed ship does not fail the call: the file is in place,
+and `ship_error` says why. Then the replica holds older data. Ship the key
+before any replica restore: an open in a process that replicates it ships
+a new base. A replica restore that runs between steps 8 and 9 brings back
+the replica: run restores of one key one at a time.
 
 `FleetLifecycle::restore_missing` is a lower-level hook. Each request-path
 open of a missing file asks it, under the path lock, whatever
@@ -352,7 +359,8 @@ autumn fleet restore tenant:acme --from /backups/acme.db --force
   on, it ships a new base snapshot of the restored file, so it needs the
   replica destination and the control database. With
   `[database.fleet.ownership]` on, it stops: this command holds no slot
-  lease.
+  lease. On Unix, the file must belong to you or to root, and every
+  directory on the way must pass the `backup` rule. A symlink is refused.
 - On Windows, another process can open the database while `delete` or
   `restore` removes files (see [Limits](#limits)). The command then
   stops with "open in another process" or "created ... during the restore".
@@ -609,7 +617,7 @@ A tombstone stops the restore of a deleted database:
   restore. If the restore fails, the row goes back.
 - `fleet.restore_from_file` refuses a key that has a row, unless
   `clear_tombstone` is set. Then it purges the old replica and drops the
-  row, but only after the file passes its checks.
+  row after the new file is in place.
 
 Use the retention as an undo window:
 

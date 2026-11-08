@@ -1054,7 +1054,7 @@ mod sqlite {
         assert!(stderr.contains("tenant:acme"), "{stderr}");
         assert!(stderr.contains("--allow-rekey"), "{stderr}");
         assert!(!app.path("globex").exists(), "nothing is published");
-        run_ok(
+        let (_, stderr) = run_ok(
             &app.dir,
             &[
                 "fleet",
@@ -1066,6 +1066,8 @@ mod sqlite {
                 "--force",
             ],
         );
+        assert!(stderr.contains("now records tenant:globex"), "{stderr}");
+        assert!(stderr.contains("created the file"), "{stderr}");
         assert_eq!(count_notes(&app.path("globex")), 2);
 
         // A bad file: refused, and the live database stays.
@@ -1096,6 +1098,51 @@ mod sqlite {
             ],
         );
         assert!(stderr.contains("is not a file"), "{stderr}");
+    }
+
+    /// Another user could swap the file in a shared directory.
+    #[cfg(unix)]
+    #[test]
+    fn fleet_restore_from_a_file_refuses_a_shared_directory_and_a_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let app = App::new("");
+        app.provision(&app.fleet(), &["acme"], 1);
+        let backup = cli_backup(&app);
+        exec(&app.path("acme"), "INSERT INTO notes VALUES ('later')");
+
+        let shared = app.dir.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let in_shared = shared.join("acme.db");
+        std::fs::copy(&backup, &in_shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                in_shared.to_str().unwrap(),
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("writable by other users"), "{stderr}");
+
+        let link = app.dir.join("link.db");
+        std::os::unix::fs::symlink(&backup, &link).unwrap();
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                link.to_str().unwrap(),
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("is not a file"), "{stderr}");
+        assert_eq!(count_notes(&app.path("acme")), 2, "nothing was restored");
     }
 
     #[test]
@@ -1185,7 +1232,7 @@ mod sqlite {
         assert!(!app.path("acme").exists());
         assert_eq!(tombstones(&app), 1);
 
-        run_ok(
+        let (_, stderr) = run_ok(
             &app.dir,
             &[
                 "fleet",
@@ -1196,6 +1243,10 @@ mod sqlite {
                 "--clear-tombstone",
                 "--force",
             ],
+        );
+        assert!(
+            stderr.contains("tombstone and the old replica are gone"),
+            "{stderr}"
         );
         assert_eq!(count_notes(&app.path("acme")), 1);
         assert_eq!(tombstones(&app), 0);

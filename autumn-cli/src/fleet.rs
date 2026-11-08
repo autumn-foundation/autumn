@@ -734,8 +734,8 @@ mod imp {
             let shared = mode & 0o022 != 0 && mode & 0o1000 == 0;
             if !owned || shared {
                 return Err(format!(
-                    "{} is writable by other users, or belongs to another user.\n  Write the \
-                     backup under directories that only you (or root) can change.",
+                    "{} is writable by other users, or belongs to another user.\n  Keep \
+                     backups under directories that only you (or root) can change.",
                     ancestor.display()
                 ));
             }
@@ -1007,7 +1007,7 @@ mod imp {
     fn restore_from_file(
         target: &Target,
         key: &str,
-        src: &Path,
+        source: &Path,
         opts: LocalRestore,
         force: bool,
     ) -> Result<(), String> {
@@ -1015,7 +1015,7 @@ mod imp {
             return Err(format!(
                 "Restore stopped: this replaces the database file of {key} with {} ({} \
                  profile).\n  Run again with --force.",
-                src.display(),
+                source.display(),
                 target.profile
             ));
         }
@@ -1028,9 +1028,7 @@ mod imp {
                     .to_owned(),
             );
         }
-        if !src.is_file() {
-            return Err(format!("{} is not a file.", src.display()));
-        }
+        let source = checked_source(source)?;
         target.require_root()?;
         let fleet = target.build(fleet_sources()?)?;
         let remapped = fleet.remapped_migrations();
@@ -1059,7 +1057,7 @@ mod imp {
                 .map_err(|_| "the fleet already replicates".to_owned())?;
         }
         let restored = runtime()?.block_on(async {
-            let result = fleet.restore_from_file(&key, src, opts).await;
+            let result = fleet.restore_from_file(&key, &source, opts).await;
             // Ships the last frames of the restored database.
             fleet.close_all().await;
             result
@@ -1073,7 +1071,6 @@ mod imp {
                 "{key} was deleted, and its tombstone keeps the replica for undo.\n  Nothing \
                  was restored. Run again with --clear-tombstone: this purges the old replica."
             ),
-            FleetError::Restore { detail, .. } if detail.contains("did not ship") => e.to_string(),
             FleetError::Migration { .. } => format!(
                 "{e}\n  Nothing was restored. If the file records a plugin migration, call \
                  `DatabaseFleet::restore_from_file` in the app instead."
@@ -1082,7 +1079,7 @@ mod imp {
         })?;
         eprintln!(
             "\u{2713} Restored {key} from {} ({}).",
-            src.display(),
+            source.display(),
             if outcome.replaced {
                 "replaced the old file"
             } else {
@@ -1107,7 +1104,55 @@ mod imp {
                 shipped.shipped, shipped.bytes
             );
         }
+        if let Some(error) = &outcome.ship_error {
+            eprintln!(
+                "  \u{26A0} The new base snapshot did not ship: {error}.\n    The restored file \
+                 is in place. A replica restore would bring back older data. If the app \
+                 serves {key}, it ships a new base when it opens it. Otherwise run this \
+                 restore again."
+            );
+        }
         Ok(())
+    }
+
+    /// The `--from` file, checked. It must be a regular file, not a symlink.
+    /// On Unix it must belong to root or to this user, and every directory on
+    /// the way must pass [`refuse_unsafe_path`]: another user must not swap
+    /// the file under the restore. Returns the checked path.
+    fn checked_source(source: &Path) -> Result<PathBuf, String> {
+        let not_a_file = || {
+            format!(
+                "Restore stopped: {} is not a file.\n  Nothing was restored.",
+                source.display()
+            )
+        };
+        let meta = source.symlink_metadata().map_err(|_| not_a_file())?;
+        if !meta.file_type().is_file() {
+            return Err(not_a_file());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let me = nix::unistd::geteuid().as_raw();
+            if meta.uid() != 0 && meta.uid() != me {
+                return Err(format!(
+                    "Restore stopped: {} belongs to another user.\n  Restore only a file \
+                     that you (or root) own.",
+                    source.display()
+                ));
+            }
+            let parent = source
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let dir = refuse_unsafe_path(parent)?;
+            let name = source.file_name().ok_or_else(not_a_file)?;
+            Ok(dir.join(name))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(source.to_path_buf())
+        }
     }
 
     /// The arguments of `fleet lake`.
