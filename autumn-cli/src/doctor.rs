@@ -6688,7 +6688,8 @@ fn read_manifest_role_files(root: &std::path::Path) -> Vec<(String, String)> {
 /// A line scan, not a YAML parser: a top-level `roles:` line, then each key
 /// two spaces in. This is the shape `autumn release init` writes.
 fn helm_value_roles(text: &str) -> Vec<(String, Option<bool>)> {
-    let mut roles: Vec<(String, Option<bool>)> = Vec::new();
+    // Each role: its name, its servesHttp, and whether it is off.
+    let mut roles: Vec<(String, Option<bool>, bool)> = Vec::new();
     let mut in_roles = false;
     // The indent of the role keys, and of the keys inside a role.
     let mut key_indent: Option<usize> = None;
@@ -6711,7 +6712,7 @@ fn helm_value_roles(text: &str) -> Vec<(String, Option<bool>)> {
         let key_at = *key_indent.get_or_insert(indent);
         if indent == key_at {
             if let Some(key) = trimmed.strip_suffix(':') {
-                roles.push((key.trim_matches(['"', '\'']).to_owned(), None));
+                roles.push((key.trim_matches(['"', '\'']).to_owned(), None, false));
                 field_indent = None;
             }
         } else if indent > key_at && field_indent.is_none_or(|at| at == indent) {
@@ -6721,16 +6722,17 @@ fn helm_value_roles(text: &str) -> Vec<(String, Option<bool>)> {
             };
             if let Some(value) = trimmed.strip_prefix("servesHttp:") {
                 last.1 = value.trim().parse().ok();
-            } else if trimmed
-                .strip_prefix("enabled:")
-                .is_some_and(|v| v.trim() == "false")
-            {
-                // A role that is off runs nowhere: do not check it.
-                roles.pop();
+            } else if let Some(value) = trimmed.strip_prefix("enabled:") {
+                last.2 = value.trim() == "false";
             }
         }
     }
+    // A role that is off runs nowhere: do not check it.
     roles
+        .into_iter()
+        .filter(|(_, _, off)| !off)
+        .map(|(name, http, _)| (name, http))
+        .collect()
 }
 
 /// `line` without a YAML or TOML comment. A `#` starts a comment at the start
@@ -22016,6 +22018,19 @@ mount = ["service"]
         assert_eq!(autumn_role_values(compose), ["worker"]);
         let fly_env = "[env]\n  AUTUMN_ROLE = \"worker\"\n";
         assert_eq!(autumn_role_values(fly_env), ["worker"]);
+    }
+
+    #[test]
+    fn a_disabled_role_keeps_its_own_fields() {
+        let values = "roles:\n  web:\n    enabled: true\n    servesHttp: true\n  worker:\n    \
+                      enabled: false\n    servesHttp: false\n  critical:\n    servesHttp: false\n";
+        assert_eq!(
+            helm_value_roles(values),
+            [
+                ("web".to_owned(), Some(true)),
+                ("critical".to_owned(), Some(false))
+            ]
+        );
     }
 
     #[test]
