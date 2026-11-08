@@ -388,7 +388,7 @@ async fn a_concurrent_open_waits_for_the_restore_and_sees_the_restored_rows() {
                 .await
         })
     };
-    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(NOT_STUCK))
+    crate::time::spawn_blocking(move || entered_rx.recv_timeout(NOT_STUCK))
         .await
         .unwrap()
         .expect("the restore reached its release step");
