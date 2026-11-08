@@ -2675,9 +2675,12 @@ jobs:
           # `sim_` prefix keeps them out of the other `sqlite_` filters.
           # `migrate::tests::sqlite_sets_` (#3536) measures the apply of more
           # than one SQLite app set, which only the CLI calls.
+          # `plugin_conformance::fleet` and `replication::fence` measure the
+          # generation ship checks of the fleet kit, which need `sqlite`.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
             fleet_layout:: app::fleet_boot_tests db::sqlite_types:: \
+            plugin_conformance::fleet replication::fence \
             migrate::tests::sqlite_sets_ \
             mail::db_suppression:: db::tests::sim_sqlite_ \
             time::tests::sim_spawn_blocking_ungated

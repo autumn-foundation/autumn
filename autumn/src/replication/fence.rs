@@ -376,6 +376,24 @@ mod tests {
     }
 
     #[test]
+    fn reads_pass_through_and_the_parts_are_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = dest(tmp.path());
+        inner.put(&format!("{ROOT}/a"), b"x").unwrap();
+        let fenced = FencedDestination::new(
+            Arc::clone(&inner),
+            ShipFence::new(Arc::clone(&inner), ROOT, Some(4)),
+        );
+        assert_eq!(fenced.get(&format!("{ROOT}/a")).unwrap(), b"x");
+        let out = tmp.path().join("out");
+        fenced.get_to_file(&format!("{ROOT}/a"), &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"x");
+        assert_eq!(fenced.fence().epoch(), Some(4));
+        assert!(format!("{fenced:?}").contains("FencedDestination"));
+        assert!(format!("{:?}", fenced.fence()).contains(ROOT));
+    }
+
+    #[test]
     fn the_fence_describes_the_inner_destination() {
         let tmp = tempfile::tempdir().unwrap();
         let inner = dest(tmp.path());

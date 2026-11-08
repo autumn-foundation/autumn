@@ -251,3 +251,109 @@ pub trait FleetEngine: Send + Sync + 'static {
         async move { Err(FleetError::NotReplicated { name }) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An engine that keeps every default method.
+    struct Bare;
+
+    #[derive(Clone)]
+    struct BareHandle;
+
+    impl FleetEngine for Bare {
+        type Handle = BareHandle;
+
+        async fn open(
+            &self,
+            _: &FleetDbKey,
+            _: &Path,
+            _: Option<FencingToken>,
+        ) -> Result<BareHandle, FleetError> {
+            Ok(BareHandle)
+        }
+
+        fn close(&self, _: &BareHandle) {}
+
+        fn in_use(&self, _: &BareHandle) -> bool {
+            false
+        }
+
+        async fn snapshot(
+            &self,
+            _: &BareHandle,
+            _: &Path,
+            _: &Path,
+        ) -> Result<Vec<PathBuf>, FleetError> {
+            Ok(Vec::new())
+        }
+
+        fn remove(&self, _: &FleetDbKey, _: &Path) -> Result<bool, FleetError> {
+            Ok(false)
+        }
+
+        fn resident_bytes(&self, _: &BareHandle) -> u64 {
+            0
+        }
+
+        fn ship_mode(&self) -> ShipMode {
+            ShipMode::Rebuild
+        }
+    }
+
+    #[test]
+    fn each_mode_has_a_name_and_an_interval() {
+        let generations = ShipMode::Generations {
+            every: Duration::from_secs(30),
+        };
+        assert_eq!(generations.name(), "generations");
+        assert_eq!(generations.every(), Some(Duration::from_secs(30)));
+        assert_eq!(
+            ShipMode::Generations {
+                every: Duration::ZERO
+            }
+            .every(),
+            Some(Duration::from_secs(1)),
+            "zero ships every second"
+        );
+        assert_eq!(ShipMode::Rebuild.name(), "rebuild");
+        assert_eq!(ShipMode::Rebuild.every(), None);
+        assert_eq!(format!("{generations:?}"), "Generations { every: 30s }");
+        assert_eq!(format!("{:?}", ShipMode::Rebuild), "Rebuild");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_continuous_mode_names_its_shipper() {
+        let mode = ShipMode::Continuous(Arc::new(WalShipper));
+        assert_eq!(mode.name(), "continuous");
+        assert_eq!(mode.every(), None);
+        assert_eq!(format!("{mode:?}"), "Continuous(\"sqlite-wal\")");
+    }
+
+    #[tokio::test]
+    async fn the_defaults_know_no_stamp_and_rebuild_nothing() {
+        let key = FleetDbKey::Slot(3);
+        let path = Path::new("db");
+        assert_eq!(Bare.epoch_stamp(&key, path).unwrap(), None);
+        assert!(matches!(
+            Bare.rebuild(&key, path).await,
+            Err(FleetError::NotReplicated { .. })
+        ));
+        assert!(Bare.sidecars(path).is_empty());
+        assert_eq!(Bare.migrations_applied(), 0);
+        assert!(!Bare.exists(Path::new("/no/such/db")));
+        assert!(Bare.open(&key, path, None).await.is_ok());
+        assert!(
+            Bare.snapshot(&BareHandle, path, path)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!Bare.remove(&key, path).unwrap());
+        assert_eq!(Bare.resident_bytes(&BareHandle), 0);
+        assert!(!Bare.in_use(&BareHandle));
+        Bare.close(&BareHandle);
+    }
+}
