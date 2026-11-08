@@ -245,6 +245,7 @@ pub mod http_server;
 pub mod i18n;
 #[cfg_attr(not(feature = "idempotency"), path = "idempotency_off.rs")]
 pub mod idempotency;
+pub mod latency_tracker;
 pub mod range;
 // NOTE: no outer `///` doc here. rustdoc MERGES an outer doc on a `pub mod`
 // declaration with the module's own `//!` header and resolves the combined

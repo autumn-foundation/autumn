@@ -49,6 +49,18 @@ impl HedgePolicy {
         }
     }
 
+    /// One extra copy, sent after the observed `q` quantile of `tracker`
+    /// (`0.95` is the usual pick). Until the tracker has a sample, `fallback`
+    /// is the delay.
+    #[must_use]
+    pub fn from_tracker(
+        tracker: &crate::latency_tracker::LatencyTracker,
+        q: f64,
+        fallback: Duration,
+    ) -> Self {
+        Self::new(tracker.quantile(q).unwrap_or(fallback))
+    }
+
     /// Allow up to `max_hedges` extra copies. Each one waits a further `delay`
     /// after the last. `0` turns hedging off.
     #[must_use]
@@ -199,6 +211,17 @@ mod tests {
         assert_eq!(out, 2);
         assert_eq!(made.load(Ordering::SeqCst), 3);
         assert_eq!(start.elapsed(), MS(25));
+    }
+
+    #[test]
+    fn from_tracker_uses_the_quantile_or_the_fallback() {
+        let t = crate::latency_tracker::LatencyTracker::new();
+        assert_eq!(HedgePolicy::from_tracker(&t, 0.95, MS(7)).delay(), MS(7));
+        for _ in 0..100 {
+            t.record(MS(40));
+        }
+        let d = HedgePolicy::from_tracker(&t, 0.95, MS(7)).delay();
+        assert!(d >= MS(40) && d <= MS(50), "{d:?}");
     }
 
     #[tokio::test(start_paused = true)]
