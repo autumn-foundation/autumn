@@ -220,7 +220,7 @@ fn is_acknowledgement(body: &str) -> bool {
 /// The signature check of the inbox endpoint. The app installs it when
 /// `outbox.inbox.enabled = true`.
 #[derive(Debug)]
-pub(crate) struct InboxVerifier {
+pub struct InboxVerifier {
     verifier: crate::webhook::AutumnSignatureVerifier,
     max_body_bytes: usize,
 }
@@ -253,7 +253,7 @@ impl InboxVerifier {
 }
 
 /// The router of the inbox endpoint.
-pub(crate) fn inbox_router() -> axum::Router<AppState> {
+pub fn inbox_router() -> axum::Router<AppState> {
     axum::Router::new().route(INBOX_PATH, axum::routing::post(receive))
 }
 
@@ -393,7 +393,10 @@ pub(super) async fn run_inbox_listener(
                 row.listener, row.message.topic
             ))
         })?;
+    // The listener runs as a job does: a free `events::publish` in it goes to
+    // this app, not to the process-global bus.
     let run = handler(state.clone(), row.message.payload);
+    let run = crate::events::scope_event_app(state, run);
     CURRENT_MESSAGE_ID.scope(row.message.id, run).await
 }
 

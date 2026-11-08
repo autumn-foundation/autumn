@@ -77,7 +77,7 @@ pub const TOPIC_WEBHOOK: &str = "autumn.webhook";
 /// See [`INBOX_PATH`].
 pub const TOPIC_INBOX: &str = "autumn.inbox";
 
-mod remote;
+pub(crate) mod remote;
 pub(crate) use remote::inbox_router;
 pub use remote::{INBOX_PATH, MESSAGE_ID_HEADER, SIGNATURE_HEADER, TOPIC_HEADER, inbox_signature};
 

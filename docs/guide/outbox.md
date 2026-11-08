@@ -361,8 +361,9 @@ the receiver first, or keep `max_attempts` high enough for the rollout.
   each topic with each id. Give it only to services you trust as much as
   your own.
 - **Clocks:** the clocks of the two services must agree to within
-  `timestamp_tolerance_secs` (default 300). It must be shorter than
-  `retention_ms`, so a signature ends before the inbox forgets its id.
+  `timestamp_tolerance_secs` (default 300). `retention_ms` must be longer
+  than two times this value, so a signature ends before the inbox forgets
+  its id.
 - **Hosts:** the receiver must trust the host of `url` in
   `[security.trusted_hosts]`. The relay does not filter the URL for private
   addresses: you set it, so an internal host is correct.

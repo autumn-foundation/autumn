@@ -5497,11 +5497,13 @@ impl OutboxConfig {
             ));
         }
         // A copy is dropped only while its inbox row exists. The purge deletes
-        // rows after `retention_ms`, so a signature must expire before that.
-        if self.inbox.timestamp_tolerance_secs.saturating_mul(1000) >= self.retention_ms {
+        // rows after `retention_ms`, so a signature must expire before that. A
+        // time ahead of the receiver clock stays valid for up to two
+        // tolerances after the inbox takes it.
+        if self.inbox.timestamp_tolerance_secs.saturating_mul(2_000) >= self.retention_ms {
             return Err(ConfigError::Validation(
-                "outbox.inbox.timestamp_tolerance_secs must be shorter than \
-                 outbox.retention_ms: else a copy can arrive after the purge"
+                "outbox.retention_ms must be longer than two times \
+                 outbox.inbox.timestamp_tolerance_secs: else a copy can arrive after the purge"
                     .to_owned(),
             ));
         }
@@ -19362,14 +19364,16 @@ path = "/healthz"
 
     #[test]
     fn outbox_remote_secrets_resolve_from_the_environment() {
-        let mut config = AutumnConfig::default();
-        config.outbox = with_destinations(&[(
-            "marketing",
-            OutboxDestinationConfig {
-                signing_secret: Some("${MARKETING_INBOX_SECRET}".to_owned()),
-                ..destination("https://m/_autumn/inbox", &["deal.won"])
-            },
-        )]);
+        let mut config = AutumnConfig {
+            outbox: with_destinations(&[(
+                "marketing",
+                OutboxDestinationConfig {
+                    signing_secret: Some("${MARKETING_INBOX_SECRET}".to_owned()),
+                    ..destination("https://m/_autumn/inbox", &["deal.won"])
+                },
+            )]),
+            ..AutumnConfig::default()
+        };
         config.outbox.inbox.signing_secret = Some("${CORE_INBOX_SECRET}".to_owned());
         config.outbox.inbox.previous_signing_secrets = vec!["${OLD_SECRET}".to_owned()];
         let env = MockEnv::new()
@@ -19392,14 +19396,16 @@ path = "/healthz"
 
     #[test]
     fn outbox_remote_unset_secret_reference_fails_validation() {
-        let mut config = AutumnConfig::default();
-        config.outbox = with_destinations(&[(
-            "marketing",
-            OutboxDestinationConfig {
-                signing_secret: Some("${NOT_SET_ANYWHERE}".to_owned()),
-                ..destination("https://m/_autumn/inbox", &["deal.won"])
-            },
-        )]);
+        let mut config = AutumnConfig {
+            outbox: with_destinations(&[(
+                "marketing",
+                OutboxDestinationConfig {
+                    signing_secret: Some("${NOT_SET_ANYWHERE}".to_owned()),
+                    ..destination("https://m/_autumn/inbox", &["deal.won"])
+                },
+            )]),
+            ..AutumnConfig::default()
+        };
         config.apply_env_overrides_with_env(&MockEnv::new());
         let error = config.outbox.validate().unwrap_err().to_string();
         assert!(error.contains("NOT_SET_ANYWHERE"), "{error}");
@@ -19470,7 +19476,7 @@ path = "/healthz"
             (
                 OutboxConfig {
                     enabled: true,
-                    retention_ms: 60_000,
+                    retention_ms: 600_000,
                     inbox: OutboxInboxConfig {
                         enabled: true,
                         signing_secret: Some(REMOTE_SECRET.to_owned()),
@@ -19492,25 +19498,27 @@ path = "/healthz"
 
     #[test]
     fn outbox_remote_weak_secret_is_refused_in_production() {
-        let mut config = AutumnConfig::default();
-        config.profile = Some("prod".to_owned());
-        config.outbox = with_destinations(&[(
+        let outbox = with_destinations(&[(
             "marketing",
             OutboxDestinationConfig {
                 signing_secret: Some("short".to_owned()),
                 ..destination("https://m/_autumn/inbox", &["deal.won"])
             },
         )]);
-        let error = config
-            .outbox
+        let error = outbox
             .validate_signing_secrets(true)
             .unwrap_err()
             .to_string();
         assert!(error.contains("marketing"), "{error}");
-        config
-            .outbox
+        outbox
             .validate_signing_secrets(false)
             .expect("dev accepts any secret");
+        let prod = AutumnConfig {
+            profile: Some("prod".to_owned()),
+            outbox,
+            ..AutumnConfig::default()
+        };
+        assert!(prod.validate().is_err(), "boot validation checks it");
     }
 
     #[test]

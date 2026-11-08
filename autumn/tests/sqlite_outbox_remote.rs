@@ -37,6 +37,25 @@ struct DealWon {
     seq: i64,
 }
 
+/// A follow-up event that B's listener publishes in B.
+#[event(name = "deal.followed_up")]
+struct DealFollowedUp {
+    deal_id: i64,
+}
+
+/// How many follow-ups B's own bus delivered.
+#[derive(Default)]
+struct FollowUps(AtomicI64);
+
+#[listener(DealFollowedUp)]
+async fn count_follow_up(state: AppState, event: DealFollowedUp) -> AutumnResult<()> {
+    assert!(event.deal_id > 0);
+    if let Some(follow_ups) = state.extension::<FollowUps>() {
+        follow_ups.0.fetch_add(1, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
 /// Fail the first run of the message with this `seq` (0: none).
 #[derive(Default)]
 struct FailOnce(AtomicI64);
@@ -61,7 +80,11 @@ async fn record_deal(state: AppState, event: DealWon) -> AutumnResult<()> {
         .execute(&mut conn)
         .await
         .map_err(|error| AutumnError::internal_server_error_msg(error.to_string()))?;
-    Ok(())
+    // The free `publish` must reach B's bus, not the bus of the last app built.
+    autumn_web::events::publish(DealFollowedUp {
+        deal_id: event.deal_id,
+    })
+    .await
 }
 
 async fn database() -> SqliteSubstrate {
@@ -119,8 +142,10 @@ fn marketing_config() -> OutboxConfig {
 fn marketing(pool: SqlitePool, with_listener: bool) -> TestApp {
     // Core calls B by the host name `marketing`. CSRF is on: the inbox is
     // exempt, because it checks its own signature.
-    let mut config = autumn_web::config::AutumnConfig::default();
-    config.profile = Some("test".to_owned());
+    let mut config = autumn_web::config::AutumnConfig {
+        profile: Some("test".to_owned()),
+        ..autumn_web::config::AutumnConfig::default()
+    };
     config.security.csrf.enabled = true;
     config
         .security
@@ -131,9 +156,12 @@ fn marketing(pool: SqlitePool, with_listener: bool) -> TestApp {
         .config(config)
         .with_db(pool)
         .with_outbox(marketing_config())
-        .state_initializer(|state| state.insert_extension(FailOnce::default()));
+        .state_initializer(|state| {
+            state.insert_extension(FailOnce::default());
+            state.insert_extension(FollowUps::default());
+        });
     if with_listener {
-        app.listeners(listeners![record_deal])
+        app.listeners(listeners![record_deal, count_follow_up])
     } else {
         app
     }
@@ -246,6 +274,14 @@ async fn commit_in_core_delivers_exactly_one_effect_in_marketing_across_a_redeli
     assert_eq!(
         effects[0].message_id, rows[0].id,
         "the listener sees the producer's message id"
+    );
+    assert_eq!(
+        AtomicI64::load(
+            &marketing_state.extension::<FollowUps>().unwrap().0,
+            Ordering::SeqCst
+        ),
+        1,
+        "a publish in the listener goes to B's own bus"
     );
 
     // Forced redelivery: A loses the acknowledgement and sends again.
@@ -459,7 +495,7 @@ async fn inbox_rejects_a_bad_signature_and_an_unknown_topic_as_retryable() {
         .await
         .assert_status(401);
     // Too many `v1=` candidates: refused before any hash work.
-    let many = format!("t={timestamp},{}", vec!["v1=00"; 9].join(","));
+    let many = format!("t={timestamp},{}", ["v1=00"; 9].join(","));
     client
         .post(outbox::INBOX_PATH)
         .header(outbox::SIGNATURE_HEADER, &many)
