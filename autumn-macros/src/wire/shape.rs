@@ -99,6 +99,19 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
         }
     };
 
+    // A serde attribute behind `cfg_attr` is not expanded yet: the shape it
+    // gives depends on a cfg the macro cannot see.
+    if let Some(attr) = cfg_attr_serde(&input.attrs) {
+        return Err(cfg_attr_refusal(attr));
+    }
+    if let Some(attr) = named
+        .into_iter()
+        .flat_map(|fields| fields.named.iter())
+        .find_map(|field| cfg_attr_serde(&field.attrs))
+    {
+        return Err(cfg_attr_refusal(attr));
+    }
+
     // A container attribute that replaces or reshapes the object makes every
     // field row below a fiction. The module's rule is to refuse what it cannot
     // read rather than guess, and these cannot be read off the struct at all.
@@ -161,6 +174,27 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
         deserialized: deserialized.fields,
         closed,
     })
+}
+
+/// The first `#[cfg_attr(…, serde(…))]` in `attrs`, if any.
+fn cfg_attr_serde(attrs: &[syn::Attribute]) -> Option<&syn::Attribute> {
+    attrs.iter().find(|attr| {
+        attr.path().is_ident("cfg_attr")
+            && attr
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .is_ok_and(|metas| metas.iter().skip(1).any(|m| m.path().is_ident("serde")))
+    })
+}
+
+fn cfg_attr_refusal(attr: &syn::Attribute) -> syn::Error {
+    syn::Error::new_spanned(
+        attr,
+        "#[derive(WireShape)] refuses `#[cfg_attr(…, serde(…))]`: the serde attribute depends \
+         on a cfg the macro cannot see, so the descriptor could claim a shape the build does \
+         not have",
+    )
 }
 
 /// Split a struct's fields into what it produces and what it accepts.
@@ -492,6 +526,25 @@ mod tests {
     #[test]
     fn a_tuple_struct_is_refused() {
         assert!(refusal("struct Id(String);").contains("named fields"));
+    }
+
+    #[test]
+    fn a_serde_attribute_behind_cfg_attr_is_refused() {
+        assert!(
+            refusal(
+                "struct Item { #[cfg_attr(feature = \"redact\", serde(skip_serializing))] email: String }"
+            )
+            .contains("cfg_attr")
+        );
+        assert!(
+            refusal(
+                "#[cfg_attr(test, serde(rename_all = \"camelCase\"))] struct Item { a: String }"
+            )
+            .contains("cfg_attr")
+        );
+        // A cfg_attr that adds no serde attribute is fine.
+        let s = shape("struct Item { #[cfg_attr(test, allow(dead_code))] a: String }");
+        assert_eq!(names(&s.serialized), ["a"]);
     }
 
     #[test]

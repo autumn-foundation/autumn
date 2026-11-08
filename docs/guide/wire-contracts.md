@@ -411,7 +411,9 @@ A descriptor that is not true of the code is worse than none, so
 * `#[serde(transparent)]` — there is no object on the wire;
 * `#[serde(into = …)]`, `#[serde(from = …)]`, `#[serde(try_from = …)]` — the
   wire shape is another type's;
-* `#[serde(tag = …)]` on a struct — it adds a key that is not a field.
+* `#[serde(tag = …)]` on a struct — it adds a key that is not a field;
+* `#[cfg_attr(…, serde(…))]` — the macro cannot see the cfg, so it cannot
+  know which shape the build has.
 
 `#[serde(with)]` and `#[serde(deserialize_with)]` *are* supported, and taken
 seriously: serde bypasses its own missing-field shortcut for such a field, so
