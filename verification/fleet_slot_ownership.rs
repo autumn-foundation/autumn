@@ -320,6 +320,42 @@ pub proof fn fenced_replicator_stops(old_epoch: nat, new_epoch: nat)
     ensures !may_ship(old_epoch, new_epoch)
 {}
 
+/// Shipping is its own step: core checks the fence before each put of every
+/// ship mode (`ShipFence::check` in `autumn/src/replication/fence.rs`).
+/// `known` is the newest epoch this host saw. `newest` is the newest epoch
+/// marker at the destination.
+pub open spec fn may_put(mine: nat, known: nat, newest: nat) -> bool {
+    known <= mine && may_ship(mine, newest)
+}
+
+/// A put that the fence admits is a ship that `may_ship` admits.
+pub proof fn admitted_put_may_ship(mine: nat, known: nat, newest: nat)
+    requires may_put(mine, known, newest)
+    ensures may_ship(mine, newest)
+{}
+
+/// After a new owner writes its epoch marker, each put of the old owner is
+/// refused. A newer epoch this host saw refuses it too.
+pub proof fn fenced_put_is_refused(old_epoch: nat, new_epoch: nat, known: nat)
+    requires old_epoch < new_epoch
+    ensures
+        !may_put(old_epoch, known, new_epoch),
+        !may_put(old_epoch, new_epoch, 0),
+{}
+
+/// A grant can put until a newer grant: the fence never stops the current
+/// owner.
+pub proof fn grant_may_put(s: State, op: Op, known: nat, newest: nat)
+    requires
+        inv(s),
+        grants(s, op),
+        known <= s.last,
+        newest <= s.last,
+    ensures may_put(apply(s, op).slot.epoch, known, newest)
+{
+    grant_is_above_the_counter(s, op);
+}
+
 // ---- Open of a database file ----
 
 /// `FleetEngine::open`: an open under `epoch` accepts a file stamped at or

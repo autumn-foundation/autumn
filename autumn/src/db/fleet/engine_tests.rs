@@ -476,3 +476,61 @@ async fn a_fence_retires_a_database_that_is_still_draining() {
     drop(busy);
     closing.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_rebuild_engine_with_no_replica_rebuilds_and_ships_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), 8, 0);
+    let acme = key(&fleet, "acme");
+    let stats = fleet.stats();
+    assert_eq!(stats.ship_mode, "rebuild");
+    assert_eq!(stats.rpo_secs, None);
+    // Nothing on disk: nothing to rebuild.
+    assert!(matches!(
+        fleet.restore_latest(&acme).await,
+        Err(FleetError::NotFound { .. })
+    ));
+    let db = fleet.open(&acme).await.unwrap();
+    TextEngine::write(db.handle(), "derived").unwrap();
+    drop(db);
+    assert!(matches!(
+        fleet.ship_now(&acme).await,
+        Err(FleetError::NotReplicated { .. })
+    ));
+    fleet.restore_latest(&acme).await.unwrap();
+    let db = fleet.open(&acme).await.unwrap();
+    assert_eq!(TextEngine::read(db.handle()).unwrap(), ["rebuilt"]);
+    drop(db);
+    fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn a_generations_engine_with_no_replica_restores_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = TextEngine::new(100);
+    engine.every = Some(Duration::from_secs(60));
+    let fleet = DatabaseFleet::with_engine(&config(tmp.path(), 8, 0), engine).unwrap();
+    let acme = key(&fleet, "acme");
+    assert_eq!(fleet.stats().ship_mode, "generations");
+    assert_eq!(fleet.stats().rpo_secs, None, "no replica: no RPO");
+    assert!(matches!(
+        fleet.restore_latest(&acme).await,
+        Err(FleetError::NotReplicated { .. })
+    ));
+    assert!(matches!(
+        fleet.ship_now(&acme).await,
+        Err(FleetError::NotReplicated { .. })
+    ));
+}
+
+#[test]
+fn a_fenced_ship_answers_421() {
+    let error = FleetError::Fenced {
+        name: "tenant:acme".to_owned(),
+        epoch: 1,
+        newest: 2,
+    };
+    assert_eq!(error.http_status(), http::StatusCode::MISDIRECTED_REQUEST);
+    assert!(error.to_string().contains("epoch 2"));
+    assert_eq!(super::ShipReport::default().generation, None);
+}

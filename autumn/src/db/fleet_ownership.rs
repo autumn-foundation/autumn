@@ -1362,6 +1362,19 @@ impl FleetOwnership {
         held
     }
 
+    /// The newest epoch a replicator or a fence saw at the destination for
+    /// `slot`. `0` when none did.
+    #[must_use]
+    pub(crate) fn fence_floor(&self, slot: u16) -> u64 {
+        self.ranges
+            .iter()
+            .zip(&self.fence_floors)
+            .filter(|(range, _)| range.contains(slot))
+            .map(|(_, floor)| floor.load(std::sync::atomic::Ordering::Acquire))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Drop the range that holds `slot` when its epoch is older than
     /// `newer` (a replicator saw `newer` at the destination). Returns whether
     /// a range was dropped.
@@ -1533,15 +1546,16 @@ impl crate::actuator::HealthIndicator for OwnershipIndicator {
     }
 }
 
-/// An ownership table in memory, for tests of one process. Each call is one
-/// [`OwnershipTable`] decision at the clock's time.
-#[cfg(test)]
+/// An ownership table in memory, for tests of one process and the fleet
+/// conformance kit. Each call is one [`OwnershipTable`] decision at the
+/// clock's time.
+#[cfg(any(test, feature = "sqlite"))]
 pub(crate) struct MemoryOwnership {
     table: Mutex<OwnershipTable>,
     clock: Arc<dyn crate::time::ClockSource>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sqlite"))]
 impl MemoryOwnership {
     pub(crate) fn new(clock: Arc<dyn crate::time::ClockSource>) -> Self {
         Self {
@@ -1566,7 +1580,7 @@ impl MemoryOwnership {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sqlite"))]
 impl SlotOwnershipStore for MemoryOwnership {
     fn claim<'a>(
         &'a self,

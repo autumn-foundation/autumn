@@ -248,7 +248,11 @@ impl From<SegmentError> for ReplicationError {
 }
 impl From<DestinationError> for ReplicationError {
     fn from(e: DestinationError) -> Self {
-        Self::Destination(e)
+        match e {
+            // The fence of core refused a put.
+            DestinationError::Fenced { epoch, newest } => Self::Fenced { epoch, newest },
+            e => Self::Destination(e),
+        }
     }
 }
 impl From<SqliteError> for ReplicationError {
@@ -416,6 +420,13 @@ impl Replicator {
         }
     }
 
+    /// Ship to `destination` from now on. The fleet gives a reused
+    /// replicator the fence of its new epoch.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn set_destination(&mut self, destination: Arc<dyn ReplicaDestination>) {
+        self.destination = destination;
+    }
+
     /// The newer epoch that stopped this replicator, if one did.
     #[must_use]
     pub const fn fenced_by(&self) -> Option<u64> {
@@ -567,6 +578,13 @@ impl Replicator {
     /// point, so lag keeps growing until shipping works again.
     pub fn tick(&mut self) -> Result<TickReport, ReplicationError> {
         let result = self.tick_inner();
+        // When the fence refuses a put, this replicator stops permanently.
+        // Its own fence check does the same.
+        if let Err(ReplicationError::Fenced { newest, .. }) = &result
+            && self.epoch.is_some()
+        {
+            self.fenced_by = Some(*newest);
+        }
         if let Err(e) = &result {
             self.status
                 .record_tick_error(e.to_string(), self.clock.now());

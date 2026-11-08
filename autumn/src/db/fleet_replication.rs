@@ -51,11 +51,13 @@ use crate::entropy::Entropy;
 use crate::fleet_layout::FleetDbKey;
 use crate::replication::destination::ReplicaDestination;
 use crate::replication::engine::{ReplicationSettings, Replicator};
+use crate::replication::fence::{FencedDestination, ShipFence};
 use crate::replication::restore::{RestoreError, RestoreOutcome};
 use crate::replication::segment;
 use crate::replication::status::ReplicationStatus;
 use crate::time::ClockSource;
 
+use super::fleet::generations::GenerationSlot;
 use super::fleet::{FleetDatabase, FleetLifecycle};
 use super::fleet_tombstones::{
     FleetTombstones, MARKER_OBJECT, Marker, PurgeReport, Tombstone, purge_deletes, restore_allowed,
@@ -281,8 +283,16 @@ pub struct FleetReplication {
     unshipped: Mutex<Vec<String>>,
     /// When shutdown must be done. Close-time shipping stops at it.
     shutdown_cutoff: Mutex<Option<std::time::Instant>>,
-    /// Told when a replicator sees a newer epoch (issue #3233).
-    fence_hook: Mutex<Option<FenceHook>>,
+    /// Told when a replicator sees a newer epoch. Shared with the fence of
+    /// each replica.
+    fence_hook: Arc<Mutex<Option<FenceHook>>>,
+    /// The newest epoch this host saw for a database. Shared with the fence
+    /// of each replica.
+    known_hook: Arc<Mutex<Option<KnownHook>>>,
+    /// The ship mode of the fleet, and its RPO. Set at install.
+    ship: std::sync::OnceLock<ShipInfo>,
+    /// The ship slot of each open database in `generations` mode.
+    generation_slots: Mutex<HashMap<FleetDbKey, Arc<GenerationSlot>>>,
     /// The tombstone rows of deleted databases (issue #3235). `None`: a
     /// failed purge is not retried.
     tombstones: Option<Arc<FleetTombstones>>,
@@ -335,6 +345,18 @@ pub(crate) enum RestoreCheck {
 /// Called with the database and the newer epoch a replicator saw.
 pub(crate) type FenceHook = Arc<dyn Fn(&FleetDbKey, u64) + Send + Sync>;
 
+/// Returns the newest epoch this host saw for the database.
+pub(crate) type KnownHook = Arc<dyn Fn(&FleetDbKey) -> u64 + Send + Sync>;
+
+/// The ship mode of a fleet, for health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShipInfo {
+    /// [`ShipMode::name`](super::fleet_engine::ShipMode::name).
+    pub(crate) mode: &'static str,
+    /// The interval of `Generations`. `None` in other modes.
+    pub(crate) every: Option<Duration>,
+}
+
 impl FleetReplication {
     /// Replicate fleet databases next to the control database.
     ///
@@ -362,7 +384,10 @@ impl FleetReplication {
             final_flush_ms: AtomicU64::new(5_000),
             unshipped: Mutex::new(Vec::new()),
             shutdown_cutoff: Mutex::new(None),
-            fence_hook: Mutex::new(None),
+            fence_hook: Arc::new(Mutex::new(None)),
+            known_hook: Arc::new(Mutex::new(None)),
+            ship: std::sync::OnceLock::new(),
+            generation_slots: Mutex::new(HashMap::new()),
             tombstones: None,
             retention_after_delete: Duration::ZERO,
             restore_check: None,
@@ -466,6 +491,110 @@ impl FleetReplication {
             .fence_hook
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Tell the fence of each replica the newest epoch this host saw. The
+    /// fleet installs it with its ownership.
+    pub(crate) fn set_known_hook(&self, hook: KnownHook) {
+        *self
+            .known_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// The fence of the replica of `key`, for a writer of `epoch`. Core
+    /// writes through it in every ship mode.
+    pub(crate) fn ship_fence(&self, key: &FleetDbKey, epoch: Option<u64>) -> ShipFence {
+        let (known, fenced) = (Arc::clone(&self.known_hook), Arc::clone(&self.fence_hook));
+        let (known_key, fenced_key) = (key.clone(), key.clone());
+        ShipFence::new(Arc::clone(&self.destination), self.root_for(key), epoch)
+            .known_epoch(Arc::new(move || {
+                let hook = known.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                hook.map_or(0, |hook| hook(&known_key))
+            }))
+            .on_fenced(Arc::new(move |newest| {
+                let hook = fenced
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(hook) = hook {
+                    hook(&fenced_key, newest);
+                }
+            }))
+    }
+
+    /// The destination of `key` for a writer of `epoch`, with its fence.
+    pub(crate) fn fenced_destination(
+        &self,
+        key: &FleetDbKey,
+        epoch: Option<u64>,
+    ) -> Arc<dyn ReplicaDestination> {
+        Arc::new(FencedDestination::new(
+            Arc::clone(&self.destination),
+            self.ship_fence(key, epoch),
+        ))
+    }
+
+    /// Record the ship mode of the fleet. The first call wins.
+    pub(crate) fn set_ship_info(&self, info: ShipInfo) {
+        let _ = self.ship.set(info);
+    }
+
+    /// The ship mode of the fleet. `continuous` before an install.
+    pub(crate) fn ship_info(&self) -> ShipInfo {
+        self.ship.get().copied().unwrap_or(ShipInfo {
+            mode: "continuous",
+            every: None,
+        })
+    }
+
+    /// The RPO of the fleet: the sync interval of `continuous`, the
+    /// interval of `generations`, none for `rebuild`.
+    #[must_use]
+    pub(crate) fn rpo(&self) -> Option<Duration> {
+        let info = self.ship_info();
+        match info.mode {
+            "continuous" => Some(self.settings.sync_interval),
+            _ => info.every,
+        }
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<GenerationSlot>>> {
+        self.generation_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The ship slot of the open database of `key`, if it ships
+    /// generations in this process.
+    pub(crate) fn current_generation_slot(&self, key: &FleetDbKey) -> Option<Arc<GenerationSlot>> {
+        self.slots().get(key).cloned()
+    }
+
+    /// A new ship slot for `key`, at an open. It replaces the slot of an
+    /// earlier open.
+    pub(crate) fn open_generation_slot(&self, key: &FleetDbKey) -> Arc<GenerationSlot> {
+        let slot = Arc::new(GenerationSlot::new(self.clock.now()));
+        self.slots().insert(key.clone(), Arc::clone(&slot));
+        slot
+    }
+
+    /// Drop `slot` of `key` when it is still the current one.
+    pub(crate) fn forget_generation_slot(&self, key: &FleetDbKey, slot: &Arc<GenerationSlot>) {
+        let mut slots = self.slots();
+        if slots
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+        {
+            slots.remove(key);
+        }
+    }
+
+    fn generation_slots(&self) -> Vec<(FleetDbKey, Arc<GenerationSlot>)> {
+        self.slots()
+            .iter()
+            .map(|(key, slot)| (key.clone(), Arc::clone(slot)))
+            .collect()
     }
 
     /// Stop `replica` for good: a newer epoch owns its database.
@@ -684,6 +813,13 @@ impl FleetReplication {
             .remove(key);
         if let Some(replica) = released.and_then(|weak| weak.upgrade()) {
             drop(lock_replicator(&replica, &|| None));
+        }
+        // A generation ship in flight holds the upload lock. Its database
+        // is retired, so a later put is refused. The slot stays: only the
+        // worker of its open drops it.
+        let slot = self.current_generation_slot(key);
+        if let Some(slot) = slot {
+            slot.wait_upload();
         }
     }
 
@@ -944,6 +1080,39 @@ impl FleetReplication {
         }
     }
 
+    /// Tick the open database `key` once, now. Blocking. `Ok(None)` when
+    /// this process does not replicate it: another process holds its lock.
+    ///
+    /// # Errors
+    ///
+    /// The tick failed. [`ReplicationError::Fenced`] when a newer epoch owns
+    /// the replica.
+    pub(crate) fn ship_one(
+        &self,
+        key: &FleetDbKey,
+    ) -> Result<Option<crate::replication::TickReport>, crate::replication::ReplicationError> {
+        let Some(replica) = self.active().get(key).cloned() else {
+            return Ok(None);
+        };
+        if !replica.claim(key) {
+            return Ok(None);
+        }
+        let Some(mut replicator) = lock_replicator(&replica, &|| self.shutdown_cutoff()) else {
+            return Ok(None);
+        };
+        if let Some(newest) = replicator.fenced_by() {
+            return Err(crate::replication::ReplicationError::Fenced {
+                epoch: replica.epoch.load(Ordering::Acquire),
+                newest,
+            });
+        }
+        let result = replicator.tick();
+        if let Some(newest) = replicator.fenced_by() {
+            self.fence(key, &replica, newest);
+        }
+        result.map(Some)
+    }
+
     /// Ship the backlog of the closed database `key`, and retire its
     /// replicator when it caught up.
     fn tick_parked(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
@@ -1135,14 +1304,72 @@ impl FleetReplication {
             true
         };
         let restore_ok = self.lifecycle_details(&mut details);
+        let generations_ok = self.ship_details(&mut details, now);
         // A database whose lock cannot be taken is never replicated. A
         // replica that does not restore is not a backup.
-        let healthy = lag_ok && lock_failures.is_empty() && restore_ok;
+        let healthy = lag_ok && lock_failures.is_empty() && restore_ok && generations_ok;
         if healthy {
             HealthCheckOutput::up().with_details(details)
         } else {
             HealthCheckOutput::down().with_details(details)
         }
+    }
+
+    /// The ship mode, the RPO and, in `generations` mode, the lag of each
+    /// database. `false` when a database did not ship for longer than the
+    /// interval plus the lag alert.
+    fn ship_details(
+        &self,
+        details: &mut HashMap<String, serde_json::Value>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let ship = self.ship_info();
+        details.insert("ship_mode".to_owned(), ship.mode.into());
+        details.insert(
+            "rpo_seconds".to_owned(),
+            self.rpo().map(|rpo| rpo.as_secs()).into(),
+        );
+        let Some(every) = ship.every else {
+            return true;
+        };
+        let mut worst: Option<(Duration, String)> = None;
+        let (mut databases, mut failing) = (0_u64, 0_u64);
+        let mut last_error = None;
+        for (key, slot) in self.generation_slots() {
+            let (failures, error, since) = {
+                let track = slot.track();
+                (
+                    track.failures,
+                    track.last_error.clone(),
+                    track.last_ok.unwrap_or(track.registered_at),
+                )
+            };
+            databases += 1;
+            if failures > 0 {
+                failing += 1;
+                last_error = error;
+            }
+            let lag = now
+                .signed_duration_since(since)
+                .to_std()
+                .unwrap_or(Duration::ZERO);
+            if worst.as_ref().is_none_or(|(w, _)| lag > *w) {
+                worst = Some((lag, key.name()));
+            }
+        }
+        let limit = every.saturating_add(self.lag_alert_after);
+        let mut generations = serde_json::json!({
+            "databases": databases,
+            "failing": failing,
+            "last_error": last_error,
+        });
+        let ok = worst.as_ref().is_none_or(|(lag, _)| *lag <= limit);
+        if let Some((lag, name)) = worst {
+            generations["worst_lag_seconds"] = lag.as_secs().into();
+            generations["worst_database"] = name.into();
+        }
+        details.insert("generations".to_owned(), generations);
+        ok
     }
 
     /// The tombstone and restore-check details (issue #3235). `false` when
@@ -1300,6 +1527,7 @@ impl FleetLifecycle for FleetReplication {
             };
             if !parked.fenced.load(Ordering::Acquire) {
                 replicator.set_epoch(epoch);
+                replicator.set_destination(self.fenced_destination(db.key(), epoch));
                 parked.epoch.store(epoch.unwrap_or(0), Ordering::Release);
                 drop(replicator);
                 self.active().insert(db.key().clone(), Arc::clone(&parked));
@@ -1315,10 +1543,13 @@ impl FleetLifecycle for FleetReplication {
             ..self.settings.clone()
         };
         let status = Arc::new(ReplicationStatus::new(self.destination.describe()));
-        let replicator =
-            Replicator::new(settings, Arc::clone(&self.destination), Arc::clone(&status))
-                .with_clock(Arc::clone(&self.clock))
-                .with_epoch(epoch);
+        let replicator = Replicator::new(
+            settings,
+            self.fenced_destination(db.key(), epoch),
+            Arc::clone(&status),
+        )
+        .with_clock(Arc::clone(&self.clock))
+        .with_epoch(epoch);
         let replica = Arc::new(ActiveReplica {
             replicator: Mutex::new(replicator),
             lock: Mutex::new(None),
@@ -1430,6 +1661,11 @@ fn ship_until_caught_up(
         }
     }
     Err(format!("still behind after {FINAL_SHIP_MAX_TICKS} ticks"))
+}
+
+/// Whether the shutdown `cutoff` has passed.
+pub(crate) fn cutoff_passed(cutoff: std::time::Instant) -> bool {
+    expired(Some(cutoff))
 }
 
 /// Whether `cutoff` has passed. Real time on purpose: the flush bounds

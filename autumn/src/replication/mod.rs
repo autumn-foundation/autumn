@@ -46,6 +46,7 @@
 
 pub mod destination;
 pub mod engine;
+pub mod fence;
 pub mod restore;
 #[cfg(feature = "http-client")]
 pub mod s3;
@@ -64,6 +65,7 @@ use std::time::Duration;
 
 pub use destination::{DestinationError, FileDestination, ReplicaDestination, ScopedDestination};
 pub use engine::{ReplicationError, ReplicationSettings, Replicator, TickReport};
+pub use fence::{FencedDestination, ShipFence};
 pub use restore::{RestoreError, RestoreOutcome, RestorePlan};
 pub use status::{
     HealthThresholds, INDICATOR_NAME, ReplicationHealthIndicator, ReplicationSnapshot,

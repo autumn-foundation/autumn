@@ -222,6 +222,46 @@ from `DatabaseFleet::stats`.
 
 ---
 
+### Fleet: `ShipMode::Continuous` carries a shipper
+
+**Why:** core ships the databases of every engine and checks the fence
+before each write
+(ADR 0040 §5). `ShipMode` has a new mode, `Generations { every }`.
+`Continuous` carries the shipper that core drives, an `Arc<dyn
+ContinuousShipper>`. So `ShipMode` is no longer `Copy`, `PartialEq` or `Eq`.
+`ContinuousShipper` is sealed: only `SqliteEngine` uses `Continuous`.
+
+**You are affected only if your code matches or compares a `ShipMode`, or
+your engine returned `ShipMode::Continuous`.** An engine plugin that returned
+`ShipMode::Rebuild` needs no change. An engine that returned
+`ShipMode::Continuous` must return `ShipMode::Generations { every }`. Core
+does not let a plugin give a continuous shipper.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+if engine.ship_mode() == ShipMode::Continuous {
+    // ...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+if matches!(engine.ship_mode(), ShipMode::Continuous(_)) {
+    // ...
+}
+```
+
+`DatabaseFleet::install_replication` now works for any engine, and its
+signature does not change. `FleetStats` has the new fields `ship_mode` and
+`rpo_secs`; it is `#[non_exhaustive]`, so a read needs no change.
+
+**Automation:** `manual` — a codemod cannot know which comparison the code
+wants.
+
+---
+
 ### Database: `DatabaseConfig` and `DatabaseFleetConfig` have `mmap_size` and `cache_size_kib`
 
 **Why:** an app can turn on SQLite memory-mapped reads and a larger page

@@ -3192,6 +3192,17 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `DatabaseFleet::with_engine(&config, engine)`, reads `db.handle()`, and
   runs `plugin_conformance::fleet::run_fleet_conformance` with a
   `FleetFixture` in its CI. Engines go in their plugin, never in core.
+- Shipping another engine: return `ShipMode::Generations { every }` from
+  `ship_mode` and call `fleet.install_replication(replication)` (needs
+  `sqlite`). Core snapshots every `every` and at close, puts only files with
+  a new SHA-256, and restores the newest generation on a new volume. The
+  engine never writes the replica: core checks the fence before each put
+  (`FleetError::Fenced`, `421`). Make a snapshot of unchanged data the same
+  bytes, and return the stamp from `epoch_stamp`. `ShipMode::Rebuild` ships
+  nothing: `restore_latest` calls `FleetEngine::rebuild`. Operators:
+  `fleet.ship_now(&key)`, `fleet.restore_latest(&key)`. `FleetStats` has
+  `ship_mode` and `rpo_secs`. Guide: "Shipping a plugin engine" in
+  `docs/guide/sqlite-fleet.md`.
 - Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
   databases, also closed ones (issue #3234). Write outbox rows in a
   transaction on the tenant connection: the write records the database in

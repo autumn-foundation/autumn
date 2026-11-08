@@ -694,7 +694,7 @@ the [cell router](cell-isolation.md).
 | Lose | The host closes every open database of the range. The close does not wait for workers, but it waits for connections that are in use. The sweeper and the fan-outs skip the range. |
 | Lease length | A lease never ends earlier than an older call set it. If you make `lease_secs` shorter, the new length applies when the old lease ends. |
 | Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after it sent its last renew. This is before the lease in the table ends. |
-| Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. A replicator reads the epochs at the destination at each new generation and every 60 s. If it finds a newer epoch, it stops, and the host loses the range. |
+| Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. Before each write to the replica, core reads the epochs at the destination: one list for each put. If it finds a newer epoch, the write is refused, the replicator stops, and the host loses the range. |
 | Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped. The next owner can then claim them at once. In all other cases, the leases end on their own. |
 
 The ownership table is `_autumn_fleet_slot_owners` on the control database.
@@ -896,8 +896,65 @@ that fleet:
   other object of the scope.
 - The scope refuses writes after the database closes, and after a fence, a
   delete or a restore. Each write also checks the epoch: once this host
-  loses the slot, the scope refuses writes at once. Ship the last files in
-  `on_close`. Reads still work.
+  loses the slot, the scope refuses writes at once. Before each write, the
+  scope also reads the epoch markers of the primary's replica. A newer
+  marker refuses the write with `DestinationError::Fenced`. Ship the last
+  files in `on_close`. Reads still work.
+
+### Shipping a plugin engine
+
+`FleetEngine::ship_mode` tells core how the databases get to object
+storage. Core does every write to the replica. The engine only gives files.
+
+| Mode | What core does | RPO |
+| --- | --- | --- |
+| `Continuous(_)` | Ships the changes as they commit. Only `SqliteEngine` (WAL shipping). `ContinuousShipper` is sealed. | `sync_interval` |
+| `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
+| `Rebuild` | Ships nothing. `restore_latest` calls `FleetEngine::rebuild`. | none |
+
+Install replication as for `SQLite`:
+`fleet.install_replication(Arc::new(FleetReplication::new(..)))`. The mode
+decides what it starts. Replication needs the `sqlite` feature: it keeps
+the tombstones on the `SQLite` control database. `FleetStats` and the `replication:fleet` health
+indicator report `ship_mode` and the RPO (`rpo_secs`, `rpo_seconds`).
+
+A generation of `Generations` mode is these objects:
+
+```text
+<key prefix>/epochs/<epoch>                    the epochs that wrote here
+<key prefix>/generations/<id>/epoch-<epoch>
+<key prefix>/generations/<id>/files/<sha256>   files new in this generation
+<key prefix>/generations/<id>/manifest.json    written last
+```
+
+- **Unchanged files.** The manifest names, for each file, the generation
+  that holds its content. A file with no change is not shipped again. A
+  snapshot with no change ships nothing. So a snapshot of unchanged data
+  must be the same bytes.
+- **Prune.** Core keeps the two newest generations, and each generation
+  that their manifests name.
+- **Fence.** Before each write, core reads the epoch markers. A newer
+  epoch refuses the write (`FleetError::Fenced`, `421`), and this host
+  loses the slot. This holds in every mode.
+- **Restore.** A missing database with `restore_missing` takes the newest
+  generation, by epoch and then by time. Core checks the SHA-256 and the
+  length of each file. The tombstone rules apply as for `SQLite`: a delete
+  blocks the restore.
+- **Fail-back.** Return the stamp from `FleetEngine::epoch_stamp`. When the
+  replica holds a newer epoch of another owner, core restores the database
+  before the open. With `None`, core counts the stamp as 0: it restores at
+  each new epoch that another owner wrote.
+- **Epoch marker.** A new owner writes its epoch marker when it opens the
+  database, before its first generation. From then on, each write of the
+  old owner is refused.
+- **Snapshot shape.** A snapshot is one database: one file, or one
+  directory of files. Core refuses two paths that are the same.
+- **Operators.** `DatabaseFleet::ship_now(key)` ships an open database now.
+  `DatabaseFleet::restore_latest(key)` restores from the newest replica, in
+  every mode. Within the retention, it undoes a delete.
+
+`plugin_conformance::fleet` checks the engine side. `fleet-fenced-ship`
+and `fleet-unchanged-files` need a fixture that installs replication.
 
 ## Limits
 

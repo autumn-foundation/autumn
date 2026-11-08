@@ -72,6 +72,14 @@ pub enum DestinationError {
         /// Why.
         detail: String,
     },
+    /// A newer ownership epoch owns this replica. The fence refused the
+    /// write before it was sent.
+    Fenced {
+        /// The epoch of the writer.
+        epoch: u64,
+        /// The newest epoch the fence found.
+        newest: u64,
+    },
 }
 
 impl DestinationError {
@@ -101,6 +109,11 @@ impl fmt::Display for DestinationError {
                 None => write!(f, "replica {op} failed: HTTP {status}"),
             },
             Self::Rejected { detail } => write!(f, "replica destination rejected: {detail}"),
+            Self::Fenced { epoch, newest } => write!(
+                f,
+                "replica write refused: epoch {newest} owns this replica now, and this writer \
+                 has epoch {epoch}"
+            ),
         }
     }
 }

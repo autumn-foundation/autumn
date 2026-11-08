@@ -74,7 +74,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, OnceCell};
 use tokio_util::sync::CancellationToken;
 
-pub use super::fleet_engine::{FleetEngine, ShipMode};
+pub use super::fleet_engine::{ContinuousShipper, FleetEngine, ShipMode};
 use crate::config::DatabaseFleetConfig;
 use crate::error::AutumnError;
 use crate::fleet_layout::{FleetDbKey, FleetLayoutError, FleetMode, FleetPathTemplate, TenantDbId};
@@ -86,7 +86,7 @@ mod replica;
 /// Without `sqlite` there is no replication: each replica step does nothing.
 #[cfg(not(feature = "sqlite"))]
 mod replica {
-    use super::{DatabaseFleet, FleetDbKey, FleetEngine, FleetError, Path};
+    use super::{DatabaseFleet, FleetDbKey, FleetEngine, FleetError, Path, ShipMode, ShipReport};
 
     /// No tombstone row to write.
     pub(super) struct DeleteRecord;
@@ -164,11 +164,52 @@ mod replica {
         pub(super) const fn begin_replica_shutdown(&self, _: std::time::Instant) {}
 
         pub(super) async fn finish_replica_shutdown(&self, _: std::time::Instant) {}
+
+        pub(super) const fn rpo(&self) -> Option<std::time::Duration> {
+            None
+        }
+
+        pub(super) async fn ship_replica(
+            &self,
+            key: &FleetDbKey,
+        ) -> Result<ShipReport, FleetError> {
+            Err(FleetError::NotReplicated { name: key.name() })
+        }
+
+        /// No replica: only a `rebuild` engine restores.
+        pub(super) async fn replace_from_replica(
+            &self,
+            key: &FleetDbKey,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
+            if !matches!(self.inner.engine.ship_mode(), ShipMode::Rebuild) {
+                return Err(FleetError::NotReplicated { name: key.name() });
+            }
+            let path = self.path_of(key);
+            super::check_contained(self.root(), &path)?;
+            // A rebuild replaces a database: it never brings back a deleted
+            // one. The path lock keeps a delete of another process out.
+            let (root, name) = (self.root().to_path_buf(), key.name());
+            let _lock = crate::time::spawn_blocking(move || super::PathLock::acquire(&root, &name))
+                .await
+                .map_err(|error| FleetError::Restore {
+                    name: key.name(),
+                    detail: error.to_string(),
+                })??;
+            if !self.inner.engine.exists(&path) {
+                return Err(FleetError::NotFound { name: key.name() });
+            }
+            self.inner.engine.rebuild(key, &path).await.map(|()| None)
+        }
     }
 }
 /// The `SQLite` engine and the `SQLite`-only fleet operations.
 #[cfg(feature = "sqlite")]
 mod sqlite;
+
+/// Generation shipping: `ShipMode::Generations`.
+#[cfg(feature = "sqlite")]
+pub(crate) mod generations;
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::{DatabaseFleetBuilder, FleetDbInfo, FleetMigrationReport, SqliteEngine};
@@ -335,6 +376,20 @@ pub enum FleetError {
         /// The epoch the database records.
         found: u64,
     },
+    /// A newer epoch owns the replica of the database (`421`). The fence of
+    /// core refused the ship before any write.
+    #[error(
+        "fleet database {name}: epoch {newest} owns the replica now, so this host's ship under \
+         epoch {epoch} is refused"
+    )]
+    Fenced {
+        /// The database name.
+        name: String,
+        /// The epoch of this host.
+        epoch: u64,
+        /// The newer epoch.
+        newest: u64,
+    },
     /// `DatabaseFleet::import` (`SQLite`) refused its source file (`422`): it is
     /// missing, is not a database, fails the integrity check, or does not
     /// record the key in its identity row. Nothing was changed.
@@ -383,7 +438,9 @@ impl FleetError {
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::AlreadyExists { .. } | Self::InUseElsewhere { .. } => StatusCode::CONFLICT,
             Self::Deleting { .. } => StatusCode::GONE,
-            Self::NotOwner { .. } | Self::NewerEpoch { .. } => StatusCode::MISDIRECTED_REQUEST,
+            Self::NotOwner { .. } | Self::NewerEpoch { .. } | Self::Fenced { .. } => {
+                StatusCode::MISDIRECTED_REQUEST
+            }
             Self::PendingMigrations { .. }
             | Self::Migration { .. }
             | Self::Unavailable { .. }
@@ -497,6 +554,39 @@ pub(crate) struct ReplicaBase {
     ownership: Option<Arc<super::fleet_ownership::FleetOwnership>>,
 }
 
+impl ReplicaBase {
+    /// The fence of the database `key` opened under `epoch`: a newer epoch
+    /// at the destination, or one this host saw, refuses each write.
+    fn fence(
+        &self,
+        key: &FleetDbKey,
+        epoch: Option<crate::lock::FencingToken>,
+    ) -> crate::replication::ShipFence {
+        let fence = crate::replication::ShipFence::new(
+            Arc::clone(&self.destination),
+            self.root.clone(),
+            epoch.map(crate::lock::FencingToken::get),
+        );
+        let Some(ownership) = &self.ownership else {
+            return fence;
+        };
+        let slot = key.routing_slot();
+        let (known, lost) = (Arc::downgrade(ownership), Arc::downgrade(ownership));
+        fence
+            .known_epoch(Arc::new(move || {
+                known.upgrade().map_or(0, |o| o.fence_floor(slot))
+            }))
+            .on_fenced(Arc::new(move |newest| {
+                let newer = i64::try_from(newest)
+                    .ok()
+                    .and_then(|n| crate::lock::FencingToken::try_from(n).ok());
+                if let (Some(ownership), Some(newer)) = (lost.upgrade(), newer) {
+                    ownership.lose(slot, newer);
+                }
+            }))
+    }
+}
+
 impl<E: FleetEngine> Clone for FleetDatabase<E> {
     fn clone(&self) -> Self {
         Self {
@@ -586,7 +676,10 @@ impl<E: FleetEngine> FleetDatabase<E> {
                     .is_some_and(|(ownership, epoch)| ownership.epoch_for(slot) != Some(*epoch))
         };
         crate::replication::ScopedDestination::new(
-            Arc::clone(&replica.destination),
+            Arc::new(crate::replication::FencedDestination::new(
+                Arc::clone(&replica.destination),
+                replica.fence(&self.key, self.epoch),
+            )),
             sidecar_root(&replica.root, engine)?,
         )
         .map(|scope| Some(scope.stopped_when(Arc::new(stop))))
@@ -754,6 +847,29 @@ pub struct FleetStats {
     pub created_total: u64,
     /// Databases deleted since boot.
     pub deleted_total: u64,
+    /// How the databases get to object storage: `continuous`,
+    /// `generations` or `rebuild`.
+    pub ship_mode: &'static str,
+    /// The RPO in seconds: the sync interval of `continuous`, the interval
+    /// of `generations`. `None` for `rebuild`, or with no replica.
+    pub rpo_secs: Option<u64>,
+}
+
+/// The result of [`DatabaseFleet::ship_now`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct ShipReport {
+    /// The id of the new generation in `generations` mode. `None` when
+    /// nothing changed, or in `continuous` mode.
+    pub generation: Option<String>,
+    /// Objects with new data: files of a generation, or WAL segments and a
+    /// base snapshot.
+    pub shipped: usize,
+    /// Files whose hash the previous generation holds. They are not
+    /// shipped again.
+    pub reused: usize,
+    /// Bytes shipped.
+    pub bytes: u64,
 }
 
 // ── The fleet ────────────────────────────────────────────────────────────────
@@ -1786,7 +1902,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             for hook in &hooks {
                 if let Err(detail) = hook.on_open(&opened) {
                     // Undo the hooks that did start (a replicator that
-                    // registered) before refusing the open.
+                    // registered) before refusing the open. The open is
+                    // refused: a hook must ship nothing of it.
+                    opened.retired.store(true, Ordering::Release);
                     // Stop the workers first, as `drain` does.
                     tokio::runtime::Handle::current().block_on(opened.quiesce_workers(true));
                     for hook in started {
@@ -2512,6 +2630,95 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             migrations_applied_total: self.inner.engine.migrations_applied(),
             created_total: c.created.load(Ordering::Relaxed),
             deleted_total: c.deleted.load(Ordering::Relaxed),
+            ship_mode: self.inner.engine.ship_mode().name(),
+            rpo_secs: self.rpo().map(|rpo| rpo.as_secs()),
+        }
+    }
+
+    /// Ship the open database of `key` now: one generation in
+    /// `generations` mode, one WAL tick in `continuous` mode. Core checks
+    /// the fence before each write.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::NotReplicated`] with no replica, or in `rebuild` mode.
+    /// [`FleetError::Fenced`] when a newer epoch owns the replica.
+    /// [`FleetError::Unavailable`] when the database is not open in this
+    /// process, or the ship failed. The error of [`FleetEngine::snapshot`].
+    pub async fn ship_now(&self, key: &FleetDbKey) -> Result<ShipReport, FleetError> {
+        self.check_key(key)?;
+        self.ship_replica(key).await
+    }
+
+    /// Bring the database of `key` back from its newest replica, as an
+    /// operator does after a loss. `generations`: the newest generation.
+    /// `continuous`: the latest WAL state. `rebuild`: the engine builds it
+    /// again ([`FleetEngine::rebuild`]).
+    ///
+    /// It takes the tombstone row of a delete, so it undoes a delete within
+    /// its retention. After the purge nothing is left: it is refused.
+    ///
+    /// Cancellation-safe: the work runs in an owned task.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::NotReplicated`] with no replica (and not `rebuild`),
+    /// [`FleetError::NotFound`] when nothing was shipped for the key (in
+    /// `rebuild` mode: when no database is on disk),
+    /// [`FleetError::Deleting`] during a delete, [`FleetError::Unavailable`]
+    /// once a shutdown has begun, [`FleetError::InUseElsewhere`] when
+    /// another process has the database open, or [`FleetError::Restore`].
+    /// In `rebuild` mode, the error of [`FleetEngine::rebuild`].
+    pub async fn restore_latest(&self, key: &FleetDbKey) -> Result<(), FleetError> {
+        self.restore_to_point(key, None).await.map(drop)
+    }
+
+    /// The restore of [`restore_latest`](Self::restore_latest), at or
+    /// before `target`. `Some` outcome in `continuous` mode.
+    pub(crate) async fn restore_to_point(
+        &self,
+        key: &FleetDbKey,
+        target: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
+        self.check_key(key)?;
+        let (fleet, key, name) = (self.clone(), key.clone(), key.name());
+        let counted = self.admit_mutation(&key)?;
+        tokio::spawn(async move {
+            let _counted = counted;
+            fleet.restore_owned(&key, target).await
+        })
+        .await
+        .map_err(|error| FleetError::Restore {
+            name,
+            detail: error.to_string(),
+        })?
+    }
+
+    async fn restore_owned(
+        &self,
+        key: &FleetDbKey,
+        target: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
+        loop {
+            if let Some((key, entry, drain)) = self.begin_exclusive(key, false)? {
+                let _finish = DrainGuard {
+                    fleet: self,
+                    key: key.clone(),
+                    drain,
+                };
+                let db = self.take_database(entry).await;
+                self.drain(&key, db, false).await;
+                for hook in self.hooks() {
+                    hook.release(&key);
+                }
+                // The guard finishes the drain whatever fails: an error that
+                // skipped it would strand every later opener of this key.
+                return self.replace_from_replica(&key, target).await;
+            }
+            let pending = self.lock_state().draining.get(key).cloned();
+            if let Some(pending) = pending {
+                pending.wait().await;
+            }
         }
     }
 
@@ -5697,3 +5904,6 @@ pub(crate) mod test_engine;
 
 #[cfg(test)]
 mod engine_tests;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod generations_tests;

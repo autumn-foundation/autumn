@@ -285,6 +285,41 @@ pub enum ShipMode {
 - RPO for `Generations` is `every`. `Rebuild` has no RPO: the data is
   derived. Health reports both.
 
+##### Notes from step 3
+
+Step 3 changed this section in these ways:
+
+- `ContinuousShipper` is sealed. Core has one continuous shipper, `SQLite`
+  WAL shipping, and drives it. A plugin engine uses `Generations`.
+- `install_replication` is on `DatabaseFleet<E>`. The ship mode decides
+  what it starts. `Rebuild` starts nothing, and the tombstones still apply.
+- The fence is `ShipFence` in `replication/fence.rs`. Before each `put` it
+  reads `<key prefix>/epochs/`: one list for each put. It also refuses a
+  newer epoch this host saw, and a retired database. The WAL replicators,
+  the generation shipper and the sidecar scopes write through it. A newer
+  marker drops this host's range.
+- A generation is `generations/<id>/files/<sha256>` for each new file, and
+  `generations/<id>/manifest.json`, written last. The manifest names the
+  generation that holds each file. A snapshot with no change ships nothing.
+  A prune keeps the two newest generations and each holder they name.
+- The ids, the epoch markers and the restore order are the ones of WAL
+  shipping. So `purge_replica`, the tombstone markers and the epoch check
+  at an open also work on generations. They did not change.
+- New `FleetEngine` methods with defaults: `epoch_stamp` (for the
+  fail-back check of an open) and `rebuild` (for `Rebuild`). In
+  `Generations`, a stamp of `None` counts as 0. A rebuild replaces a
+  database on disk. It never brings back a deleted one.
+- A new owner writes its epoch marker when it opens the database. The last
+  generation of a close ships in `on_close`, after every use ended. A
+  retired database ships nothing, and its close waits for an upload in
+  flight. Each ship runs in an owned task, one at a time per database.
+- New `DatabaseFleet` methods: `ship_now` and `restore_latest`, for every
+  mode. `FleetStats` has `ship_mode` and `rpo_secs`. New errors:
+  `FleetError::Fenced` (`421`) and `DestinationError::Fenced`.
+- `verification/fleet_generations.rs` models the fence for each mode, the
+  unchanged files, the prune and the restore. `fleet_slot_ownership.rs`
+  has the ship step `may_put`.
+
 #### 6. `LakeSink`
 
 Core keeps the inclusion rule: tombstones, markers, `as_of`, and one listing
@@ -328,10 +363,12 @@ checks:
 Each plugin runs the kit in its own CI. The proofs cover core. The kit
 covers the engine side of the contract.
 
-The kit implements every check above but "a fenced ship refused". That
-check needs `ShipMode::Generations` (step 3). An engine crate gives a
-`FleetFixture`: its fleet, a write and a read through a handle, and an
-optional restore. A fixture with no restore skips the restore check.
+An engine crate gives a `FleetFixture`: its fleet, a write and a read
+through a handle, and an optional restore. A fixture with no restore skips
+the restore check. Step 3 adds `fleet-fenced-ship`,
+`fleet-unchanged-files` and `fleet-epoch-stamp`. The first two need a
+fixture that installs replication. `fleet-unchanged-files` runs only in
+`Generations` mode.
 
 ##### Notes from step 2
 
@@ -402,7 +439,7 @@ Notes for the plugins. These are not part of this decision:
    `fleet_ownership_store`. Then the DuckDB plugin adds `FleetDuckDb` as a
    sidecar.
 3. Add `ShipMode::Generations` and `Rebuild`. Then the RocksDB plugin adds
-   its engine.
+   its engine. The core part is done.
 4. Add `LakeSink` and port the SQLite lake to it. Then the DuckDB plugin adds
    the Parquet sink.
 
