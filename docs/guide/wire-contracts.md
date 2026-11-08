@@ -15,6 +15,10 @@ There is no IDL, no codegen step, and nothing to keep in sync by hand.
 | callee | `#[endpoint(service = "…")]` | marks a handler and emits its contract |
 | caller | `wire_client!` | generates the typed client |
 | caller | `#[contract_checked]` | fails the build when a call site disagrees |
+| producer | `#[event(name = "…")]` | records an event payload's field shape |
+| consumer | `#[listener]`, `#[event_consumer]` | fails the build when a read disagrees |
+
+For events, see [Events](#events).
 
 ## Callee
 
@@ -154,6 +158,10 @@ method. `#[contract_checked]` writes a `caller.*.json` file: the read-set and
 write-set of each call. `autumn contracts export` uses these two to find what
 each deployed caller reads and sends.
 
+`#[event]` writes an `event.*.json` file: the topic, the version and the
+payload shape. `#[listener]` and `#[event_consumer]` write a
+`listener.*.json` file: the event type and the read-set.
+
 The descriptors are proc-macro side effects, not declared build outputs. A
 normal build writes nothing for a crate that cargo finds fresh, and the
 enriched message then falls back to the plain one. Nothing deletes old files.
@@ -248,6 +256,54 @@ that no closed type and no new caller needs first. It may not:
 * remove a response field a deployed caller reads;
 * make a request field required that a deployed caller does not send;
 * change a path or method without keeping the old route.
+
+### Events across releases
+
+The check also compares events. The producer side counts as the callee, and
+the consumer side as the caller. Each consumer decodes with the event type of
+its own release. The producer sends with the type of its release. Events
+match by topic, so `contact.updated` and `contact.updated.v2` are two events.
+
+The rules:
+
+* **A producer may add fields.** A new field is not a break, unless the
+  consumer's type has `#[serde(deny_unknown_fields)]`.
+* **A producer may not remove a field any deployed consumer reads.** Remove
+  it from the consumers first.
+* **A consumer may not start to require a field that deployed producers do
+  not send.** Add it to the producer first.
+* **A field's type must not change**, with the same rules as a response.
+* **A topic must still be sent while a deployed consumer reads it.**
+* **A new consumer must not miss a version that deployed producers send.** A
+  consumer that reads only v2, next to a producer that sends only v1, loses
+  the v1 events. A new consumer of a new event is not a break. It gets no
+  events until the producer sends the topic.
+
+A break shows the topic and the consumer:
+
+```
+If the callees ship first (new callees, deployed callers): 1 break(s)
+  - contact.updated (event): consumer `marketing::on_contact` reads field `email`, which the new producer does not send
+```
+
+For a change that no order makes safe, publish a new version beside the old
+one. `#[event(name = "contact.updated", version = 2)]` sends on
+`contact.updated.v2`. Keep the producer of v1 while a consumer in the deployed
+release or in the new release reads it. The report says when no consumer
+reads it:
+
+```
+Note: Event `contact.updated` v1: no consumer reads it in the deployed release or in this one. It can be dropped.
+```
+
+An opaque event (`#[event(opaque)]`) has no shape, so the field rules skip
+it. The check knows only the consumers in the bundle, so it does not stop
+the removal of a topic that no bundled consumer reads. An event without
+`name` is not in the bundle. A bundle from an older CLI has no events. Then
+the check finds no deployed consumer to protect.
+
+A bundle with events has format 2. A bundle with no events keeps format 1
+and the same bytes. An older CLI refuses format 2.
 
 ### Deploy order
 
@@ -363,11 +419,31 @@ annotated function — otherwise it would pass by checking nothing. It recognise
 a client that arrives as a typed parameter, a typed `let`, or a `let`
 initialised from the client's own constructor.
 
+## Events
+
+An `#[event]` payload is a wire contract too. `#[event]` derives `WireShape`
+and gives the event a topic and a version. A `#[listener]`, or an
+`#[event_consumer]` on an outbox topic handler, records its read-set. Each
+read becomes a const assertion against the event's field table:
+
+```rust
+const _: () = assert!(
+    autumn_web::wire::event_delivers(
+        <ContactUpdated as autumn_web::events::Event>::SHAPE,
+        "email",
+    ),
+    "event contract broken in `sync_marketing`: reads field `email` of event `ContactUpdated`, …",
+);
+```
+
+See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
+[Events across releases](#events-across-releases) for the deploy rules.
+
 ## Limits of the first slice
 
 * One workspace. Both ends must be present at build time.
-* Synchronous request/response, JSON over HTTP. No streaming, websockets, or
-  events.
+* Synchronous request/response and events, as JSON. No streaming or
+  websockets.
 * Path parameters and a JSON body. Query parameters are not part of the
   contract yet.
 * A write-set is only visible when the request is an inline struct literal at
@@ -386,6 +462,11 @@ initialised from the client's own constructor.
   a client outside the workspace, so it keeps every deployed route.
 * The cross-release check compares a nested type by its name only. A change
   inside a nested `WireShape` type does not show.
+* An event consumer is checked only for the fields it names. A payload given
+  whole to another function is not checked field by field.
+* An event without `name` is not in the bundle. A consumer of a hand-written
+  `impl Event` is not in the bundle either.
+* Two `#[event]` types with one type name in one crate stop the export.
 * A type is known by its name in its crate. Two types with one name in one
   crate share one descriptor file.
 * A service that is a caller and a callee ships as one unit in each window. A

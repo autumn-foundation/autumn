@@ -185,6 +185,10 @@ struct Call {
     span: Span,
     /// Response fields the caller names.
     reads: Vec<String>,
+    /// The span of the first read of each field.
+    read_spans: BTreeMap<String, Span>,
+    /// In payload mode: whether the walk bound the payload anywhere.
+    payload_seen: bool,
     /// Request fields the caller sets, or `None` when the request is not an
     /// inline struct literal.
     writes: Option<Vec<String>>,
@@ -226,6 +230,69 @@ struct Analyzer<'a> {
     scopes: Vec<BTreeMap<String, Bound>>,
     /// Calls in the order they were found.
     calls: Vec<Call>,
+    /// In payload mode, the event type whose bindings are `Response(0)`.
+    payload: Option<&'a Path>,
+    /// Whether a name was bound to the payload.
+    payload_found: std::cell::Cell<bool>,
+}
+
+/// How a consumer function holds its event payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadBinding {
+    /// The parameter at this index is the payload, whatever its type says.
+    Param(usize),
+    /// Every binding whose type names the event is the payload.
+    Typed,
+}
+
+/// The fields a consumer reads off its event payload.
+#[derive(Debug, Clone, Default)]
+pub struct PayloadReads {
+    /// Each field read, by Rust name, sorted, with the span of its first read.
+    pub reads: Vec<(String, Span)>,
+    /// Whether the function binds the payload at all.
+    pub found: bool,
+}
+
+/// The payload fields that `func` reads.
+///
+/// The same scoped walk as `#[contract_checked]`: the payload is one
+/// "response", so field access, destructuring, macro bodies and shadowing all
+/// follow the same rules.
+#[must_use]
+pub fn payload_reads(func: &ItemFn, event: &Path, binding: PayloadBinding) -> PayloadReads {
+    let mut analyzer = Analyzer::new(&[]);
+    analyzer.payload = Some(event);
+    analyzer.calls.push(Call {
+        node: std::ptr::null(),
+        client: usize::MAX,
+        method: Ident::new("payload", Span::call_site()),
+        span: Span::call_site(),
+        reads: Vec::new(),
+        read_spans: BTreeMap::new(),
+        payload_seen: false,
+        writes: None,
+    });
+    let param = match binding {
+        PayloadBinding::Param(index) => Some(index),
+        PayloadBinding::Typed => None,
+    };
+    let found_param = param.is_some_and(|index| func.sig.inputs.len() > index);
+    let mut calls = analyzer.run_with(func, param);
+    let call = calls.swap_remove(0);
+    PayloadReads {
+        found: found_param || call.payload_seen,
+        reads: call
+            .reads
+            .iter()
+            .map(|f| {
+                (
+                    f.clone(),
+                    call.read_spans.get(f).copied().unwrap_or(call.span),
+                )
+            })
+            .collect(),
+    }
 }
 
 impl<'a> Analyzer<'a> {
@@ -234,23 +301,105 @@ impl<'a> Analyzer<'a> {
             clients,
             scopes: vec![BTreeMap::new()],
             calls: Vec::new(),
+            payload: None,
+            payload_found: std::cell::Cell::new(false),
         }
     }
 
+    /// Record that call `index` has `field` read at `span`.
+    fn read(&mut self, index: usize, field: String, span: Span) {
+        let call = &mut self.calls[index];
+        call.read_spans.entry(field.clone()).or_insert(span);
+        call.reads.push(field);
+    }
+
+    /// Whether `ty` names the payload's event type.
+    fn is_payload(&self, ty: &syn::Type) -> bool {
+        match strip_refs(ty) {
+            syn::Type::Path(tp) if tp.qself.is_none() => self.is_payload_path(&tp.path),
+            _ => false,
+        }
+    }
+
+    /// Whether `path` names the payload's event type.
+    ///
+    /// The written path must be a suffix of the declared one, after a
+    /// leading `crate`, `self` or `super`. So `OrderPlaced` matches a
+    /// declared `orders::OrderPlaced`, but `legacy::OrderPlaced` does not
+    /// match a declared `OrderPlaced`: that is another type.
+    fn is_payload_path(&self, path: &Path) -> bool {
+        let Some(payload) = self.payload else {
+            return false;
+        };
+        let mut written: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        while written
+            .first()
+            .is_some_and(|s| matches!(s.as_str(), "crate" | "self" | "super"))
+        {
+            written.remove(0);
+        }
+        let declared: Vec<String> = payload
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        !written.is_empty() && is_suffix(&declared, &written)
+    }
+
+    /// Whether `expr` decodes the payload through a turbofish:
+    /// `m.payload_as::<E>()` or `serde_json::from_value::<E>(v)`.
+    fn is_payload_turbofish(&self, expr: &Expr) -> bool {
+        if self.payload.is_none() {
+            return false;
+        }
+        let args = match peel(expr) {
+            Expr::MethodCall(call) => call.turbofish.as_ref().map(|t| &t.args),
+            Expr::Call(call) => match call.func.as_ref() {
+                Expr::Path(path) => path.path.segments.last().and_then(|s| match &s.arguments {
+                    syn::PathArguments::AngleBracketed(a) => Some(&a.args),
+                    _ => None,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+        let found = args.is_some_and(|args| {
+            args.iter().any(|arg| match arg {
+                syn::GenericArgument::Type(ty) => self.is_payload(ty),
+                _ => false,
+            })
+        });
+        if found {
+            self.payload_found.set(true);
+        }
+        found
+    }
+
     /// Walk a function: its parameters bind in the body's scope.
-    fn run(mut self, func: &ItemFn) -> Vec<Call> {
-        for arg in &func.sig.inputs {
+    fn run(self, func: &ItemFn) -> Vec<Call> {
+        self.run_with(func, None)
+    }
+
+    /// Walk a function. The parameter at `payload_param`, if any, is the
+    /// payload, whatever its type says.
+    fn run_with(mut self, func: &ItemFn, payload_param: Option<usize>) -> Vec<Call> {
+        for (index, arg) in func.sig.inputs.iter().enumerate() {
             if let syn::FnArg::Typed(pat) = arg {
-                let bound = self
-                    .client_index(&pat.ty)
-                    .map_or(Bound::Other, Bound::Client);
+                let bound = if payload_param == Some(index) || self.is_payload(&pat.ty) {
+                    Bound::Response(0)
+                } else {
+                    self.client_index(&pat.ty)
+                        .map_or(Bound::Other, Bound::Client)
+                };
                 self.bind_pattern(&pat.pat, bound);
             }
         }
         self.visit_block(&func.block);
+        let found = self.payload_found.get();
         for call in &mut self.calls {
             call.reads.sort();
             call.reads.dedup();
+            call.payload_seen = found;
         }
         self.calls
     }
@@ -260,6 +409,9 @@ impl<'a> Analyzer<'a> {
     }
 
     fn bind(&mut self, name: String, bound: Bound) {
+        if self.payload.is_some() && bound == Bound::Response(0) {
+            self.payload_found.set(true);
+        }
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, bound);
         }
@@ -274,17 +426,44 @@ impl<'a> Analyzer<'a> {
         match pat {
             syn::Pat::Ident(ident) => {
                 self.bind(field_name(&ident.ident), bound);
+                // `x @ Item { .. }`: the sub-pattern sees the same value.
                 if let Some((_, sub)) = &ident.subpat {
-                    self.bind_pattern(sub, Bound::Other);
+                    let sub_bound = match bound {
+                        Bound::Response(_) => bound,
+                        _ => Bound::Other,
+                    };
+                    self.bind_pattern(sub, sub_bound);
                 }
             }
             syn::Pat::Type(p) => {
-                let bound = self.client_index(&p.ty).map_or(bound, Bound::Client);
+                let bound = if self.is_payload(&p.ty) {
+                    Bound::Response(0)
+                } else {
+                    self.client_index(&p.ty).map_or(bound, Bound::Client)
+                };
                 self.bind_pattern(&p.pat, bound);
             }
             syn::Pat::Reference(p) => self.bind_pattern(&p.pat, bound),
             syn::Pat::Paren(p) => self.bind_pattern(&p.pat, bound),
             syn::Pat::Struct(p) => {
+                // `Item { id, name, .. }` over a response names the fields
+                // it reads. A pattern that names the payload type is the
+                // payload, whatever its value comes from.
+                let bound = if self.is_payload_path(&p.path) {
+                    Bound::Response(0)
+                } else {
+                    bound
+                };
+                if let Bound::Response(index) = bound {
+                    if self.payload.is_some() && index == 0 {
+                        self.payload_found.set(true);
+                    }
+                    for field in &p.fields {
+                        if let syn::Member::Named(ident) = &field.member {
+                            self.read(index, field_name(ident), ident.span());
+                        }
+                    }
+                }
                 for field in &p.fields {
                     self.bind_pattern(&field.pat, Bound::Other);
                 }
@@ -376,6 +555,9 @@ impl<'a> Analyzer<'a> {
 
     /// What an expression evaluates to, when that is knowable.
     fn bound_of(&self, expr: &Expr) -> Option<Bound> {
+        if self.is_payload_turbofish(expr) {
+            return Some(Bound::Response(0));
+        }
         match peel(expr) {
             Expr::Path(path) => self.lookup(&field_name(path.path.get_ident()?)),
             Expr::MethodCall(call) => {
@@ -414,6 +596,8 @@ impl<'a> Analyzer<'a> {
             // about which call is at fault.
             span: call.method.span(),
             reads: Vec::new(),
+            read_spans: BTreeMap::new(),
+            payload_seen: false,
             writes: request_write_set(call.args.last()),
         });
     }
@@ -432,19 +616,8 @@ impl<'a> Analyzer<'a> {
                 .or_else(|| self.constructor_client(&init.expr).map(Bound::Client))
                 .unwrap_or(Bound::Other)
         });
-        // `let Item { id, name, .. } = …` names the fields it reads.
-        if let (Bound::Response(index), syn::Pat::Struct(pat)) = (bound, strip_pat_type(&local.pat))
-        {
-            let fields: Vec<String> = pat
-                .fields
-                .iter()
-                .filter_map(|f| match &f.member {
-                    syn::Member::Named(ident) => Some(field_name(ident)),
-                    syn::Member::Unnamed(_) => None,
-                })
-                .collect();
-            self.calls[index].reads.extend(fields);
-        }
+        // `let Item { id, name, .. } = …` names the fields it reads: the
+        // pattern records them as it binds.
         self.bind_pattern(&local.pat, bound);
     }
 
@@ -477,8 +650,8 @@ impl<'a> Analyzer<'a> {
             },
             &mut reads,
         );
-        for (index, field) in reads {
-            self.calls[index].reads.push(field);
+        for (index, field, span) in reads {
+            self.read(index, field, span);
         }
     }
 }
@@ -516,7 +689,7 @@ impl Visit<'_> for Analyzer<'_> {
                 if let (Some(index), syn::Member::Named(name)) =
                     (self.response_of(&field.base), &field.member)
                 {
-                    self.calls[index].reads.push(field_name(name));
+                    self.read(index, field_name(name), name.span());
                 }
             }
             Expr::Closure(closure) => {
@@ -536,7 +709,15 @@ impl Visit<'_> for Analyzer<'_> {
             }
             Expr::Let(let_expr) => {
                 self.visit_expr(&let_expr.expr);
-                self.bind_pattern(&let_expr.pat, Bound::Other);
+                let bound = self.response_bound(&let_expr.expr);
+                self.bind_pattern(&let_expr.pat, bound);
+            }
+            Expr::Match(m) => {
+                self.visit_expr(&m.expr);
+                let bound = self.response_bound(&m.expr);
+                for arm in &m.arms {
+                    self.arm(arm, bound);
+                }
             }
             Expr::Macro(mac) => self.scan_macro(&mac.mac),
             other => visit::visit_expr(self, other),
@@ -544,18 +725,32 @@ impl Visit<'_> for Analyzer<'_> {
     }
 
     fn visit_arm(&mut self, arm: &syn::Arm) {
+        self.arm(arm, Bound::Other);
+    }
+
+    fn visit_stmt_macro(&mut self, stmt: &syn::StmtMacro) {
+        self.scan_macro(&stmt.mac);
+    }
+}
+
+impl Analyzer<'_> {
+    /// The bound a scrutinee passes to its pattern: a response stays a
+    /// response, anything else is `Other`.
+    fn response_bound(&self, expr: &Expr) -> Bound {
+        self.response_of(expr).map_or(Bound::Other, Bound::Response)
+    }
+
+    /// A match arm: the pattern binds `bound`, then the guard and the body run
+    /// in the arm's own scope.
+    fn arm(&mut self, arm: &syn::Arm, bound: Bound) {
         self.scopes.push(BTreeMap::new());
         let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
-        self.bind_pattern(pat, Bound::Other);
+        self.bind_pattern(pat, bound);
         if let Some(guard) = guard {
             self.visit_expr(guard);
         }
         self.visit_expr(&arm.body);
         self.scopes.pop();
-    }
-
-    fn visit_stmt_macro(&mut self, stmt: &syn::StmtMacro) {
-        self.scan_macro(&stmt.mac);
     }
 }
 
@@ -600,14 +795,6 @@ fn strip_refs(ty: &syn::Type) -> &syn::Type {
     match ty {
         syn::Type::Reference(r) => strip_refs(&r.elem),
         syn::Type::Paren(p) => strip_refs(&p.elem),
-        other => other,
-    }
-}
-
-/// Look through a `let x: T` pattern to the name it binds.
-fn strip_pat_type(pat: &syn::Pat) -> &syn::Pat {
-    match pat {
-        syn::Pat::Type(p) => strip_pat_type(&p.pat),
         other => other,
     }
 }
@@ -678,7 +865,7 @@ fn collect_macro_bound(
 fn scan_tokens(
     tokens: &proc_macro2::TokenStream,
     resolve: &dyn Fn(&str) -> Option<usize>,
-    reads: &mut Vec<(usize, String)>,
+    reads: &mut Vec<(usize, String, Span)>,
 ) {
     let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
     for (i, tt) in tts.iter().enumerate() {
@@ -715,7 +902,7 @@ fn scan_tokens(
         {
             continue;
         }
-        reads.push((index, field_name(field)));
+        reads.push((index, field_name(field), field.span()));
     }
 }
 
@@ -870,7 +1057,7 @@ fn named_violations(site: &CallSite) -> Vec<(ViolationKind, String)> {
 /// implicit capture of a variable named `id`, and the build fails with
 /// "cannot find value `id`" instead of the contract error. Const panics cannot
 /// take runtime arguments, so the braces are doubled instead.
-fn escape_for_assert(message: &str) -> String {
+pub fn escape_for_assert(message: &str) -> String {
     message.replace('{', "{{").replace('}', "}}")
 }
 

@@ -19,8 +19,11 @@ on:
     branches: [trunk, trunk-dev]
     paths:
       - "autumn-macros/src/wire/**"
+      - "autumn-macros/src/event.rs"
+      - "autumn-macros/src/listener.rs"
       - "autumn-macros-support/src/wire.rs"
       - "autumn/src/wire/**"
+      - "autumn/src/events.rs"
       - "autumn-cli/src/contracts/**"
       - "examples/mesh-catalog/**"
       - "examples/mesh-storefront/**"
@@ -30,8 +33,11 @@ on:
     branches: [trunk, trunk-dev]
     paths:
       - "autumn-macros/src/wire/**"
+      - "autumn-macros/src/event.rs"
+      - "autumn-macros/src/listener.rs"
       - "autumn-macros-support/src/wire.rs"
       - "autumn/src/wire/**"
+      - "autumn/src/events.rs"
       - "autumn-cli/src/contracts/**"
       - "examples/mesh-catalog/**"
       - "examples/mesh-storefront/**"

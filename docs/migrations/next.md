@@ -302,6 +302,51 @@ Add the same two fields to a `DatabaseConfig` literal, or end it with
 **Automation:** `manual` — `0` keeps the old behavior, but a codemod cannot
 know if the app wants a different value.
 
+---
+
+### Events: `#[event]` derives `WireShape` and refuses what it cannot read
+
+**Why:** an event payload is a wire contract between a producer and its
+consumers. `#[event]` now records the payload's shape, so a `#[listener]`
+that reads a field the event does not send fails the build.
+
+**You are affected only if an `#[event]` type is generic, an enum, a tuple
+struct, uses `#[serde(flatten)]`, `#[serde(transparent)]`, `#[serde(into)]`,
+`#[serde(from)]`, `#[serde(try_from)]`, `#[serde(tag)]`, a split `rename`, or
+also has `#[derive(WireShape)]`.** Other events need no change. Their topic
+does not change.
+
+**You are also affected if a `#[listener]` reads a field with
+`#[serde(skip_serializing)]` or `#[serde(skip_deserializing)]`.** That read
+never got the value. The build now fails at the read. Stop reading the
+field, or remove the skip.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[event]
+struct PageLoaded {
+    #[serde(flatten)]
+    counts: BTreeMap<String, i64>,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[event(opaque)]
+struct PageLoaded {
+    #[serde(flatten)]
+    counts: BTreeMap<String, i64>,
+}
+```
+
+An `#[event]` that also derives `WireShape` drops the derive: `#[event]`
+implements it now.
+
+**Automation:** `manual` — `opaque` turns the check off. A codemod cannot know
+if the app wants that, or a payload the check can read.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**

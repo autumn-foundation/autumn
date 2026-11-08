@@ -1,0 +1,5 @@
+error: #[event_consumer] found no `OrderPlaced` payload in `post_to_ledger` to check. Give the payload a type: a parameter (`order: OrderPlaced`), a typed `let` (`let order: OrderPlaced = message.payload_as()?`), or a turbofish (`payload_as::<OrderPlaced>()`).
+  --> tests/compile-fail/event_consumer_payload_not_found.rs:11:18
+   |
+11 | #[event_consumer(OrderPlaced)]
+   |                  ^^^^^^^^^^^

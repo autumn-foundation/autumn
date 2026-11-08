@@ -1,9 +1,14 @@
 //! Build-checked typed contracts between two Autumn services (issue #1755).
 //!
-//! **Experimental.** Everything in this module, the input syntax of its four
+//! **Experimental.** Everything in this module, the input syntax of its
 //! macros, and the JSON descriptor format under `target/autumn-contracts/` may
 //! change in any release — see `STABILITY.md`. This is a first slice: one
-//! workspace, synchronous request/response, JSON over HTTP.
+//! workspace, synchronous request/response over HTTP, and events. Both use
+//! JSON.
+//!
+//! Events use the same tables: `#[event]` derives the payload's
+//! [`WireShape`] and sets [`EventShape`], and a `#[listener]` or
+//! `#[event_consumer]` asserts each field it reads with [`event_delivers`].
 //!
 //! Two Autumn services in one Cargo workspace share one compiler-checked
 //! contract: the callee's handler signatures. Nothing is hand-maintained, and
@@ -109,6 +114,32 @@ impl<T: WireShape> WireShape for Vec<T> {
     const TYPE_NAME: &'static str = <T as WireShape>::TYPE_NAME;
     const SERIALIZED: &'static [WireField] = <T as WireShape>::SERIALIZED;
     const DESERIALIZED: &'static [WireField] = <T as WireShape>::DESERIALIZED;
+}
+
+/// An `#[event]` payload's wire shape, in both directions.
+///
+/// `#[event]` sets [`Event::SHAPE`](crate::events::Event::SHAPE) to this.
+/// A `#[listener]` asserts its reads against it.
+#[derive(Debug, Clone, Copy)]
+pub struct EventShape {
+    /// Fields the producer puts on the wire.
+    pub serialized: &'static [WireField],
+    /// Fields the consumer takes off the wire.
+    pub deserialized: &'static [WireField],
+}
+
+/// Whether a consumer that reads `field` gets the value the producer wrote.
+///
+/// The field must be in both tables. A field the producer skips never
+/// arrives. A field the consumer skips reads as its default. `None` is an
+/// opaque event or a hand-written `Event` impl: there is no table, so this is
+/// true.
+#[must_use]
+pub const fn event_delivers(shape: Option<EventShape>, field: &str) -> bool {
+    match shape {
+        Some(shape) => has_field(shape.serialized, field) && has_field(shape.deserialized, field),
+        None => true,
+    }
 }
 
 /// One service endpoint's contract, as `#[endpoint]` derived it from the
@@ -562,6 +593,36 @@ mod tests {
         assert_eq!(<Vec<Item> as WireShape>::SERIALIZED.len(), FIELDS.len());
         assert_eq!(<Vec<Item> as WireShape>::TYPE_NAME, "Item");
     }
+
+    const EVENT: EventShape = EventShape {
+        serialized: FIELDS,
+        deserialized: &[WireField {
+            rust_name: "name",
+            wire_name: "name",
+            ty: "String",
+            required: true,
+        }],
+    };
+
+    #[test]
+    fn an_event_delivers_a_field_it_writes_and_reads() {
+        assert!(event_delivers(Some(EVENT), "name"));
+    }
+
+    #[test]
+    fn an_event_does_not_deliver_a_field_one_side_skips() {
+        // Written, but not read back: the consumer gets a default.
+        assert!(!event_delivers(Some(EVENT), "price_cents"));
+        assert!(!event_delivers(Some(EVENT), "sku"));
+    }
+
+    #[test]
+    fn an_opaque_event_has_no_table_to_check() {
+        assert!(event_delivers(None, "anything"));
+    }
+
+    const _: () = assert!(event_delivers(Some(EVENT), "name"));
+    const _: () = assert!(!event_delivers(Some(EVENT), "sku"));
 
     #[test]
     fn no_body_is_empty_in_both_directions() {

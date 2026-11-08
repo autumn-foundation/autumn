@@ -90,6 +90,20 @@ A handler gets the `AppState` and an `OutboxMessage` (`id`, `aggregate`,
 `topic`, `payload`, `attempt`, `created_at`). Return `Ok(())` to mark the
 message sent. Return an error, or panic, to send it again later.
 
+When the payload is an `#[event]`, put `#[event_consumer]` on the handler.
+Then each payload field the handler reads must be one the event sends, or the
+build fails. The read-set also goes into the release bundle, so
+`autumn contracts check` covers the topic. See
+[Events: wire contracts](events.md#wire-contracts).
+
+```rust
+#[event_consumer(OrderPlaced)]
+async fn post_to_ledger(state: AppState, message: OutboxMessage) -> AutumnResult<()> {
+    let order: OrderPlaced = message.payload_as()?;
+    record(&state, order.total_cents).await
+}
+```
+
 ## Drop copies with the inbox
 
 Call `Inbox::seen` in the same transaction as the side effect. Then the inbox

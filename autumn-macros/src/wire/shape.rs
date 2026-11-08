@@ -23,15 +23,23 @@ struct Direction {
 }
 
 pub fn derive_wire_shape(input: &DeriveInput) -> Result<TokenStream, syn::Error> {
-    let name = &input.ident;
     let shape = wire_type_descriptor(input)?;
+    Ok(wire_shape_tokens(&input.ident, &shape))
+}
+
+/// The `WireShape` impl and the descriptor write for a shape already read.
+///
+/// `#[event]` reads the shape once and uses it here and in its own
+/// descriptor.
+#[must_use]
+pub fn wire_shape_tokens(name: &syn::Ident, shape: &WireTypeDescriptor) -> TokenStream {
     let serialized = field_tokens(&shape.serialized);
     let deserialized = field_tokens(&shape.deserialized);
     let type_name = &shape.name;
-    let written = write_descriptor(&shape);
+    let written = write_descriptor(shape);
     let track = store::track_contract_dir();
 
-    Ok(quote! {
+    quote! {
         #track
         #written
 
@@ -40,7 +48,7 @@ pub fn derive_wire_shape(input: &DeriveInput) -> Result<TokenStream, syn::Error>
             const SERIALIZED: &'static [::autumn_web::wire::WireField] = &[#(#serialized),*];
             const DESERIALIZED: &'static [::autumn_web::wire::WireField] = &[#(#deserialized),*];
         }
-    })
+    }
 }
 
 /// Write this type's JSON descriptor, if a contract directory resolves.

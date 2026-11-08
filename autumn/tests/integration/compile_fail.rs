@@ -618,6 +618,22 @@ fn compile_fail_wire_contract_tests() {
     t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
 }
 
+/// Event contracts: a consumer that reads a field the event does not send
+/// fails the build at the read, and names the event and the field.
+#[test]
+fn compile_fail_event_contract_tests() {
+    let t = trybuild::TestCases::new();
+
+    t.compile_fail("tests/compile-fail/event_listener_reads_missing_field.rs");
+    t.compile_fail("tests/compile-fail/event_listener_reads_unsent_field.rs");
+    // `OutboxMessage` is behind `db`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/event_consumer_reads_unsent_field.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/event_consumer_payload_not_found.rs");
+    t.compile_fail("tests/compile-fail/event_rejects_flatten.rs");
+}
+
 // Split into `_a` / `_b` halves so CI can run them as two parallel trybuild
 // shards (see the `trybuild` job in .github/workflows/ci.yml). Each half owns a
 // disjoint slice of the SAME fixture list — nothing is gated on the split, so a

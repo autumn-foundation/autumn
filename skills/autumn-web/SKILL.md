@@ -1943,6 +1943,13 @@ can fan out without inline coupling: `#[event]` on a struct, publish via the
 register with `.listeners(listeners![...])`. Do not also list durable
 listeners in `jobs![...]`. See `docs/guide/events.md`.
 
+Event wire contracts: `#[event(name = "contact.updated", version = 2)]` sets
+the topic (`contact.updated.v2`) and derives `WireShape` (do not derive it
+again). A `#[listener]` that reads a field the event does not send fails the
+build. Put `#[event_consumer(E)]` on an outbox topic handler for the same
+check. `#[event(opaque)]` turns the check off for a payload `WireShape`
+refuses. `autumn contracts check` covers events across releases.
+
 ## Distributed locks (0.6.0)
 
 For "run this exactly once across replicas right now" work (nightly cleanup,

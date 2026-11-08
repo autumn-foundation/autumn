@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: event contract broken in `post_to_ledger`: reads field `total_cents` of event `OrderPlaced`, which the event does not send
+  --> tests/compile-fail/event_consumer_reads_unsent_field.rs:16:19
+   |
+16 |     let _ = order.total_cents;
+   |                   ^^^^^^^^^^^ evaluation of `post_to_ledger::{closure#0}::_` failed here

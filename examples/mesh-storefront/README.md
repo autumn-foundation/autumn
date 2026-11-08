@@ -27,6 +27,12 @@ reads the request and response types off each signature and emits the contract.
 are the catalog's real types. `#[contract_checked]` then holds each call site to
 what the catalog actually produces and accepts.
 
+`mesh-catalog` also declares one event, `ItemRepriced`. The storefront's
+`#[listener]` reads `id` and `price_cents` off it. Add
+`#[serde(skip_serializing)]` to `price_cents`, and the storefront build fails
+with ``event contract broken in `on_item_repriced` ``. The release bundle holds the
+event and the listener, so `autumn contracts check` covers them too.
+
 ## Seed a breaking change
 
 Stop the catalog serializing a response field the storefront reads:
