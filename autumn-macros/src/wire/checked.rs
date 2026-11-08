@@ -723,6 +723,23 @@ impl Visit<'_> for Analyzer<'_> {
                 let bound = self.response_bound(&let_expr.expr);
                 self.bind_pattern(&let_expr.pat, bound);
             }
+            // An `if let` / `while let` binding lives in the condition and the
+            // body only: not in the `else` branch, and not after the loop.
+            Expr::If(if_expr) => {
+                self.scopes.push(BTreeMap::new());
+                self.visit_expr(&if_expr.cond);
+                self.visit_block(&if_expr.then_branch);
+                self.scopes.pop();
+                if let Some((_, else_branch)) = &if_expr.else_branch {
+                    self.visit_expr(else_branch);
+                }
+            }
+            Expr::While(while_expr) => {
+                self.scopes.push(BTreeMap::new());
+                self.visit_expr(&while_expr.cond);
+                self.visit_block(&while_expr.body);
+                self.scopes.pop();
+            }
             Expr::Match(m) => {
                 self.visit_expr(&m.expr);
                 let bound = self.response_bound(&m.expr);

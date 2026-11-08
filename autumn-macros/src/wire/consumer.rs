@@ -63,7 +63,9 @@ pub fn consumer_checks(func: &ItemFn, event: &Path, reads: &PayloadReads) -> Tok
             event: event_text.clone(),
             reads: reads.reads.iter().map(|(field, _)| field.clone()).collect(),
         };
-        let key = stable_key(&func.to_token_stream().to_string());
+        // The event path is part of the key: two equal functions in two
+        // modules can consume two different events.
+        let key = stable_key(&format!("{event_text} {}", func.to_token_stream()));
         store::write_outcome(store::write_listener(&dir, &descriptor, &key))
     });
     let track = store::track_contract_dir();
@@ -338,6 +340,21 @@ mod tests {
              if let Err(e) = m.payload_as::<ContactUpdated>() { let _ = e.kind; } Ok(()) }",
         );
         assert_eq!(names(&reads), ["id", "secret"]);
+    }
+
+    #[test]
+    fn an_if_let_binding_does_not_reach_the_else_branch_or_later_code() {
+        let reads = consumer(
+            "async fn h(m: OutboxMessage, event: Local) -> R { \
+             if let Ok(event) = m.payload_as::<ContactUpdated>() { let _ = event.id; } \
+             else { let _ = event.local_else; } \
+             let _ = event.local_after; \
+             while let Some(event) = next::<ContactUpdated>() { let _ = event.email; } \
+             let _ = event.local_end; Ok(()) }",
+        );
+        // `id` and `email` come from the two payload bindings. No
+        // `local_*` read of the outer `event` leaks in.
+        assert_eq!(names(&reads), ["email", "id"]);
     }
 
     #[test]
