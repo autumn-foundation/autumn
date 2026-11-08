@@ -235,8 +235,29 @@ pub fn compare(deployed: &Bundle, current: &Bundle) -> Report {
     Report {
         callee_first: old_callers,
         caller_first: new_callers,
-        notes: droppable_versions(deployed, current),
+        notes: event_notes(deployed, current),
     }
+}
+
+/// The notes about events: the consumers the check cannot see, and the old
+/// versions that can be dropped. No version is called droppable while an
+/// unseen consumer may read it.
+fn event_notes(deployed: &Bundle, current: &Bundle) -> Vec<String> {
+    let unseen: BTreeSet<&String> = deployed
+        .unresolved
+        .iter()
+        .chain(&current.unresolved)
+        .collect();
+    if unseen.is_empty() {
+        return droppable_versions(deployed, current);
+    }
+    let mut notes = vec![format!(
+        "{} event consumer(s) are not in the bundles, so the check does not protect them. \
+         Use the event's own type name, and give the event a `name`.",
+        unseen.len()
+    )];
+    notes.extend(unseen.into_iter().map(|u| format!("  {u}")));
+    notes
 }
 
 /// Check one event consumer against the event the other release sends.
@@ -996,6 +1017,7 @@ mod tests {
             ],
             events: Vec::new(),
             listeners: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
 
@@ -1674,6 +1696,27 @@ mod tests {
         assert!(report.notes[0].contains("`contact.updated`"), "{report:?}");
         assert!(report.notes[0].contains("v1"), "{report:?}");
         assert!(report.render(Order::Any).contains("can be dropped"));
+    }
+
+    #[test]
+    fn an_unseen_consumer_is_named_and_no_version_is_called_droppable() {
+        let mut deployed = with_events();
+        deployed.events.push(event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email", "String", true)]),
+        ));
+        deployed.listeners = vec![listener("on_contact", "contact.updated.v2", &["email"])];
+        deployed.unresolved = vec![
+            "`marketing::on_old` consumes `Updated`: no `#[event]` in the pass has that \
+                  type name"
+                .to_owned(),
+        ];
+        let report = compare(&deployed, &deployed.clone());
+        assert_eq!(report.verdict(), Verdict::Compatible);
+        let text = report.render(Order::Any);
+        assert!(text.contains("not in the bundles"), "{text}");
+        assert!(text.contains("marketing::on_old"), "{text}");
+        assert!(!text.contains("can be dropped"), "{text}");
     }
 
     #[test]

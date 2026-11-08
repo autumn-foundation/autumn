@@ -465,7 +465,9 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * An event consumer is checked only for the fields it names. A payload given
   whole to another function is not checked field by field.
 * An event without `name` is not in the bundle. A consumer of a hand-written
-  `impl Event` is not in the bundle either.
+  `impl Event`, or one that names its event through a `use … as` alias, is
+  not in the bundle either. The export warns, and the check names each such
+  consumer.
 * Two `#[event]` types with one type name in one crate stop the export.
 * A type is known by its name in its crate. Two types with one name in one
   crate share one descriptor file.

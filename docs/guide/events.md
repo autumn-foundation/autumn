@@ -284,6 +284,10 @@ across releases. See [Events across releases](wire-contracts.md#events-across-re
 - A hand-written `impl Event` has no shape. Its consumers are not checked.
 - An event without `name` and its consumers are not in the release bundle.
   The compile-time check still applies to them.
+- A consumer that names its event through an alias (`use x::ContactUpdated
+  as Updated`) is not in the bundle. Use the event's own type name.
+  `autumn contracts export` warns about each consumer it cannot place. The
+  check names them, and then it does not say that a version can be dropped.
 - Two `#[event]` types with one type name in one crate (`v1::OrderPlaced`
   and `v2::OrderPlaced`) stop the export. Give each its own type name.
 

@@ -44,6 +44,10 @@ pub struct Bundle {
     /// Every event consumer, sorted. Left out of the bytes when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listeners: Vec<BundleListener>,
+    /// Consumers the bundle has no topic for, as `krate::function consumes
+    /// Path: reason`, sorted. The check cannot protect them, so it says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
 }
 
 /// One event with its payload shape inline.
@@ -255,18 +259,20 @@ impl Bundle {
         }
 
         let joined_events = join_events(&events)?;
-        let joined_listeners = join_listeners(&listeners, &events)?;
-        let format = if joined_events.is_empty() && joined_listeners.is_empty() {
-            BUNDLE_FORMAT
-        } else {
-            EVENTS_FORMAT
-        };
+        let (joined_listeners, unresolved) = join_listeners(&listeners, &events)?;
+        let format =
+            if joined_events.is_empty() && joined_listeners.is_empty() && unresolved.is_empty() {
+                BUNDLE_FORMAT
+            } else {
+                EVENTS_FORMAT
+            };
         Ok(Self {
             format,
             endpoints: joined,
             callers: calls.into_iter().collect(),
             events: joined_events,
             listeners: joined_listeners,
+            unresolved,
         })
     }
 }
@@ -303,18 +309,30 @@ fn join_events(events: &[EventDescriptor]) -> Result<Vec<BundleEvent>, String> {
     Ok(joined)
 }
 
-/// Every consumer, with the topic of the event it reads.
+/// Every consumer, with the topic of the event it reads, and the consumers
+/// with no topic.
 ///
-/// A consumer of an event with no descriptor (a hand-written `impl Event`, or
-/// a crate outside the pass) or with no `name` is left out: the bundle has no
-/// topic for it.
+/// A consumer has no topic when no descriptor has its event's type name (a
+/// hand-written `impl Event`, a `use … as` alias, or a crate outside the
+/// pass), or when the event has no `name`.
 fn join_listeners(
     listeners: &[ListenerDescriptor],
     events: &[EventDescriptor],
-) -> Result<Vec<BundleListener>, String> {
+) -> Result<(Vec<BundleListener>, Vec<String>), String> {
     let mut joined = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
     for listener in listeners {
-        let Some(topic) = resolve_event(listener, events)?.and_then(EventDescriptor::topic) else {
+        let event = resolve_event(listener, events)?;
+        let Some(topic) = event.and_then(EventDescriptor::topic) else {
+            let reason = if event.is_some() {
+                "the event has no `name`"
+            } else {
+                "no `#[event]` in the pass has that type name"
+            };
+            unresolved.insert(format!(
+                "`{}::{}` consumes `{}`: {reason}",
+                listener.krate, listener.function, listener.event
+            ));
             continue;
         };
         joined.insert(BundleListener {
@@ -324,7 +342,10 @@ fn join_listeners(
             reads: sorted(listener.reads.clone()),
         });
     }
-    Ok(joined.into_iter().collect())
+    Ok((
+        joined.into_iter().collect(),
+        unresolved.into_iter().collect(),
+    ))
 }
 
 /// The event a consumer reads, by its type path. `None` when no descriptor
@@ -1020,7 +1041,31 @@ mod tests {
         std::fs::remove_file(dir.path().join("event.core.ContactUpdated.json")).expect("rm");
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert!(bundle.listeners.is_empty() && bundle.events.is_empty());
-        assert_eq!(bundle.format, BUNDLE_FORMAT);
+        assert_eq!(
+            bundle.unresolved,
+            [
+                "`marketing::on_contact` consumes `core::ContactUpdated`: no `#[event]` in the pass \
+              has that type name"
+            ]
+        );
+        assert_eq!(
+            bundle.format, EVENTS_FORMAT,
+            "an older CLI must not drop it"
+        );
+    }
+
+    #[test]
+    fn a_listener_that_names_its_event_through_an_alias_is_unresolved() {
+        let dir = event_fixture();
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "Updated", &["email"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(bundle.listeners.is_empty(), "{bundle:?}");
+        assert_eq!(bundle.unresolved.len(), 1, "{bundle:?}");
+        assert!(bundle.unresolved[0].contains("`Updated`"), "{bundle:?}");
     }
 
     #[test]
@@ -1032,6 +1077,10 @@ mod tests {
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert!(bundle.events.is_empty(), "{bundle:?}");
         assert!(bundle.listeners.is_empty(), "{bundle:?}");
+        assert!(
+            bundle.unresolved[0].ends_with("the event has no `name`"),
+            "{bundle:?}"
+        );
     }
 
     #[test]

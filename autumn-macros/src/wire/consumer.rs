@@ -330,6 +330,17 @@ mod tests {
     }
 
     #[test]
+    fn an_ok_or_some_arm_over_a_decode_holds_the_payload() {
+        let reads = consumer(
+            "async fn h(m: OutboxMessage) -> R { \
+             match m.payload_as::<ContactUpdated>() { Ok(event) => record(event.secret), Err(_) => {} } \
+             if let Ok(c) = serde_json::from_value::<ContactUpdated>(v) { let _ = c.id; } \
+             if let Err(e) = m.payload_as::<ContactUpdated>() { let _ = e.kind; } Ok(()) }",
+        );
+        assert_eq!(names(&reads), ["id", "secret"]);
+    }
+
+    #[test]
     fn a_struct_pattern_that_names_the_event_is_the_payload() {
         let reads = consumer(
             "async fn h(m: OutboxMessage) -> R { let ContactUpdated { email, .. } = m.payload_as()?; Ok(()) }",

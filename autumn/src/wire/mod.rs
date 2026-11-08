@@ -7,8 +7,10 @@
 //! JSON.
 //!
 //! Events use the same tables: `#[event]` derives the payload's
-//! [`WireShape`] and sets [`EventShape`], and a `#[listener]` or
-//! `#[event_consumer]` asserts each field it reads with [`event_delivers`].
+//! [`WireShape`](crate::wire::WireShape) and sets
+//! [`EventShape`](crate::wire::EventShape), and a `#[listener]` or
+//! `#[event_consumer]` asserts each field it reads with
+//! [`event_delivers`](crate::wire::event_delivers).
 //!
 //! Two Autumn services in one Cargo workspace share one compiler-checked
 //! contract: the callee's handler signatures. Nothing is hand-maintained, and

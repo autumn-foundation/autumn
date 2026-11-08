@@ -469,8 +469,19 @@ impl<'a> Analyzer<'a> {
                 }
             }
             syn::Pat::TupleStruct(p) => {
+                // `Ok(x)` or `Some(x)` over a response holds the response:
+                // `match m.payload_as::<E>() { Ok(event) => … }`.
+                let wraps = p.elems.len() == 1
+                    && p.path
+                        .segments
+                        .last()
+                        .is_some_and(|s| s.ident == "Ok" || s.ident == "Some");
+                let inner = match bound {
+                    Bound::Response(_) if wraps => bound,
+                    _ => Bound::Other,
+                };
                 for elem in &p.elems {
-                    self.bind_pattern(elem, Bound::Other);
+                    self.bind_pattern(elem, inner);
                 }
             }
             syn::Pat::Tuple(p) => {
