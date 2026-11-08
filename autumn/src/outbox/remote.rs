@@ -178,7 +178,10 @@ async fn deliver(
     // `Sim`, the sim clock inside one.
     let timestamp = crate::time::ambient_now().timestamp();
     let signature = inbox_signature(&destination.secret, timestamp, &body);
+    // Named by its URL, as webhook delivery is: a test mocks the destination
+    // with `TestApp::http_mock(url)`.
     let response = crate::http_client::Client::from_state(&state)
+        .named(&destination.url)
         .post(&destination.url)
         .header("Content-Type", "application/json")
         .header(SIGNATURE_HEADER, signature)
@@ -400,9 +403,148 @@ pub(super) async fn run_inbox_listener(
     CURRENT_MESSAGE_ID.scope(row.message.id, run).await
 }
 
+#[cfg(test)]
+mod endpoint_tests {
+    use super::{INBOX_PATH, InboxVerifier, SIGNATURE_HEADER, accept, inbox_signature};
+    use crate::config::OutboxInboxConfig;
+    use crate::{AppState, AutumnResult};
+
+    const SECRET: &str = "endpoint-test-secret-0123456789abcdef";
+
+    fn state(max_body_bytes: usize) -> AppState {
+        let state = AppState::for_test();
+        let verifier = InboxVerifier::from_config(&OutboxInboxConfig {
+            enabled: true,
+            signing_secret: Some(SECRET.to_owned()),
+            max_body_bytes,
+            ..OutboxInboxConfig::default()
+        })
+        .expect("verifier");
+        state.insert_extension(verifier);
+        state
+    }
+
+    fn now() -> i64 {
+        crate::time::ambient_now().timestamp()
+    }
+
+    async fn post(
+        state: &AppState,
+        signature: Option<String>,
+        body: &str,
+    ) -> AutumnResult<&'static str> {
+        let mut headers = http::HeaderMap::new();
+        if let Some(signature) = signature {
+            headers.insert(SIGNATURE_HEADER, signature.parse().expect("header value"));
+        }
+        accept(state, &headers, axum::body::Body::from(body.to_owned())).await
+    }
+
+    fn status(result: AutumnResult<&'static str>) -> u16 {
+        result.expect_err("refused").status().as_u16()
+    }
+
+    #[test]
+    fn the_endpoint_needs_a_secret() {
+        assert!(InboxVerifier::from_config(&OutboxInboxConfig::default()).is_err());
+        assert_eq!(INBOX_PATH, "/_autumn/inbox");
+    }
+
+    #[tokio::test]
+    async fn without_a_verifier_the_endpoint_is_unavailable() {
+        assert_eq!(status(post(&AppState::for_test(), None, "{}").await), 503);
+    }
+
+    #[tokio::test]
+    async fn header_and_time_are_checked_before_the_body() {
+        let state = state(1024);
+        assert_eq!(status(post(&state, None, "{}").await), 400);
+        let stale = inbox_signature(SECRET, now() - 3_600, "{}");
+        assert_eq!(status(post(&state, Some(stale), "{}").await), 401);
+        let malformed = format!("t={},v9=00", now());
+        assert_eq!(status(post(&state, Some(malformed), "{}").await), 400);
+    }
+
+    #[tokio::test]
+    async fn a_large_body_is_refused() {
+        let state = state(8);
+        let body = "{\"id\":\"0123456789\"}";
+        let signature = inbox_signature(SECRET, now(), body);
+        assert_eq!(status(post(&state, Some(signature), body).await), 413);
+    }
+
+    #[tokio::test]
+    async fn the_signature_and_the_envelope_are_checked() {
+        let state = state(4096);
+        let wrong = inbox_signature("another-secret-0123456789abcdef", now(), "{}");
+        assert_eq!(status(post(&state, Some(wrong), "{}").await), 401);
+
+        let not_an_envelope = "{\"id\":1}";
+        let signed = inbox_signature(SECRET, now(), not_an_envelope);
+        assert_eq!(
+            status(post(&state, Some(signed), not_an_envelope).await),
+            400
+        );
+
+        let bad_topic = r#"{"id":"m","topic":"a b","aggregate":"x","created_at":"2026-01-01T00:00:00Z","payload":null}"#;
+        let signed = inbox_signature(SECRET, now(), bad_topic);
+        assert_eq!(status(post(&state, Some(signed), bad_topic).await), 400);
+
+        // A good request on an app with no database: 503, so the relay retries.
+        let good = r#"{"id":"m","topic":"deal.won","aggregate":"x","created_at":"2026-01-01T00:00:00Z","payload":{}}"#;
+        let signed = inbox_signature(SECRET, now(), good);
+        assert_eq!(status(post(&state, Some(signed), good).await), 503);
+    }
+}
+
 #[cfg(all(test, feature = "http-client"))]
 mod tests {
-    use super::is_acknowledgement;
+    use std::sync::Arc;
+
+    use super::{Destination, deliver, is_acknowledgement};
+    use crate::outbox::OutboxMessage;
+
+    async fn send_to(status: u16, body: serde_json::Value) -> crate::AutumnResult<()> {
+        let mut app = crate::test::TestApp::new();
+        let mock = app
+            .http_mock("http://marketing/_autumn/inbox")
+            .post("/_autumn/inbox")
+            .respond_with(status, body);
+        let client = app.build();
+        let destination = Arc::new(Destination {
+            name: "marketing".to_owned(),
+            url: "http://marketing/_autumn/inbox".to_owned(),
+            secret: "deliver-test-secret-0123456789abcdef".to_owned(),
+        });
+        let message = OutboxMessage::new(
+            "m-1",
+            "deal:1",
+            "deal.won",
+            serde_json::json!({ "deal_id": 1 }),
+            chrono::Utc::now(),
+        );
+        let result = deliver(client.state().clone(), destination, message).await;
+        mock.expect_called(1);
+        result
+    }
+
+    #[tokio::test]
+    async fn only_an_acknowledged_200_marks_a_message_sent() {
+        send_to(200, serde_json::json!({ "status": "accepted" }))
+            .await
+            .expect("accepted");
+        send_to(200, serde_json::json!({ "status": "duplicate" }))
+            .await
+            .expect("duplicate");
+        let error = send_to(200, serde_json::json!({ "ok": true }))
+            .await
+            .expect_err("not an acknowledgement");
+        assert!(error.to_string().contains("marketing"), "{error}");
+        let error = send_to(409, serde_json::json!({}))
+            .await
+            .expect_err("a failure");
+        assert!(error.to_string().contains("409"), "{error}");
+    }
 
     #[test]
     fn only_an_inbox_status_is_an_acknowledgement() {

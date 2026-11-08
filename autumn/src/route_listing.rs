@@ -2581,6 +2581,44 @@ mod tests {
         );
     }
 
+    /// The outbox inbox endpoint is listed and CSRF-exempt only when the app
+    /// serves it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn outbox_inbox_route_is_listed_and_exempt_when_served() {
+        let mut config = AutumnConfig::default();
+        config.outbox.enabled = true;
+        config.outbox.inbox.enabled = true;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(
+            infos.iter().any(|i| i.method == "POST"
+                && i.path == crate::outbox::INBOX_PATH
+                && i.classification == RouteClassification::Framework),
+            "{infos:?}"
+        );
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            dump.csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::outbox::INBOX_PATH)
+        );
+
+        config.outbox.inbox.enabled = false;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(!infos.iter().any(|i| i.path == crate::outbox::INBOX_PATH));
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            !dump
+                .csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::outbox::INBOX_PATH)
+        );
+    }
+
     // ── capacity contract: per-route resource shape (#1733) ──────────────
 
     #[test]
