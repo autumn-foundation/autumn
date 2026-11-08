@@ -212,6 +212,18 @@ const CLIENT_OWN_METHODS: [&str; 6] = ["new", "base_url", "clone", "to_owned", "
 /// Wrapper types a client is commonly injected through.
 const CLIENT_WRAPPERS: [&str; 5] = ["Arc", "Rc", "Box", "State", "Extension"];
 
+/// `Option` and `Result` methods whose last argument is a callback that gets
+/// the success value.
+const VALUE_CALLBACKS: [&str; 7] = [
+    "map",
+    "and_then",
+    "inspect",
+    "is_some_and",
+    "is_ok_and",
+    "map_or",
+    "map_or_else",
+];
+
 /// Macros whose tokens are never evaluated, so a field named inside one is not
 /// a read. `matches!` is not one: it evaluates its first argument, and its
 /// pattern cannot hold a `binding.field` read.
@@ -747,8 +759,26 @@ impl Visit<'_> for Analyzer<'_> {
         match expr {
             Expr::MethodCall(call) => {
                 self.visit_expr(&call.receiver);
-                for arg in &call.args {
-                    self.visit_expr(arg);
+                // `m.payload_as::<E>().map(|event| event.email)`: the
+                // callback gets the success value, so its first parameter
+                // holds the response.
+                let callback = VALUE_CALLBACKS
+                    .contains(&call.method.to_string().as_str())
+                    .then(|| self.response_bound(&call.receiver))
+                    .filter(|bound| matches!(bound, Bound::Response(_)));
+                let last = call.args.len().saturating_sub(1);
+                for (i, arg) in call.args.iter().enumerate() {
+                    match (callback, arg) {
+                        (Some(bound), Expr::Closure(closure)) if i == last => {
+                            self.scopes.push(BTreeMap::new());
+                            for (n, input) in closure.inputs.iter().enumerate() {
+                                self.bind_pattern(input, if n == 0 { bound } else { Bound::Other });
+                            }
+                            self.visit_expr(&closure.body);
+                            self.scopes.pop();
+                        }
+                        _ => self.visit_expr(arg),
+                    }
                 }
                 self.record_call(call);
             }
