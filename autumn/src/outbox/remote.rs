@@ -459,8 +459,8 @@ mod endpoint_tests {
     async fn header_and_time_are_checked_before_the_body() {
         let state = state(1024);
         assert_eq!(status(post(&state, None, "{}").await), 400);
-        let stale = inbox_signature(SECRET, now() - 3_600, "{}");
-        assert_eq!(status(post(&state, Some(stale), "{}").await), 401);
+        let expired = inbox_signature(SECRET, now() - 3_600, "{}");
+        assert_eq!(status(post(&state, Some(expired), "{}").await), 401);
         let malformed = format!("t={},v9=00", now());
         assert_eq!(status(post(&state, Some(malformed), "{}").await), 400);
     }
