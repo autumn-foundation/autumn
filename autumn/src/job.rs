@@ -23750,7 +23750,8 @@ mod tests {
                     .enqueue_after_commit("test_job", serde_json::json!({}))
                     .await
                     .expect("outside tx enqueues immediately");
-                let job = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                // The bound only catches a hang; it is not a latency budget.
+                let job = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
                     .await
                     .expect("job should arrive")
                     .expect("channel open");

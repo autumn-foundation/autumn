@@ -121,8 +121,8 @@ async fn timer_inside_crossed_dst_window_fires_in_virtual_time(mut sim: Sim) {
     );
 
     // Cross the DST boundary by advancing to the zoned target. The wall clock
-    // covers only this advance: the first request below pays the one-time
-    // warm-up of the app, which is not virtual time.
+    // covers only this advance: the first request below pays the app's
+    // one-time warm-up, which is not part of the virtual-time budget.
     let wall_start = Instant::now();
     sim.advance_to(&target_local).await;
     sim.run_to_idle().await;

@@ -256,11 +256,14 @@ fn a_git_ref_is_exported_in_a_worktree_that_is_removed_afterwards() {
 
     let current = golden_dir().join("unchanged/current.json");
     let (code, _, stderr) = check_in(root, &current, "HEAD", &[]);
-    // The crate has no `#[endpoint]`, so the export at HEAD refuses an empty
-    // contract. The worktree and its pass ran to get there.
+    // The crate has no `#[endpoint]` and no `#[event]`, so the export at HEAD
+    // refuses an empty contract. The worktree and its pass ran to get there.
     assert_eq!(code, 4, "{stderr}");
     assert!(stderr.contains("export at `HEAD`"), "{stderr}");
-    assert!(stderr.contains("no endpoint descriptor"), "{stderr}");
+    assert!(
+        stderr.contains("no endpoint or event descriptor"),
+        "{stderr}"
+    );
     assert_eq!(
         git(&["worktree", "list"]).lines().count(),
         1,

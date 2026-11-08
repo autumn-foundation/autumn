@@ -3,6 +3,9 @@
 //! Two handlers, each marked `#[endpoint]`. The attribute reads the request and
 //! response types straight off the signature and emits the contract the
 //! storefront is compiled against — there is no IDL and no hand-written schema.
+//!
+//! One event, `ItemRepriced`. `#[event]` records its payload shape, and the
+//! storefront's listener is checked against it.
 
 use autumn_web::prelude::*;
 
@@ -36,6 +39,16 @@ pub struct NewItem {
     /// Optional note. Absent from a request body is fine.
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// Sent when an item's price changes. The storefront keeps its own copy of
+/// the price, so it reads this event instead of calling `get_item`.
+#[event(name = "catalog.item_repriced")]
+pub struct ItemRepriced {
+    /// Stable item identifier.
+    pub id: String,
+    /// New price in cents.
+    pub price_cents: u32,
 }
 
 impl Item {

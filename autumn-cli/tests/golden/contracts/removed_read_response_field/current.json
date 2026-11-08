@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "endpoints": [
     {
       "service": "catalog",
@@ -196,6 +196,58 @@
         "name"
       ],
       "writes": null
+    }
+  ],
+  "events": [
+    {
+      "topic": "catalog.item_repriced",
+      "name": "catalog.item_repriced",
+      "version": 1,
+      "krate": "mesh-catalog",
+      "type_name": "ItemRepriced",
+      "shape": {
+        "name": "ItemRepriced",
+        "serialized": [
+          {
+            "rust_name": "id",
+            "wire_name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          }
+        ],
+        "deserialized": [
+          {
+            "rust_name": "id",
+            "wire_name": "id",
+            "ty": "String",
+            "required": true
+          },
+          {
+            "rust_name": "price_cents",
+            "wire_name": "price_cents",
+            "ty": "u32",
+            "required": true
+          }
+        ],
+        "closed": false
+      }
+    }
+  ],
+  "listeners": [
+    {
+      "krate": "mesh-storefront",
+      "function": "on_item_repriced",
+      "topic": "catalog.item_repriced",
+      "reads": [
+        "id",
+        "price_cents"
+      ]
     }
   ]
 }

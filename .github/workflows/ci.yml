@@ -1018,6 +1018,12 @@ jobs:
     # 7 GB the runner swaps until GitHub loses it: "The hosted runner lost
     # communication with the server". The `test` macOS shards run on the
     # same image, because the archive holds x86_64 binaries.
+    #
+    # The macOS build runs at cargo's default, one job per core. A cap of two
+    # jobs, set when this leg ran on the 7 GB arm64 runner, left half of the
+    # 4-core runner idle. The archive step still builds `integration_tests`
+    # first and alone, so its rustc never shares the runner's memory with
+    # another compile.
     strategy:
       fail-fast: false
       matrix:
@@ -1029,8 +1035,8 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          # A cold build of every workspace test, and the kache store beside
-          # it, fill the macOS runner's disk, as `test-build` notes for
+          # A cold build of every workspace test, and the restored cache,
+          # fill the macOS runner's disk, as `test-build` notes for
           # Linux. The runner then stops answering: "The hosted runner lost
           # communication with the server", with no log. Remove what a Rust
           # build does not use: other Xcodes, simulators and SDKs. Keep the
@@ -1057,23 +1063,12 @@ jobs:
       - uses: ./.github/actions/kache
         continue-on-error: true
         with:
-          # See `test-build`.
+          # See `test-build`. On macOS the composite uses rust-cache, not
+          # kache; see .github/actions/kache.
           shared-key: workspace-test
-          # The macOS runner has 7 GB of memory. With S3 and one manifest for
-          # all OSes, it prefetched Linux or Windows artifacts that it cannot
-          # use; that is the likely cause of the lost runner. The manifest is
-          # now per host, and macOS downloads only what a compile asks for.
-          warm: ${{ runner.os != 'macOS' }}
       - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-nextest@0.9.149
-      - name: Cap the macOS compile at two jobs
-        # The macOS runner has 3 cores and 7 GB, and the build swaps at one
-        # job per core (see the job comment). Two jobs bound the peak, as in
-        # the `lint` job. Windows keeps one job per core.
-        if: runner.os == 'macOS'
-        shell: bash
-        run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - name: Archive the workspace test build
         shell: bash
         run: |

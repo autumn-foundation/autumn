@@ -118,6 +118,7 @@ GATED_MODULES=(
   autumn/src/db/fleet.rs:sqlite
   autumn/src/db/fleet/generations.rs:sqlite
   autumn/src/db/fleet_lake.rs:sqlite
+  autumn/src/db/fleet_lake/sqlite.rs:sqlite
   autumn/src/db/fleet_ownership.rs:sqlite
   autumn/src/db/fleet_replication.rs:sqlite
   autumn/src/db/fleet_sweeper.rs:sqlite

@@ -4,6 +4,10 @@
 //! Mirrors `#[job]` — it emits a `__autumn_listener_info_{fn}()` companion that
 //! `listeners![]` collects into a `Vec<ListenerInfo>` for `AppBuilder::listeners`.
 //!
+//! Each payload field the listener reads is checked against the event's wire
+//! shape at compile time, and the read-set goes into a descriptor. See
+//! `crate::wire::consumer`.
+//!
 //! A listener runs **synchronously** (in-request, before the response) by
 //! default, or **durably** (`durable`) — enqueued onto the existing `#[job]`
 //! queue so it survives restarts and inherits retry + DLQ semantics.
@@ -109,6 +113,17 @@ pub fn listener_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let event_type = &attrs.event_type;
+
+    // The read-set: each payload field the listener names must be one the
+    // event sends. A type that is not a plain path has no table to name.
+    let input_fn = match crate::wire::consumer::event_path(event_type) {
+        Some(path) => {
+            let reads = crate::wire::consumer::listener_reads(&input_fn, &path);
+            crate::wire::consumer::with_checks(&input_fn, &path, &reads)
+        }
+        None => input_fn,
+    };
+
     let fn_name = &input_fn.sig.ident;
     let companion_name = format_ident!("__autumn_listener_info_{fn_name}");
     let fn_name_str = fn_name.to_string();
@@ -229,6 +244,38 @@ mod tests {
             },
         );
         assert!(expanded.contains("async fn(AppState, Event)"), "{expanded}");
+    }
+
+    #[test]
+    fn a_listener_asserts_each_read_against_the_event_table() {
+        let expanded = expand(
+            quote! { ContactUpdated },
+            quote! {
+                async fn on_update(state: AppState, event: ContactUpdated) -> AutumnResult<()> {
+                    let _ = event.email;
+                    Ok(())
+                }
+            },
+        );
+        assert!(expanded.contains("event_delivers"), "{expanded}");
+        assert!(
+            expanded.contains("reads field `email` of event `ContactUpdated`"),
+            "{expanded}"
+        );
+        assert!(expanded.contains("in `on_update`"), "{expanded}");
+    }
+
+    #[test]
+    fn a_listener_that_reads_nothing_asserts_nothing() {
+        let expanded = expand(
+            quote! { ContactUpdated },
+            quote! {
+                async fn on_update(state: AppState, _event: ContactUpdated) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        );
+        assert!(!expanded.contains("event_delivers"), "{expanded}");
     }
 
     #[test]

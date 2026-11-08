@@ -347,6 +347,31 @@ pub trait LakeSink: Send + Sync + 'static {
   generation under its own prefix. Core never adds a lake catalog table to
   the control database.
 
+##### Notes from step 4
+
+Step 4 changed this section in these ways:
+
+- The trait is `LakeSink: Send + 'static`, not `Sync`, and `type Lake`
+  is `Send + 'static`. The `SQLite` sink holds one connection, and core
+  calls the sink on one thread.
+- `Generation` is `LakeGeneration`: the generation id, the last WAL segment
+  and the effective time. In WAL shipping a generation grows. The id alone
+  does not show a new commit.
+- The trait has a new method, `keep(key, generation)`. Core calls it when
+  `has` is `true`. A sink that keeps its lake drops, at `finish`, each
+  member that it got from neither `add` nor `keep`. So a deleted tenant
+  leaves the lake.
+- Core calls `has` and `keep` for all members first. Then it restores the
+  other members and calls `add`.
+- A sink sets `TAKES_SLOTS = true` to get slot databases. The default is
+  `false`.
+- Core checks the identity row of each restored file before `add`. So
+  each sink gets this check.
+- `FleetLake::load(sink)` runs any sink. `materialize()` runs the `SQLite`
+  sink. `verification/fleet_lake.rs` proves that a load that skips held
+  members gives the same rows as a load that restores all of them, when
+  the sink holds the right rows for each state.
+
 #### 7. Conformance kit
 
 `plugin_conformance::fleet` runs one suite against any `FleetEngine`. It

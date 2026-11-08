@@ -6,6 +6,10 @@
 //! compares what a caller's own release expects with what the serving release
 //! does. A window with no break is a safe deploy order.
 //!
+//! Events use the same two windows. The producer side counts as the callee,
+//! and the consumer side as the caller: [`check_listener`] compares what a
+//! consumer's own release decodes with what the other release sends.
+//!
 //! Fields match by wire key (`wire_name` and aliases), not by Rust name, so a
 //! `#[serde(rename)]` that keeps the key is not a break. Path parameters match
 //! by position, not by name.
@@ -13,9 +17,9 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use autumn_macros_support::wire::WireFieldDescriptor;
+use autumn_macros_support::wire::{WireFieldDescriptor, WireTypeDescriptor};
 
-use super::bundle::{Bundle, BundleCall, BundleEndpoint};
+use super::bundle::{Bundle, BundleCall, BundleEndpoint, BundleEvent, BundleListener};
 
 /// The two deploy windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -76,6 +80,46 @@ pub enum BreakKind {
         /// The type the callee decodes.
         callee: String,
     },
+    /// No producer in the serving release sends the consumer's topic.
+    EventTopicMissing,
+    /// The payload is JSON `null` (a unit struct) on one side and an object
+    /// on the other.
+    EventUnitChanged,
+    /// The consumer reads an event field the producer does not send.
+    EventFieldMissing(String),
+    /// The consumer's event type needs a field the producer may leave out.
+    EventDecodeFails(String),
+    /// The consumer's event type denies unknown fields, and the producer
+    /// sends one.
+    EventFieldRejected(String),
+    /// The consumer's event type gets one field under two keys.
+    EventDuplicateKey(String),
+    /// An event field changed its Rust type.
+    EventTypeChanged {
+        /// The field's wire key.
+        field: String,
+        /// The type the consumer decodes.
+        consumer: String,
+        /// The type the producer sends.
+        producer: String,
+    },
+}
+
+impl BreakKind {
+    /// Whether this break is about an event, not an endpoint.
+    #[must_use]
+    pub const fn is_event(&self) -> bool {
+        matches!(
+            self,
+            Self::EventTopicMissing
+                | Self::EventUnitChanged
+                | Self::EventFieldMissing(_)
+                | Self::EventDecodeFails(_)
+                | Self::EventFieldRejected(_)
+                | Self::EventDuplicateKey(_)
+                | Self::EventTypeChanged { .. }
+        )
+    }
 }
 
 /// One break, with what a report needs to name it.
@@ -104,6 +148,9 @@ pub struct Report {
     pub callee_first: Vec<Break>,
     /// Breaks if the callers ship first.
     pub caller_first: Vec<Break>,
+    /// Facts that are not breaks, such as an event version that no consumer
+    /// reads any more.
+    pub notes: Vec<String>,
 }
 
 /// Which deploy orders are safe.
@@ -169,6 +216,22 @@ pub fn compare(deployed: &Bundle, current: &Bundle) -> Report {
     for call in &current.callers {
         new_callers.extend(check_call(Window::CallerFirst, current, call, deployed));
     }
+    for listener in &deployed.listeners {
+        old_callers.extend(check_listener(
+            Window::CalleeFirst,
+            deployed,
+            listener,
+            current,
+        ));
+    }
+    for listener in &current.listeners {
+        new_callers.extend(check_listener(
+            Window::CallerFirst,
+            current,
+            listener,
+            deployed,
+        ));
+    }
     old_callers.sort();
     old_callers.dedup();
     new_callers.sort();
@@ -176,7 +239,153 @@ pub fn compare(deployed: &Bundle, current: &Bundle) -> Report {
     Report {
         callee_first: old_callers,
         caller_first: new_callers,
+        notes: event_notes(deployed, current),
     }
+}
+
+/// The notes about events: the consumers the check cannot see, and the old
+/// versions that can be dropped. No version is called droppable while an
+/// unseen consumer may read it.
+fn event_notes(deployed: &Bundle, current: &Bundle) -> Vec<String> {
+    let unseen: BTreeSet<&String> = deployed
+        .unresolved
+        .iter()
+        .chain(&current.unresolved)
+        .collect();
+    if unseen.is_empty() {
+        return droppable_versions(deployed, current);
+    }
+    let mut notes = vec![format!(
+        "{} event consumer(s) are not in the bundles, so the check does not protect them. \
+         Use the event's own type name, and give the event a `name`.",
+        unseen.len()
+    )];
+    notes.extend(unseen.into_iter().map(|u| format!("  {u}")));
+    notes
+}
+
+/// Check one event consumer against the event the other release sends.
+///
+/// `built_against` is the consumer's own release: it gives the type the
+/// consumer decodes with. `sending_release` produces the event.
+///
+/// When `sending_release` does not send the topic, a deployed consumer loses
+/// its events. A new consumer of a topic that is not sent yet gets no events
+/// until the producer ships. That is not a break for a new event. It is a
+/// break when the sending release sends a version of the same event that no
+/// consumer in the consumer's release reads: those events are lost.
+#[must_use]
+pub fn check_listener(
+    window: Window,
+    built_against: &Bundle,
+    listener: &BundleListener,
+    sending_release: &Bundle,
+) -> Vec<Break> {
+    let Some(view) = built_against.event(&listener.topic) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut report = |kind| {
+        out.push(Break {
+            window,
+            endpoint: view.topic.clone(),
+            route: "event".to_owned(),
+            service: service_of(built_against, &view.krate),
+            caller: Some(listener.consumer()),
+            caller_krate: Some(listener.krate.clone()),
+            kind,
+        });
+    };
+    let Some(sent) = sending_release.event(&listener.topic) else {
+        // A version that this consumer's crate does not read in its own
+        // release is lost to it while this window lasts. Another crate that
+        // still reads that version does not run this consumer's effects.
+        let lost = sending_release.events.iter().any(|e| {
+            e.name == view.name
+                && !built_against
+                    .listeners
+                    .iter()
+                    .any(|l| l.topic == e.topic && l.krate == listener.krate)
+        });
+        if window == Window::CalleeFirst || lost {
+            report(BreakKind::EventTopicMissing);
+        }
+        return out;
+    };
+    if view.opaque || sent.opaque {
+        return out;
+    }
+    if view.unit != sent.unit {
+        // `null` where an object was, or the reverse: no field matters.
+        report(BreakKind::EventUnitChanged);
+        return out;
+    }
+    for issue in decode_issues(&view.shape, &sent.shape.serialized, &listener.reads) {
+        report(match issue {
+            Decode::Missing(f) => BreakKind::EventFieldMissing(f),
+            Decode::Fails(f) => BreakKind::EventDecodeFails(f),
+            Decode::Rejected(f) => BreakKind::EventFieldRejected(f),
+            Decode::DuplicateKey(f) => BreakKind::EventDuplicateKey(f),
+            Decode::TypeChanged {
+                field,
+                reader,
+                writer,
+            } => BreakKind::EventTypeChanged {
+                field,
+                consumer: reader,
+                producer: writer,
+            },
+        });
+    }
+    out
+}
+
+/// How a deploy order names the crate that defines an event: the service of
+/// its `#[endpoint]`s when it has exactly one, else the crate.
+fn service_of(bundle: &Bundle, krate: &str) -> String {
+    let services: BTreeSet<&str> = bundle
+        .endpoints
+        .iter()
+        .filter(|e| e.krate == krate)
+        .map(|e| e.service.as_str())
+        .collect();
+    match services.into_iter().collect::<Vec<_>>().as_slice() {
+        [one] => (*one).to_owned(),
+        _ => krate.to_owned(),
+    }
+}
+
+/// A note for each event version below the newest that no consumer reads,
+/// in the deployed release or in this one. The producer can stop sending it.
+fn droppable_versions(deployed: &Bundle, current: &Bundle) -> Vec<String> {
+    let read = |topic: &str| {
+        deployed
+            .listeners
+            .iter()
+            .chain(&current.listeners)
+            .any(|l| l.topic == topic)
+    };
+    let newest = |event: &BundleEvent| {
+        current
+            .events
+            .iter()
+            .filter(|e| e.name == event.name)
+            .map(|e| e.version)
+            .max()
+            .unwrap_or(event.version)
+    };
+    current
+        .events
+        .iter()
+        .filter(|e| e.version < newest(e) && !read(&e.topic))
+        .map(|e| {
+            format!(
+                "Event `{}` v{}: no consumer reads it in the deployed release or in this one. \
+                 It can be dropped.",
+                e.name, e.version
+            )
+        })
+        .collect()
 }
 
 /// `(service, METHOD, path)` with path parameter names dropped.
@@ -331,46 +540,95 @@ fn response_breaks(
         report(BreakKind::ResponseListChanged);
         return;
     }
-    let decoded = &view.response.deserialized;
-    let produced = &serve.response.serialized;
+    for issue in decode_issues(&view.response, &serve.response.serialized, &call.reads) {
+        report(match issue {
+            Decode::Missing(f) => BreakKind::ResponseFieldMissing(f),
+            Decode::Fails(f) => BreakKind::ResponseDecodeFails(f),
+            Decode::Rejected(f) => BreakKind::ResponseFieldRejected(f),
+            Decode::DuplicateKey(f) => BreakKind::ResponseDuplicateKey(f),
+            Decode::TypeChanged {
+                field,
+                reader,
+                writer,
+            } => BreakKind::ResponseTypeChanged {
+                field,
+                caller: reader,
+                callee: writer,
+            },
+        });
+    }
+}
+
+/// One way a reader's type fails on what a writer sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Decode {
+    /// The reader reads a field the writer does not send.
+    Missing(String),
+    /// The reader's type needs a field the writer may leave out.
+    Fails(String),
+    /// The reader's type denies unknown fields, and the writer sends one.
+    Rejected(String),
+    /// The reader's type gets one field under two keys.
+    DuplicateKey(String),
+    /// A field changed its Rust type.
+    TypeChanged {
+        /// The field's wire key.
+        field: String,
+        /// The type the reader decodes.
+        reader: String,
+        /// The type the writer sends.
+        writer: String,
+    },
+}
+
+/// The decode rules, shared by responses and events: `reader` decodes what
+/// `produced` holds, and the code reads the fields in `reads`.
+fn decode_issues(
+    reader: &WireTypeDescriptor,
+    produced: &[WireFieldDescriptor],
+    reads: &[String],
+) -> Vec<Decode> {
+    let mut out = Vec::new();
+    let decoded = &reader.deserialized;
     let mut named = BTreeSet::new();
-    for read in &call.reads {
+    for read in reads {
         let Some(field) = decoded.iter().find(|f| &f.rust_name == read) else {
             continue;
         };
         if produced_for(produced, field).is_none() {
             named.insert(field.wire_name.clone());
-            report(BreakKind::ResponseFieldMissing(field.wire_name.clone()));
+            out.push(Decode::Missing(field.wire_name.clone()));
         }
     }
     for field in decoded {
         if key_hits(produced, field) > 1 {
-            report(BreakKind::ResponseDuplicateKey(field.wire_name.clone()));
+            out.push(Decode::DuplicateKey(field.wire_name.clone()));
         }
         match produced_for(produced, field) {
             Some(made) if !type_reads(&field.ty, &made.ty) => {
-                report(BreakKind::ResponseTypeChanged {
+                out.push(Decode::TypeChanged {
                     field: field.wire_name.clone(),
-                    caller: field.ty.clone(),
-                    callee: made.ty.clone(),
+                    reader: field.ty.clone(),
+                    writer: made.ty.clone(),
                 });
             }
             Some(made) if field.required && !made.required => {
-                report(BreakKind::ResponseDecodeFails(field.wire_name.clone()));
+                out.push(Decode::Fails(field.wire_name.clone()));
             }
             None if field.required && !named.contains(&field.wire_name) => {
-                report(BreakKind::ResponseDecodeFails(field.wire_name.clone()));
+                out.push(Decode::Fails(field.wire_name.clone()));
             }
             _ => {}
         }
     }
-    if view.response.closed {
+    if reader.closed {
         for made in produced {
             if accepting(decoded, made).is_none() {
-                report(BreakKind::ResponseFieldRejected(made.wire_name.clone()));
+                out.push(Decode::Rejected(made.wire_name.clone()));
             }
         }
     }
+    out
 }
 
 /// Request rules: the callee decodes what the caller's own type sends.
@@ -490,6 +748,12 @@ impl Report {
             "If the callers ship first (new callers, deployed callees)",
             &self.caller_first,
         );
+        for note in &self.notes {
+            let _ = writeln!(out, "Note: {note}");
+        }
+        if !self.notes.is_empty() {
+            out.push('\n');
+        }
         let services_of = |breaks: &[Break]| join(breaks.iter().map(|b| b.service.clone()));
         let crates_of = |breaks: &[Break]| {
             let named = join(breaks.iter().filter_map(|b| b.caller_krate.clone()));
@@ -561,6 +825,10 @@ fn render_window(out: &mut String, title: &str, breaks: &[Break]) {
     }
     let _ = writeln!(out, "{title}: {} break(s)", breaks.len());
     for b in breaks {
+        if b.kind.is_event() {
+            let _ = writeln!(out, "  - {} ({}): {}", b.endpoint, b.route, event_detail(b));
+            continue;
+        }
         let who = b.caller.as_deref().map_or_else(
             || "any client".to_owned(),
             |caller| format!("caller `{caller}`"),
@@ -631,16 +899,68 @@ fn render_window(out: &mut String, title: &str, breaks: &[Break]) {
                 "{who} sends request field `{field}` as `{caller}`, and {callee} decodes it as \
                  `{theirs}`"
             ),
+            // Rendered by `event_detail`.
+            BreakKind::EventTopicMissing
+            | BreakKind::EventUnitChanged
+            | BreakKind::EventFieldMissing(_)
+            | BreakKind::EventDecodeFails(_)
+            | BreakKind::EventFieldRejected(_)
+            | BreakKind::EventDuplicateKey(_)
+            | BreakKind::EventTypeChanged { .. } => String::new(),
         };
         let _ = writeln!(out, "  - {} ({}): {detail}", b.endpoint, b.route);
     }
     out.push('\n');
 }
 
+/// The text for one event break.
+fn event_detail(b: &Break) -> String {
+    let who = b.caller.as_deref().map_or_else(
+        || "a consumer".to_owned(),
+        |consumer| format!("consumer `{consumer}`"),
+    );
+    let (producer, own_type) = match b.window {
+        Window::CalleeFirst => ("the new producer", "its deployed type"),
+        Window::CallerFirst => ("the deployed producer", "its new type"),
+    };
+    match &b.kind {
+        BreakKind::EventTopicMissing => {
+            format!("{who} reads this topic, and {producer} does not send it")
+        }
+        BreakKind::EventUnitChanged => format!(
+            "the payload is JSON `null` on one side and an object on the other, so {who} cannot \
+             decode what {producer} sends"
+        ),
+        BreakKind::EventFieldMissing(f) => {
+            format!("{who} reads field `{f}`, which {producer} does not send")
+        }
+        BreakKind::EventDecodeFails(f) => format!(
+            "{who} decodes the event with {own_type}, which needs field `{f}`, and {producer} \
+             does not always send it"
+        ),
+        BreakKind::EventFieldRejected(f) => format!(
+            "{who} decodes the event with {own_type}, which denies unknown fields, and \
+             {producer} sends `{f}`"
+        ),
+        BreakKind::EventDuplicateKey(f) => format!(
+            "{who} decodes field `{f}` under its name or an alias, and {producer} sends both keys"
+        ),
+        BreakKind::EventTypeChanged {
+            field,
+            consumer,
+            producer: theirs,
+        } => format!(
+            "event field `{field}` is `{theirs}` in {producer}, and {who} decodes it as \
+             `{consumer}`"
+        ),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::bundle::BUNDLE_FORMAT;
+    use crate::contracts::bundle::{BUNDLE_FORMAT, BundleEvent, BundleListener};
     use autumn_macros_support::wire::WireTypeDescriptor;
 
     fn field(rust: &str, wire: &str, ty: &str, required: bool) -> WireFieldDescriptor {
@@ -714,6 +1034,9 @@ mod tests {
                 call("add_item", "create_item", &["id"], Some(&["name"])),
                 call("show_item", "get_item", &["name"], None),
             ],
+            events: Vec::new(),
+            listeners: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
 
@@ -1147,6 +1470,351 @@ mod tests {
         assert!(text.contains("catalog.create_item (POST /items)"), "{text}");
         assert!(text.contains("mesh-storefront::add_item"), "{text}");
         assert!(text.contains("`sku`"), "{text}");
+    }
+
+    // --- events ---
+
+    /// `(name, type, always sent)`. An `Option` is not required on decode.
+    fn contact_shape(fields: &[(&str, &str, bool)]) -> WireTypeDescriptor {
+        let sent: Vec<WireFieldDescriptor> = fields
+            .iter()
+            .map(|(name, ty, required)| field(name, name, ty, *required))
+            .collect();
+        let decoded: Vec<WireFieldDescriptor> = fields
+            .iter()
+            .map(|(name, ty, required)| {
+                field(name, name, ty, *required && !ty.starts_with("Option<"))
+            })
+            .collect();
+        shape("ContactUpdated", sent, decoded)
+    }
+
+    fn event(version: u32, shape: WireTypeDescriptor) -> BundleEvent {
+        let name = "contact.updated".to_owned();
+        BundleEvent {
+            topic: autumn_macros_support::wire::versioned_topic(&name, version),
+            name,
+            version,
+            krate: "core".to_owned(),
+            type_name: format!("ContactUpdatedV{version}"),
+            opaque: false,
+            unit: false,
+            shape,
+        }
+    }
+
+    fn listener(function: &str, topic: &str, reads: &[&str]) -> BundleListener {
+        BundleListener {
+            krate: "marketing".to_owned(),
+            function: function.to_owned(),
+            topic: topic.to_owned(),
+            reads: reads.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
+    /// Release 1 plus `contact.updated { id, email }` and a consumer of
+    /// `email`.
+    fn with_events() -> Bundle {
+        let mut bundle = release_1();
+        bundle.events = vec![event(
+            1,
+            contact_shape(&[("id", "i64", true), ("email", "String", true)]),
+        )];
+        bundle.listeners = vec![listener("on_contact", "contact.updated", &["email"])];
+        bundle
+    }
+
+    #[test]
+    fn a_removed_event_field_a_deployed_consumer_reads_fails() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events[0].shape = contact_shape(&[("id", "i64", true)]);
+        // The new consumer cannot read it any more: it would not compile.
+        current.listeners = vec![listener("on_contact", "contact.updated", &["id"])];
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::EventFieldMissing("email".to_owned())]
+        );
+        assert!(report.caller_first.is_empty(), "{report:?}");
+        assert_eq!(report.verdict(), Verdict::CallerFirst);
+        assert_eq!(report.exit_code(Order::Any), EXIT_ORDER);
+        assert_ne!(report.exit_code(Order::CalleeFirst), 0);
+    }
+
+    #[test]
+    fn a_new_event_field_passes() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events[0].shape = contact_shape(&[
+            ("id", "i64", true),
+            ("email", "String", true),
+            ("phone", "Option<String>", true),
+        ]);
+        let report = compare(&deployed, &current);
+        assert_eq!(report, Report::default(), "{report:?}");
+    }
+
+    #[test]
+    fn a_consumer_that_starts_reading_a_new_field_needs_the_producer_first() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events[0].shape = contact_shape(&[
+            ("id", "i64", true),
+            ("email", "String", true),
+            ("phone", "String", true),
+        ]);
+        current.listeners = vec![listener("on_contact", "contact.updated", &["phone"])];
+        let report = compare(&deployed, &current);
+        assert!(report.callee_first.is_empty(), "{report:?}");
+        assert_eq!(
+            kinds(&report.caller_first),
+            [BreakKind::EventFieldMissing("phone".to_owned())]
+        );
+        assert_eq!(report.verdict(), Verdict::CalleeFirst);
+    }
+
+    #[test]
+    fn an_unread_required_event_field_removed_breaks_the_old_decode() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events[0].shape = contact_shape(&[("email", "String", true)]);
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::EventDecodeFails("id".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_event_field_type_change_is_a_break() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events[0].shape = contact_shape(&[("id", "i64", true), ("email", "u32", true)]);
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::EventTypeChanged {
+                field: "email".to_owned(),
+                consumer: "String".to_owned(),
+                producer: "u32".to_owned(),
+            }]
+        );
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+    }
+
+    #[test]
+    fn a_closed_event_type_rejects_a_new_field() {
+        let mut deployed = with_events();
+        deployed.events[0].shape.closed = true;
+        let mut current = deployed.clone();
+        current.events[0].shape = contact_shape(&[
+            ("id", "i64", true),
+            ("email", "String", true),
+            ("phone", "Option<String>", true),
+        ]);
+        current.events[0].shape.closed = true;
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::EventFieldRejected("phone".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_topic_no_new_producer_sends_breaks_a_deployed_consumer() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events = vec![event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email", "String", true)]),
+        )];
+        current.listeners = vec![listener("on_contact", "contact.updated.v2", &["email"])];
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::EventTopicMissing]);
+        // v1 replaced by v2 in one release: no order is safe.
+        assert_eq!(kinds(&report.caller_first), [BreakKind::EventTopicMissing]);
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+        let text = report.render(Order::Any);
+        assert!(text.contains("contact.updated (event)"), "{text}");
+        assert!(text.contains("marketing::on_contact"), "{text}");
+    }
+
+    #[test]
+    fn a_new_consumer_of_a_topic_the_deployed_release_lacks_is_not_a_break() {
+        let deployed = release_1();
+        let current = with_events();
+        let report = compare(&deployed, &current);
+        assert_eq!(report, Report::default(), "{report:?}");
+    }
+
+    #[test]
+    fn a_v2_beside_v1_needs_the_producer_first_when_the_consumer_moves_to_v2() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events.push(event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email_address", "String", true)]),
+        ));
+        current.listeners = vec![listener(
+            "on_contact",
+            "contact.updated.v2",
+            &["email_address"],
+        )];
+        let report = compare(&deployed, &current);
+        // The deployed consumer still gets v1 from the new producer.
+        assert!(report.callee_first.is_empty(), "{report:?}");
+        // A new consumer of v2 next to a producer of v1 only: v1 is lost.
+        assert_eq!(kinds(&report.caller_first), [BreakKind::EventTopicMissing]);
+        assert_eq!(report.verdict(), Verdict::CalleeFirst);
+    }
+
+    #[test]
+    fn a_v2_beside_v1_is_safe_while_the_consumer_reads_both() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events.push(event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email_address", "String", true)]),
+        ));
+        current.listeners.push(listener(
+            "on_contact_v2",
+            "contact.updated.v2",
+            &["email_address"],
+        ));
+        let report = compare(&deployed, &current);
+        assert_eq!(report, Report::default(), "{report:?}");
+    }
+
+    #[test]
+    fn a_consumer_that_moves_to_v2_is_not_covered_by_another_crate_on_v1() {
+        let mut deployed = with_events();
+        deployed.listeners.push(BundleListener {
+            krate: "billing".to_owned(),
+            ..listener("on_contact_billing", "contact.updated", &["id"])
+        });
+        let mut current = deployed.clone();
+        current.events.push(event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email_address", "String", true)]),
+        ));
+        // `marketing` moves to v2; `billing` stays on v1.
+        current.listeners.retain(|l| l.krate != "marketing");
+        current.listeners.push(listener(
+            "on_contact",
+            "contact.updated.v2",
+            &["email_address"],
+        ));
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.caller_first), [BreakKind::EventTopicMissing]);
+        assert_eq!(
+            report.caller_first[0].caller.as_deref(),
+            Some("marketing::on_contact")
+        );
+        assert_eq!(report.verdict(), Verdict::CalleeFirst);
+    }
+
+    #[test]
+    fn a_deploy_order_names_an_event_crate_by_its_service() {
+        let mut deployed = with_events();
+        deployed.events[0].krate = "mesh-catalog".to_owned();
+        let mut current = deployed.clone();
+        current.events[0].shape = contact_shape(&[("id", "i64", true)]);
+        current.listeners.clear();
+        let text = compare(&deployed, &current).render(Order::Any);
+        assert!(text.contains("Deploy marketing before catalog."), "{text}");
+    }
+
+    #[test]
+    fn the_check_reports_when_v1_can_be_dropped() {
+        let mut deployed = with_events();
+        deployed.events.push(event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email_address", "String", true)]),
+        ));
+        deployed.listeners = vec![listener(
+            "on_contact",
+            "contact.updated.v2",
+            &["email_address"],
+        )];
+        let current = deployed.clone();
+        let report = compare(&deployed, &current);
+        assert_eq!(report.verdict(), Verdict::Compatible);
+        assert_eq!(report.notes.len(), 1, "{report:?}");
+        assert!(report.notes[0].contains("`contact.updated`"), "{report:?}");
+        assert!(report.notes[0].contains("v1"), "{report:?}");
+        assert!(report.render(Order::Any).contains("can be dropped"));
+    }
+
+    #[test]
+    fn an_unseen_consumer_is_named_and_no_version_is_called_droppable() {
+        let mut deployed = with_events();
+        deployed.events.push(event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email", "String", true)]),
+        ));
+        deployed.listeners = vec![listener("on_contact", "contact.updated.v2", &["email"])];
+        deployed.unresolved = vec![
+            "`marketing::on_old` consumes `Updated`: no `#[event]` in the pass has that \
+                  type name"
+                .to_owned(),
+        ];
+        let report = compare(&deployed, &deployed.clone());
+        assert_eq!(report.verdict(), Verdict::Compatible);
+        let text = report.render(Order::Any);
+        assert!(text.contains("not in the bundles"), "{text}");
+        assert!(text.contains("marketing::on_old"), "{text}");
+        assert!(!text.contains("can be dropped"), "{text}");
+    }
+
+    #[test]
+    fn v1_is_kept_while_any_consumer_reads_it() {
+        let mut current = with_events();
+        current.events.push(event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email", "String", true)]),
+        ));
+        let report = compare(&current, &current);
+        assert!(report.notes.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_unit_event_that_gains_fields_is_a_break_in_both_orders() {
+        let mut deployed = with_events();
+        deployed.events[0].unit = true;
+        deployed.events[0].shape = contact_shape(&[]);
+        deployed.listeners = vec![listener("on_contact", "contact.updated", &[])];
+        let mut current = with_events();
+        current.events[0].shape = contact_shape(&[("trace", "Option<String>", true)]);
+        current.listeners = vec![listener("on_contact", "contact.updated", &[])];
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::EventUnitChanged]);
+        assert_eq!(kinds(&report.caller_first), [BreakKind::EventUnitChanged]);
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+        assert!(report.render(Order::Any).contains("JSON `null`"));
+    }
+
+    #[test]
+    fn an_opaque_event_is_not_checked() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events[0].opaque = true;
+        current.events[0].shape = WireTypeDescriptor::default();
+        let report = compare(&deployed, &current);
+        assert_eq!(report, Report::default(), "{report:?}");
+    }
+
+    #[test]
+    fn an_event_break_names_the_topic_the_consumer_and_the_field() {
+        let deployed = with_events();
+        let mut current = with_events();
+        current.events[0].shape = contact_shape(&[("id", "i64", true)]);
+        current.listeners.clear();
+        let text = compare(&deployed, &current).render(Order::Any);
+        assert!(text.contains("contact.updated (event)"), "{text}");
+        assert!(text.contains("consumer `marketing::on_contact`"), "{text}");
+        assert!(text.contains("reads field `email`"), "{text}");
+        assert!(text.contains("Deploy marketing before core."), "{text}");
     }
 
     // --- review regressions ---

@@ -1,0 +1,5 @@
+error: #[derive(WireShape)] refuses `#[serde(flatten)]`: the flattened keys are not visible here, so the descriptor would claim a shape it cannot see. To publish this payload without a wire contract, write `#[event(opaque)]`.
+  --> tests/compile-fail/event_rejects_flatten.rs:13:5
+   |
+13 |     #[serde(flatten)]
+   |     ^

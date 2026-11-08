@@ -124,6 +124,8 @@ mod encryption_columns;
 mod encryption_repository;
 mod error_reporting;
 mod error_validation_details;
+#[cfg(feature = "db")]
+mod event_wire_contract;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;

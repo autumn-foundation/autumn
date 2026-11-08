@@ -1,22 +1,29 @@
 //! The release bundle: every wire descriptor of one build, joined and sorted.
 //!
-//! The wire macros write one JSON file per endpoint, type, client and checked
-//! caller. [`Bundle::from_dir`] joins them. An endpoint carries its request and
-//! response shapes inline. A caller call names the endpoint it reaches by
-//! `service` and `endpoint`. The bytes are the same on every rebuild: all
-//! lists are sorted, and no path or time goes in.
+//! The wire macros write one JSON file per endpoint, type, client, checked
+//! caller, event and event consumer. [`Bundle::from_dir`] joins them. An
+//! endpoint carries its request and response shapes inline. A caller call
+//! names the endpoint it reaches by `service` and `endpoint`. An event carries
+//! its payload shape inline, and a consumer names the event by its topic. The
+//! bytes are the same on every rebuild: all lists are sorted, and no path or
+//! time goes in.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use autumn_macros_support::wire::{
-    CallerCall, CallerDescriptor, ClientDescriptor, EndpointDescriptor, TypeDescriptor,
-    WireTypeDescriptor,
+    CallerCall, CallerDescriptor, ClientDescriptor, EndpointDescriptor, EventDescriptor,
+    ListenerDescriptor, TypeDescriptor, WireTypeDescriptor,
 };
 use serde::{Deserialize, Serialize};
 
-/// The bundle format this CLI writes and reads.
+/// The bundle format of a bundle with no events. Its bytes are the same as
+/// before events existed.
 pub const BUNDLE_FORMAT: u32 = 1;
+
+/// The bundle format of a bundle with events. An older CLI refuses it rather
+/// than skip the events it cannot read.
+pub const EVENTS_FORMAT: u32 = 2;
 
 /// The type name of an endpoint with no request body.
 pub const NO_BODY: &str = "NoBody";
@@ -30,6 +37,61 @@ pub struct Bundle {
     pub endpoints: Vec<BundleEndpoint>,
     /// Every checked call, sorted.
     pub callers: Vec<BundleCall>,
+    /// Every `#[event]`, sorted by topic. Left out of the bytes when empty,
+    /// so a bundle with no events is the same as before events existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<BundleEvent>,
+    /// Every event consumer, sorted. Left out of the bytes when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listeners: Vec<BundleListener>,
+    /// Consumers the bundle has no topic for, as `krate::function consumes
+    /// Path: reason`, sorted. The check cannot protect them, so it says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
+}
+
+/// One event with its payload shape inline.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BundleEvent {
+    /// The routing topic: `name`, plus `.vN` above version 1.
+    pub topic: String,
+    /// The topic without its version suffix.
+    pub name: String,
+    /// The schema version.
+    pub version: u32,
+    /// The crate that defines the event.
+    pub krate: String,
+    /// The event type's Rust name.
+    pub type_name: String,
+    /// `#[event(opaque)]`: the payload has no shape to check.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opaque: bool,
+    /// A unit struct: the payload is JSON `null`, not an object.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unit: bool,
+    /// The payload's shape.
+    pub shape: WireTypeDescriptor,
+}
+
+/// One consumer of an event: a `#[listener]` or an `#[event_consumer]`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BundleListener {
+    /// The crate that holds the consumer.
+    pub krate: String,
+    /// The consumer function.
+    pub function: String,
+    /// The topic of the event it consumes.
+    pub topic: String,
+    /// Payload fields the consumer reads, by Rust name.
+    pub reads: Vec<String>,
+}
+
+impl BundleListener {
+    /// `krate::function`.
+    #[must_use]
+    pub fn consumer(&self) -> String {
+        format!("{}::{}", self.krate, self.function)
+    }
 }
 
 /// One endpoint with its shapes inline.
@@ -105,6 +167,12 @@ impl Bundle {
             .find(|e| e.service == service && e.name == name)
     }
 
+    /// The event with this topic, if the bundle has it.
+    #[must_use]
+    pub fn event(&self, topic: &str) -> Option<&BundleEvent> {
+        self.events.iter().find(|e| e.topic == topic)
+    }
+
     /// Parse a bundle and refuse a format this CLI does not know.
     ///
     /// # Errors
@@ -112,9 +180,10 @@ impl Bundle {
     pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
         let bundle: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("not a contract bundle: {e}"))?;
-        if bundle.format != BUNDLE_FORMAT {
+        if !(BUNDLE_FORMAT..=EVENTS_FORMAT).contains(&bundle.format) {
             return Err(format!(
-                "contract bundle format {} is not supported; this CLI reads format {BUNDLE_FORMAT}",
+                "contract bundle format {} is not supported; this CLI reads formats \
+                 {BUNDLE_FORMAT} to {EVENTS_FORMAT}",
                 bundle.format
             ));
         }
@@ -140,9 +209,12 @@ impl Bundle {
         let types: Vec<TypeDescriptor> = read_all(dir, "type.")?;
         let clients: Vec<ClientDescriptor> = read_all(dir, "client.")?;
         let callers: Vec<CallerDescriptor> = read_all(dir, "caller.")?;
-        if endpoints.is_empty() {
+        let events: Vec<EventDescriptor> = read_all(dir, "event.")?;
+        let listeners: Vec<ListenerDescriptor> = read_all(dir, "listener.")?;
+        if endpoints.is_empty() && events.is_empty() {
             return Err(format!(
-                "no endpoint descriptor in {}: no crate in the pass has an `#[endpoint]`",
+                "no endpoint or event descriptor in {}: no crate in the pass has an \
+                 `#[endpoint]` or an `#[event]`",
                 dir.display()
             ));
         }
@@ -189,11 +261,171 @@ impl Bundle {
             }
         }
 
+        let joined_events = join_events(&events)?;
+        let (joined_listeners, unresolved) = join_listeners(&listeners, &events)?;
+        let format =
+            if joined_events.is_empty() && joined_listeners.is_empty() && unresolved.is_empty() {
+                BUNDLE_FORMAT
+            } else {
+                EVENTS_FORMAT
+            };
         Ok(Self {
-            format: BUNDLE_FORMAT,
+            format,
             endpoints: joined,
             callers: calls.into_iter().collect(),
+            events: joined_events,
+            listeners: joined_listeners,
+            unresolved,
         })
+    }
+}
+
+/// Every event with a `name`, keyed by topic. Two events with one topic are
+/// an error: the bus cannot tell their payloads apart.
+///
+/// An event without `name` routes on its module path, which no descriptor
+/// knows. It is left out, and so are its consumers.
+fn join_events(events: &[EventDescriptor]) -> Result<Vec<BundleEvent>, String> {
+    let mut joined: Vec<BundleEvent> = Vec::with_capacity(events.len());
+    for event in events {
+        let (Some(topic), Some(name)) = (event.topic(), event.base_name()) else {
+            continue;
+        };
+        if let Some(other) = joined.iter().find(|e| e.topic == topic) {
+            return Err(format!(
+                "events `{}::{}` and `{}::{}` both have topic `{topic}`; give one another \
+                 name or version",
+                other.krate, other.type_name, event.krate, event.type_name
+            ));
+        }
+        joined.push(BundleEvent {
+            topic,
+            name: name.to_owned(),
+            version: event.version,
+            krate: event.krate.clone(),
+            type_name: event.type_name.clone(),
+            opaque: event.opaque,
+            unit: event.unit,
+            shape: canonical(event.shape.clone()),
+        });
+    }
+    joined.sort();
+    Ok(joined)
+}
+
+/// Every consumer, with the topic of the event it reads, and the consumers
+/// with no topic.
+///
+/// A consumer has no topic when no descriptor has its event's type name (a
+/// hand-written `impl Event`, a `use … as` alias, or a crate outside the
+/// pass), or when the event has no `name`.
+fn join_listeners(
+    listeners: &[ListenerDescriptor],
+    events: &[EventDescriptor],
+) -> Result<(Vec<BundleListener>, Vec<String>), String> {
+    let mut joined = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
+    for listener in listeners {
+        let event = resolve_event(listener, events)?;
+        let Some(topic) = event.and_then(EventDescriptor::topic) else {
+            let reason = if event.is_some() {
+                "the event has no `name`"
+            } else {
+                "no `#[event]` in the pass has that type name"
+            };
+            unresolved.insert(format!(
+                "`{}::{}` consumes `{}`: {reason}",
+                listener.krate, listener.function, listener.event
+            ));
+            continue;
+        };
+        joined.insert(BundleListener {
+            krate: listener.krate.clone(),
+            function: listener.function.clone(),
+            topic,
+            reads: sorted(listener.reads.clone()),
+        });
+    }
+    Ok((
+        joined.into_iter().collect(),
+        unresolved.into_iter().collect(),
+    ))
+}
+
+/// The event a consumer reads, by its type path. `None` when no descriptor
+/// has that type name.
+///
+/// A crate-qualified path (`core::ContactUpdated`) narrows the match to that
+/// crate. Otherwise, or when no crate has that name, an event in the
+/// consumer's own crate wins, and else the name must be unique.
+fn resolve_event<'a>(
+    listener: &ListenerDescriptor,
+    events: &'a [EventDescriptor],
+) -> Result<Option<&'a EventDescriptor>, String> {
+    let segments: Vec<&str> = listener.event.split("::").collect();
+    let name = segments.last().copied().unwrap_or_default();
+    let named: Vec<&EventDescriptor> = events.iter().filter(|e| e.type_name == name).collect();
+    let in_crate = |krate: &str| -> Vec<&EventDescriptor> {
+        named
+            .iter()
+            .copied()
+            .filter(|e| e.krate.replace('-', "_") == krate)
+            .collect()
+    };
+    let own = listener.krate.replace('-', "_");
+    let at = format!(
+        "`{}::{}` consumes `{}`",
+        listener.krate, listener.function, listener.event
+    );
+    // A first segment that names no crate in the pass is a local module
+    // (`events::Created`) or a renamed dependency (`contracts::Created`). The
+    // path cannot tell them apart. With an event of that name both in the
+    // consumer's own crate and in another crate, it refuses to guess.
+    let unknown_prefix = match segments.as_slice() {
+        [first, _, ..] if !["crate", "self", "super"].contains(first) => {
+            let prefixed = in_crate(first);
+            if !prefixed.is_empty() {
+                return pick(&prefixed, &at, name).map(Some);
+            }
+            true
+        }
+        _ => false,
+    };
+    let preferred = in_crate(&own);
+    if unknown_prefix
+        && !preferred.is_empty()
+        && named.iter().any(|e| e.krate.replace('-', "_") != own)
+    {
+        return Err(format!(
+            "{at}, and `{}` names no crate in the pass, so the event is ambiguous; write \
+             `crate::…` for an event in this crate, or the package name of the dependency",
+            segments[0]
+        ));
+    }
+    match (preferred.as_slice(), named.as_slice()) {
+        (_, []) => Ok(None),
+        ([], [one]) => Ok(Some(*one)),
+        ([], _) => Err(format!(
+            "{at}, and more than one crate defines an `#[event]` named `{name}`; write the \
+             crate in the path"
+        )),
+        (preferred, _) => pick(preferred, &at, name).map(Some),
+    }
+}
+
+/// The one event among `candidates`, all from one crate.
+fn pick<'a>(
+    candidates: &[&'a EventDescriptor],
+    at: &str,
+    name: &str,
+) -> Result<&'a EventDescriptor, String> {
+    match candidates {
+        [one] => Ok(*one),
+        _ => Err(format!(
+            "{at}, and crate `{}` has more than one `#[event]` named `{name}`; give each \
+             another type name, for example `{name}V2`",
+            candidates.first().map_or("", |e| e.krate.as_str())
+        )),
     }
 }
 
@@ -371,7 +603,9 @@ fn read_all<T: serde::de::DeserializeOwned>(dir: &Path, prefix: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autumn_macros_support::wire::{CallerCall, ClientEndpoint, WireFieldDescriptor};
+    use autumn_macros_support::wire::{
+        CallerCall, ClientEndpoint, EventDescriptor, ListenerDescriptor, WireFieldDescriptor,
+    };
 
     fn field(name: &str, required: bool) -> WireFieldDescriptor {
         WireFieldDescriptor {
@@ -536,6 +770,8 @@ mod tests {
     fn an_unknown_format_is_refused() {
         let err = Bundle::from_slice(br#"{"format": 99, "endpoints": [], "callers": []}"#)
             .expect_err("refused");
+        Bundle::from_slice(br#"{"format": 2, "endpoints": [], "callers": []}"#)
+            .expect("the events format parses");
         assert!(err.contains("format 99"), "{err}");
     }
 
@@ -543,7 +779,7 @@ mod tests {
     fn an_empty_directory_is_an_error_not_an_empty_contract() {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = Bundle::from_dir(dir.path()).expect_err("refused");
-        assert!(err.contains("no endpoint descriptor"), "{err}");
+        assert!(err.contains("no endpoint or event descriptor"), "{err}");
     }
 
     #[test]
@@ -705,6 +941,316 @@ mod tests {
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert_eq!(bundle.callers.len(), 1);
         assert_eq!(bundle.callers[0].endpoint, "get_item");
+    }
+
+    fn contact_event(krate: &str, version: u32) -> EventDescriptor {
+        EventDescriptor {
+            krate: krate.to_owned(),
+            type_name: "ContactUpdated".to_owned(),
+            name: Some("contact.updated".to_owned()),
+            version,
+            opaque: false,
+            unit: false,
+            shape: WireTypeDescriptor {
+                name: "ContactUpdated".to_owned(),
+                serialized: vec![field("id", true), field("email", true)],
+                deserialized: vec![field("id", true), field("email", true)],
+                closed: false,
+            },
+        }
+    }
+
+    fn listener(function: &str, event: &str, reads: &[&str]) -> ListenerDescriptor {
+        ListenerDescriptor {
+            krate: "marketing".to_owned(),
+            function: function.to_owned(),
+            event: event.to_owned(),
+            reads: reads.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
+    /// A descriptor directory with one event and one listener of it.
+    fn event_fixture() -> tempfile::TempDir {
+        let dir = fixture();
+        write(
+            dir.path(),
+            "event.core.ContactUpdated.json",
+            &contact_event("core", 1),
+        );
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener(
+                "on_contact",
+                "core::ContactUpdated",
+                &["email", "id", "email"],
+            ),
+        );
+        dir
+    }
+
+    #[test]
+    fn the_bundle_joins_events_and_their_listeners() {
+        let dir = event_fixture();
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let [event] = bundle.events.as_slice() else {
+            panic!("one event: {bundle:?}");
+        };
+        assert_eq!(event.topic, "contact.updated");
+        assert_eq!(event.name, "contact.updated");
+        assert_eq!(event.version, 1);
+        let names: Vec<&str> = event
+            .shape
+            .serialized
+            .iter()
+            .map(|f| f.rust_name.as_str())
+            .collect();
+        assert_eq!(names, ["email", "id"], "fields are sorted");
+        let [l] = bundle.listeners.as_slice() else {
+            panic!("one listener: {bundle:?}");
+        };
+        assert_eq!(l.consumer(), "marketing::on_contact");
+        assert_eq!(l.topic, "contact.updated");
+        assert_eq!(l.reads, ["email", "id"], "reads are sorted and unique");
+    }
+
+    #[test]
+    fn a_bundle_with_events_round_trips() {
+        let dir = event_fixture();
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let back = Bundle::from_slice(&bundle.to_bytes()).expect("parses");
+        assert_eq!(back, bundle);
+    }
+
+    #[test]
+    fn a_bundle_with_no_events_has_the_same_bytes_as_before() {
+        let dir = fixture();
+        let text = String::from_utf8(Bundle::from_dir(dir.path()).expect("bundle").to_bytes())
+            .expect("utf8");
+        assert!(!text.contains("events"), "{text}");
+        assert!(!text.contains("listeners"), "{text}");
+        let old = br#"{"format": 1, "endpoints": [], "callers": []}"#;
+        let bundle = Bundle::from_slice(old).expect("an old bundle still parses");
+        assert!(bundle.events.is_empty() && bundle.listeners.is_empty());
+    }
+
+    #[test]
+    fn a_pass_with_events_and_no_endpoint_is_a_bundle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            "event.core.ContactUpdated.json",
+            &contact_event("core", 1),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.events.len(), 1);
+        assert!(bundle.endpoints.is_empty());
+    }
+
+    #[test]
+    fn two_versions_of_one_event_are_two_topics() {
+        let dir = event_fixture();
+        let mut v2 = contact_event("core", 2);
+        v2.type_name = "ContactUpdatedV2".to_owned();
+        write(dir.path(), "event.core.ContactUpdatedV2.json", &v2);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let topics: Vec<&str> = bundle.events.iter().map(|e| e.topic.as_str()).collect();
+        assert_eq!(topics, ["contact.updated", "contact.updated.v2"]);
+    }
+
+    #[test]
+    fn two_events_with_one_topic_are_an_error() {
+        let dir = event_fixture();
+        let mut other = contact_event("core", 1);
+        other.type_name = "Other".to_owned();
+        write(dir.path(), "event.core.Other.json", &other);
+        let err = Bundle::from_dir(dir.path()).expect_err("refused");
+        assert!(err.contains("contact.updated"), "{err}");
+    }
+
+    #[test]
+    fn a_listener_of_an_event_with_no_descriptor_is_left_out() {
+        // A hand-written `impl Event` writes no descriptor. Its consumer has
+        // no topic in the bundle, and the export still works.
+        let dir = event_fixture();
+        std::fs::remove_file(dir.path().join("event.core.ContactUpdated.json")).expect("rm");
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(bundle.listeners.is_empty() && bundle.events.is_empty());
+        assert_eq!(
+            bundle.unresolved,
+            [
+                "`marketing::on_contact` consumes `core::ContactUpdated`: no `#[event]` in the pass \
+              has that type name"
+            ]
+        );
+        assert_eq!(
+            bundle.format, EVENTS_FORMAT,
+            "an older CLI must not drop it"
+        );
+    }
+
+    #[test]
+    fn a_listener_that_names_its_event_through_an_alias_is_unresolved() {
+        let dir = event_fixture();
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "Updated", &["email"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(bundle.listeners.is_empty(), "{bundle:?}");
+        assert_eq!(bundle.unresolved.len(), 1, "{bundle:?}");
+        assert!(bundle.unresolved[0].contains("`Updated`"), "{bundle:?}");
+    }
+
+    #[test]
+    fn an_event_without_a_name_and_its_listeners_are_left_out() {
+        let dir = event_fixture();
+        let mut unnamed = contact_event("core", 1);
+        unnamed.name = None;
+        write(dir.path(), "event.core.ContactUpdated.json", &unnamed);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(bundle.events.is_empty(), "{bundle:?}");
+        assert!(bundle.listeners.is_empty(), "{bundle:?}");
+        assert!(
+            bundle.unresolved[0].ends_with("the event has no `name`"),
+            "{bundle:?}"
+        );
+    }
+
+    #[test]
+    fn a_bundle_with_events_has_the_events_format() {
+        let dir = event_fixture();
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.format, EVENTS_FORMAT);
+        assert_eq!(
+            Bundle::from_dir(fixture().path()).expect("bundle").format,
+            BUNDLE_FORMAT
+        );
+    }
+
+    #[test]
+    fn a_path_whose_first_segment_is_a_module_falls_back_to_the_own_crate() {
+        // Only the consumer's own crate has the event, so `events::` is a
+        // local module.
+        let dir = event_fixture();
+        std::fs::remove_file(dir.path().join("event.core.ContactUpdated.json")).expect("rm");
+        let mut own = contact_event("marketing", 1);
+        own.name = Some("marketing.contact".to_owned());
+        write(dir.path(), "event.marketing.ContactUpdated.json", &own);
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "events::ContactUpdated", &["id"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.listeners[0].topic, "marketing.contact");
+    }
+
+    #[test]
+    fn a_crate_relative_path_picks_the_own_crate_beside_a_dependency() {
+        let dir = event_fixture();
+        let mut own = contact_event("marketing", 1);
+        own.name = Some("marketing.contact".to_owned());
+        write(dir.path(), "event.marketing.ContactUpdated.json", &own);
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "crate::events::ContactUpdated", &["id"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.listeners[0].topic, "marketing.contact");
+    }
+
+    #[test]
+    fn two_events_with_one_type_name_in_one_crate_are_named_in_the_error() {
+        let dir = event_fixture();
+        let mut v2 = contact_event("core", 2);
+        v2.name = Some("contact.updated".to_owned());
+        write(dir.path(), "event.core.ContactUpdated.v2.k.json", &v2);
+        let err = Bundle::from_dir(dir.path()).expect_err("refused");
+        assert!(err.contains("crate `core` has more than one"), "{err}");
+    }
+
+    #[test]
+    fn a_crate_qualified_event_path_picks_that_crates_event() {
+        let dir = event_fixture();
+        let mut other = contact_event("billing", 1);
+        other.name = Some("billing.contact".to_owned());
+        write(dir.path(), "event.billing.ContactUpdated.json", &other);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.listeners[0].topic, "contact.updated");
+    }
+
+    #[test]
+    fn an_unqualified_event_path_prefers_the_listeners_own_crate() {
+        let dir = event_fixture();
+        let mut own = contact_event("marketing", 1);
+        own.name = Some("marketing.contact".to_owned());
+        write(dir.path(), "event.marketing.ContactUpdated.json", &own);
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "ContactUpdated", &["id"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.listeners[0].topic, "marketing.contact");
+    }
+
+    #[test]
+    fn a_renamed_dependency_path_is_not_taken_for_a_local_event() {
+        // `contracts::ContactUpdated` where `contracts` is a renamed `core`,
+        // and the consumer's own crate has a `ContactUpdated` too.
+        let dir = event_fixture();
+        let mut own = contact_event("marketing", 1);
+        own.name = Some("marketing.contact".to_owned());
+        write(dir.path(), "event.marketing.ContactUpdated.json", &own);
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "contracts::ContactUpdated", &["id"]),
+        );
+        let err = Bundle::from_dir(dir.path()).expect_err("refused");
+        assert!(err.contains("`contracts` names no crate"), "{err}");
+        assert!(err.contains("crate::"), "{err}");
+    }
+
+    #[test]
+    fn a_renamed_dependency_path_resolves_when_only_one_crate_has_the_event() {
+        let dir = event_fixture();
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "contracts::ContactUpdated", &["id"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert_eq!(bundle.listeners[0].topic, "contact.updated");
+    }
+
+    #[test]
+    fn an_ambiguous_unqualified_event_path_is_an_error() {
+        let dir = event_fixture();
+        let mut other = contact_event("billing", 1);
+        other.name = Some("billing.contact".to_owned());
+        write(dir.path(), "event.billing.ContactUpdated.json", &other);
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener("on_contact", "ContactUpdated", &["id"]),
+        );
+        let err = Bundle::from_dir(dir.path()).expect_err("refused");
+        assert!(err.contains("more than one crate"), "{err}");
+    }
+
+    #[test]
+    fn an_opaque_event_is_kept_with_no_shape() {
+        let dir = event_fixture();
+        let mut opaque = contact_event("core", 1);
+        opaque.opaque = true;
+        opaque.shape = WireTypeDescriptor::default();
+        write(dir.path(), "event.core.ContactUpdated.json", &opaque);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(bundle.events[0].opaque);
     }
 
     #[test]

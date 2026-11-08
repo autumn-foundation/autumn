@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: event contract broken in `sync_marketing`: reads field `email` of event `ContactUpdated`, which the event does not send
+  --> tests/compile-fail/event_listener_reads_unsent_field.rs:14:19
+   |
+14 |     let _ = event.email;
+   |                   ^^^^^ evaluation of `sync_marketing::{closure#0}::_` failed here

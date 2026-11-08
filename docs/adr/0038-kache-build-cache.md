@@ -121,6 +121,16 @@ flowchart LR
   PRs means moving the write token into a GitHub environment whose
   deployment branches are limited to protected branches, and naming that
   environment on the jobs that write.
+- macOS runners use `Swatinem/rust-cache`, not kache (amended 2026-11-08).
+  The macOS test archive is bound by the runner's memory and disk, and kache
+  adds a daemon and a second copy of every artifact in its store beside
+  `target/`. The composite action picks rust-cache on macOS, so every macOS
+  job, and the callers' `shared-key`, `key` and `save` inputs, carry over
+  unchanged. On macOS the `s3` and `warm` inputs have no effect, and the cache
+  is the GitHub Actions cache, keyed by workflow, job (or `shared-key`),
+  `key`, OS, arch, rustc and the Cargo manifests. The same macOS change
+  removed the two-job compile cap from the `test-archive` macOS leg, which
+  now builds on a 4-core, 14 GB runner.
 - Scaffolded apps (`autumn-cli/src/templates/.github/workflows/*.tmpl`) still
   use rust-cache. What a generated app's CI uses is a separate decision for
   its users.
