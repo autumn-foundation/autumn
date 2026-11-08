@@ -1762,6 +1762,7 @@ enum Commands {
     ///   autumn fleet backup tenant:acme /backups/acme.db
     ///   autumn fleet import tenant:acme /backups/acme.db
     ///   autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+    ///   autumn fleet restore tenant:acme --from /backups/acme.db --force
     ///   autumn fleet lake report.sql --out report.csv
     #[command(subcommand, verbatim_doc_comment)]
     Fleet(FleetCommands),
@@ -3720,8 +3721,20 @@ enum FleetCommands {
         #[arg(value_name = "KEY")]
         key: String,
         /// Restore to this RFC 3339 instant instead of the latest state.
-        #[arg(long, value_name = "RFC3339")]
+        #[arg(long, value_name = "RFC3339", conflicts_with = "from")]
         timestamp: Option<String>,
+        /// Restore from this local file (a `fleet backup`) instead of the
+        /// replica. Replication is not needed.
+        #[arg(long, value_name = "FILE")]
+        from: Option<std::path::PathBuf>,
+        /// With `--from`: accept a backup of another key, and write this key
+        /// into its identity row.
+        #[arg(long, requires = "from")]
+        allow_rekey: bool,
+        /// With `--from`: restore a deleted key. This purges the replica of
+        /// the deleted database and drops its tombstone.
+        #[arg(long, requires = "from")]
+        clear_tombstone: bool,
         /// Confirm the replacement. Required on every profile.
         #[arg(long)]
         force: bool,
@@ -3824,11 +3837,17 @@ impl FleetCommands {
                 profile,
                 key,
                 timestamp,
+                from,
+                allow_rekey,
+                clear_tombstone,
                 force,
             } => fleet::FleetCommand::Restore {
                 profile,
                 key,
                 timestamp,
+                from,
+                allow_rekey,
+                clear_tombstone,
                 force,
             },
             Self::Lake {
@@ -7963,6 +7982,9 @@ mod tests {
                 profile: None,
                 key: "slot:00042".to_owned(),
                 timestamp: Some("2026-10-01T12:00:00Z".to_owned()),
+                from: None,
+                allow_rekey: false,
+                clear_tombstone: false,
                 force: false
             }
         );
@@ -7997,6 +8019,52 @@ mod tests {
             Cli::try_parse_from(["autumn", "fleet", "lake", "q.sql", "--concurrency", "0"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fleet_restore_from_a_file_parses() {
+        use fleet::FleetCommand;
+        assert_eq!(
+            fleet_command(&[
+                "restore",
+                "tenant:acme",
+                "--from",
+                "/backups/acme.db",
+                "--allow-rekey",
+                "--clear-tombstone",
+                "--force"
+            ]),
+            FleetCommand::Restore {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                timestamp: None,
+                from: Some(std::path::PathBuf::from("/backups/acme.db")),
+                allow_rekey: true,
+                clear_tombstone: true,
+                force: true
+            }
+        );
+        // A file restore has no point in time.
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                "a.db",
+                "--timestamp",
+                "2026-10-01T12:00:00Z"
+            ])
+            .is_err()
+        );
+        // The file options need a file.
+        for flag in ["--allow-rekey", "--clear-tombstone"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "fleet", "restore", "tenant:acme", flag]).is_err(),
+                "{flag}"
+            );
+        }
     }
 
     #[test]

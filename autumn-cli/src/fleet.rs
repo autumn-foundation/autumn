@@ -59,7 +59,7 @@ pub enum FleetCommand {
         /// Confirm the deletion.
         force: bool,
     },
-    /// Rebuild one database from its replica.
+    /// Rebuild one database from its replica, or from a local file.
     Restore {
         /// Profile overlay for the config.
         profile: Option<String>,
@@ -67,6 +67,12 @@ pub enum FleetCommand {
         key: String,
         /// Restore to this RFC 3339 instant instead of the latest state.
         timestamp: Option<String>,
+        /// Restore from this local file instead of the replica.
+        from: Option<PathBuf>,
+        /// With `from`: accept a backup of another key.
+        allow_rekey: bool,
+        /// With `from`: restore a deleted key, and drop its tombstone.
+        clear_tombstone: bool,
         /// Confirm the replacement.
         force: bool,
     },
@@ -142,7 +148,7 @@ mod imp {
     use std::ops::ControlFlow;
 
     use autumn_web::config::{AutumnConfig, DatabaseFleetConfig};
-    use autumn_web::db::fleet::{DatabaseFleet, FleetError};
+    use autumn_web::db::fleet::{DatabaseFleet, FleetError, LocalRestore};
     use autumn_web::db::fleet_lake::{FleetLake, LakeSnapshot, LakeValue, SkipReason};
     use autumn_web::db::fleet_replication::{FleetReplication, replica_root};
     use autumn_web::db::fleet_tombstones::FleetTombstones;
@@ -214,8 +220,27 @@ mod imp {
             FleetCommand::Restore {
                 profile,
                 key,
+                from: Some(from),
+                allow_rekey,
+                clear_tombstone,
+                force,
+                ..
+            } => restore_from_file(
+                &Target::load(profile.as_deref())?,
+                key,
+                from,
+                LocalRestore::new()
+                    .allow_rekey(*allow_rekey)
+                    .clear_tombstone(*clear_tombstone)
+                    .apply_migrations(true),
+                *force,
+            ),
+            FleetCommand::Restore {
+                profile,
+                key,
                 timestamp,
                 force,
+                ..
             } => restore(
                 &Target::load(profile.as_deref())?,
                 key,
@@ -973,6 +998,115 @@ mod imp {
             outcome.frames_replayed,
             outcome.plan.effective.to_rfc3339()
         );
+        Ok(())
+    }
+
+    /// `fleet restore --from`: replace the database of `key` with a local
+    /// file, as `DatabaseFleet::restore_from_file` does. With `[replication]`
+    /// on, it also ships a new base snapshot of the restored file.
+    fn restore_from_file(
+        target: &Target,
+        key: &str,
+        src: &Path,
+        opts: LocalRestore,
+        force: bool,
+    ) -> Result<(), String> {
+        if !force {
+            return Err(format!(
+                "Restore stopped: this replaces the database file of {key} with {} ({} \
+                 profile).\n  Run again with --force.",
+                src.display(),
+                target.profile
+            ));
+        }
+        // The copy must carry the epoch of the host that owns the slot.
+        if target.fleet.ownership.is_some() {
+            return Err(
+                "Restore stopped: [database.fleet.ownership] is on, and this command holds no \
+                 slot lease.\n  Call `DatabaseFleet::restore_from_file` in the app that owns \
+                 the slot."
+                    .to_owned(),
+            );
+        }
+        if !src.is_file() {
+            return Err(format!("{} is not a file.", src.display()));
+        }
+        target.require_root()?;
+        let fleet = target.build(fleet_sources()?)?;
+        let remapped = fleet.remapped_migrations();
+        if !remapped.is_empty() {
+            return Err(format!(
+                "These migrations share a version with another migration: {}.\n  \
+                 `autumn fleet restore --from` cannot record them as boot does. Use \
+                 `DatabaseFleet::restore_from_file` in the app instead.",
+                remapped.join(", ")
+            ));
+        }
+        let key = parse_key(&fleet, key)?;
+        // With replication on, the restore ships a new base snapshot, and
+        // reads the tombstone of a deleted key.
+        if target.replicated() {
+            let needs = |error: String| {
+                format!(
+                    "Restore stopped: with [replication] on, a restore ships the restored \
+                     database and reads its tombstone, and it cannot reach them.\n  {error}"
+                )
+            };
+            let loaded = validated_replication(target).map_err(needs)?;
+            let replication = replication_for(target, &loaded).map_err(needs)?;
+            fleet
+                .install_replication(replication)
+                .map_err(|_| "the fleet already replicates".to_owned())?;
+        }
+        let restored = runtime()?.block_on(async {
+            let result = fleet.restore_from_file(&key, src, opts).await;
+            // Ships the last frames of the restored database.
+            fleet.close_all().await;
+            result
+        });
+        let outcome = restored.map_err(|e| match &e {
+            FleetError::Restore { detail, .. } if detail.contains("is a copy of") => format!(
+                "{e}\n  Nothing was restored. To restore it as {key}, run again with \
+                 --allow-rekey."
+            ),
+            FleetError::Restore { detail, .. } if detail.contains("clear_tombstone") => format!(
+                "{key} was deleted, and its tombstone keeps the replica for undo.\n  Nothing \
+                 was restored. Run again with --clear-tombstone: this purges the old replica."
+            ),
+            FleetError::Restore { detail, .. } if detail.contains("did not ship") => e.to_string(),
+            FleetError::Migration { .. } => format!(
+                "{e}\n  Nothing was restored. If the file records a plugin migration, call \
+                 `DatabaseFleet::restore_from_file` in the app instead."
+            ),
+            _ => format!("{e}\n  Nothing was restored."),
+        })?;
+        eprintln!(
+            "\u{2713} Restored {key} from {} ({}).",
+            src.display(),
+            if outcome.replaced {
+                "replaced the old file"
+            } else {
+                "created the file"
+            }
+        );
+        if let Some(found) = &outcome.rekeyed_from {
+            eprintln!("  \u{2139} The file was a copy of {found}; it now records {key}.");
+        }
+        if outcome.migrations_applied > 0 {
+            eprintln!(
+                "  \u{2139} {} migration(s) applied.",
+                outcome.migrations_applied
+            );
+        }
+        if outcome.tombstone_cleared {
+            eprintln!("  \u{2139} The tombstone and the old replica are gone.");
+        }
+        if let Some(shipped) = &outcome.shipped {
+            eprintln!(
+                "  \u{2713} New base snapshot shipped: {} object(s), {} byte(s).",
+                shipped.shipped, shipped.bytes
+            );
+        }
         Ok(())
     }
 
