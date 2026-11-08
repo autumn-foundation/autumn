@@ -687,6 +687,11 @@ impl Visit<'_> for Analyzer<'_> {
     }
 
     fn visit_expr(&mut self, expr: &Expr) {
+        // A typed decode is the payload even when nothing binds it:
+        // `record(m.payload_as::<E>()?)`. The check marks it found.
+        if matches!(expr, Expr::MethodCall(_) | Expr::Call(_)) {
+            self.is_payload_turbofish(expr);
+        }
         match expr {
             Expr::MethodCall(call) => {
                 self.visit_expr(&call.receiver);

@@ -358,6 +358,19 @@ mod tests {
     }
 
     #[test]
+    fn a_decode_that_nothing_binds_is_still_the_payload() {
+        for body in [
+            "record(m.payload_as::<ContactUpdated>()?).await",
+            "m.payload_as::<ContactUpdated>()?; Ok(())",
+            "forward(serde_json::from_value::<ContactUpdated>(v)?)",
+        ] {
+            let reads = consumer(&format!("async fn h(m: OutboxMessage) -> R {{ {body} }}"));
+            assert!(reads.found, "`{body}` decodes the payload");
+            assert!(reads.reads.is_empty(), "`{body}` names no field");
+        }
+    }
+
+    #[test]
     fn a_struct_pattern_that_names_the_event_is_the_payload() {
         let reads = consumer(
             "async fn h(m: OutboxMessage) -> R { let ContactUpdated { email, .. } = m.payload_as()?; Ok(()) }",
