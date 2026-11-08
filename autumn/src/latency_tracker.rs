@@ -104,7 +104,12 @@ impl LatencyTracker {
     /// (every minute, say) to make the quantile follow recent traffic.
     pub fn decay(&self) {
         for b in &self.buckets {
-            let _ = b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v / 2));
+            let mut cur = b.load(Ordering::Relaxed);
+            while let Err(seen) =
+                b.compare_exchange_weak(cur, cur / 2, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                cur = seen;
+            }
         }
     }
 
