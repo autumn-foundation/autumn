@@ -654,6 +654,39 @@ The CLI uses the control database when its file is on the host. Else pass
 `--markers-only`. It writes CSV: `NULL` is empty, a blob is hex. Slot fleets
 are not supported.
 
+### Lake sinks
+
+The `SQLite` lake is one `LakeSink` (ADR 0040 §6). A plugin can give
+another, for example a Parquet sink. Core keeps the inclusion rule. The sink
+builds the lake.
+
+```rust,ignore
+let load = fleet.lake()?.load(MySink::open(..)).await?;
+// load.lake: what the sink gave. load.members, load.skipped: the report.
+```
+
+- Core calls the sink in two passes, each in key order. First it calls
+  `has(key, generation)` for each member that the inclusion rule takes.
+  When it is `true`, core calls `keep(key, generation)` and restores
+  nothing. Then core restores each other member and calls `add(member)`.
+- `add` gets the `key`, the `generation` and the restored `file`. Core
+  checks that the identity row of the file names the key. Core removes
+  the file after `add`.
+- A `LakeGeneration` holds the generation id and the WAL position. So a
+  new commit in the same generation is a change.
+- `finish()` gives the lake. A sink that keeps its lake between loads
+  drops, at `finish`, each member that it got from neither `add` nor
+  `keep`. A deleted tenant is gone then. So is a tenant that failed in
+  this load.
+- Set `TAKES_SLOTS = true` to get slot databases. One slot database holds
+  many tenants, so its key names no tenant.
+- `with_tables` applies to the `SQLite` lake only.
+- Keep the sink's catalog in files under its own prefix, for example
+  `<base>/lake/<sink>/`. Do not write under `<base>/fleet/`. Core adds no
+  lake table to the control database.
+- Return `LakeError::Ingest` for a member that fails. Leave no part of
+  that member. `skip_failed_tenants()` then skips the member.
+
 ## Failover: slot ownership
 
 With `[database.fleet.ownership]`, a host serves only the slot ranges that it

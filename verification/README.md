@@ -500,6 +500,11 @@ It proves these properties:
 - The total does not depend on the order in which tenants are loaded.
 - A file in a fresh scratch directory is never under the fleet root when the
   scratch parent is not under it.
+- A `LakeSink` that keeps its lake between loads holds the same rows as a
+  new lake, when it holds the right rows for each state and no member
+  fails. The model assumes that core asks `has` only for an included
+  member, and that the sink drops each member it did not get. Then a
+  deleted member adds no rows.
 
 It does not model the restore, the schema union or the query. Tests cover
 them.

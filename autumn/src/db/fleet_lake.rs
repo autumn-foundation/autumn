@@ -7,11 +7,19 @@
 //! ```text
 //! list    ─► one listing of <base>/fleet/ (tenants, markers, generations)
 //! decide  ─► a tombstone row or marker covers the generation: skip it
-//! restore ─► N workers restore N tenants into a private scratch directory
-//! ingest  ─► in tenant order: ATTACH one file, copy each table with an
-//!            _autumn_tenant column, DETACH, remove the file
-//! query   ─► a read-only connection runs one SELECT over the lake
+//! has     ─► the sink holds this state: keep it, restore nothing
+//! restore ─► N workers restore N members into a private scratch directory
+//! check   ─► the identity row of each restored file names its key
+//! add     ─► in key order: the sink takes each restored member
+//! finish  ─► the sink gives its lake
 //! ```
+//!
+//! Core runs the inclusion rule (list, decide). Then it asks the sink
+//! `has`, restores, and checks the identity row of each restored file. A
+//! [`LakeSink`] builds the lake (ADR 0040 §6). [`FleetLake::load`] runs any
+//! sink. [`FleetLake::materialize`] runs the `SQLite` sink: it copies each
+//! table with an `_autumn_tenant` column into one lake file, and
+//! [`LakeSnapshot::query`] runs one `SELECT` on it.
 //!
 //! Each tenant is consistent at its own snapshot. The lake has no atomic
 //! snapshot across tenants. The SQL is operator SQL: do not pass request
@@ -26,13 +34,10 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use diesel::connection::SimpleConnection as _;
-use diesel::{OptionalExtension as _, RunQueryDsl as _, SqliteConnection};
 
 use crate::entropy::Entropy;
 use crate::fleet_layout::{FleetDbKey, TenantDbId};
@@ -43,81 +48,163 @@ use crate::replication::segment;
 use super::fleet_replication::replica_root;
 use super::fleet_tombstones::{FleetTombstones, MARKER_OBJECT, Marker, restore_allowed};
 
-/// The column the lake adds to each table: the tenant id of the row.
+mod sqlite;
+
+pub use sqlite::{LakeRows, LakeSnapshot, LakeValue};
+
+use sqlite::{LakeFiles, SqliteSink, check_identity, collect_rows};
+#[cfg(test)]
+use sqlite::{parse_literal, quote_ident, statement};
+#[cfg(test)]
+use std::ops::ControlFlow;
+
+/// The column the `SQLite` lake adds to each table: the tenant id of the
+/// row.
 pub const TENANT_COLUMN: &str = "_autumn_tenant";
 
-/// The lake table with one row per loaded tenant: `tenant`, `generation`,
-/// `effective` (RFC 3339) and `effective_ms`.
+/// The `SQLite` lake table with one row per loaded tenant: `tenant`,
+/// `generation`, `effective` (RFC 3339) and `effective_ms`.
 pub const MANIFEST_TABLE: &str = "_autumn_lake_tenants";
 
-/// Tenants restored at the same time when the caller sets no count.
+/// Members restored at the same time when the caller sets no count.
 pub const DEFAULT_LAKE_WORKERS: usize = 4;
-
-/// The temporary view a query runs through.
-const RESULT_VIEW: &str = "_autumn_lake_result";
-
-/// The identity table of a fleet database.
-const IDENTITY_TABLE: &str = "_autumn_fleet_identity";
 
 /// Tombstone rows read per page.
 const TOMBSTONE_PAGE: usize = 500;
 
-/// Columns per `json_array` call. `SQLite` caps function arguments.
-const COLUMNS_PER_ARRAY: usize = 100;
+// ── Seam ────────────────────────────────────────────────────────────────────
 
-/// A value in a lake result. It keeps the `SQLite` storage class.
-#[derive(Debug, Clone, PartialEq)]
-pub enum LakeValue {
-    /// `NULL`.
-    Null,
-    /// An `INTEGER`.
-    Integer(i64),
-    /// A `REAL`.
-    Real(f64),
-    /// A `TEXT`.
-    Text(String),
-    /// A `BLOB`.
-    Blob(Vec<u8>),
+/// The replica state of one member: a generation and the WAL position in
+/// it. Two loads restore the same data when their states are equal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct LakeGeneration {
+    /// The generation id.
+    pub id: String,
+    /// The last WAL segment that the restore applies after the snapshot,
+    /// as (WAL index, sequence). `None`: the snapshot only.
+    pub segment: Option<(u32, u64)>,
+    /// The ship time of the last segment, or of the snapshot when there is
+    /// no segment.
+    pub effective: DateTime<Utc>,
 }
 
-impl LakeValue {
-    /// The value as an `i64`, when it is an integer.
-    #[must_use]
-    pub const fn as_i64(&self) -> Option<i64> {
-        match self {
-            Self::Integer(value) => Some(*value),
-            _ => None,
-        }
-    }
-
-    /// The value as an `f64`, when it is a number.
-    #[must_use]
-    #[allow(clippy::cast_precision_loss, reason = "an integer read as a real")]
-    pub const fn as_f64(&self) -> Option<f64> {
-        match self {
-            Self::Integer(value) => Some(*value as f64),
-            Self::Real(value) => Some(*value),
-            _ => None,
-        }
-    }
-
-    /// The value as text, when it is text.
-    #[must_use]
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::Text(value) => Some(value),
-            _ => None,
+impl LakeGeneration {
+    /// The state that `plan` restores.
+    fn of(plan: &RestorePlan) -> Self {
+        Self {
+            id: plan.generation.clone(),
+            segment: plan
+                .segments
+                .last()
+                .map(|segment| (segment.index, segment.seq)),
+            effective: plan.effective,
         }
     }
 }
 
-/// The rows of one lake query.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LakeRows {
-    /// Column names, in result order.
-    pub columns: Vec<String>,
-    /// Rows, in result order.
-    pub rows: Vec<Vec<LakeValue>>,
+/// One included member, given to [`LakeSink::add`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct LakeMember<'a> {
+    /// The database. A tenant key carries its routing slot.
+    pub key: &'a FleetDbKey,
+    /// The replica state restored.
+    pub generation: &'a LakeGeneration,
+    /// The restored `SQLite` file: checkpointed, with no sidecars. Its
+    /// identity row names `key`. Core removes the file after `add` returns.
+    pub file: &'a Path,
+}
+
+/// Builds a lake from the members that core includes (ADR 0040 §6).
+///
+/// Core runs the inclusion rule first. Then it calls the sink in two
+/// passes, each in key order:
+///
+/// 1. Core calls [`has`](Self::has) for each included member. When it is
+///    `true`, core calls [`keep`](Self::keep) and restores nothing.
+/// 2. Core restores each other member and calls [`add`](Self::add).
+///
+/// Then core calls [`finish`](Self::finish). Core never calls `has` for an
+/// excluded member. When the load fails, core drops the sink and does not
+/// call `finish`.
+///
+/// # Contract
+///
+/// - A sink that keeps its lake between loads drops, at `finish`, each
+///   member it got from neither `add` nor `keep`. A deleted member is
+///   gone then. So is a member that failed in this load.
+/// - When `add` or `keep` fails, leave no part of that member.
+/// - Return [`LakeError::Ingest`] for a member that fails. With
+///   [`FleetLake::skip_failed_tenants`], core skips the member and loads
+///   the rest. Other errors that do not name a member fail the load.
+/// - Keep the catalog in files under the sink's own prefix, for example a
+///   manifest per member and generation. Do not write under
+///   `<base>/fleet/`: core lists it. Core adds no lake catalog table to the
+///   control database.
+pub trait LakeSink: Send + 'static {
+    /// What [`finish`](Self::finish) gives.
+    type Lake: Send + 'static;
+
+    /// Set to `true` to get slot databases. A slot database holds many
+    /// tenants, so its key names no tenant. When `false`, core skips slot
+    /// databases, and refuses a fleet of slot databases only
+    /// ([`LakeError::SlotFleet`]).
+    const TAKES_SLOTS: bool = false;
+
+    /// Take one restored member.
+    ///
+    /// # Errors
+    ///
+    /// [`LakeError::Ingest`] when the member fails.
+    fn add(&mut self, member: LakeMember<'_>) -> Result<(), LakeError>;
+
+    /// Return `true` when the sink holds this state of the member. Core
+    /// then calls [`keep`](Self::keep) and does not restore the member.
+    fn has(&self, key: &FleetDbKey, generation: &LakeGeneration) -> bool {
+        let _ = (key, generation);
+        false
+    }
+
+    /// Keep the member that [`has`](Self::has) holds.
+    ///
+    /// # Errors
+    ///
+    /// [`LakeError::Ingest`] when the member fails.
+    fn keep(&mut self, key: &FleetDbKey, generation: &LakeGeneration) -> Result<(), LakeError> {
+        let _ = (key, generation);
+        Ok(())
+    }
+
+    /// Give the lake after the last member.
+    ///
+    /// # Errors
+    ///
+    /// The sink cannot complete the lake.
+    fn finish(self) -> Result<Self::Lake, LakeError>;
+}
+
+/// One member in a load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LakeEntry {
+    /// The database.
+    pub key: FleetDbKey,
+    /// Its replica state.
+    pub generation: LakeGeneration,
+    /// Core restored it in this load. `false`: the sink kept it.
+    pub restored: bool,
+}
+
+/// The result of [`FleetLake::load`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct LakeLoad<L> {
+    /// What the sink gave.
+    pub lake: L,
+    /// The members in the lake, sorted by key.
+    pub members: Vec<LakeEntry>,
+    /// The databases not in the lake, sorted by name.
+    pub skipped: Vec<LakeSkip>,
 }
 
 /// One tenant in the lake.
@@ -142,7 +229,7 @@ pub enum SkipReason {
     AbsentAtTarget,
     /// The name is not a valid tenant id.
     InvalidName,
-    /// A slot database. The lake loads tenant databases only.
+    /// A slot database, and the sink takes no slots.
     SlotDatabase,
     /// The tenant failed. Only with [`FleetLake::skip_failed_tenants`].
     Failed(String),
@@ -229,7 +316,8 @@ pub enum LakeError {
         /// Detail.
         detail: String,
     },
-    /// The destination holds slot databases only.
+    /// The destination holds slot databases only, and the sink takes no
+    /// slots.
     #[error("the fleet keeps slot databases; the lake loads tenant databases only")]
     SlotFleet,
     /// The query failed, or it is not one `SELECT`, `WITH` or `VALUES`.
@@ -254,8 +342,8 @@ impl LakeError {
     }
 }
 
-/// A read-only view of a fleet's replicas, loaded on demand into a scratch
-/// `SQLite` lake. See the module docs.
+/// A read-only view of a fleet's replicas, loaded on demand into a
+/// [`LakeSink`]. See the module docs.
 #[derive(Clone)]
 pub struct FleetLake {
     destination: Arc<dyn ReplicaDestination>,
@@ -339,7 +427,8 @@ impl FleetLake {
         self
     }
 
-    /// Load only these tables.
+    /// Load only these tables into the `SQLite` lake. A sink of
+    /// [`load`](Self::load) gets the full restored file.
     #[must_use]
     pub fn with_tables<I, S>(mut self, tables: I) -> Self
     where
@@ -382,7 +471,7 @@ impl FleetLake {
         self
     }
 
-    /// Restore every live tenant and load it into a new lake.
+    /// Restore every live tenant and load it into a new `SQLite` lake.
     ///
     /// # Errors
     ///
@@ -394,6 +483,24 @@ impl FleetLake {
         crate::time::spawn_blocking(move || lake.materialize_blocking(&rows))
             .await
             .map_err(|error| LakeError::Task(error.to_string()))?
+    }
+
+    /// Run the inclusion rule and give each included member to `sink`. The
+    /// restored files go in a scratch directory that the load removes.
+    ///
+    /// # Errors
+    ///
+    /// See [`LakeError`]. A member that fails fails the load, unless
+    /// [`skip_failed_tenants`](Self::skip_failed_tenants) is set.
+    pub async fn load<S: LakeSink>(&self, sink: S) -> Result<LakeLoad<S::Lake>, LakeError> {
+        let rows = self.tombstone_rows().await?;
+        let lake = self.clone();
+        crate::time::spawn_blocking(move || {
+            let (scratch, _) = lake.new_scratch()?;
+            lake.load_blocking(&scratch.dir, &rows, sink)
+        })
+        .await
+        .map_err(|error| LakeError::Task(error.to_string()))?
     }
 
     /// Make a lake, run one query on it, and remove it. Each call restores
@@ -440,7 +547,8 @@ impl FleetLake {
         }
     }
 
-    fn materialize_blocking(&self, rows: &HashSet<String>) -> Result<LakeSnapshot, LakeError> {
+    /// A new scratch directory, and the canonical fleet root.
+    fn new_scratch(&self) -> Result<(Scratch, Option<PathBuf>), LakeError> {
         let root = self
             .forbidden_root
             .as_deref()
@@ -450,59 +558,121 @@ impl FleetLake {
             root.as_deref(),
             self.entropy.as_ref(),
         )?;
-        let found = discover(self.destination.as_ref(), &self.base)?;
+        Ok((scratch, root))
+    }
+
+    fn materialize_blocking(&self, rows: &HashSet<String>) -> Result<LakeSnapshot, LakeError> {
+        let (scratch, root) = self.new_scratch()?;
+        let sink = SqliteSink::create(scratch.dir.join("lake.db"), self.tables.clone())?;
+        let load = self.load_blocking(&scratch.dir, rows, sink)?;
+        let tenants = load
+            .members
+            .into_iter()
+            .filter_map(|member| {
+                Some(LakeTenant {
+                    tenant: member.key.tenant()?.clone(),
+                    generation: member.generation.id,
+                    effective: member.generation.effective,
+                })
+            })
+            .collect();
+        Ok(LakeSnapshot {
+            files: Arc::new(LakeFiles {
+                dir: scratch.keep(),
+                db: load.lake,
+            }),
+            tenants,
+            skipped: load.skipped,
+            root,
+        })
+    }
+
+    /// The inclusion rule. Restored files go in `dir`.
+    fn load_blocking<S: LakeSink>(
+        &self,
+        dir: &Path,
+        rows: &HashSet<String>,
+        mut sink: S,
+    ) -> Result<LakeLoad<S::Lake>, LakeError> {
+        let found = discover(self.destination.as_ref(), &self.base, S::TAKES_SLOTS)?;
         let mut skipped = found.skipped;
+        let mut members = Vec::new();
         let mut planned = Vec::new();
-        for (tenant, keys) in &found.tenants {
-            match self.plan_tenant(tenant, keys, rows) {
-                Ok(Planned::Restore(plan)) => planned.push((tenant.clone(), *plan)),
+        for (key, keys) in &found.members {
+            match self.plan_member(key, keys, rows) {
+                Ok(Planned::Restore(plan)) => {
+                    let generation = LakeGeneration::of(&plan);
+                    if !sink.has(key, &generation) {
+                        planned.push((key.clone(), *plan, generation));
+                        continue;
+                    }
+                    match sink.keep(key, &generation) {
+                        Ok(()) => members.push(LakeEntry {
+                            key: key.clone(),
+                            generation,
+                            restored: false,
+                        }),
+                        Err(error) => skipped.push(self.member_failed(key, error)?),
+                    }
+                }
                 Ok(Planned::Skip(reason)) => skipped.push(LakeSkip {
-                    name: tenant.to_string(),
+                    name: member_name(key),
                     reason,
                 }),
                 Err(error) => skipped.push(self.failed(error)?),
             }
         }
 
-        let db = scratch.dir.join("lake.db");
-        let mut conn = open_lake(&db)?;
-        let mut tenants = Vec::new();
         for (chunk_index, chunk) in planned.chunks(self.workers).enumerate() {
-            let restored = self.restore_chunk(&scratch.dir, chunk_index, chunk);
-            for ((tenant, plan), (output, result)) in chunk.iter().zip(restored) {
+            let restored = self.restore_chunk(dir, chunk_index, chunk);
+            for ((key, _, generation), (output, result)) in chunk.iter().zip(restored) {
+                let name = member_name(key);
                 let loaded = result
                     .map_err(|error| LakeError::Restore {
-                        tenant: tenant.to_string(),
+                        tenant: name.clone(),
                         detail: error.to_string(),
                     })
+                    .and_then(|()| check_identity(key, &name, &output))
                     .and_then(|()| {
-                        ingest(&mut conn, tenant, plan, &output, self.tables.as_deref())
+                        sink.add(LakeMember {
+                            key,
+                            generation,
+                            file: &output,
+                        })
                     });
                 remove_database(&output);
                 match loaded {
-                    Ok(()) => tenants.push(LakeTenant {
-                        tenant: tenant.clone(),
-                        generation: plan.generation.clone(),
-                        effective: plan.effective,
+                    Ok(()) => members.push(LakeEntry {
+                        key: key.clone(),
+                        generation: generation.clone(),
+                        restored: true,
                     }),
-                    Err(error) => skipped.push(self.failed(error)?),
+                    Err(error) => skipped.push(self.member_failed(key, error)?),
                 }
             }
         }
-        drop(conn);
+        members.sort_by(|a, b| a.key.cmp(&b.key));
         skipped.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(LakeSnapshot {
-            files: Arc::new(LakeFiles {
-                dir: scratch.keep(),
-                db,
-            }),
-            tenants,
+        Ok(LakeLoad {
+            lake: sink.finish()?,
+            members,
             skipped,
-            root,
         })
     }
 
-    /// A per-tenant error: a skip with `skip_failed_tenants`, else the
+    /// An error of `key` after its plan: a skip named from the key with
+    /// `skip_failed_tenants`, else the error.
+    fn member_failed(&self, key: &FleetDbKey, error: LakeError) -> Result<LakeSkip, LakeError> {
+        match error.tenant() {
+            Some(_) if self.skip_failed => Ok(LakeSkip {
+                name: member_name(key),
+                reason: SkipReason::Failed(error.to_string()),
+            }),
+            _ => Err(error),
+        }
+    }
+
+    /// A per-member error: a skip with `skip_failed_tenants`, else the
     /// error.
     fn failed(&self, error: LakeError) -> Result<LakeSkip, LakeError> {
         match error.tenant() {
@@ -517,30 +687,26 @@ impl FleetLake {
     /// Decide from the listing, then plan the restore. The restore applies
     /// this plan, so the decision and the restore see the same generation.
     /// A listing older than the replica (a ship or a purge since) is read
-    /// again for this tenant, once.
-    fn plan_tenant(
+    /// again for this member, once.
+    fn plan_member(
         &self,
-        tenant: &TenantDbId,
+        key: &FleetDbKey,
         keys: &[String],
         rows: &HashSet<String>,
     ) -> Result<Planned, LakeError> {
-        let key = FleetDbKey::Tenant {
-            id: tenant.clone(),
-            slot: 0,
-        };
-        let root = replica_root(&self.base, &key);
+        let root = replica_root(&self.base, key);
         let row = rows.contains(&key.name());
-        if let Attempt::Done(planned) = self.plan_from(tenant, &root, keys, row)? {
+        if let Attempt::Done(planned) = self.plan_from(key, &root, keys, row)? {
             return Ok(planned);
         }
         let fresh = self
             .destination
             .list(&format!("{root}/"))
             .map_err(|error| LakeError::Destination(error.to_string()))?;
-        match self.plan_from(tenant, &root, &fresh, row)? {
+        match self.plan_from(key, &root, &fresh, row)? {
             Attempt::Done(planned) => Ok(planned),
             Attempt::Stale(detail) => Err(LakeError::Restore {
-                tenant: tenant.to_string(),
+                tenant: member_name(key),
                 detail,
             }),
         }
@@ -549,12 +715,12 @@ impl FleetLake {
     /// One decision and plan from `keys`.
     fn plan_from(
         &self,
-        tenant: &TenantDbId,
+        key: &FleetDbKey,
         root: &str,
         keys: &[String],
         row: bool,
     ) -> Result<Attempt, LakeError> {
-        let marker = match self.marker(tenant, root, keys)? {
+        let marker = match self.marker(key, root, keys)? {
             MarkerRead::Absent => None,
             MarkerRead::At(deleted_at) => Some(deleted_at),
             MarkerRead::Gone => {
@@ -582,7 +748,7 @@ impl FleetLake {
                 }
                 Err(error) => {
                     return Err(LakeError::Restore {
-                        tenant: tenant.to_string(),
+                        tenant: member_name(key),
                         detail: error.to_string(),
                     });
                 }
@@ -594,10 +760,10 @@ impl FleetLake {
         Ok(Attempt::Done(Planned::Restore(Box::new(plan))))
     }
 
-    /// The tenant's marker, read only when the listing has one.
+    /// The member's marker, read only when the listing has one.
     fn marker(
         &self,
-        tenant: &TenantDbId,
+        key: &FleetDbKey,
         root: &str,
         keys: &[String],
     ) -> Result<MarkerRead, LakeError> {
@@ -606,7 +772,7 @@ impl FleetLake {
             return Ok(MarkerRead::Absent);
         }
         let unreadable = |detail: String| LakeError::Marker {
-            tenant: tenant.to_string(),
+            tenant: member_name(key),
             detail,
         };
         let body = match self.destination.get(&marker_key) {
@@ -620,12 +786,12 @@ impl FleetLake {
             .map_err(|error| unreadable(error.to_string()))
     }
 
-    /// Restore one chunk of tenants, one thread each. Blocking.
+    /// Restore one chunk of members, one thread each. Blocking.
     fn restore_chunk(
         &self,
         dir: &Path,
         chunk_index: usize,
-        chunk: &[(TenantDbId, RestorePlan)],
+        chunk: &[(FleetDbKey, RestorePlan, LakeGeneration)],
     ) -> Vec<(PathBuf, Result<(), RestoreError>)> {
         let destination = self.destination.as_ref();
         let output = |index: usize| dir.join(format!("{chunk_index:08}-{index:04}.db"));
@@ -635,7 +801,7 @@ impl FleetLake {
             let handles: Vec<_> = chunk
                 .iter()
                 .enumerate()
-                .map(|(index, (_, plan))| {
+                .map(|(index, (_, plan, _))| {
                     let path = output(index);
                     let handle = std::thread::Builder::new()
                         .name("autumn-fleet-lake".to_owned())
@@ -668,20 +834,29 @@ impl FleetLake {
     }
 }
 
-/// What the lake does with one tenant.
+/// The name of a member in a [`LakeSkip`] and in errors: the tenant id, or
+/// the slot number.
+fn member_name(key: &FleetDbKey) -> String {
+    match key {
+        FleetDbKey::Tenant { id, .. } => id.to_string(),
+        FleetDbKey::Slot(slot) => format!("{slot:05}"),
+    }
+}
+
+/// What the lake does with one member.
 enum Planned {
     Restore(Box<RestorePlan>),
     Skip(SkipReason),
 }
 
-/// One try of [`FleetLake::plan_tenant`].
+/// One try of [`FleetLake::plan_member`].
 enum Attempt {
     Done(Planned),
     /// The listing is older than the replica. Why.
     Stale(String),
 }
 
-/// The tombstone marker of a tenant.
+/// The tombstone marker of a member.
 enum MarkerRead {
     /// The listing has none.
     Absent,
@@ -693,21 +868,26 @@ enum MarkerRead {
 
 /// The databases one listing of `<base>/fleet/` finds.
 struct Discovery {
-    /// Each tenant and every key under its root, sorted by tenant.
-    tenants: BTreeMap<TenantDbId, Vec<String>>,
-    /// Invalid names and slot databases.
+    /// Each member and every key under its root, sorted by key.
+    members: BTreeMap<FleetDbKey, Vec<String>>,
+    /// Invalid names, and slot databases when the sink takes no slots.
     skipped: Vec<LakeSkip>,
 }
 
-/// List `<base>/fleet/` once and group the keys by database.
-fn discover(destination: &dyn ReplicaDestination, base: &str) -> Result<Discovery, LakeError> {
+/// List `<base>/fleet/` once and group the keys by database. `slots`: the
+/// sink takes slot databases.
+fn discover(
+    destination: &dyn ReplicaDestination,
+    base: &str,
+    slots: bool,
+) -> Result<Discovery, LakeError> {
     let prefix = format!("{base}/fleet/");
     let keys = destination
         .list(&prefix)
         .map_err(|error| LakeError::Destination(error.to_string()))?;
-    let mut tenants: BTreeMap<TenantDbId, Vec<String>> = BTreeMap::new();
+    let mut members: BTreeMap<FleetDbKey, Vec<String>> = BTreeMap::new();
     let mut invalid = BTreeSet::new();
-    let mut slots = BTreeSet::new();
+    let mut refused = BTreeSet::new();
     for key in keys {
         let Some(rest) = key.strip_prefix(&prefix) else {
             continue;
@@ -718,20 +898,23 @@ fn discover(destination: &dyn ReplicaDestination, base: &str) -> Result<Discover
         let Some((name, _)) = rest.split_once('/') else {
             continue;
         };
-        match kind {
-            "tenant" => match TenantDbId::parse(name) {
-                Ok(id) => tenants.entry(id).or_default().push(key),
-                Err(_) => {
-                    invalid.insert(name.to_owned());
-                }
-            },
+        let member = match kind {
+            "tenant" => TenantDbId::parse(name).ok().map(tenant_key),
+            "slot" if slots => slot_key(name),
             "slot" => {
-                slots.insert(name.to_owned());
+                refused.insert(name.to_owned());
+                continue;
             }
-            _ => {}
+            _ => continue,
+        };
+        match member {
+            Some(member) => members.entry(member).or_default().push(key),
+            None => {
+                invalid.insert(name.to_owned());
+            }
         }
     }
-    if tenants.is_empty() && !slots.is_empty() {
+    if members.is_empty() && !refused.is_empty() {
         return Err(LakeError::SlotFleet);
     }
     let skip = |reason: SkipReason| {
@@ -743,9 +926,23 @@ fn discover(destination: &dyn ReplicaDestination, base: &str) -> Result<Discover
     let skipped = invalid
         .into_iter()
         .map(skip(SkipReason::InvalidName))
-        .chain(slots.into_iter().map(skip(SkipReason::SlotDatabase)))
+        .chain(refused.into_iter().map(skip(SkipReason::SlotDatabase)))
         .collect();
-    Ok(Discovery { tenants, skipped })
+    Ok(Discovery { members, skipped })
+}
+
+/// The key of a tenant, with its routing slot.
+fn tenant_key(id: TenantDbId) -> FleetDbKey {
+    let slot = crate::sharding::slot_for_key(id.as_str().into()).0;
+    FleetDbKey::Tenant { id, slot }
+}
+
+/// The key of a slot directory name. Only the five-digit form that
+/// [`replica_root`] writes is valid.
+fn slot_key(name: &str) -> Option<FleetDbKey> {
+    let slot = name.parse::<u16>().ok()?;
+    let key = FleetDbKey::slot(slot).ok()?;
+    (format!("{slot:05}") == name).then_some(key)
 }
 
 /// When the newest complete generation under `root` was created.
@@ -865,581 +1062,6 @@ fn remove_database(path: &Path) {
     for sidecar in crate::fleet_layout::sidecar_paths(path) {
         let _ = std::fs::remove_file(sidecar);
     }
-}
-
-// ── Ingest ──────────────────────────────────────────────────────────────────
-
-#[derive(diesel::QueryableByName)]
-struct Name {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    name: String,
-}
-
-#[derive(diesel::QueryableByName)]
-struct ListedTable {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    name: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    kind: String,
-}
-
-#[derive(diesel::QueryableByName)]
-struct Column {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    name: String,
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    hidden: i32,
-}
-
-/// A `file:` URI for `path` with `query`.
-fn uri(path: &Path, query: &str) -> Result<String, String> {
-    crate::replication::file_uri(path)
-        .map(|uri| format!("{uri}?{query}"))
-        .ok_or_else(|| format!("{} is not valid Unicode", path.display()))
-}
-
-/// Make the lake file and its manifest table.
-fn open_lake(db: &Path) -> Result<SqliteConnection, LakeError> {
-    let scratch = |detail: String| LakeError::Scratch(format!("{}: {detail}", db.display()));
-    let mut conn =
-        super::establish_sqlite_migration_connection(&uri(db, "mode=rwc").map_err(scratch)?)
-            .map_err(|error| scratch(error.to_string()))?;
-    // A scratch file: a crash loses nothing the next load does not make.
-    // The journal stays (in memory): a skipped tenant rolls back.
-    conn.batch_execute(&format!(
-        "PRAGMA journal_mode = MEMORY; PRAGMA synchronous = OFF; \
-         CREATE TABLE {MANIFEST_TABLE} (tenant TEXT PRIMARY KEY, generation TEXT NOT NULL, \
-         effective TEXT NOT NULL, effective_ms INTEGER NOT NULL);"
-    ))
-    .map_err(|error| scratch(error.to_string()))?;
-    Ok(conn)
-}
-
-/// Copy one restored tenant into the lake, in one transaction.
-fn ingest(
-    conn: &mut SqliteConnection,
-    tenant: &TenantDbId,
-    plan: &RestorePlan,
-    path: &Path,
-    tables: Option<&[String]>,
-) -> Result<(), LakeError> {
-    let failed = |detail: String| LakeError::Ingest {
-        tenant: tenant.to_string(),
-        detail,
-    };
-    // A private file `restore::apply` checkpointed: no locks, no sidecars.
-    diesel::sql_query("ATTACH DATABASE ? AS src")
-        .bind::<diesel::sql_types::Text, _>(uri(path, "mode=ro&immutable=1").map_err(failed)?)
-        .execute(conn)
-        .map_err(|error| failed(error.to_string()))?;
-    let result = conn
-        .batch_execute("BEGIN")
-        .map_err(|error| failed(error.to_string()))
-        .and_then(|()| copy_tenant(conn, tenant, plan, tables));
-    let ended = match &result {
-        Ok(()) => conn.batch_execute("COMMIT"),
-        Err(_) => conn.batch_execute("ROLLBACK"),
-    };
-    let detached = conn.batch_execute("DETACH DATABASE src");
-    result?;
-    ended.map_err(|error| failed(error.to_string()))?;
-    detached.map_err(|error| failed(error.to_string()))
-}
-
-/// The copy inside the transaction of [`ingest`].
-fn copy_tenant(
-    conn: &mut SqliteConnection,
-    tenant: &TenantDbId,
-    plan: &RestorePlan,
-    tables: Option<&[String]>,
-) -> Result<(), LakeError> {
-    let failed = |error: diesel::result::Error| LakeError::Ingest {
-        tenant: tenant.to_string(),
-        detail: error.to_string(),
-    };
-    check_identity(conn, tenant)?;
-    let mut names: Vec<String> =
-        diesel::sql_query("SELECT name, type AS kind FROM pragma_table_list WHERE schema = 'src'")
-            .load::<ListedTable>(conn)
-            .map_err(failed)?
-            .into_iter()
-            .filter(|table| table.kind == "table" && is_app_table(&table.name))
-            .map(|table| table.name)
-            .filter(|name| {
-                tables.is_none_or(|only| only.iter().any(|t| t.eq_ignore_ascii_case(name)))
-            })
-            .collect();
-    names.sort();
-    for table in &names {
-        let columns: Vec<String> =
-            diesel::sql_query("SELECT name, hidden FROM pragma_table_xinfo(?, 'src')")
-                .bind::<diesel::sql_types::Text, _>(table)
-                .load::<Column>(conn)
-                .map_err(failed)?
-                .into_iter()
-                // 1: a hidden column of a virtual table. 2, 3: generated.
-                .filter(|column| column.hidden != 1)
-                .map(|column| column.name)
-                .collect();
-        if columns
-            .iter()
-            .any(|column| column.eq_ignore_ascii_case(TENANT_COLUMN))
-        {
-            return Err(LakeError::ReservedColumn {
-                tenant: tenant.to_string(),
-                table: table.clone(),
-            });
-        }
-        add_lake_table(conn, table, &columns).map_err(failed)?;
-        let list = std::iter::once(TENANT_COLUMN.to_owned())
-            .chain(columns.iter().cloned())
-            .map(|column| quote_ident(&column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let select = columns
-            .iter()
-            .map(|column| quote_ident(column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let table = quote_ident(table);
-        diesel::sql_query(format!(
-            "INSERT INTO main.{table} ({list}) SELECT ?, {select} FROM src.{table}"
-        ))
-        .bind::<diesel::sql_types::Text, _>(tenant.as_str())
-        .execute(conn)
-        .map_err(failed)?;
-    }
-    diesel::sql_query(format!("INSERT INTO {MANIFEST_TABLE} VALUES (?, ?, ?, ?)"))
-        .bind::<diesel::sql_types::Text, _>(tenant.as_str())
-        .bind::<diesel::sql_types::Text, _>(&plan.generation)
-        .bind::<diesel::sql_types::Text, _>(plan.effective.to_rfc3339())
-        .bind::<diesel::sql_types::BigInt, _>(plan.effective.timestamp_millis())
-        .execute(conn)
-        .map_err(failed)?;
-    Ok(())
-}
-
-/// A table the app owns: not `SQLite`'s, the framework's or diesel's.
-fn is_app_table(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    !(lower.starts_with("sqlite_")
-        || lower.starts_with("_autumn_")
-        || lower.starts_with("__diesel"))
-}
-
-/// The identity row of the restored file must name the tenant.
-fn check_identity(conn: &mut SqliteConnection, tenant: &TenantDbId) -> Result<(), LakeError> {
-    let misplaced = |detail: String| LakeError::Misplaced {
-        tenant: tenant.to_string(),
-        detail,
-    };
-    let expected = FleetDbKey::Tenant {
-        id: tenant.clone(),
-        slot: 0,
-    }
-    .name();
-    let exists =
-        diesel::sql_query("SELECT name FROM src.sqlite_schema WHERE type = 'table' AND name = ?")
-            .bind::<diesel::sql_types::Text, _>(IDENTITY_TABLE)
-            .get_result::<Name>(conn)
-            .optional()
-            .map_err(|error| misplaced(error.to_string()))?
-            .is_some();
-    if !exists {
-        return Err(misplaced("the identity row is missing".to_owned()));
-    }
-    let found = diesel::sql_query(format!(
-        "SELECT name FROM src.{IDENTITY_TABLE} WHERE id = 1"
-    ))
-    .get_result::<Name>(conn)
-    .optional()
-    .map_err(|error| misplaced(error.to_string()))?;
-    match found {
-        Some(found) if found.name == expected => Ok(()),
-        Some(found) => Err(misplaced(format!(
-            "the identity row names {}, not {expected}",
-            found.name
-        ))),
-        None => Err(misplaced("the identity row is missing".to_owned())),
-    }
-}
-
-/// Make the lake table, or add the columns it does not have yet. The
-/// columns have no type, so each value keeps its storage class.
-fn add_lake_table(
-    conn: &mut SqliteConnection,
-    table: &str,
-    columns: &[String],
-) -> Result<(), diesel::result::Error> {
-    let existing: Vec<String> = diesel::sql_query("SELECT name FROM pragma_table_info(?, 'main')")
-        .bind::<diesel::sql_types::Text, _>(table)
-        .load::<Name>(conn)?
-        .into_iter()
-        .map(|column| column.name.to_ascii_lowercase())
-        .collect();
-    let quoted = quote_ident(table);
-    if existing.is_empty() {
-        let list = std::iter::once(TENANT_COLUMN)
-            .chain(columns.iter().map(String::as_str))
-            .map(quote_ident)
-            .collect::<Vec<_>>()
-            .join(", ");
-        diesel::sql_query(format!("CREATE TABLE main.{quoted} ({list})")).execute(conn)?;
-        return Ok(());
-    }
-    for column in columns {
-        if !existing.contains(&column.to_ascii_lowercase()) {
-            diesel::sql_query(format!(
-                "ALTER TABLE main.{quoted} ADD COLUMN {}",
-                quote_ident(column)
-            ))
-            .execute(conn)?;
-        }
-    }
-    Ok(())
-}
-
-/// Quote an identifier for `SQLite`.
-pub(crate) fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-// ── Snapshot and query ──────────────────────────────────────────────────────
-
-/// The files of a lake. The last owner removes them, so a query still
-/// running keeps them.
-#[derive(Debug)]
-struct LakeFiles {
-    dir: PathBuf,
-    db: PathBuf,
-}
-
-impl Drop for LakeFiles {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// A loaded lake. Dropping it removes its scratch directory, after the
-/// last running query.
-#[derive(Debug)]
-pub struct LakeSnapshot {
-    files: Arc<LakeFiles>,
-    tenants: Vec<LakeTenant>,
-    skipped: Vec<LakeSkip>,
-    /// The canonical fleet root, when known.
-    root: Option<PathBuf>,
-}
-
-impl LakeSnapshot {
-    /// The tenants in the lake, sorted by id.
-    #[must_use]
-    pub fn tenants(&self) -> &[LakeTenant] {
-        &self.tenants
-    }
-
-    /// The databases the lake did not load, sorted by name.
-    #[must_use]
-    pub fn skipped(&self) -> &[LakeSkip] {
-        &self.skipped
-    }
-
-    /// The lake database file.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.files.db
-    }
-
-    /// Run one `SELECT`, `WITH` or `VALUES` statement.
-    ///
-    /// # Errors
-    ///
-    /// [`LakeError::Query`].
-    pub async fn query(&self, sql: &str) -> Result<LakeRows, LakeError> {
-        let (files, sql) = (Arc::clone(&self.files), sql.to_owned());
-        crate::time::spawn_blocking(move || collect_rows(&files.db, &sql))
-            .await
-            .map_err(|error| LakeError::Task(error.to_string()))?
-    }
-
-    /// The column names of `sql`, with no rows read. Blocking.
-    ///
-    /// # Errors
-    ///
-    /// [`LakeError::Query`].
-    pub fn columns(&self, sql: &str) -> Result<Vec<String>, LakeError> {
-        columns_of(&mut read_only(&self.files.db)?, sql)
-    }
-
-    /// Run one statement and give each row to `each`. Blocking. Returns
-    /// the number of rows given.
-    ///
-    /// # Errors
-    ///
-    /// [`LakeError::Query`].
-    pub fn for_each_row(
-        &self,
-        sql: &str,
-        each: impl FnMut(&[String], Vec<LakeValue>) -> ControlFlow<()>,
-    ) -> Result<usize, LakeError> {
-        for_each_row(&self.files.db, sql, each)
-    }
-
-    /// Write a standalone copy of the lake to `path` (owner-only on unix).
-    /// `path` must not exist. The copy holds the rows of every tenant.
-    /// Blocking.
-    ///
-    /// # Errors
-    ///
-    /// [`LakeError::Persist`] when `path` exists or cannot be written.
-    /// [`LakeError::UnderRoot`] when `path` is under the fleet root.
-    pub fn persist(&self, path: &Path) -> Result<(), LakeError> {
-        let failed = |detail: String| LakeError::Persist(format!("{}: {detail}", path.display()));
-        let name = path
-            .file_name()
-            .ok_or_else(|| failed("no file name".to_owned()))?;
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let parent = parent
-            .canonicalize()
-            .map_err(|error| failed(error.to_string()))?;
-        refuse_under(&parent, self.root.as_deref())?;
-        let target = parent.join(name);
-        // A URI, so SQLite writes this file: a name like `file:x` is a name.
-        let target_uri = crate::replication::file_uri(&target)
-            .ok_or_else(|| failed("the path is not valid Unicode".to_owned()))?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        drop(
-            options
-                .open(&target)
-                .map_err(|error| failed(error.to_string()))?,
-        );
-        let written = read_only(&self.files.db).and_then(|mut conn| {
-            diesel::sql_query("VACUUM INTO ?")
-                .bind::<diesel::sql_types::Text, _>(target_uri)
-                .execute(&mut conn)
-                .map(|_| ())
-                .map_err(|error| LakeError::Query(error.to_string()))
-        });
-        if written.is_err() {
-            let _ = std::fs::remove_file(&target);
-        }
-        written.map_err(|error| failed(error.to_string()))
-    }
-}
-
-/// A read-only connection to the lake.
-fn read_only(db: &Path) -> Result<SqliteConnection, LakeError> {
-    super::establish_sqlite_migration_connection(&uri(db, "mode=ro").map_err(LakeError::Query)?)
-        .map_err(|error| LakeError::Query(error.to_string()))
-}
-
-fn collect_rows(db: &Path, sql: &str) -> Result<LakeRows, LakeError> {
-    let mut out = LakeRows::default();
-    for_each_row(db, sql, |columns, row| {
-        if out.columns.is_empty() {
-            out.columns = columns.to_vec();
-        }
-        out.rows.push(row);
-        ControlFlow::Continue(())
-    })?;
-    if out.columns.is_empty() {
-        out.columns = columns_of(&mut read_only(db)?, sql)?;
-    }
-    Ok(out)
-}
-
-/// Make the result view for `sql` and return its columns. The view holds
-/// one statement: a trailing statement does not run, and it is refused.
-fn columns_of(conn: &mut SqliteConnection, sql: &str) -> Result<Vec<String>, LakeError> {
-    let query = |error: diesel::result::Error| LakeError::Query(error.to_string());
-    let body = format!("SELECT * FROM (\n{}\n)", statement(sql));
-    diesel::sql_query(format!("CREATE TEMP VIEW {RESULT_VIEW} AS {body}"))
-        .execute(conn)
-        .map_err(query)?;
-    let stored: Name =
-        diesel::sql_query("SELECT sql AS name FROM temp.sqlite_schema WHERE name = ?")
-            .bind::<diesel::sql_types::Text, _>(RESULT_VIEW)
-            .get_result(conn)
-            .map_err(query)?;
-    if !stored.name.ends_with(&body) {
-        return Err(LakeError::Query(
-            "the lake runs one SELECT, WITH or VALUES statement".to_owned(),
-        ));
-    }
-    Ok(diesel::sql_query(format!(
-        "SELECT name FROM pragma_table_info('{RESULT_VIEW}', 'temp')"
-    ))
-    .load::<Name>(conn)
-    .map_err(query)?
-    .into_iter()
-    .map(|column| column.name)
-    .collect())
-}
-
-/// `sql` with no trailing `;`, white space or comments. It reads quotes
-/// and comments, so a `;` or a `--` in a literal stays.
-fn statement(sql: &str) -> &str {
-    let bytes = sql.as_bytes();
-    // The end of the last byte that is code, not space, `;` or a comment.
-    let mut end = 0;
-    let mut at = 0;
-    while at < bytes.len() {
-        match bytes[at] {
-            quote @ (b'\'' | b'"' | b'`' | b'[') => {
-                let close = if quote == b'[' { b']' } else { quote };
-                at += 1;
-                while at < bytes.len() {
-                    if bytes[at] == close {
-                        // A doubled quote is one quote in the literal.
-                        if close != b']' && bytes.get(at + 1) == Some(&close) {
-                            at += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    at += 1;
-                }
-                at = (at + 1).min(bytes.len());
-                end = at;
-            }
-            b'-' if bytes.get(at + 1) == Some(&b'-') => {
-                while at < bytes.len() && bytes[at] != b'\n' {
-                    at += 1;
-                }
-            }
-            b'/' if bytes.get(at + 1) == Some(&b'*') => {
-                at += 2;
-                while at < bytes.len() && !(bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/')) {
-                    at += 1;
-                }
-                at = (at + 2).min(bytes.len());
-            }
-            byte if byte == b';' || byte.is_ascii_whitespace() => at += 1,
-            _ => {
-                at += 1;
-                end = at;
-            }
-        }
-    }
-    // `end` follows an ASCII byte or the end of a literal, so it is a char
-    // boundary.
-    sql.get(..end).unwrap_or(sql)
-}
-
-#[derive(diesel::QueryableByName)]
-struct Encoded {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    row: String,
-}
-
-fn for_each_row(
-    db: &Path,
-    sql: &str,
-    mut each: impl FnMut(&[String], Vec<LakeValue>) -> ControlFlow<()>,
-) -> Result<usize, LakeError> {
-    let query = |detail: String| LakeError::Query(detail);
-    let mut conn = read_only(db)?;
-    let columns = columns_of(&mut conn, sql)?;
-    conn.batch_execute("PRAGMA query_only = ON")
-        .map_err(|error| query(error.to_string()))?;
-    // `quote()` keeps the storage class and round-trips a real. Text goes
-    // as `T` and hex: `quote()` stops at a NUL. A tab joins the arrays:
-    // JSON escapes a tab inside a string.
-    let arrays = columns
-        .chunks(COLUMNS_PER_ARRAY)
-        .map(|chunk| {
-            let quoted = chunk
-                .iter()
-                .map(|column| {
-                    let column = quote_ident(column);
-                    format!(
-                        "CASE typeof({column}) WHEN 'text' THEN 'T' || hex({column}) \
-                         ELSE quote({column}) END"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("json_array({quoted})")
-        })
-        .collect::<Vec<_>>()
-        .join(" || char(9) || ");
-    // An OFFSET stops SQLite from flattening the subquery into this one. It
-    // runs as a co-routine: each value is computed once per row (its type
-    // and its bytes agree, even for `random()`), and rows still stream.
-    let statement =
-        format!("SELECT {arrays} AS row FROM (SELECT * FROM temp.{RESULT_VIEW} LIMIT -1 OFFSET 0)");
-    let rows = diesel::sql_query(statement)
-        .load_iter::<Encoded, diesel::connection::DefaultLoadingMode>(&mut conn)
-        .map_err(|error| query(error.to_string()))?;
-    let mut given = 0;
-    for row in rows {
-        let row = row.map_err(|error| query(error.to_string()))?;
-        let mut values = Vec::with_capacity(columns.len());
-        for part in row.row.split('\t') {
-            let literals: Vec<String> =
-                serde_json::from_str(part).map_err(|error| query(error.to_string()))?;
-            for literal in literals {
-                values.push(parse_literal(&literal).map_err(query)?);
-            }
-        }
-        given += 1;
-        if each(&columns, values).is_break() {
-            break;
-        }
-    }
-    Ok(given)
-}
-
-/// Parse one `quote()` literal, or `T` and the hex of a text, into a value.
-pub(crate) fn parse_literal(literal: &str) -> Result<LakeValue, String> {
-    let bad = || format!("unexpected value {literal:?}");
-    if literal == "NULL" {
-        return Ok(LakeValue::Null);
-    }
-    if let Some(hex) = literal.strip_prefix('T') {
-        let bytes = decode_hex(hex).ok_or_else(bad)?;
-        return Ok(LakeValue::Text(String::from_utf8(bytes).unwrap_or_else(
-            |error| String::from_utf8_lossy(error.as_bytes()).into_owned(),
-        )));
-    }
-    if let Some(text) = literal.strip_prefix('\'') {
-        let text = text.strip_suffix('\'').ok_or_else(bad)?;
-        return Ok(LakeValue::Text(text.replace("''", "'")));
-    }
-    if let Some(hex) = literal.strip_prefix("X'") {
-        let hex = hex.strip_suffix('\'').ok_or_else(bad)?;
-        return decode_hex(hex).map(LakeValue::Blob).ok_or_else(bad);
-    }
-    if literal.contains(['.', 'e', 'E']) {
-        return literal
-            .parse::<f64>()
-            .map(LakeValue::Real)
-            .map_err(|_| bad());
-    }
-    literal
-        .parse::<i64>()
-        .map(LakeValue::Integer)
-        .map_err(|_| bad())
-}
-
-/// Decode upper- or lowercase hex. `None` for an odd length or a bad digit.
-fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) || !hex.is_ascii() {
-        return None;
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).ok())
-        .collect()
 }
 
 #[cfg(test)]
