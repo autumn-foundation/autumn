@@ -25,6 +25,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use autumn_web::reexports::tokio_util::sync::CancellationToken;
+
 /// Seconds between retention sweeps (hourly, matching Arroyo).
 const SWEEP_INTERVAL_SECONDS: u64 = 3600;
 
@@ -304,37 +306,64 @@ pub async fn sweep_recordings_root(
     report
 }
 
-/// Spawn the hourly retention sweep loop over `root`.
+/// Sweep `root` each hour until `shutdown` is cancelled.
 ///
-/// A `retention_days` of `0` disables retention: no loop is spawned. The loop
-/// tolerates transient failures (each tick is independent) and never panics.
+/// The first sweep runs at once. A `retention_days` of `0` disables
+/// retention: the function returns at once. Each sweep is independent, so a
+/// failed sweep does not stop the loop. The loop does not panic.
+///
+/// [`MediaPlugin::recordings_root`](crate::MediaPlugin::recordings_root)
+/// registers this loop as the background task
+/// [`RETENTION_TASK`](crate::RETENTION_TASK).
+pub async fn run_retention_sweep(
+    root: PathBuf,
+    retention_days: u32,
+    defer: Option<RetentionDefer>,
+    shutdown: CancellationToken,
+) {
+    if retention_days == 0 {
+        tracing::info!("media retention: disabled (retention_days = 0); no sweep");
+        return;
+    }
+    let mut interval = tokio::time::interval(Duration::from_secs(SWEEP_INTERVAL_SECONDS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        let report = tokio::select! {
+            () = shutdown.cancelled() => return,
+            report = sweep_recordings_root(&root, retention_days, SystemTime::now(), defer.as_ref()) => report,
+        };
+        if report.deleted > 0 || report.errors > 0 || report.deferred > 0 {
+            tracing::info!(
+                deleted = report.deleted,
+                deferred = report.deferred,
+                errors = report.errors,
+                "media retention sweep completed"
+            );
+        }
+    }
+}
+
+/// Spawn [`run_retention_sweep`] on the current runtime. It runs until the
+/// process exits.
+#[deprecated(
+    note = "It starts on every role. `MediaPlugin::recordings_root` registers the sweep as a \
+            background task. Call `run_retention_sweep` from your own task."
+)]
 pub fn spawn_retention_sweep_loop(
     root: PathBuf,
     retention_days: u32,
     defer: Option<RetentionDefer>,
 ) {
-    if retention_days == 0 {
-        tracing::info!("media retention: disabled (retention_days = 0); sweep not spawned");
-        return;
-    }
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(SWEEP_INTERVAL_SECONDS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let report =
-                sweep_recordings_root(&root, retention_days, SystemTime::now(), defer.as_ref())
-                    .await;
-            if report.deleted > 0 || report.errors > 0 || report.deferred > 0 {
-                tracing::info!(
-                    deleted = report.deleted,
-                    deferred = report.deferred,
-                    errors = report.errors,
-                    "media retention sweep completed"
-                );
-            }
-        }
-    });
+    tokio::spawn(run_retention_sweep(
+        root,
+        retention_days,
+        defer,
+        CancellationToken::new(),
+    ));
 }
 
 #[cfg(test)]
@@ -497,6 +526,46 @@ mod tests {
 
         assert_eq!(report, super::RetentionReport::default());
         assert!(old.exists(), "disabled retention deletes nothing");
+    }
+
+    #[tokio::test]
+    async fn run_retention_sweep_deletes_and_stops_on_shutdown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old = temp.path().join("old.mp4");
+        write_with_mtime(&old, b"old", 100 * DAY);
+        let shutdown = autumn_web::reexports::tokio_util::sync::CancellationToken::new();
+        let sweep = tokio::spawn(super::run_retention_sweep(
+            temp.path().to_path_buf(),
+            1,
+            None,
+            shutdown.clone(),
+        ));
+        // The first sweep runs at once.
+        for _ in 0..200 {
+            if !old.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!old.exists(), "the expired file stays");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), sweep)
+            .await
+            .expect("the sweep stops on shutdown")
+            .expect("the sweep does not panic");
+    }
+
+    #[tokio::test]
+    async fn run_retention_sweep_returns_at_once_when_retention_is_off() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shutdown = autumn_web::reexports::tokio_util::sync::CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            super::run_retention_sweep(temp.path().to_path_buf(), 0, None, shutdown),
+        )
+        .await
+        .expect("a disabled sweep returns at once");
     }
 
     #[test]

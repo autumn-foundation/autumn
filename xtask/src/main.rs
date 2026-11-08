@@ -9,6 +9,8 @@
 mod argv;
 mod docs;
 mod lanes;
+#[cfg(test)]
+mod plugin_spawns;
 mod runner;
 mod scripts;
 

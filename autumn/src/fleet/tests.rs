@@ -56,6 +56,8 @@ fn config(root: &Path, max_open: usize) -> DatabaseFleetConfig {
         replica_retention_after_delete: Duration::ZERO,
         restore_check_sample: 1,
         replication_workers: 1,
+        mmap_size: 0,
+        cache_size_kib: 0,
     }
 }
 

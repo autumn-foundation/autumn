@@ -289,6 +289,14 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   in `on_startup` that you do not move behaves as before. See
   [Background work in a plugin](../guide/extensibility.md#background-work-in-a-plugin)
   and [Background tasks for plugins and apps](../guide/jobs.md#background-tasks-for-plugins-and-apps).
+- **In-repo plugins on background tasks (#3546):** `autumn-media-plugin`
+  and `autumn-billing` start no loop from `on_startup` now. The reference
+  plugin shows the pattern: one-time setup in `on_startup`, the loop in
+  `background_task`. A test in `xtask` (`plugin_spawns`) fails on a spawn
+  that an `on_startup` or `state_initializer` argument of a plugin crate
+  reaches. `spawn_room_reaper_loop` and `spawn_retention_sweep_loop` are
+  deprecated. Call `run_room_reaper` or `run_retention_sweep` from a
+  `background_task`.
 - **New experimental surface (fleet engines, #3642):** `db::fleet_engine`
   (the `FleetEngine` trait and `DatabaseFleet::with_engine`) and
   `plugin_conformance::fleet` (`FleetFixture`, `run_fleet_conformance`).
@@ -357,6 +365,14 @@ Changes that still compile but behave differently at runtime. Examples:
 - A scheduled task now runs on a different worker.
 
 If nothing changed, delete this section.
+
+- **Media and billing loops follow the role (#3546).** The `db` room reaper
+  and the recording retention sweep do not run on `web`. The `memory` room
+  reaper runs on `combined` and `web`, not on `worker`. The dunning re-arm
+  runs on `combined` and `worker`, not on `web`. A fleet of only `web`
+  replicas needs a `worker`, or `MediaPlugin::room_reaper_on_every_role()`
+  and `MediaPlugin::retention_on_every_role()`. See
+  [Media: background tasks and roles](../guide/media.md#background-tasks-and-roles).
 
 ### Comments: the comment router shows one page (#3325)
 

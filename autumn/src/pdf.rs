@@ -97,6 +97,8 @@ use crate::download::Download;
 
 mod html;
 mod layout;
+#[cfg(test)]
+mod linear;
 mod metrics;
 
 /// A PDF document rendered from an HTML string, ready to return from a
