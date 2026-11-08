@@ -165,6 +165,11 @@ impl SecurityDump {
         if config.mail.should_mount_unsubscribe_endpoint() {
             exempt_paths.push(crate::mail::UNSUBSCRIBE_PATH.to_owned());
         }
+        // The outbox inbox endpoint is exempt at runtime too.
+        #[cfg(feature = "db")]
+        if config.outbox.serves_inbox() {
+            exempt_paths.push(crate::outbox::INBOX_PATH.to_owned());
+        }
         exempt_paths.sort();
         exempt_paths.dedup();
 
@@ -899,6 +904,16 @@ pub(crate) fn append_framework_routes_with_env(
                 "unsubscribe",
             ));
         }
+    }
+
+    // The outbox inbox endpoint, under the same predicate as the mount.
+    #[cfg(feature = "db")]
+    if config.outbox.serves_inbox() {
+        infos.push(RouteInfo::framework_route(
+            "POST",
+            crate::outbox::INBOX_PATH.to_owned(),
+            "outbox_inbox",
+        ));
     }
 
     // Widget story gallery routes (#1526), listed iff the resolved config

@@ -380,6 +380,47 @@ fn metrics_of(state: &AppState) -> &MetricsCollector {
 
 **Automation:** `manual` — remove `const` from the caller.
 
+---
+
+### Outbox: `OutboxConfig` has `destinations` and `inbox` fields
+
+**Why:** the relay can send a topic to another service, and an app can take
+messages from another service (issue #3553). `[outbox.destinations.<name>]`
+and `[outbox.inbox]` set this.
+
+**You are affected only if your code builds an `OutboxConfig` with a struct
+literal and no `..` spread.** TOML and `AUTUMN_*` config need no change: no
+destination and a disabled inbox keep the old behavior.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+OutboxConfig {
+    enabled: true,
+    // ...every other field...
+    retention_ms: 604_800_000,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+OutboxConfig {
+    enabled: true,
+    // ...every other field...
+    retention_ms: 604_800_000,
+    destinations: std::collections::BTreeMap::new(),
+    inbox: OutboxInboxConfig::default(),
+}
+```
+
+`TestApp::with_outbox` is no longer `const fn`. No `TestApp` value can exist
+in a const context, so no call changes.
+
+**Automation:** `manual` — add the two fields, or end the literal with
+`..OutboxConfig::default()`. A codemod cannot know which ending the app
+wants.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -455,6 +496,11 @@ single most valuable section of the guide — keep it factual and short.
 
 - New key `[database.fleet] max_resident_bytes` (default `0`, no budget),
   and its variable `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES`.
+
+- New tables `[outbox.destinations.<name>]` (`url`, `signing_secret`,
+  `topics`) and `[outbox.inbox]` (`enabled`, `signing_secret`,
+  `previous_signing_secrets`, `timestamp_tolerance_secs`, `max_body_bytes`).
+  A `signing_secret` of the form `"${NAME}"` reads the variable `NAME`.
 
 - `autumn.toml` keys that were renamed, removed, or have new defaults.
 - New `AUTUMN_*` environment variables.

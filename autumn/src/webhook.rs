@@ -1360,6 +1360,63 @@ async fn verify_request(
     })
 }
 
+/// Verifies an `Autumn-Signature: t=<unix>,v1=<hex>` header: the HMAC-SHA256
+/// of `{t}.{body}`, the scheme outbound webhooks send.
+///
+/// It checks the signature and the timestamp tolerance only. It keeps no
+/// replay record: the caller drops copies itself (the outbox inbox does).
+pub(crate) struct AutumnSignatureVerifier {
+    endpoint: ResolvedWebhookEndpoint,
+}
+
+impl std::fmt::Debug for AutumnSignatureVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutumnSignatureVerifier")
+            .field("name", &self.endpoint.config.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AutumnSignatureVerifier {
+    /// A verifier for `secret` and the `previous` secrets of a rotation.
+    pub(crate) fn new(
+        name: &str,
+        path: &str,
+        secret: &str,
+        previous: &[String],
+        tolerance_secs: u64,
+    ) -> Self {
+        let mut config = WebhookEndpointConfig::stripe(name, path, secret)
+            .with_timestamp_tolerance_secs(tolerance_secs)
+            .without_replay_protection();
+        config.signature_header = Some("Autumn-Signature".to_owned());
+        config.previous_secrets = previous.to_vec();
+        let keys = crate::security::config::ResolvedSigningKeys::new(
+            secret.as_bytes().to_vec(),
+            previous.iter().map(|key| key.as_bytes().to_vec()).collect(),
+        );
+        Self {
+            endpoint: ResolvedWebhookEndpoint { config, keys },
+        }
+    }
+
+    /// Check the signature of `body`.
+    ///
+    /// # Errors
+    ///
+    /// `400` for a missing or malformed header, `401` for a stale timestamp
+    /// or a signature that does not match.
+    pub(crate) fn verify(
+        &self,
+        headers: &HeaderMap,
+        body: &[u8],
+        received_at: SystemTime,
+    ) -> Result<(), crate::AutumnError> {
+        verify_stripe(&self.endpoint, headers, body, received_at)
+            .map_err(WebhookVerifyError::into_autumn_error)
+    }
+}
+
 fn verify_stripe(
     endpoint: &ResolvedWebhookEndpoint,
     headers: &HeaderMap,

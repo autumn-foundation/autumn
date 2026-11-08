@@ -164,6 +164,194 @@ messages have no order between them.
   runs on the job backend and the webhook store, so use a durable job backend
   and a durable store (`OutboundWebhookPlugin::sql()`).
 
+## Send to another service
+
+A module can become its own service, with its own database. Then a handler
+in that service cannot run in the same process. Use a remote destination.
+The relay sends the messages of some topics to the inbox of the other
+service. The outbox rules stay the same:
+
+- The message commits or rolls back with your data.
+- The relay sends it at least once, and the inbox drops each copy.
+- The relay sends the messages of one aggregate in order.
+- A failed send waits with jitter, then goes again. After `max_attempts`, it
+  is a dead letter. `requeue` sends it again.
+
+### Example: core sends `DealWon` to marketing
+
+Both services use the event from a shared crate. The event must have a
+`name`. See [Events: wire contracts](events.md#wire-contracts).
+
+```rust
+// contracts/src/lib.rs
+use autumn_web::event;
+
+#[event(name = "deal.won")]
+pub struct DealWon {
+    pub deal_id: i64,
+    pub amount_cents: i64,
+}
+```
+
+**Core** routes the topic to marketing:
+
+```toml
+# core/autumn.toml
+[outbox]
+enabled = true
+
+[outbox.destinations.marketing]
+url = "https://marketing.internal/_autumn/inbox"
+signing_secret = "${MARKETING_INBOX_SECRET}"
+topics = ["deal.won"]
+```
+
+Core writes the message in the transaction of its data. The topic is
+`DealWon::NAME`. The deal id is the aggregate.
+
+```rust
+use autumn_web::events::Event as _;
+use autumn_web::outbox::Outbox;
+use autumn_web::prelude::*;
+use contracts::DealWon;
+use scoped_futures::ScopedFutureExt as _;
+
+#[post("/deals/{id}/win")]
+async fn win_deal(Path(id): Path<i64>, mut db: Db, outbox: Outbox) -> AutumnResult<()> {
+    db.tx(|conn| {
+        async move {
+            let deal = mark_won(conn, id).await?;
+            let won = DealWon { deal_id: id, amount_cents: deal.amount_cents };
+            outbox
+                .write(conn, &format!("deal:{id}"), DealWon::NAME, &won)
+                .await?;
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+```
+
+**Marketing** serves the inbox. It uses the same secret, and trusts its own
+host name:
+
+```toml
+# marketing/autumn.toml
+[outbox]
+enabled = true
+
+[outbox.inbox]
+enabled = true
+signing_secret = "${MARKETING_INBOX_SECRET}"
+
+[security.trusted_hosts]
+hosts = ["marketing.internal"]
+```
+
+Marketing handles the topic with a `#[listener]`:
+
+```rust
+use autumn_web::prelude::*;
+use contracts::DealWon;
+
+#[listener(DealWon, durable)]
+async fn start_campaign(state: AppState, event: DealWon) -> AutumnResult<()> {
+    // `current_message_id()` is the id that core wrote.
+    let id = autumn_web::outbox::current_message_id();
+    send_thank_you(&state, event.deal_id, id).await
+}
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .listeners(listeners![start_campaign])
+        .run()
+        .await;
+}
+```
+
+### What happens
+
+1. Core commits. The row is in the core `autumn_outbox`. A rollback writes
+   no row, so nothing goes to marketing.
+2. The core relay POSTs the message to the marketing inbox.
+3. The inbox checks the signature. Then, in one transaction, it records the
+   message id with `Inbox::seen` and writes one row for each listener of the
+   topic in the marketing `autumn_outbox`. It returns `200`.
+4. The core relay marks the message sent.
+5. The marketing relay runs each listener. Each listener has its own retries
+   and dead letters, and keeps the order of each aggregate.
+
+If core does not get the `200`, it sends the message again. The inbox finds
+the id, returns `200` with `"status": "duplicate"`, and writes nothing. So
+the listener runs for one copy only.
+
+### The request
+
+`POST /_autumn/inbox` with a JSON body:
+
+```json
+{
+  "id": "0b6c…",
+  "topic": "deal.won",
+  "aggregate": "deal:42",
+  "created_at": "2026-11-08T10:00:00Z",
+  "payload": { "deal_id": 42, "amount_cents": 990000 }
+}
+```
+
+| Header | Value |
+| --- | --- |
+| `Autumn-Signature` | `t=<unix seconds>,v1=<hex HMAC-SHA256 of "{t}.{body}">` |
+| `Autumn-Message-Id` | The message id. For logs only. |
+| `Autumn-Topic` | The topic. For logs only. |
+
+The signature covers the whole body, so a copy cannot change the id, the
+topic or the aggregate. `autumn_web::outbox::inbox_signature` makes the
+header value. It is the scheme of
+[outbound webhooks](outbound-webhooks.md) (`Autumn-Signature`).
+
+| Status | Cause | The relay |
+| --- | --- | --- |
+| `200`, `"accepted"` | The listeners have the message. | Marks it sent. |
+| `200`, `"duplicate"` | The inbox has the id. | Marks it sent. |
+| `400` | No signature, or a bad body. | Sends again. |
+| `401` | A bad signature, or a time not in `timestamp_tolerance_secs`. | Sends again. |
+| `413` | The body is larger than `max_body_bytes`. | Sends again. |
+| `503` | This release has no listener for the topic, or no database. | Sends again. |
+
+The relay sends again after each status that is not `2xx`. Thus a rolling
+deploy is safe: a topic that arrives before the release that handles it
+gets `503`, and waits. The later messages of its aggregate wait too. Deploy
+the receiver first, or keep `max_attempts` high enough for the rollout.
+
+### Rules
+
+- **Contracts:** each topic of a destination must be an
+  `#[event(name = "...")]` in the binary of the producer. If it is not, the
+  boot fails. Thus `autumn contracts check` covers the producer and each
+  consumer. See [Events across releases](wire-contracts.md#events-across-releases).
+- **One place per topic:** a topic goes to one destination. It cannot also
+  have an `outbox_handler`.
+- **Roles:** the relay sends only on a process with the `outbox_relay`
+  capability (`combined` and `worker`). The inbox endpoint also runs on a
+  `web` process. Its rows wait for a relay of that service.
+- **Listeners:** on the receiver, each listener of the topic runs through
+  the relay, sync or durable. The `[outbox]` settings of the receiver set
+  its attempts and backoff, not the job settings of the listener.
+- **Secrets:** `"${NAME}"` reads the environment variable `NAME`. An unset
+  variable stops the boot. In production, a weak secret stops the boot. To
+  rotate, put the old secret in `previous_signing_secrets` of the receiver,
+  change the producer, then remove the old secret.
+- **Clocks:** the clocks of the two services must agree to within
+  `timestamp_tolerance_secs` (default 300).
+- **Hosts:** the receiver must trust the host of `url` in
+  `[security.trusted_hosts]`. The relay does not filter the URL for private
+  addresses: you set it, so an internal host is correct.
+- **Middleware:** the endpoint is exempt from CSRF, one-time submit tokens
+  and CAPTCHA. Its signature protects it.
+
 ## Relay
 
 The relay claims ready messages, calls their handlers, and marks them sent.
@@ -221,6 +409,15 @@ The relay claims ready messages, calls their handlers, and marks them sent.
 | `outbox.lease_ms` | `60000` | `AUTUMN_OUTBOX__LEASE_MS` |
 | `outbox.retention_ms` | `604800000` | `AUTUMN_OUTBOX__RETENTION_MS` |
 
+| `outbox.destinations.<name>.url` | none | — |
+| `outbox.destinations.<name>.signing_secret` | none | `"${NAME}"` |
+| `outbox.destinations.<name>.topics` | none | — |
+| `outbox.inbox.enabled` | `false` | — |
+| `outbox.inbox.signing_secret` | none | `"${NAME}"` |
+| `outbox.inbox.previous_signing_secrets` | `[]` | `"${NAME}"` |
+| `outbox.inbox.timestamp_tolerance_secs` | `300` | — |
+| `outbox.inbox.max_body_bytes` | `1048576` | — |
+
 `batch_size`, `max_attempts` and `lease_ms` must be greater than zero.
 `max_backoff_ms` must not be smaller than `initial_backoff_ms`.
 
@@ -262,4 +459,6 @@ claims of the dead relay end. See `autumn/tests/sim_outbox_crash.rs` and
 - An `#[inbox]` attribute. Call `Inbox::seen` in the handler.
 - Exactly-once side effects outside your database. The inbox makes a
   database effect exactly once. A call to another system needs an id that
-  system can use to drop copies, for example `webhook-id`.
+  system can use to drop copies, for example `webhook-id`. Another Autumn
+  service gets this from its inbox: see
+  [Send to another service](#send-to-another-service).

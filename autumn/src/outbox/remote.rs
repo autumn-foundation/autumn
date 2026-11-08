@@ -1,0 +1,384 @@
+//! Outbox delivery to another service, and the inbox endpoint that takes it.
+//!
+//! **Producer.** Each topic of `[outbox.destinations.<name>]` gets a relay
+//! handler. The handler POSTs the message to the destination as a signed
+//! envelope. The relay keeps its rules: retry with jitter, order per
+//! aggregate, dead letters and `requeue`.
+//!
+//! **Receiver.** `POST /_autumn/inbox` verifies the signature. Then, in one
+//! transaction, it records the message id with [`Inbox::seen`] and writes one
+//! relay row for each `#[listener]` of the topic. A copy commits nothing new.
+//! The receiver relay then runs each listener, in order per aggregate.
+//!
+//! The envelope is the JSON body
+//! `{"id", "topic", "aggregate", "created_at", "payload"}`. The
+//! `Autumn-Signature: t=<unix>,v1=<hex>` header signs `{t}.{body}` with
+//! HMAC-SHA256. The id, topic and aggregate are in the signed body, so a
+//! replay cannot change them.
+
+#[cfg(feature = "http-client")]
+use std::sync::Arc;
+
+use axum::response::IntoResponse as _;
+use chrono::{DateTime, Utc};
+use scoped_futures::ScopedFutureExt as _;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::{
+    CURRENT_MESSAGE_ID, Inbox, OutboxHandlers, OutboxMessage, TOPIC_INBOX, insert_message_with_id,
+    is_valid_topic, mail_pool,
+};
+use crate::config::{OutboxConfig, OutboxInboxConfig};
+use crate::{AppState, AutumnError, AutumnResult};
+
+/// The path of the inbox endpoint.
+pub const INBOX_PATH: &str = "/_autumn/inbox";
+/// The header that signs an inbox request: `t=<unix seconds>,v1=<hex>`.
+pub const SIGNATURE_HEADER: &str = "Autumn-Signature";
+/// The header that holds the message id. For logs only: the signed body holds
+/// the id that counts.
+pub const MESSAGE_ID_HEADER: &str = "Autumn-Message-Id";
+/// The header that holds the topic. For logs only, as [`MESSAGE_ID_HEADER`].
+pub const TOPIC_HEADER: &str = "Autumn-Topic";
+
+/// The [`Inbox`] consumer name of the inbox endpoint.
+const INBOX_CONSUMER: &str = "autumn.inbox";
+
+/// The body of an inbox request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Envelope {
+    id: String,
+    topic: String,
+    aggregate: String,
+    created_at: DateTime<Utc>,
+    payload: Value,
+}
+
+/// The `Autumn-Signature` value for `body`, signed at `timestamp` (Unix
+/// seconds): `t=<timestamp>,v1=<hex HMAC-SHA256 of "{timestamp}.{body}">`.
+#[must_use]
+pub fn inbox_signature(secret: &str, timestamp: i64, body: &str) -> String {
+    let signature = crate::security::config::hmac_sha256_hex(
+        secret.as_bytes(),
+        format!("{timestamp}.{body}").as_bytes(),
+    );
+    format!("t={timestamp},v1={signature}")
+}
+
+// ── Producer ────────────────────────────────────────────────────────────────
+
+/// Add one relay handler for each destination topic.
+///
+/// # Errors
+///
+/// Returns an error when a topic also has an `outbox_handler`, a topic is not
+/// an `#[event(name = "...")]` in this binary, a secret is not set, or the
+/// `http-client` feature is off.
+pub(super) fn add_destinations(
+    handlers: &mut OutboxHandlers,
+    config: &OutboxConfig,
+) -> AutumnResult<()> {
+    for (name, destination) in &config.destinations {
+        for topic in &destination.topics {
+            if handlers.handlers.contains_key(topic) {
+                return Err(AutumnError::internal_server_error_msg(format!(
+                    "outbox topic {topic:?} has an outbox_handler and is in \
+                     outbox.destinations.{name}; send each topic to one place"
+                )));
+            }
+            if crate::events::event_contract(topic).is_none() {
+                return Err(AutumnError::internal_server_error_msg(format!(
+                    "outbox.destinations.{name}: topic {topic:?} is not an \
+                     #[event(name = \"...\")] in this binary. A remote topic must be an event \
+                     with a descriptor, so that `autumn contracts check` covers it"
+                )));
+            }
+        }
+        let secret = destination
+            .signing_secret
+            .clone()
+            .filter(|secret| !secret.is_empty())
+            .ok_or_else(|| {
+                AutumnError::internal_server_error_msg(format!(
+                    "outbox.destinations.{name}.signing_secret is required"
+                ))
+            })?;
+        add_destination(
+            handlers,
+            name,
+            &destination.url,
+            secret,
+            &destination.topics,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "http-client")]
+fn add_destination(
+    handlers: &mut OutboxHandlers,
+    name: &str,
+    url: &str,
+    secret: String,
+    topics: &[String],
+) -> AutumnResult<()> {
+    let destination = Arc::new(Destination {
+        name: name.to_owned(),
+        url: url.to_owned(),
+        secret,
+    });
+    for topic in topics {
+        let destination = Arc::clone(&destination);
+        handlers.insert_unchecked(topic.clone(), move |state, message| {
+            deliver(state, Arc::clone(&destination), message)
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "http-client"))]
+fn add_destination(
+    _handlers: &mut OutboxHandlers,
+    name: &str,
+    _url: &str,
+    _secret: String,
+    _topics: &[String],
+) -> AutumnResult<()> {
+    Err(AutumnError::internal_server_error_msg(format!(
+        "outbox.destinations.{name} needs the autumn-web `http-client` feature"
+    )))
+}
+
+/// One remote destination of the relay.
+#[cfg(feature = "http-client")]
+struct Destination {
+    name: String,
+    url: String,
+    secret: String,
+}
+
+/// POST `message` to `destination`. A `2xx` response marks it sent. Any other
+/// result is a failure, and the relay sends the message again later.
+#[cfg(feature = "http-client")]
+async fn deliver(
+    state: AppState,
+    destination: Arc<Destination>,
+    message: OutboxMessage,
+) -> AutumnResult<()> {
+    let body = serde_json::to_string(&Envelope {
+        id: message.id.clone(),
+        topic: message.topic.clone(),
+        aggregate: message.aggregate.clone(),
+        created_at: message.created_at,
+        payload: message.payload,
+    })
+    .map_err(|error| AutumnError::internal_server_error_msg(error.to_string()))?;
+    // The receiver checks `t=` against its own clock: real time outside a
+    // `Sim`, the sim clock inside one.
+    let timestamp = crate::time::ambient_now().timestamp();
+    let signature = inbox_signature(&destination.secret, timestamp, &body);
+    let response = crate::http_client::Client::from_state(&state)
+        .post(&destination.url)
+        .header("Content-Type", "application/json")
+        .header(SIGNATURE_HEADER, signature)
+        .header(MESSAGE_ID_HEADER, &message.id)
+        .header(TOPIC_HEADER, &message.topic)
+        .text_body(body)
+        .breaker_scoped()
+        .send()
+        .await
+        .map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "outbox destination {}: {error}",
+                destination.name
+            ))
+        })?;
+    if response.is_success() {
+        return Ok(());
+    }
+    Err(AutumnError::service_unavailable_msg(format!(
+        "outbox destination {}: the inbox returned {}",
+        destination.name,
+        response.status()
+    )))
+}
+
+// ── Receiver ────────────────────────────────────────────────────────────────
+
+/// The signature check of the inbox endpoint. The app installs it when
+/// `outbox.inbox.enabled = true`.
+#[derive(Debug)]
+pub(crate) struct InboxVerifier {
+    verifier: crate::webhook::AutumnSignatureVerifier,
+    max_body_bytes: usize,
+}
+
+impl InboxVerifier {
+    /// A verifier for `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the signing secret is not set.
+    pub(super) fn from_config(config: &OutboxInboxConfig) -> AutumnResult<Self> {
+        let secret = config
+            .signing_secret
+            .as_deref()
+            .filter(|secret| !secret.is_empty())
+            .ok_or_else(|| {
+                AutumnError::internal_server_error_msg("outbox.inbox.signing_secret is required")
+            })?;
+        Ok(Self {
+            verifier: crate::webhook::AutumnSignatureVerifier::new(
+                "outbox-inbox",
+                INBOX_PATH,
+                secret,
+                &config.previous_signing_secrets,
+                config.timestamp_tolerance_secs,
+            ),
+            max_body_bytes: config.max_body_bytes,
+        })
+    }
+}
+
+/// The router of the inbox endpoint.
+pub(crate) fn inbox_router() -> axum::Router<AppState> {
+    axum::Router::new().route(INBOX_PATH, axum::routing::post(receive))
+}
+
+/// `200 {"status": "accepted" | "duplicate"}`, or a problem response.
+async fn receive(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: http::HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    match accept(&state, &headers, body).await {
+        Ok(status) => axum::Json(serde_json::json!({ "status": status })).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Verify the request and hand the message to the listeners of its topic.
+///
+/// Status codes: `400` for a bad header or body, `401` for a bad signature,
+/// `413` for a body that is too large, and `503` when this release has no
+/// listener for the topic. The relay of the producer sends again on each of
+/// them, so a topic that arrives before the release that handles it waits.
+async fn accept(
+    state: &AppState,
+    headers: &http::HeaderMap,
+    body: axum::body::Body,
+) -> AutumnResult<&'static str> {
+    let verifier = state
+        .extension::<InboxVerifier>()
+        .ok_or_else(|| AutumnError::service_unavailable_msg("the outbox inbox is not installed"))?;
+    let bytes = axum::body::to_bytes(body, verifier.max_body_bytes)
+        .await
+        .map_err(|_| {
+            AutumnError::bad_request_msg("inbox body is larger than outbox.inbox.max_body_bytes")
+                .with_status(http::StatusCode::PAYLOAD_TOO_LARGE)
+        })?;
+    verifier
+        .verifier
+        .verify(headers, &bytes, crate::time::ambient_system_time())?;
+    let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
+        // The serde text can quote payload values, so give only its kind.
+        AutumnError::bad_request_msg(format!(
+            "inbox body is not a message envelope ({:?})",
+            error.classify()
+        ))
+    })?;
+    if envelope.id.is_empty() || !is_valid_topic(&envelope.topic) {
+        return Err(AutumnError::bad_request_msg(
+            "inbox message needs an id and a topic of A-Z a-z 0-9 . _ : -",
+        ));
+    }
+    let listeners: Vec<String> = state
+        .extension::<crate::events::EventRegistry>()
+        .map(|registry| {
+            registry
+                .listeners_for(&envelope.topic)
+                .iter()
+                .map(|listener| listener.listener_name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if listeners.is_empty() {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "this release has no #[listener] for topic {}; send it again later",
+            envelope.topic
+        )));
+    }
+    let pool = mail_pool(state)
+        .ok_or_else(|| AutumnError::service_unavailable_msg("the outbox inbox needs a database"))?;
+    let mut conn = pool.get().await.map_err(|error| {
+        AutumnError::service_unavailable_msg(format!("outbox inbox: no connection: {error}"))
+    })?;
+    let clock = state.clock_arc();
+    let message_id = envelope.id.clone();
+    let status = crate::db::scoped_transaction(&mut *conn, |conn| {
+        async move {
+            if Inbox::new(INBOX_CONSUMER).seen(conn, &envelope.id).await? {
+                return Ok::<_, AutumnError>("duplicate");
+            }
+            let message = serde_json::to_value(&envelope)
+                .map_err(|error| AutumnError::internal_server_error_msg(error.to_string()))?;
+            for listener in &listeners {
+                let body = serde_json::json!({ "listener": listener, "message": message });
+                // One lane per listener and aggregate: the order of the
+                // producer holds, and one failing listener does not stop
+                // the others.
+                insert_message_with_id(
+                    conn,
+                    format!("{}:{listener}", envelope.id),
+                    clock.as_ref(),
+                    Some(&format!("{listener}|{}", envelope.aggregate)),
+                    TOPIC_INBOX,
+                    &body,
+                )
+                .await?;
+            }
+            Ok("accepted")
+        }
+        .scope_boxed()
+    })
+    .await?;
+    if status == "duplicate" {
+        tracing::debug!(%message_id, "outbox inbox dropped a copy");
+    }
+    Ok(status)
+}
+
+#[derive(Deserialize)]
+struct InboxRow {
+    listener: String,
+    message: Envelope,
+}
+
+/// The relay handler of [`TOPIC_INBOX`]: run one listener for one message
+/// that the inbox took.
+///
+/// The listener runs with [`current_message_id`](super::current_message_id)
+/// set to the id of the producer.
+pub(super) async fn run_inbox_listener(
+    state: AppState,
+    message: OutboxMessage,
+) -> AutumnResult<()> {
+    let row: InboxRow = message.payload_as()?;
+    let registry = state
+        .extension::<crate::events::EventRegistry>()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("no event listeners installed"))?;
+    let handler = registry
+        .listeners_for(&row.message.topic)
+        .iter()
+        .find(|listener| listener.listener_name == row.listener)
+        .map(|listener| listener.handler)
+        .ok_or_else(|| {
+            AutumnError::internal_server_error_msg(format!(
+                "listener {} of topic {} is not in this release",
+                row.listener, row.message.topic
+            ))
+        })?;
+    let run = handler(state.clone(), row.message.payload);
+    CURRENT_MESSAGE_ID.scope(row.message.id, run).await
+}
