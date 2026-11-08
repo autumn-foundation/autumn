@@ -579,8 +579,34 @@ impl<'a> Analyzer<'a> {
                     .position(|c| c.node == node)
                     .map(Bound::Response)
             }
+            Expr::Match(m) => self.match_passes_through(m).map(Bound::Response),
             _ => None,
         }
+    }
+
+    /// The response a `match` hands back unchanged, if any.
+    ///
+    /// `match m.payload_as::<E>() { Ok(e) => e, Err(err) => return … }` is
+    /// the payload: each arm either gives back the value its pattern binds
+    /// (`x`, `Ok(x)`, `Some(x)`), or does not finish (`return`, `break`,
+    /// `continue`, `panic!`, `unreachable!`, `todo!`).
+    fn match_passes_through(&self, m: &syn::ExprMatch) -> Option<usize> {
+        let index = self.response_of(&m.expr)?;
+        let mut passes = false;
+        for arm in &m.arms {
+            if diverges(&arm.body) {
+                continue;
+            }
+            let bound = bound_name(&arm.pat)?;
+            let Expr::Path(body) = peel(&arm.body) else {
+                return None;
+            };
+            if body.path.get_ident().map(field_name) != Some(bound) {
+                return None;
+            }
+            passes = true;
+        }
+        passes.then_some(index)
     }
 
     /// The call index an expression's response came from.
@@ -793,6 +819,45 @@ fn is_suffix(haystack: &[String], needle: &[String]) -> bool {
 fn field_name(ident: &Ident) -> String {
     let raw = ident.to_string();
     raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
+}
+
+/// The one name a pattern binds to the whole value: `x`, `Ok(x)`, `Some(x)`.
+fn bound_name(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(p) if p.subpat.is_none() => Some(field_name(&p.ident)),
+        syn::Pat::TupleStruct(p)
+            if p.elems.len() == 1
+                && p.path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "Ok" || s.ident == "Some") =>
+        {
+            bound_name(&p.elems[0])
+        }
+        _ => None,
+    }
+}
+
+/// Whether an arm body never finishes with a value.
+fn diverges(expr: &Expr) -> bool {
+    match expr {
+        Expr::Return(_) | Expr::Break(_) | Expr::Continue(_) => true,
+        Expr::Macro(m) => m.mac.path.segments.last().is_some_and(|s| {
+            matches!(
+                s.ident.to_string().as_str(),
+                "panic" | "unreachable" | "todo" | "unimplemented" | "bail"
+            )
+        }),
+        Expr::Block(b) => b.block.stmts.last().is_some_and(|s| match s {
+            Stmt::Expr(e, _) => diverges(e),
+            Stmt::Macro(m) => diverges(&Expr::Macro(syn::ExprMacro {
+                attrs: Vec::new(),
+                mac: m.mac.clone(),
+            })),
+            _ => false,
+        }),
+        _ => false,
+    }
 }
 
 /// Peel the wrappers that sit between a call and the value it produces.

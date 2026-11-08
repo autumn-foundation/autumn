@@ -295,6 +295,21 @@ mod tests {
     }
 
     #[test]
+    fn a_match_that_hands_back_the_decode_is_the_payload() {
+        let reads = consumer(
+            "async fn h(m: OutboxMessage) -> R { \
+             let event = match m.payload_as::<ContactUpdated>() { \
+                 Ok(e) => e, Err(err) => return Err(err.into()) }; \
+             let _ = event.email; \
+             let other = match m.payload_as::<ContactUpdated>() { \
+                 Ok(e) => e.id, Err(_) => { panic!(\"bad\") } }; \
+             let _ = other.not_payload; Ok(()) }",
+        );
+        // `other` is a field, not the payload, so `not_payload` is no read.
+        assert_eq!(names(&reads), ["email", "id"]);
+    }
+
+    #[test]
     fn a_method_call_on_the_payload_is_not_a_read() {
         assert_eq!(
             listener(
