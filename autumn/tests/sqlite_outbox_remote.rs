@@ -1,4 +1,4 @@
-//! Outbox delivery to another service, with inbox dedupe on the receiver.
+//! Outbox delivery to another service. The receiver inbox drops copies.
 //!
 //! Two in-process apps on two `SQLite` databases. App A ("core") routes the
 //! `deal.won` topic to app B ("marketing") through
@@ -364,6 +364,42 @@ async fn order_per_aggregate_is_kept_across_the_hop_and_failures() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_failed_send_holds_the_later_messages_of_its_aggregate() {
+    let core_db = database().await;
+    let marketing_db = database().await;
+    let marketing = marketing(marketing_db.pool(), true).build();
+    let marketing_state = marketing.state().clone();
+    let net = SimNet::new().host("marketing", marketing.into_router());
+    let mut sim = Sim::from_seed(14);
+    sim.net(net.clone());
+    sim.build(core(core_db.pool()));
+    let core_state = sim.client().state().clone();
+
+    write_deal(&core_state, 5, 1, true).await;
+    sim.run_to_idle().await;
+    // The second send fails. The third must wait for it.
+    net.partition("marketing");
+    write_deal(&core_state, 5, 2, true).await;
+    write_deal(&core_state, 5, 3, true).await;
+    sim.run_to_idle().await;
+    let rows = core_rows(&core_db.pool()).await;
+    assert!(rows[0].dispatched_at.is_some());
+    assert!(rows[1].dispatched_at.is_none() && rows[1].attempts >= 1);
+    assert_eq!(rows[2].attempts, 0, "the third message is not sent yet");
+
+    net.heal("marketing");
+    sim.advance(Duration::from_secs(1)).await;
+    sim.run_to_idle().await;
+    drain_marketing(&marketing_state).await;
+    let seqs: Vec<i64> = won(&marketing_db.pool())
+        .await
+        .iter()
+        .map(|won| won.seq)
+        .collect();
+    assert_eq!(seqs, vec![1, 2, 3]);
+}
+
 /// A signed request to B's inbox. `secret` signs it.
 fn inbox_request(
     client: &autumn_web::test::TestClient,
@@ -422,6 +458,15 @@ async fn inbox_rejects_a_bad_signature_and_an_unknown_topic_as_retryable() {
         .send()
         .await
         .assert_status(401);
+    // Too many `v1=` candidates: refused before any hash work.
+    let many = format!("t={timestamp},{}", vec!["v1=00"; 9].join(","));
+    client
+        .post(outbox::INBOX_PATH)
+        .header(outbox::SIGNATURE_HEADER, &many)
+        .body("{}")
+        .send()
+        .await
+        .assert_status(400);
     // An unknown topic: 503, which the relay retries.
     inbox_request(&client, Some(SECRET), "deal.lost", "m-2")
         .send()
@@ -440,6 +485,18 @@ async fn inbox_rejects_a_bad_signature_and_an_unknown_topic_as_retryable() {
     assert!(copy.text().contains("duplicate"), "{}", copy.text());
     drain_marketing(client.state()).await;
     assert_eq!(won(&marketing_db.pool()).await.len(), 1);
+
+    // A later release without the listener still acknowledges the copy.
+    let later = marketing(marketing_db.pool(), false).build();
+    let copy = inbox_request(&later, Some(SECRET), TOPIC, "m-3")
+        .send()
+        .await;
+    copy.assert_status(200);
+    assert!(copy.text().contains("duplicate"), "{}", copy.text());
+    inbox_request(&later, Some(SECRET), TOPIC, "m-4")
+        .send()
+        .await
+        .assert_status(503);
     assert!(
         won(&marketing_db.pool())
             .await

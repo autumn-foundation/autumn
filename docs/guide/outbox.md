@@ -257,7 +257,7 @@ use contracts::DealWon;
 
 #[listener(DealWon, durable)]
 async fn start_campaign(state: AppState, event: DealWon) -> AutumnResult<()> {
-    // `current_message_id()` is the id that core wrote.
+    // `current_message_id()` returns `Some` with the id that core wrote.
     let id = autumn_web::outbox::current_message_id();
     send_thank_you(&state, event.deal_id, id).await
 }
@@ -285,7 +285,10 @@ async fn main() {
 
 If core does not get the `200`, it sends the message again. The inbox finds
 the id, returns `200` with `"status": "duplicate"`, and writes nothing. So
-the listener runs for one copy only.
+marketing takes one copy only. The marketing relay itself sends at least
+once: a crash after the listener and before the relay marks the row sent
+runs the listener again. For an effect that occurs one time only, call
+`Inbox::seen` with `current_message_id()` in the transaction of the effect.
 
 ### The request
 
@@ -321,7 +324,9 @@ header value. It is the scheme of
 | `413` | The body is larger than `max_body_bytes`. | Sends again. |
 | `503` | This release has no listener for the topic, or no database. | Sends again. |
 
-The relay sends again after each status that is not `2xx`. Thus a rolling
+Only a `200` with one of these two statuses marks the message sent. The
+relay does not follow a redirect, so a login page does not count as a
+delivery. The relay sends again after each other result. Thus a rolling
 deploy is safe: a topic that arrives before the release that handles it
 gets `503`, and waits. The later messages of its aggregate wait too. Deploy
 the receiver first, or keep `max_attempts` high enough for the rollout.
@@ -331,7 +336,8 @@ the receiver first, or keep `max_attempts` high enough for the rollout.
 - **Contracts:** each topic of a destination must be an
   `#[event(name = "...")]` in the binary of the producer. If it is not, the
   boot fails. Thus `autumn contracts check` covers the producer and each
-  consumer. See [Events across releases](wire-contracts.md#events-across-releases).
+  consumer. For an `#[event(opaque)]` it checks only the name and version.
+  See [Events across releases](wire-contracts.md#events-across-releases).
 - **One place per topic:** a topic goes to one destination. It cannot also
   have an `outbox_handler`.
 - **Roles:** the relay sends only on a process with the `outbox_relay`
@@ -339,13 +345,24 @@ the receiver first, or keep `max_attempts` high enough for the rollout.
   `web` process. Its rows wait for a relay of that service.
 - **Listeners:** on the receiver, each listener of the topic runs through
   the relay, sync or durable. The `[outbox]` settings of the receiver set
-  its attempts and backoff, not the job settings of the listener.
+  its attempts and backoff, not the job settings of the listener. A queued
+  row names its listener by module path. If you move or rename a listener,
+  its queued rows fail and become dead letters. Let the queue empty first.
+- **Retention:** the inbox keeps each id for `retention_ms`. The receiver
+  can take a message, but the producer can miss the `200` and make it a dead
+  letter. If the producer requeues it after `retention_ms`, the listener can
+  run again.
 - **Secrets:** `"${NAME}"` reads the environment variable `NAME`. An unset
   variable stops the boot. In production, a weak secret stops the boot. To
-  rotate, put the old secret in `previous_signing_secrets` of the receiver,
-  change the producer, then remove the old secret.
+  rotate: on the receiver, set the new secret in `signing_secret` and move
+  the old one to `previous_signing_secrets`. Change the producer. Then
+  remove the old secret.
+- **Trust:** the inbox has one secret. Each service that has it can send
+  each topic with each id. Give it only to services you trust as much as
+  your own.
 - **Clocks:** the clocks of the two services must agree to within
-  `timestamp_tolerance_secs` (default 300).
+  `timestamp_tolerance_secs` (default 300). It must be shorter than
+  `retention_ms`, so a signature ends before the inbox forgets its id.
 - **Hosts:** the receiver must trust the host of `url` in
   `[security.trusted_hosts]`. The relay does not filter the URL for private
   addresses: you set it, so an internal host is correct.
@@ -408,15 +425,17 @@ The relay claims ready messages, calls their handlers, and marks them sent.
 | `outbox.max_backoff_ms` | `300000` | `AUTUMN_OUTBOX__MAX_BACKOFF_MS` |
 | `outbox.lease_ms` | `60000` | `AUTUMN_OUTBOX__LEASE_MS` |
 | `outbox.retention_ms` | `604800000` | `AUTUMN_OUTBOX__RETENTION_MS` |
-
 | `outbox.destinations.<name>.url` | none | — |
-| `outbox.destinations.<name>.signing_secret` | none | `"${NAME}"` |
+| `outbox.destinations.<name>.signing_secret` | none | — |
 | `outbox.destinations.<name>.topics` | none | — |
 | `outbox.inbox.enabled` | `false` | — |
-| `outbox.inbox.signing_secret` | none | `"${NAME}"` |
-| `outbox.inbox.previous_signing_secrets` | `[]` | `"${NAME}"` |
+| `outbox.inbox.signing_secret` | none | — |
+| `outbox.inbox.previous_signing_secrets` | `[]` | — |
 | `outbox.inbox.timestamp_tolerance_secs` | `300` | — |
 | `outbox.inbox.max_body_bytes` | `1048576` | — |
+
+A secret value of the form `"${NAME}"` reads the environment variable
+`NAME` at load.
 
 `batch_size`, `max_attempts` and `lease_ms` must be greater than zero.
 `max_backoff_ms` must not be smaller than `initial_backoff_ms`.

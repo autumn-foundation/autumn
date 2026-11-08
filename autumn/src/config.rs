@@ -5339,7 +5339,8 @@ pub struct OutboxInboxConfig {
     pub signing_secret: Option<String>,
     /// Old keys that still verify during a rotation.
     pub previous_signing_secrets: Vec<String>,
-    /// Largest difference between the signature time and now. Default `300`.
+    /// Largest difference between the signature time and now, in seconds.
+    /// Default `300`.
     pub timestamp_tolerance_secs: u64,
     /// Largest request body. Default `1048576` (1 MiB).
     pub max_body_bytes: usize,
@@ -5492,6 +5493,15 @@ impl OutboxConfig {
             return Err(ConfigError::Validation(
                 "outbox.inbox.enabled needs outbox.enabled = true: the inbox hands each \
                  message to the relay"
+                    .to_owned(),
+            ));
+        }
+        // A copy is dropped only while its inbox row exists. The purge deletes
+        // rows after `retention_ms`, so a signature must expire before that.
+        if self.inbox.timestamp_tolerance_secs.saturating_mul(1000) >= self.retention_ms {
+            return Err(ConfigError::Validation(
+                "outbox.inbox.timestamp_tolerance_secs must be shorter than \
+                 outbox.retention_ms: else a copy can arrive after the purge"
                     .to_owned(),
             ));
         }
@@ -9009,13 +9019,13 @@ impl AutumnConfig {
             "AUTUMN_OUTBOX__MAX_BACKOFF_MS",
             &mut self.outbox.max_backoff_ms,
         );
-        self.outbox.resolve_secret_references(env);
         parse_env(env, "AUTUMN_OUTBOX__LEASE_MS", &mut self.outbox.lease_ms);
         parse_env(
             env,
             "AUTUMN_OUTBOX__RETENTION_MS",
             &mut self.outbox.retention_ms,
         );
+        self.outbox.resolve_secret_references(env);
     }
 
     /// Set `role` from `AUTUMN_ROLE`. A blank value leaves it. A value that is
@@ -19456,6 +19466,19 @@ path = "/healthz"
                     ..OutboxConfig::default()
                 },
                 "outbox.enabled",
+            ),
+            (
+                OutboxConfig {
+                    enabled: true,
+                    retention_ms: 60_000,
+                    inbox: OutboxInboxConfig {
+                        enabled: true,
+                        signing_secret: Some(REMOTE_SECRET.to_owned()),
+                        ..OutboxInboxConfig::default()
+                    },
+                    ..OutboxConfig::default()
+                },
+                "retention_ms",
             ),
         ];
         for (config, needle) in cases {

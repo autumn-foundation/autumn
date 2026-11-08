@@ -76,6 +76,7 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
 /// `#[event]` registers one for each event with a `name`: those events
 /// have a descriptor in the release bundle. A remote outbox destination
 /// accepts only these topics, so the cross-release check covers them.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventContract {
     /// The topic: [`Event::NAME`].
@@ -90,6 +91,7 @@ inventory::collect!(EventContract);
 
 /// The [`EventContract`] of `topic`, if an `#[event(name = "...")]` in this
 /// binary has that topic.
+#[doc(hidden)]
 #[must_use]
 pub fn event_contract(topic: &str) -> Option<&'static EventContract> {
     inventory::iter::<EventContract>

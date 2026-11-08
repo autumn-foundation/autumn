@@ -1365,10 +1365,12 @@ async fn verify_request(
 ///
 /// It checks the signature and the timestamp tolerance only. It keeps no
 /// replay record: the caller drops copies itself (the outbox inbox does).
+#[cfg(feature = "db")]
 pub(crate) struct AutumnSignatureVerifier {
     endpoint: ResolvedWebhookEndpoint,
 }
 
+#[cfg(feature = "db")]
 impl std::fmt::Debug for AutumnSignatureVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AutumnSignatureVerifier")
@@ -1377,6 +1379,7 @@ impl std::fmt::Debug for AutumnSignatureVerifier {
     }
 }
 
+#[cfg(feature = "db")]
 impl AutumnSignatureVerifier {
     /// A verifier for `secret` and the `previous` secrets of a rotation.
     pub(crate) fn new(
@@ -1398,6 +1401,28 @@ impl AutumnSignatureVerifier {
         Self {
             endpoint: ResolvedWebhookEndpoint { config, keys },
         }
+    }
+
+    /// Check the header shape and the timestamp before the body is read.
+    ///
+    /// # Errors
+    ///
+    /// `400` for a missing or malformed header, `401` for a stale timestamp.
+    pub(crate) fn precheck(
+        &self,
+        headers: &HeaderMap,
+        received_at: SystemTime,
+    ) -> Result<(), crate::AutumnError> {
+        let check = || {
+            let header = required_header(headers, signature_header(&self.endpoint))?;
+            let (timestamp, _) = parse_stripe_signature(header)?;
+            verify_timestamp(
+                timestamp,
+                received_at,
+                self.endpoint.config.timestamp_tolerance_secs,
+            )
+        };
+        check().map_err(WebhookVerifyError::into_autumn_error)
     }
 
     /// Check the signature of `body`.
@@ -1437,10 +1462,9 @@ fn verify_stripe(
     signed_payload.push(b'.');
     signed_payload.extend_from_slice(body);
 
-    if signatures
-        .iter()
-        .any(|signature| endpoint.keys.verify(&signed_payload, signature))
-    {
+    // One MAC per key, not one per candidate: a header with many `v1=`
+    // entries must not multiply the hash work over the body.
+    if endpoint.keys.verify_any(&signed_payload, &signatures) {
         Ok(())
     } else {
         Err(WebhookVerifyError::SignatureMismatch)
@@ -1556,11 +1580,15 @@ fn parse_stripe_signature(header: &str) -> Result<(i64, Vec<&str>), WebhookVerif
     }
 
     let timestamp = timestamp.ok_or(WebhookVerifyError::MalformedTimestamp)?;
-    if signatures.is_empty() {
+    if signatures.is_empty() || signatures.len() > MAX_SIGNATURE_CANDIDATES {
         return Err(WebhookVerifyError::MalformedSignature);
     }
     Ok((timestamp, signatures))
 }
+
+/// Most `v1=` entries one `t=…,v1=…` header may hold. A sender lists one per
+/// active secret, so a rotation needs two or three.
+const MAX_SIGNATURE_CANDIDATES: usize = 8;
 
 fn verify_timestamp(
     timestamp: i64,

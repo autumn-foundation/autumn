@@ -104,13 +104,21 @@ pub(super) fn add_destinations(
                     "outbox.destinations.{name}.signing_secret is required"
                 ))
             })?;
+        #[cfg(feature = "http-client")]
         add_destination(
             handlers,
             name,
             &destination.url,
             secret,
             &destination.topics,
-        )?;
+        );
+        #[cfg(not(feature = "http-client"))]
+        {
+            drop(secret);
+            return Err(AutumnError::internal_server_error_msg(format!(
+                "outbox.destinations.{name} needs the autumn-web `http-client` feature"
+            )));
+        }
     }
     Ok(())
 }
@@ -122,7 +130,7 @@ fn add_destination(
     url: &str,
     secret: String,
     topics: &[String],
-) -> AutumnResult<()> {
+) {
     let destination = Arc::new(Destination {
         name: name.to_owned(),
         url: url.to_owned(),
@@ -134,20 +142,6 @@ fn add_destination(
             deliver(state, Arc::clone(&destination), message)
         });
     }
-    Ok(())
-}
-
-#[cfg(not(feature = "http-client"))]
-fn add_destination(
-    _handlers: &mut OutboxHandlers,
-    name: &str,
-    _url: &str,
-    _secret: String,
-    _topics: &[String],
-) -> AutumnResult<()> {
-    Err(AutumnError::internal_server_error_msg(format!(
-        "outbox.destinations.{name} needs the autumn-web `http-client` feature"
-    )))
 }
 
 /// One remote destination of the relay.
@@ -158,8 +152,14 @@ struct Destination {
     secret: String,
 }
 
-/// POST `message` to `destination`. A `2xx` response marks it sent. Any other
-/// result is a failure, and the relay sends the message again later.
+/// POST `message` to `destination`. Only a `200` with the status `accepted`
+/// or `duplicate` marks it sent. Any other result is a failure, and the relay
+/// sends the message again later.
+///
+/// The request does not follow redirects: a redirect to a login page must not
+/// count as delivered. It does not use the shared circuit breaker: the relay
+/// already waits between attempts, and an open breaker would use up attempts
+/// without a send.
 #[cfg(feature = "http-client")]
 async fn deliver(
     state: AppState,
@@ -185,7 +185,7 @@ async fn deliver(
         .header(MESSAGE_ID_HEADER, &message.id)
         .header(TOPIC_HEADER, &message.topic)
         .text_body(body)
-        .breaker_scoped()
+        .no_redirect()
         .send()
         .await
         .map_err(|error| {
@@ -194,14 +194,25 @@ async fn deliver(
                 destination.name
             ))
         })?;
-    if response.is_success() {
+    let status = response.status();
+    if status.as_u16() == 200 && is_acknowledgement(&response.text()) {
         return Ok(());
     }
     Err(AutumnError::service_unavailable_msg(format!(
-        "outbox destination {}: the inbox returned {}",
-        destination.name,
-        response.status()
+        "outbox destination {}: the inbox returned {status}, not an acknowledgement",
+        destination.name
     )))
+}
+
+/// Whether `body` is the JSON acknowledgement of an inbox.
+#[cfg(feature = "http-client")]
+fn is_acknowledgement(body: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Ack {
+        status: String,
+    }
+    serde_json::from_str::<Ack>(body)
+        .is_ok_and(|ack| matches!(ack.status.as_str(), "accepted" | "duplicate"))
 }
 
 // ── Receiver ────────────────────────────────────────────────────────────────
@@ -272,15 +283,16 @@ async fn accept(
     let verifier = state
         .extension::<InboxVerifier>()
         .ok_or_else(|| AutumnError::service_unavailable_msg("the outbox inbox is not installed"))?;
+    let received_at = crate::time::ambient_system_time();
+    // Refuse a request with no header or a stale time before reading its body.
+    verifier.verifier.precheck(headers, received_at)?;
     let bytes = axum::body::to_bytes(body, verifier.max_body_bytes)
         .await
         .map_err(|_| {
             AutumnError::bad_request_msg("inbox body is larger than outbox.inbox.max_body_bytes")
                 .with_status(http::StatusCode::PAYLOAD_TOO_LARGE)
         })?;
-    verifier
-        .verifier
-        .verify(headers, &bytes, crate::time::ambient_system_time())?;
+    verifier.verifier.verify(headers, &bytes, received_at)?;
     let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
         // The serde text can quote payload values, so give only its kind.
         AutumnError::bad_request_msg(format!(
@@ -303,12 +315,6 @@ async fn accept(
                 .collect()
         })
         .unwrap_or_default();
-    if listeners.is_empty() {
-        return Err(AutumnError::service_unavailable_msg(format!(
-            "this release has no #[listener] for topic {}; send it again later",
-            envelope.topic
-        )));
-    }
     let pool = mail_pool(state)
         .ok_or_else(|| AutumnError::service_unavailable_msg("the outbox inbox needs a database"))?;
     let mut conn = pool.get().await.map_err(|error| {
@@ -318,8 +324,16 @@ async fn accept(
     let message_id = envelope.id.clone();
     let status = crate::db::scoped_transaction(&mut *conn, |conn| {
         async move {
+            // A copy is acknowledged even after a deploy that dropped the
+            // listener. A new message with no listener rolls back the record.
             if Inbox::new(INBOX_CONSUMER).seen(conn, &envelope.id).await? {
                 return Ok::<_, AutumnError>("duplicate");
+            }
+            if listeners.is_empty() {
+                return Err(AutumnError::service_unavailable_msg(format!(
+                    "this release has no #[listener] for topic {}; send it again later",
+                    envelope.topic
+                )));
             }
             let message = serde_json::to_value(&envelope)
                 .map_err(|error| AutumnError::internal_server_error_msg(error.to_string()))?;
@@ -381,4 +395,18 @@ pub(super) async fn run_inbox_listener(
         })?;
     let run = handler(state.clone(), row.message.payload);
     CURRENT_MESSAGE_ID.scope(row.message.id, run).await
+}
+
+#[cfg(all(test, feature = "http-client"))]
+mod tests {
+    use super::is_acknowledgement;
+
+    #[test]
+    fn only_an_inbox_status_is_an_acknowledgement() {
+        assert!(is_acknowledgement(r#"{"status":"accepted"}"#));
+        assert!(is_acknowledgement(r#"{"status":"duplicate"}"#));
+        for body in ["", "<html>login</html>", "{}", r#"{"status":"ok"}"#] {
+            assert!(!is_acknowledgement(body), "{body:?}");
+        }
+    }
 }
