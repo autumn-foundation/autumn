@@ -293,10 +293,15 @@ pub fn check_listener(
         });
     };
     let Some(sent) = sending_release.event(&listener.topic) else {
-        // Events of a version that the consumer's release does not read are
-        // lost while this window lasts.
+        // A version that this consumer's crate does not read in its own
+        // release is lost to it while this window lasts. Another crate that
+        // still reads that version does not run this consumer's effects.
         let lost = sending_release.events.iter().any(|e| {
-            e.name == view.name && !built_against.listeners.iter().any(|l| l.topic == e.topic)
+            e.name == view.name
+                && !built_against
+                    .listeners
+                    .iter()
+                    .any(|l| l.topic == e.topic && l.krate == listener.krate)
         });
         if window == Window::CalleeFirst || lost {
             report(BreakKind::EventTopicMissing);
@@ -1664,6 +1669,34 @@ mod tests {
         ));
         let report = compare(&deployed, &current);
         assert_eq!(report, Report::default(), "{report:?}");
+    }
+
+    #[test]
+    fn a_consumer_that_moves_to_v2_is_not_covered_by_another_crate_on_v1() {
+        let mut deployed = with_events();
+        deployed.listeners.push(BundleListener {
+            krate: "billing".to_owned(),
+            ..listener("on_contact_billing", "contact.updated", &["id"])
+        });
+        let mut current = deployed.clone();
+        current.events.push(event(
+            2,
+            contact_shape(&[("id", "i64", true), ("email_address", "String", true)]),
+        ));
+        // `marketing` moves to v2; `billing` stays on v1.
+        current.listeners.retain(|l| l.krate != "marketing");
+        current.listeners.push(listener(
+            "on_contact",
+            "contact.updated.v2",
+            &["email_address"],
+        ));
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.caller_first), [BreakKind::EventTopicMissing]);
+        assert_eq!(
+            report.caller_first[0].caller.as_deref(),
+            Some("marketing::on_contact")
+        );
+        assert_eq!(report.verdict(), Verdict::CalleeFirst);
     }
 
     #[test]

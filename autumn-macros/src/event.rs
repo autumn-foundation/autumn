@@ -61,6 +61,9 @@ fn parse_event_args(attr: TokenStream) -> syn::Result<EventAttrs> {
 }
 
 pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // The descriptor key covers the arguments too: two events with one body
+    // in two modules differ only in their `name`.
+    let attr_text = attr.to_string();
     let attrs = match parse_event_args(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
@@ -99,7 +102,7 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     let (wire, shape_const, shape) = payload_shape(&attrs, &input, &mut refusal);
-    let key = autumn_macros_support::wire::stable_key(&quote!(#input).to_string());
+    let key = autumn_macros_support::wire::stable_key(&format!("{attr_text} {}", quote!(#input)));
     // A refused event writes no descriptor: the build fails anyway.
     let written = if refusal.is_empty() {
         write_descriptor(&attrs, &ident_str, shape, &key)
@@ -416,6 +419,19 @@ mod tests {
             has_version_suffix("a.v12")
                 && !has_version_suffix("a.vx")
                 && !has_version_suffix("a.v")
+        );
+    }
+
+    #[test]
+    fn the_descriptor_key_covers_the_arguments() {
+        let key = |attr: TokenStream| {
+            let attr_text = attr.to_string();
+            let input = quote! { pub struct Created { pub id: i64 } };
+            autumn_macros_support::wire::stable_key(&format!("{attr_text} {input}"))
+        };
+        assert_ne!(
+            key(quote! { name = "a.created" }),
+            key(quote! { name = "b.created" })
         );
     }
 
