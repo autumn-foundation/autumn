@@ -3122,6 +3122,13 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deploy:: db::sqlite_snapshot:: \
             | tee "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
+          # Same gap for `autumn release init` (`release::`, the role set in
+          # `release_roles::`, its flags in `tests::parse_release`) and the
+          # download retry of `autumn setup` (`http::`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- release:: release_roles:: \
+            http:: tests::parse_release \
+            | tee "$RUNNER_TEMP/cli-release-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-release-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
