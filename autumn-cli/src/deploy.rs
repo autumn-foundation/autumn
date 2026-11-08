@@ -2691,7 +2691,8 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
 ///
 /// Two sources, deliberately: the names this particular deploy would upload
 /// ([`ResolvedDeployConfig::release_payloads`]), plus a filesystem-independent
-/// rule for the app binary and the `autumn*.toml` manifest family. The second is
+/// rule for the app binary, the `autumn*.toml` manifest family and the role
+/// file. The second is
 /// not redundant — the payload list is empty for a bare
 /// [`ResolvedDeployConfig::resolve`], and a database named `autumn.toml` must be
 /// refused even on a project that has no `autumn.toml` YET, since adding one
@@ -2718,6 +2719,10 @@ fn collides_with_release_payload(text: &str, cfg: &ResolvedDeployConfig) -> Opti
             && text.rsplit_once('.').is_some_and(|(_, ext)| ext == "toml"));
     if is_manifest {
         return Some(format!("the config manifest {text}"));
+    }
+    // The role file of a group host is written into the release dir too.
+    if text == ROLE_ENV_FILE {
+        return Some(format!("the role file {ROLE_ENV_FILE}"));
     }
     cfg.release_payloads
         .iter()
@@ -7794,6 +7799,24 @@ mod tests {
             matches!(graded, SqliteDataFile::Refused(_)),
             "a non-absolute app dir must refuse, never grade Persistent: {graded:?}"
         );
+    }
+
+    /// The release role file is written after the data link, so a database
+    /// with its name would be overwritten.
+    #[test]
+    fn classify_sqlite_data_file_refuses_the_role_file_name() {
+        let cfg = deploy_cfg();
+        for url in [
+            "sqlite://role.env",
+            "sqlite://./role.env",
+            "sqlite://role.env/app.db",
+        ] {
+            let graded = classify_sqlite_data_file(Some(url), &cfg);
+            let SqliteDataFile::Refused(detail) = graded else {
+                panic!("{url} must be refused: {graded:?}");
+            };
+            assert!(detail.contains("role.env"), "{detail}");
+        }
     }
 
     #[test]

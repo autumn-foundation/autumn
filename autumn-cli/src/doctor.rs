@@ -6679,8 +6679,35 @@ fn read_manifest_role_files(root: &std::path::Path) -> Vec<(String, String)> {
         }
     }
     kustomize.sort();
-    files.extend(kustomize);
+    // A component that the base does not list is not deployed: a left-over
+    // from a role that `autumn release init --force` no longer writes.
+    let base = format!("{MANIFEST_ROLE_KUSTOMIZE_DIR}/base/kustomization.yaml");
+    let listed = kustomize
+        .iter()
+        .find(|(name, _)| *name == base)
+        .map(|(_, text)| listed_components(text));
+    let prefix = format!("{MANIFEST_ROLE_KUSTOMIZE_DIR}/components/");
+    files.extend(kustomize.into_iter().filter(|(name, _)| {
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            return true;
+        };
+        let component = rest.split('/').next().unwrap_or_default();
+        listed
+            .as_ref()
+            .is_none_or(|listed| listed.iter().any(|c| c == component))
+    }));
     files
+}
+
+/// The component names that a Kustomize base lists as `../components/<name>`.
+fn listed_components(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let item = strip_yaml_comment(line).trim().strip_prefix("- ")?.trim();
+            let name = item.strip_prefix("../components/")?;
+            Some(name.trim_end_matches('/').to_owned())
+        })
+        .collect()
 }
 
 /// The `roles:` keys of a Helm values file, each with its `servesHttp`.
@@ -22046,6 +22073,43 @@ mount = ["service"]
             &[],
         );
         assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+    }
+
+    /// A component that the base no longer lists is not deployed, so its
+    /// role is not checked.
+    #[test]
+    fn manifest_role_walk_skips_components_the_base_does_not_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("deploy/kustomize");
+        for role in ["web", "old"] {
+            let component = root.join("components").join(role);
+            std::fs::create_dir_all(&component).unwrap();
+            std::fs::write(
+                component.join("deployment.yaml"),
+                format!("- name: AUTUMN_ROLE\n  value: {role}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(root.join("base")).unwrap();
+        std::fs::write(
+            root.join("base/kustomization.yaml"),
+            "components:\n  - ../components/web # main\nimages: []\n",
+        )
+        .unwrap();
+        let files = read_manifest_role_files(dir.path());
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"deploy/kustomize/components/web/deployment.yaml"),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("components/old")),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"deploy/kustomize/base/kustomization.yaml"),
+            "{names:?}"
+        );
     }
 
     #[cfg(unix)]
