@@ -1,8 +1,15 @@
 name: kache build cache
 description: >
   Restores this job's kache compiler cache, sets RUSTC_WRAPPER so every rustc
-  and C/C++ compile goes through it, and saves the cache after the job. The
-  one place the repo configures kunobi-ninja/kache-action.
+  and C/C++ compile goes through it, and saves the cache after the job. On a
+  macOS runner it uses Swatinem/rust-cache instead. The one place the repo
+  configures kunobi-ninja/kache-action and Swatinem/rust-cache.
+
+# macOS uses Swatinem/rust-cache, not kache. The macOS test archive is bound by
+# the runner's memory and disk (see `test-archive` in ci.yml), and kache adds
+# a daemon and a second copy of every artifact in its store beside target/.
+# rust-cache keeps one target/ directory and nothing else. On macOS the `s3`
+# and `warm` inputs have no effect, and the cache is the GitHub Actions cache.
 
 # kache caches each compile by the hash of its inputs, not a whole target
 # directory. A hit needs the same inputs, compiler and flags, so one store can
@@ -84,11 +91,13 @@ runs:
         fi
         echo "scope=$workflow-$scope-$rustc_id" >> "$GITHUB_OUTPUT"
         echo "prefix=kache-$workflow-$scope-$rustc_id" >> "$GITHUB_OUTPUT"
+        echo "workflow=$workflow" >> "$GITHUB_OUTPUT"
         # The S3 manifest has no OS part of its own. Without the host, the
         # Linux, macOS and Windows legs of one shared-key write one manifest,
         # and each leg prefetches the artifacts of the last OS to save it.
         echo "manifest=$workflow-$scope-$host-$rustc_id" >> "$GITHUB_OUTPUT"
     - id: backend
+      if: runner.os != 'macOS'
       shell: bash
       env:
         BUCKET: ${{ env.AUTUMN_KACHE_S3_BUCKET }}
@@ -123,7 +132,8 @@ runs:
           echo "kache: S3 off for this job, or no S3 remote or read key; using the GitHub Actions cache"
         fi
     # v1 as of 2026-09-25.
-    - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
+    - if: runner.os != 'macOS'
+      uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
       with:
         version: v2.0.0
         cache-key-prefix: ${{ steps.key.outputs.prefix }}
@@ -150,3 +160,22 @@ runs:
         # A sticky comment per job would notify everyone on the PR. The job
         # summary carries the same stats.
         pr-comment: false
+    # v2.9.3.
+    - if: runner.os == 'macOS'
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      with:
+        # The workflow in the prefix, as in the kache prefix, so jobs with one
+        # id in two workflows do not share an entry. rust-cache adds the job
+        # id (or `shared-key`), `key`, the OS and arch, and a hash of rustc,
+        # Cargo.lock and the Cargo.toml files.
+        prefix-key: v0-rust-${{ steps.key.outputs.workflow }}
+        shared-key: ${{ inputs.shared-key }}
+        key: ${{ inputs.key }}
+        save-if: ${{ inputs.save == 'true' }}
+        # kache saves after a failed job too, and a red suite is what the next
+        # run iterates against.
+        cache-on-failure: true
+        # Tools come from their pinned installs, as with kache. install-action
+        # skips its verified download when the pinned version is already in
+        # $CARGO_HOME/bin.
+        cache-bin: false

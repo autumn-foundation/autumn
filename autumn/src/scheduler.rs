@@ -1196,7 +1196,7 @@ mod tests {
             toml::from_str("role = \"critical\"\n[roles.critical]\nbase = \"worker\"\n")
                 .expect("roles config");
         let mut state = AppState::for_test();
-        state.role = app.resolve_role().expect("critical");
+        state.fields_mut().role = app.resolve_role().expect("critical");
         let coordinator = coordinator_from_config(&config, &state).expect("in-process coordinator");
         assert_eq!(coordinator.replica_id(), format!("critical-{plain}"));
     }
