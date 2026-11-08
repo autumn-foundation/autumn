@@ -873,7 +873,21 @@ fn collect_macro_bound(
         match tt {
             proc_macro2::TokenTree::Group(group) => collect_macro_bound(&group.stream(), bound),
             proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '|' => {
-                in_closure_params = !in_closure_params;
+                // A `|` after an operand is `a | b` or `a || b`, not the start
+                // of a closure's parameters. `move |x|` is a closure.
+                let prev = i.checked_sub(1).and_then(|p| tts.get(p));
+                let after_operand = match prev {
+                    // The second `|` of `a || b` follows the first one.
+                    Some(proc_macro2::TokenTree::Punct(p))
+                        if p.as_char() == '|' && !in_closure_params =>
+                    {
+                        is_operand(i.checked_sub(2).and_then(|p| tts.get(p)))
+                    }
+                    other => is_operand(other),
+                };
+                if in_closure_params || !after_operand {
+                    in_closure_params = !in_closure_params;
+                }
             }
             proc_macro2::TokenTree::Ident(ident) => {
                 if in_closure_params {
@@ -886,6 +900,16 @@ fn collect_macro_bound(
             }
             proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => {}
         }
+    }
+}
+
+/// Whether `token` ends an operand: an identifier (not `move`), a literal or
+/// a group.
+fn is_operand(token: Option<&proc_macro2::TokenTree>) -> bool {
+    match token {
+        Some(proc_macro2::TokenTree::Ident(id)) => id != "move",
+        Some(proc_macro2::TokenTree::Literal(_) | proc_macro2::TokenTree::Group(_)) => true,
+        _ => false,
     }
 }
 

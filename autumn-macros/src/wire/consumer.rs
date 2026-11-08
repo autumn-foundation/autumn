@@ -248,6 +248,30 @@ mod tests {
     }
 
     #[test]
+    fn a_bitwise_or_in_a_macro_is_not_a_closure() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 assert!(event.email.is_some() | event.phone.is_some()); \
+                 assert!(event.id > 0 || event.name.is_empty()); Ok(()) }"
+            ),
+            ["email", "id", "name", "phone"]
+        );
+    }
+
+    #[test]
+    fn a_closure_parameter_in_a_macro_still_shadows_the_payload() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 tracing::info!(rows.iter().map(|event| event.other)); \
+                 tracing::info!(f(move |event| event.other2)); Ok(()) }"
+            ),
+            [] as [&str; 0]
+        );
+    }
+
+    #[test]
     fn a_method_call_on_the_payload_is_not_a_read() {
         assert_eq!(
             listener(
