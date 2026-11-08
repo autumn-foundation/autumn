@@ -105,7 +105,9 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let key = autumn_macros_support::wire::stable_key(&format!("{attr_text} {}", quote!(#input)));
     // A refused event writes no descriptor: the build fails anyway.
     let written = if refusal.is_empty() {
-        write_descriptor(&attrs, &ident_str, shape, &key)
+        let unit =
+            matches!(&input.data, syn::Data::Struct(s) if matches!(s.fields, syn::Fields::Unit));
+        write_descriptor(&attrs, &ident_str, shape, &key, unit)
     } else {
         TokenStream::new()
     };
@@ -219,6 +221,7 @@ fn write_descriptor(
     type_name: &str,
     shape: WireTypeDescriptor,
     key: &str,
+    unit: bool,
 ) -> TokenStream {
     let Some(dir) = store::contract_dir() else {
         return TokenStream::new();
@@ -232,6 +235,7 @@ fn write_descriptor(
             name: attrs.name.clone(),
             version: attrs.version,
             opaque: attrs.opaque,
+            unit,
             shape,
         },
     ))

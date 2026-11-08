@@ -273,6 +273,9 @@ The rules:
 * **A consumer may not start to require a field that deployed producers do
   not send.** Add it to the producer first.
 * **A field's type must not change**, with the same rules as a response.
+* **A unit event stays a unit.** `struct Ping;` is JSON `null` on the wire.
+  An object is another shape, so adding fields to it is a break in both
+  orders. Publish a new version instead.
 * **A topic must still be sent while a deployed consumer reads it.**
 * **A new consumer must not miss a version that deployed producers send.** A
   consumer that reads only v2, next to a producer that sends only v1, loses

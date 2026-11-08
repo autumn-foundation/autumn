@@ -82,6 +82,9 @@ pub enum BreakKind {
     },
     /// No producer in the serving release sends the consumer's topic.
     EventTopicMissing,
+    /// The payload is JSON `null` (a unit struct) on one side and an object
+    /// on the other.
+    EventUnitChanged,
     /// The consumer reads an event field the producer does not send.
     EventFieldMissing(String),
     /// The consumer's event type needs a field the producer may leave out.
@@ -109,6 +112,7 @@ impl BreakKind {
         matches!(
             self,
             Self::EventTopicMissing
+                | Self::EventUnitChanged
                 | Self::EventFieldMissing(_)
                 | Self::EventDecodeFails(_)
                 | Self::EventFieldRejected(_)
@@ -309,6 +313,11 @@ pub fn check_listener(
         return out;
     };
     if view.opaque || sent.opaque {
+        return out;
+    }
+    if view.unit != sent.unit {
+        // `null` where an object was, or the reverse: no field matters.
+        report(BreakKind::EventUnitChanged);
         return out;
     }
     for issue in decode_issues(&view.shape, &sent.shape.serialized, &listener.reads) {
@@ -892,6 +901,7 @@ fn render_window(out: &mut String, title: &str, breaks: &[Break]) {
             ),
             // Rendered by `event_detail`.
             BreakKind::EventTopicMissing
+            | BreakKind::EventUnitChanged
             | BreakKind::EventFieldMissing(_)
             | BreakKind::EventDecodeFails(_)
             | BreakKind::EventFieldRejected(_)
@@ -917,6 +927,10 @@ fn event_detail(b: &Break) -> String {
         BreakKind::EventTopicMissing => {
             format!("{who} reads this topic, and {producer} does not send it")
         }
+        BreakKind::EventUnitChanged => format!(
+            "the payload is JSON `null` on one side and an object on the other, so {who} cannot \
+             decode what {producer} sends"
+        ),
         BreakKind::EventFieldMissing(f) => {
             format!("{who} reads field `{f}`, which {producer} does not send")
         }
@@ -1484,6 +1498,7 @@ mod tests {
             krate: "core".to_owned(),
             type_name: format!("ContactUpdatedV{version}"),
             opaque: false,
+            unit: false,
             shape,
         }
     }
@@ -1761,6 +1776,22 @@ mod tests {
         ));
         let report = compare(&current, &current);
         assert!(report.notes.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_unit_event_that_gains_fields_is_a_break_in_both_orders() {
+        let mut deployed = with_events();
+        deployed.events[0].unit = true;
+        deployed.events[0].shape = contact_shape(&[]);
+        deployed.listeners = vec![listener("on_contact", "contact.updated", &[])];
+        let mut current = with_events();
+        current.events[0].shape = contact_shape(&[("trace", "Option<String>", true)]);
+        current.listeners = vec![listener("on_contact", "contact.updated", &[])];
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::EventUnitChanged]);
+        assert_eq!(kinds(&report.caller_first), [BreakKind::EventUnitChanged]);
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+        assert!(report.render(Order::Any).contains("JSON `null`"));
     }
 
     #[test]

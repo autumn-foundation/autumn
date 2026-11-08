@@ -228,6 +228,11 @@ pub struct EventDescriptor {
     /// `#[event(opaque)]`: the payload has no wire shape to check.
     #[serde(default)]
     pub opaque: bool,
+    /// A unit struct (`struct Ping;`): the payload is JSON `null`, not an
+    /// object. Its shape is empty, like an object with no fields, so this
+    /// flag tells the two apart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unit: bool,
     /// The payload's shape. Empty when `opaque`.
     pub shape: WireTypeDescriptor,
 }
@@ -348,6 +353,7 @@ mod tests {
             name: name.map(str::to_owned),
             version,
             opaque: false,
+            unit: false,
             shape: WireTypeDescriptor::default(),
         }
     }

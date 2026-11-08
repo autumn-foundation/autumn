@@ -66,6 +66,9 @@ pub struct BundleEvent {
     /// `#[event(opaque)]`: the payload has no shape to check.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub opaque: bool,
+    /// A unit struct: the payload is JSON `null`, not an object.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unit: bool,
     /// The payload's shape.
     pub shape: WireTypeDescriptor,
 }
@@ -302,6 +305,7 @@ fn join_events(events: &[EventDescriptor]) -> Result<Vec<BundleEvent>, String> {
             krate: event.krate.clone(),
             type_name: event.type_name.clone(),
             opaque: event.opaque,
+            unit: event.unit,
             shape: canonical(event.shape.clone()),
         });
     }
@@ -916,6 +920,7 @@ mod tests {
             name: Some("contact.updated".to_owned()),
             version,
             opaque: false,
+            unit: false,
             shape: WireTypeDescriptor {
                 name: "ContactUpdated".to_owned(),
                 serialized: vec![field("id", true), field("email", true)],
