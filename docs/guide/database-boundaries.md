@@ -371,6 +371,9 @@ of database and user. So each boundary gets its own server pool.
 * `schema diff` refuses a type change of a column that a foreign key points
   at, when an FK of the same table name in another schema exists. This is a
   false refusal. Write the change by hand.
+* `schema diff` refuses the rename of a table when an index of the new
+  convention name exists in another schema. This is a false refusal. Write the
+  rename by hand.
 * A model with `schema` stops `schema diff` on SQLite.
 * `autumn migrate` does not run an embedded `migrations_in_schema` set. Run it
   at boot, or set `AUTUMN_MIGRATE=1`.
