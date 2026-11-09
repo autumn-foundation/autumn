@@ -1094,11 +1094,11 @@ fn detect_inbound_fk_blocks(
         return;
     }
     // The dropped table that `fk_table`, written on `owner`, points at.
-    let dropped_target = |owner: &Table, fk_table: &str| {
+    let dropped_target = |fk_table: &str| {
         dropped
             .get(bare_name(fk_table))
             .copied()
-            .filter(|t| fk_reaches(owner, fk_table, t))
+            .filter(|t| fk_reaches(fk_table, t))
     };
 
     // (referencing table, referencing column) pairs being dropped in this plan.
@@ -1134,7 +1134,7 @@ fn detect_inbound_fk_blocks(
                 continue;
             }
             if let Some(fk) = &column.references
-                && let Some(target) = dropped_target(table, &fk.table)
+                && let Some(target) = dropped_target(&fk.table)
             {
                 blocks.insert((
                     target.qualified_name(),
@@ -1154,7 +1154,7 @@ fn detect_inbound_fk_blocks(
         }
         for column in &table.columns {
             if let Some(fk) = &column.references
-                && let Some(target) = dropped_target(table, &fk.table)
+                && let Some(target) = dropped_target(&fk.table)
             {
                 blocks.insert((
                     target.qualified_name(),
@@ -4056,24 +4056,18 @@ fn fk_targets(fk_table: &str, table: &Table) -> bool {
     name == table.name && schema.filter(|s| *s != "public") == named_schema(table)
 }
 
-/// True when the FK target `fk_table`, written on `owner`, can point at `target`.
+/// True when the FK target `fk_table` points at `target`.
 ///
-/// A qualified target must match the schema of `target`. A bare target points at
-/// a table of the schema of `owner` (introspection writes a same-schema target
-/// bare) or of the default schema. This errs toward a match: the caller uses it
-/// to refuse an unsafe drop.
-fn fk_reaches(owner: &Table, fk_table: &str, target: &Table) -> bool {
+/// A qualified target must match the schema of `target`. A bare target matches
+/// by name only: the schema tools need one table name for each schema, so a bare
+/// name can only mean one table. The planner stores a bare target for a model
+/// `#[references]`, also when the table is in a named schema.
+fn fk_reaches(fk_table: &str, target: &Table) -> bool {
     let (schema, name) = fk_table
         .rsplit_once('.')
         .map_or((None, fk_table), |(s, n)| (Some(s), n));
-    if name != target.name {
-        return false;
-    }
-    let target_schema = named_schema(target);
-    schema.map_or_else(
-        || target_schema.is_none() || target_schema == named_schema(owner),
-        |s| Some(s).filter(|s| *s != "public") == target_schema,
-    )
+    name == target.name
+        && schema.is_none_or(|s| Some(s).filter(|s| *s != "public") == named_schema(target))
 }
 
 /// The name of the constraint for the foreign key on `table.column`. The
@@ -6755,6 +6749,24 @@ mod tests {
         let mut fk = col("author_id", ColumnType::Int64);
         fk.references = Some(ForeignKey::new("authors", "id"));
         let posts = in_schema(posts_with(vec![fk]), "blog");
+        let plan = diff_schema(
+            &[authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_err(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn dropping_a_table_with_a_bare_cross_schema_inbound_fk_is_refused() {
+        // public `posts` points at modeled `blog.authors` by the bare target the
+        // planner stores. Table names are unique across schemas, so the bare
+        // name can only mean that table.
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("authors", "id"));
+        let posts = posts_with(vec![fk]);
         let plan = diff_schema(
             &[authors, posts.clone()],
             &parsed(vec![posts], vec![]),
