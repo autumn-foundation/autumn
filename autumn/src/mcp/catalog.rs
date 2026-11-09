@@ -396,7 +396,10 @@ fn score(words: &ToolWords, terms: &[String]) -> u32 {
 fn matches(word: &str, term: &str) -> bool {
     // `starts_with` goes first: it fails for nearly every word, so the
     // character count of the term runs only for a real prefix hit.
-    word == term || (word.starts_with(term) && term.chars().nth(2).is_some())
+    // Comparing the first byte inline rejects almost every word without a
+    // `memcmp` call.
+    word.as_bytes().first() == term.as_bytes().first()
+        && (word == term || (word.starts_with(term) && term.chars().nth(2).is_some()))
 }
 
 /// The lowercase words of `text`. A character that is not a letter or a
