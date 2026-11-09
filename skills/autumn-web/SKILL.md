@@ -3159,6 +3159,14 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `rpo_secs` of committed writes that already returned success are missing.
   A replicated fleet root is served by one process (one replicator per
   database).
+- A write that spans two databases (move a row: upsert into `dst`, delete
+  from `src`): do the second half only after the first is in the replica.
+  `fleet.wait_replicated(&dst, committed_at, timeout)` with `committed_at`
+  read from the app clock after the commit; `fleet.replicated_through(&key)`
+  gives the instant itself. Errors: `NotReplicating`, `Fenced`, `TimedOut`
+  (not a loss: keep the source row, retry). Do not use `worst_lag_seconds`
+  or `last_success_at` for this. Guide: "Know when a write is in the
+  replica" in `docs/guide/sqlite-fleet.md`.
 - Delete with replication (issue #3235): `delete` also purges the replica.
   It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
   database first; no row, no delete (`503`). A failed purge keeps the row,
@@ -3239,8 +3247,12 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   bytes, and return the stamp from `epoch_stamp`. `ShipMode::Rebuild` ships
   nothing: `restore_latest` calls `FleetEngine::rebuild`. Operators:
   `fleet.ship_now(&key)`, `fleet.restore_latest(&key)`. `FleetStats` has
-  `ship_mode` and `rpo_secs`. Guide: "Shipping a plugin engine" in
-  `docs/guide/sqlite-fleet.md`.
+  `ship_mode` and `rpo_secs`. A close-time generation that did not ship
+  stays as unshipped work: the replication loop (`spawn_loop`) and the
+  shutdown flush ship it again, and `release_ownership` lets the ranges
+  lapse until then. Watch `replication:fleet` `unshipped` and
+  `FleetReplication::unshipped_generations()`. Do not write your own retry.
+  Guide: "Shipping a plugin engine" in `docs/guide/sqlite-fleet.md`.
 - Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
   databases, also closed ones (issue #3234). Write outbox rows in a
   transaction on the tenant connection: the write records the database in
@@ -3449,7 +3461,13 @@ duration_secs = 300   # or: autumn deploy up --bake-secs 300
 Kubernetes: `autumn release init --target kubernetes` writes a Helm chart
 (`deploy/helm/`, set `trustedHosts`) and a Kustomize base with probes, a
 `preStop` hook, a safe grace period, a PDB, and opt-in Argo Rollouts or Flagger
-canaries. See `docs/guide/slo.md` and `docs/guide/kubernetes.md`.
+canaries. Each role gets its own workload (`roles:` in `values.yaml`, one
+Kustomize component per role); only HTTP roles get a Service and an Ingress.
+`--roles` picks the roles. `--target fly` writes one `[processes]` entry per
+role. A fleet sets a role per host group with a `[[deploy.groups]]` table
+(`role = "worker"` and `hosts = ["10.0.0.3"]`). `autumn doctor` warns when a
+manifest names an undeclared role. See `docs/guide/slo.md`, `docs/guide/kubernetes.md` and
+`docs/guide/fleet-deploys.md`.
 
 ## Shadow (differential) deploys
 

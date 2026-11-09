@@ -217,6 +217,112 @@ pub proof fn purge_keeps_a_newer_database(created_ms: int, cutoff: int, newer_ex
     ensures !purge_deletes(Some(created_ms), cutoff, newer_exists)
 {}
 
+// ---- A close-time generation that did not ship ----
+
+/// The result of the last generation of a close, or of a retry.
+pub enum CloseShip {
+    /// The generation shipped, or there was nothing to ship.
+    Shipped,
+    /// The ship failed, or the shutdown cutoff skipped it.
+    Failed,
+    /// A newer epoch refused it.
+    Fenced,
+    /// The key is open or draining. The retry waits.
+    Busy,
+}
+
+/// Why a database stopped shipping.
+pub enum Retire {
+    /// It did not.
+    No,
+    /// A delete or a restore replaced its files.
+    Replaced,
+    /// A newer epoch owns its slot.
+    NewerEpoch,
+    /// The lease of this host lapsed. No newer epoch is known.
+    Lapse,
+}
+
+/// Whether the record of a closed database stays. `had`: a record was
+/// there before.
+pub open spec fn keeps_record(retire: Retire, had: bool, ship: CloseShip) -> bool {
+    match retire {
+        Retire::Replaced => false,
+        Retire::NewerEpoch => false,
+        // The writes are still this host's: they ship later.
+        Retire::Lapse => true,
+        Retire::No => match ship {
+            CloseShip::Shipped => false,
+            CloseShip::Fenced => false,
+            CloseShip::Failed => true,
+            CloseShip::Busy => had,
+        },
+    }
+}
+
+/// A delete or a restore that ends. `replaced`: the files are gone or
+/// replaced. A failed one puts the record back.
+pub open spec fn keeps_after_release(had: bool, replaced: bool) -> bool {
+    had && !replaced
+}
+
+/// `release_ownership` releases only with no parked WAL replicator and no
+/// kept generation. Otherwise the ranges lapse.
+pub open spec fn may_release(parked: nat, kept: nat) -> bool {
+    parked == 0 && kept == 0
+}
+
+/// A failed close-time ship keeps the record.
+pub proof fn failed_close_keeps_the_record(had: bool)
+    ensures keeps_record(Retire::No, had, CloseShip::Failed)
+{}
+
+/// A kept record makes the ranges lapse.
+pub proof fn a_record_blocks_release(parked: nat, kept: nat)
+    requires kept > 0
+    ensures !may_release(parked, kept)
+{}
+
+/// A retry that ships drops the record.
+pub proof fn a_shipped_retry_drops_the_record(had: bool)
+    ensures !keeps_record(Retire::No, had, CloseShip::Shipped)
+{}
+
+/// A lapse keeps the record, whatever the ship did.
+pub proof fn a_lapse_keeps_the_record(had: bool, ship: CloseShip)
+    ensures keeps_record(Retire::Lapse, had, ship)
+{}
+
+/// A delete, a restore or a newer epoch drops the record. A retired
+/// database puts nothing, so nothing ships for it.
+pub proof fn a_retire_drops_the_record_and_ships_nothing(
+    had: bool,
+    ship: CloseShip,
+    mine: Option<nat>,
+    known: nat,
+    newest: nat,
+)
+    ensures
+        !keeps_record(Retire::Replaced, had, ship),
+        !keeps_record(Retire::NewerEpoch, had, ship),
+        !put_allowed(Mode::Generations, true, mine, known, newest),
+{}
+
+/// A delete or a restore that fails keeps the record.
+pub proof fn a_failed_release_keeps_the_record()
+    ensures
+        keeps_after_release(true, false),
+        !keeps_after_release(true, true),
+{}
+
+/// Only a ship, a fence, a delete or a restore clears a record.
+pub proof fn only_a_ship_or_a_retire_clears_the_record(retire: Retire, ship: CloseShip)
+    requires !keeps_record(retire, true, ship)
+    ensures
+        retire == Retire::Replaced || retire == Retire::NewerEpoch
+            || ship == CloseShip::Shipped || ship == CloseShip::Fenced,
+{}
+
 fn main() {}
 
 } // verus!

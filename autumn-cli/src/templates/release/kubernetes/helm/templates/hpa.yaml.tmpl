@@ -1,0 +1,31 @@
+{{- range $name, $role := .Values.roles }}
+{{- $ctx := dict "root" $ "name" $name "role" $role }}
+{{- if and $role.enabled (dig "autoscaling" "enabled" false $role) }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "app.roleName" $ctx }}
+  labels:
+    {{- include "app.roleLabels" $ctx | nindent 4 }}
+spec:
+  scaleTargetRef:
+    {{- if include "app.roleIsRollout" $ctx }}
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    {{- else }}
+    apiVersion: apps/v1
+    kind: Deployment
+    {{- end }}
+    name: {{ include "app.roleName" $ctx }}
+  minReplicas: {{ $role.autoscaling.minReplicas }}
+  maxReplicas: {{ $role.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $role.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}

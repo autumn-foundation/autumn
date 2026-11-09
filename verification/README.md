@@ -214,6 +214,33 @@ It proves these properties:
 The proptest `the_rules_keep_the_model_properties` checks the same rules on
 the runtime functions.
 
+## Replica bound
+
+`replicated_through.rs` models the bound `replicated_through` of one
+replicator (`Replicator::tick_inner` and `settled_tail` in
+`autumn/src/replication/engine.rs`, and `ReplicationStatus` in
+`autumn/src/replication/status.rs`). Verify it with:
+
+```sh
+verus verification/replicated_through.rs
+```
+
+It proves these properties:
+
+- Each commit at or before the bound is in the replica. This holds at the
+  start and after every step: a commit, an upload, a tick, a new
+  generation, a new epoch and a fence.
+- A tick reads the clock before it measures the tail. It stamps one step
+  below that reading. It drops a bound at or above the reading.
+- In one generation, a tick never moves the bound back. A tick with an
+  unshipped commit does not advance it.
+- A fenced replica claims nothing. Only a new epoch ends the fence.
+- The old order (measure, then read the clock) can cover a commit that is
+  not shipped, even one step below the reading.
+
+The property test `a_restore_holds_every_write_at_or_before_the_bound` in
+`autumn/tests/integration/sqlite_replicated_through.rs` checks the runtime.
+
 ## Billing plan gate
 
 `billing_gate.rs` models the plan gate selection in
@@ -542,6 +569,23 @@ HTTP mounts no group, that a valid `mount` list is exact, that a framework
 route is served on every HTTP role, and that a group another fleet role mounts
 is not drift. The test `mount_matches_the_model` in `autumn/src/config.rs`
 checks the runtime against the same rules.
+
+## Role manifests
+
+`role_manifests.rs` models the role set of `autumn release init` and the
+`[[deploy.groups]]` checks (issue #3547, ADR 0043). A role name is an
+integer. Verify it with:
+
+```sh
+verus verification/role_manifests.rs
+```
+
+It proves that each role in the default set is declared and has a unique
+name, that every role gets a workload and only an HTTP role gets a Service,
+that a fleet host never gets two roles, and that a fleet that passes
+preflight on a local jobs backend runs only `combined`. The test
+`manifest_roles_match_the_model` in `autumn-cli/src/release_roles.rs` checks
+the runtime against the same rules.
 
 ## Background tasks
 

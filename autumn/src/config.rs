@@ -2073,6 +2073,44 @@ pub struct DeployConfig {
     /// See [`DeployBakeConfig`].
     #[serde(default)]
     pub bake: DeployBakeConfig,
+
+    /// Host groups, each with one role (`[[deploy.groups]]`). The env file of
+    /// each host sets `AUTUMN_ROLE` to the role of its group. The rollout
+    /// order is the group order, then the host order. Not allowed together
+    /// with [`host`](Self::host) or [`hosts`](Self::hosts). Empty: every host
+    /// runs the role in `autumn.toml`. See [`DeployGroup`].
+    #[serde(default)]
+    pub groups: Vec<DeployGroup>,
+}
+
+/// One `[[deploy.groups]]` entry: a role and the hosts that run it.
+///
+/// ```toml
+/// [[deploy.groups]]
+/// role = "web"
+/// hosts = ["10.0.0.1", "10.0.0.2"]
+///
+/// [[deploy.groups]]
+/// role = "worker"
+/// hosts = ["10.0.0.3"]
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployGroup {
+    /// A built-in role or a `[roles.<name>]` preset.
+    pub role: String,
+    /// SSH-reachable addresses, in rollout order.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// One host of a `[[deploy.groups]]` fleet and the role it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployGroupHost {
+    /// The trimmed SSH address.
+    pub host: String,
+    /// The canonical role name. A built-in alias becomes its built-in name.
+    pub role: String,
 }
 
 /// Default for [`DeployConfig::install_proxy`]: prepare the host (issue #1607).
@@ -2098,11 +2136,70 @@ impl Default for DeployConfig {
             tls: DeployTlsConfig::default(),
             install_proxy: default_deploy_install_proxy(),
             bake: DeployBakeConfig::default(),
+            groups: Vec::new(),
         }
     }
 }
 
 impl DeployConfig {
+    /// The hosts of `[[deploy.groups]]` and their roles, in rollout order.
+    /// Empty when no group is set.
+    ///
+    /// This checks the shape only. The CLI checks that each role is declared.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when groups are set with `host` or `hosts`, when a
+    /// group has a blank or invalid role, no hosts or a blank host, or when a
+    /// host is in more than one group or twice in one group.
+    pub fn group_hosts(&self) -> Result<Vec<DeployGroupHost>, String> {
+        if self.groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let host_set = self.host.as_deref().is_some_and(|h| !h.trim().is_empty());
+        if host_set || !self.hosts.is_empty() {
+            return Err(
+                "[[deploy.groups]] is mutually exclusive with [deploy] host and [deploy] \
+                 hosts: put every host in a group"
+                    .to_owned(),
+            );
+        }
+        let mut out: Vec<DeployGroupHost> = Vec::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            if group.role.trim().is_empty() {
+                return Err(format!("[[deploy.groups]] entry {index}: role is blank"));
+            }
+            let role: RoleName = group
+                .role
+                .parse()
+                .map_err(|e| format!("[[deploy.groups]] entry {index}: invalid role: {e}"))?;
+            if group.hosts.is_empty() {
+                return Err(format!(
+                    "[[deploy.groups]] entry {index} (role {role}) lists no hosts"
+                ));
+            }
+            for (host_index, host) in group.hosts.iter().enumerate() {
+                let host = host.trim();
+                if host.is_empty() {
+                    return Err(format!(
+                        "[[deploy.groups]] entry {index}: host {host_index} is blank"
+                    ));
+                }
+                if out.iter().any(|seen| seen.host == host) {
+                    return Err(format!(
+                        "[[deploy.groups]] lists `{host}` more than once: a host runs one \
+                         role, so put it in one group"
+                    ));
+                }
+                out.push(DeployGroupHost {
+                    host: host.to_owned(),
+                    role: role.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Validate the `[deploy]` section for a context that actually runs a deploy.
     ///
     /// A bare `[deploy]` table is valid at rest, but a deploy needs a target:
@@ -2122,8 +2219,12 @@ impl DeployConfig {
     /// # Errors
     ///
     /// Returns a message when `host` and `hosts` are both set, when a `hosts`
-    /// entry is blank or duplicated, or when neither key provides a target.
+    /// entry is blank or duplicated, when neither key provides a target, or
+    /// when [`group_hosts`](Self::group_hosts) refuses the groups.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.groups.is_empty() {
+            return self.group_hosts().map(|_| ());
+        }
         let host = self
             .host
             .as_deref()
@@ -14150,6 +14251,11 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     } else if env_set_host && !env_set_hosts {
         deploy.hosts.clear();
     }
+    // An env target also wins over `[[deploy.groups]]`. Groups have no env
+    // override.
+    if env_set_host || env_set_hosts {
+        deploy.groups.clear();
+    }
     parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
     parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
     parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
@@ -21056,6 +21162,134 @@ path = "/healthz"
         );
     }
 
+    fn group(role: &str, hosts: &[&str]) -> DeployGroup {
+        DeployGroup {
+            role: role.to_owned(),
+            hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn deploy_groups_parse_from_toml() {
+        let cfg: DeployConfig = toml::from_str(
+            "[[groups]]\nrole = \"web\"\nhosts = [\"10.0.0.1\", \"10.0.0.2\"]\n\n\
+             [[groups]]\nrole = \"worker\"\nhosts = [\"10.0.0.3\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.groups,
+            [
+                group("web", &["10.0.0.1", "10.0.0.2"]),
+                group("worker", &["10.0.0.3"])
+            ]
+        );
+        assert!(
+            toml::from_str::<DeployConfig>("[[groups]]\nrole = \"web\"\nhost = \"x\"\n").is_err()
+        );
+    }
+
+    /// Strict config knows the `[[deploy.groups]]` keys and flags a typo.
+    #[test]
+    fn strict_config_accepts_deploy_groups() {
+        let schema = AutumnConfig::get_schema_keys();
+        let ok = "[[deploy.groups]]\nrole = \"web\"\nhosts = [\"10.0.0.1\"]\n";
+        let errors = AutumnConfig::validate_toml(ok, &schema);
+        assert!(errors.is_empty(), "{errors:?}");
+        let typo = "[[deploy.groups]]\nrole = \"web\"\nhostz = [\"10.0.0.1\"]\n";
+        let errors = AutumnConfig::validate_toml(typo, &schema);
+        assert!(!errors.is_empty(), "a typo in a group must be flagged");
+    }
+
+    #[test]
+    fn deploy_group_hosts_keep_group_then_host_order() {
+        let cfg = DeployConfig {
+            groups: vec![
+                group("web", &[" 10.0.0.1 ", "10.0.0.2"]),
+                group("JOBS", &["10.0.0.3"]),
+                group("critical", &["10.0.0.4"]),
+            ],
+            ..DeployConfig::default()
+        };
+        let hosts = cfg.group_hosts().unwrap();
+        let pairs: Vec<(&str, &str)> = hosts
+            .iter()
+            .map(|h| (h.host.as_str(), h.role.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("10.0.0.1", "web"),
+                ("10.0.0.2", "web"),
+                ("10.0.0.3", "worker"),
+                ("10.0.0.4", "critical"),
+            ]
+        );
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn deploy_group_hosts_refuse_a_bad_shape() {
+        let cases: [(DeployConfig, &str); 7] = [
+            (
+                DeployConfig {
+                    host: Some("10.0.0.9".to_owned()),
+                    groups: vec![group("web", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "mutually exclusive",
+            ),
+            (
+                DeployConfig {
+                    hosts: vec!["10.0.0.9".to_owned()],
+                    groups: vec![group("web", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "mutually exclusive",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group(" ", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "role is blank",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group("Bad Role!", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "invalid role",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group("web", &[])],
+                    ..DeployConfig::default()
+                },
+                "no hosts",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group("web", &["10.0.0.1", "  "])],
+                    ..DeployConfig::default()
+                },
+                "host 1 is blank",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group("web", &["10.0.0.1"]), group("worker", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "more than once",
+            ),
+        ];
+        for (cfg, needle) in cases {
+            let err = cfg.group_hosts().expect_err(needle);
+            assert!(err.contains(needle), "want {needle:?}, got {err}");
+            let err = cfg.validate().expect_err(needle);
+            assert!(err.contains(needle), "validate: want {needle:?}, got {err}");
+        }
+    }
+
     #[test]
     fn deploy_validate_rejects_host_and_hosts_set_together() {
         // #1621 (AC-1): `host` and `hosts` are mutually exclusive — with both set
@@ -21245,6 +21479,31 @@ path = "/healthz"
                 deploy.validate()
             );
         }
+    }
+
+    #[test]
+    fn a_deploy_host_env_override_clears_the_toml_groups() {
+        for (key, value) in [
+            ("AUTUMN_DEPLOY__HOST", "staging-1"),
+            ("AUTUMN_DEPLOY__HOSTS", "a,b"),
+        ] {
+            let mut cfg: AutumnConfig =
+                toml::from_str("[[deploy.groups]]\nrole = \"web\"\nhosts = [\"10.0.0.1\"]\n")
+                    .expect("groups parse");
+            cfg.apply_env_overrides_with_env(&MockEnv::new().with(key, value));
+            let deploy = cfg.deploy.expect("deploy configured");
+            assert!(deploy.groups.is_empty(), "{key} must clear the groups");
+            assert!(deploy.validate().is_ok(), "{:?}", deploy.validate());
+        }
+        let mut kept: AutumnConfig =
+            toml::from_str("[[deploy.groups]]\nrole = \"web\"\nhosts = [\"10.0.0.1\"]\n")
+                .expect("groups parse");
+        kept.apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", " "));
+        assert_eq!(
+            kept.deploy.expect("deploy").groups.len(),
+            1,
+            "a blank value keeps them"
+        );
     }
 
     #[test]

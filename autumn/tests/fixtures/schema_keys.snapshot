@@ -234,6 +234,9 @@ deploy.bake.interval_secs
 deploy.bake.max_error_rate
 deploy.bake.max_p99_ms
 deploy.bake.min_requests
+deploy.groups
+deploy.groups.hosts
+deploy.groups.role
 deploy.host
 deploy.hosts
 deploy.install_proxy

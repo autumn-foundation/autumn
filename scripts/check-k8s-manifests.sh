@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Lint the Kubernetes release templates and the golden SLO files (issue #3069).
+# Lint the Kubernetes release output and the golden SLO files (issue #3069).
 #
 # Usage:
 #   scripts/check-k8s-manifests.sh              # run every check
 #   scripts/check-k8s-manifests.sh --self-test  # prove that a bad manifest fails
 #
-# The checks:
-#   1. Render the `autumn release init --target kubernetes` templates.
-#   2. `helm lint --strict` on the chart: default values, then each opt-in mode
-#      (Argo Rollouts, Flagger, PodMonitor, Flagger with a PodMonitor).
-#   3. `helm template | kubeconform -strict` for each of those modes.
-#   4. The chart refuses bad values (Argo and Flagger together, no buffer).
-#   5. `kustomize build | kubeconform -strict` on the Kustomize base.
+# The checks run on the golden copies of `autumn release init --target
+# kubernetes` in autumn-cli/tests/golden/release/. A Rust test keeps the
+# copies equal to the generator output. There are two: an app with the web,
+# worker and marketing roles, and an app with only the combined role.
+#   1. `helm lint --strict` on each chart: default values, then each opt-in
+#      mode (Argo Rollouts, Flagger, PodMonitor, Ingress, autoscaling).
+#   2. `helm template | kubeconform -strict` for each of those modes.
+#   3. One workload per role. Only a role that serves HTTP gets a Service.
+#   4. The chart refuses bad values (Argo and Flagger together, no buffer, no
+#      role on, an Ingress with no host).
+#   5. `kustomize build | kubeconform -strict` on each Kustomize base.
 #   6. `kubeconform -strict` on the golden PrometheusRule, AnalysisTemplate and
 #      MetricTemplates from `autumn slo generate`.
 #   7. `promtool check rules` and `promtool test rules` on the golden rules.
@@ -45,7 +49,8 @@ CRD_CATALOG_COMMIT="fd90051867733c60d32d16450556e9cd18459aef"
 K8S_SCHEMAS="https://raw.githubusercontent.com/yannh/kubernetes-json-schema/${K8S_SCHEMA_COMMIT}/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json"
 CRD_CATALOG="https://raw.githubusercontent.com/datreeio/CRDs-catalog/${CRD_CATALOG_COMMIT}/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
 
-templates="autumn-cli/src/templates/release/kubernetes"
+roles_app="autumn-cli/tests/golden/release/kubernetes-roles/deploy"
+combined_app="autumn-cli/tests/golden/release/kubernetes-combined/deploy"
 golden="autumn-cli/tests/golden/slo"
 promtool_test="autumn-cli/tests/fixtures/slo/burn-rate.test.yaml"
 
@@ -124,22 +129,6 @@ validate() {
     -schema-location "${K8S_SCHEMAS}" -schema-location "${CRD_CATALOG}" "$@"
 }
 
-# Render the release templates as `autumn release init` does for a project
-# named demo_app. A Rust test (kubernetes_templates_use_only_placeholders_the_
-# ci_check_knows) keeps this list of placeholders complete.
-render() {
-  local out="$1"
-  mkdir -p "${out}"
-  cp -R "${templates}/." "${out}/"
-  while IFS= read -r -d '' file; do
-    sed -e 's/{{k8s_name}}/demo-app/g' -e 's/{{project_name}}/demo_app/g' "${file}" > "${file%.tmpl}"
-    rm "${file}"
-  done < <(find "${out}" -name '*.tmpl' -print0)
-  if grep -rnE '\{\{(k8s_name|project_name)\}\}' "${out}"; then
-    fail "a release placeholder was not replaced"
-  fi
-}
-
 # expect_failure DESCRIPTION REASON COMMAND...: the command must exit non-zero
 # and print REASON, so an unrelated error cannot pass the check.
 expect_failure() {
@@ -169,9 +158,8 @@ spec:
   notAField: true
 EOF
   expect_failure "kubeconform on an invalid Deployment" "is invalid" validate "${work}/bad.yaml"
-  render "${work}/chart"
   expect_failure "a chart with no shutdown buffer" "bufferSeconds must be 1 or more" \
-    "${HELM}" template demo "${work}/chart/helm" --set 'trustedHosts[0]=a.example.com' \
+    "${HELM}" template demo "${roles_app}/helm" --set 'trustedHosts[0]=a.example.com' \
     --set shutdown.bufferSeconds=0
   echo "self-test passed"
 }
@@ -183,60 +171,135 @@ main() {
   "${KUSTOMIZE}" version
   "${PROMTOOL}" --version | head -n 1
 
-  local rendered="${work}/rendered"
-  render "${rendered}"
-  local chart="${rendered}/helm"
-
-  local -a modes=(
+  # The chart requires trustedHosts; every mode sets it.
+  local base_args="--set trustedHosts[0]=demo.example.com"
+  local -a shared_modes=(
     "default::"
     "argo-rollouts::--set rollout.enabled=true --set analysis.templateName=demo-app-slo"
     "flagger::--set flagger.enabled=true -f ${golden}/helm-values.yaml"
     "pod-monitor::--set metrics.podMonitor.enabled=true"
-    "flagger-pod-monitor::--set flagger.enabled=true --set metrics.podMonitor.enabled=true --set flagger.provider=nginx --set flagger.ingressRef.apiVersion=networking.k8s.io/v1 --set flagger.ingressRef.kind=Ingress --set flagger.ingressRef.name=demo -f ${golden}/helm-values.yaml"
     "flagger-gatewayapi::--set flagger.enabled=true --set flagger.provider=gatewayapi:v1 --set flagger.service.gatewayRefs[0].name=public -f ${golden}/helm-values.yaml"
     "pod-annotations::--set podAnnotations.prometheus\\.io/port=9000 --set podAnnotations.team=web"
   )
-  # The chart requires trustedHosts; every mode sets it.
-  local base_args="--set trustedHosts[0]=demo.example.com"
-  local mode name args
-  for mode in "${modes[@]}"; do
-    name="${mode%%::*}"
-    args="${base_args} ${mode#*::}"
-    echo "==> helm lint --strict (${name})"
-    # shellcheck disable=SC2086 # args is a word list on purpose.
-    "${HELM}" lint --strict "${chart}" ${args}
-    echo "==> helm template | kubeconform (${name})"
-    # shellcheck disable=SC2086
-    "${HELM}" template demo "${chart}" ${args} > "${work}/${name}.yaml"
-    validate "${work}/${name}.yaml"
+  local role_ingress="--set roles.web.ingress.enabled=true --set roles.web.ingress.hosts[0].host=shop.example.com --set roles.marketing.ingress.enabled=true --set roles.marketing.ingress.hosts[0].host=www.example.com --set roles.marketing.ingress.hosts[0].paths[0].path=/blog"
+  local role_hpa="--set roles.web.autoscaling.enabled=true --set roles.worker.autoscaling.enabled=true"
+  local -a roles_modes=(
+    "${shared_modes[@]}"
+    "ingress::${role_ingress}"
+    "autoscaling::${role_hpa}"
+    "argo-rollouts-autoscaling::--set rollout.enabled=true ${role_hpa}"
+    "flagger-ingress-autoscaling::--set flagger.enabled=true --set flagger.provider=nginx ${role_ingress} ${role_hpa} -f ${golden}/helm-values.yaml"
+    "pin::--set roles.worker.pin[0]=critical --set roles.worker.pin[1]=default"
+    "flagger-pod-monitor::--set flagger.enabled=true --set metrics.podMonitor.enabled=true --set flagger.provider=nginx ${role_ingress} -f ${golden}/helm-values.yaml"
+  )
+  local -a combined_modes=(
+    "${shared_modes[@]}"
+    "flagger-pod-monitor::--set flagger.enabled=true --set metrics.podMonitor.enabled=true --set flagger.provider=nginx --set flagger.ingressRef.apiVersion=networking.k8s.io/v1 --set flagger.ingressRef.kind=Ingress --set flagger.ingressRef.name=demo -f ${golden}/helm-values.yaml"
+    "ingress::--set roles.combined.ingress.enabled=true --set roles.combined.ingress.hosts[0].host=shop.example.com"
+  )
+
+  local mode name args app
+  for app in roles combined; do
+    local chart_dir modes_name
+    if [[ "${app}" == roles ]]; then
+      chart_dir="${roles_app}/helm"
+      modes_name="roles_modes[@]"
+    else
+      chart_dir="${combined_app}/helm"
+      modes_name="combined_modes[@]"
+    fi
+    for mode in "${!modes_name}"; do
+      name="${app}-${mode%%::*}"
+      args="${base_args} ${mode#*::}"
+      echo "==> helm lint --strict (${name})"
+      # shellcheck disable=SC2086 # args is a word list on purpose.
+      "${HELM}" lint --strict "${chart_dir}" ${args}
+      echo "==> helm template | kubeconform (${name})"
+      # shellcheck disable=SC2086
+      "${HELM}" template demo "${chart_dir}" ${args} > "${work}/${name}.yaml"
+      validate "${work}/${name}.yaml"
+    done
   done
 
+  # count FILE PATTERN: the number of lines that are exactly PATTERN.
+  count() {
+    grep -cxF -- "$2" "$1" || true
+  }
+  # expect_count FILE PATTERN N MESSAGE
+  expect_count() {
+    local got
+    got="$(count "$1" "$2")"
+    [[ "${got}" == "$3" ]] || fail "$4 (${got} lines of \"$2\", not $3)"
+  }
+
+  local roles_default="${work}/roles-default.yaml"
+  # One workload per role. Only web and marketing serve HTTP.
+  expect_count "${roles_default}" "kind: Deployment" 3 "the roles chart needs one Deployment per role"
+  expect_count "${roles_default}" "kind: Service" 2 "only the roles that serve HTTP get a Service"
+  expect_count "${roles_default}" "kind: PodDisruptionBudget" 3 "each role needs a PodDisruptionBudget"
+  for role in web worker marketing; do
+    expect_count "${roles_default}" "              value: \"${role}\"" 1 "AUTUMN_ROLE=${role} is not set once"
+    grep -qxF "      app.kubernetes.io/component: ${role}" "${roles_default}" \
+      || fail "the ${role} selector has no component label"
+    # Flagger selects on "app", so each role needs its own value.
+    expect_count "${work}/roles-flagger.yaml" "      app: demo-demo-app-${role}" 1 \
+      "the ${role} Deployment needs its own app label in its selector"
+    expect_count "${work}/roles-flagger.yaml" "        app: demo-demo-app-${role}" 1 \
+      "the ${role} pods need their own app label"
+  done
+  if grep -qxF "  name: demo-demo-app-worker" <(awk '/^kind: Service$/{s=1} /^---/{s=0} s' "${roles_default}"); then
+    fail "the worker role got a Service"
+  fi
+  expect_count "${roles_default}" "              path: /live" 3 "each role needs a liveness probe"
+  expect_count "${roles_default}" "              path: /ready" 3 "each role needs a readiness probe"
+  expect_count "${work}/roles-ingress.yaml" "kind: Ingress" 2 "each HTTP role with ingress.enabled needs an Ingress"
+  grep -qF 'value: "demo.example.com,www.example.com,$(POD_IP)"' "${work}/roles-ingress.yaml" \
+    || fail "the Ingress hosts are not trusted hosts"
+  expect_count "${work}/roles-autoscaling.yaml" "kind: HorizontalPodAutoscaler" 2 "each role with autoscaling needs an HPA"
+  expect_count "${work}/roles-argo-rollouts.yaml" "kind: Rollout" 2 "each HTTP role needs a Rollout"
+  expect_count "${work}/roles-argo-rollouts.yaml" "kind: Deployment" 1 "a worker stays a Deployment under Argo Rollouts"
+  expect_count "${work}/roles-flagger.yaml" "kind: Canary" 2 "each HTTP role needs a Canary"
+  expect_count "${work}/roles-flagger.yaml" "kind: Service" 0 "Flagger makes the Services"
+  grep -qF 'value: "critical,default"' "${work}/roles-pin.yaml" \
+    || fail "roles.worker.pin does not set AUTUMN_JOBS__PIN"
+  # The web HPA scales the web Rollout. The worker HPA scales a Deployment.
+  grep -A3 '^  scaleTargetRef:$' "${work}/roles-argo-rollouts-autoscaling.yaml" \
+    | grep -A1 -F 'kind: Rollout' | grep -qxF '    name: demo-demo-app-web' \
+    || fail "the web HPA does not scale the web Rollout"
+  grep -A3 '^  scaleTargetRef:$' "${work}/roles-argo-rollouts-autoscaling.yaml" \
+    | grep -A1 -F 'kind: Deployment' | grep -qxF '    name: demo-demo-app-worker' \
+    || fail "the worker HPA does not scale the worker Deployment"
+  expect_count "${work}/combined-default.yaml" "kind: Deployment" 1 "the combined chart needs one Deployment"
+  expect_count "${work}/combined-default.yaml" "kind: Service" 1 "the combined role serves HTTP"
+
+  local default="${work}/combined-default.yaml"
   # The grace period is the sum of the shutdown values: 5 + 5 + 30 + 10.
-  grep -q 'terminationGracePeriodSeconds: 50$' "${work}/default.yaml" \
+  grep -q 'terminationGracePeriodSeconds: 50$' "${default}" \
     || fail "the default grace period is not 50 s"
-  grep -q 'kind: PodDisruptionBudget' "${work}/default.yaml" \
+  grep -q 'kind: PodDisruptionBudget' "${default}" \
     || fail "the chart has no PodDisruptionBudget"
-  grep -q 'podTemplateHashValue: Latest' "${work}/argo-rollouts.yaml" \
+  grep -q 'podTemplateHashValue: Latest' "${work}/combined-argo-rollouts.yaml" \
     || fail "the Rollout does not pass the canary hash to the analysis"
-  grep -q 'name: shop-availability' "${work}/flagger.yaml" \
+  grep -q 'name: shop-availability' "${work}/combined-flagger.yaml" \
     || fail "the Flagger Canary does not use the generated MetricTemplates"
 
-  grep -q 'kind: PodMonitor' "${work}/flagger-pod-monitor.yaml" \
+  grep -q 'kind: PodMonitor' "${work}/combined-flagger-pod-monitor.yaml" \
     || fail "Flagger mode has no PodMonitor"
-  grep -q 'prometheus.io/scrape' "${work}/default.yaml" \
+  grep -q 'prometheus.io/scrape' "${default}" \
     || fail "the default pod has no scrape annotations"
-  grep -q 'jobLabel: app.kubernetes.io/instance' "${work}/pod-monitor.yaml" \
+  grep -q 'jobLabel: app.kubernetes.io/instance' "${work}/combined-pod-monitor.yaml" \
     || fail "the PodMonitor does not set job to the release name"
-  grep -q 'prometheus.io/port: "9000"' "${work}/pod-annotations.yaml" \
+  grep -q 'prometheus.io/port: "9000"' "${work}/combined-pod-annotations.yaml" \
     || fail "podAnnotations do not override the scrape annotations"
-  if grep -q 'prometheus.io/scrape' "${work}/pod-monitor.yaml"; then
+  if grep -q 'prometheus.io/scrape' "${work}/combined-pod-monitor.yaml"; then
     fail "a pod with a PodMonitor also has scrape annotations"
   fi
-  grep -q 'automountServiceAccountToken: false' "${work}/default.yaml" \
+  grep -q 'automountServiceAccountToken: false' "${default}" \
     || fail "the pod mounts a service account token"
-  grep -q 'value: "demo.example.com,$(POD_IP)"' "${work}/default.yaml" \
+  grep -q 'value: "demo.example.com,$(POD_IP)"' "${default}" \
     || fail "the trusted hosts do not include the configured host and the pod IP"
 
+  local chart="${roles_app}/helm"
   expect_failure "a chart with no trusted hosts" "set trustedHosts" \
     "${HELM}" template demo "${chart}"
   # shellcheck disable=SC2086 # base_args is a word list on purpose.
@@ -245,10 +308,33 @@ main() {
   # shellcheck disable=SC2086
   expect_failure "a shutdown buffer of 0" "bufferSeconds must be 1 or more" \
     "${HELM}" template demo "${chart}" ${base_args} --set shutdown.bufferSeconds=0
+  # shellcheck disable=SC2086
+  expect_failure "a chart with no role on" "at least one role" \
+    "${HELM}" template demo "${chart}" ${base_args} --set roles.web.enabled=false \
+    --set roles.worker.enabled=false --set roles.marketing.enabled=false
+  # shellcheck disable=SC2086
+  expect_failure "a top-level replicaCount" "replicaCount moved" \
+    "${HELM}" template demo "${chart}" ${base_args} --set replicaCount=3
+  # shellcheck disable=SC2086
+  expect_failure "one flagger.ingressRef for two HTTP roles" "can serve one role only" \
+    "${HELM}" template demo "${chart}" ${base_args} --set flagger.enabled=true \
+    --set flagger.ingressRef.name=shop
+  # shellcheck disable=SC2086
+  expect_failure "an Ingress with no host" "roles.web.ingress.hosts" \
+    "${HELM}" template demo "${chart}" ${base_args} --set roles.web.ingress.enabled=true
 
-  echo "==> kustomize build | kubeconform"
-  "${KUSTOMIZE}" build "${rendered}/kustomize" > "${work}/kustomize.yaml"
-  validate "${work}/kustomize.yaml"
+  for app in "${roles_app}" "${combined_app}"; do
+    echo "==> kustomize build | kubeconform (${app})"
+    "${KUSTOMIZE}" build "${app}/kustomize/base" > "${work}/kustomize.yaml"
+    validate "${work}/kustomize.yaml"
+  done
+  "${KUSTOMIZE}" build "${roles_app}/kustomize/base" > "${work}/kustomize-roles.yaml"
+  expect_count "${work}/kustomize-roles.yaml" "kind: Deployment" 3 "the Kustomize base needs one Deployment per role"
+  expect_count "${work}/kustomize-roles.yaml" "kind: Service" 2 "only the Kustomize roles that serve HTTP get a Service"
+  expect_count "${work}/kustomize-roles.yaml" "kind: Ingress" 2 "only the Kustomize roles that serve HTTP get an Ingress"
+  for role in web worker marketing; do
+    expect_count "${work}/kustomize-roles.yaml" "          value: ${role}" 1 "Kustomize AUTUMN_ROLE=${role} is not set once"
+  done
 
   echo "==> kubeconform on the golden SLO objects"
   validate "${golden}/prometheus-rule.yaml" "${golden}/argo-analysis-template.yaml" \

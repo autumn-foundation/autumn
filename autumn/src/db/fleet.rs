@@ -163,6 +163,8 @@ mod replica {
 
         pub(super) const fn begin_replica_shutdown(&self, _: std::time::Instant) {}
 
+        pub(super) const fn settle_release(&self, _: &FleetDbKey, _: bool) {}
+
         pub(super) async fn finish_replica_shutdown(&self, _: std::time::Instant) {}
 
         pub(super) const fn rpo(&self) -> Option<std::time::Duration> {
@@ -1018,6 +1020,28 @@ impl<E: FleetEngine> Drop for DrainGuard<'_, E> {
     }
 }
 
+/// After the hooks released a closed key: tells the replication whether
+/// the delete or the restore replaced the files. A drop without
+/// [`done`](Self::done) means they stay, with their unshipped writes.
+struct ReleaseSettle<'a, E: FleetEngine> {
+    fleet: &'a DatabaseFleet<E>,
+    key: FleetDbKey,
+    replaced: bool,
+}
+
+impl<E: FleetEngine> ReleaseSettle<'_, E> {
+    /// The files are gone or replaced.
+    const fn done(&mut self) {
+        self.replaced = true;
+    }
+}
+
+impl<E: FleetEngine> Drop for ReleaseSettle<'_, E> {
+    fn drop(&mut self) {
+        self.fleet.settle_release(&self.key, self.replaced);
+    }
+}
+
 /// A key that is closing or being deleted. Openers wait on `done`.
 struct Drain {
     deleting: bool,
@@ -1029,6 +1053,9 @@ struct Drain {
     /// The retire flag of the database and the epoch it opened under, so a
     /// fence can retire a database that is still draining.
     retire: Option<(Arc<AtomicBool>, Option<crate::lock::FencingToken>)>,
+    /// A short hold of a closed key, not a close. `close_all` does not wait
+    /// for it.
+    hold: bool,
 }
 
 impl Drain {
@@ -1343,7 +1370,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             return false;
         };
         if self.unshipped() {
-            tracing::warn!("fleet ownership: unshipped frames; the ranges lapse instead");
+            tracing::warn!("fleet ownership: unshipped writes; the ranges lapse instead");
             return false;
         }
         if ownership.unsettled() {
@@ -2281,6 +2308,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             finished: AtomicBool::new(false),
             done: Notify::new(),
             retire: Some((Arc::clone(&db.retired), db.epoch)),
+            hold: false,
         });
         state.draining.insert(key.clone(), Arc::clone(&drain));
         self.inner.in_flight_drains.fetch_add(1, Ordering::Relaxed);
@@ -2439,7 +2467,13 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // Together, so the worker timeout is paid once, not per database.
         futures::future::join_all(keys.iter().map(|key| self.close(key))).await;
         loop {
-            let pending: Vec<Arc<Drain>> = self.lock_state().draining.values().cloned().collect();
+            let pending: Vec<Arc<Drain>> = self
+                .lock_state()
+                .draining
+                .values()
+                .filter(|drain| !drain.hold)
+                .cloned()
+                .collect();
             if pending.is_empty() {
                 return;
             }
@@ -2559,6 +2593,11 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         for hook in self.hooks() {
             hook.release(&key);
         }
+        let mut settle = ReleaseSettle {
+            fleet: self,
+            key: key.clone(),
+            replaced: false,
+        };
         let path = self.path_of(&key);
         let root = self.inner.root.clone();
         let name = key.name();
@@ -2612,6 +2651,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 .and_then(|r| r);
                 if removed.is_ok() {
                     self.lock_state().unacknowledged.remove(&key);
+                    // Removed, or no file was there.
+                    settle.done();
                 }
                 Ok::<_, FleetError>(removed)
             })
@@ -2675,6 +2716,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 .as_ref()
                 .and_then(|entry| entry.cell.get())
                 .map(|db| (Arc::clone(&db.retired), db.epoch)),
+            hold: false,
         });
         state.draining.insert(key.clone(), Arc::clone(&drain));
         drop(state);
@@ -2924,9 +2966,18 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 for hook in self.hooks() {
                     hook.release(&key);
                 }
+                let mut settle = ReleaseSettle {
+                    fleet: self,
+                    key: key.clone(),
+                    replaced: false,
+                };
                 // The guard finishes the drain whatever fails: an error that
                 // skipped it would strand every later opener of this key.
-                return work.await;
+                let result = work.await;
+                if result.is_ok() {
+                    settle.done();
+                }
+                return result;
             }
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(pending) = pending {

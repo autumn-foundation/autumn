@@ -1,0 +1,82 @@
+--- pg_stat_statements: notifications statements (buffers = hit+read)
+ calls | buffers |  hit   |  read   | temp_w | rows | pct_buffers | pct_calls |                                             q                                              
+-------+---------+--------+---------+--------+------+-------------+-----------+--------------------------------------------------------------------------------------------
+   100 | 1942203 | 789843 | 1152360 |      0 |  100 |        56.2 |      50.0 | SELECT COUNT(*) FROM notifications WHERE tenant_id = $1 AND recipient_id = $2 AND read_at 
+   100 | 1511203 | 143933 | 1367270 |      0 | 1050 |        43.8 |      50.0 | SELECT id, tenant_id, recipient_id, kind, payload, read_at, created_at FROM notifications 
+(2 rows)
+
+--- EXPLAIN (heavy recipient): unread_count
+                                                                    QUERY PLAN                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=49217.90..49217.91 rows=1 width=8) (actual time=45.963..48.529 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=13952 read=24864
+   ->  Gather  (cost=49217.69..49217.90 rows=2 width=8) (actual time=45.888..48.522 rows=3 loops=1)
+         Output: (PARTIAL count(*))
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=13952 read=24864
+         ->  Partial Aggregate  (cost=48217.69..48217.70 rows=1 width=8) (actual time=42.739..42.740 rows=1 loops=3)
+               Output: PARTIAL count(*)
+               Buffers: shared hit=13952 read=24864
+               Worker 0:  actual time=41.354..41.355 rows=1 loops=1
+                 Buffers: shared hit=4810 read=8853
+               Worker 1:  actual time=41.109..41.110 rows=1 loops=1
+                 Buffers: shared hit=4098 read=7253
+               ->  Parallel Seq Scan on public.notifications  (cost=0.00..48190.64 rows=10817 width=0) (actual time=19.815..42.725 rows=7 loops=3)
+                     Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+                     Filter: ((notifications.read_at IS NULL) AND (notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1))
+                     Rows Removed by Filter: 499993
+                     Buffers: shared hit=13952 read=24864
+                     Worker 0:  actual time=21.706..41.342 rows=9 loops=1
+                       Buffers: shared hit=4810 read=8853
+                     Worker 1:  actual time=18.659..41.098 rows=4 loops=1
+                       Buffers: shared hit=4098 read=7253
+ Query Identifier: 7377513505993996169
+ Planning Time: 0.057 ms
+ Execution Time: 48.552 ms
+(27 rows)
+
+--- EXPLAIN (heavy recipient): unread page
+                                                                             QUERY PLAN                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.43..66.12 rows=20 width=167) (actual time=0.026..143.271 rows=20 loops=1)
+   Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+   Buffers: shared hit=2692 read=27504
+   ->  Index Scan Backward using notifications_pkey on public.notifications  (cost=0.43..85278.29 rows=25961 width=167) (actual time=0.026..143.253 rows=20 loops=1)
+         Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+         Filter: ((notifications.read_at IS NULL) AND (notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1))
+         Rows Removed by Filter: 949981
+         Buffers: shared hit=2692 read=27504
+ Query Identifier: -5090810326736857262
+ Planning Time: 0.077 ms
+ Execution Time: 143.294 ms
+(11 rows)
+
+--- EXPLAIN (median recipient): unread_count
+                                                                           QUERY PLAN                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=97.51..97.52 rows=1 width=8) (actual time=0.109..0.109 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared read=28
+   ->  Index Scan using idx_notifications_tenant_recipient on public.notifications  (cost=0.43..97.51 rows=1 width=0) (actual time=0.036..0.106 rows=1 loops=1)
+         Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+         Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1500))
+         Filter: (notifications.read_at IS NULL)
+         Rows Removed by Filter: 24
+         Buffers: shared read=28
+ Query Identifier: 7377513505993996169
+ Planning Time: 0.115 ms
+ Execution Time: 0.129 ms
+(12 rows)
+
+--- equivalence: md5 of ordered unread ids, plus counts, per recipient
+ recipient_id | count |               md5                
+--------------+-------+----------------------------------
+            1 |    20 | a85f1afc118e3d9c3deaa7e46490513d
+         1001 |     1 | b69f378b8b00e843f4b677aa57fe4ec5
+         1500 |     1 | 0b97be8b4b408a3a0780a32e0a143a7f
+        20999 |     1 | 937a099ea83f875440a0320911adc1a4
+(4 rows)
+
+sizes: table=303 MB idx_shipped=11 MB idx_unread=-

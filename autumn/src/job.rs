@@ -15770,7 +15770,9 @@ mod tests {
         )
         .await;
 
-        let retried = timeout(Duration::from_millis(100), rx.recv())
+        // The bound only catches a hang. A loaded runner can take more than
+        // 100 ms to run the spawned retry task.
+        let retried = timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("retry should be scheduled")
             .expect("retry payload should be sent");
@@ -23330,8 +23332,9 @@ mod tests {
             .await
             .expect("enqueue_after_commit should succeed outside tx");
 
-        // The job should have been enqueued immediately (not deferred)
-        let received = timeout(Duration::from_millis(100), rx.recv()).await;
+        // The job should have been enqueued immediately (not deferred). The
+        // bound only catches a hang; it is not a latency budget.
+        let received = timeout(Duration::from_secs(5), rx.recv()).await;
         assert!(
             received.is_ok(),
             "job should be received immediately outside tx"
@@ -23400,8 +23403,8 @@ mod tests {
             cb().await.unwrap();
         }
 
-        // Now the job should appear
-        let received = timeout(Duration::from_millis(100), rx.recv()).await;
+        // Now the job should appear. The bound only catches a hang.
+        let received = timeout(Duration::from_secs(5), rx.recv()).await;
         assert!(
             received.is_ok(),
             "job should be enqueued after commit callbacks run"
@@ -23747,7 +23750,8 @@ mod tests {
                     .enqueue_after_commit("test_job", serde_json::json!({}))
                     .await
                     .expect("outside tx enqueues immediately");
-                let job = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                // The bound only catches a hang; it is not a latency budget.
+                let job = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
                     .await
                     .expect("job should arrive")
                     .expect("channel open");

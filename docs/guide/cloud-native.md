@@ -346,7 +346,8 @@ On Kubernetes this is two `Deployment`s off the same image — one with
 `AUTUMN_ROLE=web`, one with `AUTUMN_ROLE=worker` — each with its own replica
 count and autoscaler, both pointing the readiness probe at `/ready` so the
 [rolling-deploy drain](#rolling-deploy-lifecycle) supervises worker rollouts the
-same way it does web.
+same way it does web. `autumn release init --target kubernetes` writes these
+for you: see [One workload per role](kubernetes.md#one-workload-per-role).
 
 ### Gating app-owned background work
 

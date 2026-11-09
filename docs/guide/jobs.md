@@ -429,7 +429,11 @@ crate. Request-scoped spawns go on its allow-list.
 ### Named roles
 
 Declare a tier once in `autumn.toml` as a `[roles.<name>]` preset (#3543).
-Each Deployment or Fly process then sets only `AUTUMN_ROLE=<name>`:
+Each Deployment or Fly process then sets only `AUTUMN_ROLE=<name>`.
+`autumn release init --target kubernetes` and `--target fly` write one
+workload per preset (see [Kubernetes](kubernetes.md#one-workload-per-role)),
+and `[[deploy.groups]]` sets a role per fleet host group (see
+[Fleet deploys](fleet-deploys.md#per-group-roles)):
 
 ```toml
 [roles.critical]

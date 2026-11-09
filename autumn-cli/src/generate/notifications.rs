@@ -257,9 +257,21 @@ fn migration_up_sql(backend: DatabaseBackend) -> String {
         "tenant_id TEXT NOT NULL",
         "tenant_id TEXT NOT NULL DEFAULT ''",
     );
+    // Postgres also gets a partial index over the unread rows. The bell badge
+    // and the `unread` feed filter read only `read_at IS NULL` rows, and a
+    // recipient's history is almost all read, so the composite index alone
+    // makes them walk and discard every read row. `id` is the feed's default
+    // sort key, so the unread page needs no sort either.
+    let unread_index = match backend {
+        DatabaseBackend::Postgres => {
+            "CREATE INDEX idx_notifications_unread ON notifications \
+             (tenant_id, recipient_id, id) WHERE read_at IS NULL;\n"
+        }
+        DatabaseBackend::Sqlite => "",
+    };
     format!(
         "{sql}CREATE INDEX idx_notifications_tenant_recipient ON notifications \
-         (tenant_id, recipient_id);\n"
+         (tenant_id, recipient_id);\n{unread_index}"
     )
 }
 
@@ -788,7 +800,8 @@ async fn main() {
                  \x20   read_at TIMESTAMPTZ NULL,\n\
                  \x20   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n\
                  );\n\
-                 CREATE INDEX idx_notifications_tenant_recipient ON notifications (tenant_id, recipient_id);\n"
+                 CREATE INDEX idx_notifications_tenant_recipient ON notifications (tenant_id, recipient_id);\n\
+                 CREATE INDEX idx_notifications_unread ON notifications (tenant_id, recipient_id, id) WHERE read_at IS NULL;\n"
             );
 
             let down = fs::read_to_string(dir.join("down.sql")).unwrap();

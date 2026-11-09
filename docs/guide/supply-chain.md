@@ -436,7 +436,7 @@ When there is no fix — or the vulnerable code path is unreachable from your ap
 [advisories]
 ignore = [
     # Why this is acceptable *here*, and when you will look again.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path (autumn-web `jwt` feature, default-on); reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    { id = "RUSTSEC-2023-0071", reason = "verify-only; reaches this app only through jsonwebtoken's RSA-family JWT verification path (autumn-web `jwt` feature, default-on), never signing; rsa 0.10.0 final now exists but jsonwebtoken (^0.9) and webauthn-rs/crypto-glue (rc pin vs. final's mandatory sha2 feature) both block taking it; reconfirmed unreachable 2026-11-09; review-by 2026-12-05" },
 ]
 ```
 
@@ -448,7 +448,9 @@ in a pull request rather than living in someone's memory.
 Your generated `deny.toml` has three waivers. Two are `RUSTSEC-2023-0071`
 (`rsa`) and `RUSTSEC-2026-0387` (`crypto-bigint` 0.5). Both reach an Autumn app through
 `jsonwebtoken`, which `autumn-web` compiles behind its default-on `jwt`
-feature. No fix an app can take exists for either. An app that needs neither
+feature. A fix exists upstream for `rsa` (0.10.0 final, 2026-11) but nothing
+in either dependency chain can consume it yet, and no fix an app can take
+exists for `crypto-bigint`. An app that needs neither
 JWT tenancy nor OIDC can set `default-features = false`, leave out `jwt` (and
 `oauth2`, which turns it on), and delete both waivers. A passkey app still
 reaches `rsa` through `webauthn-rs`. cargo-deny's "this waiver is unused"
