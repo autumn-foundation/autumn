@@ -165,6 +165,11 @@ impl SecurityDump {
         if config.mail.should_mount_unsubscribe_endpoint() {
             exempt_paths.push(crate::mail::UNSUBSCRIBE_PATH.to_owned());
         }
+        // The outbox inbox endpoint is exempt at runtime too.
+        #[cfg(feature = "db")]
+        if config.outbox.serves_inbox() {
+            exempt_paths.push(crate::outbox::INBOX_PATH.to_owned());
+        }
         exempt_paths.sort();
         exempt_paths.dedup();
 
@@ -899,6 +904,16 @@ pub(crate) fn append_framework_routes_with_env(
                 "unsubscribe",
             ));
         }
+    }
+
+    // The outbox inbox endpoint, under the same predicate as the mount.
+    #[cfg(feature = "db")]
+    if config.outbox.serves_inbox() {
+        infos.push(RouteInfo::framework_route(
+            "POST",
+            crate::outbox::INBOX_PATH.to_owned(),
+            "outbox_inbox",
+        ));
     }
 
     // Widget story gallery routes (#1526), listed iff the resolved config
@@ -2563,6 +2578,44 @@ mod tests {
                 .any(|p| p == crate::mail::UNSUBSCRIBE_PATH),
             "unmounted unsubscribe path must not be exempt: {:?}",
             plain_dump.csrf.exempt_paths
+        );
+    }
+
+    /// The outbox inbox endpoint is listed and CSRF-exempt only when the app
+    /// serves it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn outbox_inbox_route_is_listed_and_exempt_when_served() {
+        let mut config = AutumnConfig::default();
+        config.outbox.enabled = true;
+        config.outbox.inbox.enabled = true;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(
+            infos.iter().any(|i| i.method == "POST"
+                && i.path == crate::outbox::INBOX_PATH
+                && i.classification == RouteClassification::Framework),
+            "{infos:?}"
+        );
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            dump.csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::outbox::INBOX_PATH)
+        );
+
+        config.outbox.inbox.enabled = false;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(!infos.iter().any(|i| i.path == crate::outbox::INBOX_PATH));
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            !dump
+                .csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::outbox::INBOX_PATH)
         );
     }
 

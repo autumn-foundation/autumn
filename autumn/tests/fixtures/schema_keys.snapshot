@@ -386,7 +386,14 @@ openapi.enabled
 openapi.path
 outbox
 outbox.batch_size
+outbox.destinations
 outbox.enabled
+outbox.inbox
+outbox.inbox.enabled
+outbox.inbox.max_body_bytes
+outbox.inbox.previous_signing_secrets
+outbox.inbox.signing_secret
+outbox.inbox.timestamp_tolerance_secs
 outbox.initial_backoff_ms
 outbox.lease_ms
 outbox.max_attempts

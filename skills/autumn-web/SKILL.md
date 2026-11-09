@@ -1950,6 +1950,17 @@ build. Put `#[event_consumer(E)]` on an outbox topic handler for the same
 check. `#[event(opaque)]` turns the check off for a payload `WireShape`
 refuses. `autumn contracts check` covers events across releases.
 
+Send an event to another Autumn service with an outbox destination, not a
+hand-written HTTP call. The producer sets `[outbox.destinations.<name>]`
+(`url`, `signing_secret = "${VAR}"`, `topics`) and writes the event with
+`outbox.write(conn, aggregate, Event::NAME, &event)` in its transaction. Each
+topic must be an `#[event(name = "...")]`, or the boot fails. The receiver
+sets `[outbox.inbox]` (`enabled`, the same `signing_secret`) and handles the
+topic with a `#[listener]`; it serves `POST /_autumn/inbox`, drops copies
+with `Inbox::seen`, and returns `503` for a topic it does not know yet, which
+the producer relay sends again. Both apps need `outbox.enabled = true`. See
+`docs/guide/outbox.md`.
+
 ## Distributed locks (0.6.0)
 
 For "run this exactly once across replicas right now" work (nightly cleanup,

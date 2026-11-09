@@ -5291,6 +5291,112 @@ pub struct OutboxConfig {
     /// Age after which the relay deletes sent messages and inbox entries.
     /// Default `604800000` (7 days).
     pub retention_ms: u64,
+    /// Other services that get the messages of some topics, by name. The
+    /// relay POSTs each message to the inbox of the service.
+    pub destinations: BTreeMap<String, OutboxDestinationConfig>,
+    /// The inbox endpoint that takes messages from other services.
+    pub inbox: OutboxInboxConfig,
+}
+
+/// One remote outbox destination: `[outbox.destinations.<name>]`.
+///
+/// The relay POSTs each message of `topics` to `url`, signed with
+/// `signing_secret`. See `docs/guide/outbox.md`.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct OutboxDestinationConfig {
+    /// The inbox URL of the other service, for example
+    /// `https://marketing.internal/_autumn/inbox`.
+    pub url: String,
+    /// The HMAC key. Write `"${NAME}"` to read it from the environment
+    /// variable `NAME`.
+    pub signing_secret: Option<String>,
+    /// The topics that go to this destination. Each one is the topic of an
+    /// `#[event(name = "...")]`.
+    pub topics: Vec<String>,
+}
+
+impl std::fmt::Debug for OutboxDestinationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboxDestinationConfig")
+            .field("url", &self.url)
+            .field("signing_secret", &redacted(self.signing_secret.as_ref()))
+            .field("topics", &self.topics)
+            .finish()
+    }
+}
+
+/// The inbox endpoint: `[outbox.inbox]`.
+///
+/// When `enabled`, the app serves `POST /_autumn/inbox`. It takes messages
+/// that the relay of another service sends. See `docs/guide/outbox.md`.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct OutboxInboxConfig {
+    /// Serve the endpoint. Default `false`. Needs `outbox.enabled = true`.
+    pub enabled: bool,
+    /// The HMAC key. Write `"${NAME}"` to read it from the environment.
+    pub signing_secret: Option<String>,
+    /// Old keys that still verify during a rotation.
+    pub previous_signing_secrets: Vec<String>,
+    /// Largest difference between the signature time and now, in seconds.
+    /// Default `300`.
+    pub timestamp_tolerance_secs: u64,
+    /// Largest request body. Default `1048576` (1 MiB).
+    pub max_body_bytes: usize,
+}
+
+impl Default for OutboxInboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            signing_secret: None,
+            previous_signing_secrets: Vec::new(),
+            timestamp_tolerance_secs: 300,
+            max_body_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl std::fmt::Debug for OutboxInboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboxInboxConfig")
+            .field("enabled", &self.enabled)
+            .field("signing_secret", &redacted(self.signing_secret.as_ref()))
+            .field(
+                "previous_signing_secrets",
+                &self.previous_signing_secrets.len(),
+            )
+            .field("timestamp_tolerance_secs", &self.timestamp_tolerance_secs)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .finish()
+    }
+}
+
+/// The `Debug` text of a secret: never its value.
+const fn redacted(secret: Option<&String>) -> &'static str {
+    match secret {
+        Some(_) => "<redacted>",
+        None => "<none>",
+    }
+}
+
+/// The variable name of a `"${NAME}"` reference, else `None`.
+fn secret_reference(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .filter(|name| !name.is_empty())
+}
+
+/// Replace a `"${NAME}"` reference with the value of `NAME`. An unset
+/// variable leaves the reference, so validation names it.
+fn resolve_secret_reference(env: &dyn Env, value: &mut String) {
+    if let Some(name) = secret_reference(value)
+        && let Ok(resolved) = env.var(name)
+    {
+        *value = resolved;
+    }
 }
 
 impl OutboxConfig {
@@ -5323,8 +5429,168 @@ impl OutboxConfig {
                     .to_owned(),
             ));
         }
+        self.validate_destinations()?;
+        self.validate_inbox()
+    }
+
+    /// Whether the app serves the inbox endpoint: `enabled` and
+    /// `inbox.enabled` are both `true`.
+    #[must_use]
+    pub const fn serves_inbox(&self) -> bool {
+        self.enabled && self.inbox.enabled
+    }
+
+    fn validate_destinations(&self) -> Result<(), ConfigError> {
+        let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, destination) in &self.destinations {
+            let key = format!("outbox.destinations.{name}");
+            let uri = destination.url.parse::<http::Uri>().ok();
+            let web_url = uri.as_ref().is_some_and(|uri| {
+                matches!(uri.scheme_str(), Some("http" | "https")) && uri.host().is_some()
+            });
+            if !web_url {
+                return Err(ConfigError::Validation(format!(
+                    "{key}.url must be an http:// or https:// URL"
+                )));
+            }
+            if destination.topics.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "{key}.topics must name at least one topic"
+                )));
+            }
+            for topic in &destination.topics {
+                if topic.starts_with(OUTBOX_RESERVED_TOPIC_PREFIX) {
+                    return Err(ConfigError::Validation(format!(
+                        "{key}: topic {topic:?} uses the reserved prefix \
+                         `{OUTBOX_RESERVED_TOPIC_PREFIX}`"
+                    )));
+                }
+                if !is_valid_outbox_topic(topic) {
+                    return Err(ConfigError::Validation(format!(
+                        "{key}: topic {topic:?} must use only A-Z a-z 0-9 . _ : -"
+                    )));
+                }
+                if let Some(other) = owners.insert(topic, name) {
+                    return Err(ConfigError::Validation(format!(
+                        "outbox topic {topic:?} is in more than one destination \
+                         ({other:?} and {name:?})"
+                    )));
+                }
+            }
+            check_secret(
+                &format!("{key}.signing_secret"),
+                destination.signing_secret.as_ref(),
+            )?;
+        }
         Ok(())
     }
+
+    fn validate_inbox(&self) -> Result<(), ConfigError> {
+        if !self.inbox.enabled {
+            return Ok(());
+        }
+        if !self.enabled {
+            return Err(ConfigError::Validation(
+                "outbox.inbox.enabled needs outbox.enabled = true: the inbox hands each \
+                 message to the relay"
+                    .to_owned(),
+            ));
+        }
+        // A copy is dropped only while its inbox row exists. The purge deletes
+        // rows after `retention_ms`, so a signature must expire before that. A
+        // time ahead of the receiver clock stays valid for up to two
+        // tolerances after the inbox takes it.
+        if self.inbox.timestamp_tolerance_secs.saturating_mul(2_000) >= self.retention_ms {
+            return Err(ConfigError::Validation(
+                "outbox.retention_ms must be longer than two times \
+                 outbox.inbox.timestamp_tolerance_secs: else a copy can arrive after the purge"
+                    .to_owned(),
+            ));
+        }
+        check_secret(
+            "outbox.inbox.signing_secret",
+            self.inbox.signing_secret.as_ref(),
+        )?;
+        for (index, previous) in self.inbox.previous_signing_secrets.iter().enumerate() {
+            check_secret(
+                &format!("outbox.inbox.previous_signing_secrets[{index}]"),
+                Some(previous),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Check the strength of each signing secret. In production a weak or
+    /// template secret is an error, as for signed webhooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] that names the weak secret.
+    pub fn validate_signing_secrets(&self, is_production: bool) -> Result<(), ConfigError> {
+        let mut secrets: Vec<(String, &String)> = Vec::new();
+        for (name, destination) in &self.destinations {
+            if let Some(secret) = &destination.signing_secret {
+                secrets.push((format!("outbox.destinations.{name}.signing_secret"), secret));
+            }
+        }
+        if self.inbox.enabled {
+            if let Some(secret) = &self.inbox.signing_secret {
+                secrets.push(("outbox.inbox.signing_secret".to_owned(), secret));
+            }
+            for (index, secret) in self.inbox.previous_signing_secrets.iter().enumerate() {
+                secrets.push((
+                    format!("outbox.inbox.previous_signing_secrets[{index}]"),
+                    secret,
+                ));
+            }
+        }
+        for (key, secret) in secrets {
+            crate::security::config::validate_signing_secret(Some(secret), is_production)
+                .map_err(|reason| ConfigError::Validation(format!("{key}: {reason}")))?;
+        }
+        Ok(())
+    }
+
+    /// Resolve each `"${NAME}"` secret reference from `env`.
+    fn resolve_secret_references(&mut self, env: &dyn Env) {
+        for destination in self.destinations.values_mut() {
+            if let Some(secret) = destination.signing_secret.as_mut() {
+                resolve_secret_reference(env, secret);
+            }
+        }
+        if let Some(secret) = self.inbox.signing_secret.as_mut() {
+            resolve_secret_reference(env, secret);
+        }
+        for secret in &mut self.inbox.previous_signing_secrets {
+            resolve_secret_reference(env, secret);
+        }
+    }
+}
+
+/// Outbox topics that start with this prefix belong to the framework.
+pub(crate) const OUTBOX_RESERVED_TOPIC_PREFIX: &str = "autumn.";
+
+/// `true` when `topic` uses only `A-Z a-z 0-9 . _ : -`. The relay puts
+/// topics in its SQL text, so no other character is allowed.
+pub(crate) fn is_valid_outbox_topic(topic: &str) -> bool {
+    !topic.is_empty()
+        && topic
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// A signing secret must be set, must not be empty, and must not be an
+/// unresolved `"${NAME}"` reference.
+fn check_secret(key: &str, secret: Option<&String>) -> Result<(), ConfigError> {
+    let Some(secret) = secret.filter(|secret| !secret.is_empty()) else {
+        return Err(ConfigError::Validation(format!("{key} is required")));
+    };
+    if let Some(name) = secret_reference(secret) {
+        return Err(ConfigError::Validation(format!(
+            "{key} reads the environment variable {name}, which is not set"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for OutboxConfig {
@@ -5338,6 +5604,8 @@ impl Default for OutboxConfig {
             max_backoff_ms: 300_000,
             lease_ms: 60_000,
             retention_ms: 604_800_000,
+            destinations: BTreeMap::new(),
+            inbox: OutboxInboxConfig::default(),
         }
     }
 }
@@ -7094,6 +7362,10 @@ impl AutumnConfig {
         self.http.client.retry_budget.validate()?;
         self.scheduler.validate()?;
         self.outbox.validate()?;
+        self.outbox.validate_signing_secrets(matches!(
+            self.profile.as_deref(),
+            Some("prod" | "production")
+        ))?;
         // #1605: reject an unparseable or zero retention window at boot rather
         // than silently skipping the dataset it names — a policy an operator
         // believes is enforced but isn't is worse than no policy.
@@ -8755,6 +9027,7 @@ impl AutumnConfig {
             "AUTUMN_OUTBOX__RETENTION_MS",
             &mut self.outbox.retention_ms,
         );
+        self.outbox.resolve_secret_references(env);
     }
 
     /// Set `role` from `AUTUMN_ROLE`. A blank value leaves it. A value that is
@@ -19035,8 +19308,227 @@ path = "/healthz"
                 max_backoff_ms: 200,
                 lease_ms: 900,
                 retention_ms: 1_000,
+                ..OutboxConfig::default()
             }
         );
+    }
+
+    const REMOTE_SECRET: &str = "marketing-inbox-secret-0123456789abcdef";
+
+    fn destination(url: &str, topics: &[&str]) -> OutboxDestinationConfig {
+        OutboxDestinationConfig {
+            url: url.to_owned(),
+            signing_secret: Some(REMOTE_SECRET.to_owned()),
+            topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+        }
+    }
+
+    fn with_destinations(destinations: &[(&str, OutboxDestinationConfig)]) -> OutboxConfig {
+        OutboxConfig {
+            enabled: true,
+            destinations: destinations
+                .iter()
+                .map(|(name, destination)| ((*name).to_owned(), destination.clone()))
+                .collect(),
+            ..OutboxConfig::default()
+        }
+    }
+
+    #[test]
+    fn outbox_destinations_and_inbox_parse_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [outbox]
+            enabled = true
+
+            [outbox.destinations.marketing]
+            url = "https://marketing.internal/_autumn/inbox"
+            signing_secret = "s3cret-value-0123456789abcdef0123"
+            topics = ["deal.won", "contact.updated.v2"]
+
+            [outbox.inbox]
+            enabled = true
+            signing_secret = "s3cret-value-0123456789abcdef0123"
+            previous_signing_secrets = ["old-value-0123456789abcdef012345"]
+            "#,
+        )
+        .expect("outbox remote config");
+        let marketing = &config.outbox.destinations["marketing"];
+        assert_eq!(marketing.url, "https://marketing.internal/_autumn/inbox");
+        assert_eq!(marketing.topics, ["deal.won", "contact.updated.v2"]);
+        assert!(config.outbox.inbox.enabled);
+        assert_eq!(config.outbox.inbox.previous_signing_secrets.len(), 1);
+        assert_eq!(config.outbox.inbox.timestamp_tolerance_secs, 300);
+        config.outbox.validate().expect("valid");
+    }
+
+    #[test]
+    fn outbox_remote_secrets_resolve_from_the_environment() {
+        let mut config = AutumnConfig {
+            outbox: with_destinations(&[(
+                "marketing",
+                OutboxDestinationConfig {
+                    signing_secret: Some("${MARKETING_INBOX_SECRET}".to_owned()),
+                    ..destination("https://m/_autumn/inbox", &["deal.won"])
+                },
+            )]),
+            ..AutumnConfig::default()
+        };
+        config.outbox.inbox.signing_secret = Some("${CORE_INBOX_SECRET}".to_owned());
+        config.outbox.inbox.previous_signing_secrets = vec!["${OLD_SECRET}".to_owned()];
+        let env = MockEnv::new()
+            .with("MARKETING_INBOX_SECRET", "from-env-1")
+            .with("CORE_INBOX_SECRET", "from-env-2")
+            .with("OLD_SECRET", "from-env-3");
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.outbox.destinations["marketing"]
+                .signing_secret
+                .as_deref(),
+            Some("from-env-1")
+        );
+        assert_eq!(
+            config.outbox.inbox.signing_secret.as_deref(),
+            Some("from-env-2")
+        );
+        assert_eq!(config.outbox.inbox.previous_signing_secrets, ["from-env-3"]);
+    }
+
+    #[test]
+    fn outbox_remote_unset_secret_reference_fails_validation() {
+        let mut config = AutumnConfig {
+            outbox: with_destinations(&[(
+                "marketing",
+                OutboxDestinationConfig {
+                    signing_secret: Some("${NOT_SET_ANYWHERE}".to_owned()),
+                    ..destination("https://m/_autumn/inbox", &["deal.won"])
+                },
+            )]),
+            ..AutumnConfig::default()
+        };
+        config.apply_env_overrides_with_env(&MockEnv::new());
+        let error = config.outbox.validate().unwrap_err().to_string();
+        assert!(error.contains("NOT_SET_ANYWHERE"), "{error}");
+    }
+
+    #[test]
+    fn outbox_destination_validation_refuses_bad_values() {
+        let cases: Vec<(OutboxConfig, &str)> = vec![
+            (
+                with_destinations(&[("m", destination("", &["deal.won"]))]),
+                "url",
+            ),
+            (
+                with_destinations(&[("m", destination("ftp://m/inbox", &["deal.won"]))]),
+                "url",
+            ),
+            (
+                with_destinations(&[("m", destination("https://m/_autumn/inbox", &[]))]),
+                "topics",
+            ),
+            (
+                with_destinations(&[("m", destination("https://m/i", &["autumn.event"]))]),
+                "reserved",
+            ),
+            (
+                with_destinations(&[("m", destination("https://m/i", &["deal won"]))]),
+                "topic",
+            ),
+            (
+                with_destinations(&[(
+                    "m",
+                    OutboxDestinationConfig {
+                        signing_secret: None,
+                        ..destination("https://m/i", &["deal.won"])
+                    },
+                )]),
+                "signing_secret",
+            ),
+            (
+                with_destinations(&[
+                    ("a", destination("https://a/i", &["deal.won"])),
+                    ("b", destination("https://b/i", &["deal.won"])),
+                ]),
+                "more than one destination",
+            ),
+            (
+                OutboxConfig {
+                    enabled: true,
+                    inbox: OutboxInboxConfig {
+                        enabled: true,
+                        ..OutboxInboxConfig::default()
+                    },
+                    ..OutboxConfig::default()
+                },
+                "signing_secret",
+            ),
+            (
+                OutboxConfig {
+                    inbox: OutboxInboxConfig {
+                        enabled: true,
+                        signing_secret: Some(REMOTE_SECRET.to_owned()),
+                        ..OutboxInboxConfig::default()
+                    },
+                    ..OutboxConfig::default()
+                },
+                "outbox.enabled",
+            ),
+            (
+                OutboxConfig {
+                    enabled: true,
+                    retention_ms: 600_000,
+                    inbox: OutboxInboxConfig {
+                        enabled: true,
+                        signing_secret: Some(REMOTE_SECRET.to_owned()),
+                        ..OutboxInboxConfig::default()
+                    },
+                    ..OutboxConfig::default()
+                },
+                "retention_ms",
+            ),
+        ];
+        for (config, needle) in cases {
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(needle), "{needle:?} not in {error:?}");
+        }
+        with_destinations(&[("m", destination("http://m/_autumn/inbox", &["deal.won"]))])
+            .validate()
+            .expect("plain http is allowed for an internal host");
+    }
+
+    #[test]
+    fn outbox_remote_weak_secret_is_refused_in_production() {
+        let outbox = with_destinations(&[(
+            "marketing",
+            OutboxDestinationConfig {
+                signing_secret: Some("short".to_owned()),
+                ..destination("https://m/_autumn/inbox", &["deal.won"])
+            },
+        )]);
+        let error = outbox
+            .validate_signing_secrets(true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("marketing"), "{error}");
+        outbox
+            .validate_signing_secrets(false)
+            .expect("dev accepts any secret");
+        let prod = AutumnConfig {
+            profile: Some("prod".to_owned()),
+            outbox,
+            ..AutumnConfig::default()
+        };
+        assert!(prod.validate().is_err(), "boot validation checks it");
+    }
+
+    #[test]
+    fn outbox_remote_debug_redacts_secrets() {
+        let mut config = with_destinations(&[("m", destination("https://m/i", &["deal.won"]))]);
+        config.inbox.signing_secret = Some(REMOTE_SECRET.to_owned());
+        config.inbox.previous_signing_secrets = vec![REMOTE_SECRET.to_owned()];
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(REMOTE_SECRET), "{debug}");
+        assert!(debug.contains("redacted"), "{debug}");
     }
 
     #[test]

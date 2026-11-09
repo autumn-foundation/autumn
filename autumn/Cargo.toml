@@ -1541,6 +1541,10 @@ path = "tests/sim_outbox_mail.rs"
 name = "sqlite_outbox_writers"
 path = "tests/sqlite_outbox_writers.rs"
 
+[[test]]
+name = "sqlite_outbox_remote"
+path = "tests/sqlite_outbox_remote.rs"
+
 # W5.a (item 5, issue #1797): deterministic per-send SMTP transport fault
 # schedule ("send #7 fails, #8 times out") over the in-memory SQLite sim
 # substrate. Same isolated-binary rationale as `sim_chaos` above, but it needs

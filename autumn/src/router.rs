@@ -1881,6 +1881,12 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     if config.mail.should_mount_unsubscribe_endpoint() {
         claimed.insert(crate::mail::UNSUBSCRIBE_PATH.to_owned());
     }
+    // The outbox inbox endpoint merges a POST before the late-merged
+    // OpenAPI/MCP routers, so reserve it too.
+    #[cfg(feature = "db")]
+    if config.outbox.serves_inbox() {
+        claimed.insert(crate::outbox::INBOX_PATH.to_owned());
+    }
     // The tracked-job status endpoint merges a GET before the late-merged
     // OpenAPI/MCP routers, so reserve it too (same rationale as unsubscribe
     // above): an OpenAPI/MCP mount at this path should surface the typed
@@ -3597,6 +3603,16 @@ fn mount_framework_routes(
         );
     }
 
+    // The outbox inbox: other services POST signed messages here.
+    #[cfg(feature = "db")]
+    if config.outbox.serves_inbox() {
+        router = router.merge(crate::outbox::inbox_router());
+        tracing::debug!(
+            path = crate::outbox::INBOX_PATH,
+            "Mounted the outbox inbox endpoint"
+        );
+    }
+
     // Tracked-job status endpoint (enqueue_tracked / #[job] JobContext) — on
     // by default; opt out via `jobs.tracking.route_enabled = false`.
     #[cfg(feature = "job-tracking")]
@@ -4088,6 +4104,12 @@ fn build_csrf_layer(
         if config.mail.should_mount_unsubscribe_endpoint() {
             csrf_layer = csrf_layer.with_exempt_path(crate::mail::UNSUBSCRIBE_PATH);
         }
+        // The inbox verifies its own HMAC signature; a peer service sends no
+        // CSRF token.
+        #[cfg(feature = "db")]
+        if config.outbox.serves_inbox() {
+            csrf_layer = csrf_layer.with_exempt_path(crate::outbox::INBOX_PATH);
+        }
         tracing::info!("CSRF protection enabled");
         Some(csrf_layer)
     } else {
@@ -4190,6 +4212,10 @@ fn build_submit_token_layer(
     if config.mail.should_mount_unsubscribe_endpoint() {
         layer = layer.with_exempt_path(crate::mail::UNSUBSCRIBE_PATH);
     }
+    #[cfg(feature = "db")]
+    if config.outbox.serves_inbox() {
+        layer = layer.with_exempt_path(crate::outbox::INBOX_PATH);
+    }
     tracing::info!(
         backend = ?backend,
         inherited = cfg.backend.is_none(),
@@ -4222,6 +4248,10 @@ fn build_bot_protection_layer(
         #[cfg(feature = "mail")]
         if config.mail.should_mount_unsubscribe_endpoint() {
             exempt.push(crate::mail::UNSUBSCRIBE_PATH.to_owned());
+        }
+        #[cfg(feature = "db")]
+        if config.outbox.serves_inbox() {
+            exempt.push(crate::outbox::INBOX_PATH.to_owned());
         }
         let layer =
             crate::security::captcha::BotProtectionLayer::from_config(&config.bot_protection)
