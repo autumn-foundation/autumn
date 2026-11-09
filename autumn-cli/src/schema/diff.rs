@@ -2262,7 +2262,15 @@ const PG_MAX_IDENTIFIER_BYTES: usize = 63;
 /// derivation), and every index name emitted as a top-level `CREATE INDEX` — the
 /// [`SchemaChange::AddIndex`] index name plus each index on a [`SchemaChange::CreateTable`].
 /// These are exactly the names Postgres would truncate to 63 bytes.
-fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
+fn generated_identifiers(plan: &MigrationPlan) -> Vec<(String, String)> {
+    // `(schema, name)`: two relations of one name can live in two schemas. The
+    // schema is empty for a table in the default schema.
+    let schema_of = |table: &str| {
+        table
+            .rsplit_once('.')
+            .map(|(schema, _)| schema.to_owned())
+            .unwrap_or_default()
+    };
     let mut names = Vec::new();
     for change in &plan.changes {
         match change {
@@ -2271,13 +2279,20 @@ fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
                 // goes through `bounded_pg_identifier` (matching the `ADD`/`DROP
                 // CONSTRAINT` emitters). A short name is returned unchanged; only an
                 // over-limit one is truncate+hashed — so this never trips the guard.
-                names.push(bounded_pg_identifier(&format!("{table}_{column}_fkey")));
+                names.push((schema_of(table), fk_constraint_name(table, column)));
             }
-            SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
-                names.push(index.name.clone());
+            SchemaChange::AddIndex { table, index }
+            | SchemaChange::RenameIndex { table, index, .. } => {
+                names.push((schema_of(table), index.name.clone()));
             }
             SchemaChange::CreateTable(table) => {
-                names.extend(table.indexes.iter().map(|i| i.name.clone()));
+                let schema = named_schema(table).unwrap_or_default().to_owned();
+                names.extend(
+                    table
+                        .indexes
+                        .iter()
+                        .map(|i| (schema.clone(), i.name.clone())),
+                );
             }
             _ => {}
         }
@@ -2370,8 +2385,8 @@ fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
     }) {
         return Some(DiffError::GeneratedIdentifierTooLong { name });
     }
-    let mut by_truncated: BTreeMap<String, String> = BTreeMap::new();
-    for name in generated_identifiers(plan) {
+    let mut by_truncated: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (schema, name) in generated_identifiers(plan) {
         // Over the limit: PG truncates it silently — refuse outright (this alone
         // catches every *distinct*-name post-truncation collision, since such a
         // collision requires at least one name to exceed 63 bytes).
@@ -2387,7 +2402,10 @@ fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
         // must NOT dedup or skip the `prev == name` case: identical names are precisely
         // the hazard.
         if by_truncated
-            .insert(truncate_pg_identifier(&name).to_owned(), name.clone())
+            .insert(
+                (schema, truncate_pg_identifier(&name).to_owned()),
+                name.clone(),
+            )
             .is_some()
         {
             return Some(DiffError::GeneratedIdentifierTooLong { name });
@@ -6759,6 +6777,36 @@ mod tests {
             ALLOW,
         );
         assert!(guard_plan(&plan, ALLOW).is_ok(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn the_same_index_name_in_two_schemas_is_not_a_collision() {
+        let mut a = posts_with(vec![col("x", ColumnType::Text)]);
+        a.indexes
+            .push(Index::new("idx_shared", vec!["x".to_owned()], false));
+        let mut b = in_schema(posts_with(vec![col("x", ColumnType::Text)]), "blog");
+        b.name = "other".to_owned();
+        b.indexes
+            .push(Index::new("idx_shared", vec!["x".to_owned()], false));
+        let plan = diff_schema(&[], &parsed(vec![a, b], vec![]), DEFAULT_OPTS);
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "{:?}",
+            plan.changes
+        );
+    }
+
+    #[test]
+    fn the_same_index_name_twice_in_one_schema_is_still_refused() {
+        let mut a = in_schema(posts_with(vec![col("x", ColumnType::Text)]), "blog");
+        a.indexes
+            .push(Index::new("idx_shared", vec!["x".to_owned()], false));
+        let mut b = in_schema(posts_with(vec![col("x", ColumnType::Text)]), "blog");
+        b.name = "other".to_owned();
+        b.indexes
+            .push(Index::new("idx_shared", vec!["x".to_owned()], false));
+        let plan = diff_schema(&[], &parsed(vec![a, b], vec![]), DEFAULT_OPTS);
+        assert!(guard_plan(&plan, DEFAULT_OPTS).is_err());
     }
 
     #[test]
