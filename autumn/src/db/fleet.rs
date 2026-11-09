@@ -1735,6 +1735,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     ) -> Result<Option<BackgroundOpen<E>>, FleetError> {
         self.check_key(key)?;
         let mut deadline = None;
+        // The closes this call started for room, to wait for them.
+        let mut closing = Vec::new();
         loop {
             // Before anything touches the disk: `restore_missing` runs only
             // for a key this host owns (issue #3233).
@@ -1749,7 +1751,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 Next::Full => {
                     let deadline = *deadline
                         .get_or_insert_with(|| tokio::time::Instant::now() + self.inner.open_wait);
-                    self.wait_for_room(key, deadline).await?;
+                    self.wait_for_room(key, deadline, &mut closing).await?;
                     continue;
                 }
                 Next::Open(entry, elected) => (entry, elected),
@@ -1945,16 +1947,22 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         &self,
         key: &FleetDbKey,
         deadline: tokio::time::Instant,
+        closing: &mut Vec<Arc<Drain>>,
     ) -> Result<(), FleetError> {
         let notified = self.inner.room.notified();
-        let started = self.evict(None, 1);
+        // Close one more database only when the last close of this call has
+        // ended. Else each poll would close another one.
+        closing.retain(|drain| !drain.finished.load(Ordering::Acquire));
+        if closing.is_empty() {
+            *closing = self.evict(None, 1);
+        }
         // A close or a failed open can free a slot after the claim failed.
         if !self.full_locked(&self.lock_state()) {
             return Ok(());
         }
         let now = tokio::time::Instant::now();
         let refuse = self.inner.max_open_policy == crate::config::FleetMaxOpenPolicy::Refuse;
-        if now >= deadline || (refuse && started.is_empty()) {
+        if now >= deadline || (refuse && closing.is_empty()) {
             self.inner.counters.refused.fetch_add(1, Ordering::Relaxed);
             let residency = self.inner.min_residency;
             let secs = residency.as_secs() + u64::from(residency.subsec_nanos() > 0);
@@ -1968,7 +1976,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         if refuse {
             // Wait only for the closes this call started. An unrelated drain
             // can take long, and `refuse` does not wait for it.
-            let closes = futures::future::join_all(started.iter().map(|drain| drain.wait()));
+            let closes = futures::future::join_all(closing.iter().map(|drain| drain.wait()));
             let _ = tokio::time::timeout(remaining, closes).await;
             return Ok(());
         }
@@ -2163,7 +2171,15 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let min_residency = self.inner.min_residency;
         let now = crate::time::ambient_instant();
         let victims = self.begin_drains(|state| {
-            let excess = (state.open.len() + reserve).saturating_sub(max_open);
+            // A hard cap counts the closing databases that hold files: they
+            // use slots, and a slow close must not stop an idle one from
+            // closing too.
+            let closing = if self.hard_cap() {
+                Self::closing_locked(state)
+            } else {
+                0
+            };
+            let excess = (state.open.len() + closing + reserve).saturating_sub(max_open);
             let over = if budget == 0 {
                 0
             } else {
@@ -3952,6 +3968,29 @@ mod tests {
         closing.await.unwrap();
         settle(&fleet).await;
         assert!(fleet.open(&slot(2)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_slow_close_does_not_stop_an_idle_database_from_closing() {
+        use crate::config::FleetMaxOpenPolicy::Refuse;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 2, Refuse, Duration::ZERO, 5);
+        let held = fleet.open(&slot(1)).await.unwrap();
+        let conn = held.pool().get().await.unwrap();
+        drop(fleet.open(&slot(2)).await.unwrap());
+        let closing = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.close(&slot(1)).await }
+        });
+        while fleet.stats().draining == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Slot 1 closes slowly. Slot 2 is idle, so it closes for slot 3.
+        assert!(fleet.open(&slot(3)).await.is_ok());
+        assert!(fleet.stats().peak_open <= 2);
+        drop(conn);
+        drop(held);
+        closing.await.unwrap();
     }
 
     #[tokio::test]
