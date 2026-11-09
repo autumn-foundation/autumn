@@ -4051,10 +4051,11 @@ fn fk_reaches(owner: &Table, fk_table: &str, target: &Table) -> bool {
     if name != target.name {
         return false;
     }
-    match schema {
-        Some(s) => Some(s).filter(|s| *s != "public") == named_schema(target),
-        None => named_schema(target).is_none() || named_schema(target) == named_schema(owner),
-    }
+    let target_schema = named_schema(target);
+    schema.map_or_else(
+        || target_schema.is_none() || target_schema == named_schema(owner),
+        |s| Some(s).filter(|s| *s != "public") == target_schema,
+    )
 }
 
 /// The name of the constraint for the foreign key on `table.column`. The
