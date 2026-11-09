@@ -1,4 +1,4 @@
-error: `schema` must be a plain lower-case identifier, such as `schema = "marketing"`
+error: `schema` must be a plain lower-case identifier that Postgres does not reserve, such as `schema = "marketing"`
  --> tests/compile-fail/model_schema_bad_name.rs:4:18
   |
 4 | #[model(schema = "a.b")]
