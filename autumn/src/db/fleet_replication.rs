@@ -388,9 +388,9 @@ pub struct FleetReplication {
     progress: tokio::sync::Notify,
     /// The longest `wait_replicated` sleeps with no wake-up.
     wait_poll: Duration,
-    /// The last bound of each closed database. Cleared at the next open, a
-    /// delete or a restore.
-    closed: Mutex<HashMap<FleetDbKey, ClosedBound>>,
+    /// The last bound of each closed database, and when it closed. Cleared
+    /// at the next open, a delete, a restore, or after [`CLOSED_BOUND_TTL`].
+    closed: Mutex<HashMap<FleetDbKey, (ClosedBound, DateTime<Utc>)>>,
     /// The epoch at which this host serves a key now. `None`: its lease
     /// lapsed. The fleet installs it with its ownership.
     serving_hook: Mutex<Option<ServingHook>>,
@@ -421,6 +421,9 @@ pub(crate) enum ClosedBound {
         at: Option<DateTime<Utc>>,
         epoch: u64,
     },
+    /// Its last generation ships from this slot, also in a retry after the
+    /// close: read the slot.
+    Slot(Arc<GenerationSlot>),
     /// A newer owner fenced it.
     Fenced,
 }
@@ -433,6 +436,10 @@ impl Drop for Wake<'_> {
         self.0.notify_waiters();
     }
 }
+
+/// How long a closed database keeps its last bound. A waiter needs it
+/// only around the close.
+const CLOSED_BOUND_TTL: Duration = Duration::from_secs(3600);
 
 /// Longest `wait_replicated` sleeps between two checks with no wake-up.
 const WAIT_POLL: Duration = Duration::from_millis(250);
@@ -751,9 +758,10 @@ impl FleetReplication {
     /// A new ship slot for `key`, at an open. It replaces the slot of an
     /// earlier open.
     pub(crate) fn open_generation_slot(&self, key: &FleetDbKey, epoch: u64) -> Arc<GenerationSlot> {
-        self.forget_closed(key);
         let slot = Arc::new(GenerationSlot::new(self.clock.now(), epoch));
         self.slots().insert(key.clone(), Arc::clone(&slot));
+        // After the insert: a waiter never sees the key in neither map.
+        self.forget_closed(key);
         slot
     }
 
@@ -1138,14 +1146,23 @@ impl FleetReplication {
     }
 
     /// Drop a parked replicator that is still the one parked for `key`.
-    fn retire_parked(&self, key: &FleetDbKey, replica: &Arc<ActiveReplica>) -> bool {
+    /// Keep `closed` as its last bound. It is kept under the parked lock:
+    /// a `release` that takes the lock after it clears it.
+    fn retire_parked(
+        &self,
+        key: &FleetDbKey,
+        replica: &Arc<ActiveReplica>,
+        closed: ClosedBound,
+    ) -> bool {
         let mut parked = self.parked();
         let current = parked
             .get(key)
             .is_some_and(|current| Arc::ptr_eq(current, replica));
         if current {
             parked.remove(key);
+            self.remember_closed(key, closed);
         }
+        drop(parked);
         current
     }
 
@@ -1372,6 +1389,9 @@ impl FleetReplication {
         for_each_on(self.ship_workers, &kept, |key| {
             self.retry_unshipped(key, cutoff);
         });
+        // A retry moves the bound of its slot.
+        self.notify_progress();
+        self.prune_closed();
     }
 
     /// The open databases, the oldest last ship first. A database that never
@@ -1492,14 +1512,11 @@ impl FleetReplication {
         drop(replicator);
         if fenced_by.is_some() {
             // Nothing more ships: let the file go.
-            if self.retire_parked(key, &replica) {
-                self.remember_closed(key, ClosedBound::Fenced);
-            }
+            self.retire_parked(key, &replica, ClosedBound::Fenced);
             return;
         }
-        if caught_up && self.retire_parked(key, &replica) {
+        if caught_up && self.retire_parked(key, &replica, closed_at(&replica)) {
             tracing::info!(database = %key, "fleet replication: closed database caught up");
-            self.remember_closed(key, closed_at(&replica));
         }
     }
 
@@ -1556,7 +1573,8 @@ impl FleetReplication {
     /// - the database never opened in this process, or a delete or a
     ///   restore replaced it.
     ///
-    /// A closed database keeps its last bound until it opens again.
+    /// A closed database keeps its last bound for an hour, or until it opens
+    /// again, a delete or a restore in this process.
     #[must_use]
     pub fn replicated_through(&self, key: &FleetDbKey) -> Option<DateTime<Utc>> {
         match self.bound(key) {
@@ -1626,12 +1644,38 @@ impl FleetReplication {
 
     /// Keep the last bound of the closed database `key`.
     pub(crate) fn remember_closed(&self, key: &FleetDbKey, bound: ClosedBound) {
+        let now = self.clock.now();
         let mut closed = self.closed.lock().unwrap_or_else(PoisonError::into_inner);
         if matches!(bound, ClosedBound::At { at: None, .. }) {
             closed.remove(key);
         } else {
-            closed.insert(key.clone(), bound);
+            closed.insert(key.clone(), (bound, now));
         }
+    }
+
+    /// Drop the closed bounds that no waiter can use: older than
+    /// [`CLOSED_BOUND_TTL`], or under an epoch this host no longer serves.
+    /// A bound that is still shipping (`Live`) stays.
+    fn prune_closed(&self) {
+        let now = self.clock.now();
+        // Lock order: `closed`, then the serving hook. Nothing takes them
+        // the other way round.
+        self.closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|key, (bound, at)| {
+                let old = now
+                    .signed_duration_since(*at)
+                    .to_std()
+                    .is_ok_and(|age| age >= CLOSED_BOUND_TTL);
+                let epoch = match bound {
+                    ClosedBound::Live { .. } => return true,
+                    ClosedBound::At { epoch, .. } => Some(*epoch),
+                    ClosedBound::Slot(slot) => Some(slot.epoch()),
+                    ClosedBound::Fenced => None,
+                };
+                !old && epoch.is_none_or(|epoch| self.serves(key, epoch))
+            });
     }
 
     /// Forget the last bound of `key`: it opens again, or a delete or a
@@ -1644,17 +1688,15 @@ impl FleetReplication {
     }
 
     /// Whether this host serves `key` at `epoch` now. Always `true` without
-    /// ownership (`epoch` 0, or no hook).
+    /// ownership (no hook).
     fn serves(&self, key: &FleetDbKey, epoch: u64) -> bool {
-        if epoch == 0 {
-            return true;
-        }
         let hook = self
             .serving_hook
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        hook.is_none_or(|hook| hook(key) == Some(epoch))
+        // With ownership, a replica with no epoch opened before it: no claim.
+        hook.is_none_or(|hook| epoch != 0 && hook(key) == Some(epoch))
     }
 
     /// `at` under `epoch`, or `Unknown` when:
@@ -1665,6 +1707,19 @@ impl FleetReplication {
         match at {
             Some(at) if at < self.clock.now() && self.serves(key, epoch) => Bound::At(at),
             _ => Bound::Unknown,
+        }
+    }
+
+    /// The bound of a generations-mode slot.
+    fn slot_bound(&self, key: &FleetDbKey, slot: &GenerationSlot) -> Bound {
+        let (at, fenced) = {
+            let track = slot.track();
+            (track.replicated_through, track.fenced)
+        };
+        if fenced {
+            Bound::Fenced
+        } else {
+            self.bound_at(key, at, slot.epoch())
         }
     }
 
@@ -1684,26 +1739,20 @@ impl FleetReplication {
             return self.bound_at(key, replica.status.replicated_through(), epoch);
         }
         if let Some(slot) = self.current_generation_slot(key) {
-            let (at, fenced) = {
-                let track = slot.track();
-                (track.replicated_through, track.fenced)
-            };
-            if fenced {
-                return Bound::Fenced;
-            }
-            return self.bound_at(key, at, slot.epoch());
+            return self.slot_bound(key, &slot);
         }
         let closed = self
             .closed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
-            .cloned();
+            .map(|(bound, _)| bound.clone());
         match closed {
             Some(ClosedBound::Live { status, epoch }) => {
                 self.bound_at(key, status.replicated_through(), epoch)
             }
             Some(ClosedBound::At { at, epoch }) => self.bound_at(key, at, epoch),
+            Some(ClosedBound::Slot(slot)) => self.slot_bound(key, &slot),
             Some(ClosedBound::Fenced) => Bound::Fenced,
             None => Bound::NotReplicating,
         }
@@ -1943,6 +1992,81 @@ impl FleetReplication {
 }
 
 impl FleetReplication {
+    /// Register the replicator of `db`, or take back its parked one.
+    fn open_replica(&self, db: &FleetDatabase) -> Result<(), String> {
+        // A closed database still shipping its backlog keeps its replicator:
+        // two replicators on one file would both checkpoint it.
+        let epoch = db.epoch().map(crate::lock::FencingToken::get);
+        let parked = self.parked().remove(db.key());
+        // A fenced replica cannot be reused.
+        if let Some(parked) = parked
+            && !parked.fenced.load(Ordering::Acquire)
+        {
+            if parked.epoch.load(Ordering::Acquire) == epoch.unwrap_or(0) {
+                // Nothing to change, so no wait for a tick in destination
+                // I/O. A fence that lands now names a newer epoch, and that
+                // also drops this host's range.
+                self.active().insert(db.key().clone(), parked);
+                return Ok(());
+            }
+            // A new epoch starts a new generation. The flag is read under
+            // the replicator lock, which a tick holds while it sets it. The
+            // tick may be in destination I/O: wait only so long.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real time: the wait bounds blocking I/O"
+            )]
+            let limit = std::time::Instant::now() + REUSE_WAIT;
+            let Some(mut replicator) = lock_replicator(&parked, &|| Some(limit)) else {
+                self.parked().insert(db.key().clone(), parked);
+                return Err(
+                    "the replicator of this database is busy shipping its backlog; retry"
+                        .to_owned(),
+                );
+            };
+            if !parked.fenced.load(Ordering::Acquire) {
+                replicator.set_epoch(epoch);
+                replicator.set_destination(self.fenced_destination(db.key(), epoch));
+                parked.epoch.store(epoch.unwrap_or(0), Ordering::Release);
+                drop(replicator);
+                self.active().insert(db.key().clone(), Arc::clone(&parked));
+                return Ok(());
+            }
+        }
+        let settings = ReplicationSettings {
+            database_path: db.path().to_path_buf(),
+            root: self.root_for(db.key()),
+            // A verification restores the whole database; across a fleet that
+            // is the operator's call (`restore`), not a timer's.
+            verify_interval: None,
+            ..self.settings.clone()
+        };
+        let status = Arc::new(ReplicationStatus::new(self.destination.describe()));
+        let replicator = Replicator::new(
+            settings,
+            self.fenced_destination(db.key(), epoch),
+            Arc::clone(&status),
+        )
+        .with_clock(Arc::clone(&self.clock))
+        .with_epoch(epoch);
+        let replica = Arc::new(ActiveReplica {
+            replicator: Mutex::new(replicator),
+            lock: Mutex::new(None),
+            lock_error: Mutex::new(None),
+            retired: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            epoch: AtomicU64::new(epoch.unwrap_or(0)),
+            path: db.path().to_path_buf(),
+            status,
+            registered_at: self.clock.now(),
+        });
+        // Another process may own it. The loop claims it when that one lets go.
+        replica.claim(db.key());
+        self.active().insert(db.key().clone(), replica);
+        Ok(())
+    }
+
     /// Claim at close. An owner that closes at the same time still holds the
     /// lock while it ships, so wait for it, within `CLAIM_WAIT` and the
     /// shutdown cutoff.
@@ -2018,79 +2142,13 @@ impl FleetLifecycle for FleetReplication {
     }
 
     fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
-        // The open replica answers for the bound from now on.
-        self.forget_closed(db.key());
-        // A closed database still shipping its backlog keeps its replicator:
-        // two replicators on one file would both checkpoint it.
-        let epoch = db.epoch().map(crate::lock::FencingToken::get);
-        let parked = self.parked().remove(db.key());
-        // A fenced replica cannot be reused.
-        if let Some(parked) = parked
-            && !parked.fenced.load(Ordering::Acquire)
-        {
-            if parked.epoch.load(Ordering::Acquire) == epoch.unwrap_or(0) {
-                // Nothing to change, so no wait for a tick in destination
-                // I/O. A fence that lands now names a newer epoch, and that
-                // also drops this host's range.
-                self.active().insert(db.key().clone(), parked);
-                return Ok(());
-            }
-            // A new epoch starts a new generation. The flag is read under
-            // the replicator lock, which a tick holds while it sets it. The
-            // tick may be in destination I/O: wait only so long.
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "real time: the wait bounds blocking I/O"
-            )]
-            let limit = std::time::Instant::now() + REUSE_WAIT;
-            let Some(mut replicator) = lock_replicator(&parked, &|| Some(limit)) else {
-                self.parked().insert(db.key().clone(), parked);
-                return Err(
-                    "the replicator of this database is busy shipping its backlog; retry"
-                        .to_owned(),
-                );
-            };
-            if !parked.fenced.load(Ordering::Acquire) {
-                replicator.set_epoch(epoch);
-                replicator.set_destination(self.fenced_destination(db.key(), epoch));
-                parked.epoch.store(epoch.unwrap_or(0), Ordering::Release);
-                drop(replicator);
-                self.active().insert(db.key().clone(), Arc::clone(&parked));
-                return Ok(());
-            }
+        let opened = self.open_replica(db);
+        // After the insert: the open replica answers for the bound from now
+        // on, and a waiter never sees the key in neither map.
+        if opened.is_ok() {
+            self.forget_closed(db.key());
         }
-        let settings = ReplicationSettings {
-            database_path: db.path().to_path_buf(),
-            root: self.root_for(db.key()),
-            // A verification restores the whole database; across a fleet that
-            // is the operator's call (`restore`), not a timer's.
-            verify_interval: None,
-            ..self.settings.clone()
-        };
-        let status = Arc::new(ReplicationStatus::new(self.destination.describe()));
-        let replicator = Replicator::new(
-            settings,
-            self.fenced_destination(db.key(), epoch),
-            Arc::clone(&status),
-        )
-        .with_clock(Arc::clone(&self.clock))
-        .with_epoch(epoch);
-        let replica = Arc::new(ActiveReplica {
-            replicator: Mutex::new(replicator),
-            lock: Mutex::new(None),
-            lock_error: Mutex::new(None),
-            retired: AtomicBool::new(false),
-            fenced: AtomicBool::new(false),
-            released: AtomicBool::new(false),
-            epoch: AtomicU64::new(epoch.unwrap_or(0)),
-            path: db.path().to_path_buf(),
-            status,
-            registered_at: self.clock.now(),
-        });
-        // Another process may own it. The loop claims it when that one lets go.
-        replica.claim(db.key());
-        self.active().insert(db.key().clone(), replica);
-        Ok(())
+        opened
     }
 
     fn on_close(&self, db: &FleetDatabase) {
@@ -2166,11 +2224,13 @@ impl FleetLifecycle for FleetReplication {
 
     fn release(&self, key: &FleetDbKey) {
         let _wake = Wake(&self.progress);
-        // A delete or a restore replaces the files: the old bound is void.
-        self.forget_closed(key);
         // The files are about to be removed or replaced: a parked replicator
         // must not hold them open, and must ship nothing more.
-        let Some(replica) = self.parked().remove(key) else {
+        let parked = self.parked().remove(key);
+        // After the parked lock: a pass that retired the replica kept its
+        // bound under that lock. A delete or a restore voids it.
+        self.forget_closed(key);
+        let Some(replica) = parked else {
             return;
         };
         replica.released.store(true, Ordering::Release);
@@ -4448,6 +4508,26 @@ mod tests {
                 .await,
             Err(ReplicatedWaitError::NotReplicating { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_pass_drops_a_closed_bound_after_an_hour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        clock.advance(1);
+        drop(db);
+        fleet.close(&key).await;
+        assert!(replication.replicated_through(&key).is_some());
+        clock.advance(3599);
+        tick(&replication).await;
+        assert!(replication.replicated_through(&key).is_some(), "not yet");
+        clock.advance(2);
+        tick(&replication).await;
+        assert_eq!(replication.replicated_through(&key), None, "pruned");
     }
 
     #[tokio::test]

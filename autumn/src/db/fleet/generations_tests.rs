@@ -1284,3 +1284,39 @@ async fn a_fenced_generation_ship_drops_the_bound() {
     );
     a.fleet.close_all().await;
 }
+
+#[tokio::test]
+async fn a_retry_after_a_failed_close_ship_moves_the_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, refusing) = refusing_host(tmp.path(), "vol-a");
+    let key = acme(&a.fleet);
+    write(&a, &key, "a1").await;
+    let committed_at = wall_after_commit();
+    refusing.set(true);
+    a.fleet.close_all().await;
+    assert_eq!(
+        a.replication.unshipped_generations(),
+        1,
+        "the close kept it"
+    );
+    assert_eq!(a.fleet.replicated_through(&key), None, "nothing shipped");
+
+    // The retry ships the kept generation. A waiter sees it.
+    refusing.set(false);
+    tick(&a).await;
+    assert_eq!(
+        a.replication.unshipped_generations(),
+        0,
+        "the retry shipped"
+    );
+    assert!(
+        a.fleet
+            .replicated_through(&key)
+            .is_some_and(|through| through >= committed_at),
+        "the retry covers the write"
+    );
+    a.fleet
+        .wait_replicated(&key, committed_at, Duration::ZERO)
+        .await
+        .expect("covered after the retry");
+}

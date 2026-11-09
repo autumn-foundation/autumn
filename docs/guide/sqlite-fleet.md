@@ -635,9 +635,12 @@ Rules:
 - The bound assumes a clock that does not step back. If the clock steps
   back, the bound follows it back.
 - In one generation the bound never moves back.
-- A closed database keeps its last bound until it opens again. A database
-  that still ships its backlog after the close (`closing`) gives a bound
-  until it ships all of it.
+- A closed database keeps its last bound for an hour, or until it opens
+  again. A database that still ships its backlog after the close
+  (`closing`) gives a bound until it ships all of it. The bound is local to
+  this process: a delete or a restore in another process does not clear it.
+- A clock step back that is shorter than one sync interval can escape the
+  check. Keep the host clock in sync without steps (slew it).
 - In `generations` mode the bound is the instant before the last ship that
   worked.
 - The bound does not change `worst_lag_seconds`. Use the lag for alerts.

@@ -1379,18 +1379,9 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
         // after a delete sees every object it wrote.
         slot.wait_upload();
         // Kept before the slot goes: a waiter never sees the key in neither.
-        let closed = {
-            let track = slot.track();
-            if track.fenced {
-                ClosedBound::Fenced
-            } else {
-                ClosedBound::At {
-                    at: track.replicated_through,
-                    epoch: slot.epoch(),
-                }
-            }
-        };
-        self.replication.remember_closed(db.key(), closed);
+        // A retry of a kept generation updates the same slot.
+        self.replication
+            .remember_closed(db.key(), ClosedBound::Slot(Arc::clone(&slot)));
         self.replication.forget_generation_slot(db.key(), &slot);
     }
 
@@ -1400,6 +1391,7 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
         // A delete or a restore replaces the files: the old bound is void.
         self.replication.forget_closed(key);
         self.replication.release_unshipped_generation(key);
+        self.replication.notify_progress();
     }
 }
 
