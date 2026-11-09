@@ -28106,7 +28106,8 @@ mod tests {
         )
         .to_string();
         assert!(out.contains("pool_for :: < Marketing >"), "{out}");
-        assert!(out.contains("ReadRoute :: Primary"), "{out}");
+        // Reads stay on the role pool: the route is not read from the state.
+        assert!(!out.contains("ReadRoute :: from_state (state)"), "{out}");
     }
 
     #[test]
@@ -28114,7 +28115,8 @@ mod tests {
         let out =
             repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
         assert!(!out.contains("pool_for"), "{out}");
-        assert!(!out.contains("ReadRoute :: Primary"), "{out}");
+        // Without `primary_reads`, the read route follows the state (replica).
+        assert!(out.contains("ReadRoute :: from_state (state)"), "{out}");
     }
 
     #[test]
