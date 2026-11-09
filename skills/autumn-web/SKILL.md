@@ -1071,6 +1071,7 @@ raw Diesel:
 | `save_many`, `save_many_skip_invalid`, `update_many`, `delete_many`, `upsert_many` | Bulk ops, hook-aware, auto-chunked under the 65,535-param ceiling; `upsert_many` is a compile error on hooked repositories |
 | `with_lock` | `SELECT ... FOR UPDATE` row locking in a transaction |
 | `primary_reads` (attr) / `on_primary()` | Pin reads to primary; read-your-writes after a save |
+| `boundary = B` (attr) | Run as the Postgres role of boundary `B`; implies `primary_reads`; not with `sharded` |
 | `soft_delete`, `tenant_scoped` (attrs), `across_tenants()` | Soft deletion and tenant scoping |
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
@@ -3841,7 +3842,9 @@ today's violations, so an existing app can adopt it. See
 `docs/guide/table-ownership.md`. To make the database refuse
 the same queries, give a boundary `schema` and `role`, connect it with
 `[database.roles.<boundary>]`, and use `state.pool_for::<B>()` or
-`BoundaryDb<B>`. See `docs/guide/database-boundaries.md`.
+`BoundaryDb<B>`. Put a model in the schema with
+`#[model(managed, schema = "marketing")]`. Run a repository as the role with
+`#[repository(Model, boundary = B)]`. See `docs/guide/database-boundaries.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 
