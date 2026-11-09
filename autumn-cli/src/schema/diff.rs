@@ -1083,16 +1083,23 @@ fn detect_inbound_fk_blocks(
     desired: &ParsedSchema,
     changes: &mut Vec<SchemaChange>,
 ) {
-    let dropped: BTreeSet<&str> = changes
+    let dropped: BTreeMap<&str, &Table> = changes
         .iter()
         .filter_map(|c| match c {
-            SchemaChange::DropTable(t) => Some(t.name.as_str()),
+            SchemaChange::DropTable(t) => Some((t.name.as_str(), t)),
             _ => None,
         })
         .collect();
     if dropped.is_empty() {
         return;
     }
+    // The dropped table that `fk_table`, written on `owner`, points at.
+    let dropped_target = |owner: &Table, fk_table: &str| {
+        dropped
+            .get(bare_name(fk_table))
+            .copied()
+            .filter(|t| fk_reaches(owner, fk_table, t))
+    };
 
     // (referencing table, referencing column) pairs being dropped in this plan.
     // Such a column carries its FK constraint away with it — and `up_ordered`
@@ -1116,7 +1123,7 @@ fn detect_inbound_fk_blocks(
     // Baseline side: a retained table whose baseline FK targets a dropped table.
     for table in baseline {
         // A referencer that is itself being dropped takes its FK with it.
-        if dropped.contains(table.name.as_str()) {
+        if dropped.contains_key(table.name.as_str()) {
             continue;
         }
         for column in &table.columns {
@@ -1127,9 +1134,13 @@ fn detect_inbound_fk_blocks(
                 continue;
             }
             if let Some(fk) = &column.references
-                && dropped.contains(fk.table.as_str())
+                && let Some(target) = dropped_target(table, &fk.table)
             {
-                blocks.insert((fk.table.clone(), table.name.clone(), column.name.clone()));
+                blocks.insert((
+                    target.qualified_name(),
+                    table.name.clone(),
+                    column.name.clone(),
+                ));
             }
         }
     }
@@ -1143,9 +1154,13 @@ fn detect_inbound_fk_blocks(
         }
         for column in &table.columns {
             if let Some(fk) = &column.references
-                && dropped.contains(fk.table.as_str())
+                && let Some(target) = dropped_target(table, &fk.table)
             {
-                blocks.insert((fk.table.clone(), table.name.clone(), column.name.clone()));
+                blocks.insert((
+                    target.qualified_name(),
+                    table.name.clone(),
+                    column.name.clone(),
+                ));
             }
         }
     }
@@ -1259,7 +1274,7 @@ fn column_participates_in_fk(
         .any(|c| {
             c.references
                 .as_ref()
-                .is_some_and(|fk| fk.table == table && fk.column == column)
+                .is_some_and(|fk| bare_name(&fk.table) == table && fk.column == column)
         })
 }
 
@@ -4023,6 +4038,25 @@ fn fk_targets(fk_table: &str, table: &Table) -> bool {
     name == table.name && schema.filter(|s| *s != "public") == named_schema(table)
 }
 
+/// True when the FK target `fk_table`, written on `owner`, can point at `target`.
+///
+/// A qualified target must match the schema of `target`. A bare target points at
+/// a table of the schema of `owner` (introspection writes a same-schema target
+/// bare) or of the default schema. This errs toward a match: the caller uses it
+/// to refuse an unsafe drop.
+fn fk_reaches(owner: &Table, fk_table: &str, target: &Table) -> bool {
+    let (schema, name) = fk_table
+        .rsplit_once('.')
+        .map_or((None, fk_table), |(s, n)| (Some(s), n));
+    if name != target.name {
+        return false;
+    }
+    match schema {
+        Some(s) => Some(s).filter(|s| *s != "public") == named_schema(target),
+        None => named_schema(target).is_none() || named_schema(target) == named_schema(owner),
+    }
+}
+
 /// The name of the constraint for the foreign key on `table.column`. The
 /// schema is not part of it.
 fn fk_constraint_name(table: &str, column: &str) -> String {
@@ -6676,6 +6710,54 @@ mod tests {
         let posts_at = up.find("CREATE TABLE blog.posts").expect(&up);
         let users_at = up.find("CREATE TABLE users").expect(&up);
         assert!(posts_at < users_at, "{up}");
+    }
+
+    #[test]
+    fn dropping_a_table_with_a_qualified_inbound_fk_is_refused() {
+        // public `posts` references `blog.authors` by an explicit qualified target.
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("blog.authors", "id"));
+        let posts = posts_with(vec![fk]);
+        let plan = diff_schema(
+            &[authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_err(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn dropping_a_table_with_a_same_schema_bare_inbound_fk_is_refused() {
+        // Introspection spells a same-schema FK target bare.
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("authors", "id"));
+        let posts = in_schema(posts_with(vec![fk]), "blog");
+        let plan = diff_schema(
+            &[authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_err(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn dropping_a_table_is_not_blocked_by_an_fk_to_a_same_named_table_elsewhere() {
+        // `posts` references `auth.authors`; the table dropped is `blog.authors`.
+        let mut blog_authors = in_schema(posts_with(vec![]), "blog");
+        blog_authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("auth.authors", "id"));
+        let posts = posts_with(vec![fk]);
+        let plan = diff_schema(
+            &[blog_authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_ok(), "{:?}", plan.changes);
     }
 
     #[test]
