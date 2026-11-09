@@ -5308,7 +5308,11 @@ impl AppBuilder {
         // through the outbox unless the app set its own queue (issue #3062).
         #[cfg(feature = "db")]
         {
-            crate::outbox::install(&state, &config.outbox, outbox_handlers);
+            if let Err(error) = crate::outbox::install(&state, &config.outbox, outbox_handlers) {
+                tracing::error!(error = %error, "Failed to install the outbox relay");
+                exit_stop_managed_pg();
+                std::process::exit(1);
+            }
             if state.extension::<crate::outbox::OutboxRelay>().is_some()
                 && let Err(error) = crate::outbox::ensure_relay_schema(&state).await
             {
@@ -9273,7 +9277,11 @@ impl AppBuilder {
         // A one-off task writes to the outbox; the server relay sends it.
         #[cfg(feature = "db")]
         {
-            crate::outbox::install(&state, &config.outbox, outbox_handlers);
+            if let Err(error) = crate::outbox::install(&state, &config.outbox, outbox_handlers) {
+                eprintln!("Failed to install the outbox relay: {error}");
+                exit_stop_managed_pg();
+                std::process::exit(1);
+            }
             if state.extension::<crate::outbox::OutboxRelay>().is_some()
                 && let Err(error) = crate::outbox::ensure_relay_schema(&state).await
             {

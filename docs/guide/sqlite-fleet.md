@@ -162,6 +162,7 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | `fleet.each(n, f)` | run `f` on every database, `n` at a time |
 | `fleet.migrate_all(n)` | migrate every database, report failures per database |
 | `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
+| `fleet.restore_from_file(&key, &src, opts)` | replace (or create) the database with a local backup; no replication needed. See [Restore a backup in place](#restore-a-backup-in-place) |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
 
 ### Import a backup
@@ -197,11 +198,73 @@ Import only files that you trust: the copy keeps the schema, the triggers and
 the migration records of `src`. On Windows, the import opens `src` read-write,
 so SQLite can apply a `-wal` or a hot journal to it.
 
+### Restore a backup in place
+
+`fleet.restore_from_file(&key, &src, opts)` puts a backup back over the live
+database of `key`. It also creates the file when the key has none.
+Replication is not needed:
+
+```rust
+use autumn_web::db::fleet::LocalRestore;
+
+fleet.backup(&key, &archive).await?;
+// Later: roll the tenant back to the backup.
+let outcome = fleet.restore_from_file(&key, &archive, LocalRestore::new()).await?;
+```
+
+The steps:
+
+1. A key with a tombstone is refused, unless `clear_tombstone` is set.
+2. The fleet copies `src` into a staging file with `VACUUM INTO`. The copy
+   must pass `PRAGMA integrity_check`. Its identity row must record `key`.
+   A trigger on the identity or epoch table is refused.
+3. The fleet applies pending migrations to the copy when opens apply them
+   (`apply_migrations_on_open`, set by `database.auto_migrate`). Otherwise
+   pending migrations refuse the restore.
+4. With ownership, the copy gets the epoch of this host. Without ownership,
+   the copy has no epoch.
+5. The key goes out of service. Openers wait. The open database closes.
+6. The copy goes in place of the old file in one step, under the path lock.
+   The old `-wal` and `-shm` go.
+7. With `clear_tombstone`, the old replica and the tombstone go.
+8. Openers continue. They see the restored file.
+9. With replication, the fleet opens the database and ships a new base
+   snapshot. A later replica restore then finds the restored data.
+
+Steps 2 to 4 do not touch the live file, so openers keep working while the
+copy runs. An error before step 6 changes nothing. A refused file or key
+answers `FleetError::Restore` (`503`). This includes a file that is missing,
+is not a database, is corrupt, or records another key. Another process that
+has the file open gives `409`, and nothing changes.
+
+Each option makes the restore accept more. All are off by default:
+
+| `LocalRestore` | Does |
+| --- | --- |
+| `allow_rekey(true)` | accept a backup of another key, and write `key` into its identity row. Use it to copy a tenant to a new key |
+| `clear_tombstone(true)` | restore a deleted key that has a tombstone. After the swap, the old replica and the tombstone go, as with `provision`. This ends the undo window |
+| `apply_migrations(true)` | apply pending migrations even when opens do not |
+
+A deleted key that has a tombstone is refused by default. The tombstone
+keeps the old replica for undo, and a restore from a file would end that.
+Use `fleet.restore_latest(&key)` to undo the delete from the replica. Use
+`clear_tombstone(true)` to restore the file in its place. Without
+replication there are no tombstones: a deleted key is restored at once.
+
+`LocalRestoreOutcome` tells what changed: `replaced` (a file was there),
+`rekeyed_from`, `migrations_applied`, `tombstone_cleared`, `shipped` (the
+ship of the new base snapshot, `None` without replication) and
+`ship_error`. A failed ship does not fail the call: the file is in place,
+and `ship_error` says why. Then the replica holds older data. Ship the key
+before any replica restore: an open in a process that replicates it ships
+a new base. A replica restore that runs between steps 8 and 9 brings back
+the replica: run restores of one key one at a time.
+
 `FleetLifecycle::restore_missing` is a lower-level hook. Each request-path
 open of a missing file asks it, under the path lock, whatever
 `[database.fleet] restore_missing` says. A background open does not ask. With
-replication, an open of a deleted key does not ask. Use `import` for a local
-backup.
+replication, an open of a deleted key does not ask. Use `import` or
+`restore_from_file` for a local backup.
 
 ## Operating the fleet
 
@@ -225,6 +288,7 @@ cargo install autumn-cli --no-default-features --features sqlite
 | `autumn fleet import <key> <src>` | copy `src` into the fleet as `key`; the key must have no file |
 | `autumn fleet delete <key> --force` | remove one database and its sidecars; with replication, its replica too |
 | `autumn fleet restore <key> [--timestamp T] --force` | rebuild one database from its replica; `--timestamp` sets a point in time |
+| `autumn fleet restore <key> --from <file> --force` | replace one database with a local file; see [Restore a backup in place](#restore-a-backup-in-place) |
 | `autumn fleet lake <sql> [--out F] [--keep F] [--timestamp T]` | run one query over the replicas of every live tenant and write CSV; see [Query the lake](#query-the-lake) |
 
 ```shell
@@ -234,6 +298,7 @@ autumn fleet backup tenant:acme /backups/acme.db
 autumn fleet import tenant:acme /backups/acme.db
 autumn fleet delete tenant:acme --force
 autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+autumn fleet restore tenant:acme --from /backups/acme.db --force
 ```
 
 - A key is a name as `autumn fleet list` prints it: `tenant:<id>` or
@@ -287,6 +352,15 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   again. See [Deleting a database's replica](#deleting-a-databases-replica).
 - `restore` also brings back a deleted database whose replica is still
   there. It drops the tombstone, so it needs the control database.
+- `restore --from <file>` does not need `[replication]`. It applies
+  `migrations/` and the framework tables to the copy, as `import` does.
+  `--allow-rekey` accepts a backup of another key. `--clear-tombstone`
+  restores a deleted key and purges its old replica. With `[replication]`
+  on, it ships a new base snapshot of the restored file, so it needs the
+  replica destination and the control database. With
+  `[database.fleet.ownership]` on, it stops: this command holds no slot
+  lease. On Unix, the file must belong to you or to root, and every
+  directory on the way must pass the `backup` rule. A symlink is refused.
 - On Windows, another process can open the database while `delete` or
   `restore` removes files (see [Limits](#limits)). The command then
   stops with "open in another process" or "created ... during the restore".
@@ -541,6 +615,10 @@ A tombstone stops the restore of a deleted database:
 - `fleet.restore(&key, at)` and `autumn fleet restore` ignore the
   tombstone. They take the row first, and drop the marker after the
   restore. If the restore fails, the row goes back.
+- `fleet.restore_from_file` refuses a key that has a row, unless
+  `clear_tombstone` is set. Then it takes the row before the swap, and
+  puts it back if the swap fails. It purges the old replica after the new
+  file is in place.
 
 Use the retention as an undo window:
 

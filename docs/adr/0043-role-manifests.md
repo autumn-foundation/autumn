@@ -1,4 +1,4 @@
-# ADR 0042: One Workload per Role in Release Manifests and Fleet Deploys
+# ADR 0043: One Workload per Role in Release Manifests and Fleet Deploys
 
 - Status: Accepted
 - Date: 2026-11-08

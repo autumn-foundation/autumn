@@ -2,7 +2,7 @@ use vstd::prelude::*;
 
 verus! {
 
-// Release manifests and fleet groups per role (ADR 0042).
+// Release manifests and fleet groups per role (ADR 0043).
 //
 // The runtime is `manifest_roles` in `autumn-cli/src/release_roles.rs`,
 // `DeployConfig::group_hosts` in `autumn/src/config.rs` and

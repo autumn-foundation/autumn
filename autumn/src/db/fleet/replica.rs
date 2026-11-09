@@ -530,6 +530,73 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         Ok(row)
     }
 
+    /// A restore from a file takes the tombstone row of `key` under the
+    /// purge turn, before the swap. The replica task then cannot drop the
+    /// row without the purge. The caller puts the row back when the swap
+    /// fails, and purges with [`purge_taken`](Self::purge_taken) when it
+    /// succeeds.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Restore`] when the row cannot be read or dropped.
+    pub(super) async fn take_tombstone(
+        &self,
+        key: &FleetDbKey,
+    ) -> Result<Option<crate::db::fleet_tombstones::Tombstone>, FleetError> {
+        let Some(replication) = self.replication().cloned() else {
+            return Ok(None);
+        };
+        let _turn = replication.purge_turn().lock().await;
+        self.claim_tombstone(&replication, key).await
+    }
+
+    /// Put back a row that [`take_tombstone`](Self::take_tombstone) took.
+    pub(super) async fn put_back_tombstone(
+        &self,
+        key: &FleetDbKey,
+        row: &crate::db::fleet_tombstones::Tombstone,
+    ) {
+        if let Some(tombstones) = self.replication().and_then(|r| r.tombstones())
+            && let Err(error) = tombstones.put(row).await
+        {
+            tracing::error!(database = %key, %error, "fleet restore failed and its tombstone could not be put back");
+        }
+    }
+
+    /// Purge the replica that a taken row kept: every object of the deleted
+    /// database, up to the row's cutoff. Call it after the new file is in
+    /// place and before it ships.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Unavailable`] when the purge fails. Old objects stay
+    /// then; they are older than the next generation.
+    pub(super) async fn purge_taken(
+        &self,
+        key: &FleetDbKey,
+        row: &crate::db::fleet_tombstones::Tombstone,
+    ) -> Result<(), FleetError> {
+        let Some(replication) = self.replication().cloned() else {
+            return Ok(());
+        };
+        let _turn = replication.purge_turn().lock().await;
+        let cutoff = if row.confirmed {
+            row.deleted_at
+        } else {
+            replication.now()
+        };
+        let (purger, purge_key) = (Arc::clone(&replication), key.clone());
+        crate::time::spawn_blocking(move || purger.purge_replica(&purge_key, cutoff))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+            .map(drop)
+            .map_err(|detail| FleetError::Unavailable {
+                name: key.name(),
+                detail: format!("could not purge the replica of the deleted database: {detail}"),
+            })
+    }
+
     /// An explicit restore brought `key` back: remove its marker, so other
     /// hosts restore it again.
     async fn forget_marker(

@@ -1004,6 +1004,254 @@ mod sqlite {
         assert_eq!(count_notes(&app.path("acme")), 1);
     }
 
+    /// Back up `acme` with the CLI to `<app>/acme-backup.db`.
+    fn cli_backup(app: &App) -> PathBuf {
+        let backup = app.dir.join("acme-backup.db");
+        run_ok(
+            &app.dir,
+            &["fleet", "backup", "tenant:acme", backup.to_str().unwrap()],
+        );
+        backup
+    }
+
+    #[test]
+    fn fleet_restore_from_a_file_puts_the_backup_back() {
+        let app = App::new("");
+        app.provision(&app.fleet(), &["acme"], 2);
+        let backup = cli_backup(&app);
+        let src = backup.to_str().unwrap();
+        let path = app.path("acme");
+        exec(&path, "INSERT INTO notes VALUES ('later')");
+
+        // Destructive: needs --force.
+        let stderr = run_err(
+            &app.dir,
+            &["fleet", "restore", "tenant:acme", "--from", src],
+        );
+        assert!(stderr.contains("--force"), "{stderr}");
+        assert_eq!(count_notes(&path), 3, "nothing was restored");
+
+        let (_, stderr) = run_ok(
+            &app.dir,
+            &["fleet", "restore", "tenant:acme", "--from", src, "--force"],
+        );
+        assert!(stderr.contains("Restored tenant:acme"), "{stderr}");
+        assert_eq!(count_notes(&path), 2);
+        assert!(backup.is_file(), "the source stays");
+
+        // Another key: refused unless --allow-rekey.
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:globex",
+                "--from",
+                src,
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("tenant:acme"), "{stderr}");
+        assert!(stderr.contains("--allow-rekey"), "{stderr}");
+        assert!(!app.path("globex").exists(), "nothing is published");
+        let (_, stderr) = run_ok(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:globex",
+                "--from",
+                src,
+                "--allow-rekey",
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("now records tenant:globex"), "{stderr}");
+        assert!(stderr.contains("created the file"), "{stderr}");
+        assert_eq!(count_notes(&app.path("globex")), 2);
+
+        // A bad file: refused, and the live database stays.
+        let junk = app.dir.join("junk.db");
+        std::fs::write(&junk, b"not a database, not at all, no").unwrap();
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                junk.to_str().unwrap(),
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("Nothing was restored"), "{stderr}");
+        assert_eq!(count_notes(&path), 2);
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                "absent.db",
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("is not a file"), "{stderr}");
+    }
+
+    /// Another user could swap the file in a shared directory.
+    #[cfg(unix)]
+    #[test]
+    fn fleet_restore_from_a_file_refuses_a_shared_directory_and_a_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let app = App::new("");
+        app.provision(&app.fleet(), &["acme"], 1);
+        let backup = cli_backup(&app);
+        exec(&app.path("acme"), "INSERT INTO notes VALUES ('later')");
+
+        let shared = app.dir.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let in_shared = shared.join("acme.db");
+        std::fs::copy(&backup, &in_shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                in_shared.to_str().unwrap(),
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("writable by other users"), "{stderr}");
+
+        let link = app.dir.join("link.db");
+        std::os::unix::fs::symlink(&backup, &link).unwrap();
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                link.to_str().unwrap(),
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("is not a file"), "{stderr}");
+        assert_eq!(count_notes(&app.path("acme")), 2, "nothing was restored");
+    }
+
+    #[test]
+    fn fleet_restore_from_a_file_refuses_a_fleet_with_ownership() {
+        let app = App::new("[database.fleet.ownership]\nowner = \"host-a\"\n");
+        app.provision(&app.fleet(), &["acme"], 1);
+        let backup = cli_backup(&app);
+        exec(&app.path("acme"), "INSERT INTO notes VALUES ('later')");
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                backup.to_str().unwrap(),
+                "--force",
+            ],
+        );
+        assert!(
+            stderr.contains("DatabaseFleet::restore_from_file"),
+            "{stderr}"
+        );
+        assert_eq!(count_notes(&app.path("acme")), 2);
+    }
+
+    #[test]
+    fn fleet_restore_from_a_file_ships_a_new_base_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let app = App::new(&format!(
+            "[replication]\nenabled = true\npath = \"{}\"\nprefix = \"app\"\n",
+            replicas.display()
+        ));
+        ship_acme(&app, &replicas);
+        let backup = cli_backup(&app);
+        // The replica gets a row the backup does not have.
+        let (fleet, _) = replicated_fleet(&app, &replicas);
+        runtime().block_on(async {
+            let db = fleet.open(&fleet.key_for("acme").unwrap()).await.unwrap();
+            exec(db.path(), "INSERT INTO notes VALUES ('later')");
+            drop(db);
+            fleet.close_all().await;
+        });
+        let path = app.path("acme");
+        assert_eq!(count_notes(&path), 2);
+
+        let (_, stderr) = run_ok(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                backup.to_str().unwrap(),
+                "--force",
+            ],
+        );
+        assert!(stderr.contains("base snapshot"), "{stderr}");
+        assert_eq!(count_notes(&path), 1);
+
+        // A replica restore now finds the restored data, not the old row.
+        run_ok(&app.dir, &["fleet", "restore", "tenant:acme", "--force"]);
+        assert_eq!(count_notes(&path), 1);
+    }
+
+    #[test]
+    fn fleet_restore_from_a_file_of_a_deleted_key_needs_clear_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let app = App::new(&format!(
+            "replica_retention_after_delete = \"1d\"\n\n\
+             [replication]\nenabled = true\npath = \"{}\"\nprefix = \"app\"\n",
+            replicas.display()
+        ));
+        ship_acme(&app, &replicas);
+        let backup = cli_backup(&app);
+        let src = backup.to_str().unwrap();
+        run_ok(&app.dir, &["fleet", "delete", "tenant:acme", "--force"]);
+        assert_eq!(tombstones(&app), 1);
+
+        let stderr = run_err(
+            &app.dir,
+            &["fleet", "restore", "tenant:acme", "--from", src, "--force"],
+        );
+        assert!(stderr.contains("--clear-tombstone"), "{stderr}");
+        assert!(!app.path("acme").exists());
+        assert_eq!(tombstones(&app), 1);
+
+        let (_, stderr) = run_ok(
+            &app.dir,
+            &[
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                src,
+                "--clear-tombstone",
+                "--force",
+            ],
+        );
+        assert!(
+            stderr.contains("tombstone and the old replica are gone"),
+            "{stderr}"
+        );
+        assert_eq!(count_notes(&app.path("acme")), 1);
+        assert_eq!(tombstones(&app), 0);
+    }
+
     /// Ship `tenants` (id, notes) to `replicas`, then close the fleet.
     fn ship(app: &App, replicas: &Path, tenants: &[(&str, usize)]) {
         let (fleet, _) = replicated_fleet(app, replicas);

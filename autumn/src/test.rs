@@ -1749,7 +1749,7 @@ impl TestApp {
     /// [`crate::outbox::ensure_schema`] in the test first.
     #[cfg(feature = "db")]
     #[must_use]
-    pub const fn with_outbox(mut self, config: crate::config::OutboxConfig) -> Self {
+    pub fn with_outbox(mut self, config: crate::config::OutboxConfig) -> Self {
         self.config.outbox = config;
         self.config.outbox.enabled = true;
         self
@@ -2549,7 +2549,8 @@ impl TestApp {
             &state,
             &self.config.outbox,
             std::mem::take(&mut self.outbox_handlers),
-        );
+        )
+        .unwrap_or_else(|error| panic!("TestApp: outbox: {error}"));
 
         #[cfg(feature = "mail")]
         {

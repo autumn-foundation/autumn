@@ -2749,6 +2749,10 @@ jobs:
           # (`webhook_outbound/sql_store.rs`). Same features, so no rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_outbox_writers
+          # Outbox delivery to another service: two apps, two databases.
+          # Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_outbox_remote
           # Issue #2663: the SQLite split-sum aggregate and bulk decrement in
           # `counter_cache.rs` are sqlite-only. Same features, so no rebuild.
           # A filter that matches nothing exits 0, so check the count.
@@ -3129,6 +3133,13 @@ jobs:
             http:: tests::parse_release \
             | tee "$RUNNER_TEMP/cli-release-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-release-cov.log"
+          # Same gap for the `autumn fleet` argument parsing in `main.rs`.
+          # Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- \
+            tests::fleet_subcommands_parse_into_fleet_commands \
+            tests::fleet_restore_from_a_file_parses \
+            | tee "$RUNNER_TEMP/cli-fleet-parse-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-parse-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -3405,7 +3416,8 @@ jobs:
             --test sim_sqlite_integration \
             --test sim_chaos_crash \
             --test sim_outbox_crash \
-            --test sqlite_outbox_writers
+            --test sqlite_outbox_writers \
+            --test sqlite_outbox_remote
       - name: Run the multi-replica sim suites (issue #3067)
         # Several replicas on one sim clock and one SQLite database, and the
         # partitioned fleet owner of issue #3233. Single

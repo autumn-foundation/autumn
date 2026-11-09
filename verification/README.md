@@ -546,7 +546,7 @@ checks the runtime against the same rules.
 ## Role manifests
 
 `role_manifests.rs` models the role set of `autumn release init` and the
-`[[deploy.groups]]` checks (issue #3547, ADR 0042). A role name is an
+`[[deploy.groups]]` checks (issue #3547, ADR 0043). A role name is an
 integer. Verify it with:
 
 ```sh

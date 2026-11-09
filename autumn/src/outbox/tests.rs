@@ -124,7 +124,7 @@ fn replay_knows_when_install_gives_mail_a_queue() {
 #[test]
 fn install_without_enabled_installs_nothing() {
     let state = AppState::for_test();
-    install(&state, &OutboxConfig::default(), OutboxHandlers::default());
+    install(&state, &OutboxConfig::default(), OutboxHandlers::default()).expect("install");
     assert!(state.extension::<OutboxRelay>().is_none());
 }
 
@@ -171,7 +171,8 @@ mod sqlite {
                 ..config
             },
             handlers,
-        );
+        )
+        .expect("install");
         Fixture {
             _substrate: substrate,
             state,
@@ -774,7 +775,8 @@ mod sqlite {
                 ..OutboxConfig::default()
             },
             handlers,
-        );
+        )
+        .expect("install");
         ensure_relay_schema(&state)
             .await
             .expect("schema on every pool");
@@ -856,7 +858,8 @@ mod sqlite {
                 ..OutboxConfig::default()
             },
             handlers,
-        );
+        )
+        .expect("install");
         let mut conn = main.pool().get().await.unwrap();
         Outbox::new(&state)
             .write(&mut conn, "a", "t", &serde_json::json!({}))
@@ -902,7 +905,8 @@ mod sqlite {
                 ..OutboxConfig::default()
             },
             handlers,
-        );
+        )
+        .expect("install");
         ensure_relay_schema(&state)
             .await
             .expect("schema on the shard");
@@ -965,7 +969,8 @@ mod sqlite {
                 ..OutboxConfig::default()
             },
             handlers,
-        );
+        )
+        .expect("install");
 
         ensure_relay_schema(&state)
             .await
@@ -1115,5 +1120,121 @@ mod sqlite {
             assert_eq!(expected.len(), 5, "the fixture marks 5 rows");
             assert_eq!(claimed, expected, "with_claim_index = {with_claim_index}");
         }
+    }
+}
+
+// ── Remote destinations and the inbox endpoint ──────────────────────────────
+
+#[cfg(feature = "http-client")]
+mod remote_delivery {
+    use super::*;
+    use crate::config::{OutboxDestinationConfig, OutboxInboxConfig};
+
+    /// A named event: it is in the event catalogue.
+    #[crate::event(name = "unit.remote.deal")]
+    struct UnitDeal {
+        id: i64,
+    }
+
+    fn lazy_pool() -> Pool<RuntimeConnection> {
+        crate::db::create_pool(&crate::config::DatabaseConfig {
+            primary_url: Some(crate::test_urls::primary("unused")),
+            ..crate::config::DatabaseConfig::default()
+        })
+        .expect("pool builds")
+        .expect("url present => Some(pool)")
+    }
+
+    fn remote(topics: &[&str]) -> OutboxConfig {
+        let mut config = OutboxConfig {
+            enabled: true,
+            ..OutboxConfig::default()
+        };
+        config.destinations.insert(
+            "marketing".to_owned(),
+            OutboxDestinationConfig {
+                url: "http://marketing/_autumn/inbox".to_owned(),
+                signing_secret: Some("unit-secret-0123456789abcdef0123".to_owned()),
+                topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn inbox_signature_uses_the_autumn_signature_scheme() {
+        let header = inbox_signature("k", 1_700_000_000, "{\"a\":1}");
+        let expected = crate::security::config::hmac_sha256_hex(b"k", b"1700000000.{\"a\":1}");
+        assert_eq!(header, format!("t=1700000000,v1={expected}"));
+    }
+
+    #[test]
+    fn named_event_is_in_the_catalogue() {
+        let _ = UnitDeal { id: 1 }.id;
+        assert!(crate::events::event_contract("unit.remote.deal").is_some());
+        assert!(crate::events::event_contract("unit.remote.nothing").is_none());
+    }
+
+    #[test]
+    fn relay_routes_destination_topics_to_the_remote_handler() {
+        let state = AppState::for_test().with_pool(lazy_pool());
+        install(
+            &state,
+            &remote(&["unit.remote.deal"]),
+            OutboxHandlers::default(),
+        )
+        .expect("install");
+        let relay = state.extension::<OutboxRelay>().expect("relay");
+        assert!(relay.handles("unit.remote.deal"));
+        assert!(relay.topics_in_list.contains("'unit.remote.deal'"));
+    }
+
+    #[test]
+    fn destination_topic_must_be_a_named_event() {
+        let state = AppState::for_test().with_pool(lazy_pool());
+        let error = install(
+            &state,
+            &remote(&["unit.remote.typo"]),
+            OutboxHandlers::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unit.remote.typo"), "{error}");
+        assert!(error.contains("#[event(name"), "{error}");
+        assert!(state.extension::<OutboxRelay>().is_none());
+    }
+
+    #[test]
+    fn topic_cannot_be_local_and_remote() {
+        let state = AppState::for_test().with_pool(lazy_pool());
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert("unit.remote.deal", |_, _| async { Ok(()) });
+        let error = install(&state, &remote(&["unit.remote.deal"]), handlers)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outbox_handler"), "{error}");
+    }
+
+    #[test]
+    fn inbox_installs_its_verifier() {
+        let state = AppState::for_test().with_pool(lazy_pool());
+        let config = OutboxConfig {
+            enabled: true,
+            inbox: OutboxInboxConfig {
+                enabled: true,
+                signing_secret: Some("unit-secret-0123456789abcdef0123".to_owned()),
+                ..OutboxInboxConfig::default()
+            },
+            ..OutboxConfig::default()
+        };
+        install(&state, &config, OutboxHandlers::default()).expect("install");
+        assert!(state.extension::<remote::InboxVerifier>().is_some());
+        assert!(
+            state
+                .extension::<OutboxRelay>()
+                .expect("relay")
+                .handles(TOPIC_INBOX),
+            "the receiver relay runs the listeners"
+        );
     }
 }

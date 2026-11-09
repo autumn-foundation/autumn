@@ -300,8 +300,9 @@ across releases. See [Events across releases](wire-contracts.md#events-across-re
 
 ## Out of scope (today)
 
-- Cross-process delivery via an external broker (Kafka/NATS). Durable fan-out
-  rides the existing Postgres/Redis job queue.
+- Cross-process delivery through an external broker (Kafka/NATS). To send
+  an event to another Autumn service, use an outbox destination. See
+  [Send to another service](outbox.md#send-to-another-service).
 - Event sourcing / an append-only event store. This is in-process pub/sub for
   side effects, not persistence.
 - Auto-emitting events from model CRUD — that overlaps

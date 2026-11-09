@@ -1950,6 +1950,17 @@ build. Put `#[event_consumer(E)]` on an outbox topic handler for the same
 check. `#[event(opaque)]` turns the check off for a payload `WireShape`
 refuses. `autumn contracts check` covers events across releases.
 
+Send an event to another Autumn service with an outbox destination, not a
+hand-written HTTP call. The producer sets `[outbox.destinations.<name>]`
+(`url`, `signing_secret = "${VAR}"`, `topics`) and writes the event with
+`outbox.write(conn, aggregate, Event::NAME, &event)` in its transaction. Each
+topic must be an `#[event(name = "...")]`, or the boot fails. The receiver
+sets `[outbox.inbox]` (`enabled`, the same `signing_secret`) and handles the
+topic with a `#[listener]`; it serves `POST /_autumn/inbox`, drops copies
+with `Inbox::seen`, and returns `503` for a topic it does not know yet, which
+the producer relay sends again. Both apps need `outbox.enabled = true`. See
+`docs/guide/outbox.md`.
+
 ## Distributed locks (0.6.0)
 
 For "run this exactly once across replicas right now" work (nightly cleanup,
@@ -3110,10 +3121,14 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - `DatabaseFleet` (`autumn_web::db::fleet`): `open_for`, `provision`,
   `delete` (`410` meanwhile), `backup` (`VACUUM INTO`), `import` (copy a
   file into the fleet: check, migrate, publish; `409` when the key has a
-  file, `422` for a bad file),
+  file, `422` for a bad file), `restore_from_file(&key, &src,
+  LocalRestore::new())` (replace a live database with a local backup; no
+  replication needed; openers wait for the swap; another key's backup or a
+  deleted key is refused unless `allow_rekey` / `clear_tombstone`),
   `restore`, `list`, `each`, `migrate_all`, `stats`. Health: `db:fleet`.
-  Use `import`, not a `FleetLifecycle::restore_missing` hook, for a local
-  backup.
+  Use `import` or `restore_from_file`, not a
+  `FleetLifecycle::restore_missing` hook, for a local backup. CLI:
+  `autumn fleet restore <key> --from <file> --force`.
 - `max_open` is a soft limit: a database in use or used within
   `min_residency` (default `"2s"`) is not closed, and an open never waits.
   A burst can open far more files than `max_open`. Size `ulimit -n` for the

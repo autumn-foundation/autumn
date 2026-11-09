@@ -112,6 +112,7 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         TokenStream::new()
     };
     let track = store::track_contract_dir();
+    let catalogued = event_contract(&attrs, &input, &refusal);
 
     // `#[serde(crate = "...")]`'s value is a string serde parses into a path
     // itself (it never passes through this crate's own generic
@@ -142,11 +143,34 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #track
         #written
         #wire
+        #catalogued
 
         impl #impl_generics ::autumn_web::events::Event for #ident #ty_generics #where_clause {
             const NAME: &'static str = #name_const;
             const VERSION: u32 = #version;
             #shape_const
+        }
+    }
+}
+
+/// Register a named event in the event catalogue, else nothing.
+///
+/// Only an event with a `name` has a descriptor in the release bundle. A
+/// generic or refused event registers nothing.
+fn event_contract(attrs: &EventAttrs, input: &DeriveInput, refusal: &TokenStream) -> TokenStream {
+    if attrs.name.is_none() || !input.generics.params.is_empty() || !refusal.is_empty() {
+        return TokenStream::new();
+    }
+    let ident = &input.ident;
+    let version = attrs.version;
+    let shaped = !attrs.opaque;
+    quote! {
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::events::EventContract {
+                topic: <#ident as ::autumn_web::events::Event>::NAME,
+                version: #version,
+                shaped: #shaped,
+            }
         }
     }
 }
@@ -284,6 +308,34 @@ mod tests {
             expanded.contains("module_path ! ()") && expanded.contains("\"UserSignedUp\""),
             "{expanded}"
         );
+    }
+
+    #[test]
+    fn named_event_registers_its_topic_in_the_catalogue() {
+        let named = event_macro(
+            quote! { name = "deal.won" },
+            quote! {
+                struct DealWon {
+                    deal_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            named.contains("inventory :: submit")
+                && named.contains("autumn_web :: events :: EventContract"),
+            "{named}"
+        );
+        let unnamed = event_macro(
+            quote! {},
+            quote! {
+                struct DealWon {
+                    deal_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(!unnamed.contains("EventContract"), "{unnamed}");
     }
 
     #[test]

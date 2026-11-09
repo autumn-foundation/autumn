@@ -1774,6 +1774,8 @@ mod tests {
             mmap_size,
             cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let destination: Arc<dyn ReplicaDestination> =
@@ -2148,6 +2150,8 @@ mod tests {
             mmap_size: 0,
             cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let key = FleetDbKey::Slot(1);
@@ -2466,6 +2470,8 @@ mod tests {
             mmap_size: 0,
             cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let flaky = Arc::new(Flaky {
@@ -2728,6 +2734,8 @@ mod tests {
             mmap_size: 0,
             cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let flaky = Arc::new(Flaky {
@@ -3312,6 +3320,8 @@ mod tests {
             mmap_size: 0,
             cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let replication = Arc::new(

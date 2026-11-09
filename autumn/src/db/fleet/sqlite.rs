@@ -897,6 +897,38 @@ impl DatabaseFleet<SqliteEngine> {
         })?
     }
 
+    /// Copy `source` into a staging file beside the database of `key`, then
+    /// check and migrate it, for [`restore_from_file`](Self::restore_from_file).
+    /// Blocking. A refused source is [`FleetError::Restore`]. Migrations run
+    /// when `migrate` is set or when opens apply them.
+    pub(super) fn stage_restore(
+        &self,
+        key: &FleetDbKey,
+        source: &Path,
+        rekey: bool,
+        migrate: bool,
+        epoch: Option<u64>,
+    ) -> Result<Staged, FleetError> {
+        let (path, name) = (self.path_of(key), key.name());
+        check_contained(self.root(), &path)?;
+        let migrations = &self.inner.engine.migrations;
+        let rules = StageRules {
+            tag: "restoring",
+            rekey,
+            migrate: migrate || migrations.apply_on_open,
+        };
+        let invalid = |detail: String| FleetError::Restore {
+            name: name.clone(),
+            detail: format!("{}: {detail}", source.display()),
+        };
+        stage_file(&path, &name, source, migrations, epoch, rules, invalid)
+    }
+
+    /// Count migrations a restore applied.
+    pub(super) fn count_migrations(&self, applied: usize) {
+        self.inner.engine.count_applied(applied);
+    }
+
     /// Write a consistent copy of a database to `dest` with `VACUUM INTO`.
     /// `dest` must not exist. Readers and writers keep running meanwhile.
     ///
@@ -1599,18 +1631,34 @@ pub(super) fn restore_in_place(
             return Err(error);
         }
     };
-    let published = with_path_lock(root, &name, || {
-        with_exclusive_access(path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
-            unlink_database_set(path, "replace database", &name, present, |file| {
-                std::fs::remove_file(file)
-            })?;
-            publish_restored(&staging, path, &name)
-        })
-    });
+    let published = swap_in_staged(root, path, &name, &staging);
     discard_staging(&staging);
-    published.map(|()| crate::replication::RestoreOutcome {
+    published.map(|_| crate::replication::RestoreOutcome {
         output: path.to_path_buf(),
         ..outcome
+    })
+}
+
+/// Put the checked `staging` file at `path` in place of the database there.
+/// Blocking. Returns whether a database was there.
+///
+/// Under the path lock and the exclusive guard: the old sidecars go, then
+/// the old main file, then the staging file is linked into place. Another
+/// process that has the file open gives [`FleetError::InUseElsewhere`], and
+/// nothing changes.
+pub(super) fn swap_in_staged(
+    root: &Path,
+    path: &Path,
+    name: &str,
+    staging: &Path,
+) -> Result<bool, FleetError> {
+    with_path_lock(root, name, || {
+        with_exclusive_access(path, name, HOLD_GUARD_WHILE_REMOVING, |present| {
+            unlink_database_set(path, "replace database", name, present, |file| {
+                std::fs::remove_file(file)
+            })?;
+            publish_restored(staging, path, name).map(|()| present)
+        })
     })
 }
 
@@ -1670,6 +1718,28 @@ pub(super) fn publish_staged(
     })
 }
 
+/// How [`stage_file`] checks and migrates a copy.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StageRules {
+    /// The tag of the staging directory.
+    pub(super) tag: &'static str,
+    /// Accept a copy of another key, and write this key into its identity row.
+    pub(super) rekey: bool,
+    /// Apply pending migrations. If `false`, refuse a copy that has some.
+    pub(super) migrate: bool,
+}
+
+/// A checked copy in its staging file. The caller discards the file.
+#[derive(Debug)]
+pub(super) struct Staged {
+    /// The staging file.
+    pub(super) file: PathBuf,
+    /// Migrations applied to the copy.
+    pub(super) applied: usize,
+    /// The key the source recorded, when the copy was rekeyed.
+    pub(super) rekeyed_from: Option<String>,
+}
+
 /// Copy `source` into a new staging file beside `path`, check it and
 /// migrate it. Returns the staging file and the number of migrations
 /// applied. Removes the staging file on an error.
@@ -1680,17 +1750,42 @@ pub(super) fn stage_import_file(
     migrations: &FleetMigrations,
     epoch: Option<u64>,
 ) -> Result<(PathBuf, usize), FleetError> {
+    let rules = StageRules {
+        tag: "importing",
+        rekey: false,
+        migrate: true,
+    };
     let invalid = |detail: String| FleetError::InvalidSource {
         name: name.to_owned(),
         path: source.display().to_string(),
         detail,
     };
+    stage_file(path, name, source, migrations, epoch, rules, invalid)
+        .map(|staged| (staged.file, staged.applied))
+}
+
+/// Copy `source` into a new staging file beside `path`, then check and
+/// migrate it by `rules`. `invalid` makes the error for a refused source.
+/// Removes the staging file on an error.
+pub(super) fn stage_file(
+    path: &Path,
+    name: &str,
+    source: &Path,
+    migrations: &FleetMigrations,
+    epoch: Option<u64>,
+    rules: StageRules,
+    invalid: impl Fn(String) -> FleetError,
+) -> Result<Staged, FleetError> {
     if !source.is_file() {
         return Err(invalid("no such file".to_owned()));
     }
-    let staging = staging_path(path, "importing")?;
-    match stage_import(source, &staging, name, migrations, epoch, invalid) {
-        Ok(applied) => Ok((staging, applied)),
+    let staging = staging_path(path, rules.tag)?;
+    match stage_import(source, &staging, name, migrations, epoch, rules, invalid) {
+        Ok((applied, rekeyed_from)) => Ok(Staged {
+            file: staging,
+            applied,
+            rekeyed_from,
+        }),
         Err(error) => {
             discard_staging(&staging);
             Err(error)
@@ -1698,23 +1793,19 @@ pub(super) fn stage_import_file(
     }
 }
 
-/// Copy `source` to `staging`, check the copy, and migrate it.
+/// Copy `source` to `staging`, check the copy, and migrate it. Returns the
+/// migrations applied and the key the source recorded, if rekeyed.
 pub(super) fn stage_import(
     source: &Path,
     staging: &Path,
     name: &str,
     migrations: &FleetMigrations,
     epoch: Option<u64>,
+    rules: StageRules,
     invalid: impl Fn(String) -> FleetError,
-) -> Result<usize, FleetError> {
+) -> Result<(usize, Option<String>), FleetError> {
     use diesel::RunQueryDsl as _;
     use diesel::connection::SimpleConnection as _;
-
-    #[derive(diesel::QueryableByName)]
-    struct Kind {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        kind: String,
-    }
 
     let unavailable = |detail: String| FleetError::Unavailable {
         name: name.to_owned(),
@@ -1745,47 +1836,125 @@ pub(super) fn stage_import(
             .map_err(|e| unavailable(e.to_string()))?;
         crate::replication::sqlite::integrity_check(&mut conn)
             .map_err(|e| invalid(e.to_string()))?;
-        // The identity and epoch must be plain tables: a view with a trigger
-        // could answer any name.
-        let kinds: Vec<Kind> = diesel::sql_query(format!(
-            "SELECT name || ':' || type AS kind FROM sqlite_master \
-             WHERE name IN ('{IDENTITY_TABLE}', '{EPOCH_TABLE}')"
-        ))
-        .load(&mut conn)
-        .map_err(|e| unavailable(e.to_string()))?;
-        if kinds.iter().any(|row| !row.kind.ends_with(":table")) {
-            return Err(invalid(
-                "its identity or epoch is not a plain table".to_owned(),
-            ));
-        }
-        if !kinds
-            .iter()
-            .any(|row| row.kind == format!("{IDENTITY_TABLE}:table"))
-        {
-            return Err(invalid(
-                "it records no identity row; only a file that a fleet made can be imported"
-                    .to_owned(),
-            ));
-        }
+        check_fleet_tables(&mut conn, &unavailable, &invalid)?;
         // The copy has no history in this fleet: set its epoch, never keep
         // the source's.
         conn.batch_execute(&format!("DROP TABLE IF EXISTS {EPOCH_TABLE};"))
             .map_err(|e| unavailable(e.to_string()))?;
     }
-    match read_identity(staging, name)? {
-        Some(found) if found == name => {}
+    let rekeyed_from = match read_identity(staging, name)? {
+        Some(found) if found == name => None,
+        Some(found) if rules.rekey => {
+            write_identity(staging, name)?;
+            Some(found)
+        }
         Some(found) => {
             return Err(invalid(format!("it is a copy of {found}")));
         }
         None => {
             return Err(invalid("its identity table is empty".to_owned()));
         }
-    }
-    let applied = migrations.apply(&url, name)?;
+    };
+    let applied = if rules.migrate {
+        migrations.apply(&url, name)?
+    } else {
+        match migrations.pending(&url, name)? {
+            0 => 0,
+            count => {
+                return Err(FleetError::PendingMigrations {
+                    name: name.to_owned(),
+                    count,
+                });
+            }
+        }
+    };
     if let Some(epoch) = epoch {
         write_epoch_stamp(staging, name, epoch)?;
     }
-    Ok(applied)
+    // A trigger on another table can change the identity row while the
+    // migrations run. Read it again.
+    if read_identity(staging, name)?.as_deref() != Some(name) {
+        return Err(invalid(
+            "its identity row changed while it was migrated".to_owned(),
+        ));
+    }
+    Ok((applied, rekeyed_from))
+}
+
+/// Refuse a copy whose identity or epoch is not a plain table, that records
+/// no identity table, or that has a trigger on these tables.
+fn check_fleet_tables(
+    conn: &mut diesel::SqliteConnection,
+    unavailable: &impl Fn(String) -> FleetError,
+    invalid: &impl Fn(String) -> FleetError,
+) -> Result<(), FleetError> {
+    use diesel::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct Kind {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        kind: String,
+    }
+
+    // The identity and epoch must be plain tables: a view with a trigger
+    // could answer any name.
+    let kinds: Vec<Kind> = diesel::sql_query(format!(
+        "SELECT name || ':' || type AS kind FROM sqlite_master \
+         WHERE name IN ('{IDENTITY_TABLE}', '{EPOCH_TABLE}')"
+    ))
+    .load(conn)
+    .map_err(|e| unavailable(e.to_string()))?;
+    if kinds.iter().any(|row| !row.kind.ends_with(":table")) {
+        return Err(invalid(
+            "its identity or epoch is not a plain table".to_owned(),
+        ));
+    }
+    if !kinds
+        .iter()
+        .any(|row| row.kind == format!("{IDENTITY_TABLE}:table"))
+    {
+        return Err(invalid(
+            "it records no identity row; only a file that a fleet made is accepted".to_owned(),
+        ));
+    }
+    // A trigger on these tables could block or undo a write to them.
+    let triggers: Vec<Kind> = diesel::sql_query(format!(
+        "SELECT name AS kind FROM sqlite_master WHERE type = 'trigger' \
+         AND lower(tbl_name) IN ('{IDENTITY_TABLE}', '{EPOCH_TABLE}')"
+    ))
+    .load(conn)
+    .map_err(|e| unavailable(e.to_string()))?;
+    if !triggers.is_empty() {
+        return Err(invalid(
+            "it has a trigger on its identity or epoch table".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Write `name` into the identity row of the file at `path`. Blocking.
+/// Exactly one row must change.
+fn write_identity(path: &Path, name: &str) -> Result<(), FleetError> {
+    use diesel::RunQueryDsl as _;
+    use diesel::connection::SimpleConnection as _;
+    let unavailable = |detail: String| FleetError::Unavailable {
+        name: name.to_owned(),
+        detail,
+    };
+    let mut conn = crate::db::establish_sqlite_migration_connection(&SqliteEngine::url_of(path))
+        .map_err(|e| unavailable(e.to_string()))?;
+    conn.batch_execute("PRAGMA trusted_schema = OFF;")
+        .map_err(|e| unavailable(e.to_string()))?;
+    let changed = diesel::sql_query(format!("UPDATE {IDENTITY_TABLE} SET name = ? WHERE id = 1"))
+        .bind::<diesel::sql_types::Text, _>(name)
+        .execute(&mut conn)
+        .map_err(|e| unavailable(e.to_string()))?;
+    if changed != 1 {
+        return Err(unavailable(format!(
+            "the identity row did not change ({changed} rows)"
+        )));
+    }
+    Ok(())
 }
 
 /// Identity row and migrations on a staging file, closed before it returns.
