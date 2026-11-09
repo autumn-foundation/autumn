@@ -423,7 +423,7 @@ Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `cursor_key_type =` attr keys), bulk `save_many` / `save_many_skip_invalid` /
 `update_many` / `delete_many` / `upsert_many` (compile error on hooked repos),
 `with_lock`, `on_primary()`. Attr keys: `api =`, `policy =`,
-`scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
+`scope =`, `primary_reads`, `boundary =`, `soft_delete`, `tenant_scoped`, `hooks =`,
 `mcp` / `mcp = "read"`.
 
 **(0.6.0)**: `preload(records, spec)` (declarative associations);

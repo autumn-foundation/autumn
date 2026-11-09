@@ -387,14 +387,25 @@ pub fn renamed_baseline(baseline: &[Table], changes: &[SchemaChange]) -> Vec<Tab
     tables
 }
 
+/// True when the foreign key target `fk_table` is the table `qualified`
+/// (`table` or `schema.table`). A bare target matches the bare name. A
+/// qualified target must match the schema too.
+fn fk_names_table(fk_table: &str, qualified: &str) -> bool {
+    let bare = crate::schema::diff::bare_name(qualified);
+    fk_table == bare || (qualified.contains('.') && fk_table == qualified)
+}
+
 /// Apply one rename change to `tables`, as the database applies it: foreign
 /// keys, index columns, index definitions and `CHECK` expressions follow the
 /// new name. A non-rename change is a no-op.
 pub fn apply_rename(tables: &mut [Table], change: &SchemaChange) {
     match change {
         SchemaChange::RenameTable { from, to } => {
+            // `from` may be `schema.table`.
+            let qualified = from.as_str();
+            let from = crate::schema::diff::bare_name(from);
             for t in tables.iter_mut() {
-                if t.name == *from {
+                if t.name == from {
                     t.name.clone_from(to);
                     for idx in &mut t.indexes {
                         if let Some(def) = &mut idx.definition {
@@ -404,21 +415,31 @@ pub fn apply_rename(tables: &mut [Table], change: &SchemaChange) {
                 }
                 for c in &mut t.columns {
                     if let Some(fk) = &mut c.references
-                        && fk.table == *from
+                        && fk_names_table(&fk.table, qualified)
                     {
-                        fk.table.clone_from(to);
+                        // A qualified target keeps its schema.
+                        fk.table = if fk.table.contains('.') {
+                            qualified
+                                .rsplit_once('.')
+                                .map_or_else(|| to.clone(), |(schema, _)| format!("{schema}.{to}"))
+                        } else {
+                            to.clone()
+                        };
                     }
                 }
             }
         }
         SchemaChange::RenameColumn { table, from, to } => {
+            // `table` may be `schema.table`.
+            let qualified = table.as_str();
+            let table = crate::schema::diff::bare_name(table);
             let swap = |name: &mut String| {
                 if name == from {
                     name.clone_from(to);
                 }
             };
             for t in tables.iter_mut() {
-                if t.name == *table {
+                if t.name == table {
                     t.columns.iter_mut().for_each(|c| swap(&mut c.name));
                     t.primary_key.iter_mut().for_each(swap);
                     for idx in &mut t.indexes {
@@ -434,7 +455,7 @@ pub fn apply_rename(tables: &mut [Table], change: &SchemaChange) {
                 }
                 for c in &mut t.columns {
                     if let Some(fk) = &mut c.references
-                        && fk.table == *table
+                        && fk_names_table(&fk.table, qualified)
                         && fk.column == *from
                     {
                         fk.column.clone_from(to);
@@ -443,7 +464,9 @@ pub fn apply_rename(tables: &mut [Table], change: &SchemaChange) {
             }
         }
         SchemaChange::RenameIndex { table, from, index } => {
-            for t in tables.iter_mut().filter(|t| t.name == *table) {
+            // `table` may be `schema.table`.
+            let table = crate::schema::diff::bare_name(table);
+            for t in tables.iter_mut().filter(|t| t.name == table) {
                 for idx in &mut t.indexes {
                     if idx.name == *from {
                         *idx = index.clone();
@@ -1754,6 +1777,61 @@ mod tests {
         for bad in ["", "Title", "1a", "a b", "a;b", "a\"b", "a-b"] {
             assert!(!is_plain_identifier(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn an_index_rename_on_a_schema_table_applies() {
+        let mut t = table("posts", Backend::Postgres, &[("id", ColumnType::Int64)]);
+        t.schema = Some("blog".to_owned());
+        t.indexes
+            .push(Index::new("idx_posts_old", vec!["id".to_owned()], false));
+        let mut tables = vec![t];
+        apply_rename(
+            &mut tables,
+            &SchemaChange::RenameIndex {
+                table: "blog.posts".to_owned(),
+                from: "idx_posts_old".to_owned(),
+                index: Index::new("idx_posts_new", vec!["id".to_owned()], false),
+            },
+        );
+        assert_eq!(tables[0].indexes[0].name, "idx_posts_new");
+    }
+
+    #[test]
+    fn renames_follow_a_qualified_fk_target() {
+        // public `posts` references `blog.authors` by an explicit qualified target.
+        let mut authors = table("authors", Backend::Postgres, &[("id", ColumnType::Int64)]);
+        authors.schema = Some("blog".to_owned());
+        let mut posts = table(
+            "posts",
+            Backend::Postgres,
+            &[("author_id", ColumnType::Int64)],
+        );
+        posts.columns[0].references = Some(ForeignKey::new("blog.authors", "id"));
+        let mut tables = vec![authors, posts];
+        apply_rename(
+            &mut tables,
+            &SchemaChange::RenameTable {
+                from: "blog.authors".to_owned(),
+                to: "writers".to_owned(),
+            },
+        );
+        assert_eq!(
+            tables[1].columns[0].references.as_ref().unwrap().table,
+            "blog.writers"
+        );
+        apply_rename(
+            &mut tables,
+            &SchemaChange::RenameColumn {
+                table: "blog.writers".to_owned(),
+                from: "id".to_owned(),
+                to: "writer_id".to_owned(),
+            },
+        );
+        assert_eq!(
+            tables[1].columns[0].references.as_ref().unwrap().column,
+            "writer_id"
+        );
     }
 
     #[test]

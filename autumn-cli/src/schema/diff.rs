@@ -218,6 +218,15 @@ pub enum SchemaChange {
         /// The index with its new name (`SQLite` recreates it from this shape).
         index: Index,
     },
+    /// A table whose schema the engine cannot apply safely: it moved to another
+    /// schema, one name sits in two schemas, or `SQLite` has no schemas. A
+    /// non-emittable marker: [`guard_plan`] refuses it, with no override.
+    TableSchemaConflict {
+        /// The table name.
+        table: String,
+        /// Why the schema cannot apply.
+        reason: String,
+    },
     /// A `#[renamed_from]` hint that the engine cannot apply safely. A
     /// non-emittable marker: [`guard_plan`] refuses it, with no override.
     RenameConflict {
@@ -470,6 +479,120 @@ pub enum SchemaChange {
     },
 }
 
+/// The schema of `table` when it is not the default one. `public` is the
+/// default.
+fn named_schema(table: &Table) -> Option<&str> {
+    table.schema.as_deref().filter(|s| *s != "public")
+}
+
+/// Put the schema into the table name of each change, so the emitter writes
+/// `schema.table`. A schema the engine cannot apply becomes a refusal marker.
+fn apply_table_schemas(
+    baseline: &[Table],
+    desired: &ParsedSchema,
+    backend: Backend,
+    changes: &mut Vec<SchemaChange>,
+) {
+    let mut schemas: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    let mut conflicts: Vec<(String, String)> = Vec::new();
+    for t in desired.tables.iter().chain(baseline) {
+        if let Some(s) = t.schema.as_deref()
+            && !autumn_schema_core::is_valid_schema_name(s)
+        {
+            conflicts.push((
+                t.name.clone(),
+                format!("`{s}` is not a plain lower-case schema name"),
+            ));
+        }
+    }
+    for (side, tables) in [
+        ("desired", desired.tables.iter().collect::<Vec<_>>()),
+        ("baseline", baseline.iter().collect::<Vec<_>>()),
+    ] {
+        for t in tables {
+            match schemas.get(t.name.as_str()) {
+                None => {
+                    schemas.insert(t.name.as_str(), named_schema(t));
+                }
+                Some(seen) if *seen != named_schema(t) => conflicts.push((
+                    t.name.clone(),
+                    if side == "desired" {
+                        "the name is used in two schemas; use one name per schema".to_owned()
+                    } else {
+                        let from = named_schema(t).unwrap_or("the default schema");
+                        let to = seen.unwrap_or("the default schema");
+                        format!(
+                            "the table is in {from} but the model says {to}; \
+                             moving a table to another schema is not generated. \
+                             Write `ALTER TABLE ... SET SCHEMA` by hand"
+                        )
+                    },
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    if backend == Backend::Sqlite
+        && let Some(t) = desired.tables.iter().find(|t| t.schema.is_some())
+    {
+        conflicts.push((t.name.clone(), "SQLite has no schemas".to_owned()));
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    if !conflicts.is_empty() {
+        changes.extend(
+            conflicts
+                .into_iter()
+                .map(|(table, reason)| SchemaChange::TableSchemaConflict { table, reason }),
+        );
+        return;
+    }
+    let qualify = |table: &mut String| {
+        if let Some(Some(schema)) = schemas.get(table.as_str()) {
+            *table = format!("{schema}.{table}");
+        }
+    };
+    // `REFERENCES x` finds `x` by the `search_path`, so name the schema.
+    let qualify_fks = |columns: &mut [Column]| {
+        for fk in columns.iter_mut().filter_map(|c| c.references.as_mut()) {
+            qualify(&mut fk.table);
+        }
+    };
+    for change in changes.iter_mut() {
+        match change {
+            SchemaChange::CreateTable(t) | SchemaChange::DropTable(t) => {
+                qualify_fks(&mut t.columns);
+            }
+            SchemaChange::DropColumn { table, column }
+            | SchemaChange::AddColumn { table, column } => {
+                qualify_fks(std::slice::from_mut(column));
+                qualify(table);
+            }
+            SchemaChange::RenameTable { from, to } => {
+                if let Some(Some(schema)) = schemas.get(to.as_str()) {
+                    *from = format!("{schema}.{from}");
+                }
+            }
+            SchemaChange::RenameColumn { table, .. }
+            | SchemaChange::RenameIndex { table, .. }
+            | SchemaChange::AlterColumnType { table, .. }
+            | SchemaChange::SetNotNull { table, .. }
+            | SchemaChange::DropNotNull { table, .. }
+            | SchemaChange::SetDefault { table, .. }
+            | SchemaChange::AddIndex { table, .. }
+            | SchemaChange::DropIndex { table, .. }
+            | SchemaChange::AddCheck { table, .. } => qualify(table),
+            SchemaChange::AddForeignKey {
+                table, foreign_key, ..
+            } => {
+                qualify(table);
+                qualify(&mut foreign_key.table);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Diff policy knobs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DiffOptions {
@@ -521,6 +644,15 @@ pub enum DiffError {
         /// The table the hint is on.
         table: String,
         /// Why the hint cannot apply.
+        reason: String,
+    },
+
+    /// A table schema cannot apply (no override).
+    #[error("cannot apply the schema of table `{table}`: {reason}")]
+    TableSchema {
+        /// The table.
+        table: String,
+        /// Why the schema cannot apply.
         reason: String,
     },
 
@@ -919,6 +1051,7 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
 
     detect_inbound_fk_blocks(baseline, desired, &mut changes);
     detect_fk_type_change_blocks(baseline, desired, &mut changes);
+    apply_table_schemas(baseline, desired, backend, &mut changes);
 
     MigrationPlan { backend, changes }
 }
@@ -950,16 +1083,23 @@ fn detect_inbound_fk_blocks(
     desired: &ParsedSchema,
     changes: &mut Vec<SchemaChange>,
 ) {
-    let dropped: BTreeSet<&str> = changes
+    let dropped: BTreeMap<&str, &Table> = changes
         .iter()
         .filter_map(|c| match c {
-            SchemaChange::DropTable(t) => Some(t.name.as_str()),
+            SchemaChange::DropTable(t) => Some((t.name.as_str(), t)),
             _ => None,
         })
         .collect();
     if dropped.is_empty() {
         return;
     }
+    // The dropped table that `fk_table`, written on `owner`, points at.
+    let dropped_target = |fk_table: &str| {
+        dropped
+            .get(bare_name(fk_table))
+            .copied()
+            .filter(|t| fk_reaches(fk_table, t))
+    };
 
     // (referencing table, referencing column) pairs being dropped in this plan.
     // Such a column carries its FK constraint away with it — and `up_ordered`
@@ -983,7 +1123,7 @@ fn detect_inbound_fk_blocks(
     // Baseline side: a retained table whose baseline FK targets a dropped table.
     for table in baseline {
         // A referencer that is itself being dropped takes its FK with it.
-        if dropped.contains(table.name.as_str()) {
+        if dropped.contains_key(table.name.as_str()) {
             continue;
         }
         for column in &table.columns {
@@ -994,9 +1134,13 @@ fn detect_inbound_fk_blocks(
                 continue;
             }
             if let Some(fk) = &column.references
-                && dropped.contains(fk.table.as_str())
+                && let Some(target) = dropped_target(&fk.table)
             {
-                blocks.insert((fk.table.clone(), table.name.clone(), column.name.clone()));
+                blocks.insert((
+                    target.qualified_name(),
+                    table.name.clone(),
+                    column.name.clone(),
+                ));
             }
         }
     }
@@ -1010,9 +1154,13 @@ fn detect_inbound_fk_blocks(
         }
         for column in &table.columns {
             if let Some(fk) = &column.references
-                && dropped.contains(fk.table.as_str())
+                && let Some(target) = dropped_target(&fk.table)
             {
-                blocks.insert((fk.table.clone(), table.name.clone(), column.name.clone()));
+                blocks.insert((
+                    target.qualified_name(),
+                    table.name.clone(),
+                    column.name.clone(),
+                ));
             }
         }
     }
@@ -1126,7 +1274,7 @@ fn column_participates_in_fk(
         .any(|c| {
             c.references
                 .as_ref()
-                .is_some_and(|fk| fk.table == table && fk.column == column)
+                .is_some_and(|fk| bare_name(&fk.table) == table && fk.column == column)
         })
 }
 
@@ -1813,6 +1961,7 @@ fn foreign_key_change_error(plan: &MigrationPlan) -> Option<DiffError> {
 pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffError> {
     // 0. An unsafe `#[renamed_from]` hint — no override.
     find_rename_conflict(plan).map_or(Ok(()), Err)?;
+    find_table_schema_conflict(plan).map_or(Ok(()), Err)?;
 
     // 1. Primary-key change — no override.
     if let Some(table) = plan.changes.iter().find_map(|c| match c {
@@ -1991,6 +2140,18 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
     Ok(())
 }
 
+/// The [`DiffError::TableSchema`] refusal for the first
+/// [`SchemaChange::TableSchemaConflict`] marker in `plan`, if any.
+fn find_table_schema_conflict(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::TableSchemaConflict { table, reason } => Some(DiffError::TableSchema {
+            table: table.clone(),
+            reason: reason.clone(),
+        }),
+        _ => None,
+    })
+}
+
 /// The [`DiffError::RenameConflict`] refusal for the first
 /// [`SchemaChange::RenameConflict`] marker in `plan`, if any.
 fn find_rename_conflict(plan: &MigrationPlan) -> Option<DiffError> {
@@ -2101,7 +2262,15 @@ const PG_MAX_IDENTIFIER_BYTES: usize = 63;
 /// derivation), and every index name emitted as a top-level `CREATE INDEX` — the
 /// [`SchemaChange::AddIndex`] index name plus each index on a [`SchemaChange::CreateTable`].
 /// These are exactly the names Postgres would truncate to 63 bytes.
-fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
+fn generated_identifiers(plan: &MigrationPlan) -> Vec<(String, String)> {
+    // `(schema, name)`: two relations of one name can live in two schemas. The
+    // schema is empty for a table in the default schema.
+    let schema_of = |table: &str| {
+        table
+            .rsplit_once('.')
+            .map(|(schema, _)| schema.to_owned())
+            .unwrap_or_default()
+    };
     let mut names = Vec::new();
     for change in &plan.changes {
         match change {
@@ -2110,13 +2279,20 @@ fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
                 // goes through `bounded_pg_identifier` (matching the `ADD`/`DROP
                 // CONSTRAINT` emitters). A short name is returned unchanged; only an
                 // over-limit one is truncate+hashed — so this never trips the guard.
-                names.push(bounded_pg_identifier(&format!("{table}_{column}_fkey")));
+                names.push((schema_of(table), fk_constraint_name(table, column)));
             }
-            SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
-                names.push(index.name.clone());
+            SchemaChange::AddIndex { table, index }
+            | SchemaChange::RenameIndex { table, index, .. } => {
+                names.push((schema_of(table), index.name.clone()));
             }
             SchemaChange::CreateTable(table) => {
-                names.extend(table.indexes.iter().map(|i| i.name.clone()));
+                let schema = named_schema(table).unwrap_or_default().to_owned();
+                names.extend(
+                    table
+                        .indexes
+                        .iter()
+                        .map(|i| (schema.clone(), i.name.clone())),
+                );
             }
             _ => {}
         }
@@ -2209,8 +2385,8 @@ fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
     }) {
         return Some(DiffError::GeneratedIdentifierTooLong { name });
     }
-    let mut by_truncated: BTreeMap<String, String> = BTreeMap::new();
-    for name in generated_identifiers(plan) {
+    let mut by_truncated: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (schema, name) in generated_identifiers(plan) {
         // Over the limit: PG truncates it silently — refuse outright (this alone
         // catches every *distinct*-name post-truncation collision, since such a
         // collision requires at least one name to exceed 63 bytes).
@@ -2226,7 +2402,10 @@ fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
         // must NOT dedup or skip the `prev == name` case: identical names are precisely
         // the hazard.
         if by_truncated
-            .insert(truncate_pg_identifier(&name).to_owned(), name.clone())
+            .insert(
+                (schema, truncate_pg_identifier(&name).to_owned()),
+                name.clone(),
+            )
             .is_some()
         {
             return Some(DiffError::GeneratedIdentifierTooLong { name });
@@ -2436,7 +2615,7 @@ pub fn emit_down_sql_with_context(
 /// groups blank-line separated. Unchanged from the pg-first slice.
 fn emit_up_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
     let ordered = up_ordered(&plan.changes)?;
-    let mut groups = Vec::new();
+    let mut groups = create_schema_statements(&ordered);
     for change in ordered {
         let sql = emit_change_up(change, plan.backend)?;
         let sql = sql.trim_end();
@@ -2445,6 +2624,22 @@ fn emit_up_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
         }
     }
     Ok(join_groups(&groups))
+}
+
+/// One `CREATE SCHEMA IF NOT EXISTS` per schema that a new table uses, in first-use order.
+fn create_schema_statements(ordered: &[&SchemaChange]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for change in ordered {
+        if let SchemaChange::CreateTable(t) = change
+            && let Some(schema) = t.schema.as_deref()
+            && !seen.contains(&schema)
+        {
+            seen.push(schema);
+        }
+    }
+    seen.into_iter()
+        .map(|s| format!("CREATE SCHEMA IF NOT EXISTS {s};"))
+        .collect()
 }
 
 /// The Postgres reverse path: changes reversed and individually inverted, with
@@ -2524,19 +2719,22 @@ fn retained_indexes_depending_on_any<'a>(
     table: &str,
     dropped_columns: &BTreeSet<String>,
 ) -> Vec<&'a Index> {
-    ctx.baseline.get(table).map_or_else(Vec::new, |t| {
-        t.indexes
-            .iter()
-            .filter(|i| {
-                i.definition.is_some()
-                    && dropped_columns
-                        .iter()
-                        // pg-only rollback path (`emit_down_sql_pg`) — exact `columns`
-                        // membership; the SQLite definition-scan branch never runs here.
-                        .any(|c| index_depends_on_column(i, c, Backend::Postgres))
-            })
-            .collect()
-    })
+    // `table` may be `schema.table`; the context is keyed by bare name.
+    ctx.baseline
+        .get(bare_name(table))
+        .map_or_else(Vec::new, |t| {
+            t.indexes
+                .iter()
+                .filter(|i| {
+                    i.definition.is_some()
+                        && dropped_columns
+                            .iter()
+                            // pg-only rollback path (`emit_down_sql_pg`) — exact `columns`
+                            // membership; the SQLite definition-scan branch never runs here.
+                            .any(|c| index_depends_on_column(i, c, Backend::Postgres))
+                })
+                .collect()
+        })
 }
 
 /// The change kinds whose `SQLite` realisation is a full table recreate: the
@@ -2582,6 +2780,7 @@ const fn change_table_name(change: &SchemaChange) -> &str {
         SchemaChange::RenameColumn { table, .. }
         | SchemaChange::RenameIndex { table, .. }
         | SchemaChange::RenameConflict { table, .. }
+        | SchemaChange::TableSchemaConflict { table, .. }
         | SchemaChange::AddColumn { table, .. }
         | SchemaChange::DropColumn { table, .. }
         | SchemaChange::AlterColumnType { table, .. }
@@ -3275,8 +3474,14 @@ fn topo_sort_creates(creates: &mut [&SchemaChange]) -> Result<(), EmitError> {
         let mut d = BTreeSet::new();
         for col in &table.columns {
             if let Some(fk) = &col.references {
-                let target = fk.table.as_str();
-                if target != name && names.contains(target) {
+                // A plan names a schema table `schema.table`; the batch is keyed by
+                // bare name.
+                let target = bare_name(fk.table.as_str());
+                if target != name
+                    && tables
+                        .get(target)
+                        .is_some_and(|t| fk_targets(fk.table.as_str(), t))
+                {
                     d.insert(target);
                 }
             }
@@ -3343,8 +3548,12 @@ fn topo_sort_drops(drops: &mut [&SchemaChange]) -> Result<(), EmitError> {
     for (&name, table) in &tables {
         for col in &table.columns {
             if let Some(fk) = &col.references {
-                let target = fk.table.as_str();
-                if target != name && names.contains(target) {
+                let target = bare_name(fk.table.as_str());
+                if target != name
+                    && tables
+                        .get(target)
+                        .is_some_and(|t| fk_targets(fk.table.as_str(), t))
+                {
                     // `name` references `target` ⇒ `name` must drop before `target`.
                     deps.get_mut(target)
                         .expect("target is an in-batch name")
@@ -3399,6 +3608,7 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         SchemaChange::DropTable(_) => 7,
         // Non-emittable markers; the guard refuses them before emission is reached.
         SchemaChange::RenameConflict { .. }
+        | SchemaChange::TableSchemaConflict { .. }
         | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
@@ -3427,8 +3637,9 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
              #[belongs_to(...)] association foreign keys, which the offline snapshot cannot see; \
              if a retained table has an invisible association FK to `{0}`, this will fail to apply \
              -- verify with schema introspection or drop the FK manually first\n\
-             DROP TABLE {0};\n",
-            table.name
+             DROP TABLE {1};\n",
+            table.name,
+            table.qualified_name()
         )),
         SchemaChange::AddColumn { table, column } => emit_add_column(table, column, backend),
         SchemaChange::DropColumn { table, column } => Ok(format!(
@@ -3467,7 +3678,9 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
             ))
         }
         SchemaChange::AddIndex { table, index } => Ok(format!("{}\n", index_sql(table, index))),
-        SchemaChange::DropIndex { index, .. } => Ok(format!("DROP INDEX {};\n", index.name)),
+        SchemaChange::DropIndex { table, index } => {
+            Ok(format!("DROP INDEX {};\n", index_ref(table, &index.name)))
+        }
         SchemaChange::AddCheck { table, check } => {
             require_pg(backend, "AddCheck")?;
             Ok(check.name.as_ref().map_or_else(
@@ -3486,7 +3699,7 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
             foreign_key,
         } => {
             require_pg(backend, "AddForeignKey")?;
-            let constraint = bounded_pg_identifier(&format!("{table}_{column}_fkey"));
+            let constraint = fk_constraint_name(table, column);
             Ok(format!(
                 "ALTER TABLE {table} ADD CONSTRAINT {constraint} \
                  FOREIGN KEY ({column}) REFERENCES {}({}){};\n",
@@ -3498,6 +3711,7 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         // Non-emittable markers: the guard refuses them, so they never reach here
         // in the command flow. Render nothing defensively rather than panicking.
         SchemaChange::RenameConflict { .. }
+        | SchemaChange::TableSchemaConflict { .. }
         | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
@@ -3508,13 +3722,21 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
     }
 }
 
+/// Undo `ALTER TABLE from RENAME TO to`. `from` may carry the schema; `to` is
+/// bare, so the new table is found in the same schema.
+fn rename_table_down(from: &str, to: &str) -> String {
+    format!(
+        "ALTER TABLE {} RENAME TO {};\n",
+        index_ref(from, to),
+        bare_name(from)
+    )
+}
+
 /// Render a single change's reverse SQL, with an `-- irreversible:` / `-- manual:`
 /// marker where the round-trip is not clean.
 fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, EmitError> {
     match change {
-        SchemaChange::RenameTable { from, to } => {
-            Ok(format!("ALTER TABLE {to} RENAME TO {from};\n"))
-        }
+        SchemaChange::RenameTable { from, to } => Ok(rename_table_down(from, to)),
         SchemaChange::RenameColumn { table, from, to } => Ok(format!(
             "ALTER TABLE {table} RENAME COLUMN {to} TO {from};\n"
         )),
@@ -3526,7 +3748,7 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
             });
             Ok(emit_rename_index(table, &index.name, &old, backend))
         }
-        SchemaChange::CreateTable(table) => Ok(format!("DROP TABLE {};\n", table.name)),
+        SchemaChange::CreateTable(table) => Ok(format!("DROP TABLE {};\n", table.qualified_name())),
         SchemaChange::DropTable(table) => {
             let recreate = emit_create_table(table, backend);
             Ok(format!(
@@ -3588,19 +3810,22 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
                 },
             ))
         }
-        SchemaChange::AddIndex { index, .. } => Ok(format!("DROP INDEX {};\n", index.name)),
+        SchemaChange::AddIndex { table, index } => {
+            Ok(format!("DROP INDEX {};\n", index_ref(table, &index.name)))
+        }
         SchemaChange::DropIndex { table, index } => Ok(format!("{}\n", index_sql(table, index))),
         SchemaChange::AddCheck { table, check } => Ok(check.name.as_ref().map_or_else(
             || "-- manual: unnamed CHECK cannot be auto-dropped\n".to_owned(),
             |name| format!("ALTER TABLE {table} DROP CONSTRAINT {name};\n"),
         )),
         SchemaChange::AddForeignKey { table, column, .. } => {
-            let constraint = bounded_pg_identifier(&format!("{table}_{column}_fkey"));
+            let constraint = fk_constraint_name(table, column);
             Ok(format!(
                 "ALTER TABLE {table} DROP CONSTRAINT {constraint};\n"
             ))
         }
         SchemaChange::RenameConflict { .. }
+        | SchemaChange::TableSchemaConflict { .. }
         | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
@@ -3625,7 +3850,11 @@ const fn require_pg(backend: Backend, kind: &'static str) -> Result<(), EmitErro
 /// already satisfies the index, so this is safe.
 fn emit_rename_index(table: &str, from: &str, index: &Index, backend: Backend) -> String {
     match backend {
-        Backend::Postgres => format!("ALTER INDEX {from} RENAME TO {};\n", index.name),
+        Backend::Postgres => format!(
+            "ALTER INDEX {} RENAME TO {};\n",
+            index_ref(table, from),
+            index.name
+        ),
         Backend::Sqlite => format!("DROP INDEX {from};\n{}\n", index_sql(table, index)),
     }
 }
@@ -3637,13 +3866,14 @@ fn emit_rename_index(table: &str, from: &str, index: &Index, backend: Backend) -
 /// A `CREATE TABLE` is always renderable (the portable `SQLite` subset covers it),
 /// so this is infallible.
 fn emit_create_table(table: &Table, backend: Backend) -> String {
-    let mut out = render_create_table_body(&table.name, table, backend);
+    let qualified = table.qualified_name();
+    let mut out = render_create_table_body(&qualified, table, backend);
 
     // Indexes, name-sorted for determinism.
     let mut indexes: Vec<&Index> = table.indexes.iter().collect();
     indexes.sort_by(|a, b| a.name.cmp(&b.name));
     for index in indexes {
-        let _ = writeln!(out, "{}", index_sql(&table.name, index));
+        let _ = writeln!(out, "{}", index_sql(&qualified, index));
     }
     out
 }
@@ -3814,6 +4044,49 @@ fn index_sql(table: &str, index: &Index) -> String {
         "CREATE {unique}INDEX {} ON {table} ({});",
         index.name,
         index.columns.join(", ")
+    )
+}
+
+/// True when the FK target `fk_table` (`table` or `schema.table`) names `table`.
+/// A qualified target in another schema is a different table of the same bare name.
+fn fk_targets(fk_table: &str, table: &Table) -> bool {
+    let (schema, name) = fk_table
+        .rsplit_once('.')
+        .map_or((None, fk_table), |(s, n)| (Some(s), n));
+    name == table.name && schema.filter(|s| *s != "public") == named_schema(table)
+}
+
+/// True when the FK target `fk_table` points at `target`.
+///
+/// A qualified target must match the schema of `target`. A bare target matches
+/// by name only: the schema tools need one table name for each schema, so a bare
+/// name can only mean one table. The planner stores a bare target for a model
+/// `#[references]`, also when the table is in a named schema.
+fn fk_reaches(fk_table: &str, target: &Table) -> bool {
+    let (schema, name) = fk_table
+        .rsplit_once('.')
+        .map_or((None, fk_table), |(s, n)| (Some(s), n));
+    name == target.name
+        && schema.is_none_or(|s| Some(s).filter(|s| *s != "public") == named_schema(target))
+}
+
+/// The name of the constraint for the foreign key on `table.column`. The
+/// schema is not part of it.
+fn fk_constraint_name(table: &str, column: &str) -> String {
+    bounded_pg_identifier(&format!("{}_{column}_fkey", bare_name(table)))
+}
+
+/// The table part of a possibly qualified `schema.table`.
+pub fn bare_name(table: &str) -> &str {
+    table.rsplit_once('.').map_or(table, |(_, name)| name)
+}
+
+/// An index name, qualified with the schema of `table` when it has one. An
+/// index lives in the schema of its table.
+fn index_ref(table: &str, index: &str) -> String {
+    table.rsplit_once('.').map_or_else(
+        || index.to_owned(),
+        |(schema, _)| format!("{schema}.{index}"),
     )
 }
 
@@ -4015,8 +4288,11 @@ fn describe_change(change: &SchemaChange) -> String {
         SchemaChange::RenameConflict { table, reason } => {
             format!("! RENAME on {table}: {reason} (refused)")
         }
-        SchemaChange::CreateTable(t) => format!("+ CREATE TABLE {}", t.name),
-        SchemaChange::DropTable(t) => format!("- DROP TABLE {}", t.name),
+        SchemaChange::TableSchemaConflict { table, reason } => {
+            format!("! SCHEMA of {table}: {reason} (refused)")
+        }
+        SchemaChange::CreateTable(t) => format!("+ CREATE TABLE {}", t.qualified_name()),
+        SchemaChange::DropTable(t) => format!("- DROP TABLE {}", t.qualified_name()),
         SchemaChange::AddColumn { table, column } => {
             format!("+ ADD COLUMN {table}.{}", column.name)
         }
@@ -6113,6 +6389,456 @@ mod tests {
     }
 
     // -- 13.5 SQL emission ---------------------------------------------------
+
+    fn in_schema(mut t: Table, schema: &str) -> Table {
+        t.schema = Some(schema.to_owned());
+        t
+    }
+
+    #[test]
+    fn create_table_in_a_schema_creates_the_schema_first() {
+        let t = in_schema(posts_with(vec![col("body", ColumnType::Text)]), "blog");
+        let plan = diff_schema(&[], &parsed(vec![t], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        let schema_at = up.find("CREATE SCHEMA IF NOT EXISTS blog;").expect(&up);
+        let table_at = up.find("CREATE TABLE blog.posts (").expect(&up);
+        assert!(schema_at < table_at, "schema before table: {up}");
+    }
+
+    #[test]
+    fn two_tables_in_one_schema_create_it_once() {
+        let a = in_schema(posts_with(vec![]), "blog");
+        let mut b = in_schema(posts_with(vec![]), "blog");
+        b.name = "tags".to_owned();
+        let plan = diff_schema(&[], &parsed(vec![a, b], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert_eq!(up.matches("CREATE SCHEMA IF NOT EXISTS blog;").count(), 1);
+    }
+
+    #[test]
+    fn default_schema_table_emits_no_schema_statement() {
+        let plan = diff_schema(&[], &parsed(vec![posts_with(vec![])], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(!up.contains("SCHEMA"), "{up}");
+        assert!(up.contains("CREATE TABLE posts ("), "{up}");
+    }
+
+    #[test]
+    fn create_table_in_a_schema_qualifies_its_indexes_and_drop() {
+        let mut t = in_schema(posts_with(vec![col("slug", ColumnType::Text)]), "blog");
+        t.indexes
+            .push(Index::new("idx_posts_slug", vec!["slug".to_owned()], false));
+        let plan = diff_schema(&[], &parsed(vec![t], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("INDEX idx_posts_slug ON blog.posts (slug);"),
+            "{up}"
+        );
+        let down = emit_down_sql(&plan).expect("emit");
+        assert!(down.contains("DROP TABLE blog.posts;"), "{down}");
+        assert!(!down.contains("DROP SCHEMA"), "the schema stays: {down}");
+    }
+
+    #[test]
+    fn alters_on_a_schema_table_are_qualified() {
+        let base = in_schema(posts_with(vec![col("slug", ColumnType::Text)]), "blog");
+        let want = in_schema(
+            posts_with(vec![
+                col("slug", ColumnType::Text),
+                col("body", ColumnType::Text),
+            ]),
+            "blog",
+        );
+        let plan = diff_schema(&[base], &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("ALTER TABLE blog.posts ADD COLUMN body"),
+            "{up}"
+        );
+        assert!(!up.contains("CREATE SCHEMA"), "table exists already: {up}");
+    }
+
+    #[test]
+    fn index_drop_on_a_schema_table_names_the_schema() {
+        let mut base = in_schema(posts_with(vec![col("slug", ColumnType::Text)]), "blog");
+        base.indexes
+            .push(Index::new("idx_posts_slug", vec!["slug".to_owned()], false));
+        let want = in_schema(posts_with(vec![col("slug", ColumnType::Text)]), "blog");
+        let plan = diff_schema(&[base], &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(up.contains("DROP INDEX blog.idx_posts_slug;"), "{up}");
+    }
+
+    #[test]
+    fn fk_constraint_name_on_a_schema_table_has_no_dot() {
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddForeignKey {
+                table: "blog.posts".to_owned(),
+                column: "user_id".to_owned(),
+                foreign_key: ForeignKey::new("users", "id"),
+            }],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("ALTER TABLE blog.posts ADD CONSTRAINT posts_user_id_fkey"),
+            "{up}"
+        );
+        let down = emit_down_sql(&plan).expect("emit");
+        assert!(
+            down.contains("DROP CONSTRAINT posts_user_id_fkey"),
+            "{down}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_key_to_a_schema_table_names_the_schema() {
+        let mut parent = in_schema(posts_with(vec![]), "blog");
+        parent.name = "authors".to_owned();
+        let mut fk_col = col("author_id", ColumnType::Int64);
+        fk_col.references = Some(ForeignKey::new("authors", "id"));
+        let child = in_schema(posts_with(vec![fk_col.clone()]), "blog");
+        let plan = diff_schema(
+            &[],
+            &parsed(vec![parent.clone(), child], vec![]),
+            DEFAULT_OPTS,
+        );
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(up.contains("REFERENCES blog.authors(id)"), "{up}");
+
+        // An added column gets the same treatment.
+        let base = in_schema(posts_with(vec![]), "blog");
+        let want = in_schema(posts_with(vec![fk_col]), "blog");
+        let plan = diff_schema(
+            &[parent.clone(), base],
+            &parsed(vec![parent, want], vec![]),
+            DEFAULT_OPTS,
+        );
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(up.contains("REFERENCES blog.authors(id)"), "{up}");
+    }
+
+    #[test]
+    fn a_foreign_key_to_a_default_schema_table_stays_bare() {
+        let parent = {
+            let mut t = posts_with(vec![]);
+            t.name = "authors".to_owned();
+            t
+        };
+        let mut fk_col = col("author_id", ColumnType::Int64);
+        fk_col.references = Some(ForeignKey::new("authors", "id"));
+        let child = in_schema(posts_with(vec![fk_col]), "blog");
+        let plan = diff_schema(&[], &parsed(vec![parent, child], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(up.contains("REFERENCES authors(id)"), "{up}");
+    }
+
+    #[test]
+    fn rename_in_a_schema_writes_valid_up_and_down_sql() {
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::RenameTable {
+                from: "blog.posts".to_owned(),
+                to: "articles".to_owned(),
+            }],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("ALTER TABLE blog.posts RENAME TO articles;"),
+            "{up}"
+        );
+        let down = emit_down_sql(&plan).expect("emit");
+        assert!(
+            down.contains("ALTER TABLE blog.articles RENAME TO posts;"),
+            "{down}"
+        );
+    }
+
+    #[test]
+    fn add_foreign_key_target_in_a_schema_is_qualified() {
+        let mut base = in_schema(
+            posts_with(vec![col("author_id", ColumnType::Int64)]),
+            "blog",
+        );
+        base.managed = true;
+        let mut parent = in_schema(posts_with(vec![]), "blog");
+        parent.name = "authors".to_owned();
+        let mut want_col = col("author_id", ColumnType::Int64);
+        want_col.references = Some(ForeignKey::new("authors", "id"));
+        let want = in_schema(posts_with(vec![want_col]), "blog");
+        let plan = diff_schema(
+            &[base, parent.clone()],
+            &parsed(vec![want, parent], vec![]),
+            DEFAULT_OPTS,
+        );
+        // The diff refuses an FK on an existing column; the emitter is what
+        // matters, so also check a hand-built change.
+        let _ = plan;
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddForeignKey {
+                table: "blog.posts".to_owned(),
+                column: "author_id".to_owned(),
+                foreign_key: ForeignKey::new("blog.authors", "id"),
+            }],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(up.contains("REFERENCES blog.authors(id)"), "{up}");
+    }
+
+    #[test]
+    fn a_schema_named_public_is_the_default_schema() {
+        let base = posts_with(vec![]);
+        let want = in_schema(posts_with(vec![]), "public");
+        let plan = diff_schema(&[base], &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        assert!(plan.is_empty(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn an_unsafe_schema_name_in_a_snapshot_is_refused() {
+        let want = in_schema(posts_with(vec![]), "x; DROP TABLE y");
+        let plan = diff_schema(&[], &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        assert!(guard_plan(&plan, DEFAULT_OPTS).is_err());
+    }
+
+    #[test]
+    fn new_tables_in_a_schema_are_created_parent_first() {
+        // `campaigns` sorts before `users`, but it references `users`.
+        let users = in_schema(
+            {
+                let mut t = posts_with(vec![]);
+                t.name = "users".to_owned();
+                t
+            },
+            "blog",
+        );
+        let mut fk = col("user_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("users", "id"));
+        let mut campaigns = in_schema(posts_with(vec![fk]), "blog");
+        campaigns.name = "campaigns".to_owned();
+        let plan = diff_schema(&[], &parsed(vec![campaigns, users], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        let users_at = up.find("CREATE TABLE blog.users").expect(&up);
+        let campaigns_at = up.find("CREATE TABLE blog.campaigns").expect(&up);
+        assert!(users_at < campaigns_at, "{up}");
+    }
+
+    #[test]
+    fn dropping_a_schema_table_names_the_schema() {
+        let base = in_schema(posts_with(vec![]), "blog");
+        let plan = diff_schema(&[base], &parsed(vec![], vec![]), ALLOW);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(up.contains("DROP TABLE blog.posts;"), "{up}");
+    }
+
+    #[test]
+    fn rollback_of_a_dropped_schema_table_keeps_the_fk_schema() {
+        let mut parent = in_schema(posts_with(vec![]), "blog");
+        parent.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("authors", "id"));
+        let child = in_schema(posts_with(vec![fk.clone()]), "blog");
+        let plan = diff_schema(
+            &[parent.clone(), child],
+            &parsed(vec![parent.clone()], vec![]),
+            ALLOW,
+        );
+        let down = emit_down_sql(&plan).expect("emit");
+        assert!(down.contains("REFERENCES blog.authors(id)"), "{down}");
+
+        let base = in_schema(posts_with(vec![fk]), "blog");
+        let want = in_schema(posts_with(vec![]), "blog");
+        let plan = diff_schema(
+            &[parent.clone(), base],
+            &parsed(vec![parent, want], vec![]),
+            ALLOW,
+        );
+        let down = emit_down_sql(&plan).expect("emit");
+        assert!(down.contains("REFERENCES blog.authors(id)"), "{down}");
+    }
+
+    #[test]
+    fn a_reserved_schema_name_in_a_snapshot_is_refused() {
+        let want = in_schema(posts_with(vec![]), "order");
+        let plan = diff_schema(&[], &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        assert!(guard_plan(&plan, DEFAULT_OPTS).is_err());
+    }
+
+    #[test]
+    fn schema_tables_are_dropped_child_first() {
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("authors", "id"));
+        let posts = in_schema(posts_with(vec![fk]), "blog");
+        let plan = diff_schema(&[authors, posts], &parsed(vec![], vec![]), ALLOW);
+        let up = emit_up_sql(&plan).expect("emit");
+        let posts_at = up.find("DROP TABLE blog.posts;").expect(&up);
+        let authors_at = up.find("DROP TABLE blog.authors;").expect(&up);
+        assert!(posts_at < authors_at, "{up}");
+    }
+
+    #[test]
+    fn rollback_restores_a_retained_index_on_a_schema_table() {
+        let mut baseline = in_schema(posts_with(vec![col("email", ColumnType::Text)]), "blog");
+        baseline.indexes.push(Index {
+            name: "posts_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX posts_email_key ON blog.posts (email)".to_owned(),
+            ),
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let desired = in_schema(posts_with(vec![col("keep", ColumnType::Text)]), "blog");
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            ALLOW,
+        );
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+        assert!(
+            down.contains("CREATE UNIQUE INDEX posts_email_key ON blog.posts (email)"),
+            "{down}"
+        );
+    }
+
+    #[test]
+    fn an_fk_to_an_external_table_adds_no_create_order_edge() {
+        // `blog.posts` -> external `auth.users`; public `users` -> `blog.posts`.
+        let mut fk_ext = col("owner_id", ColumnType::Int64);
+        fk_ext.references = Some(ForeignKey::new("auth.users", "id"));
+        let posts = in_schema(posts_with(vec![fk_ext]), "blog");
+        let mut fk_posts = col("post_id", ColumnType::Int64);
+        fk_posts.references = Some(ForeignKey::new("posts", "id"));
+        let mut users = posts_with(vec![fk_posts]);
+        users.name = "users".to_owned();
+        let plan = diff_schema(&[], &parsed(vec![posts, users], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("no false cycle");
+        let posts_at = up.find("CREATE TABLE blog.posts").expect(&up);
+        let users_at = up.find("CREATE TABLE users").expect(&up);
+        assert!(posts_at < users_at, "{up}");
+    }
+
+    #[test]
+    fn dropping_a_table_with_a_qualified_inbound_fk_is_refused() {
+        // public `posts` references `blog.authors` by an explicit qualified target.
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("blog.authors", "id"));
+        let posts = posts_with(vec![fk]);
+        let plan = diff_schema(
+            &[authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_err(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn dropping_a_table_with_a_same_schema_bare_inbound_fk_is_refused() {
+        // Introspection spells a same-schema FK target bare.
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("authors", "id"));
+        let posts = in_schema(posts_with(vec![fk]), "blog");
+        let plan = diff_schema(
+            &[authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_err(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn dropping_a_table_with_a_bare_cross_schema_inbound_fk_is_refused() {
+        // public `posts` points at modeled `blog.authors` by the bare target the
+        // planner stores. Table names are unique across schemas, so the bare
+        // name can only mean that table.
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("authors", "id"));
+        let posts = posts_with(vec![fk]);
+        let plan = diff_schema(
+            &[authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_err(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn dropping_a_table_is_not_blocked_by_an_fk_to_a_same_named_table_elsewhere() {
+        // `posts` references `auth.authors`; the table dropped is `blog.authors`.
+        let mut blog_authors = in_schema(posts_with(vec![]), "blog");
+        blog_authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("auth.authors", "id"));
+        let posts = posts_with(vec![fk]);
+        let plan = diff_schema(
+            &[blog_authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_ok(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn the_same_index_name_in_two_schemas_is_not_a_collision() {
+        let mut a = posts_with(vec![col("x", ColumnType::Text)]);
+        a.indexes
+            .push(Index::new("idx_shared", vec!["x".to_owned()], false));
+        let mut b = in_schema(posts_with(vec![col("x", ColumnType::Text)]), "blog");
+        b.name = "other".to_owned();
+        b.indexes
+            .push(Index::new("idx_shared", vec!["x".to_owned()], false));
+        let plan = diff_schema(&[], &parsed(vec![a, b], vec![]), DEFAULT_OPTS);
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "{:?}",
+            plan.changes
+        );
+    }
+
+    #[test]
+    fn the_same_index_name_twice_in_one_schema_is_still_refused() {
+        let mut a = in_schema(posts_with(vec![col("x", ColumnType::Text)]), "blog");
+        a.indexes
+            .push(Index::new("idx_shared", vec!["x".to_owned()], false));
+        let mut b = in_schema(posts_with(vec![col("x", ColumnType::Text)]), "blog");
+        b.name = "other".to_owned();
+        b.indexes
+            .push(Index::new("idx_shared", vec!["x".to_owned()], false));
+        let plan = diff_schema(&[], &parsed(vec![a, b], vec![]), DEFAULT_OPTS);
+        assert!(guard_plan(&plan, DEFAULT_OPTS).is_err());
+    }
+
+    #[test]
+    fn moving_a_table_to_another_schema_is_refused() {
+        let base = in_schema(posts_with(vec![]), "blog");
+        let want = in_schema(posts_with(vec![]), "news");
+        let plan = diff_schema(&[base], &parsed(vec![want], vec![]), ALLOW);
+        let err = guard_plan(&plan, ALLOW).expect_err("a schema move is not generated");
+        assert!(err.to_string().contains("blog"), "{err}");
+        assert!(err.to_string().contains("news"), "{err}");
+    }
+
+    #[test]
+    fn same_table_name_in_two_schemas_is_refused() {
+        let a = in_schema(posts_with(vec![]), "blog");
+        let b = in_schema(posts_with(vec![]), "news");
+        let plan = diff_schema(&[], &parsed(vec![a, b], vec![]), DEFAULT_OPTS);
+        let err = guard_plan(&plan, DEFAULT_OPTS).expect_err("ambiguous names");
+        assert!(err.to_string().contains("posts"), "{err}");
+    }
 
     #[test]
     fn create_table_bigserial_pk_renders_bigserial() {

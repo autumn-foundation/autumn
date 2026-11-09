@@ -254,6 +254,8 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_managed_with_args.rs");
     #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_schema_bad_name.rs");
+    #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_unique_with_args.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
@@ -721,6 +723,10 @@ fn compile_pass_tests_a() {
     // stripped — the model still generates its normal write types.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_schema_markers.rs");
+
+    // `#[model(schema = "...")]` is accepted and changes no codegen.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_schema_arg.rs");
 
     // Model field enum (requires db feature)
     #[cfg(feature = "db")]
