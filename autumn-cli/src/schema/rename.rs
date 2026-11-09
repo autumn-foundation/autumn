@@ -393,8 +393,10 @@ pub fn renamed_baseline(baseline: &[Table], changes: &[SchemaChange]) -> Vec<Tab
 pub fn apply_rename(tables: &mut [Table], change: &SchemaChange) {
     match change {
         SchemaChange::RenameTable { from, to } => {
+            // `from` may be `schema.table`.
+            let from = crate::schema::diff::bare_name(from);
             for t in tables.iter_mut() {
-                if t.name == *from {
+                if t.name == from {
                     t.name.clone_from(to);
                     for idx in &mut t.indexes {
                         if let Some(def) = &mut idx.definition {
@@ -412,13 +414,15 @@ pub fn apply_rename(tables: &mut [Table], change: &SchemaChange) {
             }
         }
         SchemaChange::RenameColumn { table, from, to } => {
+            // `table` may be `schema.table`.
+            let table = crate::schema::diff::bare_name(table);
             let swap = |name: &mut String| {
                 if name == from {
                     name.clone_from(to);
                 }
             };
             for t in tables.iter_mut() {
-                if t.name == *table {
+                if t.name == table {
                     t.columns.iter_mut().for_each(|c| swap(&mut c.name));
                     t.primary_key.iter_mut().for_each(swap);
                     for idx in &mut t.indexes {

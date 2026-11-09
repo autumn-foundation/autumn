@@ -1144,7 +1144,8 @@ fn parse_model_args(attr: &syn::Attribute) -> ModelArgs {
             let name = lit.value();
             if name == "managed" {
                 args.managed = true;
-            } else if is_schema_ident(&name) {
+            } else if is_schema_ident(&name) && name != "public" {
+                // `public` is the default schema.
                 args.schema = Some(name);
             }
         } else if meta.input.peek(syn::token::Paren) {

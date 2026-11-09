@@ -119,7 +119,7 @@ pub struct Campaign {
   Later `ALTER`, `CREATE INDEX` and `DROP INDEX` statements use the same
   schema.
 * The sync writes a new model as `marketing.campaigns (id) { ... }` in
-  `src/schema.rs`. A block keeps its schema when the model has none.
+  `src/schema.rs`. A block that has a schema keeps it when the model names none.
 * A foreign key to a table of the same schema is written with the schema.
 * `autumn schema pull --schema marketing` reads the schema. Repeat the flag
   for more schemas. `public` is always read. A pull keeps the schemas of the
@@ -227,7 +227,8 @@ pub trait CampaignRepository {}
   result.
 * With roles, but none for `marketing`, the extractor answers 503. It does
   not use the owner role.
-* Reads stay on the role pool. A read replica connects as the owner.
+* Reads stay on the role pool. A read replica connects as the owner. So a
+  replica read would run with the wrong rights.
 * `boundary` and `sharded` cannot work together.
 * The retention sweep of a repository uses the primary pool.
 * A `dependent(...)` cascade runs the child repository on the pool of the
@@ -370,8 +371,8 @@ of database and user. So each boundary gets its own server pool.
 * A model with `schema` stops `schema diff` on SQLite.
 * `autumn migrate` does not run an embedded `migrations_in_schema` set. Run it
   at boot, or set `AUTUMN_MIGRATE=1`.
-* A role pool uses `database.url` with `user`. A URL that a pool provider
-  finds at boot is not used. Set `url` on `[database.roles.<boundary>]`.
+* A role pool uses `database.url` with `user`. The role pool ignores a URL
+  that a pool provider sets at boot. Set `url` on `[database.roles.<boundary>]`.
 * Framework raw SQL with a bare table name finds the table by the
   `search_path`. On the primary pool, the owner role needs the schema on its
   path: `ALTER ROLE app_owner SET search_path = "$user", public, marketing;`

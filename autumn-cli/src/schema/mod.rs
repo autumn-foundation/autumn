@@ -1194,9 +1194,8 @@ fn relation_clash(
         .changes
         .iter()
         .filter_map(|c| match c {
-            SchemaChange::RenameTable { from, .. } | SchemaChange::RenameIndex { from, .. } => {
-                Some(key(from))
-            }
+            SchemaChange::RenameTable { from, .. } => Some(key(diff::bare_name(from))),
+            SchemaChange::RenameIndex { from, .. } => Some(key(from)),
             SchemaChange::DropIndex { index, .. } if added.contains(&key(&index.name)) => {
                 Some(key(&index.name))
             }
@@ -1292,18 +1291,22 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
     for change in &plan.changes {
         match change {
             SchemaChange::CreateTable(table) => {
-                tables.insert(table.name.clone(), table.clone());
+                let mut table = table.clone();
+                bare_fk_targets(&mut table.columns);
+                tables.insert(table.name.clone(), table);
             }
             SchemaChange::DropTable(table) => {
                 tables.remove(&table.name);
             }
             SchemaChange::AddColumn { table, column } => {
-                if let Some(t) = tables.get_mut(table) {
-                    t.columns.push(column.clone());
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
+                    let mut column = column.clone();
+                    bare_fk_targets(std::slice::from_mut(&mut column));
+                    t.columns.push(column);
                 }
             }
             SchemaChange::DropColumn { table, column } => {
-                if let Some(t) = tables.get_mut(table) {
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     t.columns.retain(|c| c.name != column.name);
                     // Postgres `ALTER TABLE … DROP COLUMN` automatically drops any
                     // index (and the constraint it backs) that depends on the
@@ -1350,7 +1353,9 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
                 foreign_key,
             } => {
                 if let Some(c) = column_mut(&mut tables, table, column) {
-                    c.references = Some(foreign_key.clone());
+                    let mut fk = foreign_key.clone();
+                    fk.table = diff::bare_name(&fk.table).to_owned();
+                    c.references = Some(fk);
                 }
             }
             SchemaChange::AddIndex { table, index } => {
@@ -1400,8 +1405,16 @@ fn column_mut<'a>(
     column: &str,
 ) -> Option<&'a mut Column> {
     tables
-        .get_mut(table)
+        .get_mut(diff::bare_name(table))
         .and_then(|t| t.columns.iter_mut().find(|c| c.name == column))
+}
+
+/// The plan names a foreign key target as `schema.table`. A model and the
+/// baseline spell it bare, so the projected snapshot does too.
+fn bare_fk_targets(columns: &mut [Column]) {
+    for fk in columns.iter_mut().filter_map(|c| c.references.as_mut()) {
+        fk.table = diff::bare_name(&fk.table).to_owned();
+    }
 }
 
 /// Write a `migrations/<ts>_<suffix>/{up,down}.sql` pair, creating the leaf
@@ -2790,6 +2803,38 @@ mod tests {
             "retained index depending on the dropped column must be pruned: {:?}",
             users.indexes
         );
+    }
+
+    #[test]
+    fn project_plan_target_follows_changes_on_a_schema_table() {
+        use autumn_schema_core::{Column, ColumnType};
+        let mut base = Table::new("posts", Backend::Postgres);
+        base.schema = Some("blog".to_owned());
+        base.columns = vec![Column::new("id".to_string(), ColumnType::Int64)];
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::RenameTable {
+                    from: "blog.posts".to_owned(),
+                    to: "articles".to_owned(),
+                },
+                SchemaChange::AddColumn {
+                    table: "blog.articles".to_owned(),
+                    column: Column::new("body".to_string(), ColumnType::Text),
+                },
+            ],
+        };
+        let projected = project_plan_target(&[base], &plan);
+        let t = projected
+            .iter()
+            .find(|t| t.name == "articles")
+            .expect("renamed");
+        assert!(
+            t.columns.iter().any(|c| c.name == "body"),
+            "{:?}",
+            t.columns
+        );
+        assert_eq!(t.schema.as_deref(), Some("blog"));
     }
 
     #[test]
