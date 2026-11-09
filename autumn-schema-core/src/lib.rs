@@ -1099,6 +1099,102 @@ pub struct Table {
     pub schema: Option<String>,
 }
 
+/// Words that Postgres reserves. A schema cannot have one of these names
+/// without quotes.
+const RESERVED_SCHEMA_WORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "column",
+    "constraint",
+    "create",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "from",
+    "grant",
+    "group",
+    "having",
+    "in",
+    "initially",
+    "intersect",
+    "into",
+    "lateral",
+    "leading",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "select",
+    "session_user",
+    "some",
+    "symmetric",
+    "system_user",
+    "table",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "variadic",
+    "when",
+    "where",
+    "window",
+    "with",
+];
+
+/// True when `name` is a schema name the DDL can write without quotes:
+/// `[a-z_][a-z0-9_]*`, at most 63 bytes, and not a reserved Postgres word.
+#[must_use]
+pub fn is_valid_schema_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && name.len() <= 63
+        && !RESERVED_SCHEMA_WORDS.contains(&name)
+}
+
 impl Table {
     /// Construct an empty, Autumn-managed table named `name` targeting `backend`.
     pub fn new(name: impl Into<String>, backend: Backend) -> Self {
@@ -1147,6 +1243,19 @@ impl Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_names_are_plain_and_not_reserved() {
+        for ok in ["marketing", "_x", "a1", "billing_2"] {
+            assert!(is_valid_schema_name(ok), "{ok}");
+        }
+        for bad in [
+            "", "Order", "order", "user", "a.b", "1a", "a b", "a\"b", "select",
+        ] {
+            assert!(!is_valid_schema_name(bad), "{bad}");
+        }
+        assert!(!is_valid_schema_name(&"a".repeat(64)));
+    }
 
     #[test]
     fn table_schema_defaults_to_none_and_qualifies() {

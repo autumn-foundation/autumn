@@ -497,7 +497,7 @@ fn apply_table_schemas(
     let mut conflicts: Vec<(String, String)> = Vec::new();
     for t in desired.tables.iter().chain(baseline) {
         if let Some(s) = t.schema.as_deref()
-            && !crate::schema::parse::is_schema_ident(s)
+            && !autumn_schema_core::is_valid_schema_name(s)
         {
             conflicts.push((
                 t.name.clone(),
@@ -560,7 +560,13 @@ fn apply_table_schemas(
     };
     for change in changes.iter_mut() {
         match change {
-            SchemaChange::CreateTable(t) => qualify_fks(&mut t.columns),
+            SchemaChange::CreateTable(t) | SchemaChange::DropTable(t) => {
+                qualify_fks(&mut t.columns)
+            }
+            SchemaChange::DropColumn { table, column } => {
+                qualify_fks(std::slice::from_mut(column));
+                qualify(table);
+            }
             SchemaChange::AddColumn { table, column } => {
                 qualify_fks(std::slice::from_mut(column));
                 qualify(table);
@@ -572,7 +578,6 @@ fn apply_table_schemas(
             }
             SchemaChange::RenameColumn { table, .. }
             | SchemaChange::RenameIndex { table, .. }
-            | SchemaChange::DropColumn { table, .. }
             | SchemaChange::AlterColumnType { table, .. }
             | SchemaChange::SetNotNull { table, .. }
             | SchemaChange::DropNotNull { table, .. }
@@ -6548,6 +6553,39 @@ mod tests {
         let plan = diff_schema(&[base], &parsed(vec![], vec![]), ALLOW);
         let up = emit_up_sql(&plan).expect("emit");
         assert!(up.contains("DROP TABLE blog.posts;"), "{up}");
+    }
+
+    #[test]
+    fn rollback_of_a_dropped_schema_table_keeps_the_fk_schema() {
+        let mut parent = in_schema(posts_with(vec![]), "blog");
+        parent.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("authors", "id"));
+        let child = in_schema(posts_with(vec![fk.clone()]), "blog");
+        let plan = diff_schema(
+            &[parent.clone(), child],
+            &parsed(vec![parent.clone()], vec![]),
+            ALLOW,
+        );
+        let down = emit_down_sql(&plan).expect("emit");
+        assert!(down.contains("REFERENCES blog.authors(id)"), "{down}");
+
+        let base = in_schema(posts_with(vec![fk]), "blog");
+        let want = in_schema(posts_with(vec![]), "blog");
+        let plan = diff_schema(
+            &[parent.clone(), base],
+            &parsed(vec![parent, want], vec![]),
+            ALLOW,
+        );
+        let down = emit_down_sql(&plan).expect("emit");
+        assert!(down.contains("REFERENCES blog.authors(id)"), "{down}");
+    }
+
+    #[test]
+    fn a_reserved_schema_name_in_a_snapshot_is_refused() {
+        let want = in_schema(posts_with(vec![]), "order");
+        let plan = diff_schema(&[], &parsed(vec![want], vec![]), DEFAULT_OPTS);
+        assert!(guard_plan(&plan, DEFAULT_OPTS).is_err());
     }
 
     #[test]

@@ -290,7 +290,7 @@ pub fn introspect_postgres_conn_in(
 pub(crate) fn schema_scope(schemas: &[String]) -> Result<String, IntrospectError> {
     let mut all = vec!["public".to_owned()];
     for schema in schemas {
-        if !crate::schema::parse::is_schema_ident(schema) {
+        if !autumn_schema_core::is_valid_schema_name(schema) {
             return Err(IntrospectError::Query(format!(
                 "the schema name `{schema}` is not a plain lower-case identifier"
             )));

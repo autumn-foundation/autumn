@@ -48,15 +48,6 @@ struct ModelArgs {
     schema: Option<String>,
 }
 
-/// A Postgres schema name the tooling can quote safely: `[a-z_][a-z0-9_]*`.
-fn is_schema_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-}
-
 /// Process `#[model]`, `#[model(table = "...")]`, `#[model(schema = "...")]`,
 /// and `#[model(managed)]` attribute arguments.
 fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
@@ -87,12 +78,12 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
             if name == "managed" {
                 // Legacy spelling of the bare `managed` marker.
                 args.managed = true;
-            } else if is_schema_ident(&name) {
+            } else if autumn_schema_core::is_valid_schema_name(&name) {
                 args.schema = Some(name);
             } else {
                 return Err(syn::Error::new(
                     value.span(),
-                    "`schema` must be a plain lower-case identifier, such as `schema = \"marketing\"`",
+                    "`schema` must be a plain lower-case identifier that Postgres does not reserve, such as `schema = \"marketing\"`",
                 ));
             }
             Ok(())
@@ -18988,7 +18979,7 @@ mod tests {
 
     #[test]
     fn model_schema_must_be_a_plain_identifier() {
-        for bad in ["", "Mar keting", "a.b", "1abc", "a\"b"] {
+        for bad in ["", "Mar keting", "a.b", "1abc", "a\"b", "order"] {
             let err = parse_attr_args(quote! { schema = #bad })
                 .expect_err("a non-identifier schema must error");
             assert!(

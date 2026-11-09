@@ -1099,15 +1099,6 @@ fn find_model_attr(attrs: &[syn::Attribute]) -> Option<&syn::Attribute> {
     })
 }
 
-/// A schema name the DDL can quote safely: `[a-z_][a-z0-9_]*`.
-pub(crate) fn is_schema_ident(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-}
-
 /// Struct-level `#[model(...)]` arguments the parser recognizes.
 #[derive(Default)]
 struct ModelArgs {
@@ -1144,7 +1135,7 @@ fn parse_model_args(attr: &syn::Attribute) -> ModelArgs {
             let name = lit.value();
             if name == "managed" {
                 args.managed = true;
-            } else if is_schema_ident(&name) && name != "public" {
+            } else if autumn_schema_core::is_valid_schema_name(&name) && name != "public" {
                 // `public` is the default schema.
                 args.schema = Some(name);
             }
