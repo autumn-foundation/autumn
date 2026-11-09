@@ -45,7 +45,14 @@ pub struct Replay {
 /// server is unreachable or refuses the scratch database, or when a migration
 /// fails. A message never contains the password. A connection error shows
 /// only the host and port.
-pub fn replay(backend: Backend, url: &str, migrations_dir: &Path) -> Result<Replay, String> {
+///
+/// On Postgres, the replay reads the named `schemas` besides `public`.
+pub fn replay(
+    backend: Backend,
+    url: &str,
+    migrations_dir: &Path,
+    schemas: &[String],
+) -> Result<Replay, String> {
     let dev_backend = match autumn_web::config::DatabaseBackend::detect(url) {
         Some(autumn_web::config::DatabaseBackend::Postgres) => Backend::Postgres,
         Some(autumn_web::config::DatabaseBackend::Sqlite) => Backend::Sqlite,
@@ -61,7 +68,7 @@ pub fn replay(backend: Backend, url: &str, migrations_dir: &Path) -> Result<Repl
         ));
     }
     match backend {
-        Backend::Postgres => replay_postgres(url, migrations_dir),
+        Backend::Postgres => replay_postgres(url, migrations_dir, schemas),
         Backend::Sqlite => replay_sqlite(migrations_dir),
     }
 }
@@ -197,7 +204,7 @@ impl Drop for ScratchDatabase {
     }
 }
 
-fn replay_postgres(url: &str, migrations_dir: &Path) -> Result<Replay, String> {
+fn replay_postgres(url: &str, migrations_dir: &Path, schemas: &[String]) -> Result<Replay, String> {
     use crate::schema::introspect;
     let name = scratch_name();
     let target = scratch_url(url, &name)?;
@@ -213,27 +220,32 @@ fn replay_postgres(url: &str, migrations_dir: &Path) -> Result<Replay, String> {
     // Declared before `conn`, so it is dropped (and the database with it) last.
     let _scratch = ScratchDatabase { admin, name };
     let mut conn = introspect::connect_postgres(&target).map_err(|e| e.to_string())?;
-    // Introspection reads `public`, so the migrations must write there.
+    // A bare name in a migration lands in `public`. A migration may name a
+    // schema, which introspection reads when it is in `schemas`.
     diesel::sql_query("SET search_path TO public")
         .execute(&mut conn)
         .map_err(|e| format!("could not set the replay search_path: {e}"))?;
     apply_migrations(&mut conn, migrations_dir)?;
+    let scope = introspect::schema_scope(schemas).map_err(|e| e.to_string())?;
     Ok(Replay {
-        tables: introspect::introspect_postgres_conn(&mut conn).map_err(|e| e.to_string())?,
+        tables: introspect::introspect_postgres_conn_in(&mut conn, schemas)
+            .map_err(|e| e.to_string())?,
         other_relations: relation_names(
             &mut conn,
             // Indexes too: one on a view or a table that introspection
             // skips is not in `tables`. And data types: a table makes a row
             // type of its own name, so it cannot use a type name. An array
             // type does not block it (Postgres moves the array type).
-            "SELECT c.relname AS name FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = 'public' \
-             AND c.relkind IN ('v', 'm', 'S', 'f', 'c', 'i', 'I') \
-             UNION SELECT t.typname AS name FROM pg_type t \
-             JOIN pg_namespace n ON n.oid = t.typnamespace \
-             WHERE n.nspname = 'public' AND t.typtype IN ('b', 'd', 'e', 'r', 'm') \
-             AND t.typcategory <> 'A'",
+            &format!(
+                "SELECT c.relname AS name FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname IN ({scope}) \
+                 AND c.relkind IN ('v', 'm', 'S', 'f', 'c', 'i', 'I') \
+                 UNION SELECT t.typname AS name FROM pg_type t \
+                 JOIN pg_namespace n ON n.oid = t.typnamespace \
+                 WHERE n.nspname IN ({scope}) AND t.typtype IN ('b', 'd', 'e', 'r', 'm') \
+                 AND t.typcategory <> 'A'"
+            ),
         )?,
     })
 }
@@ -392,16 +404,16 @@ mod tests {
     #[test]
     fn a_dev_url_for_another_backend_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = replay(Backend::Postgres, "sqlite://dev.db", dir.path()).unwrap_err();
+        let err = replay(Backend::Postgres, "sqlite://dev.db", dir.path(), &[]).unwrap_err();
         assert!(err.contains("SQLite") && err.contains("Postgres"), "{err}");
-        let err = replay(Backend::Sqlite, "postgres://localhost/dev", dir.path()).unwrap_err();
+        let err = replay(Backend::Sqlite, "postgres://localhost/dev", dir.path(), &[]).unwrap_err();
         assert!(err.contains("SQLite") && err.contains("Postgres"), "{err}");
     }
 
     #[test]
     fn a_dev_url_that_is_not_a_database_url_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = replay(Backend::Postgres, "mysql://u:pw@host/db", dir.path()).unwrap_err();
+        let err = replay(Backend::Postgres, "mysql://u:pw@host/db", dir.path(), &[]).unwrap_err();
         assert!(err.contains("--dev-url"), "{err}");
         assert!(!err.contains("pw@"), "the URL must not leak: {err}");
     }
@@ -413,6 +425,7 @@ mod tests {
             Backend::Postgres,
             "postgres://user:s3cr3t_pw@127.0.0.1:1/dev",
             dir.path(),
+            &[],
         )
         .unwrap_err();
         assert!(err.contains("127.0.0.1"), "{err}");
@@ -426,7 +439,7 @@ mod tests {
     #[test]
     fn sqlite_replay_needs_the_sqlite_feature() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = replay(Backend::Sqlite, "sqlite::memory:", dir.path()).unwrap_err();
+        let err = replay(Backend::Sqlite, "sqlite::memory:", dir.path(), &[]).unwrap_err();
         assert!(err.contains("--features sqlite"), "{err}");
     }
 
@@ -459,7 +472,7 @@ mod tests {
             let db = root.path().join("dev.db");
             let url = format!("sqlite://{}", db.display());
 
-            let tables = replay(Backend::Sqlite, &url, &migrations)
+            let tables = replay(Backend::Sqlite, &url, &migrations, &[])
                 .expect("replay")
                 .tables;
             let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
@@ -481,7 +494,7 @@ mod tests {
             let root = tempfile::tempdir().expect("tempdir");
             let migrations = root.path().join("migrations");
             migration(&migrations, "2026-01-01-000000_bad", "CREATE TABLE (;");
-            let err = replay(Backend::Sqlite, "sqlite::memory:", &migrations).unwrap_err();
+            let err = replay(Backend::Sqlite, "sqlite::memory:", &migrations, &[]).unwrap_err();
             assert!(err.contains("replay"), "{err}");
         }
 
@@ -494,7 +507,8 @@ mod tests {
                 "2026-01-01-000000_report",
                 "CREATE TABLE t (id INTEGER PRIMARY KEY); CREATE VIEW report AS SELECT id FROM t;",
             );
-            let replayed = replay(Backend::Sqlite, "sqlite::memory:", &migrations).expect("replay");
+            let replayed =
+                replay(Backend::Sqlite, "sqlite::memory:", &migrations, &[]).expect("replay");
             assert!(
                 replayed.other_relations.contains("report"),
                 "{:?}",
@@ -510,6 +524,7 @@ mod tests {
                 Backend::Sqlite,
                 "sqlite::memory:",
                 &root.path().join("migrations"),
+                &[],
             )
             .expect("replay")
             .tables;

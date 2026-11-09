@@ -178,6 +178,11 @@ struct PlanEdits {
     columns: Vec<(String, String, String)>,
 }
 
+/// The table of a possibly qualified `schema.table` name.
+fn bare_table(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(_, table)| table)
+}
+
 /// The table drops and renames, and the column renames, of `plan`.
 fn plan_edits(plan: &MigrationPlan) -> PlanEdits {
     let mut edits = PlanEdits::default();
@@ -185,12 +190,14 @@ fn plan_edits(plan: &MigrationPlan) -> PlanEdits {
         match change {
             SchemaChange::DropTable(table) => edits.tables.push((table.name.clone(), None)),
             SchemaChange::RenameTable { from, to } => {
-                edits.tables.push((from.clone(), Some(to.clone())));
+                edits
+                    .tables
+                    .push((bare_table(from).to_owned(), Some(to.clone())));
             }
             SchemaChange::RenameColumn { table, from, to } => {
                 edits
                     .columns
-                    .push((table.clone(), from.clone(), to.clone()));
+                    .push((bare_table(table).to_owned(), from.clone(), to.clone()));
             }
             _ => {}
         }
@@ -231,7 +238,10 @@ fn sync(existing: &str, desired: &ParsedSchema, edits: &PlanEdits) -> SchemaRsSy
         let range = schema_block_range(&out.text, &token);
         let shape = range.map(|(start, end)| block_shape(&out.text[start..end]));
         // A block in a Postgres schema keeps its schema.
-        let schema = shape.as_ref().and_then(|s| s.as_ref()?.schema.clone());
+        let schema = table
+            .schema
+            .clone()
+            .or_else(|| shape.as_ref().and_then(|s| s.as_ref()?.schema.clone()));
         let block = match render_block_in(table, schema.as_deref()) {
             Ok(block) => block,
             Err(reason) => {
@@ -416,7 +426,15 @@ impl Shape {
                     .map(|ty| (c.name.clone(), normalize_type(&ty)))
             })
             .collect();
-        self.pk.iter().map(String::as_str).eq(pk) && columns.is_some_and(|c| c == self.columns)
+        // A model schema must be the schema of the block. A model with no
+        // schema keeps the schema the block has.
+        let same_schema = table
+            .schema
+            .as_ref()
+            .is_none_or(|schema| self.schema.as_ref() == Some(schema));
+        same_schema
+            && self.pk.iter().map(String::as_str).eq(pk)
+            && columns.is_some_and(|c| c == self.columns)
     }
 }
 
@@ -610,12 +628,16 @@ fn rename_header(text: &str, old: &str, new: &str) -> Option<String> {
     for line in block.split_inclusive('\n') {
         let trimmed = line.trim_start();
         // A schema-qualified header keeps its `schema.` prefix.
+        // Space around the `.` is allowed.
         let prefix = trimmed
             .split_once('.')
             .filter(|(schema, rest)| {
-                !schema.contains(char::is_whitespace) && rest.starts_with(&needle)
+                let schema = schema.trim_end();
+                !schema.is_empty()
+                    && !schema.contains(char::is_whitespace)
+                    && rest.trim_start().starts_with(&needle)
             })
-            .map_or(0, |(schema, _)| schema.len() + 1);
+            .map_or(0, |(_, rest)| trimmed.len() - rest.trim_start().len());
         if trimmed[prefix..].starts_with(&needle) {
             at = Some(offset + line.len() - trimmed.len() + prefix);
             break;
@@ -1419,6 +1441,68 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         );
         assert_eq!(out.text, MARKETING_POSTS);
         assert!(out.written.is_empty(), "{out:?}");
+    }
+
+    fn in_marketing(mut t: Table) -> Table {
+        t.schema = Some("marketing".to_owned());
+        t
+    }
+
+    #[test]
+    fn a_new_model_with_a_schema_gets_a_qualified_block() {
+        let out = sync_for_plan(
+            "",
+            &parsed(vec![in_marketing(posts(Backend::Postgres))]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, MARKETING_POSTS);
+        assert_eq!(out.written, vec!["posts".to_owned()]);
+    }
+
+    #[test]
+    fn a_model_schema_replaces_an_unqualified_block() {
+        let out = sync_for_plan(
+            POSTS_BLOCK,
+            &parsed(vec![in_marketing(posts(Backend::Postgres))]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text.trim_end(), MARKETING_POSTS.trim_end());
+        assert_eq!(out.written, vec!["posts".to_owned()]);
+    }
+
+    #[test]
+    fn a_drop_of_a_qualified_table_removes_its_block() {
+        let out = sync_for_plan(
+            MARKETING_POSTS,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(in_marketing(posts(
+                Backend::Postgres,
+            )))]),
+        );
+        assert!(!out.text.contains("posts"), "{}", out.text);
+        assert_eq!(out.removed, vec!["posts".to_owned()]);
+    }
+
+    #[test]
+    fn a_rename_with_a_qualified_old_name_renames_the_block() {
+        let existing =
+            "diesel::table! {\n    marketing.articles (id) {\n        id -> Int8,\n    }\n}\n";
+        let mut t = in_marketing(posts(Backend::Postgres));
+        t.columns.truncate(1);
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![t]),
+            &rename("marketing.articles", "posts"),
+        );
+        assert!(out.text.contains("marketing.posts (id)"), "{}", out.text);
+    }
+
+    #[test]
+    fn a_rename_handles_a_spaced_qualified_header() {
+        let existing =
+            "diesel::table! {\n    marketing . articles (id) {\n        id -> Int8,\n    }\n}\n";
+        let renamed = rename_header(existing, "articles", "posts").expect("block found");
+        assert!(renamed.contains("marketing . posts (id)"), "{renamed}");
     }
 
     #[test]

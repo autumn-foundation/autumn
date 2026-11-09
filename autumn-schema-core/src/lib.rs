@@ -1093,6 +1093,10 @@ pub struct Table {
     /// existing database can be represented as `managed = false` so tooling
     /// records its shape without claiming authority to migrate it.
     pub managed: bool,
+    /// The Postgres schema of the table. `None` is the default schema
+    /// (`public`, or the first on the `search_path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
 }
 
 impl Table {
@@ -1106,7 +1110,16 @@ impl Table {
             checks: Vec::new(),
             backend,
             managed: true,
+            schema: None,
         }
+    }
+
+    /// `schema.name`, or `name` when the table has no schema.
+    #[must_use]
+    pub fn qualified_name(&self) -> String {
+        self.schema
+            .as_deref()
+            .map_or_else(|| self.name.clone(), |s| format!("{s}.{}", self.name))
     }
 }
 
@@ -1134,6 +1147,24 @@ impl Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_schema_defaults_to_none_and_qualifies() {
+        let mut t = Table::new("campaigns", Backend::Postgres);
+        assert_eq!(t.schema, None);
+        assert_eq!(t.qualified_name(), "campaigns");
+        t.schema = Some("marketing".to_owned());
+        assert_eq!(t.qualified_name(), "marketing.campaigns");
+    }
+
+    #[test]
+    fn table_without_schema_serializes_as_before() {
+        let t = Table::new("campaigns", Backend::Postgres);
+        let json = serde_json::to_string(&t).expect("json");
+        assert!(!json.contains("schema"), "{json}");
+        let back: Table = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back, t);
+    }
 
     /// Every logical column type, for exhaustive table-driven assertions. Kept
     /// in one place so a newly added [`ColumnType`] variant that is not listed

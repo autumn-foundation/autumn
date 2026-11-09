@@ -250,6 +250,10 @@ pub(crate) struct RepoConfig {
     /// replica is configured (#971). Use for read-after-write-sensitive
     /// aggregates that cannot tolerate replication lag.
     primary_reads: bool,
+    /// `boundary = Type`: the repository connects as the Postgres role of this
+    /// `Boundary`, through `AppState::pool_for`. Implies `primary_reads`: a read
+    /// replica connects as the owner, not as the role.
+    boundary: Option<syn::Path>,
     /// When `true`, the generated `FromRequestParts` resolves the tenant → shard
     /// automatically so handlers can extract the repository directly without a
     /// [`ShardedDb`] extractor. Requires shards to be configured in `[[database.shards]]`.
@@ -968,6 +972,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut ledger_schema_version: Option<u32> = None;
     let mut ledger_upcast: Option<syn::Path> = None;
     let mut primary_reads = false;
+    let mut boundary: Option<syn::Path> = None;
     let mut sharded = false;
     let mut broadcasts = false;
     let mut broadcast_topic: Option<String> = None;
@@ -1166,6 +1171,9 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else if meta.path.is_ident("no_versioned_record_impl") {
             no_versioned_record_impl = true;
+            Ok(())
+        } else if meta.path.is_ident("boundary") {
+            boundary = Some(meta.value()?.parse()?);
             Ok(())
         } else if meta.path.is_ident("primary_reads") {
             primary_reads = true;
@@ -1386,7 +1394,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), retention(after = \"...\", basis = column, purge_deleted_after = \"...\", batch_size = N, every = \"...\"), position or position(column = \"...\", scope = \"...\"), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, boundary = Type, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), retention(after = \"...\", basis = column, purge_deleted_after = \"...\", batch_size = N, every = \"...\"), position or position(column = \"...\", scope = \"...\"), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -1654,6 +1662,16 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             ));
         }
     }
+    if boundary.is_some() && sharded {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`boundary` cannot be combined with `sharded`: a shard has its own pool, \
+             and a boundary role pool is for the one primary database. Remove one",
+        ));
+    }
+    // A replica connects as the owner, so a boundary repository reads on its
+    // role pool.
+    let primary_reads = primary_reads || boundary.is_some();
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
 
@@ -1680,6 +1698,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         ledger_schema_version: ledger_schema_version.unwrap_or(1),
         ledger_upcast,
         primary_reads,
+        boundary,
         sharded,
         broadcasts,
         broadcast_topic,
@@ -6465,6 +6484,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     } else {
+        // A boundary repository connects as the role of its boundary. When
+        // roles are set but not this one, there is no pool: the repository
+        // never falls back to the owner role.
+        let pool_init = config.boundary.as_ref().map_or_else(
+            || quote! {
+                let pool = state.pool()
+                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
+                    .clone();
+            },
+            |boundary| quote! {
+                let pool = state.pool_for::<#boundary>()
+                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg(
+                        ::std::format!(
+                            "Database role for boundary `{}` not configured",
+                            <#boundary as ::autumn_web::db_roles::Boundary>::NAME
+                        ),
+                    ))?;
+            },
+        );
         quote! {
             // Extractor: pull pool from AppState (same pattern as Db extractor)
             impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
@@ -6474,9 +6512,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _parts: &mut ::autumn_web::reexports::http::request::Parts,
                     state: &::autumn_web::AppState,
                 ) -> Result<Self, Self::Rejection> {
-                    let pool = state.pool()
-                        .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
-                        .clone();
+                    #pool_init
                     #extractor_init
                 }
             }
@@ -28021,6 +28057,63 @@ mod tests {
             generated.contains("save"),
             "non-versioned repository must still generate save"
         );
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_binds_the_role_and_pins_reads() {
+        let tokens: proc_macro2::TokenStream = "Post, boundary = Marketing".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let boundary = config.boundary.expect("boundary is set");
+        assert_eq!(quote! { #boundary }.to_string(), "Marketing");
+        assert!(
+            config.primary_reads,
+            "a replica connects as the owner, so reads stay on the role pool"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_defaults_off() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.boundary.is_none());
+        assert!(!config.primary_reads);
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_accepts_a_path() {
+        let tokens: proc_macro2::TokenStream = "Post, boundary = crate::marketing::Marketing"
+            .parse()
+            .unwrap();
+        assert!(parse_repo_args(tokens).unwrap().boundary.is_some());
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_with_sharded_is_refused() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, boundary = Marketing, sharded".parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("boundary with sharded must be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("boundary") && err.contains("sharded"), "{err}");
+    }
+
+    #[test]
+    fn repository_with_a_boundary_extracts_the_role_pool() {
+        let out = repository_macro(
+            quote! { Post, boundary = Marketing },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(out.contains("pool_for :: < Marketing >"), "{out}");
+        assert!(out.contains("ReadRoute :: Primary"), "{out}");
+    }
+
+    #[test]
+    fn repository_without_a_boundary_extracts_the_primary_pool() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(!out.contains("pool_for"), "{out}");
     }
 
     #[test]

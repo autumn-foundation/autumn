@@ -42,10 +42,23 @@ struct ModelArgs {
     /// `#[model(managed)]`. Captured but intentionally unused by codegen.
     #[allow(dead_code)]
     managed: bool,
+    /// `schema = "<name>"`: the Postgres schema of the table. Tooling only.
+    /// The `table!` module keeps its bare name.
+    #[allow(dead_code)]
+    schema: Option<String>,
 }
 
-/// Process `#[model]`, `#[model(table = "...")]`, and `#[model(managed)]`
-/// attribute arguments.
+/// A Postgres schema name the tooling can quote safely: `[a-z_][a-z0-9_]*`.
+fn is_schema_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Process `#[model]`, `#[model(table = "...")]`, `#[model(schema = "...")]`,
+/// and `#[model(managed)]` attribute arguments.
 fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
     let mut args = ModelArgs::default();
     if attr.is_empty() {
@@ -68,9 +81,24 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
             }
             args.managed = true;
             Ok(())
+        } else if meta.path.is_ident("schema") {
+            let value: LitStr = meta.value()?.parse()?;
+            let name = value.value();
+            if name == "managed" {
+                // Legacy spelling of the bare `managed` marker.
+                args.managed = true;
+            } else if is_schema_ident(&name) {
+                args.schema = Some(name);
+            } else {
+                return Err(syn::Error::new(
+                    value.span(),
+                    "`schema` must be a plain lower-case identifier, such as `schema = \"marketing\"`",
+                ));
+            }
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported `#[model(...)]` argument; expected `table = \"...\"` or `managed`",
+                "unsupported `#[model(...)]` argument; expected `table = \"...\"`, `schema = \"...\"` or `managed`",
             ))
         }
     })
@@ -18941,6 +18969,40 @@ mod tests {
             err.to_string().contains("`managed` takes no value"),
             "unexpected message: {err}"
         );
+    }
+
+    #[test]
+    fn model_schema_arg_names_a_postgres_schema() {
+        let args = parse_attr_args(quote! { table = "campaigns", schema = "marketing" })
+            .expect("`schema` must parse");
+        assert_eq!(args.schema.as_deref(), Some("marketing"));
+        assert!(!args.managed);
+    }
+
+    #[test]
+    fn model_schema_managed_stays_the_adoption_marker() {
+        let args = parse_attr_args(quote! { schema = "managed" }).expect("legacy form parses");
+        assert!(args.managed);
+        assert!(args.schema.is_none());
+    }
+
+    #[test]
+    fn model_schema_must_be_a_plain_identifier() {
+        for bad in ["", "Mar keting", "a.b", "1abc", "a\"b"] {
+            let err = parse_attr_args(quote! { schema = #bad })
+                .expect_err("a non-identifier schema must error");
+            assert!(
+                err.to_string().contains("`schema` must be"),
+                "unexpected message for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_schema_does_not_change_the_table_ident() {
+        // The `table!` module keeps its bare name; the schema is tooling-only.
+        let args = parse_attr_args(quote! { schema = "marketing" }).expect("parses");
+        assert!(args.table.is_none());
     }
 
     #[test]

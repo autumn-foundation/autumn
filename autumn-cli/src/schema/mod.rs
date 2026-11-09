@@ -148,6 +148,10 @@ pub enum SchemaAction {
         /// Print what would change without writing the snapshot file.
         #[arg(long)]
         dry_run: bool,
+        /// Also read this Postgres schema. Repeat for more. `public` is
+        /// always read. A table name must be in one schema only.
+        #[arg(long = "schema", value_name = "SCHEMA")]
+        schemas: Vec<String>,
     },
     /// Apply pending migration files against the configured database.
     ///
@@ -232,7 +236,14 @@ pub fn run(action: SchemaAction) {
             out,
             backend,
             dry_run,
-        } => run_pull(profile.as_deref(), out.as_deref(), backend, dry_run),
+            schemas,
+        } => run_pull(
+            profile.as_deref(),
+            out.as_deref(),
+            backend,
+            dry_run,
+            &schemas,
+        ),
         SchemaAction::Migrate { profile } => migrate::run_migrate(profile.as_deref()),
         SchemaAction::Doctor { profile, json } => doctor::run_doctor(profile.as_deref(), json),
         SchemaAction::Width { path, max, all } => width::run_width(&path, max, all),
@@ -442,10 +453,11 @@ fn run_pull(
     out: Option<&Path>,
     backend: Option<BackendArg>,
     dry_run: bool,
+    schemas: &[String],
 ) -> Result<(), String> {
     let project_root = std::env::current_dir()
         .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
-    pull_at(&project_root, profile, out, backend, dry_run)
+    pull_at(&project_root, profile, out, backend, dry_run, schemas)
 }
 
 /// The body of [`run_pull`], taking an explicit `project_root` so the wiring is
@@ -456,6 +468,7 @@ fn pull_at(
     out: Option<&Path>,
     backend: Option<BackendArg>,
     dry_run: bool,
+    schemas: &[String],
 ) -> Result<(), String> {
     crate::generate::ensure_project_root(project_root)
         .map_err(|_| crate::generate::GenerateError::NotInProject.to_string())?;
@@ -505,7 +518,15 @@ fn pull_at(
     // default (Postgres) build that somehow resolves a SQLite backend fails loudly
     // rather than silently mis-introspecting.
     let tables = match backend {
-        Backend::Postgres => introspect::introspect_postgres(&url).map_err(|e| e.to_string())?,
+        Backend::Postgres => {
+            // Keep the schemas the existing snapshot has, so a pull does not
+            // drop them.
+            let mut all = table_schemas(existing.iter().flat_map(|s| s.tables.iter()));
+            all.extend(schemas.iter().cloned());
+            all.sort();
+            all.dedup();
+            introspect::introspect_postgres_in(&url, &all).map_err(|e| e.to_string())?
+        }
         #[cfg(feature = "sqlite")]
         Backend::Sqlite => introspect::introspect_sqlite(&url).map_err(|e| e.to_string())?,
         #[cfg(not(feature = "sqlite"))]
@@ -1107,6 +1128,16 @@ fn load_diff_snapshot(
     }
 }
 
+/// The sorted, distinct schema names of `tables`. A table in the default
+/// schema adds none.
+pub(crate) fn table_schemas<'a>(tables: impl IntoIterator<Item = &'a Table>) -> Vec<String> {
+    let set: std::collections::BTreeSet<&str> = tables
+        .into_iter()
+        .filter_map(|t| t.schema.as_deref())
+        .collect();
+    set.into_iter().map(str::to_owned).collect()
+}
+
 /// The `--dev-url` baseline: the migrations replayed on the dev database, with
 /// a warning when they do not match the snapshot, and with managed flags from
 /// the snapshot and the models (see [`shadow::adopt_managed_flags`]).
@@ -1117,7 +1148,13 @@ fn replay_baseline(
     snapshot: Option<&SchemaSnapshot>,
     desired: &parse::ParsedSchema,
 ) -> Result<shadow::Replay, String> {
-    let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"))?;
+    let schemas = table_schemas(
+        desired
+            .tables
+            .iter()
+            .chain(snapshot.iter().flat_map(|s| s.tables.iter())),
+    );
+    let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"), &schemas)?;
     shadow::adopt_model_spelling(&mut replayed.tables, desired);
     if let Some(snapshot) = snapshot {
         warn_snapshot_drift(&snapshot.tables, &replayed.tables);
@@ -1339,6 +1376,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
             | SchemaChange::RenameColumn { .. }
             | SchemaChange::RenameIndex { .. }
             | SchemaChange::RenameConflict { .. }
+            | SchemaChange::TableSchemaConflict { .. }
             | SchemaChange::PrimaryKeyChange { .. }
             | SchemaChange::ForeignKeyChange { .. }
             | SchemaChange::IdentityChange { .. }

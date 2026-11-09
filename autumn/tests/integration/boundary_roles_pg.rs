@@ -59,6 +59,17 @@ diesel::table! {
     }
 }
 
+#[autumn_web::model(table = "campaigns", schema = "marketing")]
+pub struct Campaign {
+    #[id]
+    pub id: i64,
+    pub name: String,
+}
+
+/// Runs as the `marketing` role, through `pool_for::<Marketing>()`.
+#[autumn_web::repository(Campaign, boundary = Marketing)]
+pub trait CampaignRepository {}
+
 #[derive(QueryableByName)]
 struct Count {
     #[diesel(sql_type = BigInt)]
@@ -232,6 +243,51 @@ async fn assert_marketing(state: &AppState) {
     assert!(denied.contains("permission denied"), "{denied}");
 }
 
+/// A `boundary = Marketing` repository connects as the `marketing` role: it
+/// reads and writes the schema table, and the connection user is the role.
+async fn assert_repository(state: &AppState) {
+    use autumn_web::reexports::axum::extract::FromRequestParts as _;
+    let (mut parts, ()) = autumn_web::reexports::http::Request::new(()).into_parts();
+    let repo = PgCampaignRepository::from_request_parts(&mut parts, state)
+        .await
+        .expect("a boundary repository extracts");
+    let saved = repo
+        .save(&NewCampaign {
+            name: "winter".to_owned(),
+        })
+        .await
+        .expect("the role writes through the repository");
+    assert_eq!(saved.name, "winter");
+    let all = repo.find_all().await.expect("the role reads");
+    assert!(all.iter().any(|c| c.name == "winter"));
+}
+
+/// With roles set but none for `marketing`, a boundary repository does not
+/// fall back to the owner role.
+async fn assert_repository_without_its_role(url: &str) {
+    use autumn_web::reexports::axum::extract::FromRequestParts as _;
+    let mut database = DatabaseConfig {
+        url: Some(url.to_owned()),
+        pool_size: 2,
+        ..Default::default()
+    };
+    database.roles.insert("core".to_owned(), role("core"));
+    database.validate().expect("valid config");
+    let state = AppState::for_test().with_pool(
+        autumn_web::db::create_pool(&database)
+            .expect("pool")
+            .expect("url"),
+    );
+    state.insert_extension(autumn_web::db::create_role_pools(&database).expect("role pools"));
+    let (mut parts, ()) = autumn_web::reexports::http::Request::new(()).into_parts();
+    assert!(
+        PgCampaignRepository::from_request_parts(&mut parts, &state)
+            .await
+            .is_err(),
+        "no marketing role: the repository must not use the owner role"
+    );
+}
+
 /// Admin (the plugin set): its own table, not marketing's or core's.
 async fn assert_admin(state: &AppState) {
     let pool = state.pool_for::<Admin>().expect("admin pool");
@@ -262,5 +318,7 @@ async fn boundary_roles_read_their_own_tables_and_are_denied_others() {
     apply_grants(&mut owner).await;
     let state = role_state(&url);
     assert_marketing(&state).await;
+    assert_repository(&state).await;
+    assert_repository_without_its_role(&url).await;
     assert_admin(&state).await;
 }
