@@ -287,7 +287,7 @@ pub fn introspect_postgres_conn_in(
 ///
 /// Returns [`IntrospectError::Query`] for a schema name that is not a plain
 /// identifier, so the name is safe in SQL.
-pub(crate) fn schema_scope(schemas: &[String]) -> Result<String, IntrospectError> {
+pub fn schema_scope(schemas: &[String]) -> Result<String, IntrospectError> {
     let mut all = vec!["public".to_owned()];
     for schema in schemas {
         if !autumn_schema_core::is_valid_schema_name(schema) {

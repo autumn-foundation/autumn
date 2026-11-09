@@ -561,13 +561,10 @@ fn apply_table_schemas(
     for change in changes.iter_mut() {
         match change {
             SchemaChange::CreateTable(t) | SchemaChange::DropTable(t) => {
-                qualify_fks(&mut t.columns)
+                qualify_fks(&mut t.columns);
             }
-            SchemaChange::DropColumn { table, column } => {
-                qualify_fks(std::slice::from_mut(column));
-                qualify(table);
-            }
-            SchemaChange::AddColumn { table, column } => {
+            SchemaChange::DropColumn { table, column }
+            | SchemaChange::AddColumn { table, column } => {
                 qualify_fks(std::slice::from_mut(column));
                 qualify(table);
             }
@@ -3669,7 +3666,7 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
             foreign_key,
         } => {
             require_pg(backend, "AddForeignKey")?;
-            let constraint = bounded_pg_identifier(&format!("{}_{column}_fkey", bare_name(table)));
+            let constraint = fk_constraint_name(table, column);
             Ok(format!(
                 "ALTER TABLE {table} ADD CONSTRAINT {constraint} \
                  FOREIGN KEY ({column}) REFERENCES {}({}){};\n",
@@ -3692,15 +3689,21 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
     }
 }
 
+/// Undo `ALTER TABLE from RENAME TO to`. `from` may carry the schema; `to` is
+/// bare, so the new table is found in the same schema.
+fn rename_table_down(from: &str, to: &str) -> String {
+    format!(
+        "ALTER TABLE {} RENAME TO {};\n",
+        index_ref(from, to),
+        bare_name(from)
+    )
+}
+
 /// Render a single change's reverse SQL, with an `-- irreversible:` / `-- manual:`
 /// marker where the round-trip is not clean.
 fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, EmitError> {
     match change {
-        SchemaChange::RenameTable { from, to } => {
-            // `from` may carry the schema; `to` is bare.
-            let to = index_ref(from, to);
-            Ok(format!("ALTER TABLE {to} RENAME TO {};\n", bare_name(from)))
-        }
+        SchemaChange::RenameTable { from, to } => Ok(rename_table_down(from, to)),
         SchemaChange::RenameColumn { table, from, to } => Ok(format!(
             "ALTER TABLE {table} RENAME COLUMN {to} TO {from};\n"
         )),
@@ -3783,7 +3786,7 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
             |name| format!("ALTER TABLE {table} DROP CONSTRAINT {name};\n"),
         )),
         SchemaChange::AddForeignKey { table, column, .. } => {
-            let constraint = bounded_pg_identifier(&format!("{}_{column}_fkey", bare_name(table)));
+            let constraint = fk_constraint_name(table, column);
             Ok(format!(
                 "ALTER TABLE {table} DROP CONSTRAINT {constraint};\n"
             ))
@@ -4020,8 +4023,14 @@ fn fk_targets(fk_table: &str, table: &Table) -> bool {
     name == table.name && schema.filter(|s| *s != "public") == named_schema(table)
 }
 
+/// The name of the constraint for the foreign key on `table.column`. The
+/// schema is not part of it.
+fn fk_constraint_name(table: &str, column: &str) -> String {
+    bounded_pg_identifier(&format!("{}_{column}_fkey", bare_name(table)))
+}
+
 /// The table part of a possibly qualified `schema.table`.
-pub(crate) fn bare_name(table: &str) -> &str {
+pub fn bare_name(table: &str) -> &str {
     table.rsplit_once('.').map_or(table, |(_, name)| name)
 }
 

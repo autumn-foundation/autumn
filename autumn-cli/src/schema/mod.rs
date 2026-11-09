@@ -1130,7 +1130,7 @@ fn load_diff_snapshot(
 
 /// The sorted, distinct schema names of `tables`. A table in the default
 /// schema adds none.
-pub(crate) fn table_schemas<'a>(tables: impl IntoIterator<Item = &'a Table>) -> Vec<String> {
+pub fn table_schemas<'a>(tables: impl IntoIterator<Item = &'a Table>) -> Vec<String> {
     let set: std::collections::BTreeSet<&str> = tables
         .into_iter()
         .filter_map(|t| t.schema.as_deref())
@@ -1304,15 +1304,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
     // Renames come first in a plan and depend only on the baseline, so apply
     // them before the name-keyed working set is built.
     let baseline = rename::renamed_baseline(baseline, &plan.changes);
-    // The named schema of each table the plan knows, by bare name.
-    let schemas: BTreeMap<String, String> = baseline
-        .iter()
-        .chain(plan.changes.iter().filter_map(|c| match c {
-            SchemaChange::CreateTable(t) => Some(t),
-            _ => None,
-        }))
-        .filter_map(|t| Some((t.name.clone(), t.schema.clone()?)))
-        .collect();
+    let schemas = plan_schemas(&baseline, plan);
     // Name-keyed working set cloned from the baseline.
     let mut tables: BTreeMap<String, Table> = baseline
         .iter()
@@ -1440,6 +1432,19 @@ fn column_mut<'a>(
     tables
         .get_mut(diff::bare_name(table))
         .and_then(|t| t.columns.iter_mut().find(|c| c.name == column))
+}
+
+/// The named schema of each table that the baseline or the plan knows, by
+/// bare name.
+fn plan_schemas(baseline: &[Table], plan: &MigrationPlan) -> BTreeMap<String, String> {
+    baseline
+        .iter()
+        .chain(plan.changes.iter().filter_map(|c| match c {
+            SchemaChange::CreateTable(t) => Some(t),
+            _ => None,
+        }))
+        .filter_map(|t| Some((t.name.clone(), t.schema.clone()?)))
+        .collect()
 }
 
 /// The plan names a foreign key target as `schema.table`. A model and the

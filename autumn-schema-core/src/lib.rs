@@ -1182,9 +1182,10 @@ const RESERVED_SCHEMA_WORDS: &[&str] = &[
     "with",
 ];
 
-/// True when `name` is a schema name the DDL can write without quotes:
-/// `[a-z_][a-z0-9_]*`, at most 63 bytes, not a reserved Postgres word, and
-/// without the `pg_` prefix that Postgres keeps for system schemas.
+/// True when `name` is a schema name the DDL can write without quotes.
+///
+/// The name is `[a-z_][a-z0-9_]*`, at most 63 bytes, not a reserved Postgres
+/// word, and without the `pg_` prefix that Postgres keeps for system schemas.
 #[must_use]
 pub fn is_valid_schema_name(name: &str) -> bool {
     let mut chars = name.chars();
