@@ -659,6 +659,13 @@ only after the next sync, so the new machine can be missing up to `rpo_secs` of
 writes that already returned success. On a busy fleet the lag can pass
 `rpo_secs`; see [the fleet's replication](sqlite-fleet.md#replication-object-storage-between-volumes).
 
+A fleet app can ask whether one write is offsite.
+`fleet.replicated_through(&key)` gives the instant up to which every commit
+to that database is in the replica, and `fleet.wait_replicated` waits for
+it. Before a failover, use it to keep a write that spans two databases from
+being lost in half. See
+[Know when a write is in the replica](sqlite-fleet.md#know-when-a-write-is-in-the-replica).
+
 Two surfaces report it, from two vantage points. `autumn db replica status`
 (add `--json` for monitoring) reads the **destination** and reports the current
 generation, how many segments it holds, the instant a restore would land on, and

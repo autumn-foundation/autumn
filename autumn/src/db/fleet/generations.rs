@@ -48,7 +48,7 @@ use crate::db::fleet_replication::{FleetReplication, GenerationRetry, UnshippedG
 use crate::db::fleet_tombstones::restore_allowed;
 use crate::replication::destination::{DestinationError, ReplicaDestination};
 use crate::replication::fence::FencedDestination;
-use crate::replication::segment;
+use crate::replication::{segment, status};
 
 /// The commit marker of a generation.
 pub const MANIFEST_OBJECT: &str = "manifest.json";
@@ -410,6 +410,9 @@ pub struct GenerationTrack {
     pub registered_at: DateTime<Utc>,
     /// The last ship that worked, also one that found no change.
     pub last_ok: Option<DateTime<Utc>>,
+    /// Every commit at or before it is in the replica: the instant before the
+    /// snapshot of the last ship that worked. `None` after a fence.
+    pub replicated_through: Option<DateTime<Utc>>,
     /// Failed ships in a row.
     pub failures: u32,
     /// The error of the last failed ship.
@@ -422,6 +425,7 @@ impl GenerationTrack {
         Self {
             registered_at: now,
             last_ok: None,
+            replicated_through: None,
             failures: 0,
             last_error: None,
         }
@@ -737,24 +741,36 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // Before the snapshot: a close after it keeps a record this ship
         // does not cover.
         let mark = replication.generation_mark();
+        // Read before the snapshot: a commit at or before it is in the copy.
+        let through = replication.now();
         let shipped = self.ship_locked(replication, target).await;
         let now = replication.now();
         if shipped.is_ok() {
             // The files at the path hold the writes of an earlier record.
             replication.drop_unshipped_generation(&target.key, mark);
         }
-        let mut track = target.slot.track();
-        match &shipped {
-            Ok(_) => {
-                track.last_ok = Some(now);
-                track.failures = 0;
-                track.last_error = None;
-            }
-            Err(error) => {
-                track.failures = track.failures.saturating_add(1);
-                track.last_error = Some(error.to_string());
+        {
+            let mut track = target.slot.track();
+            match &shipped {
+                Ok(_) => {
+                    track.last_ok = Some(now);
+                    if let Some(bound) = status::bound_below(through) {
+                        track.replicated_through =
+                            Some(status::keep_later(track.replicated_through, bound));
+                    }
+                    track.failures = 0;
+                    track.last_error = None;
+                }
+                Err(error) => {
+                    if matches!(error, FleetError::Fenced { .. }) {
+                        track.replicated_through = None;
+                    }
+                    track.failures = track.failures.saturating_add(1);
+                    track.last_error = Some(error.to_string());
+                }
             }
         }
+        replication.notify_progress();
         shipped
     }
 

@@ -159,6 +159,42 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         self.inner.replication.get()
     }
 
+    /// Every transaction committed to `key` at or before the returned
+    /// instant is in the replica. See
+    /// [`FleetReplication::replicated_through`](crate::db::fleet_replication::FleetReplication::replicated_through).
+    /// `None` with no replication.
+    #[must_use]
+    pub fn replicated_through(&self, key: &FleetDbKey) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.replication()
+            .and_then(|replication| replication.replicated_through(key))
+    }
+
+    /// Wait until the replica of `key` holds every commit at or before
+    /// `committed_at`. See
+    /// [`FleetReplication::wait_replicated`](crate::db::fleet_replication::FleetReplication::wait_replicated).
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicatedWaitError::NotReplicating`](crate::db::fleet_replication::ReplicatedWaitError::NotReplicating)
+    /// with no replication. Else see `FleetReplication::wait_replicated`.
+    pub async fn wait_replicated(
+        &self,
+        key: &FleetDbKey,
+        committed_at: chrono::DateTime<chrono::Utc>,
+        timeout: Duration,
+    ) -> Result<(), crate::db::fleet_replication::ReplicatedWaitError> {
+        let Some(replication) = self.replication() else {
+            return Err(
+                crate::db::fleet_replication::ReplicatedWaitError::NotReplicating {
+                    name: key.name(),
+                },
+            );
+        };
+        replication
+            .wait_replicated(key, committed_at, timeout)
+            .await
+    }
+
     /// The replica of `key`: the destination and its key prefix.
     pub(super) fn replica_base(&self, key: &FleetDbKey) -> Option<super::ReplicaBase> {
         self.replication().map(|replication| super::ReplicaBase {

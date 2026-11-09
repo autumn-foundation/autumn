@@ -557,6 +557,8 @@ mod sla_obligation_macro;
 mod sqlite_ci_coverage;
 mod sqlite_postgres_free;
 #[cfg(feature = "db")]
+mod sqlite_replicated_through;
+#[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]
 mod sqlite_replication_s3;

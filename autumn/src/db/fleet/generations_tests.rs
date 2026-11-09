@@ -1200,3 +1200,30 @@ async fn a_record_whose_files_are_gone_ships_nothing() {
     assert!(complete(&a, &key).is_empty());
     a.fleet.close_all().await;
 }
+
+#[tokio::test]
+async fn a_shipped_generation_sets_replicated_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let key = acme(&a.fleet);
+    write(&a, &key, "plan").await;
+    let committed_at = crate::time::ClockSource::now(&crate::time::SystemClock);
+    assert_eq!(
+        a.fleet.replicated_through(&key),
+        None,
+        "nothing shipped yet"
+    );
+    a.fleet.ship_now(&key).await.unwrap();
+    let through = a.fleet.replicated_through(&key).expect("shipped");
+    assert!(through >= committed_at, "{through} < {committed_at}");
+    a.fleet
+        .wait_replicated(&key, committed_at, Duration::ZERO)
+        .await
+        .expect("covered");
+
+    // An unchanged database ships nothing new, and is still covered.
+    a.fleet.ship_now(&key).await.unwrap();
+    assert!(a.fleet.replicated_through(&key) >= Some(through));
+    a.fleet.close_all().await;
+    assert_eq!(a.fleet.replicated_through(&key), None, "closed");
+}

@@ -383,6 +383,71 @@ pub struct FleetReplication {
     /// The time of the last loop pass in milliseconds, [`NO_PASS`] before
     /// it. A shutdown flush does not change it.
     last_pass_ms: AtomicU64,
+    /// Woken after each tick, ship and close, for `wait_replicated`.
+    progress: tokio::sync::Notify,
+}
+
+/// The bound of one database, for [`FleetReplication::replicated_through`].
+enum Bound {
+    /// Every commit at or before it is in the replica.
+    At(DateTime<Utc>),
+    /// Replicated here, but no bound is proved now.
+    Unknown,
+    /// A newer owner fenced the replica.
+    Fenced,
+    /// Not open in this process.
+    NotReplicating,
+}
+
+/// Wakes each `wait_replicated` when dropped, on every return path.
+struct Wake<'a>(&'a tokio::sync::Notify);
+
+impl Drop for Wake<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
+}
+
+/// Longest `wait_replicated` sleeps between two checks with no wake-up.
+const WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// A deadline past any real wait, for a timeout too large to add.
+fn far_future() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(86_400 * 365 * 30)
+}
+
+/// Why [`FleetReplication::wait_replicated`] gave up.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReplicatedWaitError {
+    /// This process does not ship the database: it is not open here, or the
+    /// fleet does not replicate.
+    #[error("fleet database {name} has no replicator in this process")]
+    NotReplicating {
+        /// The database name.
+        name: String,
+    },
+    /// A newer owner fenced the replica. This process ships nothing more.
+    #[error("fleet database {name}: a newer owner fenced the replica")]
+    Fenced {
+        /// The database name.
+        name: String,
+    },
+    /// The replica did not reach the instant in time.
+    #[error(
+        "fleet database {name}: the replica did not reach {committed_at} in {timeout:?} \
+         (replicated through {through:?})"
+    )]
+    TimedOut {
+        /// The database name.
+        name: String,
+        /// The instant the caller waited for.
+        committed_at: DateTime<Utc>,
+        /// How long the caller waited.
+        timeout: Duration,
+        /// The bound when the wait ended.
+        through: Option<DateTime<Utc>>,
+    },
 }
 
 /// The result of one restore check (issue #3235). See
@@ -467,6 +532,7 @@ impl FleetReplication {
             last_restore_check: Mutex::new(None),
             ship_workers: DEFAULT_SHIP_WORKERS,
             last_pass_ms: AtomicU64::new(NO_PASS),
+            progress: tokio::sync::Notify::new(),
         }
     }
 
@@ -1277,6 +1343,7 @@ impl FleetReplication {
 
     /// Tick the open database `key` once.
     fn tick_active(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
+        let _wake = Wake(&self.progress);
         if expired(cutoff()) {
             return;
         }
@@ -1327,6 +1394,7 @@ impl FleetReplication {
         &self,
         key: &FleetDbKey,
     ) -> Result<Option<crate::replication::TickReport>, crate::replication::ReplicationError> {
+        let _wake = Wake(&self.progress);
         let Some(replica) = self.active().get(key).cloned() else {
             return Ok(None);
         };
@@ -1352,6 +1420,7 @@ impl FleetReplication {
     /// Ship the backlog of the closed database `key`, and retire its
     /// replicator when it caught up.
     fn tick_parked(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
+        let _wake = Wake(&self.progress);
         if expired(cutoff()) {
             return;
         }
@@ -1422,6 +1491,105 @@ impl FleetReplication {
     /// Stop the loop after its current tick.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Every transaction committed to `key` at or before the returned
+    /// instant is in the replica, under the database's current generation.
+    ///
+    /// Read the commit time from the app clock after the commit returns.
+    /// The bound assumes a clock that does not step back.
+    ///
+    /// `None` when the database is not open in this process, while another
+    /// process replicates it, while it is fenced, before its first caught-up
+    /// tick, or when no tick has proved that it was caught up. A closed
+    /// database that still ships its backlog answers until it catches up.
+    /// In one generation the bound never moves back.
+    #[must_use]
+    pub fn replicated_through(&self, key: &FleetDbKey) -> Option<DateTime<Utc>> {
+        match self.bound(key) {
+            Bound::At(at) => Some(at),
+            Bound::Unknown | Bound::Fenced | Bound::NotReplicating => None,
+        }
+    }
+
+    /// Wait until the replica of `key` holds every commit at or before
+    /// `committed_at`. A tick wakes the wait. Use it to acknowledge only a
+    /// write that survives a takeover.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicatedWaitError::NotReplicating`] when the database is not open
+    /// in this process, [`ReplicatedWaitError::Fenced`] when a newer owner
+    /// fenced it, [`ReplicatedWaitError::TimedOut`] when `timeout` passed
+    /// first. A timeout does not mean the write is lost.
+    pub async fn wait_replicated(
+        &self,
+        key: &FleetDbKey,
+        committed_at: DateTime<Utc>,
+        timeout: Duration,
+    ) -> Result<(), ReplicatedWaitError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(far_future);
+        loop {
+            // Registered before the check: a tick between the two wakes it.
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let through = match self.bound(key) {
+                Bound::At(at) if at >= committed_at => return Ok(()),
+                Bound::At(at) => Some(at),
+                Bound::Unknown => None,
+                Bound::Fenced => return Err(ReplicatedWaitError::Fenced { name: key.name() }),
+                Bound::NotReplicating => {
+                    return Err(ReplicatedWaitError::NotReplicating { name: key.name() });
+                }
+            };
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(ReplicatedWaitError::TimedOut {
+                    name: key.name(),
+                    committed_at,
+                    timeout,
+                    through,
+                });
+            }
+            // A missed wake-up costs at most one poll.
+            let poll = now
+                .checked_add(WAIT_POLL)
+                .map_or(deadline, |poll| poll.min(deadline));
+            let _ = tokio::time::timeout_at(poll, notified).await;
+        }
+    }
+
+    /// Wake each `wait_replicated`.
+    pub(crate) fn notify_progress(&self) {
+        self.progress.notify_waiters();
+    }
+
+    /// The bound of `key` and why it is missing.
+    fn bound(&self, key: &FleetDbKey) -> Bound {
+        let active = self.active().get(key).cloned();
+        let replica = active.or_else(|| self.parked().get(key).cloned());
+        if let Some(replica) = replica {
+            if replica.fenced.load(Ordering::Acquire) {
+                return Bound::Fenced;
+            }
+            if !replica.owned() {
+                return Bound::Unknown;
+            }
+            return replica
+                .status
+                .replicated_through()
+                .map_or(Bound::Unknown, Bound::At);
+        }
+        match self.current_generation_slot(key) {
+            Some(slot) => slot
+                .track()
+                .replicated_through
+                .map_or(Bound::Unknown, Bound::At),
+            None => Bound::NotReplicating,
+        }
     }
 
     /// Rebuild the replica of `key`, as of `target` (latest when `None`),
@@ -1807,6 +1975,7 @@ impl FleetLifecycle for FleetReplication {
     }
 
     fn on_close(&self, db: &FleetDatabase) {
+        let _wake = Wake(&self.progress);
         let Some(replica) = self.active().remove(db.key()) else {
             return;
         };
@@ -1858,6 +2027,7 @@ impl FleetLifecycle for FleetReplication {
     }
 
     fn release(&self, key: &FleetDbKey) {
+        let _wake = Wake(&self.progress);
         // The files are about to be removed or replaced: a parked replicator
         // must not hold them open, and must ship nothing more.
         let Some(replica) = self.parked().remove(key) else {
@@ -3983,5 +4153,161 @@ mod tests {
             details["closing"], 0,
             "a kept generation is not a parked replicator"
         );
+    }
+
+    // ── replicated_through ──────────────────────────────────────────────────
+
+    fn wall() -> DateTime<Utc> {
+        crate::time::ClockSource::now(&crate::time::SystemClock)
+    }
+
+    #[tokio::test]
+    async fn replicated_through_covers_a_commit_once_a_tick_ships_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(replication.replicated_through(&key), None, "no tick yet");
+
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('one')").await;
+        let committed_at = wall();
+        assert!(
+            replication
+                .replicated_through(&key)
+                .is_none_or(|through| through < committed_at)
+        );
+        tick(&replication).await;
+        let through = replication.replicated_through(&key).expect("caught up");
+        assert!(through >= committed_at, "{through} < {committed_at}");
+        assert_eq!(fleet.replicated_through(&key), Some(through));
+        fleet
+            .wait_replicated(&key, committed_at, Duration::ZERO)
+            .await
+            .expect("already covered: no wait");
+
+        drop(db);
+        fleet.close(&key).await;
+        assert_eq!(
+            replication.replicated_through(&key),
+            None,
+            "a closed database has no replicator here"
+        );
+        assert!(matches!(
+            fleet
+                .wait_replicated(&key, committed_at, Duration::from_millis(50))
+                .await,
+            Err(ReplicatedWaitError::NotReplicating { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_database_another_process_replicates_has_no_bound_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let db_a = a.open(&key).await.unwrap();
+        let _db_b = b.open(&key).await.unwrap();
+        exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&ra).await;
+        tick(&rb).await;
+        assert!(ra.replicated_through(&key).is_some(), "A owns it");
+        assert_eq!(rb.replicated_through(&key), None, "B does not");
+        let waited = rb
+            .wait_replicated(&key, wall(), Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(
+                waited,
+                Err(ReplicatedWaitError::TimedOut { through: None, .. })
+            ),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_replica_answers_until_it_retires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        flaky.down.store(false, Ordering::SeqCst);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&replication).await;
+        let before = replication.replicated_through(&key).expect("caught up");
+
+        // The close cannot ship the last commit: the replicator parks.
+        flaky.down.store(true, Ordering::SeqCst);
+        exec(&db, "INSERT INTO notes VALUES ('late')").await;
+        let committed_at = wall();
+        drop(db);
+        fleet.close(&key).await;
+        assert_eq!(replication.closing(), 1);
+        assert_eq!(
+            replication.replicated_through(&key),
+            Some(before),
+            "a parked replica still answers"
+        );
+
+        // It ships the tail after the close and says so.
+        flaky.down.store(false, Ordering::SeqCst);
+        let replica = replication.parked().get(&key).cloned().unwrap();
+        replica.replicator.lock().unwrap().tick().unwrap();
+        let through = replication.replicated_through(&key).expect("still parked");
+        assert!(through >= committed_at, "{through} < {committed_at}");
+        replication
+            .wait_replicated(&key, committed_at, Duration::ZERO)
+            .await
+            .expect("covered while parked");
+
+        // Retired: nothing answers for it here any more.
+        tick(&replication).await;
+        assert_eq!(replication.closing(), 0);
+        assert_eq!(replication.replicated_through(&key), None);
+    }
+
+    #[tokio::test]
+    async fn wait_replicated_returns_once_a_tick_covers_the_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&replication).await;
+        exec(&db, "INSERT INTO notes VALUES ('one')").await;
+        let committed_at = wall();
+
+        // No tick: the wait times out and names the bound it saw.
+        let waited = replication
+            .wait_replicated(&key, committed_at, Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(
+                &waited,
+                Err(ReplicatedWaitError::TimedOut { through: Some(through), .. })
+                    if *through < committed_at
+            ),
+            "{waited:?}"
+        );
+
+        // A tick on another thread wakes the waiter.
+        let ticker = {
+            let replication = Arc::clone(&replication);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                replication.tick_all();
+            })
+        };
+        replication
+            .wait_replicated(&key, committed_at, NOT_STUCK)
+            .await
+            .expect("the tick covers the commit");
+        ticker.join().unwrap();
+        drop(db);
+        fleet.close_all().await;
     }
 }
