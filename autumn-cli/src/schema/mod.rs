@@ -1280,6 +1280,15 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
     // Renames come first in a plan and depend only on the baseline, so apply
     // them before the name-keyed working set is built.
     let baseline = rename::renamed_baseline(baseline, &plan.changes);
+    // The named schema of each table the plan knows, by bare name.
+    let schemas: BTreeMap<String, String> = baseline
+        .iter()
+        .chain(plan.changes.iter().filter_map(|c| match c {
+            SchemaChange::CreateTable(t) => Some(t),
+            _ => None,
+        }))
+        .filter_map(|t| Some((t.name.clone(), t.schema.clone()?)))
+        .collect();
     // Name-keyed working set cloned from the baseline.
     let mut tables: BTreeMap<String, Table> = baseline
         .iter()
@@ -1292,7 +1301,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
         match change {
             SchemaChange::CreateTable(table) => {
                 let mut table = table.clone();
-                bare_fk_targets(&mut table.columns);
+                bare_fk_targets(&mut table.columns, &schemas);
                 tables.insert(table.name.clone(), table);
             }
             SchemaChange::DropTable(table) => {
@@ -1301,7 +1310,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
             SchemaChange::AddColumn { table, column } => {
                 if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     let mut column = column.clone();
-                    bare_fk_targets(std::slice::from_mut(&mut column));
+                    bare_fk_targets(std::slice::from_mut(&mut column), &schemas);
                     t.columns.push(column);
                 }
             }
@@ -1354,7 +1363,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
             } => {
                 if let Some(c) = column_mut(&mut tables, table, column) {
                     let mut fk = foreign_key.clone();
-                    fk.table = diff::bare_name(&fk.table).to_owned();
+                    unqualify_fk(&mut fk, &schemas);
                     c.references = Some(fk);
                 }
             }
@@ -1411,9 +1420,20 @@ fn column_mut<'a>(
 
 /// The plan names a foreign key target as `schema.table`. A model and the
 /// baseline spell it bare, so the projected snapshot does too.
-fn bare_fk_targets(columns: &mut [Column]) {
+fn bare_fk_targets(columns: &mut [Column], schemas: &BTreeMap<String, String>) {
     for fk in columns.iter_mut().filter_map(|c| c.references.as_mut()) {
-        fk.table = diff::bare_name(&fk.table).to_owned();
+        unqualify_fk(fk, schemas);
+    }
+}
+
+/// Undo the qualification that the plan added: `schema.table` becomes `table`
+/// only when `table` is in `schema`. A target the model wrote with another
+/// schema (`auth.users`) stays as written.
+fn unqualify_fk(fk: &mut autumn_schema_core::ForeignKey, schemas: &BTreeMap<String, String>) {
+    if let Some((schema, bare)) = fk.table.split_once('.')
+        && schemas.get(bare).is_some_and(|s| s == schema)
+    {
+        fk.table = bare.to_owned();
     }
 }
 
@@ -2803,6 +2823,35 @@ mod tests {
             "retained index depending on the dropped column must be pruned: {:?}",
             users.indexes
         );
+    }
+
+    #[test]
+    fn project_plan_target_keeps_an_explicit_cross_schema_fk_target() {
+        use autumn_schema_core::{Column, ColumnType, ForeignKey};
+        let mut posts = Table::new("posts", Backend::Postgres);
+        posts.schema = Some("blog".to_owned());
+        let mut owner = Column::new("owner_id".to_string(), ColumnType::Int64);
+        owner.references = Some(ForeignKey::new("auth.users", "id"));
+        let mut author = Column::new("author_id".to_string(), ColumnType::Int64);
+        author.references = Some(ForeignKey::new("blog.authors", "id"));
+        posts.columns = vec![owner, author];
+        let mut authors = Table::new("authors", Backend::Postgres);
+        authors.schema = Some("blog".to_owned());
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::CreateTable(authors),
+                SchemaChange::CreateTable(posts),
+            ],
+        };
+        let projected = project_plan_target(&[], &plan);
+        let t = projected.iter().find(|t| t.name == "posts").expect("posts");
+        let targets: Vec<&str> = t
+            .columns
+            .iter()
+            .filter_map(|c| c.references.as_ref().map(|f| f.table.as_str()))
+            .collect();
+        assert_eq!(targets, ["auth.users", "authors"]);
     }
 
     #[test]
