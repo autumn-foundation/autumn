@@ -3470,6 +3470,10 @@ mod tests {
             policy.contains("RUSTSEC-2023-0071"),
             "every flavor keeps the default `jwt` feature, so its tree reaches rsa through jsonwebtoken"
         );
+        assert!(
+            policy.contains("RUSTSEC-2026-0459"),
+            "every flavor bundles SQLite through diesel, and no libsqlite3-sys fix can resolve yet"
+        );
     }
 
     /// The advisory policy is generated but deliberately *not* reconciled

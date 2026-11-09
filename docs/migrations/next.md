@@ -222,6 +222,46 @@ from `DatabaseFleet::stats`.
 
 ---
 
+### Fleet: `max_open_policy` adds a field and an error
+
+**Why:** an app can make `max_open` a hard limit (issue #3538).
+`DatabaseFleetConfig` has a new field `max_open_policy`. `FleetError` has a
+new variant `AtCapacity` (`503`). `FleetStats` has the new fields `peak_open`,
+`over_cap_opens_total` and `refused_total`.
+
+**You are affected only if your code builds a `DatabaseFleetConfig` with a
+struct literal and no `..` spread, or matches `FleetError` without a
+wildcard arm.** TOML and `AUTUMN_*` config need no change: the default
+`"soft"` keeps the old behavior.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    // ...every other field...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    max_open_policy: FleetMaxOpenPolicy::Soft,
+    // ...every other field...
+}
+```
+
+**Automation:** `manual` — add `max_open_policy: FleetMaxOpenPolicy::Soft`,
+and a `FleetError::AtCapacity { .. }` arm (it answers `503`).
+
+---
+
 ### Fleet: `ShipMode::Continuous` carries a shipper
 
 **Why:** core ships the databases of every engine and checks the fence

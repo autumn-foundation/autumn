@@ -91,6 +91,7 @@
 //! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_OPEN` | `database.fleet.max_open` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY` | `database.fleet.max_open_policy` | `soft` / `wait` / `refuse` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES` | `database.fleet.max_resident_bytes` | `u64` |
 //! | `AUTUMN_DATABASE__FLEET__MIN_RESIDENCY` | `database.fleet.min_residency` | duration; empty is `2s` |
 //! | `AUTUMN_DATABASE__FLEET__POOL_SIZE` | `database.fleet.pool_size` | `usize` |
@@ -8623,6 +8624,11 @@ impl AutumnConfig {
         parse_env(env, "AUTUMN_DATABASE__FLEET__ROOT", &mut fleet.root);
         parse_env_option_string(env, "AUTUMN_DATABASE__FLEET__PATH", &mut fleet.path);
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_OPEN", &mut fleet.max_open);
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY",
+            &mut fleet.max_open_policy,
+        );
         let budget = &mut fleet.max_resident_bytes;
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES", budget);
         let mut residency = Some(fleet.min_residency);
@@ -12193,6 +12199,61 @@ pub struct DatabaseConfig {
     pub roles: std::collections::BTreeMap<String, crate::db_roles::DatabaseRoleConfig>,
 }
 
+/// What an open does when the fleet already holds `max_open` databases.
+///
+/// The fleet does not close a database that is in use or that was used within
+/// [`min_residency`](DatabaseFleetConfig::min_residency). The cap applies to
+/// opens for requests. A background open never passes it, with any policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetMaxOpenPolicy {
+    /// Open anyway. `max_open` is a soft limit that a burst can pass. The
+    /// sweeper closes the extra databases after the burst. This is the default.
+    #[default]
+    Soft,
+    /// Wait for a free slot, for at most `connect_timeout_secs`. Then answer
+    /// `503`. The count of open and closing databases never passes `max_open`.
+    Wait,
+    /// Answer `503` with `Retry-After` at once when no idle database can
+    /// close. If one can close, wait for that close, for at most
+    /// `connect_timeout_secs`. The count of open and closing databases never
+    /// passes `max_open`.
+    Refuse,
+}
+
+impl FleetMaxOpenPolicy {
+    /// The name used in `autumn.toml` and in the environment.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::Wait => "wait",
+            Self::Refuse => "refuse",
+        }
+    }
+}
+
+impl std::fmt::Display for FleetMaxOpenPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FleetMaxOpenPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "soft" => Ok(Self::Soft),
+            "wait" => Ok(Self::Wait),
+            "refuse" => Ok(Self::Refuse),
+            other => Err(format!(
+                "expected `soft`, `wait` or `refuse`, got {other:?}"
+            )),
+        }
+    }
+}
+
 /// `[database.fleet]`: one `SQLite` database per tenant or per routing slot.
 ///
 /// ```toml
@@ -12227,16 +12288,48 @@ pub struct DatabaseFleetConfig {
     ///
     /// Past this, the sweeper closes the least recently used idle database.
     /// It does not close a database that is in use or that was used within
-    /// [`min_residency`](Self::min_residency), and an open never waits for
-    /// room. Thus a burst across many keys can open more databases than this
-    /// value. The count decreases when the burst stops.
+    /// [`min_residency`](Self::min_residency). With `max_open_policy = "soft"`,
+    /// an open never waits for room. Thus a burst across many keys can open
+    /// more databases than this value. The count decreases when the burst
+    /// stops. See [`max_open_policy`](Self::max_open_policy) for a hard limit.
     ///
     /// Each open database holds up to [`pool_size`](Self::pool_size)
     /// connections, and about `2 × pool_size + 1` file descriptors (the
-    /// database and `-wal` per connection, one `-shm`). Set the open-file
-    /// limit (`ulimit -n`) for the peak count, not for this value.
+    /// database and `-wal` per connection, one `-shm`). With the `"soft"`
+    /// policy, set the open-file limit (`ulimit -n`) for the peak count, not
+    /// for this value.
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
+
+    /// What an open does when the fleet already holds
+    /// [`max_open`](Self::max_open) databases. Default: `"soft"`.
+    ///
+    /// - `"soft"`: open anyway (see `max_open`).
+    /// - `"wait"`: wait for a free slot, for at most `connect_timeout_secs`,
+    ///   then answer `503`.
+    /// - `"refuse"`: answer `503` with `Retry-After` at once when no idle
+    ///   database can close. If one can close, wait for that close, for at
+    ///   most `connect_timeout_secs`.
+    ///
+    /// With `"wait"` or `"refuse"`, the count of open and closing databases
+    /// never passes `max_open`. The fleet databases then hold at most
+    /// `max_open × (2 × pool_size + 1)` file descriptors. Replicas, the
+    /// control database and sockets use more.
+    ///
+    /// The fleet keeps a database open while it is in use or was used within
+    /// [`min_residency`](Self::min_residency). A burst of new keys gets `503`
+    /// until that time ends. `Retry-After` is `min_residency` rounded up to
+    /// whole seconds (from 1 to 30).
+    ///
+    /// The cap counts a request for any key, also one that does not exist.
+    /// Check the tenant id before you open its database. With `"wait"`, set a
+    /// request limit too: a parked request holds its task for the timeout.
+    ///
+    /// This policy does not apply to
+    /// [`max_resident_bytes`](Self::max_resident_bytes). With `"wait"` and
+    /// `"refuse"`, a database that is too large stays open.
+    #[serde(default)]
+    pub max_open_policy: FleetMaxOpenPolicy,
 
     /// A soft limit, in bytes, on the memory of the open databases. Default:
     /// `0` (no limit).
@@ -12244,8 +12337,8 @@ pub struct DatabaseFleetConfig {
     /// Each engine reports the memory of one open database. The `SQLite`
     /// engine counts about 2 MB of page cache for each connection. Above the
     /// limit, the fleet closes the least recently used idle database. The
-    /// rules are the same as for [`max_open`](Self::max_open). The fleet
-    /// keeps one database open, also when it alone is above the limit.
+    /// rules are the same as for [`max_open`](Self::max_open) with the
+    /// `"soft"` policy. The fleet keeps one database open, also when it alone is above the limit.
     /// While the budget is full, a background open gets no room.
     #[serde(default)]
     pub max_resident_bytes: u64,
@@ -12546,6 +12639,7 @@ const fn default_fleet_section(
         max_open: default_fleet_max_open(),
         max_resident_bytes: 0,
         min_residency: default_fleet_min_residency(),
+        max_open_policy: FleetMaxOpenPolicy::Soft,
         pool_size: default_fleet_pool_size(),
         create_on_demand: None,
         idle_close_secs: default_fleet_idle_close_secs(),
@@ -12736,9 +12830,11 @@ pub(crate) fn open_files_warning(
     Some(format!(
         "SQLite may keep about {files} files open at database.fleet.max_open, near \
          the open-file limit of {limit} (ulimit -n). The process also needs files \
-         for sockets and logs. database.fleet.max_open is a soft limit: a burst \
-         opens more. Increase ulimit -n. Or decrease database.fleet.max_open, \
-         database.fleet.pool_size or database.pool_size. Set \
+         for sockets and logs. With max_open_policy = \"soft\", \
+         database.fleet.max_open is a soft limit: a burst opens more. Use \
+         \"wait\" or \"refuse\" to bound the count. Increase ulimit -n. Or \
+         decrease database.fleet.max_open, database.fleet.pool_size or \
+         database.pool_size. Set \
          database.max_connections_warn_threshold = 0 to silence."
     ))
 }
@@ -23044,6 +23140,7 @@ path = "/healthz"
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         }
@@ -23546,6 +23643,75 @@ path = "/healthz"
             config.database.fleet.unwrap().min_residency,
             std::time::Duration::from_secs(2),
             "an empty value is the default"
+        );
+    }
+
+    #[test]
+    fn fleet_max_open_policy_default_parse_and_env() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+        };
+        let policy = |extra: &str| {
+            parse(extra)
+                .unwrap()
+                .database
+                .fleet
+                .unwrap()
+                .max_open_policy
+        };
+        assert_eq!(policy(""), FleetMaxOpenPolicy::Soft);
+        assert_eq!(
+            policy("max_open_policy = \"wait\""),
+            FleetMaxOpenPolicy::Wait
+        );
+        assert_eq!(
+            policy("max_open_policy = \"refuse\""),
+            FleetMaxOpenPolicy::Refuse
+        );
+        assert!(parse("max_open_policy = \"hard\"").is_err());
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY", "refuse");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().max_open_policy,
+            FleetMaxOpenPolicy::Refuse
+        );
+    }
+
+    #[test]
+    fn fleet_max_open_policy_names_round_trip() {
+        for policy in [
+            FleetMaxOpenPolicy::Soft,
+            FleetMaxOpenPolicy::Wait,
+            FleetMaxOpenPolicy::Refuse,
+        ] {
+            assert_eq!(policy.to_string(), policy.as_str());
+            assert_eq!(
+                format!(" {policy} ").parse::<FleetMaxOpenPolicy>(),
+                Ok(policy)
+            );
+        }
+        let error = "hard".parse::<FleetMaxOpenPolicy>().unwrap_err();
+        assert!(
+            error.contains("soft") && error.contains("refuse"),
+            "{error}"
+        );
+        // An invalid env value is ignored: the default stays.
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "slot")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY", "hard");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().max_open_policy,
+            FleetMaxOpenPolicy::Soft
         );
     }
 

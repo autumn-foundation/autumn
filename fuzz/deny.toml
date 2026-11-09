@@ -28,6 +28,13 @@ unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
+    # RUSTSEC-2026-0459 — SQLite before 3.54.0 can return uninitialized
+    # page-cache memory when a process opens a database file together with a
+    # sibling `-wal` file of a different page size. Same ingress and same
+    # verdict as the root `deny.toml`: libsqlite3-sys 0.38.2 via diesel and
+    # autumn-web. The fix needs libsqlite3-sys >= 0.39.0, which diesel 2.3.14
+    # caps. No fuzz target opens a database file. Review-by: 2026-11-16.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite < 3.54.0 (uninitialized memory with a foreign -wal); same verdict as root deny.toml; fix needs libsqlite3-sys >= 0.39.0 but diesel 2.3.14 caps it below 0.39; no fuzz target opens a database file; review-by 2026-11-16" },
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
     # Same ingress and same verdict as the root `deny.toml`: rsa 0.9.10 ->
     # jsonwebtoken -> autumn-web -> autumn-fuzz (this crate pulls in the same

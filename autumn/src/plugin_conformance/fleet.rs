@@ -168,6 +168,7 @@ fn config(root: &Path) -> DatabaseFleetConfig {
         max_open: 64,
         max_resident_bytes: 0,
         min_residency: Duration::ZERO,
+        max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
         pool_size: 2,
         create_on_demand: Some(true),
         idle_close_secs: 0,
