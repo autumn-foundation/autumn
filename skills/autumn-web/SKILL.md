@@ -3233,8 +3233,12 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   bytes, and return the stamp from `epoch_stamp`. `ShipMode::Rebuild` ships
   nothing: `restore_latest` calls `FleetEngine::rebuild`. Operators:
   `fleet.ship_now(&key)`, `fleet.restore_latest(&key)`. `FleetStats` has
-  `ship_mode` and `rpo_secs`. Guide: "Shipping a plugin engine" in
-  `docs/guide/sqlite-fleet.md`.
+  `ship_mode` and `rpo_secs`. A close-time generation that did not ship
+  stays as unshipped work: the replication loop (`spawn_loop`) and the
+  shutdown flush ship it again, and `release_ownership` lets the ranges
+  lapse until then. Watch `replication:fleet` `unshipped` and
+  `FleetReplication::unshipped_generations()`. Do not write your own retry.
+  Guide: "Shipping a plugin engine" in `docs/guide/sqlite-fleet.md`.
 - Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
   databases, also closed ones (issue #3234). Write outbox rows in a
   transaction on the tenant connection: the write records the database in

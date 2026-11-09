@@ -167,8 +167,10 @@ pub trait FleetEngine: Send + Sync + 'static {
     /// `dir/<file name of path>`. Returns every file it wrote.
     ///
     /// In [`ShipMode::Generations`], core also calls it with a closed
-    /// `handle`, for the last generation of a close. Every use has ended:
-    /// copy the files at `path`.
+    /// `handle`: for the last generation of a close, and later to ship a
+    /// close that did not ship. Every use in this process has ended, and
+    /// opens wait for the copy: copy the files at `path`. Another process
+    /// on the volume can still have the database open.
     ///
     /// # Errors
     ///

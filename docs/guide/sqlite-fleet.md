@@ -806,7 +806,7 @@ the [cell router](cell-isolation.md).
 | Lease length | A lease never ends earlier than an older call set it. If you make `lease_secs` shorter, the new length applies when the old lease ends. |
 | Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after it sent its last renew. This is before the lease in the table ends. |
 | Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. Before each write to the replica, core reads the epochs at the destination: one list for each put. If it finds a newer epoch, the write is refused, the replicator stops, and the host loses the range. |
-| Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped. The next owner can then claim them at once. In all other cases, the leases end on their own. |
+| Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped: no parked WAL replicator, and no closed database whose last generation did not ship. The next owner can then claim them at once. In all other cases, the leases end on their own. |
 
 The ownership table is `_autumn_fleet_slot_owners` on the control database.
 All hosts of the fleet must use the same table. The control database is a
@@ -1058,6 +1058,17 @@ A generation of `Generations` mode is these objects:
 - **Epoch marker.** A new owner writes its epoch marker when it opens the
   database, before its first generation. From then on, each write of the
   old owner is refused.
+- **Close.** The last generation ships at close. If that ship fails, or
+  the shutdown cutoff passed, core keeps the database as unshipped work.
+  A close after a lapse of this host's lease keeps it too. The
+  replication loop (`FleetReplication::spawn_loop`) tries the ship again
+  on each pass. The shutdown flush tries it within its budget. A ship
+  that works drops it. A delete, a restore or a newer epoch also drops
+  it. Then nothing ships for it. A delete or a restore that fails keeps
+  it. While the database is open, the loop does not try it: a ship of the
+  open database drops it. During the snapshot of a retry, opens wait.
+  Until it ships, `release_ownership` lets the ranges lapse. The
+  `replication:fleet` health details name it in `unshipped`.
 - **Snapshot shape.** A snapshot is one database: one file, or one
   directory of files. Core refuses two paths that are the same.
 - **Operators.** `DatabaseFleet::ship_now(key)` ships an open database now.

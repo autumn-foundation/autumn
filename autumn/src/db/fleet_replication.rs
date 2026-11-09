@@ -39,7 +39,7 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -259,6 +259,64 @@ impl ReplicaLock {
     }
 }
 
+/// What a retry of an [`UnshippedGeneration`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GenerationRetry {
+    /// The generation shipped, or the destination has the same files.
+    Shipped,
+    /// A fence or a retire refused it. Nothing ships for it.
+    Retired,
+    /// The key is open or draining. The retry waits.
+    Busy,
+    /// The ship failed. The next pass tries again.
+    Failed(String),
+}
+
+/// Ships an [`UnshippedGeneration`] once. Blocking: call it only on a
+/// blocking thread, never in an async task.
+pub(crate) type RetryShip = Box<dyn Fn() -> GenerationRetry + Send + Sync>;
+
+/// A closed database in `generations` mode whose last generation did not
+/// ship. Its files stay at `path`.
+pub(crate) struct UnshippedGeneration {
+    path: PathBuf,
+    epoch: Option<u64>,
+    /// Set by a delete, a restore or a fence. The ship then refuses each put.
+    retired: Arc<AtomicBool>,
+    /// The slot whose upload lock a ship of `retry` holds. A purge waits
+    /// for it.
+    upload: Option<Arc<GenerationSlot>>,
+    /// Held for one retry. A second pass skips a busy record.
+    busy: Mutex<()>,
+    /// The order in which records were kept. See
+    /// [`FleetReplication::generation_mark`].
+    seq: u64,
+    retry: RetryShip,
+}
+
+impl UnshippedGeneration {
+    /// The record of the database at `path`, closed under `epoch`. The
+    /// ship of `retry` must stop when `retired` is set, and hold the upload
+    /// lock of `upload` for its puts.
+    pub(crate) fn new(
+        path: PathBuf,
+        epoch: Option<u64>,
+        retired: Arc<AtomicBool>,
+        upload: Option<Arc<GenerationSlot>>,
+        retry: RetryShip,
+    ) -> Self {
+        Self {
+            path,
+            epoch,
+            retired,
+            upload,
+            busy: Mutex::new(()),
+            seq: 0,
+            retry,
+        }
+    }
+}
+
 /// Replicates the open databases of one fleet. Installed by
 /// [`DatabaseFleet::install_replication`](super::fleet::DatabaseFleet::install_replication).
 pub struct FleetReplication {
@@ -293,6 +351,14 @@ pub struct FleetReplication {
     ship: std::sync::OnceLock<ShipInfo>,
     /// The ship slot of each open database in `generations` mode.
     generation_slots: Mutex<HashMap<FleetDbKey, Arc<GenerationSlot>>>,
+    /// Closed databases in `generations` mode whose last generation did not
+    /// ship. The loop and the shutdown flush ship them again.
+    unshipped_generations: Mutex<HashMap<FleetDbKey, Arc<UnshippedGeneration>>>,
+    /// Kept generations that a delete or a restore released. They do not
+    /// ship. A delete or a restore that fails puts them back.
+    released_generations: Mutex<HashMap<FleetDbKey, Arc<UnshippedGeneration>>>,
+    /// The `seq` of the next kept generation.
+    next_kept_seq: AtomicU64,
     /// The tombstone rows of deleted databases (issue #3235). `None`: a
     /// failed purge is not retried.
     tombstones: Option<Arc<FleetTombstones>>,
@@ -388,6 +454,9 @@ impl FleetReplication {
             known_hook: Arc::new(Mutex::new(None)),
             ship: std::sync::OnceLock::new(),
             generation_slots: Mutex::new(HashMap::new()),
+            unshipped_generations: Mutex::new(HashMap::new()),
+            released_generations: Mutex::new(HashMap::new()),
+            next_kept_seq: AtomicU64::new(0),
             tombstones: None,
             retention_after_delete: Duration::ZERO,
             restore_check: None,
@@ -674,10 +743,10 @@ impl FleetReplication {
         Duration::from_millis(self.final_flush_ms.load(Ordering::Acquire))
     }
 
-    /// Tick until no replicator is parked, or until `deadline` passes.
-    /// This call blocks. It returns the names still unshipped. Each one is
-    /// logged with `error!`. The call replaces the `unshipped` list in the
-    /// health details.
+    /// Tick until no replicator is parked and no kept generation is left,
+    /// or until `deadline` passes. This call blocks. It returns the names
+    /// still unshipped. Each one is logged with `error!`. The call replaces
+    /// the `unshipped` list in the health details.
     ///
     /// The deadline uses real elapsed time, ticks included. A pinned or
     /// virtual clock cannot make the loop run forever. No tick starts after
@@ -697,19 +766,28 @@ impl FleetReplication {
                 break;
             }
             self.tick_pass(&|| cutoff);
-            if self.closing() == 0 {
+            // A released generation waits for its delete or restore.
+            if self.closing() == 0 && self.records().is_empty() {
                 break;
             }
             std::thread::sleep(FLUSH_RETRY.min(deadline.saturating_sub(started.elapsed())));
         }
         let mut unshipped: Vec<String> = self.parked().keys().map(FleetDbKey::name).collect();
-        unshipped.sort();
         for name in &unshipped {
             tracing::error!(
                 database = %name,
                 "fleet shutdown: committed WAL is not shipped and stays on this volume"
             );
         }
+        for name in self.unshipped_generation_names() {
+            tracing::error!(
+                database = %name,
+                "fleet shutdown: the last generation is not shipped and stays on this volume"
+            );
+            unshipped.push(name);
+        }
+        unshipped.sort();
+        unshipped.dedup();
         self.unshipped
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -819,6 +897,14 @@ impl FleetReplication {
         // worker of its open drops it.
         let slot = self.current_generation_slot(key);
         if let Some(slot) = slot {
+            slot.wait_upload();
+        }
+        // So does the retry of a kept generation that was released.
+        let kept = self
+            .released_records()
+            .get(key)
+            .and_then(|record| record.upload.clone());
+        if let Some(slot) = kept {
             slot.wait_upload();
         }
     }
@@ -960,6 +1046,152 @@ impl FleetReplication {
         self.parked().len()
     }
 
+    /// Closed databases whose last generation did not ship. Each one makes
+    /// `release_ownership` let the ranges lapse.
+    #[must_use]
+    pub fn unshipped_generations(&self) -> usize {
+        self.unshipped_generation_names().len()
+    }
+
+    fn released_records(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<UnshippedGeneration>>> {
+        self.released_generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn records(&self) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<UnshippedGeneration>>> {
+        self.unshipped_generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep `record` of `key` until a ship or a retire drops it. It
+    /// replaces an older record: the files at the path hold its writes.
+    pub(crate) fn keep_unshipped_generation(
+        &self,
+        key: &FleetDbKey,
+        mut record: UnshippedGeneration,
+    ) {
+        tracing::warn!(
+            database = %key,
+            path = %record.path.display(),
+            epoch = ?record.epoch,
+            "fleet generation: the last generation of the close did not ship; it is kept and ships later"
+        );
+        record.seq = self.next_kept_seq.fetch_add(1, Ordering::AcqRel);
+        self.records().insert(key.clone(), Arc::new(record));
+    }
+
+    /// A mark to take before a ship starts. A record kept after it can hold
+    /// writes the ship does not.
+    pub(crate) fn generation_mark(&self) -> u64 {
+        self.next_kept_seq.load(Ordering::Acquire)
+    }
+
+    /// A ship of `key` that started at `mark` worked: its files hold the
+    /// writes of a record kept before `mark`. A later record stays.
+    pub(crate) fn drop_unshipped_generation(&self, key: &FleetDbKey, mark: u64) {
+        let mut records = self.records();
+        if records.get(key).is_some_and(|record| record.seq < mark) {
+            records.remove(key);
+            drop(records);
+            tracing::info!(database = %key, "fleet generation: the kept generation shipped");
+        }
+    }
+
+    /// A delete or a restore of `key` starts: its kept generation stops
+    /// shipping. It still counts as unshipped until
+    /// [`settle_released_generation`](Self::settle_released_generation).
+    pub(crate) fn release_unshipped_generation(&self, key: &FleetDbKey) {
+        let removed = self.records().remove(key);
+        if let Some(record) = removed {
+            record.retired.store(true, Ordering::Release);
+            self.released_records().insert(key.clone(), record);
+        }
+    }
+
+    /// A delete or a restore of `key` ended. `replaced`: the files are gone
+    /// or replaced, so the kept generation goes and nothing ships for it.
+    /// Otherwise the files stay, and it ships again.
+    pub(crate) fn settle_released_generation(&self, key: &FleetDbKey, replaced: bool) {
+        let Some(record) = self.released_records().remove(key) else {
+            return;
+        };
+        if replaced {
+            tracing::info!(database = %key, "fleet generation: a delete or a restore replaced the kept generation; it does not ship");
+            return;
+        }
+        record.retired.store(false, Ordering::Release);
+        self.records().entry(key.clone()).or_insert(record);
+        tracing::warn!(database = %key, "fleet generation: the delete or the restore failed; the kept generation ships again");
+    }
+
+    /// The names of the kept generations, released ones too, sorted.
+    fn unshipped_generation_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.records().keys().map(FleetDbKey::name).collect();
+        names.extend(self.released_records().keys().map(FleetDbKey::name));
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Ship the kept generation of `key` once. A pass that finds it busy
+    /// skips it.
+    fn retry_unshipped(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
+        if expired(cutoff()) {
+            return;
+        }
+        let Some(record) = self.records().get(key).cloned() else {
+            return;
+        };
+        let _busy = match record.busy.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        // A ship or a retire dropped it, or a new close replaced it.
+        let current = self
+            .records()
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, &record));
+        if !current {
+            return;
+        }
+        if record.retired.load(Ordering::Acquire) {
+            // Nothing ships for it any more.
+            self.forget_record(key, &record);
+            return;
+        }
+        // A panic in a retry must not stop the loop thread.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (record.retry)()))
+            .unwrap_or_else(|_| GenerationRetry::Failed("the retry panicked".to_owned()));
+        match outcome {
+            GenerationRetry::Shipped => self.forget_record(key, &record),
+            GenerationRetry::Retired => {
+                record.retired.store(true, Ordering::Release);
+                self.forget_record(key, &record);
+                tracing::info!(database = %key, "fleet generation: a fence retired the kept generation; it does not ship");
+            }
+            GenerationRetry::Busy => {}
+            GenerationRetry::Failed(error) => {
+                tracing::warn!(database = %key, %error, "fleet generation: the kept generation did not ship; the next pass tries again");
+            }
+        }
+    }
+
+    /// Drop `record` of `key` when it is still the current one.
+    fn forget_record(&self, key: &FleetDbKey, record: &Arc<UnshippedGeneration>) {
+        let mut records = self.records();
+        if records
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, record))
+        {
+            records.remove(key);
+        }
+    }
+
     fn all_replicas(&self) -> Vec<(FleetDbKey, Arc<ActiveReplica>)> {
         let mut replicas: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
             .active()
@@ -1022,6 +1254,10 @@ impl FleetReplication {
         let parked: Vec<FleetDbKey> = self.parked().keys().cloned().collect();
         for_each_on(self.ship_workers, &parked, |key| {
             self.tick_parked(key, cutoff);
+        });
+        let kept: Vec<FleetDbKey> = self.records().keys().cloned().collect();
+        for_each_on(self.ship_workers, &kept, |key| {
+            self.retry_unshipped(key, cutoff);
         });
     }
 
@@ -1153,7 +1389,7 @@ impl FleetReplication {
     /// Run the loop on a dedicated thread until [`stop`](Self::stop). A pass
     /// starts every `sync_interval`, or at once when the last pass took
     /// longer. The final ship of each database happens when it closes, not
-    /// here.
+    /// here. A final generation that did not ship ships again here.
     ///
     /// # Errors
     ///
@@ -1277,14 +1513,16 @@ impl FleetReplication {
             .collect();
         details.insert("lock_failures".to_owned(), lock_failures.len().into());
         details.insert("failing".to_owned(), failing.into());
-        details.insert(
-            "unshipped".to_owned(),
-            self.unshipped
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-                .into(),
-        );
+        // The last flush, and each generation kept now.
+        let mut unshipped = self
+            .unshipped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        unshipped.extend(self.unshipped_generation_names());
+        unshipped.sort();
+        unshipped.dedup();
+        details.insert("unshipped".to_owned(), unshipped.into());
         details.insert("pending_bytes".to_owned(), pending_bytes.into());
         details.insert(
             "lag_alert_after_seconds".to_owned(),
@@ -3521,5 +3759,229 @@ mod tests {
             expected.sort();
             proptest::prop_assert_eq!(seen, expected);
         }
+
+        #[test]
+        fn kept_generations_follow_their_model(
+            ops in proptest::collection::vec((0_u8..5, 0_u16..4, 0_u8..4), 0..48)
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let replication = kept_replication(tmp.path());
+            // The model: each kept key, and the next retry outcome of each.
+            let mut model: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+            let outcomes: HashMap<u16, Arc<Mutex<GenerationRetry>>> = (0..4)
+                .map(|slot| (slot, Arc::new(Mutex::new(GenerationRetry::Busy))))
+                .collect();
+            let mut flags: HashMap<u16, Arc<AtomicBool>> = HashMap::new();
+            // Retry calls of each slot: a dropped record is never retried.
+            let calls: HashMap<u16, Arc<AtomicU64>> =
+                (0..4).map(|slot| (slot, Arc::new(AtomicU64::new(0)))).collect();
+            for (op, slot, outcome) in ops {
+                let key = FleetDbKey::Slot(slot);
+                match op {
+                    // A failed close keeps it.
+                    0 => {
+                        let retired = Arc::new(AtomicBool::new(false));
+                        let next = Arc::clone(&outcomes[&slot]);
+                        let count = Arc::clone(&calls[&slot]);
+                        replication.keep_unshipped_generation(
+                            &key,
+                            UnshippedGeneration::new(
+                                PathBuf::from(format!("db-{slot}")),
+                                None,
+                                Arc::clone(&retired),
+                                None,
+                                Box::new(move || {
+                                    count.fetch_add(1, Ordering::SeqCst);
+                                    next.lock().unwrap().clone()
+                                }),
+                            ),
+                        );
+                        flags.insert(slot, retired);
+                        model.insert(slot);
+                    }
+                    // A ship of the open database.
+                    1 => {
+                        let mark = replication.generation_mark();
+                        replication.drop_unshipped_generation(&key, mark);
+                        model.remove(&slot);
+                    }
+                    // A delete or a restore.
+                    2 => {
+                        replication.release_unshipped_generation(&key);
+                        if model.contains(&slot) {
+                            proptest::prop_assert!(flags[&slot].load(Ordering::Acquire));
+                        }
+                        // A failed delete or restore puts it back.
+                        let replaced = outcome % 2 == 0;
+                        replication.settle_released_generation(&key, replaced);
+                        if replaced {
+                            model.remove(&slot);
+                        } else if model.contains(&slot) {
+                            proptest::prop_assert!(!flags[&slot].load(Ordering::Acquire));
+                        }
+                    }
+                    // Set the next retry outcome.
+                    3 => {
+                        *outcomes[&slot].lock().unwrap() = match outcome {
+                            0 => GenerationRetry::Shipped,
+                            1 => GenerationRetry::Retired,
+                            2 => GenerationRetry::Busy,
+                            _ => GenerationRetry::Failed("down".to_owned()),
+                        };
+                    }
+                    // One loop pass.
+                    _ => {
+                        let before: HashMap<u16, u64> = calls
+                            .iter()
+                            .map(|(slot, count)| (*slot, count.load(Ordering::SeqCst)))
+                            .collect();
+                        replication.tick_all();
+                        for (slot, count) in &calls {
+                            let made = count.load(Ordering::SeqCst) - before[slot];
+                            let expected = u64::from(model.contains(slot));
+                            proptest::prop_assert_eq!(made, expected, "one retry per kept key");
+                        }
+                        let gone: Vec<u16> = model
+                            .iter()
+                            .copied()
+                            .filter(|slot| matches!(
+                                *outcomes[slot].lock().unwrap(),
+                                GenerationRetry::Shipped | GenerationRetry::Retired
+                            ))
+                            .collect();
+                        for slot in gone {
+                            if matches!(*outcomes[&slot].lock().unwrap(), GenerationRetry::Retired) {
+                                proptest::prop_assert!(flags[&slot].load(Ordering::Acquire));
+                            }
+                            model.remove(&slot);
+                        }
+                    }
+                }
+                proptest::prop_assert_eq!(replication.unshipped_generations(), model.len());
+                let names: Vec<String> =
+                    model.iter().map(|slot| FleetDbKey::Slot(*slot).name()).collect();
+                proptest::prop_assert_eq!(replication.unshipped_generation_names(), names);
+            }
+        }
+    }
+
+    fn kept_replication(dir: &Path) -> FleetReplication {
+        FleetReplication::new(
+            Arc::new(FileDestination::new(dir.join("replicas")).unwrap()),
+            settings(),
+            Duration::from_secs(30),
+            false,
+            Arc::new(crate::time::SystemClock),
+        )
+    }
+
+    #[test]
+    fn a_busy_record_is_skipped_by_a_second_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = Arc::new(kept_replication(tmp.path()));
+        let key = FleetDbKey::Slot(1);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (go, leave) = std::sync::mpsc::channel::<()>();
+        let leave = Mutex::new(leave);
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&calls);
+        replication.keep_unshipped_generation(
+            &key,
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let _ = entered.send(());
+                    let _ = leave.lock().unwrap().recv_timeout(Duration::from_secs(30));
+                    GenerationRetry::Shipped
+                }),
+            ),
+        );
+        let first = {
+            let replication = Arc::clone(&replication);
+            std::thread::spawn(move || replication.tick_all())
+        };
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The first pass holds the record: this pass skips it.
+        replication.tick_all();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        go.send(()).unwrap();
+        first.join().unwrap();
+        assert_eq!(replication.unshipped_generations(), 0);
+    }
+
+    #[test]
+    fn a_ship_drops_only_a_record_kept_before_it_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = kept_replication(tmp.path());
+        let key = FleetDbKey::Slot(1);
+        let record = || {
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(|| GenerationRetry::Busy),
+            )
+        };
+        replication.keep_unshipped_generation(&key, record());
+        let mark = replication.generation_mark();
+        // A reopen and a second close during the ship keep a new record.
+        replication.keep_unshipped_generation(&key, record());
+        replication.drop_unshipped_generation(&key, mark);
+        assert_eq!(
+            replication.unshipped_generations(),
+            1,
+            "the ship does not hold the writes of the later close"
+        );
+        let later = replication.generation_mark();
+        replication.drop_unshipped_generation(&key, later);
+        assert_eq!(replication.unshipped_generations(), 0);
+    }
+
+    #[test]
+    fn a_panicking_retry_keeps_the_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = kept_replication(tmp.path());
+        replication.keep_unshipped_generation(
+            &FleetDbKey::Slot(1),
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(|| panic!("a broken retry")),
+            ),
+        );
+        replication.tick_all();
+        assert_eq!(replication.unshipped_generations(), 1);
+    }
+
+    #[test]
+    fn health_names_each_kept_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = kept_replication(tmp.path());
+        replication.keep_unshipped_generation(
+            &FleetDbKey::Slot(2),
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                Some(3),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(|| GenerationRetry::Failed("down".to_owned())),
+            ),
+        );
+        let details = replication.health().details;
+        assert_eq!(
+            details["unshipped"],
+            serde_json::json!([FleetDbKey::Slot(2).name()])
+        );
+        assert_eq!(
+            details["closing"], 0,
+            "a kept generation is not a parked replicator"
+        );
     }
 }
