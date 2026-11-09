@@ -1,0 +1,70 @@
+--- pg_stat_statements: notifications statements (buffers = hit+read)
+ calls | buffers |  hit  | read | temp_w | rows | pct_buffers | pct_calls |                                             q                                              
+-------+---------+-------+------+--------+------+-------------+-----------+--------------------------------------------------------------------------------------------
+   100 |   31803 | 31803 |    0 |      0 | 1050 |        52.6 |      50.0 | SELECT id, tenant_id, recipient_id, kind, payload, read_at, created_at FROM notifications 
+   100 |   28653 | 28653 |    0 |      0 |  100 |        47.4 |      50.0 | SELECT COUNT(*) FROM notifications WHERE tenant_id = $1 AND recipient_id = $2 AND read_at 
+(2 rows)
+
+--- EXPLAIN (heavy recipient): unread_count
+                                                                        QUERY PLAN                                                                         
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=14180.46..14180.47 rows=1 width=8) (actual time=2.885..2.886 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=545
+   ->  Bitmap Heap Scan on public.notifications  (cost=316.31..14176.33 rows=1653 width=0) (actual time=0.793..2.876 rows=20 loops=1)
+         Recheck Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1))
+         Filter: (notifications.read_at IS NULL)
+         Rows Removed by Filter: 19980
+         Heap Blocks: exact=527
+         Buffers: shared hit=545
+         ->  Bitmap Index Scan on idx_notifications_tenant_recipient  (cost=0.00..315.89 rows=21147 width=0) (actual time=0.582..0.582 rows=20000 loops=1)
+               Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1))
+               Buffers: shared hit=18
+ Query Identifier: -7309081918138765180
+ Planning Time: 0.066 ms
+ Execution Time: 2.919 ms
+(15 rows)
+
+--- EXPLAIN (heavy recipient): unread page
+                                                                            QUERY PLAN                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..353.02 rows=20 width=163) (actual time=0.015..2.744 rows=20 loops=1)
+   Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+   Buffers: shared hit=608
+   ->  Index Scan Backward using notifications_pkey on public.notifications  (cost=0.42..29142.42 rows=1653 width=163) (actual time=0.014..2.738 rows=20 loops=1)
+         Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+         Filter: ((notifications.read_at IS NULL) AND (notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1))
+         Rows Removed by Filter: 18981
+         Buffers: shared hit=608
+ Query Identifier: 3775697715326981371
+ Planning Time: 0.072 ms
+ Execution Time: 2.758 ms
+(11 rows)
+
+--- EXPLAIN (median recipient): unread_count
+                                                                           QUERY PLAN                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=50.93..50.94 rows=1 width=8) (actual time=0.040..0.041 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=28
+   ->  Index Scan using idx_notifications_tenant_recipient on public.notifications  (cost=0.42..50.92 rows=2 width=0) (actual time=0.017..0.038 rows=1 loops=1)
+         Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+         Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1500))
+         Filter: (notifications.read_at IS NULL)
+         Rows Removed by Filter: 24
+         Buffers: shared hit=28
+ Query Identifier: -7309081918138765180
+ Planning Time: 0.065 ms
+ Execution Time: 0.059 ms
+(12 rows)
+
+--- equivalence: md5 of ordered unread ids, plus counts, per recipient
+ recipient_id | count |               md5                
+--------------+-------+----------------------------------
+            1 |    20 | e194c3b4de2d01e202e854dbe18849ef
+         1001 |     1 | b69f378b8b00e843f4b677aa57fe4ec5
+         1500 |     1 | 0b97be8b4b408a3a0780a32e0a143a7f
+        20999 |     1 | 937a099ea83f875440a0320911adc1a4
+(4 rows)
+
+sizes: table=102 MB idx_shipped=5080 kB idx_unread=-
