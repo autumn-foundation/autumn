@@ -23426,6 +23426,37 @@ path = "/healthz"
     }
 
     #[test]
+    fn fleet_max_open_policy_names_round_trip() {
+        for policy in [
+            FleetMaxOpenPolicy::Soft,
+            FleetMaxOpenPolicy::Wait,
+            FleetMaxOpenPolicy::Refuse,
+        ] {
+            assert_eq!(policy.to_string(), policy.as_str());
+            assert_eq!(
+                format!(" {policy} ").parse::<FleetMaxOpenPolicy>(),
+                Ok(policy)
+            );
+        }
+        let error = "hard".parse::<FleetMaxOpenPolicy>().unwrap_err();
+        assert!(
+            error.contains("soft") && error.contains("refuse"),
+            "{error}"
+        );
+        // An invalid env value is ignored: the default stays.
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "slot")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY", "hard");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().max_open_policy,
+            FleetMaxOpenPolicy::Soft
+        );
+    }
+
+    #[test]
     fn fleet_replica_lifecycle_keys_deserialize() {
         let config: AutumnConfig = toml::from_str(
             r#"

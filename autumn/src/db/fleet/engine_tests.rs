@@ -621,3 +621,22 @@ async fn a_burst_never_passes_max_open_under_the_wait_policy() {
     assert!(stats.peak_open <= 3, "peak {}", stats.peak_open);
     assert_eq!(stats.over_cap_opens_total, 0);
 }
+
+#[tokio::test]
+async fn a_wait_policy_with_a_residency_past_the_timeout_still_builds() {
+    use crate::config::FleetMaxOpenPolicy::Wait;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = DatabaseFleetConfig {
+        max_open_policy: Wait,
+        min_residency: Duration::from_secs(10),
+        ..config(tmp.path(), 1, 0)
+    };
+    // Boot warns, and does not refuse the choice.
+    let fleet =
+        DatabaseFleet::from_config(&config, Duration::from_secs(1), |_| TextEngine::new(100))
+            .unwrap();
+    drop(fleet.open(&key(&fleet, "a")).await.unwrap());
+    let error = fleet.open(&key(&fleet, "b")).await.unwrap_err();
+    assert!(matches!(error, FleetError::AtCapacity { .. }));
+    assert_eq!(fleet.stats().refused_total, 1);
+}
