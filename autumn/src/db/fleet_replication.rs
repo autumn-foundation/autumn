@@ -439,14 +439,14 @@ impl Drop for Wake<'_> {
 
 /// How long a closed database keeps its last bound. A waiter needs it
 /// only around the close.
-const CLOSED_BOUND_TTL: Duration = Duration::from_secs(3600);
+const CLOSED_BOUND_TTL: Duration = Duration::from_hours(1);
 
 /// Longest `wait_replicated` sleeps between two checks with no wake-up.
 const WAIT_POLL: Duration = Duration::from_millis(250);
 
 /// A deadline past any real wait, for a timeout too large to add.
 fn far_future() -> tokio::time::Instant {
-    tokio::time::Instant::now() + Duration::from_secs(86_400 * 365 * 30)
+    tokio::time::Instant::now() + Duration::from_hours(24 * 365 * 30)
 }
 
 /// Why [`FleetReplication::wait_replicated`] gave up.
@@ -4413,7 +4413,7 @@ mod tests {
             0,
             Arc::clone(clock) as Arc<dyn ClockSource>,
             |mut replication| {
-                replication.wait_poll = Duration::from_secs(3600);
+                replication.wait_poll = Duration::from_hours(1);
                 replication
             },
         )

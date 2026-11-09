@@ -3496,7 +3496,7 @@ mod tests {
             );
 
             // A's next fence check sees B's epoch: A claims nothing more.
-            a.clock.advance(Duration::from_secs(120));
+            a.clock.advance(Duration::from_mins(2));
             tick(&a.replication).await;
             assert_eq!(a.replication.replicated_through(&key), None);
             let waited = a

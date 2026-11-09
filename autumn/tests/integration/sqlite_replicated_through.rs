@@ -341,7 +341,7 @@ fn a_failed_tick_after_a_backward_step_drops_the_bound() {
 #[test]
 fn a_new_generation_proves_its_own_bound() {
     let mut h = Harness::with(|settings| ReplicationSettings {
-        snapshot_interval: Duration::from_secs(60),
+        snapshot_interval: Duration::from_mins(1),
         ..settings
     });
     insert(&mut h.conn, "a");
