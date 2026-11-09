@@ -447,7 +447,9 @@ pub fn apply_rename(tables: &mut [Table], change: &SchemaChange) {
             }
         }
         SchemaChange::RenameIndex { table, from, index } => {
-            for t in tables.iter_mut().filter(|t| t.name == *table) {
+            // `table` may be `schema.table`.
+            let table = crate::schema::diff::bare_name(table);
+            for t in tables.iter_mut().filter(|t| t.name == table) {
                 for idx in &mut t.indexes {
                     if idx.name == *from {
                         *idx = index.clone();
@@ -1758,6 +1760,24 @@ mod tests {
         for bad in ["", "Title", "1a", "a b", "a;b", "a\"b", "a-b"] {
             assert!(!is_plain_identifier(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn an_index_rename_on_a_schema_table_applies() {
+        let mut t = table("posts", Backend::Postgres, &[("id", ColumnType::Int64)]);
+        t.schema = Some("blog".to_owned());
+        t.indexes
+            .push(Index::new("idx_posts_old", vec!["id".to_owned()], false));
+        let mut tables = vec![t];
+        apply_rename(
+            &mut tables,
+            &SchemaChange::RenameIndex {
+                table: "blog.posts".to_owned(),
+                from: "idx_posts_old".to_owned(),
+                index: Index::new("idx_posts_new", vec!["id".to_owned()], false),
+            },
+        );
+        assert_eq!(tables[0].indexes[0].name, "idx_posts_new");
     }
 
     #[test]

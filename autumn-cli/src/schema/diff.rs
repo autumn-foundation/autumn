@@ -2689,19 +2689,22 @@ fn retained_indexes_depending_on_any<'a>(
     table: &str,
     dropped_columns: &BTreeSet<String>,
 ) -> Vec<&'a Index> {
-    ctx.baseline.get(table).map_or_else(Vec::new, |t| {
-        t.indexes
-            .iter()
-            .filter(|i| {
-                i.definition.is_some()
-                    && dropped_columns
-                        .iter()
-                        // pg-only rollback path (`emit_down_sql_pg`) — exact `columns`
-                        // membership; the SQLite definition-scan branch never runs here.
-                        .any(|c| index_depends_on_column(i, c, Backend::Postgres))
-            })
-            .collect()
-    })
+    // `table` may be `schema.table`; the context is keyed by bare name.
+    ctx.baseline
+        .get(bare_name(table))
+        .map_or_else(Vec::new, |t| {
+            t.indexes
+                .iter()
+                .filter(|i| {
+                    i.definition.is_some()
+                        && dropped_columns
+                            .iter()
+                            // pg-only rollback path (`emit_down_sql_pg`) — exact `columns`
+                            // membership; the SQLite definition-scan branch never runs here.
+                            .any(|c| index_depends_on_column(i, c, Backend::Postgres))
+                })
+                .collect()
+        })
 }
 
 /// The change kinds whose `SQLite` realisation is a full table recreate: the
@@ -3511,7 +3514,7 @@ fn topo_sort_drops(drops: &mut [&SchemaChange]) -> Result<(), EmitError> {
     for (&name, table) in &tables {
         for col in &table.columns {
             if let Some(fk) = &col.references {
-                let target = fk.table.as_str();
+                let target = bare_name(fk.table.as_str());
                 if target != name && names.contains(target) {
                     // `name` references `target` ⇒ `name` must drop before `target`.
                     deps.get_mut(target)
@@ -6586,6 +6589,50 @@ mod tests {
         let want = in_schema(posts_with(vec![]), "order");
         let plan = diff_schema(&[], &parsed(vec![want], vec![]), DEFAULT_OPTS);
         assert!(guard_plan(&plan, DEFAULT_OPTS).is_err());
+    }
+
+    #[test]
+    fn schema_tables_are_dropped_child_first() {
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("authors", "id"));
+        let posts = in_schema(posts_with(vec![fk]), "blog");
+        let plan = diff_schema(&[authors, posts], &parsed(vec![], vec![]), ALLOW);
+        let up = emit_up_sql(&plan).expect("emit");
+        let posts_at = up.find("DROP TABLE blog.posts;").expect(&up);
+        let authors_at = up.find("DROP TABLE blog.authors;").expect(&up);
+        assert!(posts_at < authors_at, "{up}");
+    }
+
+    #[test]
+    fn rollback_restores_a_retained_index_on_a_schema_table() {
+        let mut baseline = in_schema(posts_with(vec![col("email", ColumnType::Text)]), "blog");
+        baseline.indexes.push(Index {
+            name: "posts_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            unique: true,
+            definition: Some(
+                "CREATE UNIQUE INDEX posts_email_key ON blog.posts (email)".to_owned(),
+            ),
+            is_partial: false,
+            key_columns: Vec::new(),
+        });
+        let desired = in_schema(posts_with(vec![col("keep", ColumnType::Text)]), "blog");
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            ALLOW,
+        );
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+        assert!(
+            down.contains("CREATE UNIQUE INDEX posts_email_key ON blog.posts (email)"),
+            "{down}"
+        );
     }
 
     #[test]
