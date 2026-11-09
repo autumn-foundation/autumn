@@ -3447,7 +3447,11 @@ fn topo_sort_creates(creates: &mut [&SchemaChange]) -> Result<(), EmitError> {
                 // A plan names a schema table `schema.table`; the batch is keyed by
                 // bare name.
                 let target = bare_name(fk.table.as_str());
-                if target != name && names.contains(target) {
+                if target != name
+                    && tables
+                        .get(target)
+                        .is_some_and(|t| fk_targets(fk.table.as_str(), t))
+                {
                     d.insert(target);
                 }
             }
@@ -3515,7 +3519,11 @@ fn topo_sort_drops(drops: &mut [&SchemaChange]) -> Result<(), EmitError> {
         for col in &table.columns {
             if let Some(fk) = &col.references {
                 let target = bare_name(fk.table.as_str());
-                if target != name && names.contains(target) {
+                if target != name
+                    && tables
+                        .get(target)
+                        .is_some_and(|t| fk_targets(fk.table.as_str(), t))
+                {
                     // `name` references `target` ⇒ `name` must drop before `target`.
                     deps.get_mut(target)
                         .expect("target is an in-batch name")
@@ -4001,6 +4009,15 @@ fn index_sql(table: &str, index: &Index) -> String {
         index.name,
         index.columns.join(", ")
     )
+}
+
+/// True when the FK target `fk_table` (`table` or `schema.table`) names `table`.
+/// A qualified target in another schema is a different table of the same bare name.
+fn fk_targets(fk_table: &str, table: &Table) -> bool {
+    let (schema, name) = fk_table
+        .rsplit_once('.')
+        .map_or((None, fk_table), |(s, n)| (Some(s), n));
+    name == table.name && schema.filter(|s| *s != "public") == named_schema(table)
 }
 
 /// The table part of a possibly qualified `schema.table`.
@@ -6633,6 +6650,23 @@ mod tests {
             down.contains("CREATE UNIQUE INDEX posts_email_key ON blog.posts (email)"),
             "{down}"
         );
+    }
+
+    #[test]
+    fn an_fk_to_an_external_table_adds_no_create_order_edge() {
+        // `blog.posts` -> external `auth.users`; public `users` -> `blog.posts`.
+        let mut fk_ext = col("owner_id", ColumnType::Int64);
+        fk_ext.references = Some(ForeignKey::new("auth.users", "id"));
+        let posts = in_schema(posts_with(vec![fk_ext]), "blog");
+        let mut fk_posts = col("post_id", ColumnType::Int64);
+        fk_posts.references = Some(ForeignKey::new("posts", "id"));
+        let mut users = posts_with(vec![fk_posts]);
+        users.name = "users".to_owned();
+        let plan = diff_schema(&[], &parsed(vec![posts, users], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("no false cycle");
+        let posts_at = up.find("CREATE TABLE blog.posts").expect(&up);
+        let users_at = up.find("CREATE TABLE users").expect(&up);
+        assert!(posts_at < users_at, "{up}");
     }
 
     #[test]
