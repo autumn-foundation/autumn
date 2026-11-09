@@ -74,6 +74,18 @@ unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
+    # RUSTSEC-2026-0459 — SQLite before 3.54.0 can return uninitialized
+    # page-cache memory when a process opens a database file together with a
+    # sibling `-wal` file of a different page size.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0459
+    #
+    # Ships pre-waived because the fix is `libsqlite3-sys` >= 0.39.0 and no app
+    # can take it yet: `diesel` 2.3.14 (latest) requires `libsqlite3-sys` below
+    # 0.39, and only one crate may link `sqlite3`. Only a database file that a
+    # less trusted party wrote, opened next to a `-wal` file it wrote, is
+    # exposed. Do not open such files. Drop this waiver when `diesel` accepts
+    # `libsqlite3-sys` 0.39. Review-by: 2026-11-16.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite < 3.54.0 (uninitialized memory with a foreign -wal file); fix needs libsqlite3-sys >= 0.39.0 but diesel 2.3.14 caps it below 0.39 (links = sqlite3); review-by 2026-11-16" },
     # RUSTSEC-2023-0071 — `rsa` "Marvin Attack" timing sidechannel.
     # https://rustsec.org/advisories/RUSTSEC-2023-0071
     #
