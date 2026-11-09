@@ -1960,6 +1960,13 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             .count()
     }
 
+    /// Whether a request open of `key` can claim now: the key has an entry to
+    /// share, or the fleet has a free slot. The same rule as `claim_entry`.
+    fn has_room_for(&self, key: &FleetDbKey) -> bool {
+        let state = self.lock_state();
+        state.open.contains_key(key) || !self.full_locked(&state)
+    }
+
     /// Record the databases held after an entry was added.
     fn note_held(&self, state: &State<E>) {
         let held = state.open.len() + Self::closing_locked(state);
@@ -1981,14 +1988,19 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         closing: &mut Vec<Arc<Drain>>,
     ) -> Result<(), FleetError> {
         let notified = self.inner.room.notified();
+        // The claim failed, but a close, a failed open or an open of this key
+        // by another caller can have changed that. Retry then, and close
+        // nothing.
+        if self.has_room_for(key) {
+            return Ok(());
+        }
         // Close one more database only when the last close of this call has
         // ended. Else each poll would close another one.
         closing.retain(|drain| !drain.finished.load(Ordering::Acquire));
         if closing.is_empty() {
             *closing = self.evict(None, 1);
         }
-        // A close or a failed open can free a slot after the claim failed.
-        if !self.full_locked(&self.lock_state()) {
+        if self.has_room_for(key) {
             return Ok(());
         }
         let now = tokio::time::Instant::now();

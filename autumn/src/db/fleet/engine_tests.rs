@@ -640,3 +640,17 @@ async fn a_wait_policy_with_a_residency_past_the_timeout_still_builds() {
     assert!(matches!(error, FleetError::AtCapacity { .. }));
     assert_eq!(fleet.stats().refused_total, 1);
 }
+
+#[tokio::test]
+async fn a_full_hard_fleet_still_has_room_for_a_key_it_holds() {
+    use crate::config::FleetMaxOpenPolicy::Refuse;
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = capped(tmp.path(), 1, Refuse, Duration::from_secs(60));
+    let (held, other) = (key(&fleet, "a"), key(&fleet, "b"));
+    assert!(fleet.has_room_for(&held), "a free slot");
+    let db = fleet.open(&held).await.unwrap();
+    // The fleet is full. A request for the held key shares its entry.
+    assert!(fleet.has_room_for(&held));
+    assert!(!fleet.has_room_for(&other));
+    drop(db);
+}
