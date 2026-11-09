@@ -1948,6 +1948,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     ) -> Result<(), FleetError> {
         let notified = self.inner.room.notified();
         let started = self.evict(None, 1);
+        // A close or a failed open can free a slot after the claim failed.
+        if !self.full_locked(&self.lock_state()) {
+            return Ok(());
+        }
         let now = tokio::time::Instant::now();
         let refuse = self.inner.max_open_policy == crate::config::FleetMaxOpenPolicy::Refuse;
         if now >= deadline || (refuse && started.is_empty()) {

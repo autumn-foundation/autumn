@@ -3129,10 +3129,16 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   Use `import` or `restore_from_file`, not a
   `FleetLifecycle::restore_missing` hook, for a local backup. CLI:
   `autumn fleet restore <key> --from <file> --force`.
-- `max_open` is a soft limit: a database in use or used within
+- `max_open` is a soft limit by default: a database in use or used within
   `min_residency` (default `"2s"`) is not closed, and an open never waits.
   A burst can open far more files than `max_open`. Size `ulimit -n` for the
-  peak (about `2 × pool_size + 1` fds per open database).
+  peak (about `2 × pool_size + 1` fds per open database). `db:fleet` reports
+  `peak_open`, `over_cap_opens_total` and `refused_total`.
+- `[database.fleet] max_open_policy = "wait"` or `"refuse"` makes `max_open`
+  hard: open and closing databases never pass it. `wait` parks an open for
+  at most `database.connect_timeout_secs`, then answers `503`. `refuse`
+  answers `503` with `Retry-After` when no idle database can close. Check the
+  tenant id before `open`: the cap counts any key.
 - `max_resident_bytes` (default `0`, off) is a soft memory budget with the
   same rules as `max_open`. The SQLite engine counts about 2 MB per open
   connection. The fleet keeps one database open. `db:fleet` reports
