@@ -543,6 +543,23 @@ route is served on every HTTP role, and that a group another fleet role mounts
 is not drift. The test `mount_matches_the_model` in `autumn/src/config.rs`
 checks the runtime against the same rules.
 
+## Role manifests
+
+`role_manifests.rs` models the role set of `autumn release init` and the
+`[[deploy.groups]]` checks (issue #3547, ADR 0043). A role name is an
+integer. Verify it with:
+
+```sh
+verus verification/role_manifests.rs
+```
+
+It proves that each role in the default set is declared and has a unique
+name, that every role gets a workload and only an HTTP role gets a Service,
+that a fleet host never gets two roles, and that a fleet that passes
+preflight on a local jobs backend runs only `combined`. The test
+`manifest_roles_match_the_model` in `autumn-cli/src/release_roles.rs` checks
+the runtime against the same rules.
+
 ## Background tasks
 
 `background_tasks.rs` models `background::place` in

@@ -1,35 +1,63 @@
 {{- if .Values.flagger.enabled }}
+{{- /* Two Canaries must not share one Ingress. */}}
+{{- $shared := 0 }}
+{{- range $name, $role := .Values.roles }}
+{{- if and $role.enabled $role.servesHttp (not (dig "ingress" "enabled" false $role)) }}
+{{- $shared = add1 $shared }}
+{{- end }}
+{{- end }}
+{{- if and .Values.flagger.ingressRef (gt $shared 1) }}
+{{- fail "flagger.ingressRef can serve one role only; set roles.<name>.ingress for each role that serves HTTP" }}
+{{- end }}
+{{- range $name, $role := .Values.roles }}
+{{- $ctx := dict "root" $ "name" $name "role" $role }}
+{{- if and $role.enabled $role.servesHttp }}
+---
 apiVersion: flagger.app/v1beta1
 kind: Canary
 metadata:
-  name: {{ include "app.fullname" . }}
+  name: {{ include "app.roleName" $ctx }}
   labels:
-    {{- include "app.labels" . | nindent 4 }}
+    {{- include "app.roleLabels" $ctx | nindent 4 }}
 spec:
-  {{- with .Values.flagger.provider }}
+  {{- with $.Values.flagger.provider }}
   provider: {{ . }}
   {{- end }}
-  {{- with .Values.flagger.ingressRef }}
+  {{- /* The role Ingress, when the chart renders one. Else flagger.ingressRef. */}}
+  {{- if dig "ingress" "enabled" false $role }}
+  ingressRef:
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    name: {{ include "app.roleName" $ctx }}
+  {{- else }}
+  {{- with $.Values.flagger.ingressRef }}
   ingressRef:
     {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   targetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: {{ include "app.fullname" . }}
+    name: {{ include "app.roleName" $ctx }}
+  {{- if dig "autoscaling" "enabled" false $role }}
+  autoscalerRef:
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    name: {{ include "app.roleName" $ctx }}
+  {{- end }}
   service:
-    port: {{ .Values.service.port }}
+    port: {{ $.Values.service.port }}
     targetPort: http
-    {{- with .Values.flagger.service }}
+    {{- with $.Values.flagger.service }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
   analysis:
-    interval: {{ .Values.flagger.interval }}
-    threshold: {{ .Values.flagger.threshold }}
-    maxWeight: {{ .Values.flagger.maxWeight }}
-    stepWeight: {{ .Values.flagger.stepWeight }}
+    interval: {{ $.Values.flagger.interval }}
+    threshold: {{ $.Values.flagger.threshold }}
+    maxWeight: {{ $.Values.flagger.maxWeight }}
+    stepWeight: {{ $.Values.flagger.stepWeight }}
     metrics:
-      {{- range .Values.analysis.metricTemplates }}
+      {{- range $.Values.analysis.metricTemplates }}
       # The SLO burn rate of the canary pods.
       - name: {{ . }}
         templateRef:
@@ -39,8 +67,10 @@ spec:
           max: {{ $.Values.analysis.maxBurnRate }}
         interval: {{ $.Values.flagger.interval }}
       {{- end }}
-    {{- with .Values.flagger.webhooks }}
+    {{- with $.Values.flagger.webhooks }}
     webhooks:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+{{- end }}
+{{- end }}
 {{- end }}

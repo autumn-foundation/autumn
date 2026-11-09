@@ -1,0 +1,31 @@
+{{- if and .Values.rollout.enabled .Values.flagger.enabled }}
+{{- fail "set rollout.enabled or flagger.enabled, not both" }}
+{{- end }}
+{{- include "app.checkRoles" . }}
+{{- range $name, $role := .Values.roles }}
+{{- $ctx := dict "root" $ "name" $name "role" $role }}
+{{- if and $role.enabled (not (include "app.roleIsRollout" $ctx)) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app.roleName" $ctx }}
+  labels:
+    {{- include "app.roleLabels" $ctx | nindent 4 }}
+spec:
+  {{- if not (dig "autoscaling" "enabled" false $role) }}
+  replicas: {{ $role.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "app.roleSelectorLabels" $ctx | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    {{- include "app.podTemplate" $ctx | nindent 4 }}
+{{- end }}
+{{- end }}

@@ -21,8 +21,9 @@ kill_timeout = 50
   # a database — autumn migrate exits non-zero when no DB URL is configured.
   # release_command = "autumn migrate"
 
+{{fly_processes}}
 [http_service]
-  internal_port        = 3000
+{{fly_http_processes}}  internal_port        = 3000
   force_https          = true
   auto_stop_machines   = true
   auto_start_machines  = true

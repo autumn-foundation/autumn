@@ -259,7 +259,10 @@ fly scale count marketing=2 service=4
 
 ### Kubernetes
 
-Two Deployments use the same image. Each one sets `AUTUMN_ROLE`:
+`autumn release init --target kubernetes` writes these Deployments from your
+`[roles.*]` presets. See
+[One workload per role](kubernetes.md#one-workload-per-role). By hand, two
+Deployments use the same image. Each one sets `AUTUMN_ROLE`:
 
 ```yaml
 apiVersion: apps/v1

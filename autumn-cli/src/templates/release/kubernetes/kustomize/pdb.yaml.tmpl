@@ -1,9 +1,11 @@
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: {{k8s_name}}
+  name: {{role_object}}
+  labels:
+    app.kubernetes.io/component: {{role}}
 spec:
   maxUnavailable: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{k8s_name}}
+      app.kubernetes.io/component: {{role}}

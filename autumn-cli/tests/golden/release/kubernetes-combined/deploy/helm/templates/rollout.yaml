@@ -1,0 +1,38 @@
+{{- if .Values.rollout.enabled }}
+{{- range $name, $role := .Values.roles }}
+{{- $ctx := dict "root" $ "name" $name "role" $role }}
+{{- if and $role.enabled (include "app.roleIsRollout" $ctx) }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "app.roleName" $ctx }}
+  labels:
+    {{- include "app.roleLabels" $ctx | nindent 4 }}
+spec:
+  {{- if not (dig "autoscaling" "enabled" false $role) }}
+  replicas: {{ $role.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "app.roleSelectorLabels" $ctx | nindent 6 }}
+  template:
+    {{- include "app.podTemplate" $ctx | nindent 4 }}
+  strategy:
+    canary:
+      {{- with $.Values.analysis.templateName }}
+      # Background analysis: the SLO burn rate of the canary pods.
+      analysis:
+        templates:
+          - templateName: {{ . }}
+        args:
+          - name: canary-hash
+            valueFrom:
+              podTemplateHashValue: Latest
+      {{- end }}
+      steps:
+        {{- toYaml $.Values.rollout.steps | nindent 8 }}
+{{- end }}
+{{- end }}
+{{- end }}

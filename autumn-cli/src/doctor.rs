@@ -6624,6 +6624,318 @@ where
     }
 }
 
+/// The deploy files that `manifest_roles` reads, relative to the project.
+const MANIFEST_ROLE_FILES: [&str; 6] = [
+    "deploy/helm/values.yaml",
+    "fly.toml",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+];
+
+/// How deep `manifest_roles` walks into the Kustomize tree.
+const MANIFEST_ROLE_MAX_DEPTH: usize = 6;
+
+/// The Kustomize tree that `manifest_roles` reads.
+const MANIFEST_ROLE_KUSTOMIZE_DIR: &str = "deploy/kustomize";
+
+/// Read the deploy files for `manifest_roles`, as `(path, content)`. A file
+/// that is not there is left out.
+fn read_manifest_role_files(root: &std::path::Path) -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = MANIFEST_ROLE_FILES
+        .iter()
+        .filter_map(|name| {
+            std::fs::read_to_string(root.join(name))
+                .ok()
+                .map(|text| ((*name).to_owned(), text))
+        })
+        .collect();
+    // The walk does not follow links, so a link loop cannot stop it.
+    let mut stack = vec![(root.join(MANIFEST_ROLE_KUSTOMIZE_DIR), 0)];
+    let mut kustomize = Vec::new();
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if depth < MANIFEST_ROLE_MAX_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            } else if kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext == "yaml" || ext == "yml")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                kustomize.push((rel.to_string_lossy().replace('\\', "/"), text));
+            }
+        }
+    }
+    kustomize.sort();
+    // A component that the base does not list is not deployed: a left-over
+    // from a role that `autumn release init --force` no longer writes.
+    let base = format!("{MANIFEST_ROLE_KUSTOMIZE_DIR}/base/kustomization.yaml");
+    let listed = kustomize
+        .iter()
+        .find(|(name, _)| *name == base)
+        .map(|(_, text)| listed_components(text));
+    let prefix = format!("{MANIFEST_ROLE_KUSTOMIZE_DIR}/components/");
+    files.extend(kustomize.into_iter().filter(|(name, _)| {
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            return true;
+        };
+        let component = rest.split('/').next().unwrap_or_default();
+        listed
+            .as_ref()
+            .is_none_or(|listed| listed.iter().any(|c| c == component))
+    }));
+    files
+}
+
+/// The component names that a Kustomize base lists as `../components/<name>`.
+fn listed_components(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let item = strip_yaml_comment(line).trim().strip_prefix("- ")?.trim();
+            let name = item.strip_prefix("../components/")?;
+            Some(name.trim_end_matches('/').to_owned())
+        })
+        .collect()
+}
+
+/// The `roles:` keys of a Helm values file, each with its `servesHttp`.
+///
+/// A line scan, not a YAML parser: a top-level `roles:` line, then each key
+/// two spaces in. This is the shape `autumn release init` writes.
+fn helm_value_roles(text: &str) -> Vec<(String, Option<bool>)> {
+    // Each role: its name, its servesHttp, and whether it is off.
+    let mut roles: Vec<(String, Option<bool>, bool)> = Vec::new();
+    let mut in_roles = false;
+    // The indent of the role keys, and of the keys inside a role.
+    let mut key_indent: Option<usize> = None;
+    let mut field_indent: Option<usize> = None;
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        let code = strip_yaml_comment(line);
+        let trimmed = code.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = code.len() - code.trim_start().len();
+        if indent == 0 {
+            in_roles = trimmed == "roles:";
+            key_indent = None;
+            continue;
+        }
+        if !in_roles {
+            continue;
+        }
+        let key_at = *key_indent.get_or_insert(indent);
+        if indent == key_at {
+            if let Some(key) = trimmed.strip_suffix(':') {
+                roles.push((key.trim_matches(['"', '\'']).to_owned(), None, false));
+                field_indent = None;
+            }
+        } else if indent > key_at && field_indent.is_none_or(|at| at == indent) {
+            field_indent = Some(indent);
+            let Some(last) = roles.last_mut() else {
+                continue;
+            };
+            if let Some(value) = trimmed.strip_prefix("servesHttp:") {
+                last.1 = value.trim().parse().ok();
+            } else if let Some(value) = trimmed.strip_prefix("enabled:") {
+                last.2 = value.trim() == "false";
+            }
+        }
+    }
+    // A role that is off runs nowhere: do not check it.
+    roles
+        .into_iter()
+        .filter(|(_, _, off)| !off)
+        .map(|(name, http, _)| (name, http))
+        .collect()
+}
+
+/// `line` without a YAML or TOML comment. A `#` starts a comment at the start
+/// of the line or after a space.
+fn strip_yaml_comment(line: &str) -> &str {
+    if line.trim_start().starts_with('#') {
+        return "";
+    }
+    line.find(" #").map_or(line, |at| &line[..at])
+}
+
+/// Each `AUTUMN_ROLE` value in a manifest: `AUTUMN_ROLE=x`, `AUTUMN_ROLE: x`,
+/// or `name: AUTUMN_ROLE` and then `value: x`. A templated value is left out.
+fn autumn_role_values(text: &str) -> Vec<String> {
+    const KEY: &str = "AUTUMN_ROLE";
+    let clean = |raw: &str| -> Option<String> {
+        let value = raw.trim().trim_matches(['"', '\'']).trim();
+        let literal = !value.is_empty() && !value.contains('$') && !value.contains("{{");
+        literal.then(|| value.to_owned())
+    };
+    let mut values = Vec::new();
+    let mut lines = text
+        .lines()
+        .map(|line| strip_yaml_comment(line).trim())
+        .filter(|l| !l.is_empty())
+        .peekable();
+    while let Some(line) = lines.next() {
+        let line = line.trim_start_matches("- ").trim();
+        if line == "name: AUTUMN_ROLE" {
+            if let Some(next) = lines.peek()
+                && let Some(value) = next.strip_prefix("value:")
+            {
+                values.extend(clean(value));
+            }
+            continue;
+        }
+        // `AUTUMN_ROLE=x`, `AUTUMN_ROLE = "x"` or `AUTUMN_ROLE: x`. The key must
+        // be a whole word.
+        let mut from = 0;
+        while let Some(at) = line[from..].find(KEY).map(|i| i + from) {
+            from = at + KEY.len();
+            let whole_word = line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+            let rest = line[from..].trim_start();
+            let Some(rest) = rest.strip_prefix('=').or_else(|| rest.strip_prefix(':')) else {
+                continue;
+            };
+            if !whole_word {
+                continue;
+            }
+            let rest = rest.trim_start();
+            let value = rest.strip_prefix('"').map_or_else(
+                || {
+                    rest.split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                        .next()
+                        .unwrap_or_default()
+                },
+                |quoted| quoted.split('"').next().unwrap_or_default(),
+            );
+            values.extend(clean(value));
+        }
+    }
+    values
+}
+
+/// `manifest_roles` row: each role that a deploy manifest names must be a
+/// built-in role or a `[roles.<name>]` preset. A process with an unknown role
+/// does not boot.
+///
+/// It reads the Helm `roles:` keys, `AUTUMN_ROLE` in the Kustomize, Fly and
+/// Compose files, and `[[deploy.groups]] role`. A gap is a warning, so
+/// `--strict` fails on it. A Helm `servesHttp` that does not match the base of
+/// the role is a warning too.
+fn check_manifest_roles(table: Option<&toml::Table>, files: &[(String, String)]) -> CheckResult {
+    const NAME: &str = "manifest_roles";
+    let pass = |detail: String| CheckResult {
+        name: NAME,
+        status: CheckStatus::Pass,
+        detail: Some(detail),
+        hint: None,
+    };
+    let Ok(presets) = resolve_role_presets(table) else {
+        return pass("skipped: [roles] is invalid; see process_role_backend".to_owned());
+    };
+    // Each role a manifest names: (role, source, servesHttp in Helm values).
+    let mut named: Vec<(String, String, Option<bool>)> = Vec::new();
+    for (path, text) in files {
+        if path.ends_with("helm/values.yaml") {
+            for (role, http) in helm_value_roles(text) {
+                named.push((role, path.clone(), http));
+            }
+        } else {
+            for role in autumn_role_values(text) {
+                named.push((role, path.clone(), None));
+            }
+        }
+    }
+    let jobs_backend = table
+        .and_then(|t| t.get("jobs"))
+        .and_then(|j| j.get("backend"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("local");
+    let groups = table
+        .and_then(|t| t.get("deploy"))
+        .and_then(|d| d.get("groups"))
+        .and_then(toml::Value::as_array);
+    for group in groups.into_iter().flatten() {
+        if let Some(role) = group.get("role").and_then(toml::Value::as_str) {
+            named.push((role.to_owned(), "[[deploy.groups]]".to_owned(), None));
+        }
+    }
+    if named.is_empty() {
+        return pass("no deploy manifest names a role".to_owned());
+    }
+    let mut problems: Vec<String> = Vec::new();
+    for (role, source, http) in &named {
+        let resolved = role
+            .parse::<autumn_web::config::RoleName>()
+            .ok()
+            .and_then(|name| autumn_web::config::resolve_role(&name, &presets).ok());
+        match resolved {
+            None => problems.push(format!("{role:?} ({source}) is not declared")),
+            Some(resolved)
+                if source == "[[deploy.groups]]"
+                    && autumn_web::config::split_role_requires_durable_backend(
+                        resolved.guard_base(),
+                        jobs_backend,
+                    ) =>
+            {
+                problems.push(format!(
+                    "{role:?} ({source}) is a split role on jobs.backend = \"{jobs_backend}\"; \
+                     the hosts do not share a queue"
+                ));
+            }
+            Some(resolved) if http.is_some_and(|h| h != resolved.serves_http()) => {
+                problems.push(format!(
+                    "{role:?} ({source}) has servesHttp: {}, but its base {} {}",
+                    http.unwrap_or_default(),
+                    resolved.base().as_str(),
+                    if resolved.serves_http() {
+                        "serves HTTP"
+                    } else {
+                        "serves no HTTP"
+                    }
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    if problems.is_empty() {
+        let mut roles: Vec<&str> = named.iter().map(|(r, _, _)| r.as_str()).collect();
+        roles.sort_unstable();
+        roles.dedup();
+        return pass(format!(
+            "{} role(s) in the deploy manifests, each declared: {}",
+            roles.len(),
+            roles.join(", ")
+        ));
+    }
+    problems.dedup();
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "deploy manifest roles do not match autumn.toml: {}",
+            problems.join("; ")
+        )),
+        hint: Some(
+            "Declare each role as [roles.<name>] in autumn.toml, or use combined, web or worker. \
+             Regenerate the manifests with `autumn release init --force`.",
+        ),
+    }
+}
+
 /// Resolve the configured queue names and the effective `jobs.pin` for the
 /// zero-coverage guard (#1623). `jobs.queues` may be a TOML array (strict) or a
 /// `name = weight|table` map (weighted); either way we only need the names.
@@ -9878,8 +10190,8 @@ fn deploy_profile_config_load_check(
 /// the terminal, and a dropped `\` continuation would ship a run of spaces
 /// mid-sentence on a machine-readable surface (issue #1621).
 const DEPLOY_HOST_SPELLING_HINT: &str = "Fix the [deploy] host spelling in autumn.toml — \
-     set either `host` (one server) or `hosts` (a fleet), never both (see `autumn deploy \
-     check`)";
+     set one of `host` (one server), `hosts` (a fleet) or `[[deploy.groups]]` (a role per \
+     host group), never two (see `autumn deploy check`)";
 
 /// Remedy printed on the SSH-reachability row when the host spelling itself is
 /// broken, so there is no list to probe. See [`DEPLOY_HOST_SPELLING_HINT`].
@@ -10062,10 +10374,17 @@ pub fn run(opts: DoctorOptions) {
     // Route groups (#3544): every declared group needs a role that mounts it.
     // Read from the same merged active-profile table as the roles above.
     let route_groups_toml = merged_jobs_toml;
+    let manifest_roles_toml = route_groups_toml.clone();
     tasks.push(Box::new(move || {
         check_route_group_mounts(Some(&route_groups_toml), |path| {
             std::fs::read_to_string(path).ok()
         })
+    }));
+
+    // Each role a deploy manifest names must be declared in autumn.toml.
+    tasks.push(Box::new(move || {
+        let files = read_manifest_role_files(std::path::Path::new("."));
+        check_manifest_roles(Some(&manifest_roles_toml), &files)
     }));
 
     // A `sqlite://` primary boots only as the lone, single-backend, unsharded database
@@ -13099,8 +13418,9 @@ mod tests {
     fn deploy_host_spelling_hints_carry_no_line_continuation_gutter() {
         assert_eq!(
             DEPLOY_HOST_SPELLING_HINT,
-            "Fix the [deploy] host spelling in autumn.toml \u{2014} set either `host` (one \
-             server) or `hosts` (a fleet), never both (see `autumn deploy check`)",
+            "Fix the [deploy] host spelling in autumn.toml \u{2014} set one of `host` (one \
+             server), `hosts` (a fleet) or `[[deploy.groups]]` (a role per host group), never \
+             two (see `autumn deploy check`)",
         );
         assert_eq!(
             DEPLOY_HOST_SPELLING_REACHABILITY_HINT,
@@ -21611,6 +21931,230 @@ mount = ["service"]
 
     fn groups_table_3544(extra: &str) -> toml::Table {
         toml::from_str(&format!("{GROUPS_3544}{extra}")).expect("parse toml")
+    }
+
+    const MANIFEST_ROLES_TOML: &str = "[roles.marketing]\nbase = \"web\"\n";
+
+    fn manifest_roles_row(toml_text: &str, files: &[(&str, &str)]) -> CheckResult {
+        let table: toml::Table = toml::from_str(toml_text).expect("parse toml");
+        let files: Vec<(String, String)> = files
+            .iter()
+            .map(|(n, t)| ((*n).to_owned(), (*t).to_owned()))
+            .collect();
+        check_manifest_roles(Some(&table), &files)
+    }
+
+    const HELM_VALUES_ROLES: &str = "# comment\nroles:\n  web:\n    enabled: true\n    \
+        servesHttp: true\n    ingress:\n      hosts: []\n  marketing:\n    servesHttp: true\n\
+        \nimage:\n  repository: x\n";
+
+    #[test]
+    fn helm_value_roles_reads_the_top_level_roles_keys() {
+        assert_eq!(
+            helm_value_roles(HELM_VALUES_ROLES),
+            [
+                ("web".to_owned(), Some(true)),
+                ("marketing".to_owned(), Some(true))
+            ]
+        );
+        assert!(helm_value_roles("image:\n  roles: x\n").is_empty());
+    }
+
+    #[test]
+    fn autumn_role_values_reads_every_manifest_shape() {
+        let kustomize =
+            "env:\n  - name: AUTUMN_ROLE\n    value: worker\n  - name: X\n    value: y\n";
+        assert_eq!(autumn_role_values(kustomize), ["worker"]);
+        let fly = "[processes]\n  web = \"env AUTUMN_ROLE=web /usr/local/bin/app\"\n";
+        assert_eq!(autumn_role_values(fly), ["web"]);
+        let compose = "    environment:\n      AUTUMN_ROLE: \"worker\"\n      - AUTUMN_ROLE=web\n";
+        assert_eq!(autumn_role_values(compose), ["worker", "web"]);
+        let helm = "        - name: AUTUMN_ROLE\n          value: {{ .name | quote }}\n";
+        assert!(
+            autumn_role_values(helm).is_empty(),
+            "a templated value is skipped"
+        );
+    }
+
+    #[test]
+    fn manifest_roles_passes_declared_roles() {
+        let row = manifest_roles_row(
+            MANIFEST_ROLES_TOML,
+            &[
+                ("deploy/helm/values.yaml", HELM_VALUES_ROLES),
+                (
+                    "fly.toml",
+                    "  worker = \"env AUTUMN_ROLE=worker /usr/local/bin/app\"\n",
+                ),
+            ],
+        );
+        assert_eq!(row.name, "manifest_roles");
+        assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+    }
+
+    #[test]
+    fn manifest_roles_warns_on_an_undeclared_role() {
+        let row = manifest_roles_row(
+            "",
+            &[
+                ("deploy/helm/values.yaml", HELM_VALUES_ROLES),
+                (
+                    "deploy/kustomize/components/critical/deployment.yaml",
+                    "        - name: AUTUMN_ROLE\n          value: critical\n",
+                ),
+            ],
+        );
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        let detail = row.detail.unwrap_or_default();
+        assert!(
+            detail.contains("\"marketing\" (deploy/helm/values.yaml)"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("\"critical\" (deploy/kustomize/components/critical/deployment.yaml)"),
+            "{detail}"
+        );
+        assert!(!detail.contains("\"web\""), "{detail}");
+        assert!(row.hint.is_some());
+    }
+
+    #[test]
+    fn manifest_roles_warns_on_an_undeclared_deploy_group_role() {
+        let row = manifest_roles_row(
+            "[[deploy.groups]]\nrole = \"critical\"\nhosts = [\"a\"]\n",
+            &[],
+        );
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        assert!(row.detail.unwrap_or_default().contains("[[deploy.groups]]"));
+    }
+
+    #[test]
+    fn manifest_roles_warns_when_serves_http_does_not_match_the_base() {
+        let values = "roles:\n  worker:\n    servesHttp: true\n";
+        let row = manifest_roles_row("", &[("deploy/helm/values.yaml", values)]);
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        assert!(row.detail.unwrap_or_default().contains("servesHttp"));
+    }
+
+    #[test]
+    fn manifest_role_scanners_skip_comments_and_off_roles() {
+        let values = "\u{feff}roles:   # one per role\n    web:  # main\n      servesHttp: true # yes\n    \
+                      old:\n      enabled: false\n";
+        assert_eq!(helm_value_roles(values), [("web".to_owned(), Some(true))]);
+        let compose = "# AUTUMN_ROLE=old\n  AUTUMN_ROLE: worker  # tier\n  MY_AUTUMN_ROLE=x\n";
+        assert_eq!(autumn_role_values(compose), ["worker"]);
+        let fly_env = "[env]\n  AUTUMN_ROLE = \"worker\"\n";
+        assert_eq!(autumn_role_values(fly_env), ["worker"]);
+    }
+
+    #[test]
+    fn a_disabled_role_keeps_its_own_fields() {
+        let values = "roles:\n  web:\n    enabled: true\n    servesHttp: true\n  worker:\n    \
+                      enabled: false\n    servesHttp: false\n  critical:\n    servesHttp: false\n";
+        assert_eq!(
+            helm_value_roles(values),
+            [
+                ("web".to_owned(), Some(true)),
+                ("critical".to_owned(), Some(false))
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_roles_warns_on_a_split_group_role_on_the_local_backend() {
+        let row = manifest_roles_row(
+            "[[deploy.groups]]\nrole = \"worker\"\nhosts = [\"a\"]\n",
+            &[],
+        );
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        assert!(row.detail.unwrap_or_default().contains("local"));
+        let row = manifest_roles_row(
+            "[jobs]\nbackend = \"postgres\"\n[[deploy.groups]]\nrole = \"worker\"\nhosts = [\"a\"]\n",
+            &[],
+        );
+        assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+    }
+
+    /// A component that the base no longer lists is not deployed, so its
+    /// role is not checked.
+    #[test]
+    fn manifest_role_walk_skips_components_the_base_does_not_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("deploy/kustomize");
+        for role in ["web", "old"] {
+            let component = root.join("components").join(role);
+            std::fs::create_dir_all(&component).unwrap();
+            std::fs::write(
+                component.join("deployment.yaml"),
+                format!("- name: AUTUMN_ROLE\n  value: {role}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(root.join("base")).unwrap();
+        std::fs::write(
+            root.join("base/kustomization.yaml"),
+            "components:\n  - ../components/web # main\nimages: []\n",
+        )
+        .unwrap();
+        let files = read_manifest_role_files(dir.path());
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"deploy/kustomize/components/web/deployment.yaml"),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("components/old")),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"deploy/kustomize/base/kustomization.yaml"),
+            "{names:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_role_walk_survives_a_link_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let kustomize = dir.path().join("deploy/kustomize/base");
+        std::fs::create_dir_all(&kustomize).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("deploy"), kustomize.join("loop")).unwrap();
+        std::fs::write(
+            kustomize.join("d.yaml"),
+            "- name: AUTUMN_ROLE\n  value: web\n",
+        )
+        .unwrap();
+        let files = read_manifest_role_files(dir.path());
+        assert_eq!(files.len(), 1, "{files:?}");
+    }
+
+    #[test]
+    fn manifest_roles_passes_with_no_manifests() {
+        let row = manifest_roles_row("", &[]);
+        assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+    }
+
+    #[test]
+    fn manifest_roles_reads_the_generated_golden_output() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/release/kubernetes-roles");
+        let files = read_manifest_role_files(&root);
+        assert!(
+            files.iter().any(|(n, _)| n == "deploy/helm/values.yaml"),
+            "{files:?}"
+        );
+        assert!(
+            files
+                .iter()
+                .any(|(n, _)| n == "deploy/kustomize/components/worker/deployment.yaml"),
+            "{files:?}"
+        );
+        let declared = "[roles.marketing]\nbase = \"web\"\nmount = [\"marketing\"]\n";
+        let table: toml::Table = toml::from_str(declared).unwrap();
+        let row = check_manifest_roles(Some(&table), &files);
+        assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+        let row = check_manifest_roles(None, &files);
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
     }
 
     #[test]
