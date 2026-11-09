@@ -59,6 +59,14 @@ pub struct ReplicationSnapshot {
     /// Last tick that completed without an error — the point the replica is
     /// known to be current to.
     pub last_success_at: Option<DateTime<Utc>>,
+    /// Every transaction committed at or before this instant is in the
+    /// replica, under the current generation. `None` before the first
+    /// caught-up tick of the generation, after a new epoch, and after a
+    /// fence. Unlike `last_success_at`, the tick reads the clock before it
+    /// measures the tail. Thus the bound never covers a commit after the
+    /// check. The bound assumes a clock that does not step back. If the clock
+    /// steps back, the bound follows it back.
+    pub replicated_through: Option<DateTime<Utc>>,
     /// Last tick that actually shipped bytes.
     pub last_shipped_at: Option<DateTime<Utc>>,
     /// Segments shipped since the process started.
@@ -98,6 +106,13 @@ impl ReplicationSnapshot {
     }
 }
 
+/// The bound a clock reading proves: one step below it. A commit read at
+/// the same instant may follow the measurement.
+#[must_use]
+pub(crate) fn bound_below(read: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    read.checked_sub_signed(chrono::TimeDelta::nanoseconds(1))
+}
+
 /// Shared, mutable replication state.
 #[derive(Debug)]
 pub struct ReplicationStatus {
@@ -131,6 +146,8 @@ impl ReplicationStatus {
     pub fn record_generation(&self, generation: &str, at: DateTime<Utc>) {
         self.with(|s| {
             s.generation = Some(generation.to_owned());
+            // The new generation proves its own bound.
+            s.replicated_through = None;
             s.snapshots_taken = s.snapshots_taken.saturating_add(1);
             s.last_success_at = Some(at);
             s.last_error = None;
@@ -167,6 +184,38 @@ impl ReplicationStatus {
             s.last_error_at = None;
             s.consecutive_failures = 0;
         });
+    }
+
+    /// Record that every commit at or before `at` is in the replica.
+    ///
+    /// The bound follows the clock. It does not keep an earlier, later value:
+    /// after the clock steps back, that value would cover new commits that
+    /// are not shipped. With a clock that does not step back, the bound never
+    /// moves back.
+    pub fn record_replicated_through(&self, at: DateTime<Utc>) {
+        self.with(|s| s.replicated_through = Some(at));
+    }
+
+    /// The bound of [`ReplicationSnapshot::replicated_through`], without a
+    /// copy of the whole snapshot.
+    #[must_use]
+    pub fn replicated_through(&self) -> Option<DateTime<Utc>> {
+        self.with(|s| s.replicated_through)
+    }
+
+    /// Forget the bound when it is not below `reading`: the clock stepped
+    /// back, and the bound would cover new commits that are not shipped.
+    pub fn forget_if_ahead_of(&self, reading: DateTime<Utc>) {
+        self.with(|s| {
+            if s.replicated_through.is_some_and(|at| at >= reading) {
+                s.replicated_through = None;
+            }
+        });
+    }
+
+    /// Forget the bound: the replica no longer proves it.
+    pub fn clear_replicated_through(&self) {
+        self.with(|s| s.replicated_through = None);
     }
 
     /// Record a failed tick. Does **not** advance `last_success_at`, so lag keeps
@@ -480,5 +529,51 @@ mod tests {
             indicator(&status, at(0)).group(),
             IndicatorGroup::HealthOnly
         );
+    }
+
+    #[test]
+    fn replicated_through_follows_the_clock() {
+        let status = ReplicationStatus::new("file:///replicas");
+        status.record_generation("g1", at(0));
+        assert_eq!(status.snapshot().replicated_through, None);
+        status.record_replicated_through(at(10));
+        status.record_replicated_through(at(20));
+        assert_eq!(status.replicated_through(), Some(at(20)));
+        // A clock that stepped back: the old, later bound would cover new
+        // commits that are not shipped.
+        status.record_replicated_through(at(5));
+        assert_eq!(status.replicated_through(), Some(at(5)));
+    }
+
+    #[test]
+    fn a_new_generation_or_a_clear_drops_replicated_through() {
+        let status = ReplicationStatus::new("file:///replicas");
+        status.record_generation("g1", at(0));
+        status.record_replicated_through(at(10));
+        status.record_generation("g2", at(11));
+        assert_eq!(status.snapshot().replicated_through, None);
+        status.record_replicated_through(at(3));
+        assert_eq!(status.snapshot().replicated_through, Some(at(3)));
+        status.clear_replicated_through();
+        assert_eq!(status.snapshot().replicated_through, None);
+    }
+
+    #[test]
+    fn a_reading_at_or_below_the_bound_forgets_it() {
+        let status = ReplicationStatus::new("file:///replicas");
+        status.record_replicated_through(at(10));
+        status.forget_if_ahead_of(at(11));
+        assert_eq!(status.replicated_through(), Some(at(10)));
+        status.forget_if_ahead_of(at(10));
+        assert_eq!(status.replicated_through(), None);
+    }
+
+    #[test]
+    fn a_failed_or_behind_tick_keeps_replicated_through() {
+        let status = ReplicationStatus::new("file:///replicas");
+        status.record_replicated_through(at(10));
+        status.record_tick_error("down", at(20));
+        status.record_tick_behind(42);
+        assert_eq!(status.snapshot().replicated_through, Some(at(10)));
     }
 }

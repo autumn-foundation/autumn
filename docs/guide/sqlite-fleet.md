@@ -162,6 +162,8 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | `fleet.each(n, f)` | run `f` on every database, `n` at a time |
 | `fleet.migrate_all(n)` | migrate every database, report failures per database |
 | `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
+| `fleet.replicated_through(&key)` | the instant up to which every commit is in the replica. See [Know when a write is in the replica](#know-when-a-write-is-in-the-replica) |
+| `fleet.wait_replicated(&key, at, timeout)` | wait until every commit at or before `at` is in the replica |
 | `fleet.restore_from_file(&key, &src, opts)` | replace (or create) the database with a local backup; no replication needed. See [Restore a backup in place](#restore-a-backup-in-place) |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
 
@@ -583,6 +585,67 @@ Usually another process on the same root holds their lock. A database that
 closes and opens again during a pass can show as `unowned` for some
 milliseconds. The next pass claims it.
 
+### Know when a write is in the replica
+
+A commit is on the local disk at once. It is in the replica only after a
+pass ships it. A takeover restores from the replica. So "committed" and
+"survives a takeover" are not the same.
+
+`fleet.replicated_through(&key)` gives an instant. Every transaction
+committed to that database at or before that instant is in the replica.
+Read the commit time from the app clock after the commit returns. The fleet
+uses this clock. Compare the commit time with the instant.
+
+Use it for a write that spans two databases. For example, a row moves from
+`src` to `dst`: upsert it into `dst`, then delete it from `src`. If the
+delete ships and the upsert does not, a takeover loses the row. So delete
+only after the upsert is in the replica:
+
+```rust,ignore
+upsert(&dst_db, &row).await?;
+let committed_at = state.clock().now();
+fleet
+    .wait_replicated(&dst, committed_at, Duration::from_secs(5))
+    .await?;
+delete(&src_db, row.id).await?;
+```
+
+`replicated_through` is `None` when:
+
+- no tick proved the replica caught up since the current generation or
+  epoch started;
+- another process replicates the database;
+- the lease of this host on the slot lapsed, or a newer owner fenced the
+  replica;
+- the clock is below the bound: the clock stepped back;
+- the database never opened in this process, or a delete or a restore
+  replaced it.
+
+`wait_replicated` returns when the bound covers the commit time. It fails
+with:
+
+- `NotReplicating`: no replicator for the database ran in this process.
+  This includes `rebuild` mode and a fleet with no replication.
+- `Fenced`: a newer owner fenced the replica.
+- `TimedOut`: in all other cases, when the time is over. The write is not
+  lost. It is not known yet. Keep the source row. Try again later.
+
+Rules:
+
+- The bound assumes a clock that does not step back. If the clock steps
+  back, the bound follows it back.
+- In one generation the bound never moves back.
+- A closed database keeps its last bound for an hour, or until it opens
+  again. A database that still ships its backlog after the close
+  (`closing`) gives a bound until it ships all of it. The bound is local to
+  this process: a delete or a restore in another process does not clear it.
+- A clock step back that is shorter than one sync interval can escape the
+  check. Keep the host clock in sync without steps (slew it).
+- In `generations` mode the bound is the instant before the last ship that
+  worked.
+- The bound does not change `worst_lag_seconds`. Use the lag for alerts.
+  Use the bound for a decision about one write.
+
 ### Deleting a database's replica
 
 `fleet.delete(&key)` and `autumn fleet delete` remove the replica too:
@@ -849,6 +912,10 @@ one store: the release of one fleet ends the lease of the other.
    fail-back (step 5) replaces those files with the replica, so they do not
    come back. A planned move (step 2) loses nothing: the old host ships
    everything before it releases the ranges.
+   A takeover can lose one half of a write that spans two databases. To
+   prevent this, write the second half only after the first half is in the
+   replica. Make the second half safe to repeat. See
+   [Know when a write is in the replica](#know-when-a-write-is-in-the-replica).
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a

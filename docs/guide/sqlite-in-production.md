@@ -667,6 +667,13 @@ where the app is not running. `/actuator/health` reports what the **running
 process** knows, under the `sqlite-replication` indicator: `lag_seconds`,
 `generation`, `segments_shipped`, `pending_bytes`, `last_verified_at`.
 
+A fleet app can ask if one write is offsite.
+`fleet.replicated_through(&key)` gives an instant. Every commit to that
+database at or before it is in the replica. `fleet.wait_replicated` waits
+for it. Wait for it before you write the second half of a write that spans
+two databases. Then a takeover cannot lose one half. See
+[Know when a write is in the replica](sqlite-fleet.md#know-when-a-write-is-in-the-replica).
+
 **What you actually pay for.** Steady-state upload is the size of your WAL
 writes, not the size of your database. The `-wal` file cannot grow forever, so
 the replicator checkpoints it once `max_wal_bytes` is reached — but a checkpoint

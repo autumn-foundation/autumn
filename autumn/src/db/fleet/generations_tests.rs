@@ -1200,3 +1200,123 @@ async fn a_record_whose_files_are_gone_ships_nothing() {
     assert!(complete(&a, &key).is_empty());
     a.fleet.close_all().await;
 }
+
+/// The system clock after a commit, and a wait until it moves past that
+/// reading. A coarse clock then cannot give the next ship the same value.
+fn wall_after_commit() -> chrono::DateTime<chrono::Utc> {
+    let at = crate::time::ClockSource::now(&crate::time::SystemClock);
+    while crate::time::ClockSource::now(&crate::time::SystemClock) <= at {
+        std::thread::yield_now();
+    }
+    at
+}
+
+#[tokio::test]
+async fn a_shipped_generation_sets_replicated_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let key = acme(&a.fleet);
+    write(&a, &key, "plan").await;
+    let committed_at = wall_after_commit();
+    assert_eq!(
+        a.fleet.replicated_through(&key),
+        None,
+        "nothing shipped yet"
+    );
+    a.fleet.ship_now(&key).await.unwrap();
+    let through = a.fleet.replicated_through(&key).expect("shipped");
+    assert!(through >= committed_at, "{through} < {committed_at}");
+    a.fleet
+        .wait_replicated(&key, committed_at, Duration::ZERO)
+        .await
+        .expect("covered");
+
+    // An unchanged database ships nothing new, and is still covered.
+    a.fleet.ship_now(&key).await.unwrap();
+    assert!(a.fleet.replicated_through(&key) >= Some(through));
+
+    // The close ships the last generation. The bound stays for waiters.
+    write(&a, &key, "last").await;
+    let last_at = wall_after_commit();
+    a.fleet.close_all().await;
+    assert!(
+        a.fleet
+            .replicated_through(&key)
+            .is_some_and(|through| through >= last_at),
+        "the close-time ship covers the last write"
+    );
+}
+
+#[tokio::test]
+async fn a_fenced_generation_ship_drops_the_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let store = Arc::new(MemoryOwnership::new(Arc::new(crate::time::SystemClock)));
+    let _ownership = own(&a, &store, "a").await;
+    let key = acme(&a.fleet);
+    write(&a, &key, "plan").await;
+    let committed_at = wall_after_commit();
+    a.fleet.ship_now(&key).await.unwrap();
+    assert!(a.fleet.replicated_through(&key) >= Some(committed_at));
+
+    // Another host took the slot and wrote its epoch marker.
+    let root = a.replication.root_for(&key);
+    a.replication
+        .destination()
+        .put(&segment::epoch_marker_key(&root, 9), b"{}")
+        .unwrap();
+    write(&a, &key, "late").await;
+    assert!(matches!(
+        a.fleet.ship_now(&key).await,
+        Err(FleetError::Fenced { .. })
+    ));
+    assert_eq!(a.fleet.replicated_through(&key), None);
+    let waited = a
+        .fleet
+        .wait_replicated(&key, committed_at, Duration::from_secs(30))
+        .await;
+    assert!(
+        matches!(
+            waited,
+            Err(crate::db::fleet_replication::ReplicatedWaitError::Fenced { .. })
+        ),
+        "{waited:?}"
+    );
+    a.fleet.close_all().await;
+}
+
+#[tokio::test]
+async fn a_retry_after_a_failed_close_ship_moves_the_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, refusing) = refusing_host(tmp.path(), "vol-a");
+    let key = acme(&a.fleet);
+    write(&a, &key, "a1").await;
+    let committed_at = wall_after_commit();
+    refusing.set(true);
+    a.fleet.close_all().await;
+    assert_eq!(
+        a.replication.unshipped_generations(),
+        1,
+        "the close kept it"
+    );
+    assert_eq!(a.fleet.replicated_through(&key), None, "nothing shipped");
+
+    // The retry ships the kept generation. A waiter sees it.
+    refusing.set(false);
+    tick(&a).await;
+    assert_eq!(
+        a.replication.unshipped_generations(),
+        0,
+        "the retry shipped"
+    );
+    assert!(
+        a.fleet
+            .replicated_through(&key)
+            .is_some_and(|through| through >= committed_at),
+        "the retry covers the write"
+    );
+    a.fleet
+        .wait_replicated(&key, committed_at, Duration::ZERO)
+        .await
+        .expect("covered after the retry");
+}

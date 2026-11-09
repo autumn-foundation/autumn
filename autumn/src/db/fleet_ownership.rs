@@ -3429,6 +3429,91 @@ mod tests {
             assert_eq!(bodies(&db_c).await, vec!["a1", "b1"]);
             c.fleet.close_all().await;
         }
+
+        /// Each write at or before the old owner's last bound is in the
+        /// new owner's copy. A fenced old owner claims nothing.
+        #[tokio::test]
+        async fn a_takeover_restore_has_every_write_the_old_owner_covered() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            let mut committed = Vec::new();
+            for (i, ship) in [true, false, true, true, false, false]
+                .into_iter()
+                .enumerate()
+            {
+                let body = format!("a{i}");
+                exec(&db_a, &format!("INSERT INTO notes VALUES ('{body}')"))
+                    .await
+                    .unwrap();
+                committed.push((body, a.clock.now()));
+                // The app reads the clock after the commit. Time moves on.
+                a.clock.advance(Duration::from_millis(10));
+                if ship {
+                    tick(&a.replication).await;
+                }
+            }
+            let through = a
+                .replication
+                .replicated_through(&key)
+                .expect("A shipped under its epoch");
+            assert!(
+                committed.iter().any(|(_, at)| *at > through),
+                "the last writes are not shipped yet"
+            );
+
+            // B takes over from the replica. A is partitioned from the store.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            let db_b = b.fleet.open(&key).await.unwrap();
+            let restored = bodies(&db_b).await;
+            for (body, at) in &committed {
+                if *at <= through {
+                    assert!(
+                        restored.contains(body),
+                        "{body} at {at} <= {through}: {restored:?}"
+                    );
+                }
+            }
+            tick(&b.replication).await;
+
+            assert_eq!(
+                a.replication.replicated_through(&key),
+                Some(through),
+                "A has not learned of B yet"
+            );
+            // A learns that it lost the range: its bound goes before any fence.
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(
+                a.replication.replicated_through(&key),
+                None,
+                "a host that does not serve the slot claims nothing"
+            );
+
+            // A's next fence check sees B's epoch: A claims nothing more.
+            a.clock.advance(Duration::from_mins(2));
+            tick(&a.replication).await;
+            assert_eq!(a.replication.replicated_through(&key), None);
+            let waited = a
+                .fleet
+                .wait_replicated(&key, through, Duration::from_secs(5))
+                .await;
+            assert!(
+                matches!(
+                    waited,
+                    Err(crate::db::fleet_replication::ReplicatedWaitError::Fenced { .. })
+                ),
+                "{waited:?}"
+            );
+            drop((db_a, db_b));
+            a.fleet.close_all().await;
+            b.fleet.close_all().await;
+        }
     }
 
     mod props {
