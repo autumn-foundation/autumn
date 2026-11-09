@@ -3153,6 +3153,14 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `rpo_secs` of committed writes that already returned success are missing.
   A replicated fleet root is served by one process (one replicator per
   database).
+- A write that spans two databases (move a row: upsert into `dst`, delete
+  from `src`): do the second half only after the first is in the replica.
+  `fleet.wait_replicated(&dst, committed_at, timeout)` with `committed_at`
+  read from the app clock after the commit; `fleet.replicated_through(&key)`
+  gives the instant itself. Errors: `NotReplicating`, `Fenced`, `TimedOut`
+  (not a loss: keep the source row, retry). Do not use `worst_lag_seconds`
+  or `last_success_at` for this. Guide: "Know when a write is in the
+  replica" in `docs/guide/sqlite-fleet.md`.
 - Delete with replication (issue #3235): `delete` also purges the replica.
   It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
   database first; no row, no delete (`503`). A failed purge keeps the row,
