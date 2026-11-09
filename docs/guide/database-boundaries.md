@@ -368,6 +368,9 @@ of database and user. So each boundary gets its own server pool.
   change. Write `ALTER TABLE ... SET SCHEMA` by hand.
 * `schema diff` does not match a foreign key to a table of another named
   schema. Write that constraint in a migration.
+* `schema diff` refuses a type change of a column that a foreign key points
+  at, when an FK of the same table name in another schema exists. This is a
+  false refusal. Write the change by hand.
 * A model with `schema` stops `schema diff` on SQLite.
 * `autumn migrate` does not run an embedded `migrations_in_schema` set. Run it
   at boot, or set `AUTUMN_MIGRATE=1`.
