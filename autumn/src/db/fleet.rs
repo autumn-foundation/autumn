@@ -211,6 +211,12 @@ mod sqlite;
 #[cfg(feature = "sqlite")]
 pub(crate) mod generations;
 
+/// Restore one database from a local backup file.
+#[cfg(feature = "sqlite")]
+mod local_restore;
+
+#[cfg(feature = "sqlite")]
+pub use local_restore::{LocalRestore, LocalRestoreOutcome};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{DatabaseFleetBuilder, FleetDbInfo, FleetMigrationReport, SqliteEngine};
 #[cfg(feature = "sqlite")]
@@ -339,7 +345,8 @@ pub enum FleetError {
         /// The database name.
         name: String,
     },
-    /// Restoring the database from its replica failed (`503`).
+    /// A restore from the replica failed, or a restore from a local file
+    /// refused its file or the key (`503`).
     #[error("fleet database {name}: restore failed: {detail}")]
     Restore {
         /// The database name.
@@ -780,7 +787,7 @@ pub trait FleetLifecycle<E: FleetEngine>: Send + Sync + 'static {
     /// `[database.fleet] restore_missing` says (that setting controls only
     /// the restore from the replica). A background open does not ask. With
     /// replication, an open of a deleted database does not ask either. To
-    /// restore a local backup, use `DatabaseFleet::import`.
+    /// restore a local backup, use `DatabaseFleet::restore_from_file`.
     ///
     /// # Errors
     ///
@@ -2699,6 +2706,18 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         key: &FleetDbKey,
         target: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
+        self.with_exclusive(key, self.replace_from_replica(key, target))
+            .await
+    }
+
+    /// Run `work` while `key` is out of service for a restore. Openers wait.
+    /// It closes the open database first. The hooks release its files. Then
+    /// `work` starts.
+    async fn with_exclusive<T>(
+        &self,
+        key: &FleetDbKey,
+        work: impl Future<Output = Result<T, FleetError>>,
+    ) -> Result<T, FleetError> {
         loop {
             if let Some((key, entry, drain)) = self.begin_exclusive(key, false)? {
                 let _finish = DrainGuard {
@@ -2713,7 +2732,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 }
                 // The guard finishes the drain whatever fails: an error that
                 // skipped it would strand every later opener of this key.
-                return self.replace_from_replica(&key, target).await;
+                return work.await;
             }
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(pending) = pending {
@@ -5907,3 +5926,6 @@ mod engine_tests;
 
 #[cfg(all(test, feature = "sqlite"))]
 mod generations_tests;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod local_restore_tests;
