@@ -51,7 +51,7 @@ Enable the runtime by building the application with the `sqlite` cargo feature (
   ```toml
   autumn-web = { version = "0.10", default-features = false, features = [
       "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
-      # The widget families (#3408). Keep the ones the app renders.
+      # The widget families. Keep the ones the app renders.
       "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts",
   ] }
   ```

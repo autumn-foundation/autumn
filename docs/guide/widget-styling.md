@@ -26,7 +26,7 @@ app.
 
 ## Widget families
 
-The widgets are in families (#3408). The core widgets (layout, navigation,
+The widgets are in families. The core widgets (layout, navigation,
 feedback and data display) need only the `maud` feature. Four families have
 their own feature. All four are in `default`.
 
@@ -217,7 +217,7 @@ you would override a third-party component library:
 
 ## Class names
 
-Every widget class has the `autumn-` prefix. Since #3396 this includes the
+Every widget class has the `autumn-` prefix. This includes the
 alert, the badge and the wizard stepper:
 
 | Old | New |

@@ -217,18 +217,15 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 | `autumn-widgets.js`, gzip level 9 | 21 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
-above the budget. Raise the budget only with a reason in the PR. Issue
-#3399 added the toast runtime. It increased the budgets from 32 KiB and
-10 KiB. Issue #3404 added the tooltip runtime, next to the #3403 drawer.
-Issue #3402 added the popover menu runtime. Together they increased them from
-36 KiB and 11 KiB. Issue #3406 added the busy state for htmx requests. It
-increased them from 44 KiB and 13 KiB. Issue #3411 added the direct upload
-controller. It increased them from 46 KiB and 14 KiB. Issue #3410 added the
-tags mode of the combobox (chips). It increased them from 54 KiB and 16 KiB.
-Issue #3412 added the password reveal, the strength hint and the one-time
-code format. It increased them from 61 KiB and 18 KiB. Issue #3417 added the
-tree keys. It increased them from 70 KiB and 20 KiB. The measure includes
-the search part of the bundle.
+above the budget. Raise the budget only with a reason in the PR. The
+budgets grew with the runtime. The toast runtime raised them from 32 KiB and
+10 KiB. The tooltip, drawer and popover menu runtimes raised them from 36 KiB
+and 11 KiB. The busy state for htmx requests raised them from 44 KiB and
+13 KiB. The direct upload controller raised them from 46 KiB and 14 KiB. The
+tags mode of the combobox (chips) raised them from 54 KiB and 16 KiB. The
+password reveal, the strength hint and the one-time code format raised them
+from 61 KiB and 18 KiB. The tree keys raised them from 70 KiB and 20 KiB. The
+measure includes the search part of the bundle.
 
 ## Tests
 
