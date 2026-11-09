@@ -1771,6 +1771,7 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size,
             cache_size_kib: 0,
         })
@@ -2147,6 +2148,7 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         })
@@ -2467,6 +2469,7 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         })
@@ -2731,6 +2734,7 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         })
@@ -3317,6 +3321,7 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         })

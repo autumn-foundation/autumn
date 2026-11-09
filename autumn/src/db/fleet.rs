@@ -260,6 +260,13 @@ const MAX_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// request with a closed database.
 pub const DEFAULT_MIN_RESIDENCY: Duration = Duration::from_secs(2);
 
+/// How often a parked open looks for room again, when no close wakes it.
+const ROOM_POLL: Duration = Duration::from_millis(20);
+
+/// How long an open waits for room under `max_open_policy = "wait"`, when the
+/// caller sets no connect timeout.
+const DEFAULT_OPEN_WAIT: Duration = Duration::from_secs(5);
+
 /// How often a drain checks whether the last use of a database has ended.
 const DRAIN_POLL: Duration = Duration::from_millis(20);
 
@@ -416,6 +423,20 @@ pub enum FleetError {
         /// Why no key was found.
         detail: String,
     },
+    /// The fleet holds `max_open` databases and none can close now (`503`).
+    /// Only with `max_open_policy = "wait"` or `"refuse"`. Retry later.
+    #[error(
+        "fleet database {name} cannot open: the fleet holds its {max_open} databases and none \
+         can close yet; retry later"
+    )]
+    AtCapacity {
+        /// The database name.
+        name: String,
+        /// The configured cap.
+        max_open: usize,
+        /// Seconds to put in `Retry-After`.
+        retry_after_secs: u64,
+    },
     /// The app has no fleet of this engine (`503`).
     #[error("no fleet of engine {engine} is installed")]
     NoFleet {
@@ -433,6 +454,17 @@ pub enum FleetError {
 }
 
 impl FleetError {
+    /// Seconds for a `Retry-After` header, when the error has one.
+    #[must_use]
+    pub const fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::AtCapacity {
+                retry_after_secs, ..
+            } => Some(*retry_after_secs),
+            _ => None,
+        }
+    }
+
     /// The HTTP status a request that hit this error answers with. Applied
     /// by [`AutumnError`]'s `From` impl, so `?` on a fleet call in a handler
     /// produces it.
@@ -453,6 +485,7 @@ impl FleetError {
             | Self::Unavailable { .. }
             | Self::Restore { .. }
             | Self::NotReplicated { .. }
+            | Self::AtCapacity { .. }
             | Self::NoFleet { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Misplaced { .. } | Self::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -838,6 +871,15 @@ pub struct FleetStats {
     pub draining: usize,
     /// The configured cap.
     pub max_open: usize,
+    /// The most databases open and closing together since boot. Above
+    /// `max_open`, the cap was soft for a moment: size `ulimit -n` for this
+    /// value.
+    pub peak_open: usize,
+    /// Opens that took the fleet past `max_open` since boot (`soft` policy).
+    pub over_cap_opens_total: u64,
+    /// Opens answered `503` because the fleet was full since boot (`wait`
+    /// and `refuse` policy).
+    pub refused_total: u64,
     /// The memory the open databases hold, by the engine's count.
     pub resident_bytes: u64,
     /// The configured memory budget. `0`: no budget.
@@ -917,6 +959,8 @@ enum Next<E: FleetEngine> {
     Wait(Arc<Drain>),
     /// A background open found the fleet full.
     NoRoom,
+    /// A request open found the fleet full, and the policy is not `soft`.
+    Full,
     /// The entry, and whether this caller made it and so must start its opener.
     Open(Arc<Entry<E>>, bool),
 }
@@ -1024,6 +1068,10 @@ struct Counters {
     open_failures: AtomicU64,
     created: AtomicU64,
     deleted: AtomicU64,
+    /// The most databases open and closing together.
+    peak_held: AtomicUsize,
+    over_cap_opens: AtomicU64,
+    refused: AtomicU64,
 }
 
 struct Inner<E: FleetEngine> {
@@ -1036,6 +1084,11 @@ struct Inner<E: FleetEngine> {
     create_on_demand: bool,
     idle_close: Option<Duration>,
     min_residency: Duration,
+    max_open_policy: crate::config::FleetMaxOpenPolicy,
+    /// The longest an open waits for room under `FleetMaxOpenPolicy::Wait`.
+    open_wait: Duration,
+    /// Woken when a slot frees: a drain ends, or a failed open leaves.
+    room: Notify,
     #[cfg(feature = "sqlite")]
     replication: std::sync::OnceLock<Arc<super::fleet_replication::FleetReplication>>,
     ownership: std::sync::OnceLock<Arc<super::fleet_ownership::FleetOwnership>>,
@@ -1085,12 +1138,13 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     /// [`FleetError::InvalidKey`] for a bad template, [`FleetError::Io`] when
     /// the root cannot be created.
     pub fn with_engine(config: &DatabaseFleetConfig, engine: E) -> Result<Self, FleetError> {
-        Self::from_config(config, |_| engine)
+        Self::from_config(config, DEFAULT_OPEN_WAIT, |_| engine)
     }
 
     /// Build the fleet. `engine` gets the canonical root.
     pub(crate) fn from_config(
         config: &DatabaseFleetConfig,
+        open_wait: Duration,
         engine: impl FnOnce(&Path) -> E,
     ) -> Result<Self, FleetError> {
         let template = FleetPathTemplate::parse(config.path_template(), config.mode)?;
@@ -1109,6 +1163,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 idle_close: (config.idle_close_secs > 0)
                     .then(|| Duration::from_secs(config.idle_close_secs)),
                 min_residency: config.min_residency,
+                max_open_policy: config.max_open_policy,
+                open_wait,
+                room: Notify::new(),
                 #[cfg(feature = "sqlite")]
                 replication: std::sync::OnceLock::new(),
                 ownership: std::sync::OnceLock::new(),
@@ -1660,6 +1717,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         background: bool,
     ) -> Result<Option<BackgroundOpen<E>>, FleetError> {
         self.check_key(key)?;
+        let mut deadline = None;
         loop {
             // Before anything touches the disk: `restore_missing` runs only
             // for a key this host owns (issue #3233).
@@ -1671,6 +1729,12 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                     continue;
                 }
                 Next::NoRoom => return Ok(None),
+                Next::Full => {
+                    let deadline = *deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + self.inner.open_wait);
+                    self.wait_for_room(key, deadline).await?;
+                    continue;
+                }
                 Next::Open(entry, elected) => (entry, elected),
             };
             // No await between the claim and the spawn, so a cancelled caller
@@ -1798,14 +1862,16 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 return Ok(Next::Open(Arc::clone(entry), false));
             }
             let budget = self.inner.max_resident_bytes;
-            if state.open.len() >= self.inner.max_open
-                || (budget > 0 && self.resident_locked(&state) >= budget)
-            {
+            if self.full_locked(&state) || (budget > 0 && self.resident_locked(&state) >= budget) {
                 return Ok(Next::NoRoom);
             }
             let entry = Arc::new(Entry::new(BACKGROUND_SEQ));
             state.open.insert(key.clone(), Arc::clone(&entry));
+            self.note_held(&state);
             return Ok(Next::Open(entry, true));
+        }
+        if self.hard_cap() && !state.open.contains_key(key) && self.full_locked(&state) {
+            return Ok(Next::Full);
         }
         state.seq += 1;
         let seq = state.seq;
@@ -1814,10 +1880,71 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             elected = true;
             Arc::new(Entry::new(seq))
         }));
+        if elected {
+            self.note_held(&state);
+        }
         // Under the lock: `close_if_unused` reads the mark under it too.
         entry.touch(seq);
         drop(state);
         Ok(Next::Open(entry, elected))
+    }
+
+    /// Whether `max_open_policy` caps the open files for real.
+    fn hard_cap(&self) -> bool {
+        self.inner.max_open_policy != crate::config::FleetMaxOpenPolicy::Soft
+    }
+
+    /// Whether a new entry has no room. A closing database still holds its
+    /// files, so a hard cap counts it. The soft cap counts open ones only.
+    fn full_locked(&self, state: &State<E>) -> bool {
+        let closing = if self.hard_cap() {
+            state.draining.len()
+        } else {
+            0
+        };
+        state.open.len() + closing >= self.inner.max_open
+    }
+
+    /// Record the databases held after an entry was added.
+    fn note_held(&self, state: &State<E>) {
+        let held = state.open.len() + state.draining.len();
+        let counters = &self.inner.counters;
+        counters.peak_held.fetch_max(held, Ordering::Relaxed);
+        if held > self.inner.max_open {
+            counters.over_cap_opens.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A request open found the fleet full. Close one idle database past its
+    /// residency, then wait for the slot until `deadline`. Returns when a
+    /// retry is worth a try, or the `503` when it is not: the deadline
+    /// passed, or the policy is `refuse` and nothing is closing.
+    async fn wait_for_room(
+        &self,
+        key: &FleetDbKey,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), FleetError> {
+        let notified = self.inner.room.notified();
+        self.evict(None, 1);
+        let now = tokio::time::Instant::now();
+        let closing = !self.lock_state().draining.is_empty();
+        let refuse = self.inner.max_open_policy == crate::config::FleetMaxOpenPolicy::Refuse;
+        if now >= deadline || (refuse && !closing) {
+            self.inner.counters.refused.fetch_add(1, Ordering::Relaxed);
+            let residency = self.inner.min_residency;
+            let secs = residency.as_secs() + u64::from(residency.subsec_nanos() > 0);
+            return Err(FleetError::AtCapacity {
+                name: key.name(),
+                max_open: self.inner.max_open,
+                retry_after_secs: secs.max(1),
+            });
+        }
+        let step = (deadline - now).min(ROOM_POLL);
+        tokio::select! {
+            () = notified => {}
+            () = tokio::time::sleep(step) => {}
+        }
+        Ok(())
     }
 
     /// Remove `entry` from the open map, if it is still the one there.
@@ -1829,6 +1956,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             .is_some_and(|current| Arc::ptr_eq(current, entry))
         {
             state.open.remove(key);
+            drop(state);
+            self.inner.room.notify_waiters();
         }
     }
 
@@ -1991,12 +2120,18 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     /// use is never chosen, so both caps are soft while every open database
     /// is busy.
     fn enforce_capacity(&self, keep: Option<&FleetDbKey>) {
+        self.evict(keep, 0);
+    }
+
+    /// As [`enforce_capacity`](Self::enforce_capacity), but also leave
+    /// `reserve` free slots. Starts the closes and returns their drains.
+    fn evict(&self, keep: Option<&FleetDbKey>, reserve: usize) -> Vec<Arc<Drain>> {
         let max_open = self.inner.max_open;
         let budget = self.inner.max_resident_bytes;
         let min_residency = self.inner.min_residency;
         let now = crate::time::ambient_instant();
         let victims = self.begin_drains(|state| {
-            let excess = state.open.len().saturating_sub(max_open);
+            let excess = (state.open.len() + reserve).saturating_sub(max_open);
             let over = if budget == 0 {
                 0
             } else {
@@ -2030,9 +2165,14 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             idle.sort_unstable();
             pick_victims(idle, excess, over, state.open.len())
         });
+        let drains = victims
+            .iter()
+            .map(|(_, _, drain)| Arc::clone(drain))
+            .collect();
         for (key, db, drain) in victims {
             self.spawn_drain(key, db, drain, true);
         }
+        drains
     }
 
     /// Close every database idle for longer than `idle_close`, returning how
@@ -2172,6 +2312,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         self.inner.in_flight_drains.fetch_sub(1, Ordering::Relaxed);
         drain.finished.store(true, Ordering::Release);
         drain.done.notify_waiters();
+        self.inner.room.notify_waiters();
     }
 
     /// Close one database now (waiting for its in-flight connections). A
@@ -2629,6 +2770,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             open,
             draining: self.inner.in_flight_drains.load(Ordering::Relaxed),
             max_open: self.inner.max_open,
+            peak_open: c.peak_held.load(Ordering::Relaxed),
+            over_cap_opens_total: c.over_cap_opens.load(Ordering::Relaxed),
+            refused_total: c.refused.load(Ordering::Relaxed),
             resident_bytes,
             max_resident_bytes: self.inner.max_resident_bytes,
             opens_total: c.opens.load(Ordering::Relaxed),
@@ -3253,6 +3397,7 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         }
@@ -3595,6 +3740,157 @@ mod tests {
             1,
             "the sweep enforces max_open afterwards"
         );
+    }
+
+    /// A slot fleet with a cap policy, a residency and a connect timeout.
+    fn capped(
+        root: &Path,
+        max_open: usize,
+        policy: crate::config::FleetMaxOpenPolicy,
+        residency: Duration,
+        wait_secs: u64,
+    ) -> DatabaseFleet {
+        DatabaseFleet::builder(DatabaseFleetConfig {
+            max_open,
+            max_open_policy: policy,
+            ..config(root, FleetMode::Slot)
+        })
+        .min_residency(residency)
+        .connect_timeout_secs(wait_secs)
+        .build()
+        .unwrap()
+    }
+
+    fn slot(n: u16) -> FleetDbKey {
+        FleetDbKey::Slot(n)
+    }
+
+    #[tokio::test]
+    async fn the_soft_policy_passes_the_cap_and_counts_it() {
+        use crate::config::FleetMaxOpenPolicy::Soft;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 1, Soft, Duration::from_secs(60), 5);
+        fleet.open(&slot(1)).await.unwrap();
+        fleet.open(&slot(2)).await.unwrap();
+        let stats = fleet.stats();
+        assert_eq!(stats.open, 2);
+        assert_eq!(stats.peak_open, 2);
+        assert_eq!(stats.over_cap_opens_total, 1);
+        assert_eq!(stats.refused_total, 0);
+    }
+
+    #[tokio::test]
+    async fn the_refuse_policy_answers_503_with_retry_after_at_the_cap() {
+        use crate::config::FleetMaxOpenPolicy::Refuse;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 2, Refuse, Duration::from_secs(60), 5);
+        drop(fleet.open(&slot(1)).await.unwrap());
+        drop(fleet.open(&slot(2)).await.unwrap());
+        let started = std::time::Instant::now();
+        let error = fleet.open(&slot(3)).await.unwrap_err();
+        assert!(matches!(error, FleetError::AtCapacity { max_open: 2, .. }));
+        assert_eq!(error.http_status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.retry_after_secs().is_some_and(|secs| secs >= 1));
+        assert!(started.elapsed() < Duration::from_secs(1), "no wait");
+        let stats = fleet.stats();
+        assert_eq!((stats.open, stats.peak_open), (2, 2));
+        assert_eq!(stats.refused_total, 1);
+        assert!(!fleet.open_keys().contains(&slot(3)));
+    }
+
+    #[tokio::test]
+    async fn a_hard_policy_still_serves_a_database_that_is_open() {
+        use crate::config::FleetMaxOpenPolicy::Refuse;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 1, Refuse, Duration::from_secs(60), 5);
+        drop(fleet.open(&slot(1)).await.unwrap());
+        assert!(fleet.open(&slot(1)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_hard_policy_closes_an_idle_database_past_its_residency_to_make_room() {
+        use crate::config::FleetMaxOpenPolicy::Refuse;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 1, Refuse, Duration::ZERO, 5);
+        drop(fleet.open(&slot(1)).await.unwrap());
+        drop(fleet.open(&slot(2)).await.unwrap());
+        settle(&fleet).await;
+        assert_eq!(fleet.open_keys(), vec![slot(2)]);
+        assert_eq!(fleet.stats().peak_open, 1);
+        assert_eq!(fleet.stats().refused_total, 0);
+    }
+
+    #[tokio::test]
+    async fn a_hard_policy_never_closes_a_database_that_is_in_use() {
+        use crate::config::FleetMaxOpenPolicy::Refuse;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 1, Refuse, Duration::ZERO, 5);
+        let held = fleet.open(&slot(1)).await.unwrap();
+        let error = fleet.open(&slot(2)).await.unwrap_err();
+        assert!(matches!(error, FleetError::AtCapacity { .. }));
+        assert!(held.pool().get().await.is_ok(), "the holder still works");
+    }
+
+    #[tokio::test]
+    async fn the_wait_policy_parks_an_open_until_the_residency_has_passed() {
+        use crate::config::FleetMaxOpenPolicy::Wait;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 1, Wait, Duration::from_millis(300), 30);
+        drop(fleet.open(&slot(1)).await.unwrap());
+        let started = std::time::Instant::now();
+        drop(fleet.open(&slot(2)).await.unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(150), "it waited");
+        settle(&fleet).await;
+        assert_eq!(fleet.open_keys(), vec![slot(2)]);
+        assert_eq!(fleet.stats().peak_open, 1);
+    }
+
+    #[tokio::test]
+    async fn the_wait_policy_answers_503_when_no_room_comes_in_time() {
+        use crate::config::FleetMaxOpenPolicy::Wait;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 1, Wait, Duration::from_secs(60), 1);
+        drop(fleet.open(&slot(1)).await.unwrap());
+        let started = std::time::Instant::now();
+        let error = fleet.open(&slot(2)).await.unwrap_err();
+        assert!(matches!(error, FleetError::AtCapacity { .. }));
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(fleet.stats().refused_total, 1);
+        assert_eq!(fleet.stats().peak_open, 1);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_distinct_keys_never_passes_the_cap_under_a_hard_policy() {
+        use crate::config::FleetMaxOpenPolicy::{Refuse, Wait};
+        for policy in [Refuse, Wait] {
+            let tmp = tempfile::tempdir().unwrap();
+            let fleet = capped(tmp.path(), 3, policy, Duration::from_millis(40), 30);
+            let tasks: Vec<_> = (1..=24)
+                .map(|n| {
+                    let fleet = fleet.clone();
+                    tokio::spawn(async move {
+                        let db = fleet.open(&slot(n)).await?;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        drop(db);
+                        Ok::<_, FleetError>(())
+                    })
+                })
+                .collect();
+            for task in tasks {
+                match task.await.unwrap() {
+                    Ok(()) => {}
+                    Err(FleetError::AtCapacity { .. }) => {
+                        assert_eq!(policy, Refuse, "wait serves every open in time");
+                    }
+                    Err(other) => panic!("{other}"),
+                }
+            }
+            settle(&fleet).await;
+            let stats = fleet.stats();
+            assert!(stats.peak_open <= 3, "{policy}: peak {}", stats.peak_open);
+            assert_eq!(stats.over_cap_opens_total, 0);
+        }
     }
 
     const BROKEN: EmbeddedMigrations =

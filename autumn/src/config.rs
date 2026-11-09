@@ -91,6 +91,7 @@
 //! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_OPEN` | `database.fleet.max_open` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY` | `database.fleet.max_open_policy` | `soft` / `wait` / `refuse` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES` | `database.fleet.max_resident_bytes` | `u64` |
 //! | `AUTUMN_DATABASE__FLEET__MIN_RESIDENCY` | `database.fleet.min_residency` | duration; empty is `2s` |
 //! | `AUTUMN_DATABASE__FLEET__POOL_SIZE` | `database.fleet.pool_size` | `usize` |
@@ -8522,6 +8523,11 @@ impl AutumnConfig {
         parse_env(env, "AUTUMN_DATABASE__FLEET__ROOT", &mut fleet.root);
         parse_env_option_string(env, "AUTUMN_DATABASE__FLEET__PATH", &mut fleet.path);
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_OPEN", &mut fleet.max_open);
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY",
+            &mut fleet.max_open_policy,
+        );
         let budget = &mut fleet.max_resident_bytes;
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES", budget);
         let mut residency = Some(fleet.min_residency);
@@ -12092,6 +12098,58 @@ pub struct DatabaseConfig {
     pub roles: std::collections::BTreeMap<String, crate::db_roles::DatabaseRoleConfig>,
 }
 
+/// What an open does when the fleet already holds `max_open` databases.
+///
+/// A database used within [`min_residency`](DatabaseFleetConfig::min_residency),
+/// or in use, is never closed to make room.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetMaxOpenPolicy {
+    /// Open anyway. `max_open` is a soft limit that a burst can pass. The
+    /// sweeper closes the extra databases after the burst. This is the default.
+    #[default]
+    Soft,
+    /// Wait for a free slot, for at most `connect_timeout_secs`. Then answer
+    /// `503`. Open databases never pass `max_open`.
+    Wait,
+    /// Answer `503` with `Retry-After` at once. Open databases never pass
+    /// `max_open`.
+    Refuse,
+}
+
+impl FleetMaxOpenPolicy {
+    /// The name used in `autumn.toml` and in the environment.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::Wait => "wait",
+            Self::Refuse => "refuse",
+        }
+    }
+}
+
+impl std::fmt::Display for FleetMaxOpenPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FleetMaxOpenPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "soft" => Ok(Self::Soft),
+            "wait" => Ok(Self::Wait),
+            "refuse" => Ok(Self::Refuse),
+            other => Err(format!(
+                "expected `soft`, `wait` or `refuse`, got {other:?}"
+            )),
+        }
+    }
+}
+
 /// `[database.fleet]`: one `SQLite` database per tenant or per routing slot.
 ///
 /// ```toml
@@ -12136,6 +12194,22 @@ pub struct DatabaseFleetConfig {
     /// limit (`ulimit -n`) for the peak count, not for this value.
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
+
+    /// What an open does when the fleet already holds
+    /// [`max_open`](Self::max_open) databases. Default: `"soft"`.
+    ///
+    /// - `"soft"`: open anyway (see `max_open`).
+    /// - `"wait"`: wait for a free slot, for at most `connect_timeout_secs`,
+    ///   then answer `503`.
+    /// - `"refuse"`: answer `503` with `Retry-After` at once.
+    ///
+    /// With `"wait"` or `"refuse"`, the open and closing databases together
+    /// never pass `max_open`, so the descriptor count has a hard bound:
+    /// `max_open × (2 × pool_size + 1)`. A database that is in use, or was
+    /// used within [`min_residency`](Self::min_residency), still stays open.
+    /// A burst can then get `503` until that grace passes.
+    #[serde(default)]
+    pub max_open_policy: FleetMaxOpenPolicy,
 
     /// A soft limit, in bytes, on the memory of the open databases. Default:
     /// `0` (no limit).
@@ -12445,6 +12519,7 @@ const fn default_fleet_section(
         max_open: default_fleet_max_open(),
         max_resident_bytes: 0,
         min_residency: default_fleet_min_residency(),
+        max_open_policy: FleetMaxOpenPolicy::Soft,
         pool_size: default_fleet_pool_size(),
         create_on_demand: None,
         idle_close_secs: default_fleet_idle_close_secs(),
@@ -13185,6 +13260,15 @@ impl DatabaseConfig {
             return Ok(());
         };
         fleet.validate()?;
+        let wait = std::time::Duration::from_secs(self.connect_timeout_secs);
+        if fleet.max_open_policy == FleetMaxOpenPolicy::Wait && fleet.min_residency >= wait {
+            return Err(ConfigError::Validation(format!(
+                "database.fleet.min_residency ({:?}) must be below \
+                 database.connect_timeout_secs ({}s) with max_open_policy = \"wait\": \
+                 an open waits that long for a database to pass its residency",
+                fleet.min_residency, self.connect_timeout_secs
+            )));
+        }
         if self.has_shards() {
             return Err(ConfigError::Validation(
                 "database.fleet and [[database.shards]] are both configured; a fleet routes \
@@ -22785,6 +22869,7 @@ path = "/healthz"
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         }
@@ -23288,6 +23373,67 @@ path = "/healthz"
             std::time::Duration::from_secs(2),
             "an empty value is the default"
         );
+    }
+
+    #[test]
+    fn fleet_max_open_policy_default_parse_and_env() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+        };
+        let policy = |extra: &str| {
+            parse(extra)
+                .unwrap()
+                .database
+                .fleet
+                .unwrap()
+                .max_open_policy
+        };
+        assert_eq!(policy(""), FleetMaxOpenPolicy::Soft);
+        assert_eq!(
+            policy("max_open_policy = \"wait\""),
+            FleetMaxOpenPolicy::Wait
+        );
+        assert_eq!(
+            policy("max_open_policy = \"refuse\""),
+            FleetMaxOpenPolicy::Refuse
+        );
+        assert!(parse("max_open_policy = \"hard\"").is_err());
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY", "refuse");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().max_open_policy,
+            FleetMaxOpenPolicy::Refuse
+        );
+    }
+
+    #[test]
+    fn fleet_wait_policy_needs_a_residency_below_the_connect_timeout() {
+        let database = |policy: &str, residency: &str| {
+            let mut config = toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\
+                 connect_timeout_secs = 5\n\n[database.fleet]\nmode = \"slot\"\n\
+                 root = \"/data/fleet\"\nmax_open_policy = \"{policy}\"\n\
+                 min_residency = \"{residency}\"\n"
+            ))
+            .unwrap();
+            config
+                .database
+                .validate()
+                .map(|()| config.database.fleet.take())
+        };
+        let error = database("wait", "5s").unwrap_err().to_string();
+        assert!(error.contains("min_residency"), "{error}");
+        assert!(error.contains("connect_timeout_secs"), "{error}");
+        assert!(database("wait", "2s").is_ok());
+        assert!(database("refuse", "30s").is_ok());
+        assert!(database("soft", "30s").is_ok());
     }
 
     #[test]

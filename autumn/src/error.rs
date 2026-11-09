@@ -1601,6 +1601,11 @@ impl IntoResponse for AutumnError {
         let message = self.inner.to_string();
         let (status, problem_type) = self.rendered_problem();
 
+        #[cfg(feature = "db")]
+        let retry_after = self
+            .inner
+            .downcast_ref::<crate::db::fleet::FleetError>()
+            .and_then(crate::db::fleet::FleetError::retry_after_secs);
         let details = self.details.clone();
         #[cfg(feature = "idempotency")]
         let cache_idempotency_response = self.cache_idempotency_response;
@@ -1632,6 +1637,12 @@ impl IntoResponse for AutumnError {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),
         );
+        #[cfg(feature = "db")]
+        if let Some(secs) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
         if status == StatusCode::CONFLICT {
             response.headers_mut().insert(
                 "HX-Trigger",
@@ -1922,6 +1933,19 @@ mod tests {
             err.source_chain(),
             vec!["database connection dropped".to_string()]
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_full_fleet_answers_503_with_retry_after() {
+        let err = AutumnError::from(crate::db::fleet::FleetError::AtCapacity {
+            name: "slot-1".into(),
+            max_open: 2,
+            retry_after_secs: 3,
+        });
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "3");
     }
 
     #[test]

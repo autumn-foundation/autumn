@@ -17,6 +17,7 @@ fn config(root: &Path, max_open: usize, max_resident_bytes: u64) -> DatabaseFlee
         max_open,
         max_resident_bytes,
         min_residency: Duration::ZERO,
+        max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
         pool_size: 1,
         create_on_demand: Some(true),
         idle_close_secs: 0,
