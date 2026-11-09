@@ -28114,6 +28114,13 @@ mod tests {
         let out =
             repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
         assert!(!out.contains("pool_for"), "{out}");
+        assert!(!out.contains("ReadRoute :: Primary"), "{out}");
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_needs_a_type() {
+        let tokens: proc_macro2::TokenStream = r#"Post, boundary = "x""#.parse().unwrap();
+        assert!(parse_repo_args(tokens).is_err());
     }
 
     #[test]

@@ -223,12 +223,15 @@ pub trait CampaignRepository {}
 ```
 
 * The extractor uses `pool_for::<Marketing>()`. Without `[database.roles]`,
-  that is the primary pool.
+  that is the owner pool. A wrong key in `[database.roles]` gives the same
+  result.
 * With roles, but none for `marketing`, the extractor answers 503. It does
   not use the owner role.
 * Reads stay on the role pool. A read replica connects as the owner.
 * `boundary` and `sharded` cannot work together.
 * The retention sweep of a repository uses the primary pool.
+* A `dependent(...)` cascade runs the child repository on the pool of the
+  parent. Give the parent and the child the same `boundary`.
 
 Each role pool opens its own connections. The boot log adds them to
 `total_max_connections`, and `database.max_connections_warn_threshold`

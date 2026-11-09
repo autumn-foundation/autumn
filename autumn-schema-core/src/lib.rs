@@ -1158,6 +1158,13 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_table_without_a_schema_key_loads() {
+        let json = r#"{"name":"t","columns":[],"primary_key":[],"indexes":[],"checks":[],"backend":"Postgres","managed":true}"#;
+        let t: Table = serde_json::from_str(json).expect("old snapshot loads");
+        assert_eq!(t.schema, None);
+    }
+
+    #[test]
     fn table_without_schema_serializes_as_before() {
         let t = Table::new("campaigns", Backend::Postgres);
         let json = serde_json::to_string(&t).expect("json");
