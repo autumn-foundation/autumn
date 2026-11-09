@@ -1044,6 +1044,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // epoch itself.
         let drain = Arc::new(Drain {
             deleting: false,
+            // The key is closed: the hold keeps no file open.
+            has_files: false,
             finished: AtomicBool::new(false),
             done: Notify::new(),
             retire: None,

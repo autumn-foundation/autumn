@@ -1045,9 +1045,9 @@ impl<E: FleetEngine> Drop for ReleaseSettle<'_, E> {
 /// A key that is closing or being deleted. Openers wait on `done`.
 struct Drain {
     deleting: bool,
-    /// Whether the drain holds a database, and so its files. A delete of a
-    /// closed database holds none.
-    holds: bool,
+    /// Whether the drain keeps a database open, and so its files. A delete of
+    /// a closed database keeps none.
+    has_files: bool,
     finished: AtomicBool,
     done: Notify,
     /// The retire flag of the database and the epoch it opened under, so a
@@ -1953,7 +1953,11 @@ impl<E: FleetEngine> DatabaseFleet<E> {
 
     /// The closing databases that still hold their files.
     fn closing_locked(state: &State<E>) -> usize {
-        state.draining.values().filter(|drain| drain.holds).count()
+        state
+            .draining
+            .values()
+            .filter(|drain| drain.has_files)
+            .count()
     }
 
     /// Record the databases held after an entry was added.
@@ -2304,7 +2308,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         state.open.remove(key);
         let drain = Arc::new(Drain {
             deleting,
-            holds: true,
+            has_files: true,
             finished: AtomicBool::new(false),
             done: Notify::new(),
             retire: Some((Arc::clone(&db.retired), db.epoch)),
@@ -2709,7 +2713,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let entry = state.open.remove(key);
         let drain = Arc::new(Drain {
             deleting,
-            holds: entry.is_some(),
+            has_files: entry.is_some(),
             finished: AtomicBool::new(false),
             done: Notify::new(),
             retire: entry
