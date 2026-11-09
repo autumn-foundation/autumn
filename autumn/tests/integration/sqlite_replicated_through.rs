@@ -122,7 +122,6 @@ fn settings(db: &Path) -> ReplicationSettings {
 }
 
 struct Harness {
-    dir: tempfile::TempDir,
     db: PathBuf,
     conn: SqliteConnection,
     replicator: Replicator,
@@ -131,6 +130,8 @@ struct Harness {
     root: String,
     clock: Arc<HookClock>,
     restores: usize,
+    /// Last: it drops after every handle on its files (Windows).
+    dir: tempfile::TempDir,
 }
 
 impl Harness {
@@ -268,7 +269,7 @@ fn a_commit_after_the_caught_up_check_is_not_covered() {
     let steps: Vec<Step> = (0..10).map(commit_inside_read).collect();
     assert!(
         steps.iter().filter(|step| step.fired).count() >= 3,
-        "the sweep reaches every read of a tick"
+        "the hook fires inside each clock read of the tick"
     );
     assert!(
         steps.iter().any(|step| step.old_signal_lies),
@@ -279,38 +280,81 @@ fn a_commit_after_the_caught_up_check_is_not_covered() {
 #[test]
 fn replicated_through_never_moves_backwards_in_one_generation() {
     let mut h = Harness::new();
-    insert(&mut h.conn, "a");
-    h.clock.set(at(100));
-    h.replicator.tick().expect("tick");
-    let first = h.through().expect("a caught-up tick sets the bound");
-    let generation = h.status.snapshot().generation;
-
-    // The clock steps back. The stamp of this tick is lower.
-    insert(&mut h.conn, "b");
-    h.clock.set(at(90));
-    h.replicator.tick().expect("tick");
+    let generation = {
+        insert(&mut h.conn, "a");
+        h.replicator.tick().expect("tick");
+        h.status.snapshot().generation
+    };
+    let mut last = h.through().expect("a caught-up tick sets the bound");
+    for i in 0..6 {
+        if i % 2 == 0 {
+            insert(&mut h.conn, &format!("row-{i}"));
+        }
+        h.replicator.tick().expect("tick");
+        let through = h.through().expect("caught up");
+        assert!(through >= last, "{through} < {last}");
+        last = through;
+    }
     assert_eq!(h.status.snapshot().generation, generation);
-    assert_eq!(h.through(), Some(first), "the bound keeps its maximum");
 }
 
 #[test]
-fn a_new_generation_starts_a_new_bound() {
+fn a_clock_that_steps_back_takes_the_bound_back() {
+    let mut h = Harness::new();
+    insert(&mut h.conn, "a");
+    h.clock.set(at(100));
+    h.replicator.tick().expect("tick");
+    let first = h.through().expect("caught up");
+
+    // The clock steps back. A commit now has an earlier time than the bound.
+    h.clock.set(at(50));
+    insert(&mut h.conn, "b");
+    let b_at = h.clock.peek();
+    h.replicator.tick().expect("tick");
+    let through = h.through().expect("caught up");
+    assert!(through < first, "the bound follows the clock back");
+    assert!(through >= b_at);
+    assert!(h.replica_rows().iter().any(|v| v == "b"));
+}
+
+#[test]
+fn a_failed_tick_after_a_backward_step_drops_the_bound() {
+    let mut h = Harness::new();
+    insert(&mut h.conn, "a");
+    h.clock.set(at(100));
+    h.replicator.tick().expect("tick");
+    assert!(h.through().is_some());
+
+    // The clock steps back and the destination goes away.
+    h.clock.set(at(50));
+    insert(&mut h.conn, "b");
+    std::fs::remove_dir_all(h.dir.path().join("replica")).expect("remove");
+    std::fs::write(h.dir.path().join("replica"), b"not a directory").expect("block");
+    assert!(h.replicator.tick().is_err());
+    assert_eq!(
+        h.through(),
+        None,
+        "a bound above the clock would cover b, which is not shipped"
+    );
+}
+
+#[test]
+fn a_new_generation_proves_its_own_bound() {
     let mut h = Harness::with(|settings| ReplicationSettings {
         snapshot_interval: Duration::from_secs(60),
         ..settings
     });
     insert(&mut h.conn, "a");
-    h.clock.set(at(100));
     h.replicator.tick().expect("tick");
     let old_generation = h.status.snapshot().generation;
-    assert!(h.through().is_some_and(|through| through > at(100)));
+    let old = h.through().expect("caught up");
 
-    // A backward step expires the generation at its next checkpoint.
-    h.clock.set(at(50));
+    // The generation expires; the next checkpoint retires it.
+    h.clock.set(at(1_000));
+    insert(&mut h.conn, "b");
     h.replicator
         .tick()
         .expect("tick that retires the generation");
-    h.clock.set(at(60));
     h.replicator
         .tick()
         .expect("tick that opens a new generation");
@@ -322,11 +366,9 @@ fn a_new_generation_starts_a_new_bound() {
     let through = snapshot
         .replicated_through
         .expect("the new generation is caught up");
-    assert!(
-        through < at(100),
-        "the bound of the new generation does not carry the old maximum: {through}"
-    );
-    assert!(h.replica_rows().iter().any(|v| v == "a"));
+    assert!(through > old);
+    let rows = h.replica_rows();
+    assert!(rows.iter().any(|v| v == "a") && rows.iter().any(|v| v == "b"));
 }
 
 #[test]
@@ -363,7 +405,24 @@ fn a_new_epoch_clears_the_bound() {
 }
 
 #[test]
-fn a_tick_with_unshipped_commits_does_not_advance_the_bound() {
+fn a_commit_before_the_measurement_holds_the_bound() {
+    let mut h = Harness::new();
+    insert(&mut h.conn, "a");
+    h.replicator.tick().expect("tick");
+    h.replicator.tick().expect("tick");
+    let before = h.through();
+    // Read 0 of an idle tick is the bound's reading. The commit lands just
+    // before it, so the measurement sees it unshipped.
+    let db = h.db.clone();
+    h.clock
+        .arm(0, Box::new(move |_| insert(&mut open_app_db(&db), "late")));
+    h.replicator.tick().expect("tick");
+    assert_eq!(h.through(), before, "a tail with a commit proves nothing");
+    assert!(h.status.snapshot().pending_bytes > 0);
+}
+
+#[test]
+fn a_failed_tick_keeps_the_bound() {
     let mut h = Harness::new();
     insert(&mut h.conn, "a");
     h.replicator.tick().expect("tick");
@@ -383,6 +442,9 @@ fn a_tick_with_unshipped_commits_does_not_advance_the_bound() {
 mod props {
     use super::*;
     use proptest::prelude::*;
+
+    /// Each committed row and the time the app read after its commit.
+    type Committed = Arc<Mutex<Vec<(String, DateTime<Utc>)>>>;
 
     #[derive(Debug, Clone)]
     enum Op {
@@ -414,8 +476,7 @@ mod props {
             ops in proptest::collection::vec(op(), 1..10),
         ) {
             let mut h = Harness::new();
-            let committed: Arc<Mutex<Vec<(String, DateTime<Utc>)>>> =
-                Arc::new(Mutex::new(Vec::new()));
+            let committed: Committed = Arc::new(Mutex::new(Vec::new()));
             let mut last = None;
             for (i, op) in ops.iter().enumerate() {
                 match op {

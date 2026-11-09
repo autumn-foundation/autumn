@@ -659,13 +659,6 @@ only after the next sync, so the new machine can be missing up to `rpo_secs` of
 writes that already returned success. On a busy fleet the lag can pass
 `rpo_secs`; see [the fleet's replication](sqlite-fleet.md#replication-object-storage-between-volumes).
 
-A fleet app can ask whether one write is offsite.
-`fleet.replicated_through(&key)` gives the instant up to which every commit
-to that database is in the replica, and `fleet.wait_replicated` waits for
-it. Before a failover, use it to keep a write that spans two databases from
-being lost in half. See
-[Know when a write is in the replica](sqlite-fleet.md#know-when-a-write-is-in-the-replica).
-
 Two surfaces report it, from two vantage points. `autumn db replica status`
 (add `--json` for monitoring) reads the **destination** and reports the current
 generation, how many segments it holds, the instant a restore would land on, and
@@ -673,6 +666,13 @@ the lag to now — so it works from any machine with the credentials, including 
 where the app is not running. `/actuator/health` reports what the **running
 process** knows, under the `sqlite-replication` indicator: `lag_seconds`,
 `generation`, `segments_shipped`, `pending_bytes`, `last_verified_at`.
+
+A fleet app can ask if one write is offsite.
+`fleet.replicated_through(&key)` gives an instant. Every commit to that
+database at or before it is in the replica. `fleet.wait_replicated` waits
+for it. Wait for it before you write the second half of a write that spans
+two databases. Then a takeover cannot lose one half. See
+[Know when a write is in the replica](sqlite-fleet.md#know-when-a-write-is-in-the-replica).
 
 **What you actually pay for.** Steady-state upload is the size of your WAL
 writes, not the size of your database. The `-wal` file cannot grow forever, so

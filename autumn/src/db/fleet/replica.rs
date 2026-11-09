@@ -252,6 +252,13 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 .upgrade()
                 .map_or(0, |ownership| ownership.fence_floor(key.routing_slot()))
         }));
+        let serving = Arc::downgrade(ownership);
+        replication.set_serving_hook(Arc::new(move |key: &FleetDbKey| {
+            serving
+                .upgrade()
+                .and_then(|ownership| ownership.epoch_for(key.routing_slot()))
+                .map(crate::lock::FencingToken::get)
+        }));
         let ownership = Arc::downgrade(ownership);
         replication.set_fence_hook(Arc::new(move |key: &FleetDbKey, newest: u64| {
             let newer = i64::try_from(newest)

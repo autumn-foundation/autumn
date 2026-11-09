@@ -339,7 +339,7 @@ struct Tail {
     /// `-wal` bytes past the shipped offset.
     pending: u64,
     /// No committed transaction is left to ship. A failed measurement also
-    /// answers `true`, so lag is not invented.
+    /// gives `true`. This prevents false lag.
     caught_up: bool,
     /// The measurement read the `-wal` and proved `caught_up`.
     proven: bool,
@@ -602,8 +602,10 @@ impl Replicator {
             self.status.clear_replicated_through();
         }
         if let Err(e) = &result {
-            self.status
-                .record_tick_error(e.to_string(), self.clock.now());
+            let now = self.clock.now();
+            // A reading at or below the bound: the clock stepped back.
+            self.status.forget_if_ahead_of(now);
+            self.status.record_tick_error(e.to_string(), now);
         }
         result
     }
@@ -674,13 +676,15 @@ impl Replicator {
         // indefinitely past the configured RPO. (`maybe_checkpoint` already
         // re-measures for the same reason; the status path did not.)
         //
-        // The bound is read before the tail is measured. A commit at or
-        // before it is in the `-wal` at the measurement, so a proven
-        // caught-up tail has shipped it.
+        // Read the clock before you measure the tail. Each commit at or
+        // before this reading is then in the `-wal`. A proven caught-up tail
+        // has shipped it.
         let through = self.clock.now();
         let tail = self.settled_tail(&wal_path);
         let (pending, caught_up) = (tail.pending, tail.caught_up);
         report.pending_bytes = pending;
+        // A reading at or below the bound: the clock stepped back.
+        self.status.forget_if_ahead_of(through);
         if tail.proven
             && caught_up
             && self.fenced_by.is_none()
@@ -776,14 +780,14 @@ impl Replicator {
         };
         let scan_at = usize::try_from(cursor.offset.saturating_sub(state.shipped_offset))
             .unwrap_or(usize::MAX);
-        match wal::scan_from(&header, &cursor, buffer.get(scan_at..).unwrap_or(&[])) {
-            Ok(outcome) => Tail {
+        wal::scan_from(&header, &cursor, buffer.get(scan_at..).unwrap_or(&[])).map_or_else(
+            |_| unproven(pending),
+            |outcome| Tail {
                 pending,
                 caught_up: outcome.last_commit_end <= state.shipped_offset,
                 proven: true,
             },
-            Err(_) => unproven(pending),
-        }
+        )
     }
 
     /// Checkpoint the WAL when it is safe and due, returning whether it happened.

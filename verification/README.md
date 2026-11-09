@@ -227,16 +227,16 @@ verus verification/replicated_through.rs
 
 It proves these properties:
 
-- Each commit at or before the bound is in the replica, after every step:
-  a commit, an upload, a tick, a new generation and a fence.
-- A tick reads the clock before it measures the tail, and stamps one step
-  below that reading.
-- In one generation, a tick never moves the bound back. A commit or an
-  upload does not change it. A tick with an unshipped commit does not
-  advance it.
-- A fenced replica claims nothing.
+- Each commit at or before the bound is in the replica. This holds at the
+  start and after every step: a commit, an upload, a tick, a new
+  generation, a new epoch and a fence.
+- A tick reads the clock before it measures the tail. It stamps one step
+  below that reading. It drops a bound at or above the reading.
+- In one generation, a tick never moves the bound back. A tick with an
+  unshipped commit does not advance it.
+- A fenced replica claims nothing. Only a new epoch ends the fence.
 - The old order (measure, then read the clock) can cover a commit that is
-  not shipped.
+  not shipped, even one step below the reading.
 
 The property test `a_restore_holds_every_write_at_or_before_the_bound` in
 `autumn/tests/integration/sqlite_replicated_through.rs` checks the runtime.

@@ -383,8 +383,17 @@ pub struct FleetReplication {
     /// The time of the last loop pass in milliseconds, [`NO_PASS`] before
     /// it. A shutdown flush does not change it.
     last_pass_ms: AtomicU64,
-    /// Woken after each tick, ship and close, for `wait_replicated`.
+    /// Woken after each pass, ship, close and release, for
+    /// `wait_replicated`.
     progress: tokio::sync::Notify,
+    /// The longest `wait_replicated` sleeps with no wake-up.
+    wait_poll: Duration,
+    /// The last bound of each closed database. Cleared at the next open, a
+    /// delete or a restore.
+    closed: Mutex<HashMap<FleetDbKey, ClosedBound>>,
+    /// The epoch at which this host serves a key now. `None`: its lease
+    /// lapsed. The fleet installs it with its ownership.
+    serving_hook: Mutex<Option<ServingHook>>,
 }
 
 /// The bound of one database, for [`FleetReplication::replicated_through`].
@@ -397,6 +406,23 @@ enum Bound {
     Fenced,
     /// Not open in this process.
     NotReplicating,
+}
+
+/// The last bound of a closed database.
+#[derive(Clone)]
+pub(crate) enum ClosedBound {
+    /// Its replicator still ships the backlog: read its status.
+    Live {
+        status: Arc<ReplicationStatus>,
+        epoch: u64,
+    },
+    /// Its replica caught up, or its last generation shipped.
+    At {
+        at: Option<DateTime<Utc>>,
+        epoch: u64,
+    },
+    /// A newer owner fenced it.
+    Fenced,
 }
 
 /// Wakes each `wait_replicated` when dropped, on every return path.
@@ -476,6 +502,10 @@ pub(crate) enum RestoreCheck {
 /// Called with the database and the newer epoch a replicator saw.
 pub(crate) type FenceHook = Arc<dyn Fn(&FleetDbKey, u64) + Send + Sync>;
 
+/// Returns the epoch at which this host serves the database now. `None`
+/// when its lease lapsed.
+pub(crate) type ServingHook = Arc<dyn Fn(&FleetDbKey) -> Option<u64> + Send + Sync>;
+
 /// Returns the newest epoch this host saw for the database.
 pub(crate) type KnownHook = Arc<dyn Fn(&FleetDbKey) -> u64 + Send + Sync>;
 
@@ -533,6 +563,9 @@ impl FleetReplication {
             ship_workers: DEFAULT_SHIP_WORKERS,
             last_pass_ms: AtomicU64::new(NO_PASS),
             progress: tokio::sync::Notify::new(),
+            wait_poll: WAIT_POLL,
+            closed: Mutex::new(HashMap::new()),
+            serving_hook: Mutex::new(None),
         }
     }
 
@@ -637,6 +670,15 @@ impl FleetReplication {
             .unwrap_or_else(PoisonError::into_inner) = Some(hook);
     }
 
+    /// Tell `replicated_through` the epoch at which this host serves a key.
+    /// The fleet installs it with its ownership.
+    pub(crate) fn set_serving_hook(&self, hook: ServingHook) {
+        *self
+            .serving_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
     /// The fence of the replica of `key`, for a writer of `epoch`. Core
     /// writes through it in every ship mode.
     pub(crate) fn ship_fence(&self, key: &FleetDbKey, epoch: Option<u64>) -> ShipFence {
@@ -708,8 +750,9 @@ impl FleetReplication {
 
     /// A new ship slot for `key`, at an open. It replaces the slot of an
     /// earlier open.
-    pub(crate) fn open_generation_slot(&self, key: &FleetDbKey) -> Arc<GenerationSlot> {
-        let slot = Arc::new(GenerationSlot::new(self.clock.now()));
+    pub(crate) fn open_generation_slot(&self, key: &FleetDbKey, epoch: u64) -> Arc<GenerationSlot> {
+        self.forget_closed(key);
+        let slot = Arc::new(GenerationSlot::new(self.clock.now(), epoch));
         self.slots().insert(key.clone(), Arc::clone(&slot));
         slot
     }
@@ -1317,10 +1360,14 @@ impl FleetReplication {
         for_each_on(self.ship_workers, &active, |key| {
             self.tick_active(key, cutoff);
         });
+        // One wake-up per phase, not per database: each wake-up makes every
+        // waiter look again.
+        self.notify_progress();
         let parked: Vec<FleetDbKey> = self.parked().keys().cloned().collect();
         for_each_on(self.ship_workers, &parked, |key| {
             self.tick_parked(key, cutoff);
         });
+        self.notify_progress();
         let kept: Vec<FleetDbKey> = self.records().keys().cloned().collect();
         for_each_on(self.ship_workers, &kept, |key| {
             self.retry_unshipped(key, cutoff);
@@ -1343,7 +1390,6 @@ impl FleetReplication {
 
     /// Tick the open database `key` once.
     fn tick_active(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
-        let _wake = Wake(&self.progress);
         if expired(cutoff()) {
             return;
         }
@@ -1420,7 +1466,6 @@ impl FleetReplication {
     /// Ship the backlog of the closed database `key`, and retire its
     /// replicator when it caught up.
     fn tick_parked(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
-        let _wake = Wake(&self.progress);
         if expired(cutoff()) {
             return;
         }
@@ -1447,11 +1492,14 @@ impl FleetReplication {
         drop(replicator);
         if fenced_by.is_some() {
             // Nothing more ships: let the file go.
-            self.retire_parked(key, &replica);
+            if self.retire_parked(key, &replica) {
+                self.remember_closed(key, ClosedBound::Fenced);
+            }
             return;
         }
         if caught_up && self.retire_parked(key, &replica) {
             tracing::info!(database = %key, "fleet replication: closed database caught up");
+            self.remember_closed(key, closed_at(&replica));
         }
     }
 
@@ -1494,16 +1542,21 @@ impl FleetReplication {
     }
 
     /// Every transaction committed to `key` at or before the returned
-    /// instant is in the replica, under the database's current generation.
+    /// instant is in the replica.
     ///
-    /// Read the commit time from the app clock after the commit returns.
-    /// The bound assumes a clock that does not step back.
+    /// Read the commit time from the app clock after the commit returns. The
+    /// fleet uses the same clock. The bound assumes a clock that does not step
+    /// back. If the clock steps back, the bound follows it back.
     ///
-    /// `None` when the database is not open in this process, while another
-    /// process replicates it, while it is fenced, before its first caught-up
-    /// tick, or when no tick has proved that it was caught up. A closed
-    /// database that still ships its backlog answers until it catches up.
-    /// In one generation the bound never moves back.
+    /// `None` when:
+    /// - no tick proved the replica caught up since the current generation
+    ///   or epoch started;
+    /// - another process replicates the database;
+    /// - this host's lease on the slot lapsed, or a newer owner fenced it;
+    /// - the database never opened in this process, or a delete or a
+    ///   restore replaced it.
+    ///
+    /// A closed database keeps its last bound until it opens again.
     #[must_use]
     pub fn replicated_through(&self, key: &FleetDbKey) -> Option<DateTime<Utc>> {
         match self.bound(key) {
@@ -1513,15 +1566,19 @@ impl FleetReplication {
     }
 
     /// Wait until the replica of `key` holds every commit at or before
-    /// `committed_at`. A tick wakes the wait. Use it to acknowledge only a
-    /// write that survives a takeover.
+    /// `committed_at`. A tick pass wakes the wait. Use it to acknowledge only
+    /// a write that survives a takeover.
+    ///
+    /// Give a finite `timeout` under paused Tokio time: each poll then ends
+    /// at once.
     ///
     /// # Errors
     ///
-    /// [`ReplicatedWaitError::NotReplicating`] when the database is not open
-    /// in this process, [`ReplicatedWaitError::Fenced`] when a newer owner
-    /// fenced it, [`ReplicatedWaitError::TimedOut`] when `timeout` passed
-    /// first. A timeout does not mean the write is lost.
+    /// - [`ReplicatedWaitError::NotReplicating`]: no replicator for the
+    ///   database ran in this process.
+    /// - [`ReplicatedWaitError::Fenced`]: a newer owner fenced the replica.
+    /// - [`ReplicatedWaitError::TimedOut`]: `timeout` passed first. This does
+    ///   not mean the write is lost.
     pub async fn wait_replicated(
         &self,
         key: &FleetDbKey,
@@ -1532,7 +1589,7 @@ impl FleetReplication {
             .checked_add(timeout)
             .unwrap_or_else(far_future);
         loop {
-            // Registered before the check: a tick between the two wakes it.
+            // Registered before the check: a wake-up between the two counts.
             let notified = self.progress.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -1556,7 +1613,7 @@ impl FleetReplication {
             }
             // A missed wake-up costs at most one poll.
             let poll = now
-                .checked_add(WAIT_POLL)
+                .checked_add(self.wait_poll)
                 .map_or(deadline, |poll| poll.min(deadline));
             let _ = tokio::time::timeout_at(poll, notified).await;
         }
@@ -1567,7 +1624,52 @@ impl FleetReplication {
         self.progress.notify_waiters();
     }
 
-    /// The bound of `key` and why it is missing.
+    /// Keep the last bound of the closed database `key`.
+    pub(crate) fn remember_closed(&self, key: &FleetDbKey, bound: ClosedBound) {
+        let mut closed = self.closed.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(bound, ClosedBound::At { at: None, .. }) {
+            closed.remove(key);
+        } else {
+            closed.insert(key.clone(), bound);
+        }
+    }
+
+    /// Forget the last bound of `key`: it opens again, or a delete or a
+    /// restore replaces it.
+    pub(crate) fn forget_closed(&self, key: &FleetDbKey) {
+        self.closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
+    }
+
+    /// Whether this host serves `key` at `epoch` now. Always `true` without
+    /// ownership (`epoch` 0, or no hook).
+    fn serves(&self, key: &FleetDbKey, epoch: u64) -> bool {
+        if epoch == 0 {
+            return true;
+        }
+        let hook = self
+            .serving_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        hook.is_none_or(|hook| hook(key) == Some(epoch))
+    }
+
+    /// `at` under `epoch`, or `Unknown` when:
+    /// - this host does not serve the key at that epoch now: a new owner may
+    ///   restore before an old ship lands;
+    /// - `at` is not below the clock now: the clock stepped back.
+    fn bound_at(&self, key: &FleetDbKey, at: Option<DateTime<Utc>>, epoch: u64) -> Bound {
+        match at {
+            Some(at) if at < self.clock.now() && self.serves(key, epoch) => Bound::At(at),
+            _ => Bound::Unknown,
+        }
+    }
+
+    /// The bound of `key` and why it is missing. The lookups do not nest
+    /// locks.
     fn bound(&self, key: &FleetDbKey) -> Bound {
         let active = self.active().get(key).cloned();
         let replica = active.or_else(|| self.parked().get(key).cloned());
@@ -1578,16 +1680,31 @@ impl FleetReplication {
             if !replica.owned() {
                 return Bound::Unknown;
             }
-            return replica
-                .status
-                .replicated_through()
-                .map_or(Bound::Unknown, Bound::At);
+            let epoch = replica.epoch.load(Ordering::Acquire);
+            return self.bound_at(key, replica.status.replicated_through(), epoch);
         }
-        match self.current_generation_slot(key) {
-            Some(slot) => slot
-                .track()
-                .replicated_through
-                .map_or(Bound::Unknown, Bound::At),
+        if let Some(slot) = self.current_generation_slot(key) {
+            let (at, fenced) = {
+                let track = slot.track();
+                (track.replicated_through, track.fenced)
+            };
+            if fenced {
+                return Bound::Fenced;
+            }
+            return self.bound_at(key, at, slot.epoch());
+        }
+        let closed = self
+            .closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned();
+        match closed {
+            Some(ClosedBound::Live { status, epoch }) => {
+                self.bound_at(key, status.replicated_through(), epoch)
+            }
+            Some(ClosedBound::At { at, epoch }) => self.bound_at(key, at, epoch),
+            Some(ClosedBound::Fenced) => Bound::Fenced,
             None => Bound::NotReplicating,
         }
     }
@@ -1901,6 +2018,8 @@ impl FleetLifecycle for FleetReplication {
     }
 
     fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
+        // The open replica answers for the bound from now on.
+        self.forget_closed(db.key());
         // A closed database still shipping its backlog keeps its replicator:
         // two replicators on one file would both checkpoint it.
         let epoch = db.epoch().map(crate::lock::FencingToken::get);
@@ -1976,7 +2095,19 @@ impl FleetLifecycle for FleetReplication {
 
     fn on_close(&self, db: &FleetDatabase) {
         let _wake = Wake(&self.progress);
+        // Kept before the remove: a waiter never sees the key in neither.
+        let current = self.active().get(db.key()).cloned();
+        if let Some(replica) = current {
+            self.remember_closed(
+                db.key(),
+                ClosedBound::Live {
+                    status: Arc::clone(&replica.status),
+                    epoch: replica.epoch.load(Ordering::Acquire),
+                },
+            );
+        }
         let Some(replica) = self.active().remove(db.key()) else {
+            self.forget_closed(db.key());
             return;
         };
         // The owner may have left since the last tick. Try once, so commits
@@ -1984,11 +2115,14 @@ impl FleetLifecycle for FleetReplication {
         // A fenced replica ships nothing: a newer epoch owns the replica.
         if replica.fenced.load(Ordering::Acquire) {
             replica.retired.store(true, Ordering::Release);
+            self.remember_closed(db.key(), ClosedBound::Fenced);
             return;
         }
         let owner = self.claim_for_close(&replica, db.key());
         replica.retired.store(true, Ordering::Release);
         if !owner {
+            // Another process ships it: this process has no bound.
+            self.forget_closed(db.key());
             return;
         }
         // Every pooled connection is gone. Ship everything they committed
@@ -2011,6 +2145,7 @@ impl FleetLifecycle for FleetReplication {
         let shipped = match shipped {
             Err((_, Some(newest))) => {
                 self.fence(db.key(), &replica, newest);
+                self.remember_closed(db.key(), ClosedBound::Fenced);
                 return;
             }
             other => other.map_err(|(error, _)| error),
@@ -2023,11 +2158,16 @@ impl FleetLifecycle for FleetReplication {
                  stays open and keeps shipping until it does"
             );
             self.parked().insert(db.key().clone(), replica);
+            return;
         }
+        // Caught up: the replicator closes. Keep its last bound.
+        self.remember_closed(db.key(), closed_at(&replica));
     }
 
     fn release(&self, key: &FleetDbKey) {
         let _wake = Wake(&self.progress);
+        // A delete or a restore replaces the files: the old bound is void.
+        self.forget_closed(key);
         // The files are about to be removed or replaced: a parked replicator
         // must not hold them open, and must ship nothing more.
         let Some(replica) = self.parked().remove(key) else {
@@ -2038,6 +2178,14 @@ impl FleetLifecycle for FleetReplication {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key.clone(), Arc::downgrade(&replica));
+    }
+}
+
+/// The final bound of a replica that closes.
+fn closed_at(replica: &ActiveReplica) -> ClosedBound {
+    ClosedBound::At {
+        at: replica.status.replicated_through(),
+        epoch: replica.epoch.load(Ordering::Acquire),
     }
 }
 
@@ -2164,6 +2312,24 @@ mod tests {
         restore_missing: bool,
         mmap_size: u64,
     ) -> (DatabaseFleet, Arc<FleetReplication>) {
+        replicated_fleet_on(
+            root,
+            replicas,
+            restore_missing,
+            mmap_size,
+            Arc::new(crate::time::SystemClock),
+            |replication| replication,
+        )
+    }
+
+    fn replicated_fleet_on(
+        root: &Path,
+        replicas: &Path,
+        restore_missing: bool,
+        mmap_size: u64,
+        clock: Arc<dyn ClockSource>,
+        tune: impl FnOnce(FleetReplication) -> FleetReplication,
+    ) -> (DatabaseFleet, Arc<FleetReplication>) {
         let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
             mode: FleetMode::Tenant,
             root: root.display().to_string(),
@@ -2188,13 +2354,13 @@ mod tests {
         .unwrap();
         let destination: Arc<dyn ReplicaDestination> =
             Arc::new(FileDestination::new(replicas).unwrap());
-        let replication = Arc::new(FleetReplication::new(
+        let replication = Arc::new(tune(FleetReplication::new(
             destination,
             settings(),
             Duration::from_secs(30),
             restore_missing,
-            Arc::new(crate::time::SystemClock),
-        ));
+            clock,
+        )));
         assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
         assert!(fleet.install_replication(Arc::clone(&replication)).is_err());
         (fleet, replication)
@@ -4157,27 +4323,72 @@ mod tests {
 
     // ── replicated_through ──────────────────────────────────────────────────
 
-    fn wall() -> DateTime<Utc> {
-        crate::time::ClockSource::now(&crate::time::SystemClock)
+    /// A clock a test sets, back as well as forward.
+    struct SetClock(Mutex<DateTime<Utc>>);
+
+    impl SetClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(
+                DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            )))
+        }
+
+        fn advance(&self, secs: i64) {
+            *self.0.lock().unwrap() += chrono::Duration::seconds(secs);
+        }
+    }
+
+    impl ClockSource for SetClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// A fleet on `clock`, with no poll: only a wake-up ends a wait early.
+    fn clocked_fleet(tmp: &Path, clock: &Arc<SetClock>) -> (DatabaseFleet, Arc<FleetReplication>) {
+        replicated_fleet_on(
+            &tmp.join("fleet"),
+            &tmp.join("replicas"),
+            false,
+            0,
+            Arc::clone(clock) as Arc<dyn ClockSource>,
+            |mut replication| {
+                replication.wait_poll = Duration::from_secs(3600);
+                replication
+            },
+        )
+    }
+
+    /// The system clock after a commit, and a wait until it moves past that
+    /// reading. A coarse clock then cannot give the next tick the same value.
+    fn wall_after_commit() -> DateTime<Utc> {
+        let at = crate::time::ClockSource::now(&crate::time::SystemClock);
+        while crate::time::ClockSource::now(&crate::time::SystemClock) <= at {
+            std::thread::yield_now();
+        }
+        at
     }
 
     #[tokio::test]
     async fn replicated_through_covers_a_commit_once_a_tick_ships_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let replicas = tmp.path().join("replicas");
-        let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
         let key = fleet.key_for("acme").unwrap();
         let db = fleet.open(&key).await.unwrap();
         assert_eq!(replication.replicated_through(&key), None, "no tick yet");
 
         exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
         exec(&db, "INSERT INTO notes VALUES ('one')").await;
-        let committed_at = wall();
+        let committed_at = clock.now();
+        tick(&replication).await;
         assert!(
             replication
                 .replicated_through(&key)
-                .is_none_or(|through| through < committed_at)
+                .is_none_or(|through| through < committed_at),
+            "a reading equal to the commit time does not cover it"
         );
+        clock.advance(1);
         tick(&replication).await;
         let through = replication.replicated_through(&key).expect("caught up");
         assert!(through >= committed_at, "{through} < {committed_at}");
@@ -4186,20 +4397,76 @@ mod tests {
             .wait_replicated(&key, committed_at, Duration::ZERO)
             .await
             .expect("already covered: no wait");
-
-        drop(db);
-        fleet.close(&key).await;
-        assert_eq!(
-            replication.replicated_through(&key),
-            None,
-            "a closed database has no replicator here"
-        );
         assert!(matches!(
             fleet
-                .wait_replicated(&key, committed_at, Duration::from_millis(50))
+                .wait_replicated(&fleet.key_for("other").unwrap(), committed_at, NOT_STUCK)
                 .await,
             Err(ReplicatedWaitError::NotReplicating { .. })
         ));
+        drop(db);
+        fleet.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_closed_database_keeps_its_last_bound_until_it_opens_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('last')").await;
+        let committed_at = clock.now();
+        clock.advance(1);
+
+        // The close ships the last commit. A waiter learns it from the bound.
+        drop(db);
+        fleet.close(&key).await;
+        let through = replication
+            .replicated_through(&key)
+            .expect("closed, caught up");
+        assert!(through >= committed_at);
+        replication
+            .wait_replicated(&key, committed_at, Duration::ZERO)
+            .await
+            .expect("the close shipped it");
+
+        // A new open answers from its own replicator.
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(replication.replicated_through(&key), None);
+        clock.advance(1);
+        tick(&replication).await;
+        assert!(replication.replicated_through(&key) > Some(through));
+
+        // A delete voids the bound.
+        drop(db);
+        assert!(fleet.delete(&key).await.unwrap());
+        assert_eq!(replication.replicated_through(&key), None);
+        assert!(matches!(
+            replication
+                .wait_replicated(&key, committed_at, NOT_STUCK)
+                .await,
+            Err(ReplicatedWaitError::NotReplicating { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_bound_above_the_clock_is_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&replication).await;
+        assert!(replication.replicated_through(&key).is_some());
+        // The clock steps back. A commit now would be read below the bound.
+        clock.advance(-10);
+        assert_eq!(replication.replicated_through(&key), None);
+        clock.advance(20);
+        assert!(replication.replicated_through(&key).is_some());
+        drop(db);
+        fleet.close_all().await;
     }
 
     #[tokio::test]
@@ -4217,7 +4484,7 @@ mod tests {
         assert!(ra.replicated_through(&key).is_some(), "A owns it");
         assert_eq!(rb.replicated_through(&key), None, "B does not");
         let waited = rb
-            .wait_replicated(&key, wall(), Duration::from_millis(50))
+            .wait_replicated(&key, wall_after_commit(), Duration::from_millis(50))
             .await;
         assert!(
             matches!(
@@ -4242,7 +4509,7 @@ mod tests {
         // The close cannot ship the last commit: the replicator parks.
         flaky.down.store(true, Ordering::SeqCst);
         exec(&db, "INSERT INTO notes VALUES ('late')").await;
-        let committed_at = wall();
+        let committed_at = wall_after_commit();
         drop(db);
         fleet.close(&key).await;
         assert_eq!(replication.closing(), 1);
@@ -4252,34 +4519,41 @@ mod tests {
             "a parked replica still answers"
         );
 
-        // It ships the tail after the close and says so.
+        // The destination comes back. The pass ships the tail, retires the
+        // replicator, and keeps its last bound.
         flaky.down.store(false, Ordering::SeqCst);
-        let replica = replication.parked().get(&key).cloned().unwrap();
-        replica.replicator.lock().unwrap().tick().unwrap();
-        let through = replication.replicated_through(&key).expect("still parked");
-        assert!(through >= committed_at, "{through} < {committed_at}");
-        replication
-            .wait_replicated(&key, committed_at, Duration::ZERO)
-            .await
-            .expect("covered while parked");
-
-        // Retired: nothing answers for it here any more.
+        let waiter = {
+            let replication = Arc::clone(&replication);
+            let key = key.clone();
+            tokio::spawn(async move {
+                replication
+                    .wait_replicated(&key, committed_at, NOT_STUCK)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
         tick(&replication).await;
         assert_eq!(replication.closing(), 0);
-        assert_eq!(replication.replicated_through(&key), None);
+        waiter
+            .await
+            .unwrap()
+            .expect("the retired replica shipped the commit");
+        let through = replication.replicated_through(&key).expect("kept at close");
+        assert!(through >= committed_at, "{through} < {committed_at}");
     }
 
     #[tokio::test]
-    async fn wait_replicated_returns_once_a_tick_covers_the_commit() {
+    async fn a_tick_wakes_a_waiter() {
         let tmp = tempfile::tempdir().unwrap();
-        let replicas = tmp.path().join("replicas");
-        let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
         let key = fleet.key_for("acme").unwrap();
         let db = fleet.open(&key).await.unwrap();
         exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
         tick(&replication).await;
         exec(&db, "INSERT INTO notes VALUES ('one')").await;
-        let committed_at = wall();
+        let committed_at = clock.now();
+        clock.advance(1);
 
         // No tick: the wait times out and names the bound it saw.
         let waited = replication
@@ -4294,7 +4568,7 @@ mod tests {
             "{waited:?}"
         );
 
-        // A tick on another thread wakes the waiter.
+        // The poll is an hour: only the wake-up of the pass ends this wait.
         let ticker = {
             let replication = Arc::clone(&replication);
             std::thread::spawn(move || {
@@ -4305,7 +4579,7 @@ mod tests {
         replication
             .wait_replicated(&key, committed_at, NOT_STUCK)
             .await
-            .expect("the tick covers the commit");
+            .expect("the pass covers the commit and wakes the wait");
         ticker.join().unwrap();
         drop(db);
         fleet.close_all().await;

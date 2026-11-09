@@ -593,13 +593,13 @@ pass ships it. A takeover restores from the replica. So "committed" and
 
 `fleet.replicated_through(&key)` gives an instant. Every transaction
 committed to that database at or before that instant is in the replica.
-Read the commit time from the app clock after the commit returns. Compare
-it with the instant.
+Read the commit time from the app clock after the commit returns. The fleet
+uses this clock. Compare the commit time with the instant.
 
 Use it for a write that spans two databases. For example, a row moves from
 `src` to `dst`: upsert it into `dst`, then delete it from `src`. If the
 delete ships and the upsert does not, a takeover loses the row. So delete
-only when the upsert is in the replica:
+only after the upsert is in the replica:
 
 ```rust,ignore
 upsert(&dst_db, &row).await?;
@@ -612,28 +612,36 @@ delete(&src_db, row.id).await?;
 
 `replicated_through` is `None` when:
 
-- the database is not open in this process, or another process replicates
-  it;
-- a newer owner fenced the replica;
-- no tick proved the replica caught up since the current generation opened.
+- no tick proved the replica caught up since the current generation or
+  epoch started;
+- another process replicates the database;
+- the lease of this host on the slot lapsed, or a newer owner fenced the
+  replica;
+- the clock is below the bound: the clock stepped back;
+- the database never opened in this process, or a delete or a restore
+  replaced it.
 
-`wait_replicated` returns once the instant is covered. It fails with
-`NotReplicating` (not open here), `Fenced`, or `TimedOut`. A timeout does
-not mean the write is lost. It is not known yet: keep the source row and
-try again later.
+`wait_replicated` returns when the bound covers the commit time. It fails
+with:
+
+- `NotReplicating`: no replicator for the database ran in this process.
+  This includes `rebuild` mode and a fleet with no replication.
+- `Fenced`: a newer owner fenced the replica.
+- `TimedOut`: in all other cases, when the time is over. The write is not
+  lost. It is not known yet. Keep the source row. Try again later.
 
 Rules:
 
-- Use the clock the fleet was built with: the app clock. The bound assumes
-  a clock that does not step back.
-- In one generation the bound never moves back. A new generation or a new
-  epoch starts it again.
-- A closed database that still ships its backlog (`closing`) answers until
-  it catches up.
-- In `generations` mode the bound is the instant before the last snapshot
-  that shipped. `rebuild` mode has no bound.
-- The bound does not change `worst_lag_seconds`. Use the lag for alerts and
-  the bound for a decision about one write.
+- The bound assumes a clock that does not step back. If the clock steps
+  back, the bound follows it back.
+- In one generation the bound never moves back.
+- A closed database keeps its last bound until it opens again. A database
+  that still ships its backlog after the close (`closing`) gives a bound
+  until it ships all of it.
+- In `generations` mode the bound is the instant before the last ship that
+  worked.
+- The bound does not change `worst_lag_seconds`. Use the lag for alerts.
+  Use the bound for a decision about one write.
 
 ### Deleting a database's replica
 
@@ -901,8 +909,9 @@ one store: the release of one fleet ends the lease of the other.
    fail-back (step 5) replaces those files with the replica, so they do not
    come back. A planned move (step 2) loses nothing: the old host ships
    everything before it releases the ranges.
-   A write that spans two databases can be lost in half. To prevent this,
-   do the second half only when the first is in the replica. See
+   A takeover can lose one half of a write that spans two databases. To
+   prevent this, write the second half only after the first half is in the
+   replica. Make the second half safe to repeat. See
    [Know when a write is in the replica](#know-when-a-write-is-in-the-replica).
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew

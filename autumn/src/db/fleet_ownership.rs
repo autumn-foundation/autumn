@@ -3482,6 +3482,19 @@ mod tests {
             }
             tick(&b.replication).await;
 
+            assert_eq!(
+                a.replication.replicated_through(&key),
+                Some(through),
+                "A has not learned of B yet"
+            );
+            // A learns that it lost the range: its bound goes before any fence.
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(
+                a.replication.replicated_through(&key),
+                None,
+                "a host that does not serve the slot claims nothing"
+            );
+
             // A's next fence check sees B's epoch: A claims nothing more.
             a.clock.advance(Duration::from_secs(120));
             tick(&a.replication).await;
