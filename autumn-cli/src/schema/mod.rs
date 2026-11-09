@@ -1359,17 +1359,17 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
                 }
             }
             SchemaChange::AddIndex { table, index } => {
-                if let Some(t) = tables.get_mut(table) {
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     t.indexes.push(index.clone());
                 }
             }
             SchemaChange::DropIndex { table, index } => {
-                if let Some(t) = tables.get_mut(table) {
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     t.indexes.retain(|i| i.name != index.name);
                 }
             }
             SchemaChange::AddCheck { table, check } => {
-                if let Some(t) = tables.get_mut(table) {
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     t.checks.push(check.clone());
                 }
             }
@@ -2822,6 +2822,14 @@ mod tests {
                     table: "blog.articles".to_owned(),
                     column: Column::new("body".to_string(), ColumnType::Text),
                 },
+                SchemaChange::AddIndex {
+                    table: "blog.articles".to_owned(),
+                    index: autumn_schema_core::Index::new(
+                        "idx_articles_body",
+                        vec!["body".to_owned()],
+                        false,
+                    ),
+                },
             ],
         };
         let projected = project_plan_target(&[base], &plan);
@@ -2835,6 +2843,7 @@ mod tests {
             t.columns
         );
         assert_eq!(t.schema.as_deref(), Some("blog"));
+        assert!(t.indexes.iter().any(|i| i.name == "idx_articles_body"));
     }
 
     #[test]

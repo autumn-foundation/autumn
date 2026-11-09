@@ -3436,7 +3436,9 @@ fn topo_sort_creates(creates: &mut [&SchemaChange]) -> Result<(), EmitError> {
         let mut d = BTreeSet::new();
         for col in &table.columns {
             if let Some(fk) = &col.references {
-                let target = fk.table.as_str();
+                // A plan names a schema table `schema.table`; the batch is keyed by
+                // bare name.
+                let target = bare_name(fk.table.as_str());
                 if target != name && names.contains(target) {
                     d.insert(target);
                 }
@@ -3589,8 +3591,9 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
              #[belongs_to(...)] association foreign keys, which the offline snapshot cannot see; \
              if a retained table has an invisible association FK to `{0}`, this will fail to apply \
              -- verify with schema introspection or drop the FK manually first\n\
-             DROP TABLE {0};\n",
-            table.name
+             DROP TABLE {1};\n",
+            table.name,
+            table.qualified_name()
         )),
         SchemaChange::AddColumn { table, column } => emit_add_column(table, column, backend),
         SchemaChange::DropColumn { table, column } => Ok(format!(
@@ -6515,6 +6518,36 @@ mod tests {
         let want = in_schema(posts_with(vec![]), "x; DROP TABLE y");
         let plan = diff_schema(&[], &parsed(vec![want], vec![]), DEFAULT_OPTS);
         assert!(guard_plan(&plan, DEFAULT_OPTS).is_err());
+    }
+
+    #[test]
+    fn new_tables_in_a_schema_are_created_parent_first() {
+        // `campaigns` sorts before `users`, but it references `users`.
+        let users = in_schema(
+            {
+                let mut t = posts_with(vec![]);
+                t.name = "users".to_owned();
+                t
+            },
+            "blog",
+        );
+        let mut fk = col("user_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("users", "id"));
+        let mut campaigns = in_schema(posts_with(vec![fk]), "blog");
+        campaigns.name = "campaigns".to_owned();
+        let plan = diff_schema(&[], &parsed(vec![campaigns, users], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        let users_at = up.find("CREATE TABLE blog.users").expect(&up);
+        let campaigns_at = up.find("CREATE TABLE blog.campaigns").expect(&up);
+        assert!(users_at < campaigns_at, "{up}");
+    }
+
+    #[test]
+    fn dropping_a_schema_table_names_the_schema() {
+        let base = in_schema(posts_with(vec![]), "blog");
+        let plan = diff_schema(&[base], &parsed(vec![], vec![]), ALLOW);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(up.contains("DROP TABLE blog.posts;"), "{up}");
     }
 
     #[test]
