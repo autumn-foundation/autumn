@@ -91,6 +91,8 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   connection acquired lazily — long after the database was resolved — never
   finds its pool closed. The sweeper re-checks `max_open` at least once per grace
   window, so a burst of opens does not stay over the cap.
+  `max_open_policy = "wait"` or `"refuse"` makes the cap hard for request
+  opens (#3538). An open at the cap waits for a close, or answers `503`.
 - A new database is built in a private staging file beside its path —
   identity row and every migration — and published with a hard link, which
   refuses an existing target. A database is therefore absent or complete,
@@ -429,8 +431,9 @@ proofs are in `verification/fleet_replica_tombstones.rs`.
   SQLite-fleet app share handlers and repositories.
 - Bounded resources: `max_open × pool_size` connections, about
   `max_open × (2 × pool_size + 1)` file descriptors, when the fleet is not
-  busy. A burst can open more than `max_open` databases: the limit is soft
-  (see `database.fleet.min_residency` and ADR 0031).
+  busy. With `max_open_policy = "soft"` (the default), a burst can open more
+  than `max_open` databases: the limit is soft (see
+  `database.fleet.min_residency` and ADR 0031).
 - Metrics stay bounded: a fleet database's metric and route label is
   `shard=fleet`; its name goes on spans and logs only.
 

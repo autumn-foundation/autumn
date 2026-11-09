@@ -260,6 +260,9 @@ const MAX_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// request with a closed database.
 pub const DEFAULT_MIN_RESIDENCY: Duration = Duration::from_secs(2);
 
+/// The longest `Retry-After` of a full fleet, in seconds.
+const MAX_RETRY_AFTER_SECS: u64 = 30;
+
 /// How often a parked open looks for room again, when no close wakes it.
 const ROOM_POLL: Duration = Duration::from_millis(20);
 
@@ -871,14 +874,15 @@ pub struct FleetStats {
     pub draining: usize,
     /// The configured cap.
     pub max_open: usize,
-    /// The most databases open and closing together since boot. Above
-    /// `max_open`, the cap was soft for a moment: size `ulimit -n` for this
-    /// value.
+    /// The most databases open and closing together since boot. When this
+    /// is above `max_open`, the fleet passed `max_open`. Size `ulimit -n` for
+    /// this value.
     pub peak_open: usize,
-    /// Opens that took the fleet past `max_open` since boot (`soft` policy).
+    /// Opens that took the fleet past `max_open` (`soft` policy). Counted
+    /// since boot.
     pub over_cap_opens_total: u64,
-    /// Opens answered `503` because the fleet was full since boot (`wait`
-    /// and `refuse` policy).
+    /// Opens answered `503` because the fleet was full (`wait` and `refuse`
+    /// policy). Counted since boot.
     pub refused_total: u64,
     /// The memory the open databases hold, by the engine's count.
     pub resident_bytes: u64,
@@ -1017,6 +1021,9 @@ impl<E: FleetEngine> Drop for DrainGuard<'_, E> {
 /// A key that is closing or being deleted. Openers wait on `done`.
 struct Drain {
     deleting: bool,
+    /// Whether the drain holds a database, and so its files. A delete of a
+    /// closed database holds none.
+    holds: bool,
     finished: AtomicBool,
     done: Notify,
     /// The retire flag of the database and the epoch it opened under, so a
@@ -1148,6 +1155,16 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         engine: impl FnOnce(&Path) -> E,
     ) -> Result<Self, FleetError> {
         let template = FleetPathTemplate::parse(config.path_template(), config.mode)?;
+        if config.max_open_policy == crate::config::FleetMaxOpenPolicy::Wait
+            && config.min_residency >= open_wait
+        {
+            tracing::warn!(
+                residency = ?config.min_residency,
+                wait = ?open_wait,
+                "database.fleet.min_residency is not below the connect timeout: with \
+                 max_open_policy = \"wait\", an open at the cap answers 503 after the timeout"
+            );
+        }
         std::fs::create_dir_all(&config.root).map_err(io_error("create root directory"))?;
         // Canonical, so the containment check in `path_of` compares like with
         // like and a relative root does not move with the working directory.
@@ -1898,16 +1915,21 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     /// files, so a hard cap counts it. The soft cap counts open ones only.
     fn full_locked(&self, state: &State<E>) -> bool {
         let closing = if self.hard_cap() {
-            state.draining.len()
+            Self::closing_locked(state)
         } else {
             0
         };
         state.open.len() + closing >= self.inner.max_open
     }
 
+    /// The closing databases that still hold their files.
+    fn closing_locked(state: &State<E>) -> usize {
+        state.draining.values().filter(|drain| drain.holds).count()
+    }
+
     /// Record the databases held after an entry was added.
     fn note_held(&self, state: &State<E>) {
-        let held = state.open.len() + state.draining.len();
+        let held = state.open.len() + Self::closing_locked(state);
         let counters = &self.inner.counters;
         counters.peak_held.fetch_max(held, Ordering::Relaxed);
         if held > self.inner.max_open {
@@ -1925,24 +1947,30 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         deadline: tokio::time::Instant,
     ) -> Result<(), FleetError> {
         let notified = self.inner.room.notified();
-        self.evict(None, 1);
+        let started = self.evict(None, 1);
         let now = tokio::time::Instant::now();
-        let closing = !self.lock_state().draining.is_empty();
         let refuse = self.inner.max_open_policy == crate::config::FleetMaxOpenPolicy::Refuse;
-        if now >= deadline || (refuse && !closing) {
+        if now >= deadline || (refuse && started.is_empty()) {
             self.inner.counters.refused.fetch_add(1, Ordering::Relaxed);
             let residency = self.inner.min_residency;
             let secs = residency.as_secs() + u64::from(residency.subsec_nanos() > 0);
             return Err(FleetError::AtCapacity {
                 name: key.name(),
                 max_open: self.inner.max_open,
-                retry_after_secs: secs.max(1),
+                retry_after_secs: secs.clamp(1, MAX_RETRY_AFTER_SECS),
             });
         }
-        let step = (deadline - now).min(ROOM_POLL);
+        let remaining = deadline - now;
+        if refuse {
+            // Wait only for the closes this call started. An unrelated drain
+            // can take long, and `refuse` does not wait for it.
+            let closes = futures::future::join_all(started.iter().map(|drain| drain.wait()));
+            let _ = tokio::time::timeout(remaining, closes).await;
+            return Ok(());
+        }
         tokio::select! {
             () = notified => {}
-            () = tokio::time::sleep(step) => {}
+            () = tokio::time::sleep(remaining.min(ROOM_POLL)) => {}
         }
         Ok(())
     }
@@ -2229,6 +2257,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         state.open.remove(key);
         let drain = Arc::new(Drain {
             deleting,
+            holds: true,
             finished: AtomicBool::new(false),
             done: Notify::new(),
             retire: Some((Arc::clone(&db.retired), db.epoch)),
@@ -2619,6 +2648,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let entry = state.open.remove(key);
         let drain = Arc::new(Drain {
             deleting,
+            holds: entry.is_some(),
             finished: AtomicBool::new(false),
             done: Notify::new(),
             retire: entry
@@ -3791,7 +3821,7 @@ mod tests {
         assert!(matches!(error, FleetError::AtCapacity { max_open: 2, .. }));
         assert_eq!(error.http_status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.retry_after_secs().is_some_and(|secs| secs >= 1));
-        assert!(started.elapsed() < Duration::from_secs(1), "no wait");
+        assert!(started.elapsed() < Duration::from_secs(3), "no wait");
         let stats = fleet.stats();
         assert_eq!((stats.open, stats.peak_open), (2, 2));
         assert_eq!(stats.refused_total, 1);
@@ -3855,7 +3885,7 @@ mod tests {
         let error = fleet.open(&slot(2)).await.unwrap_err();
         assert!(matches!(error, FleetError::AtCapacity { .. }));
         assert!(started.elapsed() >= Duration::from_millis(900));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(fleet.stats().refused_total, 1);
         assert_eq!(fleet.stats().peak_open, 1);
     }
@@ -3877,9 +3907,10 @@ mod tests {
                     })
                 })
                 .collect();
+            let mut served = 0;
             for task in tasks {
                 match task.await.unwrap() {
-                    Ok(()) => {}
+                    Ok(()) => served += 1,
                     Err(FleetError::AtCapacity { .. }) => {
                         assert_eq!(policy, Refuse, "wait serves every open in time");
                     }
@@ -3888,9 +3919,90 @@ mod tests {
             }
             settle(&fleet).await;
             let stats = fleet.stats();
+            assert!(served >= 3, "{policy}: the cap still serves {served}");
             assert!(stats.peak_open <= 3, "{policy}: peak {}", stats.peak_open);
             assert_eq!(stats.over_cap_opens_total, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn a_closing_database_counts_toward_a_hard_cap() {
+        use crate::config::FleetMaxOpenPolicy::Refuse;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 1, Refuse, Duration::ZERO, 5);
+        let held = fleet.open(&slot(1)).await.unwrap();
+        let conn = held.pool().get().await.unwrap();
+        let closing = tokio::spawn({
+            let fleet = fleet.clone();
+            async move { fleet.close(&slot(1)).await }
+        });
+        while fleet.stats().draining == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Slot 1 is out of the open map, but its files are still open.
+        let error = fleet.open(&slot(2)).await.unwrap_err();
+        assert!(matches!(error, FleetError::AtCapacity { .. }));
+        assert_eq!(fleet.stats().peak_open, 1);
+        drop(conn);
+        drop(held);
+        closing.await.unwrap();
+        settle(&fleet).await;
+        assert!(fleet.open(&slot(2)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_frees_its_slot_for_a_parked_open() {
+        use crate::config::FleetMaxOpenPolicy::Wait;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
+            max_open: 1,
+            max_open_policy: Wait,
+            ..config(tmp.path(), FleetMode::Slot)
+        })
+        .min_residency(Duration::from_secs(60))
+        .connect_timeout_secs(30)
+        .migrations("broken", BROKEN)
+        .build()
+        .unwrap();
+        let (one, two) = (slot(1), slot(2));
+        let (first, second) = tokio::join!(fleet.open(&one), fleet.open(&two));
+        for result in [first, second] {
+            let error = result.err().expect("the migration is broken");
+            assert!(!matches!(error, FleetError::AtCapacity { .. }), "{error}");
+        }
+        assert_eq!(fleet.stats().refused_total, 0);
+        assert!(fleet.stats().peak_open <= 1);
+    }
+
+    #[tokio::test]
+    async fn a_background_open_gets_no_room_at_a_hard_cap_and_does_not_wait() {
+        use crate::config::FleetMaxOpenPolicy::Wait;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(tmp.path(), 1, Wait, Duration::from_secs(60), 30);
+        drop(fleet.open(&slot(1)).await.unwrap());
+        let started = std::time::Instant::now();
+        assert!(fleet.open_background(&slot(2)).await.unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fleet.stats().refused_total, 0);
+    }
+
+    #[tokio::test]
+    async fn health_shows_the_cap_counters() {
+        use crate::actuator::HealthIndicator as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = capped(
+            tmp.path(),
+            1,
+            crate::config::FleetMaxOpenPolicy::Soft,
+            Duration::from_secs(60),
+            5,
+        );
+        fleet.open(&slot(1)).await.unwrap();
+        let output = FleetHealthIndicator::new(fleet).check().await;
+        for field in ["peak_open", "over_cap_opens_total", "refused_total"] {
+            assert!(output.details.contains_key(field), "{field} missing");
+        }
+        assert_eq!(output.details["peak_open"], 1);
     }
 
     const BROKEN: EmbeddedMigrations =

@@ -12100,8 +12100,9 @@ pub struct DatabaseConfig {
 
 /// What an open does when the fleet already holds `max_open` databases.
 ///
-/// A database used within [`min_residency`](DatabaseFleetConfig::min_residency),
-/// or in use, is never closed to make room.
+/// The fleet does not close a database that is in use or that was used within
+/// [`min_residency`](DatabaseFleetConfig::min_residency). The cap applies to
+/// opens for requests. A background open never passes it, with any policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetMaxOpenPolicy {
@@ -12110,10 +12111,12 @@ pub enum FleetMaxOpenPolicy {
     #[default]
     Soft,
     /// Wait for a free slot, for at most `connect_timeout_secs`. Then answer
-    /// `503`. Open databases never pass `max_open`.
+    /// `503`. The count of open and closing databases never passes `max_open`.
     Wait,
-    /// Answer `503` with `Retry-After` at once. Open databases never pass
-    /// `max_open`.
+    /// Answer `503` with `Retry-After` at once when no idle database can
+    /// close. If one can close, wait for that close, for at most
+    /// `connect_timeout_secs`. The count of open and closing databases never
+    /// passes `max_open`.
     Refuse,
 }
 
@@ -12184,14 +12187,16 @@ pub struct DatabaseFleetConfig {
     ///
     /// Past this, the sweeper closes the least recently used idle database.
     /// It does not close a database that is in use or that was used within
-    /// [`min_residency`](Self::min_residency), and an open never waits for
-    /// room. Thus a burst across many keys can open more databases than this
-    /// value. The count decreases when the burst stops.
+    /// [`min_residency`](Self::min_residency). With `max_open_policy = "soft"`,
+    /// an open never waits for room. Thus a burst across many keys can open
+    /// more databases than this value. The count decreases when the burst
+    /// stops. See [`max_open_policy`](Self::max_open_policy) for a hard limit.
     ///
     /// Each open database holds up to [`pool_size`](Self::pool_size)
     /// connections, and about `2 × pool_size + 1` file descriptors (the
-    /// database and `-wal` per connection, one `-shm`). Set the open-file
-    /// limit (`ulimit -n`) for the peak count, not for this value.
+    /// database and `-wal` per connection, one `-shm`). With the `"soft"`
+    /// policy, set the open-file limit (`ulimit -n`) for the peak count, not
+    /// for this value.
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
 
@@ -12201,13 +12206,27 @@ pub struct DatabaseFleetConfig {
     /// - `"soft"`: open anyway (see `max_open`).
     /// - `"wait"`: wait for a free slot, for at most `connect_timeout_secs`,
     ///   then answer `503`.
-    /// - `"refuse"`: answer `503` with `Retry-After` at once.
+    /// - `"refuse"`: answer `503` with `Retry-After` at once when no idle
+    ///   database can close. If one can close, wait for that close, for at
+    ///   most `connect_timeout_secs`.
     ///
-    /// With `"wait"` or `"refuse"`, the open and closing databases together
-    /// never pass `max_open`, so the descriptor count has a hard bound:
-    /// `max_open × (2 × pool_size + 1)`. A database that is in use, or was
-    /// used within [`min_residency`](Self::min_residency), still stays open.
-    /// A burst can then get `503` until that grace passes.
+    /// With `"wait"` or `"refuse"`, the count of open and closing databases
+    /// never passes `max_open`. The fleet databases then hold at most
+    /// `max_open × (2 × pool_size + 1)` file descriptors. Replicas, the
+    /// control database and sockets use more.
+    ///
+    /// The fleet keeps a database open while it is in use or was used within
+    /// [`min_residency`](Self::min_residency). A burst of new keys gets `503`
+    /// until that time ends. `Retry-After` is `min_residency` rounded up to
+    /// whole seconds (from 1 to 30).
+    ///
+    /// The cap counts a request for any key, also one that does not exist.
+    /// Check the tenant id before you open its database. With `"wait"`, set a
+    /// request limit too: a parked request holds its task for the timeout.
+    ///
+    /// This policy does not apply to
+    /// [`max_resident_bytes`](Self::max_resident_bytes). With `"wait"` and
+    /// `"refuse"`, a database that is too large stays open.
     #[serde(default)]
     pub max_open_policy: FleetMaxOpenPolicy,
 
@@ -12217,8 +12236,8 @@ pub struct DatabaseFleetConfig {
     /// Each engine reports the memory of one open database. The `SQLite`
     /// engine counts about 2 MB of page cache for each connection. Above the
     /// limit, the fleet closes the least recently used idle database. The
-    /// rules are the same as for [`max_open`](Self::max_open). The fleet
-    /// keeps one database open, also when it alone is above the limit.
+    /// rules are the same as for [`max_open`](Self::max_open) with the
+    /// `"soft"` policy. The fleet keeps one database open, also when it alone is above the limit.
     /// While the budget is full, a background open gets no room.
     #[serde(default)]
     pub max_resident_bytes: u64,
@@ -12710,9 +12729,11 @@ pub(crate) fn open_files_warning(
     Some(format!(
         "SQLite may keep about {files} files open at database.fleet.max_open, near \
          the open-file limit of {limit} (ulimit -n). The process also needs files \
-         for sockets and logs. database.fleet.max_open is a soft limit: a burst \
-         opens more. Increase ulimit -n. Or decrease database.fleet.max_open, \
-         database.fleet.pool_size or database.pool_size. Set \
+         for sockets and logs. With max_open_policy = \"soft\", \
+         database.fleet.max_open is a soft limit: a burst opens more. Use \
+         \"wait\" or \"refuse\" to bound the count. Increase ulimit -n. Or \
+         decrease database.fleet.max_open, database.fleet.pool_size or \
+         database.pool_size. Set \
          database.max_connections_warn_threshold = 0 to silence."
     ))
 }
@@ -13260,15 +13281,6 @@ impl DatabaseConfig {
             return Ok(());
         };
         fleet.validate()?;
-        let wait = std::time::Duration::from_secs(self.connect_timeout_secs);
-        if fleet.max_open_policy == FleetMaxOpenPolicy::Wait && fleet.min_residency >= wait {
-            return Err(ConfigError::Validation(format!(
-                "database.fleet.min_residency ({:?}) must be below \
-                 database.connect_timeout_secs ({}s) with max_open_policy = \"wait\": \
-                 an open waits that long for a database to pass its residency",
-                fleet.min_residency, self.connect_timeout_secs
-            )));
-        }
         if self.has_shards() {
             return Err(ConfigError::Validation(
                 "database.fleet and [[database.shards]] are both configured; a fleet routes \
@@ -23411,29 +23423,6 @@ path = "/healthz"
             config.database.fleet.unwrap().max_open_policy,
             FleetMaxOpenPolicy::Refuse
         );
-    }
-
-    #[test]
-    fn fleet_wait_policy_needs_a_residency_below_the_connect_timeout() {
-        let database = |policy: &str, residency: &str| {
-            let mut config = toml::from_str::<AutumnConfig>(&format!(
-                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\
-                 connect_timeout_secs = 5\n\n[database.fleet]\nmode = \"slot\"\n\
-                 root = \"/data/fleet\"\nmax_open_policy = \"{policy}\"\n\
-                 min_residency = \"{residency}\"\n"
-            ))
-            .unwrap();
-            config
-                .database
-                .validate()
-                .map(|()| config.database.fleet.take())
-        };
-        let error = database("wait", "5s").unwrap_err().to_string();
-        assert!(error.contains("min_residency"), "{error}");
-        assert!(error.contains("connect_timeout_secs"), "{error}");
-        assert!(database("wait", "2s").is_ok());
-        assert!(database("refuse", "30s").is_ok());
-        assert!(database("soft", "30s").is_ok());
     }
 
     #[test]

@@ -1946,6 +1946,16 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "3");
+
+        let other = AutumnError::from(crate::db::fleet::FleetError::NotFound {
+            name: "slot-1".into(),
+        });
+        assert!(
+            !other
+                .into_response()
+                .headers()
+                .contains_key(header::RETRY_AFTER)
+        );
     }
 
     #[test]

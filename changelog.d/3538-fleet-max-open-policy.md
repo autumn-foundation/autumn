@@ -12,8 +12,9 @@
 - **db:** `[database.fleet] max_open_policy` (issue #3538). `"soft"` is the
   default and does not change. `"wait"` parks an open until a slot frees, for
   at most `connect_timeout_secs`, then answers `503`. `"refuse"` answers `503`
-  with `Retry-After` at once. With either, open and closing databases never
-  pass `max_open`, so a burst cannot fail with "too many open files".
+  with `Retry-After` at once when no idle database can close. With either
+  policy, the open and closing databases never pass `max_open`. A burst then
+  cannot fail with "too many open files".
   `FleetStats` and `/actuator/health` (`db:fleet`) add `peak_open`,
   `over_cap_opens_total` and `refused_total`. The fleet guide gives the
   descriptor count and the `ulimit -n` rule.
