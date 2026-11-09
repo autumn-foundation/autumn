@@ -288,6 +288,9 @@ pub(crate) struct UnshippedGeneration {
     upload: Option<Arc<GenerationSlot>>,
     /// Held for one retry. A second pass skips a busy record.
     busy: Mutex<()>,
+    /// The order in which records were kept. See
+    /// [`FleetReplication::generation_mark`].
+    seq: u64,
     retry: RetryShip,
 }
 
@@ -308,6 +311,7 @@ impl UnshippedGeneration {
             retired,
             upload,
             busy: Mutex::new(()),
+            seq: 0,
             retry,
         }
     }
@@ -353,6 +357,8 @@ pub struct FleetReplication {
     /// Kept generations that a delete or a restore released. They do not
     /// ship. A delete or a restore that fails puts them back.
     released_generations: Mutex<HashMap<FleetDbKey, Arc<UnshippedGeneration>>>,
+    /// The `seq` of the next kept generation.
+    next_kept_seq: AtomicU64,
     /// The tombstone rows of deleted databases (issue #3235). `None`: a
     /// failed purge is not retried.
     tombstones: Option<Arc<FleetTombstones>>,
@@ -450,6 +456,7 @@ impl FleetReplication {
             generation_slots: Mutex::new(HashMap::new()),
             unshipped_generations: Mutex::new(HashMap::new()),
             released_generations: Mutex::new(HashMap::new()),
+            next_kept_seq: AtomicU64::new(0),
             tombstones: None,
             retention_after_delete: Duration::ZERO,
             restore_check: None,
@@ -1062,19 +1069,34 @@ impl FleetReplication {
 
     /// Keep `record` of `key` until a ship or a retire drops it. It
     /// replaces an older record: the files at the path hold its writes.
-    pub(crate) fn keep_unshipped_generation(&self, key: &FleetDbKey, record: UnshippedGeneration) {
+    pub(crate) fn keep_unshipped_generation(
+        &self,
+        key: &FleetDbKey,
+        mut record: UnshippedGeneration,
+    ) {
         tracing::warn!(
             database = %key,
             path = %record.path.display(),
             epoch = ?record.epoch,
             "fleet generation: the last generation of the close did not ship; it is kept and ships later"
         );
+        record.seq = self.next_kept_seq.fetch_add(1, Ordering::AcqRel);
         self.records().insert(key.clone(), Arc::new(record));
     }
 
-    /// A ship of `key` worked: its files hold the writes of the record.
-    pub(crate) fn drop_unshipped_generation(&self, key: &FleetDbKey) {
-        if self.records().remove(key).is_some() {
+    /// A mark to take before a ship starts. A record kept after it can hold
+    /// writes the ship does not.
+    pub(crate) fn generation_mark(&self) -> u64 {
+        self.next_kept_seq.load(Ordering::Acquire)
+    }
+
+    /// A ship of `key` that started at `mark` worked: its files hold the
+    /// writes of a record kept before `mark`. A later record stays.
+    pub(crate) fn drop_unshipped_generation(&self, key: &FleetDbKey, mark: u64) {
+        let mut records = self.records();
+        if records.get(key).is_some_and(|record| record.seq < mark) {
+            records.remove(key);
+            drop(records);
             tracing::info!(database = %key, "fleet generation: the kept generation shipped");
         }
     }
@@ -3779,7 +3801,8 @@ mod tests {
                     }
                     // A ship of the open database.
                     1 => {
-                        replication.drop_unshipped_generation(&key);
+                        let mark = replication.generation_mark();
+                        replication.drop_unshipped_generation(&key, mark);
                         model.remove(&slot);
                     }
                     // A delete or a restore.
@@ -3887,6 +3910,35 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         go.send(()).unwrap();
         first.join().unwrap();
+        assert_eq!(replication.unshipped_generations(), 0);
+    }
+
+    #[test]
+    fn a_ship_drops_only_a_record_kept_before_it_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = kept_replication(tmp.path());
+        let key = FleetDbKey::Slot(1);
+        let record = || {
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(|| GenerationRetry::Busy),
+            )
+        };
+        replication.keep_unshipped_generation(&key, record());
+        let mark = replication.generation_mark();
+        // A reopen and a second close during the ship keep a new record.
+        replication.keep_unshipped_generation(&key, record());
+        replication.drop_unshipped_generation(&key, mark);
+        assert_eq!(
+            replication.unshipped_generations(),
+            1,
+            "the ship does not hold the writes of the later close"
+        );
+        let later = replication.generation_mark();
+        replication.drop_unshipped_generation(&key, later);
         assert_eq!(replication.unshipped_generations(), 0);
     }
 

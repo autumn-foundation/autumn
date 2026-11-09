@@ -734,11 +734,14 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // One ship at a time per database: a later snapshot never lands
         // before an earlier one.
         let _turn = target.slot.turn.lock().await;
+        // Before the snapshot: a close after it keeps a record this ship
+        // does not cover.
+        let mark = replication.generation_mark();
         let shipped = self.ship_locked(replication, target).await;
         let now = replication.now();
         if shipped.is_ok() {
-            // The files at the path hold the writes of a kept generation.
-            replication.drop_unshipped_generation(&target.key);
+            // The files at the path hold the writes of an earlier record.
+            replication.drop_unshipped_generation(&target.key, mark);
         }
         let mut track = target.slot.track();
         match &shipped {
