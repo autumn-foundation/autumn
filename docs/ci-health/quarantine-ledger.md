@@ -189,6 +189,32 @@ quarantine, per the rule above.
 - **Linked issue/PR**: none.
 - **Skip mechanism**: none.
 
+### `pdf::html::tests::long_run_of_unterminated_ampersands_is_linear_not_quadratic`: wall-clock ratio over the limit on macOS (observed, not quarantined)
+
+- **Observed**: 2026-11-09, PR #3680 run 42598713645 (head `4eb134af`), job
+  `Test (macos-15-intel, 3/4)`. The PR changes only this ledger, so the
+  failure is not from its diff. Nothing was skipped.
+- **Owner**: Semaphore (CI-health routine) - triage only.
+- **Diagnose-by**: 2026-11-23. If still n=1, close as "transient, runner
+  load". If it recurs, replace the wall-clock ratio with an operation count.
+- **Rerun-rate baseline**: 1 failure in CI, no same-commit rerun possible
+  from the routine. Local, Linux, debug build, `--features pdf`: the ratio
+  was 6.7-8.5 in 13 unloaded runs that reached the ratio check (the other
+  17 of 30 finished the large input under the 50 ms floor) and 6.2-14.5 in
+  20 runs pinned to one CPU beside four busy loops. Limit is 32. The test
+  needs `--features pdf`; without it the filter matches 0 tests and exits 0.
+- **Failure signature**: `decode_entities took 664.92915ms at 200000 and
+  18.396818ms at 25000: 36.1 times for 8 times the input. That looks
+  quadratic again.` (`autumn/src/pdf/linear.rs:56`). The large input ran
+  about 13x slower than the local 51 ms, the small one about 2.8x slower.
+- **Mechanism (if known)**: hypothesis. Resource contention on the macOS
+  runner during the large run: all three best-of runs were slow, so a sustained
+  stall, not one blip. The parser is not shown to be quadratic: the local
+  ratio stays near 8 even under oversubscription. Verdict: not made tolerant,
+  so `MAX_RATIO` and `FAST_ENOUGH` are unchanged.
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none; the test still runs.
+
 ## Closed entries
 
 ### RUSTSEC-2026-0385 (`ctutils` 0.4.2) fails the advisory gates on every branch
