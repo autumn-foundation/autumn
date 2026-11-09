@@ -1182,11 +1182,22 @@ fn relation_clash(
     // Names compare case-insensitively: SQLite resolves them that way, and on
     // Postgres a false match only refuses (the safe side).
     let key = |name: &str| name.to_ascii_lowercase();
+    // A relation in a named schema is `schema.name`; one in `public` is bare.
+    // `table` is `table` or `schema.table`, and its indexes share the schema.
+    let in_schema_of = |table: &str, name: &str| {
+        table
+            .rsplit_once('.')
+            .map_or_else(|| key(name), |(schema, _)| key(&format!("{schema}.{name}")))
+    };
+    let table_key = |t: &autumn_schema_core::Table| match t.schema.as_deref() {
+        Some(schema) if schema != "public" => key(&format!("{schema}.{}", t.name)),
+        _ => key(&t.name),
+    };
     let added: std::collections::BTreeSet<String> = plan
         .changes
         .iter()
         .filter_map(|c| match c {
-            SchemaChange::AddIndex { index, .. } => Some(key(&index.name)),
+            SchemaChange::AddIndex { table, index } => Some(in_schema_of(table, &index.name)),
             _ => None,
         })
         .collect();
@@ -1194,10 +1205,12 @@ fn relation_clash(
         .changes
         .iter()
         .filter_map(|c| match c {
-            SchemaChange::RenameTable { from, .. } => Some(key(diff::bare_name(from))),
-            SchemaChange::RenameIndex { from, .. } => Some(key(from)),
-            SchemaChange::DropIndex { index, .. } if added.contains(&key(&index.name)) => {
-                Some(key(&index.name))
+            SchemaChange::RenameTable { from, .. } => Some(key(from)),
+            SchemaChange::RenameIndex { table, from, .. } => Some(in_schema_of(table, from)),
+            SchemaChange::DropIndex { table, index }
+                if added.contains(&in_schema_of(table, &index.name)) =>
+            {
+                Some(in_schema_of(table, &index.name))
             }
             _ => None,
         })
@@ -1206,30 +1219,41 @@ fn relation_clash(
         .iter()
         .map(|n| key(n))
         .chain(baseline.iter().flat_map(|t| {
-            std::iter::once(key(&t.name)).chain(t.indexes.iter().map(|i| key(&i.name)))
+            let prefix = t.qualified_name();
+            std::iter::once(table_key(t)).chain(
+                t.indexes
+                    .iter()
+                    .map(move |i| in_schema_of(&prefix, &i.name)),
+            )
         }))
         .collect();
-    let taken = |name: &str| {
-        let k = key(name);
-        !freed.contains(&k) && existing.contains(&k)
-    };
+    let taken = |k: &str| !freed.contains(k) && existing.contains(k);
     // A name that two targets of this plan share collides too.
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     plan.changes.iter().find_map(|c| {
-        let names: Vec<&String> = match c {
+        // `(name to show, key to compare)` for each relation the change makes.
+        let names: Vec<(&String, String)> = match c {
             // A new table brings its own indexes.
-            SchemaChange::CreateTable(t) => std::iter::once(&t.name)
-                .chain(t.indexes.iter().map(|i| &i.name))
-                .collect(),
-            SchemaChange::RenameTable { to, .. } => vec![to],
-            SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
-                vec![&index.name]
+            SchemaChange::CreateTable(t) => {
+                let prefix = t.qualified_name();
+                std::iter::once((&t.name, table_key(t)))
+                    .chain(
+                        t.indexes
+                            .iter()
+                            .map(|i| (&i.name, in_schema_of(&prefix, &i.name))),
+                    )
+                    .collect()
+            }
+            SchemaChange::RenameTable { from, to } => vec![(to, in_schema_of(from, to))],
+            SchemaChange::AddIndex { table, index }
+            | SchemaChange::RenameIndex { table, index, .. } => {
+                vec![(&index.name, in_schema_of(table, &index.name))]
             }
             _ => return None,
         };
-        let name = names
+        let (name, _) = names
             .into_iter()
-            .find(|n| taken(n) || !seen.insert(key(n)))?;
+            .find(|(_, k)| taken(k) || !seen.insert(k.clone()))?;
         Some(format!(
             "`{name}` is already a table, index, view, sequence, type or other relation \
              in the schema; choose another name"
@@ -1781,6 +1805,25 @@ mod tests {
             to: "new".to_owned(),
         });
         assert_eq!(relation_clash(&fine, &[], &others), None);
+    }
+
+    #[test]
+    fn a_relation_in_another_schema_does_not_clash() {
+        let plan = |t: autumn_schema_core::Table| MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::CreateTable(t)],
+        };
+        let mut blog = autumn_schema_core::Table::new("report", Backend::Postgres);
+        blog.schema = Some("blog".to_owned());
+        // A public view named `report` does not block `blog.report`.
+        let public_view: std::collections::BTreeSet<String> = ["report".to_owned()].into();
+        assert_eq!(relation_clash(&plan(blog.clone()), &[], &public_view), None);
+        // A `blog.report` view does.
+        let blog_view: std::collections::BTreeSet<String> = ["blog.report".to_owned()].into();
+        assert!(relation_clash(&plan(blog), &[], &blog_view).is_some());
+        // A public table still clashes with a public view.
+        let public = autumn_schema_core::Table::new("report", Backend::Postgres);
+        assert!(relation_clash(&plan(public), &[], &public_view).is_some());
     }
 
     #[test]

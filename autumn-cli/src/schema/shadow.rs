@@ -32,7 +32,8 @@ pub struct Replay {
     /// The tables (the diff baseline).
     pub tables: Vec<Table>,
     /// The names of the other relations (views, sequences, ...). They share
-    /// the table namespace, so a new or renamed table cannot use them.
+    /// the table namespace, so a new or renamed table cannot use them. A name
+    /// in a named schema is `schema.name`. A name in `public` is bare.
     pub other_relations: BTreeSet<String>,
 }
 
@@ -237,11 +238,13 @@ fn replay_postgres(url: &str, migrations_dir: &Path, schemas: &[String]) -> Resu
             // type of its own name, so it cannot use a type name. An array
             // type does not block it (Postgres moves the array type).
             &format!(
-                "SELECT c.relname AS name FROM pg_class c \
+                "SELECT CASE WHEN n.nspname = 'public' THEN c.relname \
+                 ELSE n.nspname || '.' || c.relname END AS name FROM pg_class c \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname IN ({scope}) \
                  AND c.relkind IN ('v', 'm', 'S', 'f', 'c', 'i', 'I') \
-                 UNION SELECT t.typname AS name FROM pg_type t \
+                 UNION SELECT CASE WHEN n.nspname = 'public' THEN t.typname \
+                 ELSE n.nspname || '.' || t.typname END AS name FROM pg_type t \
                  JOIN pg_namespace n ON n.oid = t.typnamespace \
                  WHERE n.nspname IN ({scope}) AND t.typtype IN ('b', 'd', 'e', 'r', 'm') \
                  AND t.typcategory <> 'A'"
