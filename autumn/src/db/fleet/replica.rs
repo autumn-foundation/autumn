@@ -168,9 +168,11 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         })
     }
 
-    /// Whether the replication has frames it did not ship yet.
+    /// Whether the replication has writes it did not ship yet: a parked
+    /// WAL replicator, or a kept generation.
     pub(super) fn unshipped(&self) -> bool {
-        self.replication().is_some_and(|r| r.closing() > 0)
+        self.replication()
+            .is_some_and(|r| r.closing() > 0 || r.unshipped_generations() > 0)
     }
 
     /// The tombstone row of a delete of `name`.
@@ -307,10 +309,16 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             for hook in self.hooks() {
                 hook.release(key);
             }
+            let mut settle = super::ReleaseSettle {
+                fleet: self,
+                key: key.clone(),
+                replaced: false,
+            };
             check_contained(self.root(), path)?;
             match mode {
                 ShipMode::Continuous(_) => {
                     restore_in_place(self.root(), replication, key, None, path)?;
+                    settle.done();
                 }
                 ShipMode::Generations { .. } => {
                     // Only a generation above the stamp holds newer data. The
@@ -328,6 +336,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                         }
                         other => {
                             other?;
+                            settle.done();
                         }
                     }
                 }
@@ -635,6 +644,15 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 replication.stop();
             })
             .await;
+        }
+    }
+
+    /// The hooks released `key` for a delete or a restore. `replaced`: the
+    /// files are gone or replaced, so a kept generation of them goes.
+    /// Otherwise it stays and ships again.
+    pub(super) fn settle_release(&self, key: &FleetDbKey, replaced: bool) {
+        if let Some(replication) = self.replication() {
+            replication.settle_released_generation(key, replaced);
         }
     }
 

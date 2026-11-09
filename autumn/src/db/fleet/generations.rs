@@ -32,6 +32,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
@@ -39,10 +40,11 @@ use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    DatabaseFleet, FleetDatabase, FleetDbKey, FleetEngine, FleetError, FleetLifecycle, Inner,
-    Ordering, ShipReport, check_contained, discard_staging, staging_path, with_path_lock,
+    DatabaseFleet, Drain, FleetDatabase, FleetDbKey, FleetEngine, FleetError, FleetLifecycle,
+    Inner, Notify, Ordering, ShipReport, check_contained, discard_staging, staging_path,
+    with_path_lock,
 };
-use crate::db::fleet_replication::FleetReplication;
+use crate::db::fleet_replication::{FleetReplication, GenerationRetry, UnshippedGeneration};
 use crate::db::fleet_tombstones::restore_allowed;
 use crate::replication::destination::{DestinationError, ReplicaDestination};
 use crate::replication::fence::FencedDestination;
@@ -621,6 +623,8 @@ pub struct ShipTarget<E: FleetEngine> {
     retired: Arc<std::sync::atomic::AtomicBool>,
     /// The slot of this open. A ship never makes one.
     slot: Arc<GenerationSlot>,
+    /// The hold of a retry. The ship ends it after the snapshot.
+    hold: Arc<Mutex<Option<KeyHold<E>>>>,
 }
 
 impl<E: FleetEngine> Clone for ShipTarget<E> {
@@ -632,7 +636,21 @@ impl<E: FleetEngine> Clone for ShipTarget<E> {
             epoch: self.epoch,
             retired: Arc::clone(&self.retired),
             slot: Arc::clone(&self.slot),
+            hold: Arc::clone(&self.hold),
         }
+    }
+}
+
+/// Keeps a closed key out of service. The drop ends it.
+pub struct KeyHold<E: FleetEngine> {
+    fleet: DatabaseFleet<E>,
+    key: FleetDbKey,
+    drain: Arc<Drain>,
+}
+
+impl<E: FleetEngine> Drop for KeyHold<E> {
+    fn drop(&mut self) {
+        self.fleet.finish_drain(&self.key, &self.drain);
     }
 }
 
@@ -646,7 +664,17 @@ impl<E: FleetEngine> ShipTarget<E> {
             epoch: db.epoch,
             retired: Arc::clone(&db.retired),
             slot,
+            hold: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Set or end the hold of a retry.
+    fn set_hold(&self, hold: Option<KeyHold<E>>) {
+        let old = std::mem::replace(
+            &mut *self.hold.lock().unwrap_or_else(PoisonError::into_inner),
+            hold,
+        );
+        drop(old);
     }
 }
 
@@ -708,6 +736,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let _turn = target.slot.turn.lock().await;
         let shipped = self.ship_locked(replication, target).await;
         let now = replication.now();
+        if shipped.is_ok() {
+            // The files at the path hold the writes of a kept generation.
+            replication.drop_unshipped_generation(&target.key);
+        }
         let mut track = target.slot.track();
         match &shipped {
             Ok(_) => {
@@ -779,6 +811,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             .engine
             .snapshot(&target.handle, &target.path, &scratch)
             .await;
+        // The copy is in scratch: opens of a held key may go on.
+        target.set_hold(None);
         let shipped = match files {
             Ok(files) => {
                 let (fleet, replication, owned, scratch) = (
@@ -934,6 +968,95 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         )
     }
 
+    /// Why the closed `target` must not ship now. `Retired`: it is retired,
+    /// or a newer epoch owns its slot. `Failed`: this host does not hold the
+    /// slot at the epoch of the record, and no newer epoch is known. The
+    /// record stays: the next open ships the file. `None`: it may ship.
+    fn kept_stop(&self, target: &ShipTarget<E>) -> Option<GenerationRetry> {
+        if target.retired.load(Ordering::Acquire) {
+            return Some(GenerationRetry::Retired);
+        }
+        let (ownership, epoch) = self.ownership().zip(target.epoch)?;
+        let slot = target.key.routing_slot();
+        if ownership.fence_floor(slot) > epoch.get() {
+            return Some(GenerationRetry::Retired);
+        }
+        (ownership.epoch_for(slot) != Some(epoch)).then(|| {
+            GenerationRetry::Failed(
+                "this host does not hold the slot at the epoch of the close".to_owned(),
+            )
+        })
+    }
+
+    /// Whether `db` was retired by a lapse of this host's lease, and not by
+    /// a newer epoch. Its writes are still this host's to ship.
+    fn lapsed(&self, db: &FleetDatabase<E>) -> bool {
+        let Some((ownership, epoch)) = self.ownership().zip(db.epoch) else {
+            return false;
+        };
+        let slot = db.key.routing_slot();
+        ownership.fence_floor(slot) <= epoch.get() && ownership.epoch_for(slot) != Some(epoch)
+    }
+
+    /// Take the closed `key` out of service for the snapshot of a retry:
+    /// opens, deletes and restores wait. `None` when the key is open,
+    /// opening or draining.
+    fn hold_closed(&self, key: &FleetDbKey) -> Option<KeyHold<E>> {
+        let mut state = self.lock_state();
+        if state.open.contains_key(key) || state.draining.contains_key(key) {
+            return None;
+        }
+        // No retire flag: a lapse is not a fence, and the ship checks the
+        // epoch itself.
+        let drain = Arc::new(Drain {
+            deleting: false,
+            finished: AtomicBool::new(false),
+            done: Notify::new(),
+            retire: None,
+            hold: true,
+        });
+        state.draining.insert(key.clone(), Arc::clone(&drain));
+        drop(state);
+        self.inner.in_flight_drains.fetch_add(1, Ordering::Relaxed);
+        Some(KeyHold {
+            fleet: self.clone(),
+            key: key.clone(),
+            drain,
+        })
+    }
+
+    /// Ship the kept generation of the closed `target` once. Blocking.
+    fn retry_kept(
+        &self,
+        replication: &Arc<FleetReplication>,
+        target: &ShipTarget<E>,
+        runtime: &tokio::runtime::Handle,
+    ) -> GenerationRetry {
+        if let Some(stop) = self.kept_stop(target) {
+            return stop;
+        }
+        // The hold ends after the snapshot: no open writes the files while
+        // it reads them, and no delete or restore removes them.
+        let Some(hold) = self.hold_closed(&target.key) else {
+            return GenerationRetry::Busy;
+        };
+        if !self.inner.engine.exists(&target.path) {
+            // Another process deleted it: nothing is left to ship.
+            return GenerationRetry::Retired;
+        }
+        target.set_hold(Some(hold));
+        let shipped = runtime.block_on(self.ship_target(replication, target));
+        target.set_hold(None);
+        match shipped {
+            Ok(_) => GenerationRetry::Shipped,
+            Err(FleetError::Fenced { .. }) => GenerationRetry::Retired,
+            Err(error) => match self.kept_stop(target) {
+                Some(GenerationRetry::Retired) => GenerationRetry::Retired,
+                _ => GenerationRetry::Failed(error.to_string()),
+            },
+        }
+    }
+
     /// Restore the missing database of `key` at `path` from its newest
     /// generation. Blocking: core holds the path lock.
     fn restore_missing_generation(
@@ -1070,6 +1193,49 @@ impl<E: FleetEngine> GenerationShipper<E> {
     }
 }
 
+impl<E: FleetEngine> GenerationShipper<E> {
+    /// Keep the closed `db` as unshipped work. The record holds its key,
+    /// path and epoch, and its closed handle: `snapshot` then copies the
+    /// files at the path.
+    fn keep(
+        &self,
+        db: &FleetDatabase<E>,
+        slot: Arc<GenerationSlot>,
+        runtime: Option<tokio::runtime::Handle>,
+    ) {
+        // Its own flag: the close sets the flag of `db` when it ends.
+        let retired = Arc::new(AtomicBool::new(false));
+        let target = ShipTarget {
+            retired: Arc::clone(&retired),
+            ..ShipTarget::of(db, Arc::clone(&slot))
+        };
+        let (fleet, replication) = (self.fleet.clone(), Arc::downgrade(&self.replication));
+        let retry = move || {
+            let (Some(inner), Some(replication)) = (fleet.upgrade(), replication.upgrade()) else {
+                return GenerationRetry::Failed("the fleet is gone".to_owned());
+            };
+            // The current runtime first: the one of the close can be gone.
+            let Some(runtime) = tokio::runtime::Handle::try_current()
+                .ok()
+                .or_else(|| runtime.clone())
+            else {
+                return GenerationRetry::Failed("no Tokio runtime to ship on".to_owned());
+            };
+            DatabaseFleet { inner }.retry_kept(&replication, &target, &runtime)
+        };
+        self.replication.keep_unshipped_generation(
+            db.key(),
+            UnshippedGeneration::new(
+                db.path.to_path_buf(),
+                db.epoch.map(crate::lock::FencingToken::get),
+                retired,
+                Some(slot),
+                Box::new(retry),
+            ),
+        );
+    }
+}
+
 impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
     fn restore_missing(&self, key: &FleetDbKey, path: &Path) -> Result<bool, String> {
         if !self.replication.restores_missing() {
@@ -1120,6 +1286,9 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
     /// The last generation of a close. It runs after every use ended, so it
     /// holds every write. A delete, a restore, a fence or a refused open
     /// retires the database first: then it ships nothing.
+    ///
+    /// Core keeps a failed or skipped ship as unshipped work. The loop and
+    /// the shutdown flush try it again.
     fn on_close(&self, db: &FleetDatabase<E>) {
         let Some(slot) = self.replication.current_generation_slot(db.key()) else {
             return;
@@ -1128,23 +1297,59 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
             .replication
             .shutdown_cutoff()
             .is_some_and(crate::db::fleet_replication::cutoff_passed);
-        if late {
-            tracing::warn!(database = %db.key(), "fleet generation ship at close skipped: the shutdown cutoff passed");
-        }
         let fleet = self.fleet.upgrade().map(|inner| DatabaseFleet { inner });
         let runtime = tokio::runtime::Handle::try_current().ok();
-        if let (false, false, Some(fleet), Some(runtime)) =
-            (db.retired.load(Ordering::Acquire), late, fleet, runtime)
-        {
-            let target = ShipTarget::of(db, Arc::clone(&slot));
-            if let Err(error) = runtime.block_on(fleet.ship_target(&self.replication, &target)) {
-                tracing::warn!(database = %db.key(), %error, "fleet generation ship at close failed");
+        let outcome = if db.retired.load(Ordering::Acquire) {
+            // A lapse of the lease is not a fence: the writes stay this
+            // host's. A delete or a restore releases the record at once.
+            fleet
+                .as_ref()
+                .is_some_and(|fleet| fleet.lapsed(db))
+                .then(|| FleetError::Unavailable {
+                    name: db.key().name(),
+                    detail: "the lease of this host lapsed".to_owned(),
+                })
+                .map_or(Ok(()), Err)
+        } else {
+            let not_tried = |detail: &str| FleetError::Unavailable {
+                name: db.key().name(),
+                detail: detail.to_owned(),
+            };
+            match (late, fleet, &runtime) {
+                (false, Some(fleet), Some(runtime)) => {
+                    let target = ShipTarget::of(db, Arc::clone(&slot));
+                    runtime
+                        .block_on(fleet.ship_target(&self.replication, &target))
+                        .map(drop)
+                }
+                (true, ..) => Err(not_tried("the shutdown cutoff passed")),
+                (false, ..) => Err(not_tried("no fleet or Tokio runtime to ship on")),
+            }
+        };
+        match outcome {
+            Ok(()) => {}
+            // A newer epoch owns the replica: the data is not this host's.
+            Err(error @ FleetError::Fenced { .. }) => {
+                tracing::warn!(database = %db.key(), %error, "fleet generation ship at close refused");
+            }
+            Err(error) => {
+                tracing::warn!(database = %db.key(), %error, "fleet generation ship at close did not ship");
+                // After a ship in flight: its success must not drop the
+                // record of later writes.
+                let _turn = slot.turn.blocking_lock();
+                self.keep(db, Arc::clone(&slot), runtime);
             }
         }
         // A ship of a retired database may still upload: wait, so a purge
         // after a delete sees every object it wrote.
         slot.wait_upload();
         self.replication.forget_generation_slot(db.key(), &slot);
+    }
+
+    /// A delete or a restore starts: the kept generation of `key` stops
+    /// shipping. Core settles it when the delete or the restore ends.
+    fn release(&self, key: &FleetDbKey) {
+        self.replication.release_unshipped_generation(key);
     }
 }
 
