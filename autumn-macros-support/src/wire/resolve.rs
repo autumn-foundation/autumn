@@ -465,6 +465,15 @@ fn target(
         }
         ["std" | "core" | "alloc", ..] => Target::Std,
         [first, rest @ ..] => {
+            // A child module of this one shadows a crate of the same name,
+            // as in Rust. The own crate must have the type in that module.
+            let local = join(&here, prefix);
+            if all
+                .iter()
+                .any(|c| norm(c.krate) == norm(scope.krate) && c.module == local)
+            {
+                return Target::Unqualified { module: local };
+            }
             // With the graph, a first segment is a crate only when it is the
             // own crate or a dependency. Else it is a local module, even when
             // another crate in the pass has that name.
@@ -479,9 +488,7 @@ fn target(
                 )
                 .or_else(|| (norm(scope.krate) == *first).then(|| own.clone()));
             named.map_or_else(
-                || Target::Unqualified {
-                    module: join(&here, prefix),
-                },
+                || Target::Unqualified { module: local },
                 |krate| Target::Crate {
                     krate,
                     module: rest.join("::"),
@@ -669,6 +676,30 @@ mod tests {
         assert_eq!(
             pick("catalog::Item", at("storefront", ""), &types, Some(&crates)),
             Ok(Some("storefront::catalog::Item".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_local_module_shadows_a_dependency_of_the_same_name() {
+        let types = vec![
+            ty("storefront", "catalog", "Item"),
+            ty("catalog", "", "Item"),
+        ];
+        let mut crates = Crates::default();
+        crates.add_dependency("storefront", "catalog", "catalog");
+        assert_eq!(
+            pick("catalog::Item", at("storefront", ""), &types, Some(&crates)),
+            Ok(Some("storefront::catalog::Item".to_owned()))
+        );
+        // From `api`, `catalog` is not a child module, so it is the dependency.
+        assert_eq!(
+            pick(
+                "catalog::Item",
+                at("storefront", "api"),
+                &types,
+                Some(&crates)
+            ),
+            Ok(Some("catalog::Item".to_owned()))
         );
     }
 
