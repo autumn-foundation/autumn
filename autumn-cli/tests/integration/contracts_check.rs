@@ -6,6 +6,11 @@
 //! binary and compares its report with `report.txt` and its exit code with the
 //! table below. Set `UPDATE_GOLDEN=1` to write the reports again, then review
 //! the diff.
+//!
+//! A case with `deployed/` and `current/` directories holds raw descriptors,
+//! as the macros write them. The test joins each with `autumn contracts
+//! export --from`, so the case also covers how the export resolves types and
+//! routes.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -74,6 +79,93 @@ fn golden(case: &str, want_exit: i32) -> String {
     );
     assert_eq!(code, want_exit, "{case}: exit code\n{stdout}\n{stderr}");
     stdout
+}
+
+/// Join the descriptors in `dir` into a bundle file in `out`.
+fn export_from(dir: &Path, out: &Path) {
+    let run = Command::new(env!("CARGO_BIN_EXE_autumn"))
+        .args(["contracts", "export", "--from"])
+        .arg(dir)
+        .arg("--out")
+        .arg(out)
+        .output()
+        .expect("run autumn");
+    assert!(
+        run.status.success(),
+        "export --from {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// Run one case of raw descriptors and compare it with its golden report.
+fn golden_descriptors(case: &str, want_exit: i32) -> String {
+    let dir = golden_dir().join(case);
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let deployed = scratch.path().join("deployed.json");
+    let current = scratch.path().join("current.json");
+    export_from(&dir.join("deployed"), &deployed);
+    export_from(&dir.join("current"), &current);
+    let (code, stdout, stderr) = check(&current, &deployed, &[]);
+    let report = dir.join("report.txt");
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        std::fs::write(&report, &stdout).expect("write golden");
+    }
+    let expected = std::fs::read_to_string(&report)
+        .unwrap_or_else(|e| panic!("missing golden {}: {e}", report.display()));
+    assert_eq!(
+        stdout, expected,
+        "{case}: the report differs from its golden file. If the change is intended, run \
+         `UPDATE_GOLDEN=1 cargo test -p autumn-cli --test cli_tests contracts_check` and \
+         review the diff."
+    );
+    assert_eq!(code, want_exit, "{case}: exit code\n{stdout}\n{stderr}");
+    stdout
+}
+
+#[test]
+fn a_change_to_a_crate_qualified_type_is_reported_beside_a_local_type_of_one_name() {
+    // `Json<shared::Item>`, and the catalog crate has its own `Item`. A
+    // name-only lookup takes the local `Item`, which does not change, and
+    // passes.
+    let report = golden_descriptors("shared_type_identity", 3);
+    assert!(
+        report.contains("reads response field `price_cents`"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_required_field_removed_from_a_nested_type_is_a_break() {
+    let report = golden_descriptors("nested_required_field_removed", 3);
+    assert!(report.contains("needs field `details.color`"), "{report}");
+}
+
+#[test]
+fn a_unit_struct_that_becomes_an_empty_object_breaks_both_windows() {
+    let report = golden_descriptors("unit_to_empty_object", 1);
+    assert!(
+        report.contains("If the callees ship first (new callees, deployed callers): 1 break(s)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("If the callers ship first (new callers, deployed callees): 1 break(s)"),
+        "{report}"
+    );
+    assert!(report.contains("JSON `null`"), "{report}");
+}
+
+#[test]
+fn an_endpoint_removed_from_its_router_is_a_removed_route() {
+    let report = golden_descriptors("endpoint_removed_from_router", 1);
+    assert!(report.contains("does not serve it"), "{report}");
+    assert!(report.contains("no `routes![…]`"), "{report}");
+}
+
+#[test]
+fn a_user_no_body_dto_that_loses_a_read_field_is_a_break() {
+    let report = golden_descriptors("user_no_body_response", 3);
+    assert!(report.contains("reads response field `token`"), "{report}");
 }
 
 #[test]

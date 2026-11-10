@@ -454,6 +454,60 @@ if the app wants that, or a payload the check can read.
 
 ---
 
+### Wire contracts: the export refuses a field type it cannot compare
+
+**Why:** `autumn contracts check` compared a nested type by its name only, so
+a change inside it was not seen. The export now puts each nested
+`WireShape` type in the bundle. A field type with no descriptor cannot be
+compared, so the export stops rather than approve it by name.
+
+**You are affected only if you run `autumn contracts export` or
+`autumn contracts check`, and a `WireShape` or `#[event]` field has a type
+that is not a `WireShape` type and not a known leaf.** Known leaves are
+primitives, `String`, standard containers, `serde_json::Value`, `Uuid`,
+`chrono` and `time` types, `Decimal`, `Url`, and similar. An enum field is
+the usual case. The build does not change.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    pub id: String,
+    pub status: Status,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    pub id: String,
+    #[wire(opaque)]
+    pub status: Status,
+}
+```
+
+`#[wire(opaque)]` compares the field by its type name, as before. For a
+struct, derive `WireShape` on it instead, so the check compares its fields.
+
+The export also writes bundle format 3. An older CLI refuses it. Upgrade the
+CLI on every job that reads the bundle. This CLI still reads formats 1 and 2.
+
+A bare type name that two reachable crates define now stops the export.
+Write the full path in the handler signature, for example
+`Json<shared::Item>` or `Json<crate::dto::Item>`.
+
+Type descriptor files now hold the module in their name. Delete
+`target/autumn-contracts` once after the upgrade, so an old file does not
+change a build message.
+
+**Automation:** `manual` — only the app knows if a type should get a shape
+or stay opaque.
+
+---
+
 ### State: `AppState` getters are no longer `const fn`
 
 **Why:** `AppState` holds its fields behind one `Arc`, so a clone is one

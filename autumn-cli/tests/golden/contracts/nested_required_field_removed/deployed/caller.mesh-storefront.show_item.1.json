@@ -1,0 +1,14 @@
+{
+  "krate": "mesh-storefront",
+  "function": "show_item",
+  "calls": [
+    {
+      "client": "CatalogClient",
+      "method": "get_item",
+      "reads": [
+        "details"
+      ],
+      "writes": null
+    }
+  ]
+}

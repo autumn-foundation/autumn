@@ -13,6 +13,13 @@
 
 use serde::{Deserialize, Serialize};
 
+mod resolve;
+
+pub use resolve::{
+    Crates, FRAMEWORK_CRATE, NO_BODY, Resolved, Scope, crate_root, is_known_leaf, module_of_file,
+    resolve_type, type_id, type_paths,
+};
+
 /// One field of a request or response type, as serde treats it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WireFieldDescriptor {
@@ -33,6 +40,14 @@ pub struct WireFieldDescriptor {
     /// non-breaking field rename — as the compatible change it is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
+    /// `#[wire(opaque)]`: the check compares this field by its type name
+    /// only, and does not look for a shape of that type.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opaque: bool,
+    /// The ids of the `WireShape` types that this field's type names, in
+    /// source order. The export fills them in. See [`type_id`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested: Vec<String>,
 }
 
 /// The serde-visible shape of one request or response type.
@@ -50,6 +65,11 @@ pub struct WireTypeDescriptor {
     /// caller's extra key starts being rejected — so the artifact records it.
     #[serde(default)]
     pub closed: bool,
+    /// A unit struct (`struct Empty;`). serde writes it as JSON `null`, not
+    /// as an object. Its field sets are empty, as for `struct Empty {}`, so
+    /// this flag tells the two apart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unit: bool,
 }
 
 impl WireTypeDescriptor {
@@ -100,6 +120,19 @@ pub struct EndpointDescriptor {
     /// Whether the response body is a JSON array of `response_type`.
     #[serde(default)]
     pub response_list: bool,
+    /// The handler function's name. `routes![…]` names the handler, not the
+    /// endpoint, so the export joins the two by it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handler: String,
+    /// The module of the handler's source file. See [`module_of_file`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub module: String,
+    /// The request type's path as written, for example `shared::NewItem`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_path: String,
+    /// The response type's path as written, for example `shared::Item`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub response_path: String,
 }
 
 impl EndpointDescriptor {
@@ -117,23 +150,61 @@ impl EndpointDescriptor {
             self.krate, self.service, self.name
         )
     }
+
+    /// The request type's path. A descriptor without a path gives its name.
+    #[must_use]
+    pub fn request_path(&self) -> &str {
+        or_name(&self.request_path, &self.request_type)
+    }
+
+    /// The response type's path. A descriptor without a path gives its name.
+    #[must_use]
+    pub fn response_path(&self) -> &str {
+        or_name(&self.response_path, &self.response_type)
+    }
+
+    /// The handler's name. A descriptor without one gives the endpoint name.
+    #[must_use]
+    pub fn handler(&self) -> &str {
+        or_name(&self.handler, &self.name)
+    }
+}
+
+/// `value`, or `fallback` when `value` is empty.
+const fn or_name<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() { fallback } else { value }
 }
 
 /// One DTO's shape, as `#[derive(WireShape)]` wrote it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeDescriptor {
     /// The crate the type is defined in.
     pub krate: String,
+    /// The module of the type's source file. See [`module_of_file`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub module: String,
     /// The type's shape.
     #[serde(flatten)]
     pub shape: WireTypeDescriptor,
 }
 
 impl TypeDescriptor {
-    /// The artifact file name for this type, unique within a workspace.
+    /// The artifact file name for this type. Two types with one name in one
+    /// source file share it.
     #[must_use]
     pub fn artifact_file_name(&self) -> String {
-        format!("type.{}.{}.json", self.krate, self.shape.name)
+        let module = if self.module.is_empty() {
+            String::new()
+        } else {
+            format!("{}.", self.module.replace("::", "."))
+        };
+        format!("type.{}.{module}{}.json", self.krate, self.shape.name)
+    }
+
+    /// The type's id: `krate::module::Name`. See [`type_id`].
+    #[must_use]
+    pub fn id(&self) -> String {
+        type_id(&self.krate, &self.module, &self.shape.name)
     }
 }
 
@@ -214,10 +285,13 @@ impl CallerDescriptor {
 }
 
 /// One `#[event]` payload, as the macro wrote it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventDescriptor {
     /// The crate that defines the event.
     pub krate: String,
+    /// The module of the event's source file. See [`module_of_file`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub module: String,
     /// The event type's Rust name.
     pub type_name: String,
     /// The name from `#[event(name = "…")]`, if set.
@@ -300,6 +374,31 @@ impl ListenerDescriptor {
     }
 }
 
+/// One `routes![…]` call: the handlers it registers.
+///
+/// Only the export pass writes it. An `#[endpoint]` that no `routes![…]`
+/// registers is not served.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutesDescriptor {
+    /// The crate that calls `routes![…]`.
+    pub krate: String,
+    /// The module of the call's source file. See [`module_of_file`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub module: String,
+    /// Each handler path as written, for example `get_item` or
+    /// `mesh_catalog::get_item`.
+    pub handlers: Vec<String>,
+}
+
+impl RoutesDescriptor {
+    /// The artifact file name for this call. `key` keeps two calls in one
+    /// crate apart.
+    #[must_use]
+    pub fn artifact_file_name(&self, key: &str) -> String {
+        format!("routes.{}.{key}.json", self.krate)
+    }
+}
+
 /// A stable 64-bit FNV-1a hash, as 16 hex digits.
 ///
 /// Use it for file names that must be the same on every build. The standard
@@ -349,6 +448,7 @@ mod tests {
     fn event(name: Option<&str>, version: u32) -> EventDescriptor {
         EventDescriptor {
             krate: "core-app".to_owned(),
+            module: String::new(),
             type_name: "ContactUpdated".to_owned(),
             name: name.map(str::to_owned),
             version,
