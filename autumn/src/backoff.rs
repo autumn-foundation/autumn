@@ -170,6 +170,10 @@ impl<'a> RetrySchedule<'a> {
                 Some(delay) => tokio::time::sleep(delay).await,
                 None => return Err(err),
             }
+            // The task may resume late; never start a try past the deadline.
+            if deadline.is_some_and(Deadline::is_expired) {
+                return Err(err);
+            }
             attempt = attempt.saturating_add(1);
         }
     }
@@ -390,6 +394,26 @@ mod tests {
         // Sleeps at 0 and 100 ms; a third 100 ms sleep would reach 300 ms.
         assert_eq!(got, Err(2));
         assert_eq!(start.elapsed(), Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_does_not_retry_after_resuming_past_the_deadline() {
+        let entropy = Fixed(100);
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        let mut schedule = plan(&entropy, 5);
+        let retrying = schedule.run(
+            Some(Deadline::after(Duration::from_millis(150))),
+            |n| {
+                tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Err::<(), u32>(n) }
+            },
+            |_| true,
+        );
+        // The clock jumps past the deadline while `run` sleeps 100 ms.
+        let jump = async { tokio::time::advance(Duration::from_secs(1)).await };
+        let (got, ()) = tokio::join!(retrying, jump);
+        assert_eq!(got, Err(0));
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     proptest! {
