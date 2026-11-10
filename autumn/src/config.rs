@@ -6590,7 +6590,7 @@ impl AutumnConfig {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
-            let _ = Self::deserialize(de.clone());
+            let _ = Self::deserialize(value_de::ConfigDe::Schema(de.clone()));
             let mut rejected: Vec<String> = std::mem::take(
                 &mut de
                     .rejected
@@ -15328,7 +15328,7 @@ impl AutumnConfig {
     }
 }
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Visitor};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -15379,413 +15379,56 @@ impl SchemaDeserializer {
     }
 }
 
+/// Each method runs the schema walk of [`value_de::ConfigDe`]. The walk
+/// lives there, so the config types compile one walk, not two.
+macro_rules! schema_walk {
+    ($($method:ident($($arg:ident: $ty:ty),*);)*) => {$(
+        fn $method<V: Visitor<'de>>(
+            self,
+            $($arg: $ty,)*
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            de::Deserializer::$method(value_de::ConfigDe::Schema(self), $($arg,)* visitor)
+                .map_err(value_de::Error::into_value_error)
+        }
+    )*};
+}
+
 impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     type Error = serde::de::value::Error;
 
-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        // `deserialize_any` is inherently ambiguous for a placeholder walker:
-        // untagged SCALAR parsers (e.g. `deserialize_duration`) need a string,
-        // while a visitor that accepts only seq/map (e.g. `JobQueuesConfig` at
-        // `jobs.queues`) rejects a string and aborts the whole remaining walk
-        // (#1890). We can't know which shape a given visitor wants, and serde
-        // seeds can't be retried mid-walk, so we probe with a scalar by default
-        // and let `get_schema_keys` re-run the walk, escalating any REJECTED
-        // path to a map/seq probe on the next pass until none reject.
-        let path = self.path.join(".");
-        let probe = self
-            .any_probe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&path)
-            .copied()
-            .unwrap_or(AnyProbe::Str);
-        let result = match probe {
-            // "0" is a valid non-empty string that also parses as an int/duration,
-            // so untagged string- and number-shaped scalar parsers both accept it.
-            AnyProbe::Str => visitor.visit_str("0"),
-            // Empty map/seq: a seq/map-only visitor accepts it and yields an empty
-            // value, so the walk records the field as a leaf and CONTINUES past it
-            // (we intentionally do NOT descend — e.g. jobs.queues has dynamic keys).
-            AnyProbe::Map => visitor.visit_map(SchemaMapAccess {
-                fields: [].iter(),
-                current_field: None,
-                deserializer: self.clone(),
-            }),
-            AnyProbe::Seq => visitor.visit_seq(SchemaSeqAccess {
-                done: true,
-                deserializer: self.clone(),
-            }),
-        };
-        if result.is_err() {
-            self.rejected
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(path);
-        }
-        result
-    }
-
-    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_bool(false)
-    }
-
-    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i8(0)
-    }
-
-    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i16(0)
-    }
-
-    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i32(0)
-    }
-
-    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i64(0)
-    }
-
-    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u8(0)
-    }
-
-    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u16(0)
-    }
-
-    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u32(0)
-    }
-
-    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u64(0)
-    }
-
-    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_f32(0.0)
-    }
-
-    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_f64(0.0)
-    }
-
-    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_char('\0')
-    }
-
-    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_str("")
-    }
-
-    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_string(String::new())
-    }
-
-    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_bytes(&[])
-    }
-
-    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_byte_buf(Vec::new())
-    }
-
-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_some(self)
-    }
-
-    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn deserialize_unit_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn deserialize_newtype_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_newtype_struct(self)
-    }
-
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_seq(SchemaSeqAccess {
-            done: false,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_tuple_struct<V>(
-        self,
-        _name: &'static str,
-        _len: usize,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_map(SchemaMapAccess {
-            fields: [].iter(),
-            current_field: None,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_struct<V>(
-        self,
-        _name: &'static str,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let path_str = self.path.join(".");
-        {
-            let mut schema = self.schema.lock().unwrap();
-            schema.insert(path_str, fields.iter().map(|&s| s.to_string()).collect());
-        }
-
-        visitor.visit_map(SchemaMapAccess {
-            fields: fields.iter(),
-            current_field: None,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_enum<V>(
-        self,
-        _name: &'static str,
-        variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        // Feed the FIRST declared variant name (not `""`) so serde's derived
-        // variant-identifier visitor accepts it. An empty tag is an "unknown
-        // variant" error that aborts the ENTIRE remaining schema traversal, so a
-        // single enum field (e.g. `server.tls.acme.directory`) would drop every
-        // sibling/subsequent section (`database`, …) from the derived schema —
-        // silently disabling the strict unknown-key validator for them. The enum
-        // is still treated as an opaque leaf: every `SchemaEnumAccess` variant
-        // arm resolves to `visit_unit` without recursing.
-        visitor.visit_enum(SchemaEnumAccess {
-            variant: variants.first().copied().unwrap_or_default(),
-        })
-    }
-
-    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_str("")
-    }
-
-    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-}
-
-struct SchemaSeqAccess {
-    done: bool,
-    deserializer: SchemaDeserializer,
-}
-
-impl<'de> SeqAccess<'de> for SchemaSeqAccess {
-    type Error = serde::de::value::Error;
-
-    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
-    where
-        T: DeserializeSeed<'de>,
-    {
-        if self.done {
-            Ok(None)
-        } else {
-            self.done = true;
-            seed.deserialize(self.deserializer.clone()).map(Some)
-        }
-    }
-}
-
-struct SchemaMapAccess {
-    fields: std::slice::Iter<'static, &'static str>,
-    current_field: Option<&'static str>,
-    deserializer: SchemaDeserializer,
-}
-
-impl<'de> MapAccess<'de> for SchemaMapAccess {
-    type Error = serde::de::value::Error;
-
-    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
-    where
-        K: DeserializeSeed<'de>,
-    {
-        if let Some(&field) = self.fields.next() {
-            self.current_field = Some(field);
-            seed.deserialize(de::value::StrDeserializer::new(field))
-                .map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
-    where
-        V: DeserializeSeed<'de>,
-    {
-        let field = self.current_field.take().unwrap();
-        let mut new_path = self.deserializer.path.clone();
-        new_path.push(field.to_string());
-
-        let nested = SchemaDeserializer {
-            path: new_path,
-            schema: self.deserializer.schema.clone(),
-            any_probe: self.deserializer.any_probe.clone(),
-            rejected: self.deserializer.rejected.clone(),
-        };
-        seed.deserialize(nested)
-    }
-}
-
-struct SchemaEnumAccess {
-    /// The variant name to report to serde's derived variant-identifier visitor.
-    /// Must be a REAL variant name (the first declared one), never `""`, or
-    /// serde returns an "unknown variant" error that aborts schema traversal.
-    variant: &'static str,
-}
-
-impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
-    type Error = serde::de::value::Error;
-    type Variant = Self;
-
-    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
-    where
-        V: de::DeserializeSeed<'de>,
-    {
-        let val = seed.deserialize(de::value::StrDeserializer::new(self.variant))?;
-        Ok((val, self))
-    }
-}
-
-impl<'de> de::VariantAccess<'de> for SchemaEnumAccess {
-    type Error = serde::de::value::Error;
-
-    fn unit_variant(self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
-    where
-        T: de::DeserializeSeed<'de>,
-    {
-        seed.deserialize(SchemaDeserializer::new())
-    }
-
-    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn struct_variant<V>(
-        self,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
+    schema_walk! {
+        deserialize_any();
+        deserialize_bool();
+        deserialize_i8();
+        deserialize_i16();
+        deserialize_i32();
+        deserialize_i64();
+        deserialize_i128();
+        deserialize_u8();
+        deserialize_u16();
+        deserialize_u32();
+        deserialize_u64();
+        deserialize_u128();
+        deserialize_f32();
+        deserialize_f64();
+        deserialize_char();
+        deserialize_str();
+        deserialize_string();
+        deserialize_bytes();
+        deserialize_byte_buf();
+        deserialize_option();
+        deserialize_unit();
+        deserialize_unit_struct(name: &'static str);
+        deserialize_newtype_struct(name: &'static str);
+        deserialize_seq();
+        deserialize_tuple(len: usize);
+        deserialize_tuple_struct(name: &'static str, len: usize);
+        deserialize_map();
+        deserialize_struct(name: &'static str, fields: &'static [&'static str]);
+        deserialize_enum(name: &'static str, variants: &'static [&'static str]);
+        deserialize_identifier();
+        deserialize_ignored_any();
     }
 }
 

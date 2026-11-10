@@ -1,16 +1,24 @@
-//! One serde deserializer for the merged config table (#2795).
+//! One serde deserializer for config (#2795).
 //!
 //! `toml::from_str` makes one `Deserialize` copy of each config struct for
-//! each toml access type: table, array, datetime and span. This deserializer
-//! reads a `toml::Value` through one map type and one sequence type. Each
-//! config struct then compiles once, and `autumn-web` builds faster.
+//! each toml access type: table, array, datetime and span. The schema walk
+//! made one more. [`ConfigDe`] does both jobs through one map type, one
+//! sequence type and one enum type. Each config struct then compiles once,
+//! and `autumn-web` builds faster.
+//!
+//! - [`ConfigDe::Value`] reads a merged `toml::Value`.
+//! - [`ConfigDe::Schema`] walks the config types with placeholder values and
+//!   records the fields of each table. See `AutumnConfig::get_schema_keys`.
 
 use std::fmt;
+use std::sync::PoisonError;
 
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
     Visitor,
 };
+
+use super::{AnyProbe, SchemaDeserializer};
 
 /// The key that toml uses to carry a datetime through serde.
 ///
@@ -22,7 +30,7 @@ const DATETIME_KEY: &str = "$__toml_private_datetime";
 ///
 /// An error names the key path, for example ``in `server.port` ``.
 pub(crate) fn from_value<T: DeserializeOwned>(value: toml::Value) -> Result<T, toml::de::Error> {
-    T::deserialize(ValueDe(value)).map_err(Error::into_toml)
+    T::deserialize(ConfigDe::Value(value)).map_err(Error::into_toml)
 }
 
 /// An error and the key path where it occurred.
@@ -68,6 +76,11 @@ impl Error {
     fn into_toml(self) -> toml::de::Error {
         <toml::de::Error as de::Error>::custom(self)
     }
+
+    /// The error type of the public [`SchemaDeserializer`].
+    pub(crate) fn into_value_error(self) -> de::value::Error {
+        <de::value::Error as de::Error>::custom(self)
+    }
 }
 
 impl fmt::Display for Error {
@@ -91,50 +104,150 @@ impl de::Error for Error {
     }
 }
 
-/// A deserializer over one `toml::Value`.
-struct ValueDe(toml::Value);
+/// The config deserializer. See the module docs.
+pub(crate) enum ConfigDe {
+    /// Read this value.
+    Value(toml::Value),
+    /// Walk the type and record its fields.
+    Schema(SchemaDeserializer),
+}
 
-impl<'de> de::Deserializer<'de> for ValueDe {
+impl ConfigDe {
+    fn key(key: &str) -> Self {
+        Self::Value(toml::Value::String(key.to_owned()))
+    }
+}
+
+/// Read a value. Every type hint comes here, as in toml: the value decides.
+fn read_value<'de, V: Visitor<'de>>(value: toml::Value, visitor: V) -> Result<V::Value, Error> {
+    match value {
+        toml::Value::String(v) => visitor.visit_string(v),
+        toml::Value::Integer(v) => visitor.visit_i64(v),
+        toml::Value::Float(v) => visitor.visit_f64(v),
+        toml::Value::Boolean(v) => visitor.visit_bool(v),
+        toml::Value::Datetime(v) => {
+            let mut table = toml::Table::new();
+            table.insert(DATETIME_KEY.to_owned(), toml::Value::String(v.to_string()));
+            visitor.visit_map(&mut Entries::table(table))
+        }
+        toml::Value::Array(v) => {
+            let len = v.len();
+            let mut access = Items::Array {
+                iter: v.into_iter(),
+                index: 0,
+            };
+            let out = visitor.visit_seq(&mut access)?;
+            if access.is_empty() {
+                Ok(out)
+            } else {
+                Err(de::Error::invalid_length(len, &"fewer elements in array"))
+            }
+        }
+        toml::Value::Table(v) => {
+            let len = v.len();
+            let mut access = Entries::table(v);
+            let out = visitor.visit_map(&mut access)?;
+            if access.is_empty() {
+                Ok(out)
+            } else {
+                Err(de::Error::invalid_length(len, &"fewer elements in map"))
+            }
+        }
+    }
+}
+
+/// Probe a value of unknown shape in the schema walk.
+///
+/// A scalar probe is the default. `get_schema_keys` escalates a path whose
+/// visitor rejects the probe (Str, then Map, then Seq) and walks again.
+fn probe_any<'de, V: Visitor<'de>>(
+    walk: SchemaDeserializer,
+    visitor: V,
+) -> Result<V::Value, Error> {
+    let path = walk.path.join(".");
+    let probe = walk
+        .any_probe
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&path)
+        .copied()
+        .unwrap_or(AnyProbe::Str);
+    let rejected = walk.rejected.clone();
+    let result = match probe {
+        // "0" is a string, and it also parses as an integer or a duration.
+        AnyProbe::Str => visitor.visit_str("0"),
+        // An empty map or sequence. The field is a leaf, and the walk goes on.
+        AnyProbe::Map => visitor.visit_map(&mut Entries::fields(&[], walk)),
+        AnyProbe::Seq => visitor.visit_seq(&mut Items::Probe { done: true, walk }),
+    };
+    if result.is_err() {
+        rejected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path);
+    }
+    result
+}
+
+/// One `deserialize_*` method: a value reads itself, the walk gives `$probe`.
+macro_rules! hinted {
+    ($($method:ident => |$visitor:ident| $probe:expr;)*) => {$(
+        fn $method<V: Visitor<'de>>(self, $visitor: V) -> Result<V::Value, Error> {
+            match self {
+                Self::Value(value) => read_value(value, $visitor),
+                Self::Schema(_) => $probe,
+            }
+        }
+    )*};
+}
+
+impl<'de> de::Deserializer<'de> for ConfigDe {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        match self.0 {
-            toml::Value::String(v) => visitor.visit_string(v),
-            toml::Value::Integer(v) => visitor.visit_i64(v),
-            toml::Value::Float(v) => visitor.visit_f64(v),
-            toml::Value::Boolean(v) => visitor.visit_bool(v),
-            toml::Value::Datetime(v) => {
-                let mut table = toml::Table::new();
-                table.insert(DATETIME_KEY.to_owned(), toml::Value::String(v.to_string()));
-                // `&mut`, as for a table: one map type for every visitor.
-                visitor.visit_map(&mut TableAccess::new(table))
-            }
-            toml::Value::Array(v) => {
-                let len = v.len();
-                let mut access = ArrayAccess::new(v);
-                let out = visitor.visit_seq(&mut access)?;
-                if access.iter.len() == 0 {
-                    Ok(out)
-                } else {
-                    Err(de::Error::invalid_length(len, &"fewer elements in array"))
-                }
-            }
-            toml::Value::Table(v) => {
-                let len = v.len();
-                let mut access = TableAccess::new(v);
-                let out = visitor.visit_map(&mut access)?;
-                if access.iter.len() == 0 {
-                    Ok(out)
-                } else {
-                    Err(de::Error::invalid_length(len, &"fewer elements in map"))
-                }
-            }
+        match self {
+            Self::Value(value) => read_value(value, visitor),
+            Self::Schema(walk) => probe_any(walk, visitor),
         }
+    }
+
+    hinted! {
+        deserialize_bool => |visitor| visitor.visit_bool(false);
+        deserialize_i8 => |visitor| visitor.visit_i8(0);
+        deserialize_i16 => |visitor| visitor.visit_i16(0);
+        deserialize_i32 => |visitor| visitor.visit_i32(0);
+        deserialize_i64 => |visitor| visitor.visit_i64(0);
+        deserialize_i128 => |visitor| visitor.visit_i128(0);
+        deserialize_u8 => |visitor| visitor.visit_u8(0);
+        deserialize_u16 => |visitor| visitor.visit_u16(0);
+        deserialize_u32 => |visitor| visitor.visit_u32(0);
+        deserialize_u64 => |visitor| visitor.visit_u64(0);
+        deserialize_u128 => |visitor| visitor.visit_u128(0);
+        deserialize_f32 => |visitor| visitor.visit_f32(0.0);
+        deserialize_f64 => |visitor| visitor.visit_f64(0.0);
+        deserialize_char => |visitor| visitor.visit_char('\0');
+        deserialize_str => |visitor| visitor.visit_str("");
+        deserialize_string => |visitor| visitor.visit_string(String::new());
+        deserialize_bytes => |visitor| visitor.visit_bytes(&[]);
+        deserialize_byte_buf => |visitor| visitor.visit_byte_buf(Vec::new());
+        deserialize_unit => |visitor| visitor.visit_unit();
+        deserialize_identifier => |visitor| visitor.visit_str("");
     }
 
     // A present value is `Some`. A missing key is `None`, as in toml.
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         visitor.visit_some(self)
+    }
+
+    fn deserialize_unit_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        match self {
+            Self::Value(value) => read_value(value, visitor),
+            Self::Schema(_) => visitor.visit_unit(),
+        }
     }
 
     fn deserialize_newtype_struct<V: Visitor<'de>>(
@@ -145,18 +258,69 @@ impl<'de> de::Deserializer<'de> for ValueDe {
         visitor.visit_newtype_struct(self)
     }
 
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        match self {
+            Self::Value(value) => read_value(value, visitor),
+            Self::Schema(walk) => visitor.visit_seq(&mut Items::Probe { done: false, walk }),
+        }
+    }
+
+    fn deserialize_tuple<V: Visitor<'de>>(
+        self,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_tuple_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        match self {
+            Self::Value(value) => read_value(value, visitor),
+            Self::Schema(walk) => visitor.visit_map(&mut Entries::fields(&[], walk)),
+        }
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        match self {
+            Self::Value(value) => read_value(value, visitor),
+            Self::Schema(walk) => {
+                walk.schema
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(
+                        walk.path.join("."),
+                        fields.iter().map(|&s| s.to_owned()).collect(),
+                    );
+                visitor.visit_map(&mut Entries::fields(fields, walk))
+            }
+        }
+    }
+
     fn deserialize_enum<V: Visitor<'de>>(
         self,
         _name: &'static str,
-        _variants: &'static [&'static str],
+        variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        match self.0 {
-            toml::Value::String(variant) => visitor.visit_enum(Variant {
-                name: variant,
-                value: None,
-            }),
-            toml::Value::Table(table) => {
+        match self {
+            Self::Value(toml::Value::String(name)) => {
+                visitor.visit_enum(Variant::Value { name, value: None })
+            }
+            Self::Value(toml::Value::Table(table)) => {
                 if table.len() != 1 {
                     return Err(de::Error::custom(format!(
                         "wanted exactly 1 element, found {} elements",
@@ -168,14 +332,20 @@ impl<'de> de::Deserializer<'de> for ValueDe {
                         "wanted exactly 1 element, found 0 elements",
                     ));
                 };
-                visitor.visit_enum(Variant {
+                visitor.visit_enum(Variant::Value {
                     name,
                     value: Some(value),
                 })
             }
-            _ => Err(de::Error::invalid_type(
+            Self::Value(_) => Err(de::Error::invalid_type(
                 de::Unexpected::UnitVariant,
                 &"string only",
+            )),
+            // The first real variant name. An empty name is an unknown
+            // variant, and that error stops the walk for every later
+            // section. The walk does not go into the variant.
+            Self::Schema(_) => visitor.visit_enum(Variant::Schema(
+                variants.first().copied().unwrap_or_default(),
             )),
         }
     }
@@ -184,101 +354,172 @@ impl<'de> de::Deserializer<'de> for ValueDe {
         drop(self);
         visitor.visit_unit()
     }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf unit unit_struct seq tuple tuple_struct map struct
-        identifier
-    }
 }
 
-/// Map access over a table. A datetime uses it too, as a one-entry table.
-struct TableAccess {
-    iter: toml::map::IntoIter<String, toml::Value>,
-    value: Option<(String, toml::Value)>,
+/// Map access: the entries of a table, or the fields of a walked struct.
+/// A datetime is a one-entry table.
+enum Entries {
+    Table {
+        iter: toml::map::IntoIter<String, toml::Value>,
+        value: Option<(String, toml::Value)>,
+    },
+    Fields {
+        fields: std::slice::Iter<'static, &'static str>,
+        current: Option<&'static str>,
+        walk: SchemaDeserializer,
+    },
 }
 
-impl TableAccess {
-    fn new(table: toml::Table) -> Self {
-        Self {
+impl Entries {
+    fn table(table: toml::Table) -> Self {
+        Self::Table {
             iter: table.into_iter(),
             value: None,
         }
     }
+
+    fn fields(fields: &'static [&'static str], walk: SchemaDeserializer) -> Self {
+        Self::Fields {
+            fields: fields.iter(),
+            current: None,
+            walk,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Table { iter, .. } => iter.len() == 0,
+            Self::Fields { fields, .. } => fields.len() == 0,
+        }
+    }
 }
 
-impl<'de> MapAccess<'de> for TableAccess {
+impl<'de> MapAccess<'de> for Entries {
     type Error = Error;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, Error> {
-        let Some((key, value)) = self.iter.next() else {
-            return Ok(None);
-        };
-        // The key goes through the value deserializer, so field-name enums
-        // compile once. A key error names the key itself, so the path stops
-        // at the table.
-        let out = seed.deserialize(ValueDe(toml::Value::String(key.clone())))?;
-        self.value = Some((key, value));
-        Ok(Some(out))
+        match self {
+            Self::Table { iter, value } => {
+                let Some((key, next)) = iter.next() else {
+                    return Ok(None);
+                };
+                // A key error names the key itself, so the path stops at the
+                // table.
+                let out = seed.deserialize(ConfigDe::key(&key))?;
+                *value = Some((key, next));
+                Ok(Some(out))
+            }
+            Self::Fields {
+                fields, current, ..
+            } => {
+                let Some(&field) = fields.next() else {
+                    return Ok(None);
+                };
+                *current = Some(field);
+                seed.deserialize(ConfigDe::key(field)).map(Some)
+            }
+        }
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
-        let Some((key, value)) = self.value.take() else {
-            return Err(de::Error::custom("value is missing"));
-        };
-        seed.deserialize(ValueDe(value))
-            .map_err(|e| e.at(Segment::Key(key)))
+        match self {
+            Self::Table { value, .. } => {
+                let Some((key, next)) = value.take() else {
+                    return Err(de::Error::custom("value is missing"));
+                };
+                seed.deserialize(ConfigDe::Value(next))
+                    .map_err(|e| e.at(Segment::Key(key)))
+            }
+            Self::Fields { current, walk, .. } => {
+                let Some(field) = current.take() else {
+                    return Err(de::Error::custom("value is missing"));
+                };
+                let mut path = walk.path.clone();
+                path.push(field.to_owned());
+                seed.deserialize(ConfigDe::Schema(SchemaDeserializer {
+                    path,
+                    ..walk.clone()
+                }))
+            }
+        }
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.iter.len())
-    }
-}
-
-/// Sequence access over an array.
-struct ArrayAccess {
-    iter: std::vec::IntoIter<toml::Value>,
-    index: usize,
-}
-
-impl ArrayAccess {
-    fn new(array: toml::value::Array) -> Self {
-        Self {
-            iter: array.into_iter(),
-            index: 0,
+        match self {
+            Self::Table { iter, .. } => Some(iter.len()),
+            Self::Fields { fields, .. } => Some(fields.len()),
         }
     }
 }
 
-impl<'de> SeqAccess<'de> for ArrayAccess {
+/// Sequence access: the items of an array, or one probe item in the walk.
+enum Items {
+    Array {
+        iter: std::vec::IntoIter<toml::Value>,
+        index: usize,
+    },
+    Probe {
+        done: bool,
+        walk: SchemaDeserializer,
+    },
+}
+
+impl Items {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Array { iter, .. } => iter.len() == 0,
+            Self::Probe { done, .. } => *done,
+        }
+    }
+}
+
+impl<'de> SeqAccess<'de> for Items {
     type Error = Error;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, Error> {
-        let Some(value) = self.iter.next() else {
-            return Ok(None);
-        };
-        let index = self.index;
-        self.index = index.saturating_add(1);
-        seed.deserialize(ValueDe(value))
-            .map(Some)
-            .map_err(|e| e.at(Segment::Index(index)))
+        match self {
+            Self::Array { iter, index } => {
+                let Some(value) = iter.next() else {
+                    return Ok(None);
+                };
+                let at = *index;
+                *index = at.saturating_add(1);
+                seed.deserialize(ConfigDe::Value(value))
+                    .map(Some)
+                    .map_err(|e| e.at(Segment::Index(at)))
+            }
+            Self::Probe { done, walk } => {
+                if *done {
+                    return Ok(None);
+                }
+                *done = true;
+                seed.deserialize(ConfigDe::Schema(walk.clone())).map(Some)
+            }
+        }
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.iter.len())
+        match self {
+            Self::Array { iter, .. } => Some(iter.len()),
+            Self::Probe { done, .. } => Some(usize::from(!*done)),
+        }
     }
 }
 
-/// Enum access for a variant name and an optional payload.
-struct Variant {
-    name: String,
-    value: Option<toml::Value>,
+/// Enum access: a variant name and its payload, or a walked enum.
+enum Variant {
+    Value {
+        name: String,
+        value: Option<toml::Value>,
+    },
+    /// The walk reports this variant and does not go into it.
+    Schema(&'static str),
 }
 
 impl<'de> EnumAccess<'de> for Variant {
@@ -286,7 +527,10 @@ impl<'de> EnumAccess<'de> for Variant {
     type Variant = Self;
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self), Error> {
-        let name = seed.deserialize(ValueDe(toml::Value::String(self.name.clone())))?;
+        let name = match &self {
+            Self::Value { name, .. } => seed.deserialize(ConfigDe::key(name))?,
+            Self::Schema(name) => seed.deserialize(ConfigDe::key(name))?,
+        };
         Ok((name, self))
     }
 }
@@ -295,39 +539,38 @@ impl<'de> VariantAccess<'de> for Variant {
     type Error = Error;
 
     fn unit_variant(self) -> Result<(), Error> {
-        match self.value {
-            None => Ok(()),
-            Some(toml::Value::Table(table)) if table.is_empty() => Ok(()),
-            Some(_) => {
+        match self {
+            Self::Value { value: None, .. } | Self::Schema(_) => Ok(()),
+            Self::Value {
+                value: Some(toml::Value::Table(table)),
+                ..
+            } if table.is_empty() => Ok(()),
+            Self::Value { name, .. } => {
                 let err: Error = de::Error::invalid_type(de::Unexpected::Map, &"unit variant");
-                Err(err.at(Segment::Key(self.name)))
+                Err(err.at(Segment::Key(name)))
             }
         }
     }
 
     fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
-        let Variant { name, value } = self;
-        match value {
-            Some(value) => seed
-                .deserialize(ValueDe(value))
+        match self {
+            Self::Value {
+                name,
+                value: Some(value),
+            } => seed
+                .deserialize(ConfigDe::Value(value))
                 .map_err(|e| e.at(Segment::Key(name))),
-            None => Err(de::Error::invalid_type(
+            Self::Value { value: None, .. } => Err(de::Error::invalid_type(
                 de::Unexpected::UnitVariant,
                 &"newtype variant",
             )),
+            // A fresh walk: the payload's fields are not recorded.
+            Self::Schema(_) => seed.deserialize(ConfigDe::Schema(SchemaDeserializer::new())),
         }
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
-        let Variant { name, value } = self;
-        match value {
-            Some(value) => de::Deserializer::deserialize_any(ValueDe(value), visitor)
-                .map_err(|e| e.at(Segment::Key(name))),
-            None => Err(de::Error::invalid_type(
-                de::Unexpected::UnitVariant,
-                &"tuple variant",
-            )),
-        }
+        self.compound_variant(visitor, "tuple variant")
     }
 
     fn struct_variant<V: Visitor<'de>>(
@@ -335,14 +578,26 @@ impl<'de> VariantAccess<'de> for Variant {
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        let Variant { name, value } = self;
-        match value {
-            Some(value) => de::Deserializer::deserialize_any(ValueDe(value), visitor)
-                .map_err(|e| e.at(Segment::Key(name))),
-            None => Err(de::Error::invalid_type(
+        self.compound_variant(visitor, "struct variant")
+    }
+}
+
+impl Variant {
+    fn compound_variant<'de, V: Visitor<'de>>(
+        self,
+        visitor: V,
+        expected: &'static str,
+    ) -> Result<V::Value, Error> {
+        match self {
+            Self::Value {
+                name,
+                value: Some(value),
+            } => read_value(value, visitor).map_err(|e| e.at(Segment::Key(name))),
+            Self::Value { value: None, .. } => Err(de::Error::invalid_type(
                 de::Unexpected::UnitVariant,
-                &"struct variant",
+                &expected,
             )),
+            Self::Schema(_) => visitor.visit_unit(),
         }
     }
 }
