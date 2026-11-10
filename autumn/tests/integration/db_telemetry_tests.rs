@@ -159,10 +159,10 @@ mod db_telemetry_tests {
     #[ignore = "requires Docker (testcontainers)"]
     async fn test_slow_query_telemetry_logging_and_metrics() {
         let pool = setup().await;
-        // Slow query threshold = 50ms. SELECT pg_sleep(0.1) should trigger slow query metrics/logs.
+        // Slow query threshold = 50ms. The handler runs `SELECT pg_sleep(1)`.
         let client = build_client(pool, None, Duration::from_millis(50));
 
-        // Sleep for 100ms
+        // Sleep for 1s.
         let resp = client.get("/sleep-default").send().await;
         resp.assert_ok();
 

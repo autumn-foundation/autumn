@@ -7682,8 +7682,8 @@ mod tests {
         use axum::routing::{any, get};
         use tower::ServiceExt;
 
-        /// Answers with the context's route key, then the metric key `Db`'s
-        /// drop records under it (composed on the stack, as `Drop` does).
+        /// Answers with the context's route key, then the two metric keys
+        /// `Db`'s drop records: the deprecated query key and the hold key.
         async fn handler(parts: axum::http::request::Parts) -> String {
             let ctx = RequestDbContext::from_parts(&parts, &TestDbState);
             assert!(
@@ -7698,14 +7698,16 @@ mod tests {
             let metrics = crate::middleware::MetricsCollector::new();
             if let Some(key) = &ctx.route_key {
                 metrics.record_db_query_fmt(format_args!("{key} SELECT"), 1);
+                metrics.record_db_connection_hold_fmt(format_args!("{key}"), 1);
             }
-            let metric_key = metrics
-                .snapshot()
-                .db_queries
+            let snapshot = metrics.snapshot();
+            let query_key = snapshot.db_queries.into_keys().next().unwrap_or_default();
+            let hold_key = snapshot
+                .db_connection_holds
                 .into_keys()
                 .next()
                 .unwrap_or_default();
-            format!("{route_key}\n{metric_key}")
+            format!("{route_key}\n{query_key}\n{hold_key}")
         }
 
         async fn body_of(app: Router, request: Request<Body>) -> String {
@@ -7726,7 +7728,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             body_of(app.clone(), request).await,
-            "GET /users/{id}\nGET /users/{id} SELECT"
+            "GET /users/{id}\nGET /users/{id} SELECT\nGET /users/{id}"
         );
 
         // An extension method too long for `Method`'s inline storage writes
@@ -7738,7 +7740,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             body_of(app, request).await,
-            "X-LONG-EXTENSION-VERB /dav/{*rest}\nX-LONG-EXTENSION-VERB /dav/{*rest} SELECT"
+            "X-LONG-EXTENSION-VERB /dav/{*rest}\n\
+             X-LONG-EXTENSION-VERB /dav/{*rest} SELECT\n\
+             X-LONG-EXTENSION-VERB /dav/{*rest}"
         );
 
         let (parts, ()) = Request::builder()
