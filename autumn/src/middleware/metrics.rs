@@ -56,7 +56,7 @@ struct Shard {
     by_route: HashMap<String, RouteMetrics>,
     by_query: HashMap<String, RouteMetrics>,
     /// Connection hold time per route: checkout to release of one `Db`.
-    by_hold: HashMap<String, RouteMetrics>,
+    holds: HashMap<String, RouteMetrics>,
 }
 
 /// The database series a sample goes in.
@@ -630,7 +630,7 @@ impl MetricsCollector {
         {
             let map = match series {
                 DbSeries::Query => &mut shard.by_query,
-                DbSeries::Hold => &mut shard.by_hold,
+                DbSeries::Hold => &mut shard.holds,
             };
             // Probe by borrow first: every sample after a key's first sighting
             // finds its entry without building an owned key just to drop it.
@@ -737,7 +737,7 @@ impl MetricsCollector {
                 for (k, v) in &shard.by_query {
                     db_queries.insert(k.clone(), DbQueryMetric::of(v));
                 }
-                for (k, v) in &shard.by_hold {
+                for (k, v) in &shard.holds {
                     db_connection_holds.insert(k.clone(), DbQueryMetric::of(v));
                 }
             }
@@ -1424,7 +1424,7 @@ mod tests {
                 .expect("shard_index always yields an in-bounds shard");
             let mut shard = lock.write().expect("shard lock is not poisoned");
             shard
-                .by_hold
+                .holds
                 .get_mut("GET /held")
                 .expect("the hold was just recorded")
                 .count = u64::MAX;
