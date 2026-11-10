@@ -612,11 +612,11 @@ impl MetricsCollector {
         self.record_db_series(DbSeries::Query, key, latency_ms);
     }
 
-    /// Record how long one request held a database connection.
+    /// Record how long one `Db` held its database connection.
     ///
     /// The key is the route, for example `"POST /census"`. The time is from
     /// checkout to release. It includes all statements and all other work in
-    /// the hold. It is not a query time, so it goes in
+    /// the hold. It is not a query time. It goes in
     /// [`MetricsSnapshot::db_connection_holds`], not in `db_queries`.
     pub fn record_db_connection_hold(&self, route: &str, held_ms: u64) {
         self.record_db_series(DbSeries::Hold, route, held_ms);
@@ -654,9 +654,10 @@ impl MetricsCollector {
         self.record_db_series_fmt(DbSeries::Query, key, latency_ms);
     }
 
-    /// [`record_db_connection_hold`](Self::record_db_connection_hold) under
-    /// the text `route` formats to. It does not allocate for a route of 256
-    /// bytes or less.
+    /// Record a hold, as
+    /// [`record_db_connection_hold`](Self::record_db_connection_hold) does,
+    /// under the formatted `route`. A route of 256 bytes or less is built on
+    /// the stack.
     #[cfg(feature = "db")]
     pub(crate) fn record_db_connection_hold_fmt(
         &self,
@@ -803,9 +804,13 @@ impl Default for MetricsCollector {
 /// `db_connection_holds`.
 #[derive(Serialize, Clone, Debug)]
 pub struct DbQueryMetric {
+    /// All samples since the process started.
     pub count: u64,
+    /// Median, in milliseconds, of the most recent 10 000 samples.
     pub p50_ms: u64,
+    /// 95th percentile, in milliseconds, of the most recent 10 000 samples.
     pub p95_ms: u64,
+    /// 99th percentile, in milliseconds, of the most recent 10 000 samples.
     pub p99_ms: u64,
 }
 
@@ -822,7 +827,10 @@ impl DbQueryMetric {
 }
 
 /// Serializable metrics snapshot returned by `/actuator/metrics`.
+///
+/// Get one from [`MetricsCollector::snapshot`].
 #[derive(Serialize)]
+#[non_exhaustive]
 pub struct MetricsSnapshot {
     /// HTTP-specific metrics including latency and status codes.
     pub http: HttpMetrics,
@@ -830,11 +838,13 @@ pub struct MetricsSnapshot {
     pub idempotency: IdempotencyMetricsSnapshot,
     /// Database queries tracked.
     ///
+    /// Each sample is one statement that the app times with
+    /// [`run_instrumented`](crate::db::run_instrumented).
+    ///
     /// Deprecated: the `Db` extractor also writes its connection hold time
     /// under `"<route> SELECT"`. Read
     /// [`db_connection_holds`](Self::db_connection_holds) for the hold. The
-    /// next release stops this write. After that, the key holds only `SELECT`
-    /// statements from `run_instrumented`.
+    /// next release stops the `Db` extractor writing it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub db_queries: HashMap<String, DbQueryMetric>,
     /// Connection hold time per route.
@@ -842,8 +852,8 @@ pub struct MetricsSnapshot {
     /// The key is the route, for example `"POST /census"`. A `Db` from a
     /// shard adds the shard, for example `"GET /notes shard=shard0"`.
     ///
-    /// One sample for each `Db` the route held: the time from checkout to
-    /// release. It includes all statements and all other work in the hold.
+    /// One sample for each `Db` that a request on the route held: the time
+    /// from checkout to release. It includes all statements and all other work in the hold.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub db_connection_holds: HashMap<String, DbQueryMetric>,
     /// Read-your-own-writes: number of replica reads redirected to the primary

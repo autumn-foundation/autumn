@@ -4746,12 +4746,12 @@ impl Drop for Db {
             let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
             // The hold is not a query. Record it under the route alone.
-            // Both keys are composed on the stack: this runs once per request
-            // that extracts `Db`.
+            // Compose both keys on the stack. This code runs once for each
+            // `Db`.
             metrics.record_db_connection_hold_fmt(format_args!("{route_key}"), elapsed_ms);
-            // Deprecated: the hold under the old `"<route> SELECT"` query key.
-            // Keep it for one release so dashboards can move to
-            // `db_connection_holds`, then remove this call.
+            // Deprecated: the old `"<route> SELECT"` query key. It records the
+            // same sample. Remove this call in the next release. Until then,
+            // dashboards can move to `db_connection_holds`.
             metrics.record_db_query_fmt(format_args!("{route_key} SELECT"), elapsed_ms);
             // Deliberately not recorded into the Server-Timing per-request
             // accumulator. `elapsed` here is the whole connection
@@ -5014,7 +5014,7 @@ mod tests {
         assert_eq!(snap.db_queries.len(), 1, "{:?}", snap.db_queries);
     }
 
-    /// A short hold is recorded too. Only the log has a threshold.
+    /// The metric records a short hold too. Only the log uses the threshold.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sqlite_short_connection_hold_is_recorded() {

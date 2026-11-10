@@ -29,11 +29,11 @@
 //! this gate run against the code it replaced: an owned probe key per sample,
 //! plus `format!`'s allocate-then-grow for the composed key:
 //!
-//! | workload                        | before | after |
-//! |---------------------------------|--------|-------|
-//! | `record_db_query`, seen key     |      1 |     0 |
-//! | `run_instrumented`, seen route  |      3 |     0 |
-//! | `record_db_connection_hold`, seen route | new | 0 |
+//! | workload                                | before | after |
+//! |-----------------------------------------|--------|-------|
+//! | `record_db_query`, seen key             |      1 |     0 |
+//! | `run_instrumented`, seen route          |      3 |     0 |
+//! | `record_db_connection_hold`, seen route |      — |     0 |
 //!
 //! `Db::drop` calls the crate-private `_fmt` form of the hold record. That
 //! form shares `record_db_series_fmt` with `run_instrumented`, so the

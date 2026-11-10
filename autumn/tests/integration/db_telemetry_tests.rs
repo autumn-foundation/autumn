@@ -184,9 +184,8 @@ mod db_telemetry_tests {
                     found_sleep,
                     "Expected a metrics entry for GET /sleep-default"
                 );
-                // The exact key `Db`'s drop records: method, route template and
-                // verb, composed without an intermediate `String`.
-                // Deprecated: the hold under the old query key, kept one release.
+                // `Db`'s drop still records the deprecated key: the route, then
+                // `SELECT`. It stays for one release.
                 assert!(
                     queries.get("GET /sleep-default SELECT").is_some(),
                     "expected the deprecated Db key `GET /sleep-default SELECT`, got {queries}"
