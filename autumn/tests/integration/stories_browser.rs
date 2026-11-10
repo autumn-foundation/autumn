@@ -111,9 +111,10 @@ async fn seeded_busy_indicators() -> Markup {
         span id="next-status" role="status" {}
         span id="next-ind" class="ind" data-autumn-busy {}
         span id="next-decoy" class="ind" data-autumn-busy {}
-        // A keyword part and a CSS part with a comma in `:is()`.
+        // A keyword part, a CSS part with a comma in `:is()`, and a last
+        // comma.
         button type="button" id="mix-go" hx-get=(DEMO_SAVE)
-            hx-target="#mix-status" hx-indicator="next .mix, :is(#mix-a, #mix-b)" { "Mixed" }
+            hx-target="#mix-status" hx-indicator="next .mix, :is(#mix-a, #mix-b)," { "Mixed" }
         span id="mix-status" role="status" {}
         span id="mix-next" class="mix" data-autumn-busy {}
         span id="mix-a" data-autumn-busy {}
@@ -349,7 +350,8 @@ async fn select_scheme(page: &Page, scheme: &str) {
     // axe must also not read a color in the middle of an animation. Finish
     // an entrance (a toast fades in). Hold an animation that waits for a
     // delay at its start (a toast fades out after its dwell). A slow runner
-    // can reach that delay. An endless animation (a spinner) stays.
+    // can reach that delay. A held animation with a backwards fill shows its
+    // first keyframe, so finish it. An endless animation (a spinner) stays.
     assert!(
         eval_bool(
             page,
@@ -357,7 +359,8 @@ async fn select_scheme(page: &Page, scheme: &str) {
                if (!(a instanceof CSSAnimation)) return; \
                const t = a.effect.getTiming(); \
                if (t.iterations === Infinity) return; \
-               if (t.delay > 0) { a.pause(); a.currentTime = 0; } else a.finish(); }); \
+               if (t.delay > 0 && !/backwards|both/.test(t.fill)) { a.pause(); a.currentTime = 0; } \
+               else a.finish(); }); \
              return true; })()",
         )
         .await,

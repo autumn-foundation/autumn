@@ -1368,7 +1368,7 @@
   // and indicators of this request, and its target. The indicators are the
   // inherited hx-indicator, else the requester.
   var busyCount = new WeakMap();
-  var REL = /^(closest|find|next|previous)(\s|$)/;
+  var REL = /^(?:(closest|find) |(next|previous)(?: |$))/;
   // `next X` (pos 2) or `previous X` (pos 4) as htmx scans: the first match
   // after `elt`, or the last before it. Not a descendant or an ancestor.
   function scan(elt, sel, pos) {
@@ -1386,8 +1386,9 @@
     var out = [], css = [];
     try {
       sel.split(',').forEach(function (s) {
-        var m = REL.exec(s = s.trim()), k = m && m[1], r = m && s.slice(m[0].length).trim();
-        if (!m) return css.push(s);
+        var m = REL.exec(s = s.trim()), k = m && (m[1] || m[2]), r = m && s.slice(m[0].length).trim();
+        // An empty part (after a last comma) adds nothing, as in htmx.
+        if (!m) return s && css.push(s);
         var one = k === 'closest' ? elt.closest(r) : k === 'find' ? elt.querySelector(r)
           : k === 'next' ? (r ? scan(elt, r, 2) : elt.nextElementSibling)
           : r ? scan(elt, r, 4) : elt.previousElementSibling;
