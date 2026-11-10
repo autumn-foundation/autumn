@@ -1645,7 +1645,7 @@ pub async fn create_invitation(
                 // transaction inserts a fresh pending invitation the cleanup
                 // never saw — accepting that token later repopulates the
                 // organization without an Owner, recreating the exact
-                // invariant cleanup exists to prevent (Codex review finding).
+                // invariant cleanup exists to prevent.
                 ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
                     .select(Organization::as_select())
                     .first(conn)
@@ -1656,8 +1656,7 @@ pub async fn create_invitation(
                 // organization lock is held — the pre-transaction `require_role`
                 // result could be stale: another request (a demotion, a
                 // removal, or this same user's account being deleted) may have
-                // committed while this request waited for the lock above
-                // (Codex review finding).
+                // committed while this request waited for the lock above.
                 let inviter_membership: Option<Membership> = ::autumn_web::maybe_for_update!(
                     memberships::table
                         .filter(memberships::tenant_id.eq(&tenant_id))
@@ -2490,7 +2489,7 @@ async fn members_page(
 
 /// Render the members page body. Every member sees the roster. An `Admin` or
 /// `Owner` also sees the invite form and the pending invitations.
-pub(super) fn members_content(
+fn members_content(
     caller_role: Role,
     memberships: &[Membership],
     pending_invitations: &[Invitation],
@@ -4872,7 +4871,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         for field_error in [
             "email_error: Some(\"Enter a valid email address\")",
             "role_error: Some(\"Unknown role\")",
-            "email_error: Some(\n",
+            "An invitation to this email is already pending for this organization",
         ] {
             assert!(body.contains(field_error), "{field_error} in: {body}");
         }
@@ -4884,9 +4883,8 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         );
         // An Admin who invites an Owner gets 403. The form does not show again.
         assert!(
-            body.contains(
-                "forbidden_msg(\n            \"Only an owner can invite someone as owner\""
-            ),
+            body.contains("forbidden_msg(")
+                && body.contains("Only an owner can invite someone as owner"),
             "{body}"
         );
     }
@@ -4900,10 +4898,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             members.contains("pub(super) struct InviteFormView<'a>"),
             "{members}"
         );
-        assert!(
-            members.contains("pub(super) fn members_content("),
-            "{members}"
-        );
+        assert!(members.contains("fn members_content("), "{members}");
         assert!(
             members.contains("pub(super) async fn redisplay_members("),
             "{members}"
@@ -4952,10 +4947,29 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             .collect()
     }
 
+    /// Example files that the app owns. The generated module has no copy of
+    /// them: the app gets its own auth from `autumn generate auth`.
+    const EXAMPLE_APP_FILES: &[&str] = &["main.rs", "lib.rs", "routes/auth.rs"];
+
+    /// Every `.rs` file under `dir`, as a `/`-separated path from `root`.
+    fn rust_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display())) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(root, &path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path.strip_prefix(root).unwrap();
+                let parts: Vec<_> = rel.iter().map(|p| p.to_string_lossy()).collect();
+                out.push(parts.join("/"));
+            }
+        }
+    }
+
     /// Example functions that the generated module does not have. Each one
-    /// needs the app's own `users` table. The generated module does not own
-    /// that table.
+    /// needs the app's own `users` table or its own page layout. The
+    /// generated module owns neither.
     const EXAMPLE_ONLY_FNS: &[(&str, &str)] = &[
+        ("routes/layout.rs", "layout"),
         ("routes/invitations.rs", "accept_signup_form"),
         (
             "routes/invitations.rs",
@@ -4975,9 +4989,9 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
     ];
 
     /// Make sure that `examples/teams` and the `generate teams` templates
-    /// have the same functions (#3595). Each function in the example files
-    /// below must have a template function with the same name, or an entry
-    /// in [`EXAMPLE_ONLY_FNS`].
+    /// have the same functions (#3595). Each function in an example file
+    /// (except [`EXAMPLE_APP_FILES`]) must have a template function with the
+    /// same name, or an entry in [`EXAMPLE_ONLY_FNS`].
     ///
     /// The test uses all templates together, so a function can be in a
     /// different file. The test does not compare function bodies. The
@@ -5001,33 +5015,33 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         let generated: std::collections::BTreeSet<&str> =
             templates.iter().flat_map(|t| fn_names(t)).collect();
 
+        let mut files = Vec::new();
+        rust_files(&example, &example, &mut files);
+        let checked: Vec<&String> = files
+            .iter()
+            .filter(|f| !EXAMPLE_APP_FILES.contains(&f.as_str()))
+            .collect();
+        assert!(checked.len() >= 9, "{files:?}");
+
         let mut missing = Vec::new();
         let mut stale = Vec::new();
-        for file in [
-            "routes/invitations.rs",
-            "routes/members.rs",
-            "routes/organizations.rs",
-            "routes/mod.rs",
-            "role.rs",
-            "models.rs",
-            "schema.rs",
-            "repositories.rs",
-            "mailers/invitation_mailer.rs",
-        ] {
+        for file in checked {
+            let file = file.as_str();
             let source = fs::read_to_string(example.join(file))
                 .unwrap_or_else(|err| panic!("examples/teams/src/{file}: {err}"));
+            let names = fn_names(&source);
             let allowed: Vec<&str> = EXAMPLE_ONLY_FNS
                 .iter()
                 .filter(|(f, _)| *f == file)
                 .map(|(_, name)| *name)
                 .collect();
-            for name in fn_names(&source) {
+            for &name in &names {
                 if !generated.contains(name) && !allowed.contains(&name) {
                     missing.push(format!("{file}: fn {name}"));
                 }
             }
             for name in allowed {
-                if !source.contains(&format!("fn {name}")) || generated.contains(name) {
+                if !names.contains(name) || generated.contains(name) {
                     stale.push(format!("{file}: fn {name}"));
                 }
             }
