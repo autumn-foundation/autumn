@@ -8,7 +8,7 @@ tables = [
   "notifications",
 ]
 indexes = [
-  "notifications_pkey",
+  "idx_notifications_unread",
 ]
 findings = []
 notes = ""
@@ -20,16 +20,16 @@ function = "autumn_web::notifications::DbNotificationStore::mark_read"
 [plan]
 status = "ok"
 method = "EXPLAIN (GENERIC_PLAN, COSTS OFF)"
-planned_on = "schema mirror of a Postgres 11 test database"
+planned_on = "test database, Postgres 16"
 generic = [
   "Update on notifications",
-  "  ->  Index Scan using notifications_pkey on notifications",
-  "        Index Cond: (id = $3)",
-  "        Filter: ((read_at IS NULL) AND (tenant_id = $2))",
+  "  ->  Index Scan using idx_notifications_unread on notifications",
+  "        Index Cond: ((tenant_id = $2) AND (id = $3))",
+  "        Filter: (read_at IS NULL)",
 ]
 index_forced = [
   "Update on notifications",
-  "  ->  Index Scan using notifications_pkey on notifications",
-  "        Index Cond: (id = $3)",
-  "        Filter: ((read_at IS NULL) AND (tenant_id = $2))",
+  "  ->  Index Scan using idx_notifications_unread on notifications",
+  "        Index Cond: ((tenant_id = $2) AND (id = $3))",
+  "        Filter: (read_at IS NULL)",
 ]
