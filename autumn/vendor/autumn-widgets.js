@@ -1388,20 +1388,38 @@
   // submitter and indicators, and its target. Indicators resolve as htmx
   // does: the inherited hx-indicator, else the requester.
   var busyCount = new WeakMap();
+  var REL = /^(this|closest|find|next|previous)(\s|$)/;
+  // `next X` (pos 2) or `previous X` (pos 4), as htmx scans: the first
+  // match after `elt`, or the last match before it. A descendant or an
+  // ancestor of `elt` does not count.
+  function scan(elt, sel, pos) {
+    var all = Array.from(document.querySelectorAll(sel));
+    if (pos === 4) all.reverse();
+    return all.filter(function (el) { return el.compareDocumentPosition(elt) === pos; })[0];
+  }
   function indicatorsOf(elt) {
     var host = elt.closest('[hx-indicator],[data-hx-indicator]');
     if (!host) return [elt];
     var sel = host.getAttribute('hx-indicator') || host.getAttribute('data-hx-indicator');
     try {
+      var parts = sel.split(',').map(function (s) { return s.trim(); });
       // A plain CSS list stays whole: a comma can sit inside :is() or [a="b, c"].
-      if (!/(^|,)\s*(this|closest |find )/.test(sel)) return Array.from(document.querySelectorAll(sel));
-      return sel.split(',').reduce(function (all, s) {
-        s = s.trim();
-        var one = s === 'this' ? host : s.indexOf('closest ') === 0 ? elt.closest(s.slice(8))
-          : s.indexOf('find ') === 0 ? elt.querySelector(s.slice(5)) : null;
-        return all.concat(one ? [one] : /^(closest|find) /.test(s) ? [] : Array.from(document.querySelectorAll(s)));
+      if (!parts.some(function (s) { return REL.test(s); })) return Array.from(document.querySelectorAll(sel));
+      return parts.reduce(function (all, s) {
+        var m = REL.exec(s);
+        if (!m) return all.concat(Array.from(document.querySelectorAll(s)));
+        var k = m[1], rest = s.slice(m[0].length).trim();
+        var one = k === 'this' ? host : k === 'closest' ? elt.closest(rest)
+          : k === 'find' ? elt.querySelector(rest)
+          : k === 'next' ? (rest ? scan(elt, rest, 2) : elt.nextElementSibling)
+          : rest ? scan(elt, rest, 4) : elt.previousElementSibling;
+        return all.concat(one ? [one] : []);
       }, []);
     } catch (err) { return []; }
+  }
+  function unbusy(el) {
+    el.removeAttribute('aria-busy');
+    el.removeAttribute('data-autumn-busied');
   }
   document.addEventListener('htmx:beforeSend', function (e) {
     var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
@@ -1415,14 +1433,22 @@
     els.forEach(function (el) {
       busyCount.set(el, (busyCount.get(el) || 0) + 1);
       el.setAttribute('aria-busy', 'true');
+      el.setAttribute('data-autumn-busied', '');
     });
     d.xhr.addEventListener('loadend', function () {
       els.forEach(function (el) {
         var n = busyCount.get(el) - 1;
         if (n > 0) return busyCount.set(el, n);
         busyCount.delete(el);
-        el.removeAttribute('aria-busy');
+        unbusy(el);
       });
+    });
+  });
+  // htmx saves the page for history before `loadend`. A restored node
+  // keeps the runtime `aria-busy`, but no request owns it. Remove it.
+  document.addEventListener('htmx:historyRestore', function () {
+    each(document, '[data-autumn-busied]', function (el) {
+      if (!busyCount.has(el)) unbusy(el);
     });
   });
 

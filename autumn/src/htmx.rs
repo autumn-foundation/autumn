@@ -921,6 +921,15 @@ mod tests {
             "setAttribute('aria-busy', 'true')",
             "addEventListener('loadend'",
             "removeAttribute('aria-busy')",
+            // `next` and `previous` resolve as htmx does: the sibling, or
+            // the first match after or before the requester.
+            "nextElementSibling",
+            "previousElementSibling",
+            "compareDocumentPosition(elt)",
+            // A marker on each runtime `aria-busy`. A history restore
+            // removes a marked `aria-busy` that no request owns.
+            "data-autumn-busied",
+            "[data-autumn-busied]",
         ] {
             assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
         }

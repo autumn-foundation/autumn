@@ -60,6 +60,73 @@ async fn seeded_tabs() -> Markup {
     }
 }
 
+/// The slow demo backend of the gallery. It answers "Saved.".
+const DEMO_SAVE: &str = "/_stories/demo/save";
+
+/// A page with htmx and the widget runtime.
+fn busy_page(body: &Markup) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                title { "Busy" }
+                script src=(autumn_web::htmx::HTMX_JS_PATH) defer {}
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
+            }
+            body { main { (body) } }
+        }
+    }
+}
+
+/// `hx-indicator` with `next`, `next X`, `previous` and `previous X`. The
+/// requesters have no `data-autumn-busy`, so only the indicator marks the
+/// request. Each `-decoy` and `-inner` element matches the selector but
+/// htmx does not select it.
+#[get("/seeded/busy-indicators")]
+async fn seeded_busy_indicators() -> Markup {
+    busy_page(&html! {
+        span id="prev-decoy" class="ind" data-autumn-busy {}
+        span id="prev-ind" class="ind" data-autumn-busy {}
+        // An ancestor is before the requester, but htmx skips it.
+        div id="prev-outer" class="ind" data-autumn-busy {
+            button type="button" id="prev-go" hx-get=(DEMO_SAVE)
+                hx-target="#prev-status" hx-indicator="previous .ind" { "Previous" }
+        }
+        span id="prev-status" role="status" {}
+        span id="psib-ind" data-autumn-busy {}
+        button type="button" id="psib-go" hx-get=(DEMO_SAVE)
+            hx-target="#psib-status" hx-indicator="previous" { "Previous sibling" }
+        span id="psib-status" role="status" {}
+        button type="button" id="sib-go" hx-get=(DEMO_SAVE)
+            hx-target="#sib-status" hx-indicator="next" { "Next sibling" }
+        span id="sib-ind" data-autumn-busy {}
+        span id="sib-status" role="status" {}
+        // A descendant is after the requester, but htmx skips it.
+        button type="button" id="next-go" hx-get=(DEMO_SAVE)
+            hx-target="#next-status" hx-indicator="next .ind" {
+            span id="next-inner" class="ind" data-autumn-busy {}
+            "Next"
+        }
+        span id="next-status" role="status" {}
+        span id="next-ind" class="ind" data-autumn-busy {}
+        span id="next-decoy" class="ind" data-autumn-busy {}
+    })
+}
+
+/// A busy button that pushes a URL. `#hist-app` has an `aria-busy` that the
+/// app set.
+#[get("/seeded/busy-history")]
+async fn seeded_busy_history() -> Markup {
+    busy_page(&html! {
+        span id="hist-app" data-autumn-busy aria-busy="true" { "Busy" }
+        button type="button" id="hist-save" data-autumn-busy hx-get=(DEMO_SAVE)
+            hx-target="#hist-status" hx-push-url="/seeded/busy-history?saved=1"
+            hx-indicator="#hist-app, #hist-save" { "Save" }
+        span id="hist-status" role="status" {}
+    })
+}
+
 /// The markup of the Tabs story.
 fn story_tabs() -> Markup {
     let panels = [
@@ -96,7 +163,12 @@ async fn runner() -> SystemTestRunner {
     Box::pin(
         SystemTest::new()
             .state(state)
-            .routes(routes![seeded_axe, seeded_tabs])
+            .routes(routes![
+                seeded_axe,
+                seeded_tabs,
+                seeded_busy_indicators,
+                seeded_busy_history
+            ])
             .build(),
     )
     .await
@@ -1604,5 +1676,136 @@ async fn display_set_indicators_show_only_during_a_request() {
         )
         .await;
     }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// Click `#button` and wait for its request to end. Return the ids that got
+/// `aria-busy="true"` during the request, in sorted order.
+///
+/// A `MutationObserver` records the ids, because the request ends before
+/// the test can read the page.
+async fn busy_ids_during(page: &Page, button: &str, status: &str) -> Vec<String> {
+    assert!(
+        eval_bool(
+            page,
+            "(() => { if (window.__busyObs) window.__busyObs.disconnect(); \
+             window.__busied = []; \
+             window.__busyObs = new MutationObserver(ms => ms.forEach(m => { \
+               if (m.target.getAttribute('aria-busy') === 'true' \
+                 && !window.__busied.includes(m.target.id)) window.__busied.push(m.target.id); })); \
+             window.__busyObs.observe(document.body, \
+               { attributes: true, subtree: true, attributeFilter: ['aria-busy'] }); \
+             return true; })()",
+        )
+        .await,
+        "could not watch the page"
+    );
+    assert!(
+        eval_bool(
+            page,
+            &format!(
+                "(() => {{ const b = document.getElementById({button:?}); \
+                 if (!b) return false; b.click(); return true; }})()"
+            ),
+        )
+        .await,
+        "no #{button}"
+    );
+    wait_for(
+        page,
+        &format!("document.getElementById({status:?}).textContent.includes('Saved.')"),
+    )
+    .await;
+    // The runtime clears its `aria-busy` when the request ends.
+    wait_for(
+        page,
+        "window.__busied.every(id => !document.getElementById(id).hasAttribute('aria-busy'))",
+    )
+    .await;
+    let mut ids: Vec<String> = eval_string(page, "window.__busied.join(',')")
+        .await
+        .split(',')
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `hx-indicator` with `next`, `next X`, `previous` and `previous X`
+/// resolves as htmx does. The first match in document order gets
+/// `aria-busy`, and so does the swap target. A match before (for `next`)
+/// or after (for `previous`) the requester does not. A descendant (for
+/// `next`) or an ancestor (for `previous`) does not.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn busy_next_and_previous_indicators() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/seeded/busy-indicators").await;
+    for (button, status, indicator) in [
+        ("next-go", "next-status", "next-ind"),
+        ("prev-go", "prev-status", "prev-ind"),
+        ("sib-go", "sib-status", "sib-ind"),
+        ("psib-go", "psib-status", "psib-ind"),
+    ] {
+        assert_eq!(
+            busy_ids_during(&page, button, status).await,
+            [indicator, status],
+            "#{button}: wrong busy elements"
+        );
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// htmx saves the page for `hx-push-url` before the request ends, so the
+/// snapshot has the runtime `aria-busy`. After Back, the restored button
+/// and target are not busy, and the next request marks them again. An
+/// `aria-busy` that the app set stays.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn busy_state_does_not_stay_in_a_history_snapshot() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/seeded/busy-history").await;
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { window.__restored = false; \
+             document.addEventListener('htmx:historyRestore', () => { window.__restored = true; }); \
+             return true; })()",
+        )
+        .await,
+        "could not watch the history restore"
+    );
+    assert_eq!(
+        busy_ids_during(&page, "hist-save", "hist-status").await,
+        ["hist-save", "hist-status"],
+        "the first request"
+    );
+    wait_for(&page, "location.search === '?saved=1'").await;
+    assert!(
+        eval_bool(&page, "(() => { history.back(); return true; })()").await,
+        "could not go back"
+    );
+    wait_for(&page, "window.__restored === true").await;
+    let stale = "Array.from(document.querySelectorAll('#hist-save, #hist-status')) \
+                 .filter(e => e.hasAttribute('aria-busy') || e.hasAttribute('data-autumn-busied')) \
+                 .map(e => e.id).join(',')";
+    assert_eq!(
+        eval_string(&page, stale).await,
+        "",
+        "the snapshot kept a runtime aria-busy"
+    );
+    assert_eq!(
+        attr(&page, "#hist-app", "aria-busy").await,
+        "true",
+        "the restore removed the aria-busy of the app"
+    );
+    assert_eq!(
+        busy_ids_during(&page, "hist-save", "hist-status").await,
+        ["hist-save", "hist-status"],
+        "the request after the restore"
+    );
     page.expect_no_console_errors().await.expect("no errors");
 }
