@@ -99,6 +99,64 @@ Postgres and RFC 3339 `TEXT` on SQLite. Each row also has a
 reference-shaped (`{"post": 42}`, not the post body): they are stored
 verbatim per recipient and re-sent on every feed page.
 
+### Indexes
+
+`autumn generate notifications` emits these indexes on Postgres:
+
+| index | columns | serves |
+| --- | --- | --- |
+| `idx_notifications_feed` | `(tenant_id, recipient_id, id)` | the feed page in the default `id` order, and the total count |
+| `idx_notifications_unread` | `(tenant_id, recipient_id, id) WHERE read_at IS NULL` | the unread count and the unread page |
+
+The first page reads about 20 rows. Page `n` reads about `20 × n` rows. The
+length of the history has no effect. On SQLite, `id` is the rowid, so
+`(tenant_id, recipient_id)` already reads in `id` order.
+
+An app with an older generated migration can have
+`idx_notifications_tenant_recipient` on `(tenant_id, recipient_id)`, and no
+`idx_notifications_unread`. To change to the new indexes, add one migration
+for each statement below. A `CONCURRENTLY` statement cannot run in a
+transaction, and Postgres runs all statements of one `up.sql` in one
+transaction. So give each migration a `metadata.toml` with this line:
+
+```toml
+run_in_transaction = false
+```
+
+Then put one statement in each `up.sql`, in this order:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_notifications_feed
+    ON notifications (tenant_id, recipient_id, id);
+```
+
+```sql
+CREATE INDEX CONCURRENTLY idx_notifications_unread
+    ON notifications (tenant_id, recipient_id, id) WHERE read_at IS NULL;
+```
+
+```sql
+DROP INDEX CONCURRENTLY idx_notifications_tenant_recipient;
+```
+
+Do not use `IF NOT EXISTS`. A failed concurrent build can leave an invalid
+index with the same name. The next run must then fail, not skip it. Drop the
+invalid index and run the migration again. See
+[Table lock timeout and retry](migrations.md#table-lock-timeout-and-retry).
+
+The `sort=created_at` order has no index by default, so a page sorts the
+whole history of the recipient. If your app sends `sort=created_at`, add
+this index in one more migration of the same shape. It adds more write cost
+than the feed index:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_notifications_created
+    ON notifications (tenant_id, recipient_id, created_at DESC, id DESC);
+```
+
+The measurements and the write cost are in
+`docs/perf/notifications-feed/README.md`.
+
 To plug in a custom backend, implement `NotificationStore` and register it:
 
 ```rust
