@@ -9,4 +9,6 @@
 - **widgets:** after Back or Forward, a button or target from an
   `hx-push-url` history snapshot is no longer stuck in `aria-busy="true"`.
   The runtime marks its own `aria-busy` with `data-autumn-busied` and removes
-  it on `htmx:historyRestore`. An `aria-busy` that the app set stays.
+  it on `htmx:historyRestore`. A restored element that sends its load request
+  during the restore stays busy until that request ends. An `aria-busy` that
+  the app set stays.

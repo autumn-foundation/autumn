@@ -933,6 +933,10 @@ mod tests {
             "setAttribute('data-autumn-busied', '')",
             "each(document, '[data-autumn-busied]'",
             "if (!busyCount.has(el)) unbusy(el)",
+            // A marked `aria-busy` is the runtime's, also a stale one in a
+            // restored node that sends its load request before the restore
+            // event.
+            "el.hasAttribute('data-autumn-busied') || !el.hasAttribute('aria-busy')",
         ] {
             assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
         }

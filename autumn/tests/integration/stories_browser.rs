@@ -123,15 +123,19 @@ async fn seeded_busy_indicators() -> Markup {
 }
 
 /// A busy button that pushes a URL. `#hist-app` has an `aria-busy` that the
-/// app set.
+/// app set. `#hist-load` sends a request on load, so it sends one again when
+/// htmx restores it from the snapshot.
 #[get("/seeded/busy-history")]
 async fn seeded_busy_history() -> Markup {
     busy_page(&html! {
         span id="hist-app" data-autumn-busy aria-busy="true" { "Busy" }
         button type="button" id="hist-save" data-autumn-busy hx-get=(DEMO_SAVE)
             hx-target="#hist-status" hx-push-url="/seeded/busy-history?saved=1"
-            hx-indicator="#hist-app, #hist-save" { "Save" }
+            hx-indicator="#hist-app, #hist-save, #hist-load" { "Save" }
         span id="hist-status" role="status" {}
+        div id="hist-load" data-autumn-busy hx-get=(DEMO_SAVE) hx-trigger="load"
+            hx-target="#hist-load-status" { "Load" }
+        span id="hist-load-status" role="status" {}
     })
 }
 
@@ -1798,10 +1802,16 @@ async fn busy_next_and_previous_indicators() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
+/// `#hist-load` has its response, and no request marks it or its target.
+const LOAD_IDLE: &str = "document.getElementById('hist-load-status').textContent.includes('Saved.') \
+     && !document.querySelector('#hist-load[aria-busy], #hist-load-status[aria-busy]')";
+
 /// htmx saves the page for `hx-push-url` before the request ends, so the
 /// snapshot has the runtime `aria-busy`. After Back, the restored button
 /// and target are not busy, and the next request marks them again. An
-/// `aria-busy` that the app set stays.
+/// `aria-busy` that the app set stays. A restored element that sends a
+/// request on load stays busy until that request ends: htmx sends it before
+/// `htmx:historyRestore`.
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn busy_state_does_not_stay_in_a_history_snapshot() {
@@ -1813,15 +1823,18 @@ async fn busy_state_does_not_stay_in_a_history_snapshot() {
             &page,
             "(() => { window.__restored = null; \
              document.addEventListener('htmx:historyRestore', e => { \
-               window.__restored = e.detail.cacheMiss ? 'server' : 'snapshot'; }); \
+               window.__restored = e.detail.cacheMiss ? 'server' : 'snapshot'; \
+               window.__loadBusy = document.getElementById('hist-load').getAttribute('aria-busy'); }); \
              return true; })()",
         )
         .await,
         "could not watch the history restore"
     );
+    // The load request of `#hist-load` ends first.
+    wait_for(&page, LOAD_IDLE).await;
     assert_eq!(
         busy_ids_during(&page, "hist-save", "hist-status").await.0,
-        ["hist-save", "hist-status"],
+        ["hist-load", "hist-save", "hist-status"],
         "the first request"
     );
     wait_for(&page, "location.search === '?saved=1'").await;
@@ -1861,8 +1874,14 @@ async fn busy_state_does_not_stay_in_a_history_snapshot() {
         "the restore removed the aria-busy of the app"
     );
     assert_eq!(
+        eval_string(&page, "String(window.__loadBusy)").await,
+        "true",
+        "the restore removed the aria-busy of a request that runs"
+    );
+    wait_for(&page, LOAD_IDLE).await;
+    assert_eq!(
         busy_ids_during(&page, "hist-save", "hist-status").await.0,
-        ["hist-save", "hist-status"],
+        ["hist-load", "hist-save", "hist-status"],
         "the request after the restore"
     );
     page.expect_no_console_errors().await.expect("no errors");

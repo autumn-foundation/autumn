@@ -1407,8 +1407,10 @@
       return el && el.matches && el.matches('[data-autumn-busy]');
     }).concat(indicatorsOf(e.target).filter(function (el) { return el.matches('[data-autumn-busy]'); }));
     if (els.length && d.target) els.push(d.target);
+    // Skip an app aria-busy. A marked one is ours, also from a snapshot:
+    // htmx sends a restored load request first.
     els = els.filter(function (el, i) {
-      return els.indexOf(el) === i && (busyCount.has(el) || !el.hasAttribute('aria-busy'));
+      return els.indexOf(el) === i && (el.hasAttribute('data-autumn-busied') || !el.hasAttribute('aria-busy'));
     });
     els.forEach(function (el) {
       busyCount.set(el, (busyCount.get(el) || 0) + 1);
