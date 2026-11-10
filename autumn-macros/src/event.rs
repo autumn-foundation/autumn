@@ -266,21 +266,28 @@ fn write_descriptor(
     let Some(dir) = store::contract_dir() else {
         return TokenStream::new();
     };
-    let module = store::source_module(span);
-    store::write_outcome(store::write_event(
-        &dir,
-        key,
-        &EventDescriptor {
-            krate: std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
-            module,
-            type_name: type_name.to_owned(),
-            name: attrs.name.clone(),
-            version: attrs.version,
-            opaque: attrs.opaque,
-            unit,
-            shape,
-        },
-    ))
+    let descriptor = event_descriptor(attrs, type_name, shape, store::source_module(span), unit);
+    store::write_outcome(store::write_event(&dir, key, &descriptor))
+}
+
+/// The descriptor `#[event]` writes, for the crate being compiled.
+fn event_descriptor(
+    attrs: &EventAttrs,
+    type_name: &str,
+    shape: WireTypeDescriptor,
+    module: String,
+    unit: bool,
+) -> EventDescriptor {
+    EventDescriptor {
+        krate: std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
+        module,
+        type_name: type_name.to_owned(),
+        name: attrs.name.clone(),
+        version: attrs.version,
+        opaque: attrs.opaque,
+        unit,
+        shape,
+    }
 }
 
 /// Whether `name` ends in `.v<digits>`.
@@ -418,6 +425,33 @@ mod tests {
             "{expanded}"
         );
         assert!(expanded.contains("AUTUMN_CONTRACT_DIR"), "{expanded}");
+    }
+
+    #[test]
+    fn the_event_descriptor_records_each_wire_type() {
+        let attrs = parse_event_args(quote! { name = "contact.updated" }).expect("args");
+        let input: DeriveInput = syn::parse2(
+            quote! { struct ContactUpdated { id: uuid::Uuid, #[serde(with = "ts")] at: i64 } },
+        )
+        .expect("struct");
+        let mut refusal = TokenStream::new();
+        let (_, _, shape) = payload_shape(&attrs, &input, &mut refusal);
+        assert!(refusal.is_empty(), "{refusal}");
+        let event = event_descriptor(&attrs, "ContactUpdated", shape, String::new(), false);
+        let json = serde_json::to_string(&event).expect("serializes");
+        let back: EventDescriptor = serde_json::from_str(&json).expect("parses");
+        let wire = |name: &str| {
+            back.shape
+                .serialized
+                .iter()
+                .find(|f| f.rust_name == name)
+                .and_then(|f| f.wire_type.clone())
+        };
+        assert_eq!(
+            wire("id"),
+            Some(crate::wire::ir::WireType::string_in("uuid"))
+        );
+        assert_eq!(wire("at"), Some(crate::wire::ir::WireType::Any));
     }
 
     #[test]

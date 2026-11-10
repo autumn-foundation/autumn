@@ -1358,6 +1358,12 @@ pub fn contract_checked(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[wire(opaque)]` on a field tells `autumn contracts` to compare it by its
 /// type name only. Use it for a type that has no `WireShape`, such as an
 /// enum. Without it, the export stops on such a field.
+///
+/// Each field also records its wire type: the JSON form serde writes. A field
+/// with `#[serde(with)]` is `any`. `#[wire(type = "integer", format =
+/// "unix-seconds")]` names the wire type. `type` is `string`, `integer`,
+/// `number`, `boolean` or `any`. `nullable` marks an `Option` under another
+/// name. A field with `type` is not looked up as a `WireShape` type.
 #[proc_macro_derive(WireShape, attributes(wire))]
 pub fn derive_wire_shape(input: TokenStream) -> TokenStream {
     let _guard = autumn_macros_support::crate_path::set_target(None);

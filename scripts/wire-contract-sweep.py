@@ -147,6 +147,11 @@ CROSS_RELEASE = [
     (MAIN, "event: mesh_catalog::ItemRepriced)", "event: mesh_catalog::ItemRepricedV2)"),
     (MAIN, LISTENER_READ, "    let _price = (event.id, event.amount, event.currency);\n"),
  ], 3, EVENT_PRODUCERS_FIRST),
+ # The Rust type stays `u32`. The JSON form changes from a number to a
+ # string, so only the field's wire type shows the break.
+ ("response field written in a new JSON form", [
+    (LIB, "    /// Price in cents.\n    pub price_cents: u32,\n}", "    /// Price in cents, written as text.\n    #[serde(with = \"cents_text\")]\n    #[wire(type = \"string\", format = \"decimal\")]\n    pub price_cents: u32,\n}\n\n/// Writes cents as decimal text.\nmod cents_text {\n    pub fn serialize<S: serde::Serializer>(v: &u32, s: S) -> Result<S::Ok, S::Error> {\n        s.collect_str(v)\n    }\n\n    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {\n        let text = <String as serde::Deserialize>::deserialize(d)?;\n        text.parse().map_err(serde::de::Error::custom)\n    }\n}"),
+ ], 1, 'not safe in any deploy order'),
  ("path parameter renamed", [
     (LIB, '#[get("/items/{id}")]\n#[public]\npub async fn get_item(id: Path<String>)', '#[get("/items/{item_id}")]\n#[public]\npub async fn get_item(item_id: Path<String>)'),
     (LIB, "        id.to_string(),\n        format!(\"Item {}\", *id),", "        item_id.to_string(),\n        format!(\"Item {}\", *item_id),"),

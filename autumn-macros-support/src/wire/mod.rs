@@ -14,6 +14,9 @@
 use serde::{Deserialize, Serialize};
 
 mod resolve;
+mod wire_type;
+
+pub use wire_type::{WireType, format};
 
 pub use resolve::{
     Crates, FRAMEWORK_CRATE, NO_BODY, Resolved, Scope, child_module, crate_root, is_known_leaf,
@@ -29,6 +32,10 @@ pub struct WireFieldDescriptor {
     pub wire_name: String,
     /// The field's type, as written in the struct.
     pub ty: String,
+    /// The field's JSON form in this direction. `None` in a descriptor from
+    /// an older macro: the check then compares `ty` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_type: Option<WireType>,
     /// Whether the field must be present on the wire in this direction.
     ///
     /// For a request: the callee rejects a body that omits it. For a response:
@@ -511,6 +518,33 @@ mod tests {
             l.artifact_file_name("k"),
             "listener.marketing.on_contact_updated.k.json"
         );
+    }
+
+    #[test]
+    fn a_field_without_a_wire_type_still_parses() {
+        let old = r#"{"rust_name":"id","wire_name":"id","ty":"String","required":true}"#;
+        let field: WireFieldDescriptor = serde_json::from_str(old).expect("parses");
+        assert_eq!(field.wire_type, None);
+        assert_eq!(serde_json::to_string(&field).expect("serializes"), old);
+    }
+
+    #[test]
+    fn a_field_with_a_wire_type_round_trips() {
+        let field = WireFieldDescriptor {
+            rust_name: "at".to_owned(),
+            wire_name: "at".to_owned(),
+            ty: "DateTime<Utc>".to_owned(),
+            wire_type: Some(WireType::string_in(format::DATE_TIME)),
+            required: true,
+            ..WireFieldDescriptor::default()
+        };
+        let json = serde_json::to_string(&field).expect("serializes");
+        assert!(
+            json.contains(r#""wire_type":{"kind":"string","format":"date-time"}"#),
+            "{json}"
+        );
+        let back: WireFieldDescriptor = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back, field);
     }
 
     #[test]

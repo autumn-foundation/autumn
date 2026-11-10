@@ -2455,7 +2455,7 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   windows (new callees with deployed callers, new callers with deployed
   callees). Exit 0 safe, 1 not safe, 3 safe in one order only (the report
   names it; `--order callee-first|caller-first` declares it), 4 tool error.
-- The bundle (format 3) finds a type by its path, not its last name: write
+- The bundle (format 4) finds a type by its path, not its last name: write
   the path where the type is defined (`Json<shared::Item>`,
   `Json<crate::dto::Item>`) when two reachable crates have an `Item`, or the
   export stops. A path through a re-export or a `use … as` alias does not
@@ -2465,6 +2465,12 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
 - A field whose type has no `WireShape` and is not a known leaf (an enum, for
   example) stops the export: mark it `#[wire(opaque)]` to compare it by type
   name only. Do not add `WireShape` to an enum: the derive refuses it.
+- Each field records its wire type (the JSON form). A field with
+  `#[serde(with)]` is `any`: name its form with
+  `#[wire(type = "integer", format = "unix-seconds")]`. `type` is `string`,
+  `integer`, `number`, `boolean` or `any`; another value does not compile.
+  Add `nullable` for an `Option` under another name. The check reports a new
+  JSON form with the same Rust type (bundle format 4).
 - An `#[endpoint]` must be in a `routes![…]` call. Taking it out of the router
   is a removed route. For a handler of another crate, write its crate path
   (`routes![mesh_catalog::get_item]`), so the check judges that crate. `autumn contracts export --from <dir>` joins an existing

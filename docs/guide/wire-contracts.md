@@ -278,6 +278,11 @@ serves with the types of its release. The rules:
 * **Field types.** A field's Rust type must not change. Path prefixes do not
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.
+* **Wire types.** A field's JSON form must not change. This is also true
+  when the Rust type stays the same, for example `DateTime<Utc>` that gets
+  `#[serde(with = "ts_seconds")]` and `#[wire(type = "integer")]`. A nullable
+  form reads the form it wraps. `any` is not compared. See
+  [Wire types](#wire-types).
 * **Duplicate keys.** One object must not hold a field's name and its alias.
   serde refuses it.
 
@@ -340,12 +345,13 @@ the removal of a topic that no bundled consumer reads. An event without
 `name` is not in the bundle. A bundle from an older CLI has no events. Then
 the check finds no deployed consumer to protect.
 
-The export writes bundle format 3. It records nested types, the `unit`
-flag, and endpoints that no router registers. An older CLI refuses it. This
-CLI reads formats 1 to 3. With a bundle of format 1 or 2, the check
-compares nested types by name only. It does not compare the `unit` flag of a
-body or a nested type. It compares the `unit` flag of an event in every
-format.
+The export writes bundle format 4. It records the wire type of each field,
+nested types, the `unit` flag, and endpoints that no router registers. An
+older CLI refuses it. This CLI reads formats 1 to 4. When one of the two
+bundles is format 3 or older, the check does not compare wire types. With a
+bundle of format 1 or 2, the check compares nested types by name only. It
+does not compare the `unit` flag of a body or a nested type. It compares the
+`unit` flag of an event in every format.
 
 ### Deploy order
 
@@ -471,12 +477,83 @@ pub struct Item {
 
 `#[serde(with)]` and `#[serde(deserialize_with)]` *are* supported, and taken
 seriously: serde bypasses its own missing-field shortcut for such a field, so
-even an `Option<T>` becomes mandatory unless a default fills it in.
+even an `Option<T>` becomes mandatory unless a default fills it in. The
+field's wire type is `any` unless `#[wire(type = …)]` names it. See
+[Wire types](#wire-types).
 
 `#[contract_checked]` refuses a client it cannot find a value for in the
 annotated function — otherwise it would pass by checking nothing. It recognises
 a client that arrives as a typed parameter, a typed `let`, or a `let`
 initialised from the client's own constructor.
+
+## Wire types
+
+Each field in a descriptor has a `ty` and a `wire_type`. `ty` is the Rust
+type as written. `wire_type` is the JSON form that serde writes. A later IDL
+export can map it. The cross-release check compares both.
+
+| Rust type | Wire type |
+|---|---|
+| `String`, `&str`, `char`, `PathBuf`, `Path`, `SocketAddr` | `string` |
+| `i8` … `i128`, `u8` … `u128`, `isize`, `usize`, `NonZero*` | `integer` with its width and sign |
+| `f32`, `f64`, `serde_json::Number` | `number` |
+| `bool` | `boolean` |
+| `Vec<T>`, `VecDeque<T>`, `LinkedList<T>`, `BinaryHeap<T>`, `HashSet<T>`, `BTreeSet<T>`, `IndexSet<T>`, `SmallVec`, `[T; N]`, `&[T]` | `array` of `T` |
+| `Bytes`, `ByteBuf` | `array` of `integer(u8)` |
+| `HashMap<K, V>`, `BTreeMap<K, V>`, `IndexMap<K, V>`, `serde_json::Map` | `map` of `V`, when `K` is a string or an integer. Else `any` |
+| `Option<T>` | `nullable` of `T` |
+| `Box<T>`, `Rc<T>`, `Arc<T>`, `Cow<T>`, `Cell<T>`, `RefCell<T>`, `Reverse<T>`, `Wrapping<T>` | the wire type of `T` |
+| `chrono::DateTime<Tz>` | `string`, format `date-time` |
+| `chrono::NaiveDateTime`, `NaiveDate`, `NaiveTime` | `string`, format `local-date-time`, `date`, `local-time` |
+| `uuid::Uuid` | `string`, format `uuid` |
+| `rust_decimal::Decimal`, `BigDecimal` | `string`, format `decimal` |
+| `url::Url`, `IpAddr`, `Ipv4Addr`, `Ipv6Addr` | `string`, format `uri`, `ip`, `ipv4`, `ipv6` |
+| a `WireShape` type, `Self` | `object`, with the type id |
+| `serde_json::Value`, a tuple, `()`, a `time` crate type, another known leaf | `any` |
+| a field with `#[serde(with)]`, `serialize_with` or `deserialize_with` | `any` in that direction |
+
+A `time` crate type is `any`: its JSON form depends on a feature of the
+`time` crate, which the macro cannot see. A `DateTime` with no time zone
+argument is not chrono's, so it is `any` too.
+
+The macro finds a type by its last name, as the export finds a known leaf.
+In a `#[wire(opaque)]` field, a type that the macro does not know, and
+`Self`, are `any`.
+
+The check does not compare `any`. It is a form that the macro cannot read,
+so the check compares `ty` only.
+
+### Name the wire type
+
+When the macro cannot see the JSON form, name it with `#[wire(type = …)]`:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    #[serde(with = "chrono::serde::ts_seconds")]
+    #[wire(type = "integer", format = "unix-seconds")]
+    pub created_at: DateTime<Utc>,
+    #[wire(type = "string", nullable)]
+    pub nickname: Nickname, // type Nickname = Option<String>;
+}
+```
+
+* `type` is `string`, `integer`, `number`, `boolean` or `any`. Another value
+  is a compile error. An `integer` is a signed 64-bit integer.
+* `format` goes with `string` or `integer`. It is words of lowercase letters
+  and digits, joined by `-`, such as `date-time`, `unix-seconds` or `email`.
+* `nullable` makes the type nullable. Use it for an `Option` under another
+  name. A request can then leave the field out, as for `Option<T>`. With
+  `#[serde(with)]` or `deserialize_with`, the field stays required.
+* On an `Option<T>` field with no custom serde function, the wire type is
+  nullable without `nullable`. A custom function writes what `type` says, so
+  add `nullable` if the function writes `null`.
+* The field is opaque. The export does not look for a `WireShape` of its
+  Rust type, so a type alias needs no descriptor.
+
+The wire type applies to both directions. With `serialize_with` or
+`deserialize_with` on one side only, it applies to that side. The other side
+keeps the form that the macro reads off the Rust type, and is not opaque.
 
 ## Events
 
@@ -511,10 +588,25 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
   and be called through that name. One reached through a struct field
   (`self.catalog.…`) is not visible, and `#[contract_checked]` refuses rather
   than passing while checking nothing.
-* A field's recorded `ty` is the Rust type, not the wire type. So a
-  `#[serde(with)]` representation change does not show in the descriptor or in
-  the cross-release check. A type alias change reads as a type change.
-* `Option<T>` is recognised by name, so a type alias for one reads as required.
+* A field with `#[serde(with)]`, `serialize_with` or `deserialize_with` has
+  the wire type `any`, unless `#[wire(type = …)]` names it. The check does
+  not compare `any`, so a new custom form with no `#[wire(type = …)]` does
+  not show.
+* A field with `#[wire(type = …)]` is opaque. A change inside its Rust type
+  does not show.
+* `Decimal` and `BigDecimal` are `string` with their default serde
+  features. A feature that writes them as a JSON number does not show:
+  name the form with `#[wire(type = "number")]`.
+* An `integer` override is 64 bits and signed. A custom function that writes
+  another width cannot say so.
+* `Option<T>` is recognised by name, so a type alias for one reads as
+  required, unless the field has `#[wire(type = …, nullable)]`.
+* The check still compares `ty`. A type alias change reads as a type change,
+  even when the wire type is the same.
+* The macro finds a type by its last name. A type of your own named like a
+  known type, such as `Decimal`, gets the wire type of the known type.
+* A bundle older than format 4 has no wire types. The check compares wire
+  types only when both bundles have them.
 * The cross-release check compares two releases: the deployed one and the
   current one. More than two live releases need one check per pair.
 * The cross-release check knows only the callers in the bundle. It cannot see

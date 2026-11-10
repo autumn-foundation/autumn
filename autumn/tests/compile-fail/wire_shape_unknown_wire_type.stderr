@@ -1,0 +1,5 @@
+error: unknown wire type `timestamp`; expected one of `string`, `integer`, `number`, `boolean`, `any`
+ --> tests/compile-fail/wire_shape_unknown_wire_type.rs:8:19
+  |
+8 |     #[wire(type = "timestamp")]
+  |                   ^^^^^^^^^^^

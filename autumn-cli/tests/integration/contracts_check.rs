@@ -136,6 +136,22 @@ fn a_change_to_a_crate_qualified_type_is_reported_beside_a_local_type_of_one_nam
 }
 
 #[test]
+fn a_new_json_form_with_the_same_rust_type_is_a_break() {
+    // `created_at: DateTime<Utc>` gains `#[serde(with = "ts_seconds")]` and
+    // `#[wire(type = "integer", format = "unix-seconds")]`. `ty` does not
+    // change, so only the wire type shows the break.
+    let report = golden_descriptors("wire_type_representation_changed", 1);
+    assert!(
+        report.contains("`DateTime<Utc> as integer(i64, unix-seconds)`"),
+        "{report}"
+    );
+    assert!(
+        report.contains("`DateTime<Utc> as string(date-time)`"),
+        "{report}"
+    );
+}
+
+#[test]
 fn a_required_field_removed_from_a_nested_type_is_a_break() {
     let report = golden_descriptors("nested_required_field_removed", 3);
     assert!(report.contains("needs field `details.color`"), "{report}");

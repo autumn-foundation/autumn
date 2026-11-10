@@ -8,3 +8,4 @@ pub mod endpoint;
 pub mod ir;
 pub mod shape;
 pub mod store;
+pub mod wire_type;

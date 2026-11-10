@@ -20,6 +20,10 @@
 //! Both need a bundle of [`IDENTITY_FORMAT`](super::bundle::IDENTITY_FORMAT):
 //! an older bundle does not record
 //! them, and the check then compares the type names only.
+//!
+//! A field's wire type is its JSON form. When both sides record one, a new
+//! form with the same Rust type is a break. A bundle older than
+//! [`WIRE_TYPE_FORMAT`](super::bundle::WIRE_TYPE_FORMAT) records none.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -65,7 +69,7 @@ pub enum BreakKind {
     /// The caller's response type gets one field under two keys: its name
     /// and an alias. serde refuses that object.
     ResponseDuplicateKey(String),
-    /// A response field changed its Rust type.
+    /// A response field changed its Rust type or its JSON form.
     ResponseTypeChanged {
         /// The field's wire key.
         field: String,
@@ -87,7 +91,7 @@ pub enum BreakKind {
     /// The callee gets one field under two keys: its name and an alias.
     /// serde refuses that object.
     RequestDuplicateKey(String),
-    /// A request field changed its Rust type.
+    /// A request field changed its Rust type or its JSON form.
     RequestTypeChanged {
         /// The field's wire key.
         field: String,
@@ -110,7 +114,7 @@ pub enum BreakKind {
     EventFieldRejected(String),
     /// The consumer's event type gets one field under two keys.
     EventDuplicateKey(String),
-    /// An event field changed its Rust type.
+    /// An event field changed its Rust type or its JSON form.
     EventTypeChanged {
         /// The field's wire key.
         field: String,
@@ -567,6 +571,28 @@ fn type_reads(decoder: &str, producer: &str) -> bool {
     decoder == producer || decoder == format!("Option<{producer}>")
 }
 
+/// The two type labels when a decoder of `reader` cannot read what
+/// `writer` holds, else `None`.
+///
+/// The Rust types come first. When they read, and both fields record a wire
+/// type, the wire types must read too: a new JSON form with the same Rust
+/// type is a break. A label then names both, as `ty as wire`.
+fn type_change(
+    reader: &WireFieldDescriptor,
+    writer: &WireFieldDescriptor,
+) -> Option<(String, String)> {
+    if !type_reads(&reader.ty, &writer.ty) {
+        return Some((reader.ty.clone(), writer.ty.clone()));
+    }
+    match (&reader.wire_type, &writer.wire_type) {
+        (Some(read), Some(written)) if !read.reads(written) => Some((
+            format!("{} as {read}", reader.ty),
+            format!("{} as {written}", writer.ty),
+        )),
+        _ => None,
+    }
+}
+
 /// How many fields in `fields` carry a key of `field`.
 fn key_hits(fields: &[WireFieldDescriptor], field: &WireFieldDescriptor) -> usize {
     keys(field).filter(|k| by_key(fields, k).is_some()).count()
@@ -807,7 +833,7 @@ enum Decode {
     Rejected(String),
     /// The reader's type gets one field under two keys.
     DuplicateKey(String),
-    /// A field changed its Rust type.
+    /// A field changed its Rust type or its JSON form.
     TypeChanged {
         /// The field's wire key.
         field: String,
@@ -846,15 +872,15 @@ fn decode_issues(
         if key_hits(produced, field) > 1 {
             out.push(Decode::DuplicateKey(name.clone()));
         }
-        match produced_for(produced, field) {
-            Some(made) if !type_reads(&field.ty, &made.ty) => {
+        match produced_for(produced, field).map(|made| (made, type_change(field, made))) {
+            Some((_, Some((reader, writer)))) => {
                 out.push(Decode::TypeChanged {
                     field: name,
-                    reader: field.ty.clone(),
-                    writer: made.ty.clone(),
+                    reader,
+                    writer,
                 });
             }
-            Some(made) => {
+            Some((made, None)) => {
                 if field.required && !made.required {
                     out.push(Decode::Fails(name.clone()));
                 }
@@ -973,15 +999,15 @@ fn request_issues(
         }
     }
     for field in sent {
-        match accepting(accepted, field) {
-            Some(into) if !type_reads(&into.ty, &field.ty) => {
+        match accepting(accepted, field).map(|into| (into, type_change(into, field))) {
+            Some((_, Some((receiving, sending)))) => {
                 report(BreakKind::RequestTypeChanged {
                     field: field.wire_name.clone(),
-                    caller: field.ty.clone(),
-                    callee: into.ty.clone(),
+                    caller: sending,
+                    callee: receiving,
                 });
             }
-            Some(into) => {
+            Some((into, None)) => {
                 let pairs = match walk.pairs(into, field) {
                     Ok(pairs) => pairs,
                     Err((receiving, sending)) => {
@@ -1298,7 +1324,7 @@ fn event_detail(b: &Break) -> String {
 mod tests {
     use super::*;
     use crate::contracts::bundle::{BUNDLE_FORMAT, BundleEvent, BundleListener};
-    use autumn_macros_support::wire::WireTypeDescriptor;
+    use autumn_macros_support::wire::{WireType, WireTypeDescriptor};
 
     fn field(rust: &str, wire: &str, ty: &str, required: bool) -> WireFieldDescriptor {
         WireFieldDescriptor {
@@ -2621,5 +2647,215 @@ mod tests {
         ep(&mut deployed, "get_item").unrouted = true;
         let current = deployed.clone();
         assert_eq!(compare(&deployed, &current).verdict(), Verdict::Compatible);
+    }
+
+    // --- wire types ---
+
+    /// A wire type with the same JSON form in both directions.
+    fn set_wire(fields: &mut [WireFieldDescriptor], name: &str, wire: &WireType) {
+        for f in fields.iter_mut().filter(|f| f.rust_name == name) {
+            f.wire_type = Some(wire.clone());
+        }
+    }
+
+    /// Release 1 with `Item.created_at: DateTime<Utc>` in `form`.
+    fn dated_release(form: &WireType) -> Bundle {
+        let mut bundle = Bundle {
+            format: crate::contracts::bundle::WIRE_TYPE_FORMAT,
+            ..release_1()
+        };
+        for e in &mut bundle.endpoints {
+            for side in [&mut e.request, &mut e.response] {
+                if side.name == "NoBody" {
+                    continue;
+                }
+                let at = field("created_at", "created_at", "DateTime<Utc>", true);
+                side.serialized.push(at.clone());
+                side.deserialized.push(at);
+                set_wire(&mut side.serialized, "created_at", form);
+                set_wire(&mut side.deserialized, "created_at", form);
+            }
+        }
+        bundle
+    }
+
+    fn unix_seconds() -> WireType {
+        WireType::Integer {
+            bits: 64,
+            signed: true,
+            format: Some(autumn_macros_support::wire::format::UNIX_SECONDS.to_owned()),
+        }
+    }
+
+    fn rfc3339() -> WireType {
+        WireType::string_in(autumn_macros_support::wire::format::DATE_TIME)
+    }
+
+    #[test]
+    fn a_new_json_form_with_the_same_rust_type_is_a_break_in_both_windows() {
+        let deployed = dated_release(&rfc3339());
+        let current = dated_release(&unix_seconds());
+        let report = compare(&deployed, &current);
+        let response = BreakKind::ResponseTypeChanged {
+            field: "created_at".to_owned(),
+            caller: "DateTime<Utc> as string(date-time)".to_owned(),
+            callee: "DateTime<Utc> as integer(i64, unix-seconds)".to_owned(),
+        };
+        assert!(
+            kinds(&report.callee_first).contains(&response),
+            "{report:?}"
+        );
+        let request = BreakKind::RequestTypeChanged {
+            field: "created_at".to_owned(),
+            caller: "DateTime<Utc> as integer(i64, unix-seconds)".to_owned(),
+            callee: "DateTime<Utc> as string(date-time)".to_owned(),
+        };
+        assert!(kinds(&report.caller_first).contains(&request), "{report:?}");
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+        let text = report.render(Order::Any);
+        assert!(
+            text.contains("`DateTime<Utc> as integer(i64, unix-seconds)`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_same_json_form_is_compatible() {
+        let report = compare(&dated_release(&rfc3339()), &dated_release(&rfc3339()));
+        assert_eq!(report, Report::default());
+    }
+
+    #[test]
+    fn a_bundle_without_wire_types_compares_the_rust_type_only() {
+        let mut deployed = dated_release(&rfc3339());
+        deployed.format = crate::contracts::bundle::IDENTITY_FORMAT;
+        for e in &mut deployed.endpoints {
+            for f in e
+                .request
+                .serialized
+                .iter_mut()
+                .chain(e.request.deserialized.iter_mut())
+                .chain(e.response.serialized.iter_mut())
+                .chain(e.response.deserialized.iter_mut())
+            {
+                f.wire_type = None;
+            }
+        }
+        let report = compare(&deployed, &dated_release(&unix_seconds()));
+        assert_eq!(report, Report::default());
+    }
+
+    #[test]
+    fn a_rust_type_change_names_the_rust_types_only() {
+        let deployed = dated_release(&rfc3339());
+        let mut current = dated_release(&unix_seconds());
+        for e in &mut current.endpoints {
+            for f in e
+                .response
+                .serialized
+                .iter_mut()
+                .chain(e.response.deserialized.iter_mut())
+                .filter(|f| f.rust_name == "created_at")
+            {
+                f.ty = "i64".to_owned();
+            }
+        }
+        let report = compare(&deployed, &current);
+        assert!(
+            kinds(&report.callee_first).contains(&BreakKind::ResponseTypeChanged {
+                field: "created_at".to_owned(),
+                caller: "DateTime<Utc>".to_owned(),
+                callee: "i64".to_owned(),
+            }),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoder_of_a_nullable_form_reads_the_plain_form() {
+        // `type When = Option<DateTime<Utc>>` with `#[wire(type = "string",
+        // format = "date-time", nullable)]` on the caller side only.
+        let mut deployed = dated_release(&rfc3339());
+        let current = dated_release(&rfc3339());
+        for e in &mut deployed.endpoints {
+            set_wire(
+                &mut e.response.deserialized,
+                "created_at",
+                &WireType::nullable(rfc3339()),
+            );
+        }
+        let report = compare(&deployed, &current);
+        assert!(
+            !report.callee_first.iter().any(|b| matches!(
+                &b.kind,
+                BreakKind::ResponseTypeChanged { field, .. } if field == "created_at"
+            )),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn an_event_field_with_a_new_json_form_is_a_break() {
+        let mut deployed = with_events();
+        deployed.format = crate::contracts::bundle::WIRE_TYPE_FORMAT;
+        let mut current = deployed.clone();
+        let text = WireType::string();
+        let number = WireType::integer(64, true);
+        set_wire(&mut deployed.events[0].shape.serialized, "email", &text);
+        set_wire(&mut deployed.events[0].shape.deserialized, "email", &text);
+        set_wire(&mut current.events[0].shape.serialized, "email", &number);
+        set_wire(&mut current.events[0].shape.deserialized, "email", &number);
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::EventTypeChanged {
+                field: "email".to_owned(),
+                consumer: "String as string".to_owned(),
+                producer: "String as integer(i64)".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_release_with_a_one_sided_custom_function_is_compatible() {
+        // `serialize_with` writes `any`. The other side reads the mapped form.
+        let mut release = dated_release(&rfc3339());
+        for e in &mut release.endpoints {
+            for side in [&mut e.request, &mut e.response] {
+                set_wire(&mut side.serialized, "created_at", &WireType::Any);
+            }
+        }
+        assert_eq!(compare(&release, &release), Report::default());
+    }
+
+    #[test]
+    fn any_on_one_side_is_not_compared() {
+        // A custom serde function with no override makes its form `any`.
+        let deployed = dated_release(&rfc3339());
+        let current = dated_release(&WireType::Any);
+        assert_eq!(compare(&deployed, &current), Report::default());
+    }
+
+    #[test]
+    fn a_new_json_form_inside_a_nested_type_is_a_break() {
+        let mut deployed = nested_release();
+        deployed.format = crate::contracts::bundle::WIRE_TYPE_FORMAT;
+        let mut current = deployed.clone();
+        for (bundle, form) in [
+            (&mut deployed, WireType::string()),
+            (&mut current, WireType::integer(32, false)),
+        ] {
+            let shape = &mut bundle.types[0].shape;
+            set_wire(&mut shape.serialized, "size", &form);
+            set_wire(&mut shape.deserialized, "size", &form);
+        }
+        let report = compare(&deployed, &current);
+        assert!(
+            report.callee_first.iter().any(|b| matches!(
+                &b.kind,
+                BreakKind::ResponseTypeChanged { field, .. } if field == "details.size"
+            )),
+            "{report:?}"
+        );
     }
 }
