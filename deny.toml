@@ -54,6 +54,20 @@ unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
+    # RUSTSEC-2026-0459 — SQLite before 3.54.0 can return uninitialized
+    # page-cache memory when a process opens a database file together with a
+    # sibling `-wal` file of a different page size. libsqlite3-sys 0.38.2
+    # bundles an affected SQLite. The fix is libsqlite3-sys >= 0.39.0, and
+    # nothing here can take it: diesel 2.3.14 (latest) requires
+    # libsqlite3-sys < 0.39, and only one crate may link `sqlite3`
+    # (rehearsed 2026-11-09: `cargo update -p libsqlite3-sys` fails on the
+    # `links` conflict). Remove when diesel accepts 0.39.
+    # Exposure: only a database that a less trusted party wrote, opened next
+    # to a `-wal` it wrote. The fleet creates its own files. Import and
+    # restore take one main file, and a restore clears stray sidecars first.
+    # That path was not audited end to end: treat this as a short stopgap.
+    # Review-by: 2026-11-16.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite < 3.54.0 (uninitialized memory with a foreign -wal); fix needs libsqlite3-sys >= 0.39.0 but diesel 2.3.14 caps it below 0.39 (links = sqlite3); fleet creates its own files, import/restore take one main file; short stopgap, import/restore path not audited end to end; review-by 2026-11-16" },
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
     # rsa 0.10.0 (final) shipped the fix 2026-11, but nothing here can take
     # it yet: jsonwebtoken 11.1.0 (latest) still pins rsa ^0.9, and

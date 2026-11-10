@@ -1,0 +1,10 @@
+{
+  "krate": "mesh-storefront",
+  "name": "CatalogClient",
+  "endpoints": [
+    {
+      "method": "get_item",
+      "marker": "mesh_catalog::get_item_endpoint"
+    }
+  ]
+}

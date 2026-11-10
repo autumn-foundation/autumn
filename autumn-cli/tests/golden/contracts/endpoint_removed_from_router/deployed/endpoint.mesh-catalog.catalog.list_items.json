@@ -1,0 +1,14 @@
+{
+  "service": "catalog",
+  "name": "list_items",
+  "endpoint_ident": "list_items_endpoint",
+  "krate": "mesh-catalog",
+  "method": "GET",
+  "path": "/items",
+  "request_type": "NoBody",
+  "response_type": "Item",
+  "has_body": false,
+  "request_list": false,
+  "response_list": false,
+  "handler": "list_items"
+}

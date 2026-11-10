@@ -1,0 +1,10 @@
+{
+  "krate": "mesh-storefront",
+  "name": "CatalogClient",
+  "endpoints": [
+    {
+      "method": "ping",
+      "marker": "mesh_catalog::ping_endpoint"
+    }
+  ]
+}

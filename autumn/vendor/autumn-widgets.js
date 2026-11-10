@@ -467,15 +467,9 @@
   });
 
   // ── nav_bar widget ──────────────────────────────────────────────────────
-  // Progressive enhancement for autumn_web::widgets::nav_bar: before this
-  // runs, the hamburger toggle is hidden. Once it runs, the hamburger is
-  // revealed. Dropdowns are popover menus (see below).
-
-  // initNav is guarded per-CONTROL (the toggle), not once per nav element:
-  // when htmx swaps a <nav data-autumn-nav>'s innerHTML (the nav itself stays
-  // in the DOM, only its children are replaced), the swapped-in hamburger is
-  // a brand-new node, so it needs wiring again even though the nav was
-  // already initialized once.
+  // This code shows the hamburger toggle. Dropdowns are popover menus.
+  // The guard is on the toggle, not on the nav: an htmx swap of the nav
+  // content brings a new toggle, which needs its listener.
   function initNav(nav) {
     nav.classList.add('autumn-nav--enhanced');
 
@@ -605,14 +599,9 @@
   });
 
   // ── modal / confirm_action ────────────────────────────────────────────────
-  // autumn_web::widgets::modal / confirm_action open and close their
-  // <dialog> via the native HTML Invoker Commands API (command="show-modal"
-  // / command="close" + commandfor) wherever it's supported — no JS needed
-  // there. This is the fallback for browsers that don't support it yet:
-  // one delegated click handler wired to the same data-modal-open /
-  // data-modal-close attributes the widget always emits. showModal()/close()
-  // give ESC-close, a focus trap, and focus-into/-return-from the dialog for
-  // free from the browser in both paths.
+  // The dialog opens and closes with command/commandfor. This is the
+  // fallback for a browser without them: it reads data-modal-open and
+  // data-modal-close. showModal() gives Escape and the focus trap.
   if (!('command' in HTMLButtonElement.prototype)) {
     document.addEventListener('click', function (e) {
       var pop = e.target.closest('[data-popover-toggle]');
@@ -637,17 +626,10 @@
     });
   }
 
-  // ── modal light-dismiss (closedby="any") backdrop-click polyfill ──────────
-  // `closedby="any"` (ModalConfig::light_dismiss) is a newer <dialog>
-  // feature with limited browser support — where it's unsupported, the
-  // native backdrop click silently does nothing. Always wired (not
-  // feature-detected): dialog.close() on an already-closed dialog is a
-  // spec'd no-op, so this never double-fires where closedby IS natively
-  // supported. e.target === the dialog itself only happens for a genuine
-  // backdrop click here: .autumn-modal has zero padding and its one child,
-  // .autumn-modal__content, fills the whole box, so any click landing
-  // inside the visible dialog always targets a descendant, never the
-  // <dialog> element directly.
+  // ── modal light-dismiss (closedby="any") polyfill ─────────────────────────
+  // A backdrop click closes the dialog. close() on a closed dialog does
+  // nothing, so a browser with closedby is safe. The content fills the
+  // dialog, so only a backdrop click has the dialog as its target.
   document.addEventListener('click', function (e) {
     var t = e.target;
     if (t.matches && t.matches('dialog[closedby="any"][open]')) t.close();
@@ -719,11 +701,9 @@
     }
   }, true);
 
-  // A cached page can carry a stale data-theme. Only a page with a
-  // cookie-backed toggle (one that posts to the framework route) follows the
-  // cookie: its layout renders the stored preference, and no cookie means
-  // System. Other pages keep the data-theme their app set, for example a
-  // light-only pin or a theme read from a user profile.
+  // A cached page can have a stale data-theme. Only a page with a toggle
+  // that posts to the framework route follows the cookie (no cookie means
+  // System). Other pages keep the data-theme that their app set.
   function syncTheme() {
     var cookieBacked = 'form[data-autumn-theme-toggle][action="' + THEME_PATH + '"]';
     if (!document.querySelector(cookieBacked)) return;
@@ -1384,24 +1364,42 @@
   // A history restore (hx-boost, Back) brings back nodes without listeners.
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
 
-  // Busy state (#3406). Mark this request's [data-autumn-busy] requester,
-  // submitter and indicators, and its target. Indicators resolve as htmx
-  // does: the inherited hx-indicator, else the requester.
+  // Busy state (#3406). Mark the [data-autumn-busy] requester, submitter
+  // and indicators of this request, and its target. The indicators are the
+  // inherited hx-indicator, else the requester.
   var busyCount = new WeakMap();
+  var REL = /^(?:(closest|find) |(next|previous)(?: |$))/;
+  // `next X` (pos 2) or `previous X` (pos 4) as htmx scans: the first match
+  // after `elt`, or the last before it. Not a descendant or an ancestor.
+  function scan(elt, sel, pos) {
+    var all = Array.from(document.querySelectorAll(sel));
+    if (pos === 4) all.reverse();
+    return all.filter(function (el) { return el.compareDocumentPosition(elt) === pos; })[0];
+  }
+  // As htmx: `this` is the whole value. A keyword part resolves from `elt`.
+  // The other parts join again into one query, so a comma in :is() stays.
   function indicatorsOf(elt) {
     var host = elt.closest('[hx-indicator],[data-hx-indicator]');
     if (!host) return [elt];
     var sel = host.getAttribute('hx-indicator') || host.getAttribute('data-hx-indicator');
+    if (sel === 'this') return [host];
+    var out = [], css = [];
     try {
-      // A plain CSS list stays whole: a comma can sit inside :is() or [a="b, c"].
-      if (!/(^|,)\s*(this|closest |find )/.test(sel)) return Array.from(document.querySelectorAll(sel));
-      return sel.split(',').reduce(function (all, s) {
-        s = s.trim();
-        var one = s === 'this' ? host : s.indexOf('closest ') === 0 ? elt.closest(s.slice(8))
-          : s.indexOf('find ') === 0 ? elt.querySelector(s.slice(5)) : null;
-        return all.concat(one ? [one] : /^(closest|find) /.test(s) ? [] : Array.from(document.querySelectorAll(s)));
-      }, []);
-    } catch (err) { return []; }
+      sel.split(',').forEach(function (s) {
+        var m = REL.exec(s = s.trim()), k = m && (m[1] || m[2]), r = m && s.slice(m[0].length).trim();
+        // An empty part (after a last comma) adds nothing, as in htmx.
+        if (!m) return s && css.push(s);
+        var one = k === 'closest' ? elt.closest(r) : k === 'find' ? elt.querySelector(r)
+          : k === 'next' ? (r ? scan(elt, r, 2) : elt.nextElementSibling)
+          : r ? scan(elt, r, 4) : elt.previousElementSibling;
+        if (one) out.push(one);
+      });
+      return out.concat(css.length ? Array.from(document.querySelectorAll(css.join(','))) : []);
+    } catch (err) { return out; }
+  }
+  function unbusy(el) {
+    el.removeAttribute('aria-busy');
+    el.removeAttribute('data-autumn-busied');
   }
   document.addEventListener('htmx:beforeSend', function (e) {
     var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
@@ -1409,20 +1407,30 @@
       return el && el.matches && el.matches('[data-autumn-busy]');
     }).concat(indicatorsOf(e.target).filter(function (el) { return el.matches('[data-autumn-busy]'); }));
     if (els.length && d.target) els.push(d.target);
+    // Skip an app aria-busy. A marked one is ours, also from a snapshot:
+    // htmx sends a restored load request first.
     els = els.filter(function (el, i) {
-      return els.indexOf(el) === i && (busyCount.has(el) || !el.hasAttribute('aria-busy'));
+      return els.indexOf(el) === i && (el.hasAttribute('data-autumn-busied') || !el.hasAttribute('aria-busy'));
     });
     els.forEach(function (el) {
       busyCount.set(el, (busyCount.get(el) || 0) + 1);
       el.setAttribute('aria-busy', 'true');
+      el.setAttribute('data-autumn-busied', '');
     });
     d.xhr.addEventListener('loadend', function () {
       els.forEach(function (el) {
         var n = busyCount.get(el) - 1;
         if (n > 0) return busyCount.set(el, n);
         busyCount.delete(el);
-        el.removeAttribute('aria-busy');
+        unbusy(el);
       });
+    });
+  });
+  // htmx saves the page for history before `loadend`. A restored node
+  // keeps the runtime `aria-busy`, but no request owns it. Remove it.
+  document.addEventListener('htmx:historyRestore', function () {
+    each(document, '[data-autumn-busied]', function (el) {
+      if (!busyCount.has(el)) unbusy(el);
     });
   });
 

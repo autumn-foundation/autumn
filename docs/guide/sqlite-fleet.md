@@ -33,6 +33,7 @@ mode = "tenant"                 # or "slot"
 root = "/var/lib/app/fleet"     # on the host's local volume
 # path = "{bucket}/{tenant}.db" # default for mode = "tenant"
 max_open = 256                  # soft limit on open databases (LRU past this)
+# max_open_policy = "soft"    # "wait" or "refuse" make max_open a hard limit
 # max_resident_bytes = 0        # soft memory budget; 0 is off (LRU past this)
 # min_residency = "2s"          # LRU does not close a database used this recently
 pool_size = 2                   # connections per open database
@@ -134,6 +135,7 @@ paths. For analytics, [query the lake](#query-the-lake) instead.
 
 When a handler holds a `Db` past `database.slow_query_threshold`, Autumn
 logs `database connection held past slow_query_threshold` with `held_ms`.
+`/actuator/metrics` records each hold in `db_connection_holds["<route>"]`.
 The time covers all work in the hold, not one statement. For a fan-out, take
 `LazyDb`. Call `checkout()` after the fan-out.
 
@@ -445,6 +447,34 @@ them.
   12 seconds after the burst.
 - A lower `min_residency` keeps the count nearer to `max_open` during a burst.
   A request can then reopen a database that it used a moment before.
+- `max_open_policy` sets what an open does when the fleet is full:
+  - `"soft"` (default): open anyway, as above.
+  - `"wait"`: wait for a free slot, for at most `database.connect_timeout_secs`.
+    Then answer `503`. Keep `min_residency` below that timeout. Boot warns
+    when it is not.
+  - `"refuse"`: answer `503` with `Retry-After` at once when no idle database
+    can close. If one can close, wait for that close, for at most
+    `database.connect_timeout_secs`.
+
+  With `"wait"` or `"refuse"`, the count of open and closing databases never
+  passes `max_open`. The fleet databases then hold at most
+  `max_open × (2 × pool_size + 1)` file descriptors. Replicas, the control
+  database and sockets use more.
+- The fleet does not close a database that is in use or was used within
+  `min_residency`. With `"wait"` or `"refuse"`, a burst of new keys gets `503`
+  until that time ends. Set `min_residency` low (for example `"250ms"`). Set
+  `max_open` for the hot set. `Retry-After` is `min_residency` rounded up to
+  whole seconds (from 1 to 30).
+- The cap counts a request for any key, also one that does not exist. Check
+  the tenant id before you open its database. With `"wait"`, set a request
+  limit too: a parked request holds its task for the whole timeout.
+- `max_open_policy` does not apply to `max_resident_bytes`. The memory budget
+  stays soft.
+- `/actuator/health` shows `peak_open`, `over_cap_opens_total` and
+  `refused_total`. `peak_open` is the most databases open and closing together
+  since boot. `over_cap_opens_total` counts opens that passed `max_open`.
+  `refused_total` counts opens answered `503`. When `peak_open` is above
+  `max_open`, size `ulimit -n` for `peak_open`.
 - `max_resident_bytes` is a soft memory budget, with the same rules as
   `max_open`. The `SQLite` engine counts about 2 MB of page cache for each
   open connection. Above the budget, the least recently used idle database
@@ -456,9 +486,11 @@ them.
   processes on one volume create the same database, both end up on one file.
 - Budget: `pool_size` connections and about `2 × pool_size + 1` file
   descriptors (database and `-wal` per connection, one `-shm`) per open
-  database. Size the open-file limit (`ulimit -n`) for the peak open count
-  under a burst, not for `max_open`. The default limit on macOS is 256: 594
-  open databases go past it.
+  database. With `max_open_policy = "soft"`, size the open-file limit
+  (`ulimit -n`) for the peak open count under a burst, not for `max_open`.
+  The default limit on macOS is 256: 594 open databases go past it, and the
+  burst fails with "too many open files". Use `"wait"` or `"refuse"` to bound
+  the count: `max_open × (2 × pool_size + 1)` descriptors.
 - When connections reach `database.max_connections_warn_threshold`
   (default 100), the boot warning gives the open files at `max_open`. The
   formula is `2 × connections + databases`. It counts the control database.

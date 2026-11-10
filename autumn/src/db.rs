@@ -4745,8 +4745,13 @@ impl Drop for Db {
                 .saturating_duration_since(self.start_time);
             let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
-            // Record DB query metric. Composed on the stack: this runs once
-            // per request that extracts `Db`.
+            // The hold is not a query. Record it under the route alone.
+            // Compose both keys on the stack. This code runs once for each
+            // `Db`.
+            metrics.record_db_connection_hold_fmt(format_args!("{route_key}"), elapsed_ms);
+            // Deprecated: the old `"<route> SELECT"` query key. It records the
+            // same sample. Remove this call in the next release. Until then,
+            // dashboards can move to `db_connection_holds`.
             metrics.record_db_query_fmt(format_args!("{route_key} SELECT"), elapsed_ms);
             // Deliberately not recorded into the Server-Timing per-request
             // accumulator. `elapsed` here is the whole connection
@@ -4934,6 +4939,16 @@ mod tests {
         route: &str,
         held: std::time::Duration,
     ) -> Vec<crate::log::capture::CapturedLogEntry> {
+        hold_with_metrics(route, held, crate::middleware::MetricsCollector::new()).await
+    }
+
+    /// As [`logs_after_a_hold`], but the `Db` records into `metrics`.
+    #[cfg(feature = "sqlite")]
+    async fn hold_with_metrics(
+        route: &str,
+        held: std::time::Duration,
+        metrics: crate::middleware::MetricsCollector,
+    ) -> Vec<crate::log::capture::CapturedLogEntry> {
         use crate::log::capture::{LogBuffer, LogCaptureLayer};
         use crate::log::filter::ParameterFilter;
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -4956,7 +4971,7 @@ mod tests {
             statement_timeout: None,
             idle_in_transaction_timeout: None,
             route_key: Some(super::RouteKey::Composed(route.to_owned())),
-            metrics: Some(crate::middleware::MetricsCollector::new()),
+            metrics: Some(metrics),
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
             clock: std::sync::Arc::new(clock.clone()),
@@ -4966,6 +4981,54 @@ mod tests {
         clock.advance(held);
         drop(db);
         logs.snapshot(None, None)
+    }
+
+    /// The hold goes in `db_connection_holds` under the route. The old
+    /// `"<route> SELECT"` query key stays for one release, with the same
+    /// sample. It is deprecated.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_connection_hold_is_recorded_as_a_hold() {
+        let metrics = crate::middleware::MetricsCollector::new();
+        hold_with_metrics(
+            "POST /census",
+            std::time::Duration::from_millis(6653),
+            metrics.clone(),
+        )
+        .await;
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.db_connection_holds.len(),
+            1,
+            "{:?}",
+            snap.db_connection_holds
+        );
+        let hold = &snap.db_connection_holds["POST /census"];
+        assert_eq!(hold.count, 1);
+        assert_eq!(hold.p50_ms, 6653);
+
+        let legacy = &snap.db_queries["POST /census SELECT"];
+        assert_eq!(legacy.count, 1, "the deprecated key stays one release");
+        assert_eq!(legacy.p50_ms, 6653);
+        assert_eq!(snap.db_queries.len(), 1, "{:?}", snap.db_queries);
+    }
+
+    /// The metric records a short hold too. Only the log uses the threshold.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_short_connection_hold_is_recorded() {
+        let metrics = crate::middleware::MetricsCollector::new();
+        hold_with_metrics(
+            "GET /fast",
+            std::time::Duration::from_millis(3),
+            metrics.clone(),
+        )
+        .await;
+        assert_eq!(
+            metrics.snapshot().db_connection_holds["GET /fast"].p50_ms,
+            3
+        );
     }
 
     /// A handler that holds `Db` across a long fan-out must not log the hold as
@@ -7619,8 +7682,8 @@ mod tests {
         use axum::routing::{any, get};
         use tower::ServiceExt;
 
-        /// Answers with the context's route key, then the metric key `Db`'s
-        /// drop records under it (composed on the stack, as `Drop` does).
+        /// Answers with the context's route key, then the two metric keys
+        /// `Db`'s drop records: the deprecated query key and the hold key.
         async fn handler(parts: axum::http::request::Parts) -> String {
             let ctx = RequestDbContext::from_parts(&parts, &TestDbState);
             assert!(
@@ -7635,14 +7698,16 @@ mod tests {
             let metrics = crate::middleware::MetricsCollector::new();
             if let Some(key) = &ctx.route_key {
                 metrics.record_db_query_fmt(format_args!("{key} SELECT"), 1);
+                metrics.record_db_connection_hold_fmt(format_args!("{key}"), 1);
             }
-            let metric_key = metrics
-                .snapshot()
-                .db_queries
+            let snapshot = metrics.snapshot();
+            let query_key = snapshot.db_queries.into_keys().next().unwrap_or_default();
+            let hold_key = snapshot
+                .db_connection_holds
                 .into_keys()
                 .next()
                 .unwrap_or_default();
-            format!("{route_key}\n{metric_key}")
+            format!("{route_key}\n{query_key}\n{hold_key}")
         }
 
         async fn body_of(app: Router, request: Request<Body>) -> String {
@@ -7663,7 +7728,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             body_of(app.clone(), request).await,
-            "GET /users/{id}\nGET /users/{id} SELECT"
+            "GET /users/{id}\nGET /users/{id} SELECT\nGET /users/{id}"
         );
 
         // An extension method too long for `Method`'s inline storage writes
@@ -7675,7 +7740,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             body_of(app, request).await,
-            "X-LONG-EXTENSION-VERB /dav/{*rest}\nX-LONG-EXTENSION-VERB /dav/{*rest} SELECT"
+            "X-LONG-EXTENSION-VERB /dav/{*rest}\n\
+             X-LONG-EXTENSION-VERB /dav/{*rest} SELECT\n\
+             X-LONG-EXTENSION-VERB /dav/{*rest}"
         );
 
         let (parts, ()) = Request::builder()

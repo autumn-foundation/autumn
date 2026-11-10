@@ -142,12 +142,16 @@ whenever the callee's table changes. Nothing can go stale.
   "method": "GET",
   "path": "/items/{id}",
   "request_type": "NoBody",
-  "response_type": "Item"
+  "response_type": "Item",
+  "handler": "get_item",
+  "response_path": "Item"
 }
 ```
 
-Types are described once, in their own `type.*.json` file, and referenced by
-name. `#[contract_checked]` reads them back **only to write a better message** —
+Types are described once, in their own `type.*.json` file. A type file holds
+the crate and the module of the source file. The endpoint holds each type's
+path as written, for example `shared::Item`. `#[contract_checked]` reads them
+back **only to write a better message** —
 naming the field a coverage failure is about, which a const-eval message (a
 literal) cannot compute for itself. Every assertion is emitted either way, so a
 descriptor that is missing, stale or wrong can mislabel a failure but can never
@@ -157,6 +161,9 @@ cause or hide one.
 method. `#[contract_checked]` writes a `caller.*.json` file: the read-set and
 write-set of each call. `autumn contracts export` uses these two to find what
 each deployed caller reads and sends.
+
+In the export pass only, each `routes![…]` call writes a `routes.*.json`
+file: the handlers it registers.
 
 `#[event]` writes an `event.*.json` file: the topic, the version and the
 payload shape. `#[listener]` and `#[event_consumer]` write a
@@ -193,12 +200,27 @@ descriptor that cannot be written is a compile error. The bundle is sorted JSON
 with no paths and no times. Two exports of the same source give the same bytes.
 Store the bundle with each release.
 
+The export finds each type by its path, its crate, and the module of its
+source file:
+
+* A path that starts with a crate name (`shared::Item`) is that crate's
+  type. A renamed dependency counts too.
+* A bare name (`Item`) is the type defined in the same module, if there is
+  one. Else it is the one type of that name in the crate or in a crate it
+  depends on.
+* When more than one type can be meant, the export stops. Write the full
+  path in the signature, for example `Json<crate::dto::Item>`.
+
+`--from <dir>` joins a directory of descriptors that a build already wrote.
+No build runs, and there is no dependency graph, so a bare name can come
+from any crate in the directory.
+
 Use `-p` to export some packages only. The default is the whole workspace. The
 pass checks libraries and binaries. Callers in tests and examples are not part
 of the contract.
 
 After an export, the next normal `cargo check` rebuilds the crates that use
-the wire macros once, because the tracked value changed back.
+the wire macros or `routes![…]` once, because the tracked value changed back.
 
 ### Check against what is deployed
 
@@ -228,6 +250,10 @@ serves with the types of its release. The rules:
   route that no endpoint serves is a break, also with no known caller.
   Path parameter names do not count: `/items/{id}` and `/items/{item_id}` are
   the same route.
+* **Router.** An `#[endpoint]` that no `routes![…]` in the pass registers is
+  not served. Removing a handler from its router is a removed route. A new
+  caller of such a route is a break in both orders. A caller that the
+  deployed release already left without a route is not a new break.
 * **Response read.** The callee must produce each field the caller reads.
 * **Response decode.** The callee must always produce each field the caller's
   type needs to decode, also when the caller does not read it.
@@ -240,6 +266,12 @@ serves with the types of its release. The rules:
 * **Body.** A caller that sends no body must not meet a callee that reads
   one. A body that is a JSON array (`Vec<T>`) must stay an array, and an
   object must stay an object.
+* **Unit.** A unit struct (`struct Empty;`) is JSON `null`. An empty struct
+  (`struct Empty {}`) is `{}`. A change from one to the other is a break in
+  both orders. This also holds for list elements and nested types.
+* **Nested types.** A field whose type is a `WireShape` type is compared
+  field by field, with the same rules. A break names the path, for example
+  `details.color`.
 * **Field types.** A field's Rust type must not change. Path prefixes do not
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.
@@ -305,8 +337,12 @@ the removal of a topic that no bundled consumer reads. An event without
 `name` is not in the bundle. A bundle from an older CLI has no events. Then
 the check finds no deployed consumer to protect.
 
-A bundle with events has format 2. A bundle with no events keeps format 1
-and the same bytes. An older CLI refuses format 2.
+The export writes bundle format 3. It records nested types, the `unit`
+flag, and endpoints that no router registers. An older CLI refuses it. This
+CLI reads formats 1 to 3. With a bundle of format 1 or 2, the check
+compares nested types by name only. It does not compare the `unit` flag of a
+body or a nested type. It compares the `unit` flag of an event in every
+format.
 
 ### Deploy order
 
@@ -415,6 +451,21 @@ A descriptor that is not true of the code is worse than none, so
 * `#[cfg_attr(…, serde(…))]`, and a field behind `#[cfg(…)]` — the macro
   cannot see the cfg, so it cannot know which shape the build has.
 
+The export refuses a field whose type has no `WireShape` descriptor and is
+not a known leaf (a primitive, `String`, a standard container,
+`serde_json::Value`, `Uuid`, a `chrono` or `time` type, `Decimal`, `Url`,
+and similar). An enum is the usual case. Mark such a field
+`#[wire(opaque)]` to compare it by type name only:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    pub id: String,
+    #[wire(opaque)]
+    pub status: Status,
+}
+```
+
 `#[serde(with)]` and `#[serde(deserialize_with)]` *are* supported, and taken
 seriously: serde bypasses its own missing-field shortcut for such a field, so
 even an `Option<T>` becomes mandatory unless a default fills it in.
@@ -465,8 +516,16 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
   current one. More than two live releases need one check per pair.
 * The cross-release check knows only the callers in the bundle. It cannot see
   a client outside the workspace, so it keeps every deployed route.
-* The cross-release check compares a nested type by its name only. A change
-  inside a nested `WireShape` type does not show.
+* A field with `#[wire(opaque)]` is compared by its type name only. A change
+  inside its type does not show.
+* A nested type pair reports at most 100 issues. The verdict does not
+  change.
+* A known leaf is found by its last name. A type of your own named like a
+  leaf, such as `Date` or `Value`, needs no descriptor. It is compared by
+  name only.
+* A crate is judged by `routes![…]` once a call in the pass names one of its
+  endpoints. An endpoint that the crate mounts in another way, for example
+  with a hand-written route, then reads as not served.
 * An event consumer is checked only for the fields it names. A payload given
   whole to another function is not checked field by field.
 * An event without `name` is not in the bundle. A consumer of a hand-written
@@ -474,8 +533,15 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
   not in the bundle either. The export warns, and the check names each such
   consumer.
 * Two `#[event]` types with one type name in one crate stop the export.
-* A type is known by its name in its crate. Two types with one name in one
-  crate share one descriptor file.
+* The module of a type is the module of its source file. An inline `mod` is
+  not visible. Two types with one name in one source file share one
+  descriptor file.
+* The router check sees `routes![…]` calls, not the app's router. A
+  `routes()` function that is never mounted still counts. A crate counts as
+  served when no `routes![…]` in the pass names one of its endpoints, for
+  example when its router is outside the `-p` set. So a router that drops
+  every endpoint of a crate does not show. A path that can name more than
+  one handler counts for each of them.
 * A service that is a caller and a callee ships as one unit in each window. A
   chain such as A to B to C can read as unsafe in any order, though B first is
   safe.
