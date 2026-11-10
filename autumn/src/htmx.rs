@@ -864,7 +864,9 @@ mod tests {
     /// one-time code format. It increased them from 61 KiB and 18 KiB.
     /// Issue #3417 added the tree keys and the hidden-subtree skip. It
     /// increased them from 70 KiB and 20 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 72 * 1024;
+    /// The direct upload hold for htmx requests increased the raw budget
+    /// from 72 KiB. The gzip budget did not change.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 74 * 1024;
     /// Gzip budget. Browsers download this size.
     const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 21 * 1024;
 
@@ -913,7 +915,8 @@ mod tests {
             // This request's own indicators, shared ones too: resolve the
             // inherited `hx-indicator` as htmx does.
             "function indicatorsOf(elt)",
-            "closest('[hx-indicator],[data-hx-indicator]')",
+            "targetsOf(elt, 'hx-indicator') || [elt]",
+            "elt.closest('[' + attr + '],[data-' + attr + ']')",
             "if (sel === 'this') return [host]",
             // The plain parts join again into one query.
             "querySelectorAll(css.join(','))",
@@ -937,6 +940,30 @@ mod tests {
             // restored node that sends its load request before the restore
             // event.
             "el.hasAttribute('data-autumn-busied') || !el.hasAttribute('aria-busy')",
+        ] {
+            assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
+        }
+    }
+
+    /// htmx sends no request that carries a form with a running direct
+    /// upload. The `submit` guard does not see such a request: htmx sends a
+    /// button request on `click`. The browser tests are in
+    /// `widgets_direct_upload_browser.rs`.
+    #[test]
+    fn widgets_js_holds_htmx_requests_during_a_direct_upload() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS).expect("utf8");
+        for needle in [
+            "document.addEventListener('htmx:beforeRequest'",
+            // htmx 2 sends the requester form, the closest form for a
+            // request that is not GET, and each `hx-include` target.
+            "targetsOf(elt, 'hx-include')",
+            "verb !== 'get'",
+            // Only a click or a submit gets the message and the focus move.
+            "ev.type === 'click' || ev.type === 'submit'",
+            // A request on `autumn:upload` sends the new key, so it goes.
+            "ev.type.indexOf('autumn:upload') === 0",
+            // `<sel/>` is `sel`, as in htmx.
+            "function bare(s)",
         ] {
             assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
         }
