@@ -580,6 +580,44 @@ in a const context, so no call changes.
 `..OutboxConfig::default()`. A codemod cannot know which ending the app
 wants.
 
+### Metrics: `MetricsSnapshot` has a `db_connection_holds` field and is non-exhaustive
+
+**Why:** the `Db` extractor recorded its connection hold time as a query,
+under `db_queries["<route> SELECT"]` (issue #3579). The hold now has its own
+map, `db_connection_holds`, keyed by the route. See
+[Metrics: the `"<route> SELECT"` key is deprecated](#metrics-the-route-select-key-is-deprecated).
+
+`MetricsSnapshot` is now `#[non_exhaustive]`, so a later field does not
+break your code.
+
+**You are affected only if your code builds a `MetricsSnapshot` with a
+struct literal, or destructures one without `..`.** Code that reads
+`/actuator/metrics` or calls `MetricsCollector::snapshot` needs no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+MetricsSnapshot {
+    http,
+    idempotency,
+    db_queries,
+    read_your_writes_pins_total: 0,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+// A literal does not compile. Get the snapshot from the collector.
+let snapshot = state.metrics().snapshot();
+// A destructure ends with `..`.
+let MetricsSnapshot { db_queries, db_connection_holds, .. } = snapshot;
+```
+
+**Automation:** `manual` — a test that builds a snapshot by hand must record
+into a `MetricsCollector` and call `snapshot()`. A codemod cannot write those
+samples.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -715,6 +753,34 @@ What to do:
    does not show the new comment.
 4. Index the comments table: `(commentable_type, commentable_id, created_at,
    id) WHERE parent_id IS NULL AND deleted_at IS NULL`, and `parent_id`.
+
+### Metrics: the `"<route> SELECT"` key is deprecated
+
+`db_queries["<route> SELECT"]` from the `Db` extractor is not a query. It is
+the time a request held its connection, from checkout to release. It includes
+all statements and all other work in the hold, for example a fan-out. A route
+that only writes also shows it.
+
+This release records each hold in two places:
+
+| Key | Status |
+| --- | --- |
+| `db_queries["POST /census SELECT"]` | Deprecated for holds. The next release stops the `Db` extractor writing it. |
+| `db_connection_holds["POST /census"]` | New. Use this one. |
+
+`run_instrumented` also records a real `SELECT` under `"<route> SELECT"`.
+In this release, that key can mix holds and statements. After the next
+release, it holds only statements.
+
+What to do:
+
+1. Move each dashboard and alert that reads `db_queries["<route> SELECT"]`
+   for the hold to `db_connection_holds["<route>"]`. The new key has no
+   verb. A `Db` from a shard adds the shard, for example
+   `"GET /notes shard=shard0"`.
+2. Read statement times from `db_queries`. They come only from
+   `autumn_web::db::run_instrumented`. If the app does not call it,
+   `db_queries` is empty after the next release.
 
 ## Deprecations retained from `{X.Y}`
 
