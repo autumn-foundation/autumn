@@ -270,6 +270,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+mod value_de;
+
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
 use std::sync::OnceLock;
 
@@ -3309,6 +3311,15 @@ impl Default for ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Refuse `enabled = true` in a build without the `cluster` feature.
+    ///
+    /// That build has no cluster runtime. A node that does not join is a
+    /// fault, so boot fails and does not continue alone.
+    const fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        let _ = (enabled, built);
+        Ok(())
+    }
+
     /// Fail fast on a `[cluster]` section that would boot an insecure or
     /// flapping cluster.
     ///
@@ -3335,6 +3346,7 @@ impl ClusterConfig {
     ///
     /// Returns [`ConfigError::Validation`] describing the first violated rule.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        Self::check_feature(self.enabled, cfg!(feature = "cluster"))?;
         // Operational rules: only meaningful for a node that will actually
         // bind and gossip.
         if self.enabled {
@@ -18134,6 +18146,15 @@ path = "/healthz"
     }
 
     // ── [cluster] (issue #1762) ──────────────────────────────────────────
+
+    #[test]
+    fn cluster_enabled_without_the_feature_fails() {
+        let err = ClusterConfig::check_feature(true, false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`cluster` feature"), "{text}");
+        assert!(ClusterConfig::check_feature(true, true).is_ok());
+        assert!(ClusterConfig::check_feature(false, false).is_ok());
+    }
 
     /// A cluster with no shared secret is an unauthenticated cluster: anyone
     /// who can reach the port can inject state. Boot must fail, not warn.

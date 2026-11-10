@@ -1865,10 +1865,13 @@ mod tests {
     // ── cold-start budgets ────────────────────────────────────────────────
 
     #[test]
-    fn budget_cold_start_hello_p95_is_130000ms() {
-        // Recalibrated budget (issue #2309). The no-DB cold start must stay
-        // at or under p95 130s. See docs/guide/dev-loop-latency.md for why.
-        assert_eq!(budget_for(ChangeClass::ColdStartHello).p95_ms, 130_000);
+    fn budget_cold_start_hello_is_tightened_from_ci_data() {
+        // Issue #2795. CI measured 89-104s after the compile gates. The
+        // budget keeps about 15% above the slowest sample.
+        let budget = budget_for(ChangeClass::ColdStartHello);
+        assert_eq!(budget.p50_ms, 100_000);
+        assert_eq!(budget.p95_ms, 120_000);
+        assert_eq!(budget.max_ms, 145_000);
     }
 
     #[test]
@@ -1910,10 +1913,10 @@ mod tests {
             table.to_lowercase().contains("cold start"),
             "table must mention cold start, got:\n{table}"
         );
-        // 130s p95 budget for the gated no-DB shape must be visible.
+        // The 120s p95 budget for the gated no-DB shape must be visible.
         assert!(
-            table.contains("130000") || table.contains("130 000"),
-            "table must show the 130s p95 budget, got:\n{table}"
+            table.contains("120000") || table.contains("120 000"),
+            "table must show the 120s p95 budget, got:\n{table}"
         );
     }
 
