@@ -260,7 +260,7 @@ impl Bundle {
     /// holds no endpoint and no event.
     pub fn from_dir_with(dir: &Path, crates: Option<&Crates>) -> Result<Self, String> {
         let endpoints: Vec<EndpointDescriptor> = read_all(dir, "endpoint.")?;
-        let types: Vec<TypeDescriptor> = read_all(dir, "type.")?;
+        let mut types: Vec<TypeDescriptor> = read_all(dir, "type.")?;
         let clients: Vec<ClientDescriptor> = read_all(dir, "client.")?;
         let callers: Vec<CallerDescriptor> = read_all(dir, "caller.")?;
         let events: Vec<EventDescriptor> = read_all(dir, "event.")?;
@@ -274,6 +274,17 @@ impl Bundle {
             ));
         }
 
+        // An `#[event]` payload implements `WireShape` but writes only its
+        // `event.*` file. A field can still name it, so it is a type too.
+        types.extend(events.iter().filter(|e| !e.opaque).map(|e| TypeDescriptor {
+            krate: e.krate.clone(),
+            module: e.module.clone(),
+            shape: WireTypeDescriptor {
+                name: e.type_name.clone(),
+                unit: e.unit || e.shape.unit,
+                ..e.shape.clone()
+            },
+        }));
         let mut nested = Nested::new(&types, crates);
         let served = Served::new(&routes, &endpoints, crates);
         let mut seen = BTreeSet::new();
@@ -563,7 +574,26 @@ fn registers(
         [] => (own, marker.module.clone()),
         ["crate", rest @ ..] => (own, join_module(&root, rest)),
         ["self", rest @ ..] => (own, local(rest)),
-        ["super", ..] => (own, root),
+        ["super", ..] => {
+            // Each `super` goes up one module, but not above the crate root.
+            let floor = crate_root(&here).len();
+            let mut base = here.clone();
+            let mut rest = prefix;
+            while let Some((&"super", tail)) = rest.split_first() {
+                if base.len() > floor {
+                    base.pop();
+                }
+                rest = tail;
+            }
+            (
+                own,
+                base.iter()
+                    .chain(rest)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            )
+        }
         [first, rest @ ..] => {
             let named_crate = crates.map_or_else(
                 || {
@@ -1887,6 +1917,48 @@ mod tests {
         );
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert!(!bundle.endpoint("catalog", "get_item").expect("ep").unrouted);
+    }
+
+    #[test]
+    fn a_super_path_registers_the_handler_in_that_parent_module() {
+        let dir = fixture();
+        let mut root = endpoint("list", "/list", "NoBody");
+        root.module = String::new();
+        write(dir.path(), "endpoint.mesh-catalog.catalog.list.json", &root);
+        let mut nested = endpoint("api_list", "/api/items", "NoBody");
+        nested.handler = "list".to_owned();
+        nested.module = "api::items".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.api_list.json",
+            &nested,
+        );
+        let mut marker = routes("mesh-catalog", &["super::items::list", "get_item"]);
+        marker.module = "api::router".to_owned();
+        write(dir.path(), "routes.mesh-catalog.k.json", &marker);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(!bundle.endpoint("catalog", "api_list").expect("ep").unrouted);
+        assert!(bundle.endpoint("catalog", "list").expect("ep").unrouted);
+    }
+
+    #[test]
+    fn an_event_payload_is_a_nested_type() {
+        let dir = event_fixture();
+        write(
+            dir.path(),
+            "type.mesh-catalog.Item.json",
+            &typed(
+                "mesh-catalog",
+                "",
+                "Item",
+                &[("id", "String"), ("last", "ContactUpdated")],
+            ),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let ep = bundle.endpoint("catalog", "get_item").expect("ep");
+        let last = ep.response.produced("last").expect("field");
+        assert_eq!(last.nested, ["core::ContactUpdated"]);
+        assert!(bundle.nested("core::ContactUpdated").is_some());
     }
 
     #[test]
