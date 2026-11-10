@@ -617,7 +617,8 @@ impl MetricsCollector {
     /// The key is the route, for example `"POST /census"`. The time is from
     /// checkout to release. It includes all statements and all other work in
     /// the hold. It is not a query time. It goes in
-    /// [`MetricsSnapshot::db_connection_holds`], not in `db_queries`.
+    /// `db_connection_holds` in the `/actuator/metrics` JSON, not in
+    /// `db_queries`.
     pub fn record_db_connection_hold(&self, route: &str, held_ms: u64) {
         self.record_db_series(DbSeries::Hold, route, held_ms);
     }
