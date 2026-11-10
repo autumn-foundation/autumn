@@ -18,7 +18,7 @@ use std::path::Path;
 use autumn_macros_support::wire::{
     CallerCall, CallerDescriptor, ClientDescriptor, Crates, EndpointDescriptor, EventDescriptor,
     ListenerDescriptor, Resolved, RoutesDescriptor, Scope, TypeDescriptor, WireTypeDescriptor,
-    crate_root, is_known_leaf, resolve_type, type_paths,
+    child_module, crate_root, is_known_leaf, resolve_type, type_paths,
 };
 use serde::{Deserialize, Serialize};
 
@@ -397,7 +397,8 @@ fn body_shape(
             ..WireTypeDescriptor::default()
         }),
         None => Err(format!(
-            "endpoint `{}` uses type `{path}`, which has no descriptor; derive `WireShape` on it",
+            "endpoint `{}` uses type `{path}`, which has no descriptor. Derive `WireShape` on \
+             it. If `{path}` is a `use … as` or `type` alias, write the path of the type itself",
             endpoint.id()
         )),
     }
@@ -461,7 +462,9 @@ impl<'a> Nested<'a> {
                         return Err(format!(
                             "{owner}, field `{}`: type `{path}` has no `WireShape` descriptor, \
                              so the check cannot compare it. Derive `WireShape` on it, or mark \
-                             the field `#[wire(opaque)]` to compare it by type name only",
+                             the field `#[wire(opaque)]` to compare it by type name only. If \
+                             `{path}` is a `use … as` or `type` alias, write the path of the \
+                             type itself",
                             field.rust_name
                         ));
                     }
@@ -563,21 +566,17 @@ fn registers(
         .split("::")
         .filter(|m| !m.is_empty())
         .collect();
-    let root = crate_root(&here).join("::");
-    let local = |rest: &[&str]| {
-        here.iter()
-            .chain(rest)
-            .copied()
-            .collect::<Vec<_>>()
-            .join("::")
-    };
+    let root = crate_root(&here);
+    let local = |rest: &[&str]| child_module(&here, rest);
+    // A path that names a crate (`app::dto::list`) names its library.
+    let mut by_name = absolute;
     let (krate, module) = match prefix {
         [] => (own, marker.module.clone()),
-        ["crate", rest @ ..] => (own, join_module(&root, rest)),
+        ["crate", rest @ ..] => (own, child_module(root, rest)),
         ["self", rest @ ..] => (own, local(rest)),
         ["super", ..] => {
             // Each `super` goes up one module, but not above the crate root.
-            let floor = crate_root(&here).len();
+            let floor = root.len();
             let mut base = here.clone();
             let mut rest = prefix;
             while let Some((&"super", tail)) = rest.split_first() {
@@ -586,14 +585,7 @@ fn registers(
                 }
                 rest = tail;
             }
-            (
-                own,
-                base.iter()
-                    .chain(rest)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join("::"),
-            )
+            (own, child_module(&base, rest))
         }
         // A child module of this one shadows a crate of the same name, as in
         // Rust. An absolute path (`::catalog::list`) always names a crate.
@@ -616,8 +608,14 @@ fn registers(
                 |g| g.dependency(&marker.krate, first).map(norm),
             );
             match named_crate {
-                Some(krate) => (krate, rest.join("::")),
-                None if *first == own => (own, join_module(&root, rest)),
+                Some(krate) => {
+                    by_name = true;
+                    (krate, rest.join("::"))
+                }
+                None if *first == own => {
+                    by_name = true;
+                    (own, child_module(root, rest))
+                }
                 None => (own, local(prefix)),
             }
         }
@@ -632,6 +630,14 @@ fn registers(
         .filter(|(_, e)| e.module == module)
         .map(|(i, _)| *i)
         .collect();
+    let in_binary_root = !by_name
+        && here.first() == Some(&"main")
+        && krate == norm(&marker.krate)
+        && !module.is_empty()
+        && module != "main";
+    if in_binary_root && !in_module.is_empty() {
+        return (with_binary_root(in_module, &in_crate), true);
+    }
     match (in_crate.is_empty(), in_module.len()) {
         (true, _) => {
             let guessed = named
@@ -646,13 +652,22 @@ fn registers(
     }
 }
 
-/// `root::rest`, or `rest` at the library root.
-fn join_module(root: &str, rest: &[&str]) -> String {
-    std::iter::once(root)
-        .filter(|r| !r.is_empty())
-        .chain(rest.iter().copied())
-        .collect::<Vec<_>>()
-        .join("::")
+/// `in_module` and each handler of `main` in `in_crate`.
+///
+/// `main` can hold an inline `mod` of the named module, and the module file
+/// can be the library's. So a path from the binary root also registers a
+/// handler of `main`.
+fn with_binary_root(
+    mut in_module: Vec<usize>,
+    in_crate: &[(usize, &EndpointDescriptor)],
+) -> Vec<usize> {
+    in_module.extend(
+        in_crate
+            .iter()
+            .filter(|(_, e)| e.module == "main")
+            .map(|(i, _)| *i),
+    );
+    in_module
 }
 
 /// A package name as source writes it: `-` becomes `_`.
@@ -1928,6 +1943,92 @@ mod tests {
         );
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert!(!bundle.endpoint("catalog", "get_item").expect("ep").unrouted);
+    }
+
+    #[test]
+    fn a_module_path_in_the_binary_root_registers_only_that_module_file() {
+        // `src/items.rs` is `items`, and `src/main.rs` is `main`.
+        let dir = fixture();
+        for module in ["items", "orders"] {
+            let mut list = endpoint(&format!("{module}_list"), &format!("/{module}"), "NoBody");
+            list.handler = "list".to_owned();
+            list.module = module.to_owned();
+            write(
+                dir.path(),
+                &format!("endpoint.mesh-catalog.catalog.{module}_list.json"),
+                &list,
+            );
+        }
+        for (key, handler) in [
+            ("a", "items::list"),
+            ("b", "crate::items::list"),
+            ("c", "self::items::list"),
+        ] {
+            let mut marker = routes("mesh-catalog", &[handler, "get_item"]);
+            marker.module = "main".to_owned();
+            write(
+                dir.path(),
+                &format!("routes.mesh-catalog.{key}.json"),
+                &marker,
+            );
+            let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+            assert!(
+                !bundle
+                    .endpoint("catalog", "items_list")
+                    .expect("ep")
+                    .unrouted,
+                "{handler}"
+            );
+            assert!(
+                bundle
+                    .endpoint("catalog", "orders_list")
+                    .expect("ep")
+                    .unrouted,
+                "{handler}"
+            );
+            std::fs::remove_file(dir.path().join(format!("routes.mesh-catalog.{key}.json")))
+                .expect("remove marker");
+        }
+    }
+
+    #[test]
+    fn a_module_path_in_the_binary_root_also_registers_a_binary_root_handler() {
+        // `main` can hold an inline `mod dto`, and `src/dto.rs` can be the
+        // library's file.
+        let dir = fixture();
+        for module in ["main", "dto"] {
+            let mut list = endpoint(&format!("{module}_list"), &format!("/{module}"), "NoBody");
+            list.handler = "list".to_owned();
+            list.module = module.to_owned();
+            write(
+                dir.path(),
+                &format!("endpoint.mesh-catalog.catalog.{module}_list.json"),
+                &list,
+            );
+        }
+        let mut marker = routes("mesh-catalog", &["crate::dto::list", "get_item"]);
+        marker.module = "main".to_owned();
+        write(dir.path(), "routes.mesh-catalog.k.json", &marker);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(
+            !bundle
+                .endpoint("catalog", "main_list")
+                .expect("ep")
+                .unrouted
+        );
+        assert!(!bundle.endpoint("catalog", "dto_list").expect("ep").unrouted);
+        // A path that names the package names its library only.
+        let mut marker = routes("mesh-catalog", &["mesh_catalog::dto::list", "get_item"]);
+        marker.module = "main".to_owned();
+        write(dir.path(), "routes.mesh-catalog.k.json", &marker);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(
+            bundle
+                .endpoint("catalog", "main_list")
+                .expect("ep")
+                .unrouted
+        );
+        assert!(!bundle.endpoint("catalog", "dto_list").expect("ep").unrouted);
     }
 
     #[test]

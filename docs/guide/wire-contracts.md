@@ -253,7 +253,9 @@ serves with the types of its release. The rules:
 * **Router.** An `#[endpoint]` that no `routes![…]` in the pass registers is
   not served. Removing a handler from its router is a removed route. A new
   caller of such a route is a break in both orders. A caller that the
-  deployed release already left without a route is not a new break.
+  deployed release already left without a route is not a new break. See
+  [Limits](#limits-of-the-first-slice) for the cases that the router check
+  cannot see.
 * **Response read.** The callee must produce each field the caller reads.
 * **Response decode.** The callee must always produce each field the caller's
   type needs to decode, also when the caller does not read it.
@@ -271,7 +273,8 @@ serves with the types of its release. The rules:
   both orders. This also holds for list elements and nested types.
 * **Nested types.** A field whose type is a `WireShape` type is compared
   field by field, with the same rules. A break names the path, for example
-  `details.color`.
+  `details.color`. A caller's read-set is known at the top level only (see
+  [Limits](#limits-of-the-first-slice)).
 * **Field types.** A field's Rust type must not change. Path prefixes do not
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.
@@ -523,9 +526,6 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * A known leaf is found by its last name. A type of your own named like a
   leaf, such as `Date` or `Value`, needs no descriptor. It is compared by
   name only.
-* A crate is judged by `routes![…]` once a call in the pass names one of its
-  endpoints. An endpoint that the crate mounts in another way, for example
-  with a hand-written route, then reads as not served.
 * An event consumer is checked only for the fields it names. A payload given
   whole to another function is not checked field by field.
 * An event without `name` is not in the bundle. A consumer of a hand-written
@@ -535,13 +535,41 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * Two `#[event]` types with one type name in one crate stop the export.
 * The module of a type is the module of its source file. An inline `mod` is
   not visible. Two types with one name in one source file share one
-  descriptor file.
+  descriptor file. A bare name in a file with an inline `mod` that defines a
+  type of that name means that type, also when the file imports another. In
+  `src/main.rs`, a path such as `crate::dto::Item` is refused when
+  `src/main.rs` also has a type of that name: it can be an inline `mod dto`,
+  and `src/dto.rs` can belong to the library.
 * The router check sees `routes![…]` calls, not the app's router. A
-  `routes()` function that is never mounted still counts. A crate counts as
-  served when no `routes![…]` in the pass names one of its endpoints, for
-  example when its router is outside the `-p` set. So a router that drops
-  every endpoint of a crate does not show. A path that can name more than
-  one handler counts for each of them.
+  `routes()` function that is never mounted still counts. A path that can
+  name more than one handler counts for each of them.
+* The router check judges a crate only when a `routes![…]` in the pass names
+  one of its endpoints. Then an endpoint that the crate mounts in another
+  way, for example with a hand-written route, reads as not served. A crate
+  that no `routes![…]` names counts as served, for example when its router is
+  outside the `-p` set. So a router that drops every endpoint of a crate does
+  not show.
+* A `routes![get_item]` entry with no crate path, for a handler of another
+  crate (through a `use`), registers that handler. It does not judge that
+  crate, because the name can also be a local function. Write
+  `routes![mesh_catalog::get_item]` to have the check judge it.
+* A caller's read-set is known at the top level only. `item.details.color`
+  reads `details`. So the check does not see the removal of an *optional*
+  field of a nested type that a caller reads. A *required* nested field is
+  safe: the caller's type cannot decode without it. A write-set is also top
+  level only.
+* A request or response type is found by the path in the signature. A path
+  through a re-export, such as `crate::dto::Item` for `shared::Item`, is
+  refused when another crate has a type of that name. Write the path where the
+  type is defined. The check cannot tell an inline `mod` from a module file
+  with no `WireShape` type. So a re-export in such a file can still resolve to
+  a type of a parent file.
+* A `use … as` alias or a `type` alias is read by its own name. If a local
+  type has that name, the check compares that type. Write the path of the type
+  itself.
+* A user type named `NoBody` and the framework's `NoBody` have one name. A
+  bare `NoBody` that the handler's module does not define is refused. Write
+  its path, for example `crate::dto::NoBody`.
 * A service that is a caller and a callee ships as one unit in each window. A
   chain such as A to B to C can read as unsafe in any order, though B first is
   safe.

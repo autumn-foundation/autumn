@@ -22,8 +22,8 @@ use quote::quote;
 
 use crate::wire::ir::{
     CallerDescriptor, ClientDescriptor, EndpointDescriptor, EventDescriptor, ListenerDescriptor,
-    Resolved, ResolvedEndpoint, RoutesDescriptor, Scope, TypeDescriptor, WireTypeDescriptor,
-    module_of_file, resolve_type,
+    NO_BODY, Resolved, ResolvedEndpoint, RoutesDescriptor, Scope, TypeDescriptor,
+    WireTypeDescriptor, module_of_file, resolve_type,
 };
 
 /// The environment variable that names the contract directory.
@@ -283,7 +283,13 @@ fn resolve(endpoint: EndpointDescriptor, types: &[TypeDescriptor]) -> ResolvedEn
             _ => WireTypeDescriptor::default(),
         }
     };
-    let request = shape(endpoint.request_path());
+    // A descriptor without the flag predates it: infer it.
+    let has_body = endpoint.has_body || endpoint.request_type != NO_BODY;
+    let request = if has_body {
+        shape(endpoint.request_path())
+    } else {
+        WireTypeDescriptor::default()
+    };
     let response = shape(endpoint.response_path());
     ResolvedEndpoint {
         endpoint,
@@ -402,6 +408,18 @@ mod tests {
         write_type(&dir, &item_type("shared")).expect("writes");
         let got = find_by_ident(&dir, "get_item_endpoint");
         assert_eq!(got[0].response.serialized[0].rust_name, "id");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_endpoint_with_no_body_has_an_empty_request_beside_a_user_no_body() {
+        let dir = scratch("nobody");
+        write_endpoint(&dir, &endpoint("catalog", "get_item")).expect("writes");
+        let mut user = item_type("catalog");
+        user.shape.name = "NoBody".to_owned();
+        write_type(&dir, &user).expect("writes");
+        let got = find_by_ident(&dir, "get_item_endpoint");
+        assert_eq!(got[0].request.serialized, [] as [WireFieldDescriptor; 0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 mod resolve;
 
 pub use resolve::{
-    Crates, FRAMEWORK_CRATE, NO_BODY, Resolved, Scope, crate_root, is_known_leaf, module_of_file,
-    resolve_type, type_id, type_paths,
+    Crates, FRAMEWORK_CRATE, NO_BODY, Resolved, Scope, child_module, crate_root, is_known_leaf,
+    module_of_file, resolve_type, type_id, type_paths,
 };
 
 /// One field of a request or response type, as serde treats it.
