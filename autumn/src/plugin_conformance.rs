@@ -5,6 +5,10 @@
 //! this module in integration tests to get a pass/fail conformance report
 //! before publishing their crate.
 //!
+//! `autumn plugin-check` runs these same check functions and report types on
+//! the routes it collects from the built binary (issue #2828). Change a rule
+//! here, and the CLI gets the change too.
+//!
 //! # Quick start
 //!
 //! ```rust,no_run
@@ -358,9 +362,14 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 /// path, not the crate name. Only `AppBuilder::plugin` fills `registered_as`,
 /// so pass the contract from `AppBuilder::plugin_contracts`. Without it, every
 /// plugin route counts.
-fn check_no_routes(config: &ConformanceConfig, routes: &[RouteInfo]) -> CheckResult {
-    let plugin_name = config.plugin_name.as_str();
-    let contract = config.contract.as_ref();
+///
+/// `autumn plugin-check --no-routes` uses this same rule.
+#[must_use]
+pub fn check_no_routes(
+    plugin_name: &str,
+    contract: Option<&PluginContract>,
+    routes: &[RouteInfo],
+) -> CheckResult {
     let names: Vec<&str> = std::iter::once(plugin_name)
         .chain(contract.map(|c| c.plugin.as_str()))
         .chain(contract.and_then(|c| c.registered_as.as_deref()))
@@ -395,6 +404,22 @@ fn check_no_routes(config: &ConformanceConfig, routes: &[RouteInfo]) -> CheckRes
             ),
             diagnostics: vec![],
         }
+    }
+}
+
+/// `route-prefix` for a plugin that declares `no_routes` and a prefix. The two
+/// contradict each other, so the check fails. It does not pass on no routes.
+///
+/// `autumn plugin-check` uses this same rule.
+#[must_use]
+pub fn check_prefix_with_no_routes(prefix: &str) -> CheckResult {
+    CheckResult {
+        name: "route-prefix".to_owned(),
+        status: CheckStatus::Fail,
+        message: format!(
+            "no_routes and the prefix {prefix} contradict each other; set one of them"
+        ),
+        diagnostics: vec![],
     }
 }
 
@@ -630,7 +655,9 @@ pub fn check_sensitive_surfaces(
     } else {
         let mut diagnostics = undeclared;
         diagnostics.push(
-            "Add .sensitive_route(path_prefix, auth_mechanism) to ConformanceConfig".to_owned(),
+            "Declare each with ConformanceConfig::sensitive_route(path_prefix, auth_mechanism) \
+             or `autumn plugin-check --sensitive-route PATH:DESCRIPTION`"
+                .to_owned(),
         );
         CheckResult {
             name: "sensitive-surfaces".to_owned(),
@@ -811,23 +838,18 @@ pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> Conf
     let mut checks = Vec::new();
 
     if config.no_routes {
-        checks.push(check_no_routes(config, routes));
+        checks.push(check_no_routes(
+            &config.plugin_name,
+            config.contract.as_ref(),
+            routes,
+        ));
     } else {
         checks.push(check_route_attribution(&config.plugin_name, routes));
     }
 
     if let Some(ref prefix) = config.expected_prefix {
         checks.push(if config.no_routes {
-            // The same rule as a plugin index listing: a prefix for no routes
-            // is a contradiction, not a check that passes on nothing.
-            CheckResult {
-                name: "route-prefix".to_owned(),
-                status: CheckStatus::Fail,
-                message: format!(
-                    "no_routes and the prefix {prefix} contradict each other; set one of them"
-                ),
-                diagnostics: vec![],
-            }
+            check_prefix_with_no_routes(prefix)
         } else {
             check_route_prefix(
                 &config.plugin_name,
@@ -1253,6 +1275,42 @@ mod tests {
         ];
         let result = check_sensitive_surfaces("blog", &routes, &[]);
         assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    /// The CLI shows this report too, so the hint names both ways to
+    /// declare a sensitive route (#2828).
+    #[test]
+    fn sensitive_hint_names_the_library_and_the_cli_flag() {
+        let routes = vec![make_route("GET", "/admin/users", plugin("myplugin"))];
+        let result = check_sensitive_surfaces("myplugin", &routes, &[]);
+        let hint = result.diagnostics.last().expect("a hint line");
+        assert!(
+            hint.contains("ConformanceConfig::sensitive_route"),
+            "{hint}"
+        );
+        assert!(hint.contains("--sensitive-route"), "{hint}");
+        assert!(result.message.starts_with("1 "), "{}", result.message);
+    }
+
+    /// `check_no_routes` is public: `autumn plugin-check --no-routes` uses it.
+    #[test]
+    fn check_no_routes_counts_every_name_of_the_plugin() {
+        let mut contract = PluginContract::new("autumn-plugin-demo");
+        contract.registered_as = Some("demo::DemoPlugin".to_owned());
+        let crate_route = vec![make_route("GET", "/x", plugin("autumn-plugin-demo"))];
+        let result = check_no_routes("demo::DemoPlugin", Some(&contract), &crate_route);
+        assert_eq!(result.status, CheckStatus::Fail, "{}", result.message);
+        let result = check_no_routes("demo::DemoPlugin", Some(&contract), &[]);
+        assert_eq!(result.status, CheckStatus::Skip, "{}", result.message);
+    }
+
+    /// One rule for `no_routes` together with a prefix (#2828).
+    #[test]
+    fn prefix_with_no_routes_fails() {
+        let result = check_prefix_with_no_routes("/demo");
+        assert_eq!(result.name, "route-prefix");
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("/demo"), "{}", result.message);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use autumn_web::plugin_sandbox::{
 };
 use serde::Serialize;
 
-use crate::plugin_check::{self, ConformanceReport, ReportFormat};
+use crate::plugin_check::{self, PluginCheckReport, ReportFormat};
 use crate::routes::RouteInfo;
 
 /// Inputs to `autumn plugin package`.
@@ -162,7 +162,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_error: Option<String>,
     /// The route-conformance report.
-    pub conformance: ConformanceReport,
+    pub conformance: PluginCheckReport,
     /// The full consent summary, verbatim.
     pub consent: String,
     /// What this manifest asks for that the one named by `--against` did not
@@ -452,7 +452,7 @@ fn conformance_routes(manifest: &SandboxManifest) -> Vec<RouteInfo> {
             // contract (#1733) derives these from a handler's declared
             // extractors at macro-expansion time; a sandboxed route has no
             // such handler, `build_report` reads neither field, and neither is
-            // serialized — `ConformanceReport` carries only the checks. Giving
+            // serialized — the report carries only the checks. Giving
             // them a computed-looking value here would publish a claim nothing
             // derived and nothing reads. Empty matches every other
             // `RouteInfo` built by hand in this crate.
@@ -468,7 +468,7 @@ fn conformance_routes(manifest: &SandboxManifest) -> Vec<RouteInfo> {
 /// A sandboxed plugin needs no binary built and no process run: the manifest
 /// *is* the route table, and the runtime mounts exactly it. So the same checks
 /// `autumn plugin-check` applies to a native plugin apply here, offline.
-fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
+fn conformance(manifest: &SandboxManifest) -> PluginCheckReport {
     let routes = conformance_routes(manifest);
 
     // A sandboxed plugin holds no session or auth capability, so a route it
@@ -500,7 +500,7 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
     let granted = granted.join(", ");
     let gating =
         format!("sandboxed: no session, auth, filesystem or environment capability ({granted})");
-    let sensitive = vec![plugin_check::SensitiveRouteDecl {
+    let sensitive = vec![plugin_check::SensitiveRoute {
         path_pattern: manifest.prefix.clone(),
         auth_mechanism: gating.clone(),
     }];
@@ -550,7 +550,7 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
     // has already refused an ungrantable host, table, job type or slot by the
     // time this runs. The check reports authority; it does not adjudicate it.
     // Consent is `autumn plugin inspect`'s job, and it fails the verdict there.
-    report.checks.push(plugin_check::CheckResult {
+    report.report.checks.push(plugin_check::CheckResult {
         name: "capability-grants".to_owned(),
         status: plugin_check::CheckStatus::Pass,
         message: gating,

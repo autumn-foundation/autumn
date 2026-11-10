@@ -6940,10 +6940,10 @@ fn run_plugin_check_command(
         std::process::exit(1);
     });
 
-    let mut sensitive_routes: Vec<plugin_check::SensitiveRouteDecl> = Vec::new();
+    let mut sensitive_routes: Vec<plugin_check::SensitiveRoute> = Vec::new();
     for arg in sensitive_route_args {
         if let Some((path, desc)) = arg.split_once(':') {
-            sensitive_routes.push(plugin_check::SensitiveRouteDecl {
+            sensitive_routes.push(plugin_check::SensitiveRoute {
                 path_pattern: path.to_owned(),
                 auth_mechanism: desc.to_owned(),
             });
