@@ -1,0 +1,98 @@
+=== claim: claim_after.sql
+psql:schema.sql:2: NOTICE:  table "autumn_jobs" does not exist, skipping
+=== fixture: hist=1000000 sat=200000
+  status   | count  
+-----------+--------
+ completed | 970131
+ enqueued  | 240000
+ failed    |  29869
+ running   |     32
+(4 rows)
+
+  heap  
+--------
+ 311 MB
+(1 row)
+
+=== EXPLAIN first claim (rolled back)
+PREPARE
+PREPARE
+SET
+BEGIN
+                                                                                                                                                                             QUERY PLAN                                                                                                                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_jobs  (cost=5.47..13.49 rows=1 width=150) (actual time=221.835..221.841 rows=1 loops=1)
+   Output: autumn_jobs.id, autumn_jobs.name, autumn_jobs.queue, (autumn_jobs.payload)::text, autumn_jobs.status, autumn_jobs.attempt, autumn_jobs.max_attempts, autumn_jobs.initial_backoff_ms, autumn_jobs.enqueued_at, autumn_jobs.run_at, autumn_jobs.started_at, autumn_jobs.finished_at, autumn_jobs.claimed_by, autumn_jobs.claimed_at, autumn_jobs.last_error
+   Buffers: shared hit=5401 read=1 dirtied=1
+   InitPlan 2 (returns $3)
+     ->  Limit  (cost=4.61..5.04 rows=1 width=21) (actual time=221.590..221.593 rows=1 loops=1)
+           Output: candidate.id, candidate.run_at, candidate.ctid
+           Buffers: shared hit=5381
+           InitPlan 1 (returns $0)
+             ->  Aggregate  (cost=4.18..4.19 rows=1 width=32) (actual time=0.053..0.054 rows=1 loops=1)
+                   Output: jsonb_object_agg(((jsonb_build_array(running.name, running.concurrency_key))::text), (count(*)))
+                   Buffers: shared hit=2
+                   ->  GroupAggregate  (cost=0.12..4.17 rows=1 width=57) (actual time=0.033..0.041 rows=2 loops=1)
+                         Output: (jsonb_build_array(running.name, running.concurrency_key))::text, count(*), running.name, running.concurrency_key
+                         Group Key: running.name, running.concurrency_key
+                         Buffers: shared hit=2
+                         ->  Index Only Scan using idx_autumn_jobs_concurrency_running on public.autumn_jobs running  (cost=0.12..4.14 rows=1 width=17) (actual time=0.016..0.019 rows=32 loops=1)
+                               Output: running.name, running.concurrency_key
+                               Heap Fetches: 0
+                               Buffers: shared hit=2
+           ->  LockRows  (cost=0.42..88993.35 rows=208567 width=21) (actual time=221.589..221.589 rows=1 loops=1)
+                 Output: candidate.id, candidate.run_at, candidate.ctid
+                 Buffers: shared hit=5381
+                 ->  Index Scan using idx_autumn_jobs_queue_ready on public.autumn_jobs candidate  (cost=0.42..86907.68 rows=208567 width=21) (actual time=221.559..221.559 rows=1 loops=1)
+                       Output: candidate.id, candidate.run_at, candidate.ctid
+                       Index Cond: ((candidate.queue = 'default'::text) AND (candidate.run_at <= now()))
+                       Filter: ((candidate.status = 'enqueued'::text) AND ((candidate.concurrency_limit IS NULL) OR (COALESCE((($0 ->> (jsonb_build_array(candidate.name, candidate.concurrency_key))::text))::bigint, '0'::bigint) < candidate.concurrency_limit)))
+                       Rows Removed by Filter: 200000
+                       Buffers: shared hit=5379
+   ->  Index Scan using autumn_jobs_pkey on public.autumn_jobs  (cost=0.43..8.46 rows=1 width=150) (actual time=221.629..221.630 rows=1 loops=1)
+         Output: 'running'::text, now(), 'worker-1'::text, now(), CASE WHEN (autumn_jobs.unique_window = 'pending'::text) THEN NULL::text ELSE autumn_jobs.unique_key END, CASE WHEN (autumn_jobs.unique_window = 'pending'::text) THEN autumn_jobs.unique_key ELSE NULL::text END, autumn_jobs.ctid
+         Index Cond: (autumn_jobs.id = $3)
+         Buffers: shared hit=5385
+ Query Identifier: 4108931234124313684
+ Planning:
+   Buffers: shared hit=290 read=5 dirtied=1
+ Planning Time: 1.271 ms
+ Execution Time: 222.031 ms
+(37 rows)
+
+ROLLBACK
+=== workload: 100 claim+ack cycles
+claimed-id md5 (in order): b642c116e33d4c686cc834bcd40b3aba
+claimed names:     100 (     100 -     100 c     100 r 
+ pg_sleep 
+----------
+ 
+(1 row)
+
+--- pg_stat_statements (workload) ---
+ calls | buffers |  hit   | read | rows | temp_blks_written | wal_bytes |                                 query                                  
+-------+---------+--------+------+------+-------------------+-----------+------------------------------------------------------------------------
+   100 |  540432 | 540348 |   84 |  100 |                 0 |   1627093 | PREPARE claim(text, text, text[]) AS UPDATE autumn_jobs SET status = '
+   100 |    2126 |   2039 |   87 |  100 |                 0 |    741552 | PREPARE ack(text, text) AS UPDATE autumn_jobs SET status = 'completed'
+     1 |       0 |      0 |    0 |    1 |                 0 |         0 | SELECT pg_sleep($1)
+(3 rows)
+
+--- pg_stat_user_tables / indexes ---
+   relname   | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_live_tup | n_dead_tup 
+-------------+----------+--------------+----------+---------------+------------+------------
+ autumn_jobs |        0 |            0 |      400 |      20003700 |          0 |        200
+(1 row)
+
+            indexrelname             | idx_scan | idx_tup_read | idx_tup_fetch 
+-------------------------------------+----------+--------------+---------------
+ autumn_jobs_pkey                    |      100 |          101 |           100
+ idx_autumn_jobs_concurrency_running |      100 |         3300 |           200
+ idx_autumn_jobs_enqueued_dashboard  |        0 |            0 |             0
+ idx_autumn_jobs_queue_name_ready    |        0 |            0 |             0
+ idx_autumn_jobs_queue_ready         |      100 |     20000199 |      20000100
+ idx_autumn_jobs_ready               |        0 |            0 |             0
+ idx_autumn_jobs_stale_recovery      |        0 |            0 |             0
+ idx_autumn_jobs_status_finished     |      100 |         3400 |          3300
+ idx_autumn_jobs_unique_inflight     |        0 |            0 |             0
+(9 rows)
+
