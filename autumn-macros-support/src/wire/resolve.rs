@@ -347,7 +347,12 @@ pub fn resolve_type<'a>(
     }
     let refuse = |candidates: &[Candidate<'_>]| ambiguity(path, name, candidates, crates);
     let absolute = path.starts_with("::");
-    match target(prefix, absolute, scope, &all, crates) {
+    let target = target(prefix, absolute, scope, &all, crates);
+    let doubt = binary_root_doubt(&target, scope, &all);
+    if !doubt.is_empty() {
+        return Err(refuse(&doubt));
+    }
+    match target {
         Target::Std => Ok(None),
         Target::Crate { krate, module } => {
             let in_crate: Vec<Candidate<'a>> = all
@@ -412,6 +417,45 @@ pub fn resolve_type<'a>(
             }
         }
     }
+}
+
+/// The types that a path from the binary root `src/main.rs` into a child
+/// module can mean, when more than one can.
+///
+/// An inline `mod` of `src/main.rs` has the module `main`. A module file below
+/// `src/` can belong to the library of the package. So a type of `main` and a
+/// type of the named module are both candidates. Empty when not in doubt.
+fn binary_root_doubt<'a>(
+    target: &Target,
+    scope: Scope<'_>,
+    all: &[Candidate<'a>],
+) -> Vec<Candidate<'a>> {
+    let module = match target {
+        Target::Crate { krate, module } if norm(krate) == norm(scope.krate) => module,
+        Target::Unqualified { module } => module,
+        _ => return Vec::new(),
+    };
+    let in_binary_root = scope.module.split("::").next() == Some("main");
+    if !in_binary_root || module.is_empty() || module == "main" || module.starts_with("main::") {
+        return Vec::new();
+    }
+    let own: Vec<Candidate<'a>> = all
+        .iter()
+        .copied()
+        .filter(|c| norm(c.krate) == norm(scope.krate))
+        .collect();
+    let in_main = own.iter().any(|c| c.module == "main");
+    let named: Vec<Candidate<'a>> = own
+        .iter()
+        .copied()
+        .filter(|c| c.module == *module || c.module.starts_with(&format!("{module}::")))
+        .collect();
+    if !in_main || named.is_empty() {
+        return Vec::new();
+    }
+    own.into_iter()
+        .filter(|c| c.module == "main" || named.iter().any(|n| n.module == c.module))
+        .collect()
 }
 
 /// The types of other crates that a crate path can also mean.
@@ -960,7 +1004,6 @@ mod tests {
         let types = vec![
             ty("catalog", "items", "Item"),
             ty("catalog", "orders", "Item"),
-            ty("catalog", "main", "Item"),
         ];
         for path in ["crate::items::Item", "self::items::Item", "items::Item"] {
             assert_eq!(
@@ -969,9 +1012,21 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn a_path_from_the_binary_root_beside_a_binary_root_type_is_refused() {
+        // `main` can hold an inline `mod dto`, and `src/dto.rs` can be the
+        // library's file.
+        let types = vec![ty("app", "main", "Item"), ty("app", "dto", "Item")];
+        for path in ["crate::dto::Item", "self::dto::Item", "dto::Item"] {
+            let err = pick(path, at("app", "main"), &types, None).expect_err("ambiguous");
+            assert!(err.contains("`app::main::Item`"), "{path}: {err}");
+            assert!(err.contains("`app::dto::Item`"), "{path}: {err}");
+        }
         assert_eq!(
-            pick("crate::Item", at("catalog", "main"), &types, None),
-            Ok(Some("catalog::main::Item".to_owned()))
+            pick("crate::Item", at("app", "main"), &types, None),
+            Ok(Some("app::main::Item".to_owned()))
         );
     }
 

@@ -536,7 +536,10 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * The module of a type is the module of its source file. An inline `mod` is
   not visible. Two types with one name in one source file share one
   descriptor file. A bare name in a file with an inline `mod` that defines a
-  type of that name means that type, also when the file imports another.
+  type of that name means that type, also when the file imports another. In
+  `src/main.rs`, a path such as `crate::dto::Item` is refused when
+  `src/main.rs` also has a type of that name: it can be an inline `mod dto`,
+  and `src/dto.rs` can belong to the library.
 * The router check sees `routes![…]` calls, not the app's router. A
   `routes()` function that is never mounted still counts. A path that can
   name more than one handler counts for each of them.
