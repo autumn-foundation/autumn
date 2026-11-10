@@ -147,8 +147,8 @@ pub struct PluginCheckOptions<'a> {
     /// `--deny-experimental`.
     pub deny_experimental: bool,
     /// `--no-routes`: the plugin asserts it mounts no routes (a cache, a
-    /// search index). Only then may `route-attribution` skip when none are
-    /// found; without it, none found fails, as an unannotated `nest` would.
+    /// search index). Only then may `route-attribution` skip when no routes
+    /// are found. The contract dump must also give `registered_as`.
     pub no_routes: bool,
 }
 
@@ -283,18 +283,18 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Plug
     // The library lets `no_routes` skip with no contract. The CLI skips only
     // when the contract dump gives the registered name. In all other cases,
     // no routes found fails.
-    if opts.no_routes && declared.and_then(|c| c.registered_as.as_ref()).is_none() {
-        if let Some(attribution) = route_checks
+    if opts.no_routes
+        && declared.and_then(|c| c.registered_as.as_ref()).is_none()
+        && let Some(attribution) = route_checks
             .iter_mut()
             .find(|c| c.name == "route-attribution" && c.status == CheckStatus::Skip)
-        {
-            attribution.status = CheckStatus::Fail;
-            attribution.message = format!(
-                "--no-routes skips only when the contract dump gives the registered name of \
-                 {}. The dump gives none",
-                opts.plugin_name
-            );
-        }
+    {
+        attribution.status = CheckStatus::Fail;
+        attribution.message = format!(
+            "--no-routes skips only when the contract dump gives the registered name of \
+             {}. The dump gives none",
+            opts.plugin_name
+        );
     }
     checks.append(&mut route_checks);
 
@@ -657,6 +657,11 @@ mod shared_rules_tests {
             "fn check_no_routes",
             "fn check_split_attribution",
             "fn route_key",
+            "fn carries",
+            "fn route_name",
+            "fn plugin_names",
+            "fn check_attribution",
+            "fn check_prefix_with_no_routes",
             "enum CheckStatus",
             "struct CheckResult",
             "struct ConformanceReport",
@@ -785,7 +790,7 @@ mod shared_rules_tests {
                 &options("shop", &sensitive, &root, &ContractDump::Absent),
                 routes,
             );
-            let library = lib::run_conformance(&base, &library_routes(routes));
+            let library = lib::run_conformance(&base, &by_serde(routes));
             assert_same_route_checks(&cli, &library, routes);
         }
 
@@ -801,9 +806,42 @@ mod shared_rules_tests {
         ]);
         for routes in &with_contract {
             let cli = build_report(&options("shop", &sensitive, &root, &dump), routes);
-            let library = lib::run_conformance(&config, &library_routes(routes));
+            let library = lib::run_conformance(&config, &by_serde(routes));
             assert_same_route_checks(&cli, &library, routes);
         }
+
+        // `--no-routes` with a registered name: the CLI and the library agree.
+        let mut config = config.no_routes();
+        config.expected_prefix = None;
+        let mut opts = options("shop", &sensitive, &root, &dump);
+        opts.expected_prefix = None;
+        opts.no_routes = true;
+        for routes in &with_contract {
+            let cli = build_report(&opts, routes);
+            let library = lib::run_conformance(&config, &by_serde(routes));
+            assert_same_route_checks(&cli, &library, routes);
+        }
+    }
+
+    /// The library routes, made through serde rather than `library_routes`, so
+    /// that the parity test also checks the conversion.
+    fn by_serde(routes: &[RouteInfo]) -> Vec<autumn_web::route_listing::RouteInfo> {
+        let json = serde_json::to_value(routes).expect("json");
+        serde_json::from_value(json).expect("library routes")
+    }
+
+    /// The conversion keeps what the checks read: the source and the asset
+    /// marker.
+    #[test]
+    fn library_routes_keeps_source_and_middleware() {
+        let converted = library_routes(&[asset("/static/_plugins/shop/a.js", "plugin:shop")]);
+        assert_eq!(converted[0].source, RouteSource::Plugin("shop".to_owned()));
+        assert_eq!(
+            converted[0].middleware,
+            [autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER]
+        );
+        assert_eq!(converted[0].path, "/static/_plugins/shop/a.js");
+        assert_eq!(converted[0].method, "GET");
     }
 
     /// `--no-routes` counts a route under any name of the plugin, as the
@@ -852,6 +890,13 @@ mod shared_rules_tests {
                 "{routes:?}: {}",
                 attribution.message
             );
+            if routes.is_empty() {
+                assert!(
+                    attribution.message.starts_with("--no-routes skips only"),
+                    "{}",
+                    attribution.message
+                );
+            }
         }
     }
 
