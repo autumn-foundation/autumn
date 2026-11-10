@@ -222,6 +222,9 @@ pub struct CrateGraph {
     /// Package key to library name, where the two differ. A module path
     /// starts with the library name.
     pub libs: BTreeMap<String, String>,
+    /// Package key to its binary target names that differ from the package
+    /// name. A module path in a binary starts with the binary name.
+    pub bins: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl CrateGraph {
@@ -1943,6 +1946,105 @@ crates = ["crm-core-ad*"]
         let report = check(&config, Some(&graph), Some(&deps)).expect("runs");
         let v = table_violation(&report, "lib_report").expect("the route is in marketing");
         assert_eq!(v.boundary, "marketing");
+    }
+
+    /// `core` owns `contacts`. `marketing` is the package `crm-marketing`.
+    fn package_config() -> BoundaryConfig {
+        BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.marketing]\nowns = [\"campaigns\"]\ncrates = [\"crm-marketing\"]\n",
+        )
+        .expect("valid")
+    }
+
+    fn bins(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_node_joins_the_boundary_of_its_package_by_binary_name() {
+        // `crm-marketing` has `[[bin]] name = "marketing-server"`. Its module
+        // paths start with `marketing_server`.
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("bin_report", "marketing_server::routes", "GET", "/bin")
+        }];
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let mut deps = crates(&[("crm-marketing", "crm-core")]);
+        let report = check(&package_config(), Some(&graph), Some(&deps)).expect("runs");
+        assert!(
+            table_violation(&report, "bin_report").is_none(),
+            "with no binary name, no boundary claims the route"
+        );
+        deps.bins
+            .insert("crm-marketing".into(), bins(&["marketing_server"]));
+        let report = check(&package_config(), Some(&graph), Some(&deps)).expect("runs");
+        let v = table_violation(&report, "bin_report").expect("the route is in marketing");
+        assert_eq!(v.boundary, "marketing");
+    }
+
+    #[test]
+    fn a_package_with_a_library_and_a_binary_claims_nodes_of_both() {
+        const ROUTES: &[RouteGraphDescriptor] = &[
+            RouteGraphDescriptor {
+                body_symbols: &["contacts"],
+                ..route("lib_report", "crm_mkt::routes", "GET", "/lib")
+            },
+            RouteGraphDescriptor {
+                body_symbols: &["contacts"],
+                ..route("bin_report", "marketing_server::routes", "GET", "/bin")
+            },
+        ];
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let mut deps = crates(&[("crm-marketing@1.0.0", "crm-core")]);
+        deps.libs
+            .insert("crm-marketing@1.0.0".into(), "crm_mkt".into());
+        deps.bins
+            .insert("crm-marketing@1.0.0".into(), bins(&["marketing_server"]));
+        let report = check(&package_config(), Some(&graph), Some(&deps)).expect("runs");
+        for handler in ["lib_report", "bin_report"] {
+            let v = table_violation(&report, handler).expect("the route is in marketing");
+            assert_eq!(v.boundary, "marketing", "{handler}");
+        }
+    }
+
+    #[test]
+    fn a_binary_name_of_two_packages_in_two_boundaries_is_an_error() {
+        // Two packages build a binary `server`. The module path cannot tell
+        // which package the node is in.
+        const ROUTES: &[RouteGraphDescriptor] = &[route("home", "server::routes", "GET", "/")];
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let config = BoundaryConfig::parse(
+            "[boundaries.a]\nowns = [\"contacts\"]\ncrates = [\"crm-a\"]\n\
+             [boundaries.b]\nowns = [\"campaigns\"]\ncrates = [\"crm-b\"]\n",
+        )
+        .expect("valid");
+        let mut deps = CrateGraph::default();
+        deps.bins.insert("crm-a".into(), bins(&["server"]));
+        deps.bins.insert("crm-b".into(), bins(&["server"]));
+        let err = check(&config, Some(&graph), Some(&deps)).expect_err("ambiguous");
+        assert!(
+            matches!(err, BoundaryError::Ambiguous { what: "node", .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_crates_pattern_that_names_a_binary_does_not_warn() {
+        let config = BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.marketing]\nowns = [\"campaigns\"]\ncrates = [\"marketing-server\"]\n",
+        )
+        .expect("valid");
+        let mut deps = crates(&[("crm-marketing", "crm-core")]);
+        deps.bins
+            .insert("crm-marketing".into(), bins(&["marketing_server"]));
+        let report = check(&config, None, Some(&deps)).expect("runs");
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("marketing-server")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     #[test]

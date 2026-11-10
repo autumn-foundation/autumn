@@ -546,4 +546,112 @@ mod tests {
         );
         assert!(!facts.crates.libs.contains_key("crm-web"));
     }
+
+    fn names(list: &[&str]) -> std::collections::BTreeSet<String> {
+        list.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_renamed_binary_target_is_recorded() {
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "m", "name": "crm-marketing", "targets": [
+                    {"kind": ["lib"], "name": "crm_marketing"},
+                    {"kind": ["bin"], "name": "marketing-server"},
+                    {"kind": ["bin"], "name": "crm-marketing"},
+                    {"kind": ["test"], "name": "it"},
+                    {"kind": ["bench"], "name": "speed"},
+                    {"kind": ["example"], "name": "demo"},
+                    {"kind": ["custom-build"], "name": "build-script-build"}
+                ]},
+                {"id": "w", "name": "crm-web", "targets": [
+                    {"kind": ["bin"], "name": "crm-web"}
+                ]}
+            ],
+            "resolve": {"nodes": []}
+        });
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        assert_eq!(
+            facts.crates.bins.get("crm-marketing"),
+            Some(&names(&["marketing_server"]))
+        );
+        assert!(!facts.crates.libs.contains_key("crm-marketing"));
+        // A binary with the package name adds no name.
+        assert!(!facts.crates.bins.contains_key("crm-web"));
+    }
+
+    #[test]
+    fn a_package_with_a_library_and_a_binary_maps_both() {
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "m", "name": "crm-marketing", "targets": [
+                    {"kind": ["cdylib", "rlib"], "name": "crm_mkt"},
+                    {"kind": ["bin"], "name": "marketing-server"},
+                    {"kind": ["bin"], "name": "marketing-worker"}
+                ]}
+            ],
+            "resolve": {"nodes": []}
+        });
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        assert_eq!(
+            facts.crates.libs.get("crm-marketing").map(String::as_str),
+            Some("crm_mkt")
+        );
+        assert_eq!(
+            facts.crates.bins.get("crm-marketing"),
+            Some(&names(&["marketing_server", "marketing_worker"]))
+        );
+    }
+
+    #[test]
+    fn a_route_in_a_renamed_binary_is_checked() {
+        use autumn_web::graph::manifest::build;
+        use autumn_web::graph::{ModelGraphDescriptor, RouteGraphDescriptor};
+        const MODELS: &[ModelGraphDescriptor] = &[ModelGraphDescriptor {
+            model: "Contact",
+            model_path: "crm_core::Contact",
+            table: "contacts",
+            relations: &[],
+            module_path: "crm_core::models",
+            file: "src/lib.rs",
+            line: 1,
+            crate_version: "0.1.0",
+        }];
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            handler: "report",
+            module_path: "marketing_server::routes",
+            method: "GET",
+            path: "/report",
+            static_route: false,
+            file: "src/main.rs",
+            line: 1,
+            crate_version: "0.1.0",
+            signature_symbols: &[],
+            body_symbols: &["contacts"],
+            sql_symbols: &[],
+        }];
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "m", "name": "crm-marketing", "targets": [
+                    {"kind": ["bin"], "name": "marketing-server"}
+                ]},
+                {"id": "c", "name": "crm-core", "targets": [
+                    {"kind": ["lib"], "name": "crm_core"}
+                ]}
+            ],
+            "resolve": {"nodes": []}
+        });
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let config = BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.marketing]\ncrates = [\"crm-marketing\"]\n",
+        )
+        .expect("valid");
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        let (result, _) = evaluate(config, Some(&graph), Some(&facts), None).expect("runs");
+        let text = result.render();
+        assert!(!result.passes(), "{text}");
+        assert!(text.contains("marketing -> core"), "{text}");
+        assert!(text.contains("marketing_server::routes"), "{text}");
+    }
 }

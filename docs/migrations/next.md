@@ -618,6 +618,35 @@ let MetricsSnapshot { db_queries, db_connection_holds, .. } = snapshot;
 into a `MetricsCollector` and call `snapshot()`. A codemod cannot write those
 samples.
 
+### Graph: `CrateGraph` has a `bins` field and is non-exhaustive
+
+**Why:** a boundary package now also covers its renamed `[[bin]]` targets
+(issue #3599). `CrateGraph::bins` holds the binary names of each package.
+
+`CrateGraph` is now `#[non_exhaustive]`, so a later field does not break your
+code.
+
+**You are affected only if your code builds a `CrateGraph` with a struct
+literal, or destructures one without `..`.** `autumn graph check-boundaries`
+and `boundaries.toml` need no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let crates = CrateGraph { deps, libs };
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let mut crates = CrateGraph::default();
+crates.deps = deps;
+crates.libs = libs;
+```
+
+**Automation:** `manual` — start from `CrateGraph::default()` and set the
+fields.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
