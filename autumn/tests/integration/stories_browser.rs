@@ -346,6 +346,23 @@ async fn select_scheme(page: &Page, scheme: &str) {
         "document.getAnimations().every(a => !(a instanceof CSSTransition))",
     )
     .await;
+    // axe must also not read a color in the middle of an animation. Finish
+    // an entrance (a toast fades in). Hold an animation that waits for a
+    // delay at its start (a toast fades out after its dwell). A slow runner
+    // can reach that delay. An endless animation (a spinner) stays.
+    assert!(
+        eval_bool(
+            page,
+            "(() => { document.getAnimations().forEach(a => { \
+               if (!(a instanceof CSSAnimation)) return; \
+               const t = a.effect.getTiming(); \
+               if (t.iterations === Infinity) return; \
+               if (t.delay > 0) { a.pause(); a.currentTime = 0; } else a.finish(); }); \
+             return true; })()",
+        )
+        .await,
+        "could not settle the animations"
+    );
 }
 
 /// Check an open layer (dialog, menu, popup) with axe, in the light scheme
@@ -1702,8 +1719,9 @@ async fn busy_ids_during(page: &Page, button: &str, status: &str) -> (Vec<String
              const add = (list, e) => { const n = e.id || e.tagName; \
                if (!list.includes(n)) list.push(n); }; \
              window.__busyObs = new MutationObserver(ms => ms.forEach(m => { \
-               if (m.target.getAttribute('aria-busy') === 'true') add(window.__busied, m.target); \
-               if (m.target.classList.contains('htmx-request')) add(window.__requested, m.target); })); \
+               const t = m.target, a = m.attributeName; \
+               if (a === 'aria-busy' && t.getAttribute(a) === 'true') add(window.__busied, t); \
+               if (a === 'class' && t.classList.contains('htmx-request')) add(window.__requested, t); })); \
              window.__busyObs.observe(document.body, \
                { attributes: true, subtree: true, attributeFilter: ['aria-busy', 'class'] }); \
              return true; })()",
