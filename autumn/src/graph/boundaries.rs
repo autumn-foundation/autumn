@@ -215,9 +215,6 @@ pub enum BoundaryError {
 /// A key is the package name. A package that resolves at two versions has
 /// the key `name@version` for each, so their dependencies stay apart. The
 /// CLI fills this from `cargo metadata`.
-///
-/// A module path starts with the name of the library or binary that holds
-/// it. `libs` and `bins` map those names to the package.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CrateGraph {
@@ -244,16 +241,12 @@ impl CrateGraph {
     /// The normalized names of a package key: the package name, without a
     /// version, the library name and the binary names.
     fn names(&self, package: &str) -> Vec<String> {
-        let mut names = vec![crate_key(package_name(package))];
-        names.extend(self.targets_of(package).map(crate_key));
-        names
-    }
-
-    /// The library name and the binary names of a package key.
-    fn targets_of<'a>(&'a self, package: &str) -> impl Iterator<Item = &'a str> {
-        let lib = self.libs.get(package).map(String::as_str);
+        let lib = self.libs.get(package);
         let bins = self.bins.get(package).into_iter().flatten();
-        lib.into_iter().chain(bins.map(String::as_str))
+        std::iter::once(package_name(package))
+            .chain(lib.into_iter().chain(bins).map(String::as_str))
+            .map(crate_key)
+            .collect()
     }
 
     /// Every pair of a package key and one of its library or binary names.
@@ -2060,7 +2053,10 @@ crates = ["crm-core-ad*"]
             .insert("crm-marketing".into(), bins(&["marketing_server"]));
         let report = check(&config, None, Some(&deps)).expect("runs");
         assert!(
-            !report.warnings.iter().any(|w| w.contains("marketing-server")),
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("marketing-server")),
             "{:?}",
             report.warnings
         );
