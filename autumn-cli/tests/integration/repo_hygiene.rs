@@ -1558,6 +1558,7 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
         "integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks",
         "integration::scaffold_rich_text::richtext_scaffold_cargo_checks",
         "integration::scaffold_search::searchable_scaffold_cargo_checks",
+        "integration::scaffold_teams::teams_scaffold_cargo_tests",
         "integration::scaffold_trash::trash_generated_project_cargo_checks",
         "integration::seed_model_linking::linked_seed_binary_cargo_checks",
         "integration::serve::serve_daemon_start_status_stop_over_unix_socket",

@@ -51,6 +51,7 @@ mod scaffold_nested_resources;
 mod scaffold_rich_text;
 mod scaffold_search;
 mod scaffold_sort_filter;
+mod scaffold_teams;
 mod scaffold_trash;
 mod scaffold_validation;
 mod schema_dev_url;

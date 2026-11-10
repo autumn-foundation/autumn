@@ -34,7 +34,7 @@ stable Autumn primitives:
 | `src/teams/mailers/invitation_mailer.rs` | `InvitationMailer` (`#[mailer]`) |
 | `src/teams/routes/organizations.rs` | `create_organization`, `switch_organization`, `provision_default_organization` |
 | `src/teams/routes/invitations.rs` | `create_invitation`, `show_invitation`, `accept_invitation`, `revoke_invitation`, `resend_invitation` |
-| `src/teams/routes/members.rs` | `list_members`, `change_role`, `remove_member` |
+| `src/teams/routes/members.rs` | `list_members`, `change_role`, `remove_member`, and the shared `members_content` page body |
 | `migrations/<timestamp>_create_teams/` | `organizations`/`memberships`/`invitations` tables |
 | `src/main.rs` (modified) | `mod teams;` + the ten routes above wired into `routes![...]` |
 | `Cargo.toml` (modified) | `"mail"` feature enabled on the `autumn-web` dependency |
@@ -62,6 +62,17 @@ has no `SELECT … FOR UPDATE`, so on SQLite those reads go through
 SQLite allows one writer at a time, and a second transaction that read the same
 snapshot fails closed rather than losing an update — but under contention a
 request errors instead of waiting for a lock.
+
+## Invite form errors
+
+`POST /invitations` does not end on an error page for bad input. For a bad
+email, an unknown role, or a duplicate pending invitation, it shows the
+members page again with status 422. The form keeps the typed values. The
+error shows at the field that caused it, and that field gets
+`aria-invalid="true"`.
+
+An `Admin` who invites someone as `Owner` gets 403. That is a permission
+refusal, not an input error, so the page does not show again.
 
 ## The composition boundary with your own auth
 

@@ -1494,7 +1494,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::teams::mailers::invitation_mailer::InvitationMailer;
-use crate::teams::models::{InviteForm, Invitation, Membership, Organization};
+use crate::teams::models::{Invitation, InviteForm, Membership, Organization};
 use crate::teams::repositories::{
     InvitationRepository, OrganizationRepository, PgInvitationRepository, PgMembershipRepository,
     PgOrganizationRepository,
@@ -1502,6 +1502,7 @@ use crate::teams::repositories::{
 use crate::teams::role::{Role, establish_org_session, require_role};
 use crate::teams::schema::{invitations, memberships, organizations};
 
+use super::members::{InviteFormView, redisplay_members};
 use super::{csrf_value, minimal_page};
 
 const INVITATION_TTL_DAYS: i64 = 7;
@@ -1561,14 +1562,20 @@ fn app_base_url() -> String {
 /// higher (issue #1261 AC7); inviting someone as `Owner` itself requires the
 /// caller to already be an `Owner` — otherwise an Admin could mint a fresh
 /// Owner account of their own choosing.
+///
+/// A bad email, an unknown role, or a duplicate pending invitation shows the
+/// members page again at 422, with the input kept and the error at its field.
 #[post("/invitations")]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_invitation(
     session: Session,
     Tenant(tenant_id): Tenant,
     mut db: Db,
     org_repo: PgOrganizationRepository,
     membership_repo: PgMembershipRepository,
+    invitation_repo: PgInvitationRepository,
     mailer: Mailer,
+    csrf: Option<CsrfToken>,
     Form(form): Form<InviteForm>,
 ) -> AutumnResult<Response> {
     let caller_role = require_role(&session, &membership_repo, Role::Admin).await?;
@@ -1576,12 +1583,36 @@ pub async fn create_invitation(
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
 
-    let email = form.email.trim().to_lowercase();
+    let email = normalize_email(&form.email);
     if !email.contains('@') || email.len() > 254 {
-        return Err(AutumnError::unprocessable_msg("Enter a valid email address"));
+        return redisplay_members(
+            caller_role,
+            &membership_repo,
+            &invitation_repo,
+            &csrf,
+            InviteFormView {
+                email: &form.email,
+                role: &form.role,
+                email_error: Some("Enter a valid email address"),
+                role_error: None,
+            },
+        )
+        .await;
     }
     let Some(role) = Role::parse(&form.role) else {
-        return Err(AutumnError::unprocessable_msg("Unknown role"));
+        return redisplay_members(
+            caller_role,
+            &membership_repo,
+            &invitation_repo,
+            &csrf,
+            InviteFormView {
+                email: &form.email,
+                role: &form.role,
+                email_error: None,
+                role_error: Some("Unknown role"),
+            },
+        )
+        .await;
     };
     if role == Role::Owner && caller_role != Role::Owner {
         return Err(AutumnError::forbidden_msg(
@@ -1600,124 +1631,134 @@ pub async fn create_invitation(
     let token_hash = hash_api_token(&raw_token);
     let insert_email = email.clone();
     let insert_role = role.as_str().to_owned();
-    db.tx(move |conn| {
-        async move {
-            // Lock the organization row FIRST — the same shared
-            // serialization point `accept_invitation`/
-            // `remove_all_memberships_on_conn` use — before issuing a new
-            // pending invitation. Without it, an in-flight account
-            // deletion's cleanup could decide "no successor exists",
-            // revoke every pending invitation, and delete the
-            // organization's last Owner, all while this uncoordinated
-            // transaction inserts a fresh pending invitation the cleanup
-            // never saw — accepting that token later repopulates the
-            // organization without an Owner, recreating the exact
-            // invariant cleanup exists to prevent (Codex review finding).
-            ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
-                .select(Organization::as_select())
+    // `Ok(false)`: a pending invitation to this email already exists.
+    let created = db
+        .tx(move |conn| {
+            async move {
+                // Lock the organization row FIRST — the same shared
+                // serialization point `accept_invitation`/
+                // `remove_all_memberships_on_conn` use — before issuing a new
+                // pending invitation. Without it, an in-flight account
+                // deletion's cleanup could decide "no successor exists",
+                // revoke every pending invitation, and delete the
+                // organization's last Owner, all while this uncoordinated
+                // transaction inserts a fresh pending invitation the cleanup
+                // never saw — accepting that token later repopulates the
+                // organization without an Owner, recreating the exact
+                // invariant cleanup exists to prevent (Codex review finding).
+                ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
+                    .select(Organization::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+
+                // Revalidate the inviter's own membership now that the
+                // organization lock is held — the pre-transaction `require_role`
+                // result could be stale: another request (a demotion, a
+                // removal, or this same user's account being deleted) may have
+                // committed while this request waited for the lock above
+                // (Codex review finding).
+                let inviter_membership: Option<Membership> = ::autumn_web::maybe_for_update!(
+                    memberships::table
+                        .filter(memberships::tenant_id.eq(&tenant_id))
+                        .filter(memberships::user_id.eq(inviter_id))
+                        .select(Membership::as_select())
+                )
                 .first(conn)
                 .await
                 .optional()?;
+                let Some(inviter_membership) = inviter_membership else {
+                    return Err(AutumnError::unauthorized_msg("no active organization"));
+                };
+                let Some(current_caller_role) = Role::parse(&inviter_membership.role) else {
+                    return Err(AutumnError::forbidden_msg("insufficient permissions"));
+                };
+                if !current_caller_role.at_least(Role::Admin) {
+                    return Err(AutumnError::forbidden_msg("insufficient permissions"));
+                }
+                if role == Role::Owner && current_caller_role != Role::Owner {
+                    return Err(AutumnError::forbidden_msg(
+                        "Only an owner can invite someone as owner",
+                    ));
+                }
 
-            // Revalidate the inviter's own membership now that the
-            // organization lock is held — the pre-transaction `require_role`
-            // result could be stale: another request (a demotion, a
-            // removal, or this same user's account being deleted) may have
-            // committed while this request waited for the lock above
-            // (Codex review finding).
-            let inviter_membership: Option<Membership> = ::autumn_web::maybe_for_update!(
-                memberships::table
-                    .filter(memberships::tenant_id.eq(&tenant_id))
-                    .filter(memberships::user_id.eq(inviter_id))
-                    .select(Membership::as_select())
+                // Reject rather than silently revoke-and-replace a still-pending
+                // invitation to this email — now that the organization lock
+                // above serializes concurrent `create_invitation` calls for
+                // this organization, a second request for an email that's
+                // already pending is a genuine conflict the caller should see,
+                // not a race to resolve by rewriting history underneath them.
+                // Revoking-and-replacing here also sent two invite emails out
+                // of release-lock order, so a reordered delivery could leave
+                // the invitee's newest message holding an already-revoked
+                // token (Codex review finding).
+                let existing_pending: Option<Invitation> = invitations::table
+                    .filter(invitations::tenant_id.eq(&tenant_id))
+                    .filter(invitations::email.eq(&insert_email))
+                    .filter(invitations::status.eq("pending"))
+                    .select(Invitation::as_select())
+                    .first(conn)
+                    .await
+                    .optional()?;
+                if existing_pending.is_some() {
+                    return Ok(false);
+                }
+
+                diesel::insert_into(invitations::table)
+                    .values(&InsertInvitation {
+                        tenant_id,
+                        email: insert_email,
+                        role: insert_role,
+                        token_hash,
+                        status: "pending".to_owned(),
+                        invited_by_user_id: inviter_id,
+                        expires_at: chrono::Utc::now().naive_utc()
+                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                    })
+                    .execute(conn)
+                    .await?;
+
+                Ok::<_, AutumnError>(true)
+            }
+            .scope_boxed()
+        })
+        .await;
+    // The organization lock and the check above serialize concurrent calls,
+    // so this unique-index violation is a backstop only.
+    let created = match created {
+        Ok(created) => created,
+        Err(err)
+            if autumn_web::error::unique_violation_field(
+                &err,
+                &[(
+                    "idx_invitations_pending_email",
+                    "email",
+                    "An invitation to this email is already pending",
+                )],
             )
-            .first(conn)
-            .await
-            .optional()?;
-            let Some(inviter_membership) = inviter_membership else {
-                return Err(AutumnError::unauthorized_msg("no active organization"));
-            };
-            let Some(current_caller_role) = Role::parse(&inviter_membership.role) else {
-                return Err(AutumnError::forbidden_msg("insufficient permissions"));
-            };
-            if !current_caller_role.at_least(Role::Admin) {
-                return Err(AutumnError::forbidden_msg("insufficient permissions"));
-            }
-            if role == Role::Owner && current_caller_role != Role::Owner {
-                return Err(AutumnError::forbidden_msg(
-                    "Only an owner can invite someone as owner",
-                ));
-            }
-
-            // Reject rather than silently revoke-and-replace a still-pending
-            // invitation to this email — now that the organization lock
-            // above serializes concurrent `create_invitation` calls for
-            // this organization, a second request for an email that's
-            // already pending is a genuine conflict the caller should see,
-            // not a race to resolve by rewriting history underneath them.
-            // Revoking-and-replacing here also sent two invite emails out
-            // of release-lock order, so a reordered delivery could leave
-            // the invitee's newest message holding an already-revoked
-            // token (Codex review finding).
-            let existing_pending: Option<Invitation> = invitations::table
-                .filter(invitations::tenant_id.eq(&tenant_id))
-                .filter(invitations::email.eq(&insert_email))
-                .filter(invitations::status.eq("pending"))
-                .select(Invitation::as_select())
-                .first(conn)
-                .await
-                .optional()?;
-            if existing_pending.is_some() {
-                return Err(AutumnError::conflict_msg(
-                    "An invitation to this email is already pending for this organization",
-                ));
-            }
-
-            diesel::insert_into(invitations::table)
-                .values(&InsertInvitation {
-                    tenant_id,
-                    email: insert_email,
-                    role: insert_role,
-                    token_hash,
-                    status: "pending".to_owned(),
-                    invited_by_user_id: inviter_id,
-                    expires_at: chrono::Utc::now().naive_utc()
-                        + chrono::Duration::days(INVITATION_TTL_DAYS),
-                })
-                .execute(conn)
-                .await?;
-
-            Ok::<_, AutumnError>(())
-        }
-        .scope_boxed()
-    })
-    .await
-    .map_err(|err| {
-        // The organization lock plus the explicit pending-email check above
-        // already serialize concurrent `create_invitation` calls for this
-        // organization, so this should be unreachable in practice.
-        // `idx_invitations_pending_email` (a partial unique index on
-        // `(tenant_id, email) WHERE status = 'pending'`, see render_migration_up)
-        // stays as defense in depth: any INSERT that still slips past the
-        // check above fails closed instead of leaving two live pending
-        // tokens for the same invitee.
-        if autumn_web::error::unique_violation_field(
-            &err,
-            &[(
-                "idx_invitations_pending_email",
-                "email",
-                "An invitation to this email is already pending",
-            )],
-        )
-        .is_some()
+            .is_some() =>
         {
-            AutumnError::conflict_msg(
-                "An invitation to this email is already pending for this organization",
-            )
-        } else {
-            err
+            false
         }
-    })?;
+        Err(err) => return Err(err),
+    };
+    if !created {
+        return redisplay_members(
+            caller_role,
+            &membership_repo,
+            &invitation_repo,
+            &csrf,
+            InviteFormView {
+                email: &form.email,
+                role: &form.role,
+                email_error: Some(
+                    "An invitation to this email is already pending for this organization",
+                ),
+                role_error: None,
+            },
+        )
+        .await;
+    }
 
     let accept_url = format!("{}/invite/{raw_token}", app_base_url());
     // Sent synchronously (not `deliver_later_invite`): the success metric is
@@ -1738,6 +1779,11 @@ pub async fn create_invitation(
 }
 
 // ── Accept (show) ───────────────────────────────────────────────────────
+
+/// The form of an email that comparisons use: trimmed and lowercase.
+fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
 
 /// `Invitation::tenant_id` is a `String` (the `tenant_scoped` macro's
 /// convention — see `models.rs`); parse it back to the `Organization.id` it
@@ -1798,7 +1844,9 @@ pub async fn show_invitation(
     if let Some(message) = invitation_status_error(&invitation) {
         return Ok((StatusCode::GONE, invitation_error_page(message)).into_response());
     }
-    let Some(organization) = org_repo.find_by_id(parse_tenant_id(&invitation.tenant_id)?).await?
+    let Some(organization) = org_repo
+        .find_by_id(parse_tenant_id(&invitation.tenant_id)?)
+        .await?
     else {
         return Ok((
             StatusCode::NOT_FOUND,
@@ -1877,7 +1925,7 @@ pub async fn accept_invitation(
         .select(caller_users::email)
         .first(&mut *db)
         .await?;
-    if caller_email.trim().to_lowercase() != invitation.email.trim().to_lowercase() {
+    if normalize_email(&caller_email) != normalize_email(&invitation.email) {
         return Err(AutumnError::forbidden_msg(
             "This invitation was sent to a different email address",
         ));
@@ -1939,8 +1987,7 @@ pub async fn accept_invitation(
                         "log in or sign up first, then revisit this invitation link",
                     ));
                 };
-                if live_caller_email.trim().to_lowercase() != invitation_email.trim().to_lowercase()
-                {
+                if normalize_email(&live_caller_email) != normalize_email(&invitation_email) {
                     return Err(AutumnError::forbidden_msg(
                         "This invitation was sent to a different email address",
                     ));
@@ -2018,10 +2065,12 @@ pub async fn accept_invitation(
                     // redeeming the lingering token again would silently
                     // regrant it.
                     if invitation.status == "pending" {
-                        diesel::update(invitations::table.filter(invitations::id.eq(invitation_id)))
-                            .set(invitations::status.eq("accepted"))
-                            .execute(conn)
-                            .await?;
+                        diesel::update(
+                            invitations::table.filter(invitations::id.eq(invitation_id)),
+                        )
+                        .set(invitations::status.eq("accepted"))
+                        .execute(conn)
+                        .await?;
                     }
                     return Ok::<_, AutumnError>(existing);
                 }
@@ -2085,7 +2134,11 @@ pub async fn revoke_invitation(
     Path(invitation_id): Path<i64>,
 ) -> AutumnResult<Response> {
     require_role(&session, &membership_repo, Role::Admin).await?;
-    let Some(caller_id) = session.get("user_id").await.and_then(|s| s.parse::<i64>().ok()) else {
+    let Some(caller_id) = session
+        .get("user_id")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
     // `find_by_id` is tenant-scoped, so this also proves `invitation_id`
@@ -2299,8 +2352,8 @@ fn render_routes_members_rs() -> String {
     ROUTES_MEMBERS_RS.to_owned()
 }
 
-const ROUTES_MEMBERS_RS: &str = r#"//! Member-management surface: list members + pending invitations, change
-//! role, remove member (issue #1261 AC7).
+const ROUTES_MEMBERS_RS: &str = r##"//! Member-management surface: list members + pending invitations, invite,
+//! change role, remove member (issue #1261 AC7).
 //!
 //! Every mutating action is gated `require_role(&session, &membership_repo, Role::Admin)`,
 //! but an `Admin` may only change or remove `Member`/`Admin` memberships —
@@ -2346,6 +2399,34 @@ fn owner_count(memberships: &[Membership]) -> usize {
         .count()
 }
 
+/// The values and field errors of the "Send Invitation" form.
+#[derive(Clone, Copy)]
+pub(super) struct InviteFormView<'a> {
+    /// The email as the admin typed it.
+    pub(super) email: &'a str,
+    /// The submitted role value. It selects the matching option.
+    pub(super) role: &'a str,
+    /// The message to show at the email field.
+    pub(super) email_error: Option<&'a str>,
+    /// The message to show at the role field.
+    pub(super) role_error: Option<&'a str>,
+}
+
+impl InviteFormView<'static> {
+    /// An empty form with the `member` role selected.
+    pub(super) const BLANK: Self = Self {
+        email: "",
+        role: "member",
+        email_error: None,
+        role_error: None,
+    };
+}
+
+/// The `aria-invalid` value for a field with this error.
+fn aria_invalid(error: Option<&str>) -> &'static str {
+    if error.is_some() { "true" } else { "false" }
+}
+
 #[get("/members")]
 pub async fn list_members(
     session: Session,
@@ -2354,9 +2435,43 @@ pub async fn list_members(
     csrf: Option<CsrfToken>,
 ) -> AutumnResult<Response> {
     // Any member (not just Admin+) can view the roster; only Admin+ sees the
-    // management controls below.
+    // management controls.
     let caller_role = require_role(&session, &membership_repo, Role::Member).await?;
+    let page = members_page(
+        caller_role,
+        &membership_repo,
+        &invitation_repo,
+        &csrf,
+        InviteFormView::BLANK,
+    )
+    .await?;
+    Ok(page.into_response())
+}
 
+/// Show the members page again at 422, with the rejected invite in the form
+/// and each error at its own field. Use it after `require_role(Role::Admin)`
+/// passes, so the form shows.
+pub(super) async fn redisplay_members(
+    caller_role: Role,
+    membership_repo: &PgMembershipRepository,
+    invitation_repo: &PgInvitationRepository,
+    csrf: &Option<CsrfToken>,
+    form: InviteFormView<'_>,
+) -> AutumnResult<Response> {
+    let page = members_page(caller_role, membership_repo, invitation_repo, csrf, form).await?;
+    Ok((StatusCode::UNPROCESSABLE_ENTITY, page).into_response())
+}
+
+/// Load the roster and pending invitations, and render the full page.
+/// [`list_members`] and [`redisplay_members`] both use it, so the two views
+/// cannot drift apart.
+async fn members_page(
+    caller_role: Role,
+    membership_repo: &PgMembershipRepository,
+    invitation_repo: &PgInvitationRepository,
+    csrf: &Option<CsrfToken>,
+    form: InviteFormView<'_>,
+) -> AutumnResult<Markup> {
     let memberships = membership_repo.find_all().await?;
     let pending_invitations: Vec<Invitation> = invitation_repo
         .find_all()
@@ -2364,86 +2479,111 @@ pub async fn list_members(
         .into_iter()
         .filter(|i| i.status == "pending")
         .collect();
-
-    let can_manage = caller_role.at_least(Role::Admin);
-    let owners = owner_count(&memberships);
-
-    let page = minimal_page(
+    Ok(minimal_page(
         "Members",
-        html! {
-            h1 { "Members" }
+        members_content(
+            caller_role,
+            &memberships,
+            &pending_invitations,
+            csrf_value(csrf),
+            form,
+        ),
+    ))
+}
 
-            @if can_manage {
-                form action="/invitations" method="post" {
-                    input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                    input name="email" type="email" required placeholder="teammate@example.com"
-                          aria-label="Email to invite";
-                    select name="role" aria-label="Role" {
-                        option value="member" { "Member" }
-                        option value="admin" { "Admin" }
-                        option value="owner" { "Owner" }
+/// The members page body: the roster, the pending invitations, and, for an
+/// `Admin`+, the "Send Invitation" form with `form`'s values and errors.
+pub(super) fn members_content(
+    caller_role: Role,
+    memberships: &[Membership],
+    pending_invitations: &[Invitation],
+    csrf_token: &str,
+    form: InviteFormView<'_>,
+) -> Markup {
+    let can_manage = caller_role.at_least(Role::Admin);
+    let owners = owner_count(memberships);
+    html! {
+        h1 { "Members" }
+
+        @if can_manage {
+            form action="/invitations" method="post" {
+                input type="hidden" name="_csrf" value=(csrf_token);
+                input name="email" type="email" required value=(form.email)
+                      placeholder="teammate@example.com" aria-label="Email to invite"
+                      aria-invalid=(aria_invalid(form.email_error))
+                      aria-describedby=[form.email_error.map(|_| "invite-email-error")];
+                @if let Some(error) = form.email_error {
+                    p id="invite-email-error" role="alert" { (error) }
+                }
+                select name="role" aria-label="Role"
+                       aria-invalid=(aria_invalid(form.role_error))
+                       aria-describedby=[form.role_error.map(|_| "invite-role-error")] {
+                    option value="member" selected[form.role == "member"] { "Member" }
+                    option value="admin" selected[form.role == "admin"] { "Admin" }
+                    option value="owner" selected[form.role == "owner"] { "Owner" }
+                }
+                @if let Some(error) = form.role_error {
+                    p id="invite-role-error" role="alert" { (error) }
+                }
+                button type="submit" { "Invite" }
+            }
+        }
+
+        ul {
+            @for membership in memberships {
+                li {
+                    span { "User " (membership.user_id) }
+                    span { " (" (membership.role) ")" }
+                    @if can_manage {
+                        // Locked when the target is an Owner and either
+                        // the caller isn't one too (only an Owner may
+                        // touch another Owner's membership) or it's the
+                        // organization's last Owner (never demotable/
+                        // removable by anyone) — mirrors the server-side
+                        // checks in `change_role`/`remove_member`.
+                        @let locked = membership.role == Role::Owner.as_str()
+                            && (caller_role != Role::Owner || owners <= 1);
+                        form action={"/members/" (membership.id) "/role"} method="post" {
+                            input type="hidden" name="_csrf" value=(csrf_token);
+                            select name="role" aria-label="Change role" disabled[locked] {
+                                option value="member" selected[membership.role == "member"] { "Member" }
+                                option value="admin" selected[membership.role == "admin"] { "Admin" }
+                                option value="owner" selected[membership.role == "owner"] { "Owner" }
+                            }
+                            button type="submit" disabled[locked] { "Update" }
+                        }
+                        form action={"/members/" (membership.id) "/remove"} method="post" {
+                            input type="hidden" name="_csrf" value=(csrf_token);
+                            button type="submit" disabled[locked] { "Remove" }
+                        }
                     }
-                    button type="submit" { "Invite" }
                 }
             }
+        }
 
+        @if can_manage {
+            h2 { "Pending invitations" }
             ul {
-                @for membership in &memberships {
+                @for invitation in pending_invitations {
                     li {
-                        span { "User " (membership.user_id) }
-                        span { " (" (membership.role) ")" }
-                        @if can_manage {
-                            // Locked when the target is an Owner and either
-                            // the caller isn't one too (only an Owner may
-                            // touch another Owner's membership) or it's the
-                            // organization's last Owner (never demotable/
-                            // removable by anyone) — mirrors the server-side
-                            // checks in `change_role`/`remove_member`.
-                            @let locked = membership.role == Role::Owner.as_str()
-                                && (caller_role != Role::Owner || owners <= 1);
-                            form action={"/members/" (membership.id) "/role"} method="post" {
-                                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                                select name="role" aria-label="Change role" disabled[locked] {
-                                    option value="member" selected[membership.role == "member"] { "Member" }
-                                    option value="admin" selected[membership.role == "admin"] { "Admin" }
-                                    option value="owner" selected[membership.role == "owner"] { "Owner" }
-                                }
-                                button type="submit" disabled[locked] { "Update" }
-                            }
-                            form action={"/members/" (membership.id) "/remove"} method="post" {
-                                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                                button type="submit" disabled[locked] { "Remove" }
-                            }
+                        span { (invitation.email) }
+                        span { " (" (invitation.role) ")" }
+                        form action={"/invitations/" (invitation.id) "/resend"} method="post" {
+                            input type="hidden" name="_csrf" value=(csrf_token);
+                            button type="submit" { "Resend" }
+                        }
+                        form action={"/invitations/" (invitation.id) "/revoke"} method="post" {
+                            input type="hidden" name="_csrf" value=(csrf_token);
+                            button type="submit" { "Revoke" }
                         }
                     }
                 }
-            }
-
-            @if can_manage {
-                h2 { "Pending invitations" }
-                ul {
-                    @for invitation in &pending_invitations {
-                        li {
-                            span { (invitation.email) }
-                            span { " (" (invitation.role) ")" }
-                            form action={"/invitations/" (invitation.id) "/resend"} method="post" {
-                                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                                button type="submit" { "Resend" }
-                            }
-                            form action={"/invitations/" (invitation.id) "/revoke"} method="post" {
-                                input type="hidden" name="_csrf" value=(csrf_value(&csrf));
-                                button type="submit" { "Revoke" }
-                            }
-                        }
-                    }
-                    @if pending_invitations.is_empty() {
-                        li { "No pending invitations." }
-                    }
+                @if pending_invitations.is_empty() {
+                    li { "No pending invitations." }
                 }
             }
-        },
-    );
-    Ok(page.into_response())
+        }
+    }
 }
 
 /// Change a member's role within the active organization. Gated `Admin` or
@@ -2461,7 +2601,11 @@ pub async fn change_role(
     Form(form): Form<ChangeRoleForm>,
 ) -> AutumnResult<Response> {
     require_role(&session, &membership_repo, Role::Admin).await?;
-    let Some(caller_id) = session.get("user_id").await.and_then(|s| s.parse::<i64>().ok()) else {
+    let Some(caller_id) = session
+        .get("user_id")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
     let Some(new_role) = Role::parse(&form.role) else {
@@ -2574,7 +2718,11 @@ pub async fn remove_member(
     Path(membership_id): Path<i64>,
 ) -> AutumnResult<Response> {
     require_role(&session, &membership_repo, Role::Admin).await?;
-    let Some(caller_id) = session.get("user_id").await.and_then(|s| s.parse::<i64>().ok()) else {
+    let Some(caller_id) = session
+        .get("user_id")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
         return Err(AutumnError::unauthorized_msg("authentication required"));
     };
 
@@ -2646,7 +2794,106 @@ pub async fn remove_member(
 
     Ok(Redirect::to("/members").into_response())
 }
-"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(caller_role: Role, form: InviteFormView<'_>) -> String {
+        members_content(caller_role, &[], &[], "csrf-abc", form).into_string()
+    }
+
+    /// A clean form: empty email, `member` selected, no alert.
+    #[test]
+    fn members_content_invite_form_clean_when_no_error() {
+        let html = render(Role::Owner, InviteFormView::BLANK);
+        assert!(html.contains(r#"action="/invitations""#), "{html}");
+        assert!(html.contains(r#"value="csrf-abc""#), "{html}");
+        assert!(html.contains(r#"value="""#), "{html}");
+        assert_eq!(html.matches(r#"aria-invalid="false""#).count(), 2, "{html}");
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+        assert!(!html.contains("aria-describedby"), "{html}");
+        assert!(html.contains(r#"option value="member" selected"#), "{html}");
+    }
+
+    /// A rejected email: the message shows at the email field, only that
+    /// field is invalid, and the typed email and role stay.
+    #[test]
+    fn members_content_invite_form_shows_email_error_and_preserves_input() {
+        let html = render(
+            Role::Owner,
+            InviteFormView {
+                email: "not-an-email",
+                role: "admin",
+                email_error: Some("Enter a valid email address"),
+                role_error: None,
+            },
+        );
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("Enter a valid email address"), "{html}");
+        assert!(html.contains(r#"value="not-an-email""#), "{html}");
+        assert!(
+            html.contains(r#"aria-describedby="invite-email-error""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"option value="admin" selected"#), "{html}");
+        assert!(
+            !html.contains(r#"option value="member" selected"#),
+            "{html}"
+        );
+        let select_start = html.find("<select").expect("role select");
+        assert!(
+            html[..select_start].contains(r#"aria-invalid="true""#),
+            "{html}"
+        );
+        assert!(
+            html[select_start..].contains(r#"aria-invalid="false""#),
+            "{html}"
+        );
+    }
+
+    /// A rejected role: the role field is invalid, not the email field, and
+    /// the email stays.
+    #[test]
+    fn members_content_invite_form_shows_role_error_on_role_field() {
+        let html = render(
+            Role::Owner,
+            InviteFormView {
+                email: "newbie@acme.test",
+                role: "super-admin",
+                email_error: None,
+                role_error: Some("Unknown role"),
+            },
+        );
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("Unknown role"), "{html}");
+        assert!(html.contains(r#"value="newbie@acme.test""#), "{html}");
+        assert!(
+            html.contains(r#"aria-describedby="invite-role-error""#),
+            "{html}"
+        );
+        let email_start = html.find(r#"name="email""#).expect("email input");
+        let select_start = html.find("<select").expect("role select");
+        assert!(
+            html[email_start..select_start].contains(r#"aria-invalid="false""#),
+            "{html}"
+        );
+        assert!(
+            html[select_start..].contains(r#"aria-invalid="true""#),
+            "{html}"
+        );
+        // No option matches "super-admin", so none is selected.
+        assert!(!html.contains("selected"), "{html}");
+    }
+
+    /// A `Member` never sees the invite form.
+    #[test]
+    fn members_content_hides_invite_form_when_caller_cannot_manage() {
+        let html = render(Role::Member, InviteFormView::BLANK);
+        assert!(!html.contains(r#"action="/invitations""#), "{html}");
+    }
+}
+"##;
 
 // ── Migration SQL ────────────────────────────────────────────────────────
 
@@ -2894,8 +3141,10 @@ async fn main() {
             .matches("input type=\"hidden\" name=\"_csrf\" value=(csrf_value(&csrf));")
             .count()
             + members
-                .matches("input type=\"hidden\" name=\"_csrf\" value=(csrf_value(&csrf));")
+                .matches("input type=\"hidden\" name=\"_csrf\" value=(csrf_token);")
                 .count();
+        // `members_content` gets its token from `csrf_value`.
+        assert!(members.contains("csrf_value(csrf),"), "{members}");
         assert_eq!(
             csrf_field_count,
             6,
@@ -3791,9 +4040,9 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             .find("// ── Accept (show) ")
             .unwrap_or(invitations.len());
         let body = &invitations[create_start..create_end];
+        assert!(body.contains("if existing_pending.is_some()"), "{body}");
         assert!(
-            body.contains("if existing_pending.is_some()")
-                && body.contains("AutumnError::conflict_msg("),
+            body.contains("An invitation to this email is already pending for this organization"),
             "{body}"
         );
         assert!(
@@ -3940,7 +4189,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
     }
 
     #[test]
-    fn create_invitation_translates_pending_email_unique_violation_to_conflict() {
+    fn create_invitation_redisplays_on_pending_email_unique_violation() {
         let tmp = project();
         plan_teams(tmp.path(), "20260101000000", false)
             .unwrap()
@@ -4432,7 +4681,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         // pre-transaction check and this lock).
         assert!(
             invitations.contains(
-                "live_caller_email.trim().to_lowercase() != invitation_email.trim().to_lowercase()"
+                "normalize_email(&live_caller_email) != normalize_email(&invitation_email)"
             ),
             "{invitations}"
         );
@@ -4594,6 +4843,208 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         assert!(
             revoke_body.contains("if current.status != \"pending\""),
             "{revoke_body}"
+        );
+    }
+
+    /// The body of `create_invitation` in the generated invitations route.
+    fn create_invitation_body(invitations: &str) -> &str {
+        let start = invitations
+            .find("pub async fn create_invitation(")
+            .expect("create_invitation");
+        let end = invitations[start..]
+            .find("// ── Accept (show) ")
+            .map_or(invitations.len(), |end| start + end);
+        &invitations[start..end]
+    }
+
+    /// A rejected invite redisplays the members page (#3595). A bad email,
+    /// an unknown role, and a duplicate pending invitation each go back to
+    /// the form with the input kept. None of them is a bare `Err`.
+    #[test]
+    fn create_invitation_redisplays_the_members_form_on_rejected_input() {
+        let invitations = render_routes_invitations_rs();
+        let body = create_invitation_body(&invitations);
+
+        for dead_end in [
+            "unprocessable_msg(\"Enter a valid email address\")",
+            "unprocessable_msg(\"Unknown role\")",
+            "conflict_msg(",
+        ] {
+            assert!(!body.contains(dead_end), "{dead_end} in: {body}");
+        }
+        for field_error in [
+            "email_error: Some(\"Enter a valid email address\")",
+            "role_error: Some(\"Unknown role\")",
+            "email_error: Some(\n",
+        ] {
+            assert!(body.contains(field_error), "{field_error} in: {body}");
+        }
+        assert_eq!(body.matches("redisplay_members(").count(), 3, "{body}");
+        assert!(
+            body.contains("csrf: Option<CsrfToken>,")
+                && body.contains("invitation_repo: PgInvitationRepository,"),
+            "{body}"
+        );
+        // An Admin who grants Owner is refused. That is not an input error.
+        assert!(
+            body.contains(
+                "forbidden_msg(\n            \"Only an owner can invite someone as owner\""
+            ),
+            "{body}"
+        );
+    }
+
+    /// The members page body is one function, shared by `GET /members` and
+    /// the redisplay. Each field shows its own error and `aria-invalid`.
+    #[test]
+    fn members_route_shares_one_page_between_list_and_redisplay() {
+        let members = render_routes_members_rs();
+        assert!(
+            members.contains("pub(super) struct InviteFormView<'a>"),
+            "{members}"
+        );
+        assert!(
+            members.contains("pub(super) fn members_content("),
+            "{members}"
+        );
+        assert!(
+            members.contains("pub(super) async fn redisplay_members("),
+            "{members}"
+        );
+        assert!(
+            members.contains("StatusCode::UNPROCESSABLE_ENTITY"),
+            "{members}"
+        );
+        assert!(
+            members.contains("aria-invalid=(aria_invalid(form.email_error))")
+                && members.contains("aria-invalid=(aria_invalid(form.role_error))"),
+            "{members}"
+        );
+        assert!(members.contains("value=(form.email)"), "{members}");
+        assert!(
+            members.contains("selected[form.role == \"admin\"]"),
+            "{members}"
+        );
+
+        let list_body = members
+            .split("pub async fn list_members(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("list_members");
+        assert!(list_body.contains("members_page("), "{list_body}");
+        assert!(!list_body.contains("html! {"), "{list_body}");
+    }
+
+    /// Every name that follows a `fn` keyword in `source`.
+    fn fn_names(source: &str) -> std::collections::BTreeSet<&str> {
+        source
+            .match_indices("fn ")
+            .filter(|(at, _)| {
+                source[..*at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            })
+            .filter_map(|(at, _)| {
+                let rest = &source[at + 3..];
+                let end = rest
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                (end > 0).then(|| &rest[..end])
+            })
+            .collect()
+    }
+
+    /// Example functions the generated module does not have, and why.
+    /// Each one needs the app's own `users` table. The generated module
+    /// does not own that table.
+    const EXAMPLE_ONLY_FNS: &[(&str, &str)] = &[
+        ("routes/invitations.rs", "accept_signup_form"),
+        (
+            "routes/invitations.rs",
+            "accept_signup_form_clean_when_no_error",
+        ),
+        (
+            "routes/invitations.rs",
+            "accept_signup_form_never_echoes_a_password_value",
+        ),
+        (
+            "routes/invitations.rs",
+            "accept_signup_form_shows_error_and_preserves_context",
+        ),
+        ("routes/invitations.rs", "redisplay_accept_signup"),
+        ("routes/members.rs", "load_emails"),
+        ("routes/members.rs", "empty_emails"),
+    ];
+
+    /// Drift tripwire for #3595. Every function in the `examples/teams`
+    /// files below has a same-name function in a `generate teams` template,
+    /// or an entry in [`EXAMPLE_ONLY_FNS`]. A fix that adds a function to
+    /// the example fails here until the generator gets it too.
+    ///
+    /// The check uses all templates together, so a function can move to a
+    /// different file. Function bodies are not compared: the generator
+    /// adapts them (no `users` table, `SQLite` row locks).
+    #[test]
+    fn every_example_teams_fn_has_a_generated_counterpart() {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/teams/src");
+        let templates = [
+            render_mod_rs(),
+            render_schema_rs(),
+            render_models_rs(),
+            render_role_rs(),
+            render_repositories_rs(),
+            render_mailers_mod_rs(),
+            render_invitation_mailer_rs(),
+            render_routes_mod_rs(),
+            render_routes_organizations_rs(),
+            render_routes_invitations_rs(),
+            render_routes_members_rs(),
+        ];
+        let generated: std::collections::BTreeSet<&str> =
+            templates.iter().flat_map(|t| fn_names(t)).collect();
+
+        let mut missing = Vec::new();
+        let mut stale = Vec::new();
+        for file in [
+            "routes/invitations.rs",
+            "routes/members.rs",
+            "routes/organizations.rs",
+            "routes/mod.rs",
+            "role.rs",
+            "models.rs",
+            "schema.rs",
+            "repositories.rs",
+            "mailers/invitation_mailer.rs",
+        ] {
+            let source = fs::read_to_string(example.join(file))
+                .unwrap_or_else(|err| panic!("examples/teams/src/{file}: {err}"));
+            let allowed: Vec<&str> = EXAMPLE_ONLY_FNS
+                .iter()
+                .filter(|(f, _)| *f == file)
+                .map(|(_, name)| *name)
+                .collect();
+            for name in fn_names(&source) {
+                if !generated.contains(name) && !allowed.contains(&name) {
+                    missing.push(format!("{file}: fn {name}"));
+                }
+            }
+            for name in allowed {
+                if !source.contains(&format!("fn {name}")) || generated.contains(name) {
+                    stale.push(format!("{file}: fn {name}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "examples/teams has functions the `generate teams` templates lack. \
+             Port each one, or add it to EXAMPLE_ONLY_FNS with a reason:\n{}",
+            missing.join("\n"),
+        );
+        assert!(
+            stale.is_empty(),
+            "EXAMPLE_ONLY_FNS entries that no longer apply. Remove them:\n{}",
+            stale.join("\n"),
         );
     }
 }
