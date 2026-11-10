@@ -355,10 +355,38 @@ fn metadata(workspace: &Path) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))
 }
 
-/// The dependency graph of the packages in `cargo metadata --no-deps`
-/// output: normal and build dependencies, with the name each one has in
-/// source. A dev-dependency is left out: the pass checks no test.
+/// Full `cargo metadata` for the workspace at `workspace`, with the resolve
+/// graph of every package the pass builds, also those outside the
+/// workspace.
+fn resolved_metadata(workspace: &Path, pass: &PassOptions) -> Result<serde_json::Value, String> {
+    let out = Command::new("cargo")
+        .args(["metadata", "--format-version", "1"])
+        .args(pass.features.to_args())
+        .current_dir(workspace)
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("run cargo metadata: {e}"))?;
+    if !out.status.success() {
+        return Err("cargo metadata failed".to_owned());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))
+}
+
+/// The dependency graph in `cargo metadata` output: normal and build
+/// dependencies, with the name each one has in source. A dev-dependency is
+/// left out: the pass checks no test.
+///
+/// The resolve graph covers every package, also those outside the
+/// workspace. Output with no resolve graph (`--no-deps`) gives the edges of
+/// the workspace members only.
 fn crates_of(meta: &serde_json::Value) -> Crates {
+    let resolve = meta
+        .get("resolve")
+        .and_then(|r| r.get("nodes"))
+        .and_then(serde_json::Value::as_array);
+    if let Some(nodes) = resolve {
+        return crates_of_resolve(meta, nodes);
+    }
     let mut crates = Crates::default();
     let packages = meta
         .get("packages")
@@ -386,6 +414,52 @@ fn crates_of(meta: &serde_json::Value) -> Crates {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(target);
             crates.add_dependency(name, extern_name, target);
+        }
+    }
+    crates
+}
+
+/// The string at `key` in `value`, if it is one.
+fn str_of<'v>(value: &'v serde_json::Value, key: &str) -> Option<&'v str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// The graph from the resolve nodes of `cargo metadata`.
+fn crates_of_resolve(meta: &serde_json::Value, nodes: &[serde_json::Value]) -> Crates {
+    let names: std::collections::BTreeMap<&str, &str> = meta
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| Some((str_of(p, "id")?, str_of(p, "name")?)))
+        .collect();
+    let mut crates = Crates::default();
+    for node in nodes {
+        let Some(package) = str_of(node, "id").and_then(|id| names.get(id)) else {
+            continue;
+        };
+        let deps = node
+            .get("deps")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for dep in deps {
+            let only_dev = dep
+                .get("dep_kinds")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|kinds| {
+                    !kinds.is_empty() && kinds.iter().all(|k| str_of(k, "kind") == Some("dev"))
+                });
+            let (Some(extern_name), Some(target)) = (
+                str_of(dep, "name"),
+                str_of(dep, "pkg").and_then(|id| names.get(id)),
+            ) else {
+                continue;
+            };
+            if !only_dev {
+                crates.add_dependency(package, extern_name, target);
+            }
         }
     }
     crates
@@ -438,7 +512,7 @@ fn run_pass(workspace: &Path, pass: &PassOptions, target: Option<&Path>) -> Resu
     if !status.success() {
         return Err("cargo check failed; the contract needs a build that compiles".to_owned());
     }
-    let crates = crates_of(&metadata(workspace)?);
+    let crates = crates_of(&resolved_metadata(workspace, pass)?);
     Bundle::from_dir_with(out.path(), Some(&crates))
 }
 
@@ -496,6 +570,34 @@ mod tests {
             Some("shared-dto")
         );
         assert!(!crates.reaches("mesh-storefront", "test-kit"));
+    }
+
+    #[test]
+    fn the_dependency_graph_follows_crates_outside_the_workspace() {
+        // `app` is the only workspace member. `api` and `shared` come from a
+        // registry, and only the resolve graph knows that `api` uses `shared`.
+        let meta = serde_json::json!({
+            "packages": [
+                {"id": "app-id", "name": "app", "dependencies": []},
+                {"id": "api-id", "name": "api", "dependencies": []},
+                {"id": "shared-id", "name": "shared-dto", "dependencies": []},
+                {"id": "kit-id", "name": "test-kit", "dependencies": []}
+            ],
+            "resolve": {"nodes": [
+                {"id": "app-id", "deps": [
+                    {"name": "api", "pkg": "api-id", "dep_kinds": [{"kind": null}]},
+                    {"name": "test_kit", "pkg": "kit-id", "dep_kinds": [{"kind": "dev"}]}
+                ]},
+                {"id": "api-id", "deps": [
+                    {"name": "shared", "pkg": "shared-id", "dep_kinds": [{"kind": null}]}
+                ]},
+                {"id": "shared-id", "deps": []}
+            ]}
+        });
+        let crates = crates_of(&meta);
+        assert_eq!(crates.dependency("api", "shared"), Some("shared-dto"));
+        assert!(crates.reaches("app", "shared-dto"));
+        assert!(!crates.reaches("app", "test-kit"));
     }
 
     #[test]
