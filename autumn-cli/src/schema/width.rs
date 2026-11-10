@@ -340,8 +340,8 @@ fn tokenize(sql: &str) -> Vec<Tok> {
                 }
             }
         } else if c == '\'' || ((c == 'e' || c == 'E') && next == Some('\'')) {
-            // `''` is an escaped quote inside the literal. An `E'…'` string
-            // also takes `\x` escapes. A standard string treats `\` as text.
+            // `''` is a quote inside the string. In `E'…'`, `\` also escapes
+            // the next character. In a standard string, `\` is plain text.
             let backslash_escapes = c != '\'';
             i += if backslash_escapes { 2 } else { 1 };
             while i < chars.len() {
@@ -792,12 +792,29 @@ fn collect_table_macros(items: &[syn::Item], out: &mut Vec<MacroTable>) {
     }
 }
 
-/// True when `src` has `word`, optional whitespace, then `next`.
+/// True when `src` has `word`, then `next`. Whitespace and comments may sit
+/// between them. A `!` that starts `!=` does not count.
 ///
 /// Rust allows `table !` and `model (`, so a plain substring test misses them.
 fn mentions_macro(src: &str, word: &str, next: char) -> bool {
-    src.match_indices(word)
-        .any(|(at, _)| src[at + word.len()..].trim_start().starts_with(next))
+    src.match_indices(word).any(|(at, _)| {
+        let rest = skip_trivia(&src[at + word.len()..]);
+        rest.starts_with(next) && !(next == '!' && rest.starts_with("!="))
+    })
+}
+
+/// `s` without leading whitespace and Rust comments.
+fn skip_trivia(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("//") {
+            s = rest.find('\n').map_or("", |n| &rest[n..]);
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.find("*/").map_or("", |n| &rest[n + 2..]);
+        } else {
+            return s;
+        }
+    }
 }
 
 /// The widths one `.rs` file declares: its `table!` blocks and its `#[model]`
@@ -1715,7 +1732,7 @@ mod tests {
     #[test]
     fn escape_string_escaped_backslash_then_close() {
         let w = widths(&[
-            "CREATE TABLE t (a TEXT DEFAULT e'a\\\\', b TEXT);",
+            "CREATE TABLE t (a TEXT DEFAULT e'a\\\\', b TEXT DEFAULT 'x');",
             "CREATE TABLE next (x TEXT);",
         ]);
         assert_eq!(w.get("t"), Some(&2));
@@ -1725,7 +1742,7 @@ mod tests {
     #[test]
     fn standard_string_backslash_is_literal() {
         let w = widths(&[
-            "CREATE TABLE t (a TEXT DEFAULT 'C:\\path', b TEXT);",
+            "CREATE TABLE t (a TEXT DEFAULT 'C:\\', b TEXT);",
             "CREATE TABLE next (x TEXT);",
         ]);
         assert_eq!(w.get("t"), Some(&2));
@@ -1753,6 +1770,20 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].source, WidthSource::Model);
         assert_eq!(found[0].columns, 33);
+    }
+
+    #[test]
+    fn unterminated_escape_string_does_not_panic() {
+        assert!(widths(&["CREATE TABLE t (a TEXT DEFAULT E'abc\\"]).is_empty());
+        assert!(widths(&["CREATE TABLE t (a TEXT DEFAULT e'"]).is_empty());
+    }
+
+    #[test]
+    fn macro_filter_skips_comments_and_not_equals() {
+        assert!(mentions_macro("table /* c */ ! {", "table", '!'));
+        assert!(mentions_macro("table // c\n! {", "table", '!'));
+        assert!(mentions_macro("#[model ]", "model", ']'));
+        assert!(!mentions_macro("if table != x", "table", '!'));
     }
 
     #[test]
