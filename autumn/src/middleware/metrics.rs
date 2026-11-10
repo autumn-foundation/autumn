@@ -830,13 +830,17 @@ pub struct MetricsSnapshot {
     pub idempotency: IdempotencyMetricsSnapshot,
     /// Database queries tracked.
     ///
-    /// The `"<route> SELECT"` key from the `Db` extractor is deprecated. It
-    /// holds the connection hold time, not a query time. Read
-    /// [`db_connection_holds`](Self::db_connection_holds) instead. The next
-    /// release removes it.
+    /// Deprecated: the `Db` extractor also writes its connection hold time
+    /// under `"<route> SELECT"`. Read
+    /// [`db_connection_holds`](Self::db_connection_holds) for the hold. The
+    /// next release stops this write. After that, the key holds only `SELECT`
+    /// statements from `run_instrumented`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub db_queries: HashMap<String, DbQueryMetric>,
-    /// Connection hold time per route, keyed `"METHOD /path"`.
+    /// Connection hold time per route.
+    ///
+    /// The key is the route, for example `"POST /census"`. A `Db` from a
+    /// shard adds the shard, for example `"GET /notes shard=shard0"`.
     ///
     /// One sample for each `Db` the route held: the time from checkout to
     /// release. It includes all statements and all other work in the hold.

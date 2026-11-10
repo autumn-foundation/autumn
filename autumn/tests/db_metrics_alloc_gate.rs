@@ -35,6 +35,10 @@
 //! | `run_instrumented`, seen route  |      3 |     0 |
 //! | `record_db_connection_hold`, seen route | new | 0 |
 //!
+//! `Db::drop` calls the crate-private `_fmt` form of the hold record. That
+//! form shares `record_db_series_fmt` with `run_instrumented`, so the
+//! `run_instrumented` case also gates it.
+//!
 //! A failure here means a refactor put an allocation back on the hit path;
 //! re-measure and re-derive rather than raising a ceiling.
 

@@ -13,8 +13,8 @@
 
 ### Deprecated
 
-- **metrics:** the `db_queries["<route> SELECT"]` key from the `Db`
-  extractor (issue #3579). It holds the connection hold time, not a query
-  time. A route that only writes also shows it. Read
-  `db_connection_holds["<route>"]` instead. The next release removes the old
-  key.
+- **metrics:** the hold time that the `Db` extractor writes under
+  `db_queries["<route> SELECT"]` (issue #3579). It is not a query time. A
+  route that only writes also shows it. Read `db_connection_holds["<route>"]`
+  instead. The next release stops this write. After that, the key holds only
+  `SELECT` statements from `run_instrumented`.

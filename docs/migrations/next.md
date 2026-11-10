@@ -706,19 +706,25 @@ the time a request held its connection, from checkout to release. It includes
 all statements and all other work in the hold, for example a fan-out. A route
 that only writes also shows it.
 
-This release records the same sample in two places:
+This release records each hold in two places:
 
 | Key | Status |
 | --- | --- |
-| `db_queries["POST /census SELECT"]` | Deprecated. The next release removes it. |
+| `db_queries["POST /census SELECT"]` | Deprecated for holds. The next release stops this write. |
 | `db_connection_holds["POST /census"]` | New. Use this one. |
+
+`run_instrumented` also records a real `SELECT` under `"<route> SELECT"`.
+In this release, that key can mix holds and statements. After the next
+release, it holds only statements.
 
 What to do:
 
 1. Move each dashboard and alert that reads `db_queries["<route> SELECT"]`
-   to `db_connection_holds["<route>"]`. The new key has no verb.
-2. Read per-statement times from the other `db_queries` keys. These come
-   from `run_instrumented`.
+   for the hold to `db_connection_holds["<route>"]`. The new key has no
+   verb. A `Db` from a shard adds the shard, for example
+   `"GET /notes shard=shard0"`.
+2. Read statement times from `db_queries`. These come from
+   `run_instrumented`.
 
 ## Deprecations retained from `{X.Y}`
 

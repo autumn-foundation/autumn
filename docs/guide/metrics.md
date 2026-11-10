@@ -418,16 +418,20 @@ Two maps show database time:
 
 | Key | One sample is | Example key |
 | --- | --- | --- |
-| `db_queries` | one statement from `run_instrumented` | `"GET /users SELECT"` |
+| `db_queries` | one statement from `run_instrumented` | `"POST /users INSERT"` |
 | `db_connection_holds` | one `Db` hold, from checkout to release | `"POST /census"` |
+
+The hold key is the route. A `Db` from a shard adds the shard, for example
+`"GET /notes shard=shard0"`.
 
 A hold includes all statements and all other work while the handler holds
 the connection. It is not a query time. A long hold with fast statements
 shows work outside the database. To make the hold short, take `LazyDb` and
 call `checkout()` only when you need the connection.
 
-The `db_queries["<route> SELECT"]` key from the `Db` extractor is
-deprecated. It holds the same hold time. The next release removes it. See
+Deprecated: the `Db` extractor also writes each hold under
+`db_queries["<route> SELECT"]`. The next release stops this write. After
+that, the key holds only `SELECT` statements from `run_instrumented`. See
 the [migration guide](../migrations/next.md#metrics-the-route-select-key-is-deprecated).
 
 ---
