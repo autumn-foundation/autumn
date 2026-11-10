@@ -623,7 +623,7 @@ impl DatabaseFleet<SqliteEngine> {
         connect_timeout_secs: u64,
         migrations: FleetMigrations,
     ) -> Result<Self, FleetError> {
-        Self::from_config(config, |root| {
+        Self::from_config(config, Duration::from_secs(connect_timeout_secs), |root| {
             SqliteEngine::new(
                 root,
                 config.pool_size,

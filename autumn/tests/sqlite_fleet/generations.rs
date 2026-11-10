@@ -214,6 +214,7 @@ async fn host(dir: &FsPath, volume: &str, owner: &str, clock: &TickingClock) -> 
             max_open: 4,
             max_resident_bytes: 0,
             min_residency: Duration::ZERO,
+            max_open_policy: autumn_web::config::FleetMaxOpenPolicy::Soft,
             pool_size: 1,
             create_on_demand: Some(true),
             idle_close_secs: 0,

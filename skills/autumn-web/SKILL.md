@@ -121,6 +121,7 @@ the framework almost certainly already generates or ships it:
 | Calling `cache.invalidate(key)` by hand after a repository write | `#[repository(Model, invalidates(cached_fn))]`: each generated write drops the read after it commits (#3056). Async code uses `Cache::invalidate_async`, which returns the error |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | `Db` taken before a body extractor (`Form`/`Json`/`Multipart`) in the same handler — pins a pooled connection for as long as the client takes to send the body | `LazyDb` in the same argument spot; call `.checkout().await?` after the body extractor runs — for `Form`/`Json` that means right at handler entry, but `Multipart` doesn't buffer anything during extraction, so checkout must wait until every field this handler needs has been read from the `next_field()` loop, not before it (issue #2264) |
+| Reading `/actuator/metrics` `db_queries["<route> SELECT"]` as a slow `SELECT` — the `Db` extractor writes its connection hold time there (checkout to release, all work in the hold), also on routes that only write | `db_connection_holds["<route>"]` for the hold; `db_queries` for statements timed with `run_instrumented`. The `Db` write to `"<route> SELECT"` is deprecated and stops next release (issue #3579). A long hold with fast statements is work outside the database: take `LazyDb` and check out late. See `docs/guide/metrics.md` |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
 | Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (0.6.0) |
 | Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (0.6.0) |
@@ -1071,6 +1072,7 @@ raw Diesel:
 | `save_many`, `save_many_skip_invalid`, `update_many`, `delete_many`, `upsert_many` | Bulk ops, hook-aware, auto-chunked under the 65,535-param ceiling; `upsert_many` is a compile error on hooked repositories |
 | `with_lock` | `SELECT ... FOR UPDATE` row locking in a transaction |
 | `primary_reads` (attr) / `on_primary()` | Pin reads to primary; read-your-writes after a save |
+| `boundary = B` (attr) | Run as the Postgres role of boundary `B`; implies `primary_reads`; not with `sharded` |
 | `soft_delete`, `tenant_scoped` (attrs), `across_tenants()` | Soft deletion and tenant scoping |
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
@@ -2453,6 +2455,17 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   windows (new callees with deployed callers, new callers with deployed
   callees). Exit 0 safe, 1 not safe, 3 safe in one order only (the report
   names it; `--order callee-first|caller-first` declares it), 4 tool error.
+- The bundle (format 3) finds a type by its path, not its last name: write
+  `Json<shared::Item>` or `Json<crate::dto::Item>` when two reachable crates
+  have an `Item`, or the export stops. Nested `WireShape` types are compared
+  field by field (`details.color`). `struct Empty;` (JSON `null`) and
+  `struct Empty {}` (`{}`) are different shapes.
+- A field whose type has no `WireShape` and is not a known leaf (an enum, for
+  example) stops the export: mark it `#[wire(opaque)]` to compare it by type
+  name only. Do not add `WireShape` to an enum: the derive refuses it.
+- An `#[endpoint]` must be in a `routes![…]` call. Taking it out of the router
+  is a removed route. `autumn contracts export --from <dir>` joins an existing
+  descriptor directory with no build.
 
 Limits: one workspace, sync request/response, JSON over HTTP. Guide:
 `docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +
@@ -3129,10 +3142,16 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   Use `import` or `restore_from_file`, not a
   `FleetLifecycle::restore_missing` hook, for a local backup. CLI:
   `autumn fleet restore <key> --from <file> --force`.
-- `max_open` is a soft limit: a database in use or used within
+- `max_open` is a soft limit by default: a database in use or used within
   `min_residency` (default `"2s"`) is not closed, and an open never waits.
   A burst can open far more files than `max_open`. Size `ulimit -n` for the
-  peak (about `2 × pool_size + 1` fds per open database).
+  peak (about `2 × pool_size + 1` fds per open database). `db:fleet` reports
+  `peak_open`, `over_cap_opens_total` and `refused_total`.
+- `[database.fleet] max_open_policy = "wait"` or `"refuse"` makes `max_open`
+  hard: open and closing databases never pass it. `wait` parks an open for
+  at most `database.connect_timeout_secs`, then answers `503`. `refuse`
+  answers `503` with `Retry-After` when no idle database can close. Check the
+  tenant id before `open`: the cap counts any key.
 - `max_resident_bytes` (default `0`, off) is a soft memory budget with the
   same rules as `max_open`. The SQLite engine counts about 2 MB per open
   connection. The fleet keeps one database open. `db:fleet` reports
@@ -3153,6 +3172,14 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `rpo_secs` of committed writes that already returned success are missing.
   A replicated fleet root is served by one process (one replicator per
   database).
+- A write that spans two databases (move a row: upsert into `dst`, delete
+  from `src`): do the second half only after the first is in the replica.
+  `fleet.wait_replicated(&dst, committed_at, timeout)` with `committed_at`
+  read from the app clock after the commit; `fleet.replicated_through(&key)`
+  gives the instant itself. Errors: `NotReplicating`, `Fenced`, `TimedOut`
+  (not a loss: keep the source row, retry). Do not use `worst_lag_seconds`
+  or `last_success_at` for this. Guide: "Know when a write is in the
+  replica" in `docs/guide/sqlite-fleet.md`.
 - Delete with replication (issue #3235): `delete` also purges the replica.
   It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
   database first; no row, no delete (`503`). A failed purge keeps the row,
@@ -3851,7 +3878,9 @@ today's violations, so an existing app can adopt it. See
 `docs/guide/table-ownership.md`. To make the database refuse
 the same queries, give a boundary `schema` and `role`, connect it with
 `[database.roles.<boundary>]`, and use `state.pool_for::<B>()` or
-`BoundaryDb<B>`. See `docs/guide/database-boundaries.md`.
+`BoundaryDb<B>`. Put a model in the schema with
+`#[model(managed, schema = "marketing")]`. Run a repository as the role with
+`#[repository(Model, boundary = B)]`. See `docs/guide/database-boundaries.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 

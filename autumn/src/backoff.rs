@@ -81,6 +81,69 @@ pub fn retry_after_wait(hint: Duration, backoff: Duration) -> Duration {
     backoff.saturating_add(hint.min(RETRY_AFTER_SLACK))
 }
 
+/// A bounded retry plan: jittered delays that stop when the attempts run out
+/// or the time left cannot cover the next sleep.
+///
+/// Pass [`Deadline::remaining`](crate::deadline::Deadline::remaining) to
+/// [`next_delay`](Self::next_delay) so a retry loop gives up instead of
+/// sleeping past the request deadline.
+#[derive(Debug)]
+pub struct RetrySchedule<'a> {
+    entropy: &'a dyn Entropy,
+    base: Duration,
+    cap: Duration,
+    max_retries: u32,
+    retry: u32,
+}
+
+impl<'a> RetrySchedule<'a> {
+    /// A schedule of at most `max_retries` full-jitter delays.
+    #[must_use]
+    pub const fn new(
+        entropy: &'a dyn Entropy,
+        base: Duration,
+        cap: Duration,
+        max_retries: u32,
+    ) -> Self {
+        Self {
+            entropy,
+            base,
+            cap,
+            max_retries,
+            retry: 0,
+        }
+    }
+
+    /// How many delays have been handed out.
+    #[must_use]
+    pub const fn retries_taken(&self) -> u32 {
+        self.retry
+    }
+
+    /// The next delay, or `None` when the retries are spent or the delay
+    /// would not finish before `remaining` (`None` means no deadline).
+    /// A refused delay does not use up a retry.
+    pub fn next_delay(&mut self, remaining: Option<Duration>) -> Option<Duration> {
+        if self.retry >= self.max_retries {
+            return None;
+        }
+        let delay = full_jitter(self.entropy, self.base, self.cap, self.retry);
+        if remaining.is_some_and(|left| delay >= left) {
+            return None;
+        }
+        self.retry += 1;
+        Some(delay)
+    }
+}
+
+impl Iterator for RetrySchedule<'_> {
+    type Item = Duration;
+
+    fn next(&mut self) -> Option<Duration> {
+        self.next_delay(None)
+    }
+}
+
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -191,6 +254,45 @@ mod tests {
             retry_after_wait(Duration::MAX, Duration::MAX),
             Duration::MAX
         );
+    }
+
+    #[test]
+    fn schedule_stops_after_max_retries() {
+        let entropy = Fixed(u64::MAX);
+        let delays: Vec<_> = RetrySchedule::new(
+            &entropy,
+            Duration::from_millis(100),
+            Duration::from_millis(250),
+            4,
+        )
+        .collect();
+        assert_eq!(delays.len(), 4);
+        assert!(delays.iter().all(|d| *d <= Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn schedule_gives_up_when_the_deadline_is_too_close() {
+        let entropy = Fixed(100);
+        let mut plan = RetrySchedule::new(
+            &entropy,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            5,
+        );
+        assert_eq!(
+            plan.next_delay(Some(Duration::from_secs(1))),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(plan.next_delay(Some(Duration::from_millis(100))), None);
+        assert_eq!(plan.retries_taken(), 1);
+        assert!(plan.next_delay(None).is_some());
+    }
+
+    #[test]
+    fn schedule_with_zero_retries_is_empty() {
+        let entropy = Fixed(1);
+        let mut plan = RetrySchedule::new(&entropy, Duration::from_millis(1), Duration::MAX, 0);
+        assert_eq!(plan.next(), None);
     }
 
     proptest! {

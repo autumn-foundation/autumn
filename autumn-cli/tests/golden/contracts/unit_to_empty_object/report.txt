@@ -1,0 +1,9 @@
+Wire contracts: the current build against the deployed release.
+
+If the callees ship first (new callees, deployed callers): 1 break(s)
+  - catalog.ping (GET /ping): the response body is JSON `null` on one side and an object on the other, so caller `mesh-storefront::check_catalog` cannot decode what the new callee sends
+
+If the callers ship first (new callers, deployed callees): 1 break(s)
+  - catalog.ping (GET /ping): the response body is JSON `null` on one side and an object on the other, so caller `mesh-storefront::check_catalog` cannot decode what the deployed callee sends
+
+Verdict: not safe in any deploy order. Keep the old shape or route until no deployed release needs it.

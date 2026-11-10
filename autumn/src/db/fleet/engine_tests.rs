@@ -17,6 +17,7 @@ fn config(root: &Path, max_open: usize, max_resident_bytes: u64) -> DatabaseFlee
         max_open,
         max_resident_bytes,
         min_residency: Duration::ZERO,
+        max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
         pool_size: 1,
         create_on_demand: Some(true),
         idle_close_secs: 0,
@@ -533,4 +534,123 @@ fn a_fenced_ship_answers_421() {
     assert_eq!(error.http_status(), http::StatusCode::MISDIRECTED_REQUEST);
     assert!(error.to_string().contains("epoch 2"));
     assert_eq!(super::ShipReport::default().generation, None);
+}
+
+fn capped(
+    root: &Path,
+    max_open: usize,
+    policy: crate::config::FleetMaxOpenPolicy,
+    residency: Duration,
+) -> DatabaseFleet<TextEngine> {
+    let config = DatabaseFleetConfig {
+        max_open_policy: policy,
+        min_residency: residency,
+        ..config(root, max_open, 0)
+    };
+    DatabaseFleet::with_engine(&config, TextEngine::new(100)).unwrap()
+}
+
+#[tokio::test]
+async fn the_soft_policy_passes_max_open_and_counts_it() {
+    use crate::config::FleetMaxOpenPolicy::Soft;
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = capped(tmp.path(), 1, Soft, Duration::from_secs(60));
+    for tenant in ["a", "b"] {
+        drop(fleet.open(&key(&fleet, tenant)).await.unwrap());
+    }
+    let stats = fleet.stats();
+    assert_eq!((stats.open, stats.peak_open), (2, 2));
+    assert_eq!(stats.over_cap_opens_total, 1);
+    assert_eq!(stats.refused_total, 0);
+}
+
+#[tokio::test]
+async fn the_refuse_policy_answers_503_at_max_open() {
+    use crate::config::FleetMaxOpenPolicy::Refuse;
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = capped(tmp.path(), 1, Refuse, Duration::from_secs(60));
+    drop(fleet.open(&key(&fleet, "a")).await.unwrap());
+    let error = fleet.open(&key(&fleet, "b")).await.unwrap_err();
+    assert!(matches!(error, FleetError::AtCapacity { max_open: 1, .. }));
+    assert_eq!(error.http_status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    // A residency of 60 s is clamped to 30 s.
+    assert_eq!(error.retry_after_secs(), Some(30));
+    let stats = fleet.stats();
+    assert_eq!(
+        (stats.open, stats.peak_open, stats.refused_total),
+        (1, 1, 1)
+    );
+    // The open database still opens.
+    assert!(fleet.open(&key(&fleet, "a")).await.is_ok());
+}
+
+#[tokio::test]
+async fn the_wait_policy_waits_for_the_residency_then_opens() {
+    use crate::config::FleetMaxOpenPolicy::Wait;
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = capped(tmp.path(), 1, Wait, Duration::from_millis(200));
+    drop(fleet.open(&key(&fleet, "a")).await.unwrap());
+    let started = std::time::Instant::now();
+    drop(fleet.open(&key(&fleet, "b")).await.unwrap());
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    eventually(|| fleet.stats().draining == 0).await;
+    assert_eq!(fleet.stats().peak_open, 1);
+    assert_eq!(fleet.open_keys(), vec![key(&fleet, "b")]);
+}
+
+#[tokio::test]
+async fn a_burst_never_passes_max_open_under_the_wait_policy() {
+    use crate::config::FleetMaxOpenPolicy::Wait;
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = capped(tmp.path(), 3, Wait, Duration::from_millis(30));
+    let tasks: Vec<_> = (0..12)
+        .map(|n| {
+            let fleet = fleet.clone();
+            tokio::spawn(async move {
+                let db = fleet.open(&key(&fleet, &format!("t{n}"))).await?;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                drop(db);
+                Ok::<_, FleetError>(())
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    let stats = fleet.stats();
+    assert!(stats.peak_open <= 3, "peak {}", stats.peak_open);
+    assert_eq!(stats.over_cap_opens_total, 0);
+}
+
+#[tokio::test]
+async fn a_wait_policy_with_a_residency_past_the_timeout_still_builds() {
+    use crate::config::FleetMaxOpenPolicy::Wait;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = DatabaseFleetConfig {
+        max_open_policy: Wait,
+        min_residency: Duration::from_secs(10),
+        ..config(tmp.path(), 1, 0)
+    };
+    // Boot warns, and does not refuse the choice.
+    let fleet =
+        DatabaseFleet::from_config(&config, Duration::from_secs(1), |_| TextEngine::new(100))
+            .unwrap();
+    drop(fleet.open(&key(&fleet, "a")).await.unwrap());
+    let error = fleet.open(&key(&fleet, "b")).await.unwrap_err();
+    assert!(matches!(error, FleetError::AtCapacity { .. }));
+    assert_eq!(fleet.stats().refused_total, 1);
+}
+
+#[tokio::test]
+async fn a_full_hard_fleet_still_has_room_for_a_key_it_holds() {
+    use crate::config::FleetMaxOpenPolicy::Refuse;
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = capped(tmp.path(), 1, Refuse, Duration::from_secs(60));
+    let (held, other) = (key(&fleet, "a"), key(&fleet, "b"));
+    assert!(fleet.has_room_for(&held), "a free slot");
+    let db = fleet.open(&held).await.unwrap();
+    // The fleet is full. A request for the held key shares its entry.
+    assert!(fleet.has_room_for(&held));
+    assert!(!fleet.has_room_for(&other));
+    drop(db);
 }

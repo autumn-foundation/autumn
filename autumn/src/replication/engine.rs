@@ -91,7 +91,7 @@ use super::destination::{DestinationError, ReplicaDestination};
 use super::restore::{self, RestoreError, RestoreOutcome};
 use super::segment::{self, SegmentError, SegmentHeader, SnapshotMeta};
 use super::sqlite::{self, CheckpointOutcome, SqliteError};
-use super::status::ReplicationStatus;
+use super::status::{self, ReplicationStatus};
 use super::wal::{self, ScanCursor, WalError, WalHeader};
 use crate::time::{ClockSource, SystemClock};
 
@@ -333,6 +333,18 @@ impl GenerationState {
     }
 }
 
+/// The `-wal` tail after a tick's uploads.
+#[derive(Debug, Clone, Copy)]
+struct Tail {
+    /// `-wal` bytes past the shipped offset.
+    pending: u64,
+    /// No committed transaction is left to ship. A failed measurement also
+    /// gives `true`. This prevents false lag.
+    caught_up: bool,
+    /// The measurement read the `-wal` and proved `caught_up`.
+    proven: bool,
+}
+
 /// Row shape for `PRAGMA journal_mode`.
 #[derive(QueryableByName)]
 struct JournalModeRow {
@@ -415,6 +427,8 @@ impl Replicator {
         if self.epoch != epoch {
             self.epoch = epoch;
             self.state = None;
+            // The next generation proves its own bound.
+            self.status.clear_replicated_through();
             self.fence_checked_at = None;
             self.fenced_by = None;
         }
@@ -580,14 +594,18 @@ impl Replicator {
         let result = self.tick_inner();
         // When the fence refuses a put, this replicator stops permanently.
         // Its own fence check does the same.
-        if let Err(ReplicationError::Fenced { newest, .. }) = &result
-            && self.epoch.is_some()
-        {
-            self.fenced_by = Some(*newest);
+        if let Err(ReplicationError::Fenced { newest, .. }) = &result {
+            if self.epoch.is_some() {
+                self.fenced_by = Some(*newest);
+            }
+            // A newer owner writes the replica: claim nothing for it.
+            self.status.clear_replicated_through();
         }
         if let Err(e) = &result {
-            self.status
-                .record_tick_error(e.to_string(), self.clock.now());
+            let now = self.clock.now();
+            // A reading at or below the bound: the clock stepped back.
+            self.status.forget_if_ahead_of(now);
+            self.status.record_tick_error(e.to_string(), now);
         }
         result
     }
@@ -657,8 +675,23 @@ impl Replicator {
         // transfer behind. A run of slow uploads could hold the indicator `Up`
         // indefinitely past the configured RPO. (`maybe_checkpoint` already
         // re-measures for the same reason; the status path did not.)
-        let (pending, caught_up) = self.settled_tail(&wal_path);
+        //
+        // Read the clock before you measure the tail. Each commit at or
+        // before this reading is then in the `-wal`. A proven caught-up tail
+        // has shipped it.
+        let through = self.clock.now();
+        let tail = self.settled_tail(&wal_path);
+        let (pending, caught_up) = (tail.pending, tail.caught_up);
         report.pending_bytes = pending;
+        // A reading at or below the bound: the clock stepped back.
+        self.status.forget_if_ahead_of(through);
+        if tail.proven
+            && caught_up
+            && self.fenced_by.is_none()
+            && let Some(bound) = status::bound_below(through)
+        {
+            self.status.record_replicated_through(bound);
+        }
 
         // Read *after* anything this tick may have opened or shipped, never
         // before. Both judgements below compare this instant against a timestamp
@@ -692,7 +725,7 @@ impl Replicator {
         Ok(report)
     }
 
-    /// Re-measure the tail after this tick's uploads: `(pending_bytes, caught_up)`.
+    /// Re-measure the tail after this tick's uploads.
     ///
     /// Only a *committed* transaction counts as owed. Bytes from a write still
     /// in flight are not data the destination is behind on, so treating any
@@ -702,31 +735,59 @@ impl Replicator {
     /// Every failure path answers "caught up". An unreadable or re-salted `-wal`
     /// is not evidence that the replica is behind, and inventing lag from it
     /// would raise an alarm nothing can clear; the tick's own error paths
-    /// already record genuine failures.
-    fn settled_tail(&self, wal_path: &Path) -> (u64, bool) {
+    /// already record genuine failures. Those paths are not `proven`, so they
+    /// never advance `replicated_through`.
+    fn settled_tail(&self, wal_path: &Path) -> Tail {
+        let unproven = |pending| Tail {
+            pending,
+            caught_up: true,
+            proven: false,
+        };
         let Some(state) = self.state.as_ref() else {
-            return (0, true);
+            return unproven(0);
         };
         let wal_len = std::fs::metadata(wal_path).map_or(0, |m| m.len());
         let pending = wal_len.saturating_sub(state.shipped_offset);
-        if pending == 0 {
-            return (0, true);
+        if wal_len == 0 && state.shipped_offset == 0 && state.salt.is_none() {
+            // An empty `-wal` in a fresh index: every commit is in the
+            // database file, which the replica holds.
+            return Tail {
+                pending: 0,
+                caught_up: true,
+                proven: true,
+            };
         }
-        let (Ok(Some(header)), Some(cursor)) = (read_wal_header(wal_path, wal_len), state.cursor)
-        else {
-            return (pending, true);
+        let Ok(Some(header)) = read_wal_header(wal_path, wal_len) else {
+            return unproven(pending);
         };
         if state.salt != Some(header.salt()) {
-            return (pending, true);
+            return unproven(pending);
         }
+        if pending == 0 {
+            // Same salt and exactly the shipped length: nothing new. A
+            // shorter `-wal` is a change this replicator did not make.
+            return Tail {
+                pending: 0,
+                caught_up: true,
+                proven: wal_len == state.shipped_offset,
+            };
+        }
+        let Some(cursor) = state.cursor else {
+            return unproven(pending);
+        };
         let Ok(buffer) = read_range(wal_path, state.shipped_offset, wal_len) else {
-            return (pending, true);
+            return unproven(pending);
         };
         let scan_at = usize::try_from(cursor.offset.saturating_sub(state.shipped_offset))
             .unwrap_or(usize::MAX);
-        let committed = wal::scan_from(&header, &cursor, buffer.get(scan_at..).unwrap_or(&[]))
-            .is_ok_and(|outcome| outcome.last_commit_end > state.shipped_offset);
-        (pending, !committed)
+        wal::scan_from(&header, &cursor, buffer.get(scan_at..).unwrap_or(&[])).map_or_else(
+            |_| unproven(pending),
+            |outcome| Tail {
+                pending,
+                caught_up: outcome.last_commit_end <= state.shipped_offset,
+                proven: true,
+            },
+        )
     }
 
     /// Checkpoint the WAL when it is safe and due, returning whether it happened.

@@ -99,9 +99,34 @@ the boundary that owns them. The plugin SQL does not change.
 
 ## 3. Declare the table in its schema
 
-A `diesel::table!` block can name the schema. The module stays `campaigns`,
-so a `#[model(table = "campaigns")]` does not change. Diesel writes
-`"marketing"."campaigns"` in each query:
+Put the schema on the model. The `table!` block keeps the module name, so the
+model code does not change:
+
+```rust
+#[model(managed, table = "campaigns", schema = "marketing")]
+pub struct Campaign {
+    #[id]
+    pub id: i64,
+    pub name: String,
+}
+```
+
+* A schema name is lower case: `[a-z_][a-z0-9_]*`. The macro refuses other names.
+* `schema = "managed"` is the old spelling of `managed`. A schema cannot
+  have that name.
+* `autumn schema diff --write-migration` writes
+  `CREATE SCHEMA IF NOT EXISTS marketing;` and `CREATE TABLE marketing.campaigns`.
+  Later `ALTER`, `CREATE INDEX` and `DROP INDEX` statements use the same
+  schema.
+* The sync writes a new model as `marketing.campaigns (id) { ... }` in
+  `src/schema.rs`. A block that has a schema keeps it when the model names none.
+* A foreign key to a table of the same schema is written with the schema.
+* `autumn schema pull --schema marketing` reads the schema. Repeat the flag
+  for more schemas. `public` is always read. A pull keeps the schemas of the
+  existing snapshot. `schema doctor` and `schema diff --dev-url` read the
+  schemas of the snapshot and the models.
+
+A `diesel::table!` block can also name the schema without the model argument:
 
 ```rust
 diesel::table! {
@@ -112,9 +137,7 @@ diesel::table! {
 }
 ```
 
-`autumn schema diff --write-migration` keeps the schema of a block when it
-writes `src/schema.rs`. The width gate (`autumn schema width`) reads a
-qualified block too.
+The width gate (`autumn schema width`) reads a qualified block too.
 
 Some framework features write raw SQL with the bare table name. The grants
 put the schema first on the `search_path` of the boundary role, so these
@@ -188,6 +211,28 @@ async fn campaigns(mut db: autumn_web::db::BoundaryDb<Marketing>) -> AutumnResul
 | No `[database.roles]` | The primary pool. The app has one role. |
 | `[database.roles.marketing]` | The pool of `marketing`. |
 | Other roles, no `marketing` | `None`, and one warning. The boundary does not fall back to the owner role. `BoundaryDb` answers 503. |
+
+### A repository as the role
+
+Bind a repository to a boundary with `boundary = Type`. The repository then
+runs every query as the role:
+
+```rust
+#[repository(Campaign, boundary = Marketing)]
+pub trait CampaignRepository {}
+```
+
+* The extractor uses `pool_for::<Marketing>()`. Without `[database.roles]`,
+  that is the owner pool. A wrong key in `[database.roles]` gives the same
+  result.
+* With roles, but none for `marketing`, the extractor answers 503. It does
+  not use the owner role.
+* Reads stay on the role pool. A read replica connects as the owner. So a
+  replica read would run with the wrong rights.
+* `boundary` and `sharded` cannot work together.
+* The retention sweep of a repository uses the primary pool.
+* A `dependent(...)` cascade runs the child repository on the pool of the
+  parent. Give the parent and the child the same `boundary`.
 
 Each role pool opens its own connections. The boot log adds them to
 `total_max_connections`, and `database.max_connections_warn_threshold`
@@ -315,8 +360,31 @@ of database and user. So each boundary gets its own server pool.
   to `PUBLIC`, stays. The doctor check finds it.
 * Before Postgres 15, `PUBLIC` can create objects in schema `public`. Doctor
   warns. Remove it once: `REVOKE CREATE ON SCHEMA public FROM PUBLIC;`.
-* A repository uses the primary pool. Use `BoundaryDb` or `pool_for` for the
-  queries of a boundary.
+* The retention sweep of a repository uses the primary pool. A job runs
+  its SQL through `BoundaryDb` or `pool_for`.
+* One table name cannot be in two schemas. The schema tools key a table by
+  name, and refuse the second one. Use one name for each table.
+* `schema diff` does not move a table to another schema. It refuses the
+  change. Write `ALTER TABLE ... SET SCHEMA` by hand.
+* `schema diff` does not match a foreign key to a table of another named
+  schema. Write that constraint in a migration.
+* `schema diff` refuses a type change of a column that a foreign key points
+  at, when an FK of the same table name in another schema exists. This is a
+  false refusal. Write the change by hand.
+* `schema diff` refuses the rename of a table when an index of the new
+  convention name exists in another schema. This is a false refusal. Write the
+  rename by hand.
+* A model with `schema` stops `schema diff` on SQLite.
+* `autumn migrate` does not run an embedded `migrations_in_schema` set. Run it
+  at boot, or set `AUTUMN_MIGRATE=1`.
+* A role pool uses `database.url` with `user`. The role pool ignores a URL
+  that a pool provider sets at boot. Set `url` on `[database.roles.<boundary>]`.
+* Framework raw SQL with a bare table name finds the table by the
+  `search_path`. On the primary pool, the owner role needs the schema on its
+  path: `ALTER ROLE app_owner SET search_path = "$user", public, marketing;`
+* Doctor does not flag a granted view that reads tables outside the grant. A
+  view belongs to a boundary only through an `owns` pattern. Give such a view
+  `security_invoker = true` (Postgres 15 and later).
 
 ## Related
 

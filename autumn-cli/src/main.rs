@@ -653,6 +653,10 @@ pub enum ContractsSubcommands {
         /// Write the bundle to this file. The default is stdout.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
+        /// Join the descriptors already in this directory. No build runs,
+        /// and there is no dependency graph.
+        #[arg(long, value_name = "DIR")]
+        from: Option<PathBuf>,
         #[command(flatten)]
         pass: ContractsPassArgs,
     },
@@ -6165,9 +6169,10 @@ fn run_command(command: Commands) {
             });
         }
         Commands::Graph(command) => run_graph(command),
-        Commands::Contracts(ContractsSubcommands::Export { out, pass }) => {
+        Commands::Contracts(ContractsSubcommands::Export { out, from, pass }) => {
             contracts::run_export(&contracts::ExportOptions {
                 out,
+                from,
                 pass: pass.into_pass(),
             });
         }
@@ -10634,8 +10639,9 @@ mod tests {
     fn parse_contracts_export_defaults_to_the_workspace_and_stdout() {
         let cli = Cli::try_parse_from(["autumn", "contracts", "export"]).expect("parses");
         match cli.command {
-            Commands::Contracts(ContractsSubcommands::Export { out, pass }) => {
+            Commands::Contracts(ContractsSubcommands::Export { out, from, pass }) => {
                 assert!(out.is_none());
+                assert!(from.is_none(), "the default runs the pass");
                 assert!(pass.package.is_empty());
             }
             _ => panic!("expected contracts export"),

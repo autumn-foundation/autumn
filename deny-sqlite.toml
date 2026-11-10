@@ -34,23 +34,49 @@ unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
+    # RUSTSEC-2026-0459 — SQLite before 3.54.0 can return uninitialized
+    # page-cache memory when a process opens a database file together with a
+    # sibling `-wal` file of a different page size. libsqlite3-sys 0.38.2
+    # bundles an affected SQLite. The fix is libsqlite3-sys >= 0.39.0, and
+    # nothing here can take it: diesel 2.3.14 (latest) requires
+    # libsqlite3-sys < 0.39, and only one crate may link `sqlite3`
+    # (rehearsed 2026-11-09: `cargo update -p libsqlite3-sys` fails on the
+    # `links` conflict). Remove when diesel accepts 0.39.
+    # Exposure: only a database that a less trusted party wrote, opened next
+    # to a `-wal` it wrote. The fleet creates its own files. Import and
+    # restore take one main file, and a restore clears stray sidecars first.
+    # That path was not audited end to end: treat this as a short stopgap.
+    # Review-by: 2026-11-16.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite < 3.54.0 (uninitialized memory with a foreign -wal); fix needs libsqlite3-sys >= 0.39.0 but diesel 2.3.14 caps it below 0.39 (links = sqlite3); fleet creates its own files, import/restore take one main file; short stopgap, import/restore path not audited end to end; review-by 2026-11-16" },
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
-    # No patched rsa release exists (advisory: "no safe upgrade available").
-    # Ingress: rsa 0.9.10 through jsonwebtoken (RSA-family JWT sign and verify)
-    # and autumn-web's SNS check (`inbound-ses`, public key only); rsa 0.10
-    # through webauthn-rs 0.6 and crypto-glue (RS256 passkey checks, public key
-    # only). Autumn exposes no network-reachable attacker-timed RSA private-key
-    # decryption oracle, so real exposure is limited. Tracked by
-    # issue #1600. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05; or when a fixed rsa ships).
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; jsonwebtoken RSA-JWT path, SNS and webauthn-rs public-key checks only; tracked in #1600; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # rsa 0.10.0 (final) shipped the fix 2026-11, but nothing here can take
+    # it yet: jsonwebtoken 11.1.0 (latest) still pins rsa ^0.9, and
+    # webauthn-rs 0.6's crypto-glue pins rsa "^0.10.0-rc.18" — final 0.10.0
+    # made rsa's `sha2` feature non-optional, which that requirement can't
+    # resolve against, so bumping autumn-web's own direct `rsa` dependency
+    # (the `inbound-ses` SNS check) doesn't dedup onto it either (rehearsed
+    # 2026-11-09: Cargo fails to unify the two `rsa` requirements).
+    # Reachability: every RSA use in this codebase is public-key *verify*
+    # only — autumn/src/inbound_mail.rs's SNS signing-cert check
+    # (`inbound-ses`, opt-in) and autumn/src/auth.rs's JWKS RS*/PS*
+    # verification (`jwt`, default-on). No `EncodingKey::from_rsa*` exists
+    # outside one test fixture. The Marvin Attack leaks a private key
+    # through its own timing; with no RSA private key ever in use here, it
+    # does not apply regardless of which rsa version is in the graph.
+    # Tracked by issue #1600. Review-by: 2026-12-05 (reconfirmed unreachable
+    # 2026-11-09; revisit when crypto-glue/webauthn-rs or jsonwebtoken
+    # accepts rsa 0.10.0 final).
+    { id = "RUSTSEC-2023-0071", reason = "verify-only in this codebase (SNS cert check inbound_mail.rs, JWKS verify auth.rs); no RSA private-key signing anywhere; rsa 0.10.0 final now ships the fix but jsonwebtoken (^0.9) and crypto-glue/webauthn-rs (^0.10.0-rc.18, sha2-feature conflict with final 0.10.0) both block taking it; tracked in #1600; reconfirmed unreachable 2026-11-09; review-by 2026-12-05" },
     # RUSTSEC-2026-0387 — crypto-bigint secret-dependent branches in nominally
     # constant-time operations. Fixed only in >=0.7.6; no 0.5.x release carries
     # it. One copy is left: 0.5.5 via elliptic-curve 0.13 <- p256/p384 0.13 <-
     # jsonwebtoken (ES256/ES384 JWT). That is a real if low-practicality exposure
     # (microarchitectural timing on ECDSA secrets; no network-reachable signing
     # oracle). Autumn's own p256 (Web Push) and aws-sigv4 use 0.7.10. Remove
-    # when jsonwebtoken moves to p256 0.14. Review-by: 2026-11-08.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only, via jsonwebtoken ES256/ES384 -> p256/p384 0.13 -> elliptic-curve 0.13; no patched 0.5.x; review-by 2026-11-08" },
+    # when jsonwebtoken moves to p256 0.14. Reconfirmed unchanged 2026-11-09
+    # (jsonwebtoken still at latest 11.1.0, still on p256/p384 0.13).
+    # Review-by: 2026-11-23.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only, via jsonwebtoken ES256/ES384 -> p256/p384 0.13 -> elliptic-curve 0.13; no patched 0.5.x; reconfirmed unchanged 2026-11-09 (jsonwebtoken still latest at 11.1.0); review-by 2026-11-23" },
     # RUSTSEC-2026-0440 — astral-tokio-tar is unmaintained. Dev and
     # test only: testcontainers 0.27 and 0.28 depend on it, for the Docker
     # tests and the `test-support` feature. No testcontainers release drops

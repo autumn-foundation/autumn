@@ -44,11 +44,13 @@ use super::{
     Inner, Notify, Ordering, ShipReport, check_contained, discard_staging, staging_path,
     with_path_lock,
 };
-use crate::db::fleet_replication::{FleetReplication, GenerationRetry, UnshippedGeneration};
+use crate::db::fleet_replication::{
+    ClosedBound, FleetReplication, GenerationRetry, UnshippedGeneration,
+};
 use crate::db::fleet_tombstones::restore_allowed;
 use crate::replication::destination::{DestinationError, ReplicaDestination};
 use crate::replication::fence::FencedDestination;
-use crate::replication::segment;
+use crate::replication::{segment, status};
 
 /// The commit marker of a generation.
 pub const MANIFEST_OBJECT: &str = "manifest.json";
@@ -410,6 +412,11 @@ pub struct GenerationTrack {
     pub registered_at: DateTime<Utc>,
     /// The last ship that worked, also one that found no change.
     pub last_ok: Option<DateTime<Utc>>,
+    /// Every commit at or before it is in the replica: the instant before the
+    /// snapshot of the last ship that worked. `None` after a fence.
+    pub replicated_through: Option<DateTime<Utc>>,
+    /// A ship found a newer epoch at the replica.
+    pub fenced: bool,
     /// Failed ships in a row.
     pub failures: u32,
     /// The error of the last failed ship.
@@ -422,6 +429,8 @@ impl GenerationTrack {
         Self {
             registered_at: now,
             last_ok: None,
+            replicated_through: None,
+            fenced: false,
             failures: 0,
             last_error: None,
         }
@@ -436,16 +445,25 @@ pub struct GenerationSlot {
     /// Held for the blocking part of a ship. A delete waits on it.
     upload: Mutex<()>,
     track: Mutex<GenerationTrack>,
+    /// The epoch of the open, 0 without ownership.
+    epoch: u64,
 }
 
 impl GenerationSlot {
-    /// The slot of a database that opened at `now`.
-    pub fn new(now: DateTime<Utc>) -> Self {
+    /// The slot of a database that opened at `now` under `epoch` (0 without
+    /// ownership).
+    pub fn new(now: DateTime<Utc>, epoch: u64) -> Self {
         Self {
             turn: tokio::sync::Mutex::new(()),
             upload: Mutex::new(()),
             track: Mutex::new(GenerationTrack::new(now)),
+            epoch,
         }
+    }
+
+    /// The epoch of the open, 0 without ownership.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The track. Hold it only for a short read or write.
@@ -737,24 +755,37 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // Before the snapshot: a close after it keeps a record this ship
         // does not cover.
         let mark = replication.generation_mark();
+        // Read before the snapshot: a commit at or before it is in the copy.
+        let through = replication.now();
         let shipped = self.ship_locked(replication, target).await;
         let now = replication.now();
         if shipped.is_ok() {
             // The files at the path hold the writes of an earlier record.
             replication.drop_unshipped_generation(&target.key, mark);
         }
-        let mut track = target.slot.track();
-        match &shipped {
-            Ok(_) => {
-                track.last_ok = Some(now);
-                track.failures = 0;
-                track.last_error = None;
-            }
-            Err(error) => {
-                track.failures = track.failures.saturating_add(1);
-                track.last_error = Some(error.to_string());
+        {
+            let mut track = target.slot.track();
+            match &shipped {
+                Ok(_) => {
+                    track.last_ok = Some(now);
+                    // Ships run one at a time, so the bound follows the clock.
+                    if let Some(bound) = status::bound_below(through) {
+                        track.replicated_through = Some(bound);
+                    }
+                    track.failures = 0;
+                    track.last_error = None;
+                }
+                Err(error) => {
+                    if matches!(error, FleetError::Fenced { .. }) {
+                        track.replicated_through = None;
+                        track.fenced = true;
+                    }
+                    track.failures = track.failures.saturating_add(1);
+                    track.last_error = Some(error.to_string());
+                }
             }
         }
+        replication.notify_progress();
         shipped
     }
 
@@ -1013,6 +1044,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         // epoch itself.
         let drain = Arc::new(Drain {
             deleting: false,
+            // The key is closed: the hold keeps no file open.
+            has_files: false,
             finished: AtomicBool::new(false),
             done: Notify::new(),
             retire: None,
@@ -1249,7 +1282,8 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
 
     fn on_open(&self, db: &FleetDatabase<E>) -> Result<(), String> {
         // The slot lives until `on_close`: the last ship needs it.
-        let slot = self.replication.open_generation_slot(db.key());
+        let epoch = db.epoch().map_or(0, crate::lock::FencingToken::get);
+        let slot = self.replication.open_generation_slot(db.key(), epoch);
         let target = ShipTarget::of(db, slot);
         let (fleet, replication, every) = (
             self.fleet.clone(),
@@ -1346,13 +1380,20 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
         // A ship of a retired database may still upload: wait, so a purge
         // after a delete sees every object it wrote.
         slot.wait_upload();
+        // Kept before the slot goes: a waiter never sees the key in neither.
+        // A retry of a kept generation updates the same slot.
+        self.replication
+            .remember_closed(db.key(), ClosedBound::Slot(Arc::clone(&slot)));
         self.replication.forget_generation_slot(db.key(), &slot);
     }
 
     /// A delete or a restore starts: the kept generation of `key` stops
     /// shipping. Core settles it when the delete or the restore ends.
     fn release(&self, key: &FleetDbKey) {
+        // A delete or a restore replaces the files: the old bound is void.
+        self.replication.forget_closed(key);
         self.replication.release_unshipped_generation(key);
+        self.replication.notify_progress();
     }
 }
 

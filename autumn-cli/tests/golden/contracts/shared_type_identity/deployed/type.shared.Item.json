@@ -1,0 +1,45 @@
+{
+  "krate": "shared",
+  "name": "Item",
+  "serialized": [
+    {
+      "rust_name": "id",
+      "wire_name": "id",
+      "ty": "String",
+      "required": true
+    },
+    {
+      "rust_name": "name",
+      "wire_name": "name",
+      "ty": "String",
+      "required": true
+    },
+    {
+      "rust_name": "price_cents",
+      "wire_name": "price_cents",
+      "ty": "u32",
+      "required": true
+    }
+  ],
+  "deserialized": [
+    {
+      "rust_name": "id",
+      "wire_name": "id",
+      "ty": "String",
+      "required": true
+    },
+    {
+      "rust_name": "name",
+      "wire_name": "name",
+      "ty": "String",
+      "required": true
+    },
+    {
+      "rust_name": "price_cents",
+      "wire_name": "price_cents",
+      "ty": "u32",
+      "required": true
+    }
+  ],
+  "closed": false
+}
