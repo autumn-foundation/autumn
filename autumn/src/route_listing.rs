@@ -300,10 +300,11 @@ impl Serialize for RouteSource {
     }
 }
 
-/// Reads the wire form that [`Display`](std::fmt::Display) writes:
-/// `framework`, `plugin:<name>`, else `user`.
-impl From<&str> for RouteSource {
-    fn from(s: &str) -> Self {
+impl RouteSource {
+    /// Reads the dump form that [`Display`](std::fmt::Display) writes:
+    /// `framework` and `plugin:<name>`. Any other string is `User`.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Self {
         if s == "framework" {
             Self::Framework
         } else if let Some(name) = s.strip_prefix("plugin:") {
@@ -317,7 +318,7 @@ impl From<&str> for RouteSource {
 impl<'de> Deserialize<'de> for RouteSource {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        Ok(Self::from(s.as_str()))
+        Ok(Self::from_wire(&s))
     }
 }
 
@@ -1928,18 +1929,18 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    /// `From<&str>` reads the wire form, the same as `Deserialize` (#2828).
+    /// `from_wire` reads the dump form, the same as `Deserialize` (#2828).
     #[test]
-    fn route_source_from_str_reads_the_wire_form() {
+    fn route_source_from_wire_reads_the_dump_form() {
         for source in [
             RouteSource::User,
             RouteSource::Framework,
             RouteSource::Plugin("admin".to_owned()),
             RouteSource::Plugin(String::new()),
         ] {
-            assert_eq!(RouteSource::from(source.to_string().as_str()), source);
+            assert_eq!(RouteSource::from_wire(&source.to_string()), source);
         }
-        assert_eq!(RouteSource::from("something-else"), RouteSource::User);
+        assert_eq!(RouteSource::from_wire("something-else"), RouteSource::User);
     }
 
     // ── append_framework_routes ────────────────────────────────────────────

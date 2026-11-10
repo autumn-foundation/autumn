@@ -794,7 +794,7 @@ This checks:
 | Check | What it verifies |
 |-------|-----------------|
 | `installability` | Binary compiles and route manifest is produced |
-| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. When routes carry only the contract's registered name (the default `Plugin::name()`), the route checks use that name. With `--no-routes` (a plugin that mounts none, such as a cache) and a contract that gives the registered name, skips when no route carries a name of the plugin (`--plugin-name`, the contract's crate name or its registered name), and fails if one does. This is the library's `no_routes` rule. Without it, no routes found fails. It also fails when the app mounts a raw `.merge()` or an undeclared `.nest()` router: its routes were never listed, so no check saw them |
+| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. When routes carry only the contract's registered name (the default `Plugin::name()`), the route checks use that name. Routes under more than one name of the plugin fail. With `--no-routes` (a plugin that mounts no routes, such as a cache), the check uses the library `no_routes` rule: it skips when no route carries a name of the plugin (`--plugin-name`, the contract's crate name or its registered name), and fails when a route carries one. The CLI skips only when the contract gives the registered name. In all other cases, no routes found fails. It also fails when the app mounts a raw `.merge()` or an undeclared `.nest()` router: its routes were never listed, so no check saw them |
 | `route-prefix` | Every plugin route lives under the declared prefix, or is declared as an intentional root route via `--intentional-root PATH` (repeatable; exact path match) |
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |
@@ -868,6 +868,12 @@ fails the check.
 Unlike the CLI, the library check does not need a contract to skip. Do not set
 a `prefix` with `no_routes`; the two contradict each other, and `route-prefix`
 fails.
+
+With a contract, the route checks run under its `registered_as` when only that
+name carries routes. Routes under more than one name of the plugin fail
+`route-attribution`. `autumn plugin-check` calls the same
+`run_route_checks`, so the CLI and your test give the same result for the
+same routes.
 
 ### 3. Publishing checklist
 

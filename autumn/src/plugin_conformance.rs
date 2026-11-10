@@ -5,9 +5,9 @@
 //! this module in integration tests to get a pass/fail conformance report
 //! before publishing their crate.
 //!
-//! `autumn plugin-check` runs these same check functions and report types on
-//! the routes it collects from the built binary (issue #2828). Change a rule
-//! here, and the CLI gets the change too.
+//! `autumn plugin-check` calls [`run_route_checks`] and uses these report
+//! types on the routes it collects from the built binary (issue #2828). A rule
+//! change here also changes the CLI.
 //!
 //! # Quick start
 //!
@@ -318,10 +318,9 @@ pub fn is_sensitive_path(path: &str) -> bool {
 
 // ── Individual check functions ─────────────────────────────────────────────
 
-/// Check that all routes attributed to the plugin carry the expected
-/// `Plugin("<plugin_name>")` source.
+/// Check that routes carry the expected `Plugin("<plugin_name>")` source.
 ///
-/// Returns `Skip` when no routes at all are attributed to the plugin.
+/// Returns `Fail` when no route is attributed to the plugin.
 #[must_use]
 pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
     let plugin_routes: Vec<&RouteInfo> = routes
@@ -362,18 +361,12 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 /// path, not the crate name. Only `AppBuilder::plugin` fills `registered_as`,
 /// so pass the contract from `AppBuilder::plugin_contracts`. Without it, every
 /// plugin route counts.
-///
-/// `autumn plugin-check --no-routes` uses this same rule.
-#[must_use]
-pub fn check_no_routes(
+fn check_no_routes(
     plugin_name: &str,
     contract: Option<&PluginContract>,
     routes: &[RouteInfo],
 ) -> CheckResult {
-    let names: Vec<&str> = std::iter::once(plugin_name)
-        .chain(contract.map(|c| c.plugin.as_str()))
-        .chain(contract.and_then(|c| c.registered_as.as_deref()))
-        .collect();
+    let names = plugin_names(plugin_name, contract);
     // With no `registered_as`, the name the routes carry is unknown (it is
     // `Plugin::name()`, the type path by default). Then fail closed: any
     // plugin route contradicts `no_routes`.
@@ -409,10 +402,7 @@ pub fn check_no_routes(
 
 /// `route-prefix` for a plugin that declares `no_routes` and a prefix. The two
 /// contradict each other, so the check fails. It does not pass on no routes.
-///
-/// `autumn plugin-check` uses this same rule.
-#[must_use]
-pub fn check_prefix_with_no_routes(prefix: &str) -> CheckResult {
+fn check_prefix_with_no_routes(prefix: &str) -> CheckResult {
     CheckResult {
         name: "route-prefix".to_owned(),
         status: CheckStatus::Fail,
@@ -421,6 +411,79 @@ pub fn check_prefix_with_no_routes(prefix: &str) -> CheckResult {
         ),
         diagnostics: vec![],
     }
+}
+
+/// The names of one plugin: `plugin_name`, then the contract's crate name and
+/// its `registered_as`, without repeats.
+fn plugin_names<'a>(plugin_name: &'a str, contract: Option<&'a PluginContract>) -> Vec<&'a str> {
+    let mut names = vec![plugin_name];
+    let linked = contract
+        .into_iter()
+        .flat_map(|c| std::iter::once(c.plugin.as_str()).chain(c.registered_as.as_deref()));
+    for name in linked {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// `true` when a route carries `plugin:<name>`.
+fn carries(routes: &[RouteInfo], name: &str) -> bool {
+    routes
+        .iter()
+        .any(|r| matches!(&r.source, RouteSource::Plugin(n) if n == name))
+}
+
+/// The name the route checks run under. Routes carry `Plugin::name()`. When
+/// only the contract's `registered_as` carries routes, that is the name.
+/// Else it is `plugin_name`.
+fn route_name<'a>(
+    plugin_name: &'a str,
+    contract: Option<&'a PluginContract>,
+    routes: &[RouteInfo],
+) -> &'a str {
+    match contract.and_then(|c| c.registered_as.as_deref()) {
+        Some(registered) if !carries(routes, plugin_name) && carries(routes, registered) => {
+            registered
+        }
+        _ => plugin_name,
+    }
+}
+
+/// `route-attribution` when the plugin mounts routes. Routes under more than
+/// one name of the plugin fail: the other checks read the routes of one name
+/// only. Else the check runs under [`route_name`].
+fn check_attribution(
+    plugin_name: &str,
+    contract: Option<&PluginContract>,
+    route_name: &str,
+    routes: &[RouteInfo],
+) -> CheckResult {
+    let carrying: Vec<&str> = plugin_names(plugin_name, contract)
+        .into_iter()
+        .filter(|name| carries(routes, name))
+        .collect();
+    if carrying.len() > 1 {
+        return CheckResult {
+            name: "route-attribution".to_owned(),
+            status: CheckStatus::Fail,
+            message: format!(
+                "routes are attributed to more than one of this plugin's names: {}",
+                carrying.join(", ")
+            ),
+            diagnostics: vec![
+                "one plugin registers under one `Plugin::name()`; the checks cannot tell which \
+                 routes are its own"
+                    .to_owned(),
+            ],
+        };
+    }
+    let mut result = check_route_attribution(route_name, routes);
+    if route_name != plugin_name && result.status == CheckStatus::Pass {
+        result.message = format!("{} (the registered name of {plugin_name})", result.message);
+    }
+    result
 }
 
 /// `true` for a file of the plugin's own asset bundle.
@@ -655,7 +718,7 @@ pub fn check_sensitive_surfaces(
     } else {
         let mut diagnostics = undeclared;
         diagnostics.push(
-            "Declare each with ConformanceConfig::sensitive_route(path_prefix, auth_mechanism) \
+            "Declare each route with ConformanceConfig::sensitive_route(path_prefix, auth_mechanism) \
              or `autumn plugin-check --sensitive-route PATH:DESCRIPTION`"
                 .to_owned(),
         );
@@ -823,6 +886,45 @@ pub fn check_experimental_surface(contract: Option<&PluginContract>) -> CheckRes
     }
 }
 
+/// Run the route checks of [`run_conformance`]: all of them except
+/// `experimental-surface`.
+///
+/// With a contract, the route checks run under its `registered_as` when only
+/// that name carries routes. Routes under more than one name of the plugin
+/// fail `route-attribution`.
+///
+/// `autumn plugin-check` calls this function on the routes it collects, so
+/// the CLI and the library give the same result for the same routes.
+#[must_use]
+pub fn run_route_checks(config: &ConformanceConfig, routes: &[RouteInfo]) -> Vec<CheckResult> {
+    let plugin_name = config.plugin_name.as_str();
+    let contract = config.contract.as_ref();
+    let name = route_name(plugin_name, contract, routes);
+
+    let mut checks = vec![if config.no_routes {
+        check_no_routes(plugin_name, contract, routes)
+    } else {
+        check_attribution(plugin_name, contract, name, routes)
+    }];
+
+    if let Some(prefix) = &config.expected_prefix {
+        checks.push(if config.no_routes {
+            check_prefix_with_no_routes(prefix)
+        } else {
+            check_route_prefix(name, prefix, &config.intentional_root_routes, routes)
+        });
+    }
+
+    checks.push(check_collisions(routes).0);
+    checks.push(check_sensitive_surfaces(
+        name,
+        routes,
+        &config.sensitive_routes,
+    ));
+    checks.push(check_duplicate_registration(name, routes));
+    checks
+}
+
 /// Run all conformance checks and return a `ConformanceReport`.
 ///
 /// Checks run:
@@ -833,43 +935,11 @@ pub fn check_experimental_surface(contract: Option<&PluginContract>) -> CheckRes
 /// 5. `duplicate-registration` — plugin routes are not registered more than once
 /// 6. `experimental-surface` — the plugin's declared use of experimental
 ///    plugin-facing API (issue #1601), reported rather than gated
+///
+/// Checks 1 to 5 are [`run_route_checks`].
 #[must_use]
 pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> ConformanceReport {
-    let mut checks = Vec::new();
-
-    if config.no_routes {
-        checks.push(check_no_routes(
-            &config.plugin_name,
-            config.contract.as_ref(),
-            routes,
-        ));
-    } else {
-        checks.push(check_route_attribution(&config.plugin_name, routes));
-    }
-
-    if let Some(ref prefix) = config.expected_prefix {
-        checks.push(if config.no_routes {
-            check_prefix_with_no_routes(prefix)
-        } else {
-            check_route_prefix(
-                &config.plugin_name,
-                prefix,
-                &config.intentional_root_routes,
-                routes,
-            )
-        });
-    }
-
-    let (collision_check, _) = check_collisions(routes);
-    checks.push(collision_check);
-
-    checks.push(check_sensitive_surfaces(
-        &config.plugin_name,
-        routes,
-        &config.sensitive_routes,
-    ));
-
-    checks.push(check_duplicate_registration(&config.plugin_name, routes));
+    let mut checks = run_route_checks(config, routes);
     checks.push(check_experimental_surface(config.contract.as_ref()));
 
     ConformanceReport {
@@ -1098,6 +1168,32 @@ mod tests {
             "diagnostic should mention method and normalized path: {:?}",
             result.diagnostics
         );
+        assert!(
+            result.diagnostics[0].contains("(source: plugin:inventory)"),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    /// Collisions sort by path, then by method, so the report is stable.
+    #[test]
+    fn collisions_sort_by_path_then_method() {
+        let pair = |method: &str, path: &str| {
+            [
+                make_route(method, path, RouteSource::User),
+                make_route(method, path, plugin("p")),
+            ]
+        };
+        let routes: Vec<RouteInfo> = [pair("POST", "/b"), pair("GET", "/b"), pair("GET", "/a/{x}")]
+            .into_iter()
+            .flatten()
+            .collect();
+        let (_, collisions) = check_collisions(&routes);
+        let keys: Vec<(&str, &str)> = collisions
+            .iter()
+            .map(|c| (c.method.as_str(), c.path.as_str()))
+            .collect();
+        assert_eq!(keys, [("GET", "/a/{}"), ("GET", "/b"), ("POST", "/b")]);
     }
 
     #[test]
@@ -1292,7 +1388,6 @@ mod tests {
         assert!(result.message.starts_with("1 "), "{}", result.message);
     }
 
-    /// `check_no_routes` is public: `autumn plugin-check --no-routes` uses it.
     #[test]
     fn check_no_routes_counts_every_name_of_the_plugin() {
         let mut contract = PluginContract::new("autumn-plugin-demo");
@@ -1304,7 +1399,6 @@ mod tests {
         assert_eq!(result.status, CheckStatus::Skip, "{}", result.message);
     }
 
-    /// One rule for `no_routes` together with a prefix (#2828).
     #[test]
     fn prefix_with_no_routes_fails() {
         let result = check_prefix_with_no_routes("/demo");
@@ -1541,6 +1635,73 @@ mod tests {
             "a route under the registered name contradicts no_routes:\n{}",
             report.to_text_report()
         );
+    }
+
+    /// Routes carry `Plugin::name()`. With a contract that gives it as
+    /// `registered_as`, the route checks run under that name (#2828).
+    #[test]
+    fn run_conformance_follows_the_registered_name() {
+        let mut contract = PluginContract::new("shop");
+        contract.registered_as = Some("shop::Shop".to_owned());
+        let config = ConformanceConfig::new("shop")
+            .contract(contract)
+            .prefix("/elsewhere");
+        let routes = vec![make_route("GET", "/shop", plugin("shop::Shop"))];
+        let report = run_conformance(&config, &routes);
+        let find = |name: &str| report.checks.iter().find(|c| c.name == name).expect(name);
+        let attribution = find("route-attribution");
+        assert_eq!(
+            attribution.status,
+            CheckStatus::Pass,
+            "{}",
+            attribution.message
+        );
+        assert!(
+            attribution.message.contains("the registered name of shop"),
+            "{}",
+            attribution.message
+        );
+        assert_eq!(find("route-prefix").status, CheckStatus::Fail);
+        assert_eq!(report.plugin_name, "shop");
+    }
+
+    /// Routes under two names of one plugin: the checks cannot tell which
+    /// routes are its own, so attribution fails.
+    #[test]
+    fn run_conformance_fails_routes_split_across_names() {
+        let mut contract = PluginContract::new("shop");
+        contract.registered_as = Some("shop::Shop".to_owned());
+        let config = ConformanceConfig::new("shop").contract(contract);
+        let routes = vec![
+            make_route("GET", "/shop", plugin("shop")),
+            make_route("GET", "/shop/x", plugin("shop::Shop")),
+        ];
+        let report = run_conformance(&config, &routes);
+        let attribution = &report.checks[0];
+        assert_eq!(
+            attribution.status,
+            CheckStatus::Fail,
+            "{}",
+            attribution.message
+        );
+        assert!(
+            attribution.message.contains("shop::Shop"),
+            "{}",
+            attribution.message
+        );
+    }
+
+    /// `run_route_checks` is `run_conformance` without `experimental-surface`.
+    #[test]
+    fn run_route_checks_is_run_conformance_without_the_contract_check() {
+        let config = ConformanceConfig::new("shop").prefix("/shop");
+        let routes = vec![make_route("GET", "/shop", plugin("shop"))];
+        let names = |checks: &[CheckResult]| -> Vec<String> {
+            checks.iter().map(|c| c.name.clone()).collect()
+        };
+        let mut all = names(&run_conformance(&config, &routes).checks);
+        assert_eq!(all.pop().as_deref(), Some("experimental-surface"));
+        assert_eq!(names(&run_route_checks(&config, &routes)), all);
     }
 
     #[test]

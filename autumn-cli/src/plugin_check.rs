@@ -17,10 +17,9 @@
 //! | `plugin-contract` | The plugin declares a parseable `autumn-web` range |
 //! | `experimental-surface` | The plugin's declared use of experimental API |
 //!
-//! The route rules and the report types are
-//! [`autumn_web::plugin_conformance`]'s (issue #2828). This module collects
-//! the routes, picks the name to check them under, and adds the checks that
-//! need the built binary.
+//! The route rules and the report types come from
+//! [`autumn_web::plugin_conformance`] (issue #2828). This module collects the
+//! routes and adds the checks that need the built binary.
 //!
 //! The last two checks read the contract the built binary dumps after
 //! [`PLUGIN_CONTRACT_MARKER`](autumn_web::plugin_contract::PLUGIN_CONTRACT_MARKER)
@@ -31,7 +30,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use autumn_web::plugin_conformance::{self as rules, ConformanceReport};
+use autumn_web::plugin_conformance::{self as rules, ConformanceConfig, ConformanceReport};
 pub use autumn_web::plugin_conformance::{CheckResult, CheckStatus, SensitiveRoute};
 use autumn_web::plugin_contract::{
     ContractVerdict, PLUGIN_CONTRACT_MARKER, PluginContract, evaluate,
@@ -273,40 +272,32 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Plug
         ContractDump::Absent | ContractDump::Malformed(_) => None,
     };
 
-    // Routes are attributed to `Plugin::name()`, by default the type path.
-    // When only the contract's registered name carries routes, the route
-    // checks run under it. The report keeps `--plugin-name`, the crate the
-    // index lists.
-    let registered_as = declared.and_then(|c| c.registered_as.as_deref());
-    let route_key = route_key(opts.plugin_name, registered_as, &routes);
+    let mut config = ConformanceConfig::new(opts.plugin_name);
+    config.expected_prefix = opts.expected_prefix.map(str::to_owned);
+    config.intentional_root_routes = opts.intentional_root_routes.to_vec();
+    config.sensitive_routes = opts.sensitive_routes.to_vec();
+    config.contract = declared.cloned();
+    config.no_routes = opts.no_routes;
+    let mut route_checks = rules::run_route_checks(&config, &routes);
 
-    // `--no-routes` skips only when the contract gives the registered name.
-    // Without it, no routes found fails, as an unannotated `nest` would.
-    checks.push(
-        check_split_attribution(declared, opts.plugin_name, &routes).unwrap_or_else(|| {
-            if opts.no_routes && registered_as.is_some() {
-                rules::check_no_routes(opts.plugin_name, declared, &routes)
-            } else {
-                route_attribution(opts.plugin_name, route_key, &routes)
-            }
-        }),
-    );
-
-    if let Some(prefix) = opts.expected_prefix {
-        checks.push(if opts.no_routes {
-            rules::check_prefix_with_no_routes(prefix)
-        } else {
-            rules::check_route_prefix(route_key, prefix, opts.intentional_root_routes, &routes)
-        });
+    // The library lets `no_routes` skip with no contract. The CLI skips only
+    // when the contract dump gives the registered name. In all other cases,
+    // no routes found fails.
+    if opts.no_routes && declared.and_then(|c| c.registered_as.as_ref()).is_none() {
+        if let Some(attribution) = route_checks
+            .iter_mut()
+            .find(|c| c.name == "route-attribution" && c.status == CheckStatus::Skip)
+        {
+            attribution.status = CheckStatus::Fail;
+            attribution.message = format!(
+                "--no-routes skips only when the contract dump gives the registered name of \
+                 {}. The dump gives none",
+                opts.plugin_name
+            );
+        }
     }
+    checks.append(&mut route_checks);
 
-    checks.push(rules::check_collisions(&routes).0);
-    checks.push(rules::check_sensitive_surfaces(
-        route_key,
-        &routes,
-        opts.sensitive_routes,
-    ));
-    checks.push(rules::check_duplicate_registration(route_key, &routes));
     checks.push(check_plugin_contract(
         opts.plugin_name,
         opts.contracts,
@@ -325,8 +316,9 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Plug
     report
 }
 
-/// The dump's routes as the library's `RouteInfo`, so the library rules
-/// run on them. The checks read only the fields set here.
+/// Converts the dumped routes to the library `RouteInfo`, so that the library
+/// rules can run on them. The checks read only the fields that this function
+/// sets.
 fn library_routes(routes: &[RouteInfo]) -> Vec<autumn_web::route_listing::RouteInfo> {
     routes
         .iter()
@@ -334,7 +326,7 @@ fn library_routes(routes: &[RouteInfo]) -> Vec<autumn_web::route_listing::RouteI
             method: r.method.clone(),
             path: r.path.clone(),
             handler: r.handler.clone(),
-            source: RouteSource::from(r.source.as_str()),
+            source: RouteSource::from_wire(&r.source),
             middleware: r.middleware.clone(),
             ..Default::default()
         })
@@ -577,8 +569,8 @@ fn check_plugin_contract(
 /// Report the experimental plugin surface this plugin declares (issue #1601).
 ///
 /// Reports rather than gates by default. The rule is
-/// [`autumn_web::plugin_conformance::check_experimental_surface`]; this adds
-/// the contract-dump outcomes. `deny_experimental` (the
+/// [`autumn_web::plugin_conformance::check_experimental_surface`]. This
+/// function adds the contract-dump outcomes. `deny_experimental` (the
 /// `--deny-experimental` flag) turns a clean report into a hard failure for
 /// authors who want to forbid it in their own CI.
 fn check_experimental_surface(
@@ -637,78 +629,6 @@ fn check_experimental_surface(
     result
 }
 
-// ── Individual check helpers ───────────────────────────────────────────────
-
-/// `true` when a route carries `plugin:<name>`.
-fn carries(routes: &[autumn_web::route_listing::RouteInfo], name: &str) -> bool {
-    routes
-        .iter()
-        .any(|r| matches!(&r.source, RouteSource::Plugin(n) if n == name))
-}
-
-/// The name the route checks match `plugin:<name>` against: `plugin_name`,
-/// or the contract's `registered_as` when only that name carries routes.
-fn route_key<'a>(
-    plugin_name: &'a str,
-    registered_as: Option<&'a str>,
-    routes: &[autumn_web::route_listing::RouteInfo],
-) -> &'a str {
-    match registered_as {
-        Some(registered) if !carries(routes, plugin_name) && carries(routes, registered) => {
-            registered
-        }
-        _ => plugin_name,
-    }
-}
-
-/// A failed `route-attribution` when routes carry more than one of the
-/// plugin's linked names (`--plugin-name`, the contract's crate, its
-/// `registered_as`). The other checks read one name's routes, so they would
-/// miss the rest. `None` when at most one name carries routes.
-fn check_split_attribution(
-    declared: Option<&PluginContract>,
-    plugin_name: &str,
-    routes: &[autumn_web::route_listing::RouteInfo],
-) -> Option<CheckResult> {
-    let declared = declared?;
-    let mut names = vec![plugin_name, declared.plugin.as_str()];
-    names.extend(declared.registered_as.as_deref());
-    names.sort_unstable();
-    names.dedup();
-    let carrying: Vec<&str> = names
-        .into_iter()
-        .filter(|name| carries(routes, name))
-        .collect();
-    (carrying.len() > 1).then(|| CheckResult {
-        name: "route-attribution".to_owned(),
-        status: CheckStatus::Fail,
-        message: format!(
-            "routes are attributed to more than one of this plugin's names: {}",
-            carrying.join(", ")
-        ),
-        diagnostics: vec![
-            "one plugin registers under one `Plugin::name()`; the checks cannot tell which \
-             routes are its own"
-                .to_owned(),
-        ],
-    })
-}
-
-/// The library's `route-attribution` under `route_key` (see [`route_key`]).
-/// When that is the registered name, the pass message also names
-/// `plugin_name`. With no routes found, `route_key` is `plugin_name`.
-fn route_attribution(
-    plugin_name: &str,
-    route_key: &str,
-    routes: &[autumn_web::route_listing::RouteInfo],
-) -> CheckResult {
-    let mut result = rules::check_route_attribution(route_key, routes);
-    if route_key != plugin_name && result.status == CheckStatus::Pass {
-        result.message = format!("{} (the registered name of {plugin_name})", result.message);
-    }
-    result
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -722,20 +642,25 @@ mod shared_rules_tests {
     #[test]
     fn rules_and_report_types_are_not_redefined_here() {
         let src = include_str!("plugin_check.rs");
-        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let body = &src[..src.find("mod shared_rules_tests").unwrap_or(src.len())];
         for name in [
             "fn is_sensitive_path",
+            "fn is_plugin_asset_path",
             "fn normalize_path_for_collision",
             "fn is_plugin_asset_route",
             "const SENSITIVE_KEYWORDS",
+            "fn check_route_attribution",
             "fn check_route_prefix",
             "fn check_sensitive_surfaces",
             "fn check_duplicate_registration",
             "fn check_collisions",
             "fn check_no_routes",
+            "fn check_split_attribution",
+            "fn route_key",
             "enum CheckStatus",
             "struct CheckResult",
-            "struct SensitiveRouteDecl",
+            "struct ConformanceReport",
+            "struct SensitiveRoute",
             "Plugin conformance: ",
         ] {
             assert!(!body.contains(name), "`{name}` must live in the library");
@@ -758,21 +683,14 @@ mod shared_rules_tests {
         }
     }
 
-    fn library_routes(routes: &[RouteInfo]) -> Vec<autumn_web::route_listing::RouteInfo> {
-        routes
-            .iter()
-            .map(|r| autumn_web::route_listing::RouteInfo {
-                method: r.method.clone(),
-                path: r.path.clone(),
-                handler: r.handler.clone(),
-                source: r.source.as_str().into(),
-                middleware: r.middleware.clone(),
-                ..Default::default()
-            })
-            .collect()
+    fn asset(path: &str, source: &str) -> RouteInfo {
+        let mut asset = route("GET", path, source);
+        asset.middleware = vec![autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER.to_owned()];
+        asset
     }
 
     fn options<'a>(
+        plugin_name: &'a str,
         sensitive: &'a [lib::SensitiveRoute],
         root: &'a [String],
         dump: &'a ContractDump,
@@ -780,7 +698,7 @@ mod shared_rules_tests {
         PluginCheckOptions {
             package: None,
             bin: None,
-            plugin_name: "shop",
+            plugin_name,
             expected_prefix: Some("/shop"),
             intentional_root_routes: root,
             sensitive_routes: sensitive,
@@ -791,62 +709,100 @@ mod shared_rules_tests {
         }
     }
 
-    /// For the same routes, `autumn plugin-check` and `run_conformance` give
-    /// the same result for every route check. Each fixture makes one check
-    /// fail, so the messages and diagnostics are compared too (#2828).
-    #[test]
-    fn route_checks_match_the_library() {
-        let fixtures: Vec<Vec<RouteInfo>> = vec![
-            vec![route("GET", "/shop", "plugin:shop")],
-            vec![route("GET", "/other", "plugin:shop")],
-            vec![route("GET", "/hook", "plugin:shop")],
+    fn fixtures(name: &str) -> Vec<Vec<RouteInfo>> {
+        let src = format!("plugin:{name}");
+        let src = src.as_str();
+        vec![
+            vec![route("GET", "/shop", src)],
+            vec![route("GET", "/shop", src), route("POST", "/shop/{id}", src)],
+            vec![route("GET", "/other", src)],
+            vec![route("GET", "/hook", src)],
             vec![
                 route("POST", "/shop/{id}", "user"),
-                route("POST", "/shop/{item}", "plugin:shop"),
+                route("POST", "/shop/{item}", src),
                 route("GET", "/a/{x}", "framework"),
                 route("GET", "/a/{*rest}", "plugin:other"),
             ],
             vec![
-                route("GET", "/shop/admin", "plugin:shop"),
-                route("GET", "/shop/debug", "plugin:shop"),
+                route("GET", "/shop/admin", src),
+                route("GET", "/shop/debug", src),
             ],
+            vec![route("GET", "/shop/debug", src)],
+            vec![route("GET", "/shop", src), route("GET", "/shop", src)],
             vec![
-                route("GET", "/shop", "plugin:shop"),
-                route("GET", "/shop", "plugin:shop"),
+                route("GET", "/shop", src),
+                asset("/static/_plugins/shop/admin.js", src),
             ],
+            vec![route("GET", "/static/_plugins/x/admin", src)],
             vec![route("GET", "/x", "user")],
-        ];
+        ]
+    }
+
+    /// Compare every check the library runs, except `experimental-surface`
+    /// (the CLI reads it from the contract dump).
+    fn assert_same_route_checks(
+        cli: &PluginCheckReport,
+        library: &lib::ConformanceReport,
+        routes: &[RouteInfo],
+    ) {
+        for check in library
+            .checks
+            .iter()
+            .filter(|c| c.name != "experimental-surface")
+        {
+            let found = cli
+                .report
+                .checks
+                .iter()
+                .find(|c| c.name == check.name)
+                .unwrap_or_else(|| panic!("the CLI does not run `{}`", check.name));
+            assert_eq!(
+                (&found.status, &found.message, &found.diagnostics),
+                (&check.status, &check.message, &check.diagnostics),
+                "`{}` differs for {routes:?}",
+                check.name
+            );
+        }
+    }
+
+    /// For the same routes, `autumn plugin-check` and `run_conformance` give
+    /// the same status, message and diagnostics for each route check (#2828).
+    #[test]
+    fn route_checks_match_the_library() {
         let root = vec!["/hook".to_owned()];
         let sensitive = vec![lib::SensitiveRoute {
             path_pattern: "/shop/debug".to_owned(),
             auth_mechanism: "Role: ops".to_owned(),
         }];
-        let config = ConformanceConfig::new("shop")
+        let base = ConformanceConfig::new("shop")
             .prefix("/shop")
             .intentional_root_route("/hook")
             .sensitive_route("/shop/debug", "Role: ops");
-        for routes in &fixtures {
-            let cli = build_report(&options(&sensitive, &root, &ContractDump::Absent), routes);
+
+        // No contract dump.
+        for routes in &fixtures("shop") {
+            let cli = build_report(
+                &options("shop", &sensitive, &root, &ContractDump::Absent),
+                routes,
+            );
+            let library = lib::run_conformance(&base, &library_routes(routes));
+            assert_same_route_checks(&cli, &library, routes);
+        }
+
+        // A contract whose registered name carries the routes.
+        let mut contract = PluginContract::new("shop").autumn_web("0.7");
+        contract.registered_as = Some("shop::Shop".to_owned());
+        let dump = ContractDump::Present(vec![contract.clone()]);
+        let config = base.contract(contract);
+        let mut with_contract = fixtures("shop::Shop");
+        with_contract.push(vec![
+            route("GET", "/shop", "plugin:shop"),
+            route("GET", "/shop/x", "plugin:shop::Shop"),
+        ]);
+        for routes in &with_contract {
+            let cli = build_report(&options("shop", &sensitive, &root, &dump), routes);
             let library = lib::run_conformance(&config, &library_routes(routes));
-            for name in [
-                "route-attribution",
-                "route-prefix",
-                "route-collision",
-                "sensitive-surfaces",
-                "duplicate-registration",
-            ] {
-                let pick = |checks: &[CheckResult]| {
-                    checks
-                        .iter()
-                        .find(|c| c.name == name)
-                        .map(|c| (c.status.clone(), c.message.clone(), c.diagnostics.clone()))
-                };
-                assert_eq!(
-                    pick(&cli.report.checks),
-                    pick(&library.checks),
-                    "`{name}` differs for {routes:?}"
-                );
-            }
+            assert_same_route_checks(&cli, &library, routes);
         }
     }
 
@@ -858,24 +814,45 @@ mod shared_rules_tests {
         let mut contract = PluginContract::new("autumn-plugin-demo").autumn_web("0.7");
         contract.registered_as = Some("demo::DemoPlugin".to_owned());
         let dump = ContractDump::Present(vec![contract]);
-        let mut opts = options(&[], &[], &dump);
-        opts.plugin_name = "demo::DemoPlugin";
+        let mut opts = options("demo::DemoPlugin", &[], &[], &dump);
         opts.expected_prefix = None;
         opts.no_routes = true;
-        let routes = vec![route("GET", "/x", "plugin:autumn-plugin-demo")];
-        let report = build_report(&opts, &routes);
-        let attribution = report
-            .report
-            .checks
-            .iter()
-            .find(|c| c.name == "route-attribution")
-            .expect("route-attribution");
-        assert_eq!(
-            attribution.status,
-            CheckStatus::Fail,
+        let attribution = |routes: &[RouteInfo]| {
+            build_report(&opts, routes)
+                .report
+                .checks
+                .into_iter()
+                .find(|c| c.name == "route-attribution")
+                .expect("route-attribution")
+        };
+        let result = attribution(&[route("GET", "/x", "plugin:autumn-plugin-demo")]);
+        assert_eq!(result.status, CheckStatus::Fail, "{}", result.message);
+        assert!(
+            result.message.starts_with("no_routes was declared"),
             "{}",
-            attribution.message
+            result.message
         );
+        assert_eq!(attribution(&[]).status, CheckStatus::Skip);
+    }
+
+    /// `--no-routes` without a registered name never passes: routes under
+    /// the plugin name contradict it, and no routes cannot skip.
+    #[test]
+    fn no_routes_without_a_registered_name_never_passes() {
+        let mut opts = options("shop", &[], &[], &ContractDump::Absent);
+        opts.expected_prefix = None;
+        opts.no_routes = true;
+        for routes in [vec![route("GET", "/shop", "plugin:shop")], vec![]] {
+            let report = build_report(&opts, &routes);
+            let attribution = &report.report.checks[1];
+            assert_eq!(attribution.name, "route-attribution");
+            assert_eq!(
+                attribution.status,
+                CheckStatus::Fail,
+                "{routes:?}: {}",
+                attribution.message
+            );
+        }
     }
 
     /// The CLI JSON report reads as the library report: one wire shape.
@@ -884,13 +861,13 @@ mod shared_rules_tests {
         let dump = ContractDump::Absent;
         let root = vec!["/hook".to_owned()];
         let report = build_report(
-            &options(&[], &root, &dump),
+            &options("shop", &[], &root, &dump),
             &[route("GET", "/shop", "plugin:shop")],
         );
         let json = serde_json::to_string(&report).expect("json");
         let library: lib::ConformanceReport = serde_json::from_str(&json).expect("library");
         assert_eq!(library.plugin_name, "shop");
-        assert_eq!(library.checks.len(), report.report.checks.len());
+        assert_eq!(library.checks[0].name, "installability");
         let back: PluginCheckReport = serde_json::from_str(&json).expect("cli");
         assert_eq!(back.prefix.as_deref(), Some("/shop"));
         assert_eq!(back.intentional_root, root);
@@ -1440,7 +1417,13 @@ mod contract_tests {
     fn a_contract_without_a_registered_name_does_not_skip() {
         let mut contract = demo_contract();
         contract.registered_as = None;
-        let report = build_report(&opts(&present(vec![contract])), &[]);
+        let dump = present(vec![contract]);
+        let report = build_report(&opts(&dump), &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
+        // `--no-routes` cannot skip without the registered name either.
+        let mut o = opts(&dump);
+        o.no_routes = true;
+        let report = build_report(&o, &[]);
         assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
     }
 

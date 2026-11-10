@@ -452,7 +452,7 @@ fn conformance_routes(manifest: &SandboxManifest) -> Vec<RouteInfo> {
             // contract (#1733) derives these from a handler's declared
             // extractors at macro-expansion time; a sandboxed route has no
             // such handler, `build_report` reads neither field, and neither is
-            // serialized — the report carries only the checks. Giving
+            // serialized — the report carries no route fields. Giving
             // them a computed-looking value here would publish a claim nothing
             // derived and nothing reads. Empty matches every other
             // `RouteInfo` built by hand in this crate.
