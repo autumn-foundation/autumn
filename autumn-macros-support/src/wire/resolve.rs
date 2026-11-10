@@ -356,6 +356,24 @@ pub fn resolve_type<'a>(
                 .filter(|c| norm(c.krate) == norm(&krate))
                 .collect();
             if !in_crate.is_empty() {
+                // No type of the crate is in the named module, so the path
+                // can go through a re-export. Refuse when another crate has a
+                // type of that name.
+                if !in_crate.iter().any(|c| fits(c.module, &module)) {
+                    let elsewhere: Vec<Candidate<'a>> = all
+                        .iter()
+                        .copied()
+                        .filter(|c| {
+                            norm(c.krate) != norm(&krate)
+                                && (norm(&krate) == norm(scope.krate)
+                                    || norm(c.krate) != norm(scope.krate))
+                                && crates.is_none_or(|g| g.reaches(&krate, c.krate))
+                        })
+                        .collect();
+                    if !elsewhere.is_empty() {
+                        return Err(refuse(&[in_crate, elsewhere].concat()));
+                    }
+                }
                 return pick(&in_crate, &module).map(Some).map_err(|c| refuse(&c));
             }
             // The named crate re-exports a type of a crate it depends on.
@@ -449,13 +467,7 @@ fn target(
     let own = scope.krate.to_owned();
     let here: Vec<&str> = scope.module.split("::").filter(|s| !s.is_empty()).collect();
     let root = crate_root(&here).len();
-    let join = |base: &[&str], rest: &[&str]| -> String {
-        base.iter()
-            .chain(rest)
-            .copied()
-            .collect::<Vec<_>>()
-            .join("::")
-    };
+    let join = |base: &[&str], rest: &[&str]| child_module(base, rest);
     match prefix {
         [] => Target::Unqualified {
             module: scope.module.to_owned(),
@@ -535,6 +547,41 @@ pub fn crate_root<'m>(module: &'m [&'m str]) -> &'m [&'m str] {
         ["bin", _, ..] => &module[..2],
         _ => &[],
     }
+}
+
+/// The module that `rest` names below the module `base`.
+///
+/// A file below `src/` has no `main::` prefix (see [`module_of_file`]), so a
+/// child of the binary root `main` is `rest` alone.
+#[must_use]
+pub fn child_module(base: &[&str], rest: &[&str]) -> String {
+    let base = if base == ["main"] && !rest.is_empty() {
+        &[][..]
+    } else {
+        base
+    };
+    base.iter()
+        .chain(rest)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Whether a type of the file module `module` can be the one that a path to
+/// `named` means.
+///
+/// An inline `mod` is not visible, so a type of a parent file fits. A module
+/// often re-exports a type of its child (`pub use item::Item;`), so a type of
+/// a child file fits too. The crate root is not a parent here: every module
+/// is its child.
+fn fits(module: &str, named: &str) -> bool {
+    let below = |inner: &str, outer: &str| {
+        !outer.is_empty() && inner.starts_with(outer) && inner[outer.len()..].starts_with("::")
+    };
+    module == named
+        || below(named, module)
+        || below(module, named)
+        || (module == "main" && named.is_empty())
 }
 
 /// The one candidate, else the one in `module`. On failure, the candidates.
@@ -773,6 +820,99 @@ mod tests {
         assert_eq!(
             pick("crate::dto::Item", at("catalog", ""), &types, Some(&crates)),
             Ok(Some("shared::Item".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_crate_path_to_a_module_with_no_such_type_beside_another_crate_is_refused() {
+        // `dto` can re-export `shared::Item`. The local type is in `models`.
+        let types = catalog_and_shared();
+        let mut crates = Crates::default();
+        crates.add_dependency("catalog", "shared", "shared");
+        for path in ["crate::dto::Item", "self::dto::Item", "super::dto::Item"] {
+            let err =
+                pick(path, at("catalog", "api"), &types, Some(&crates)).expect_err("ambiguous");
+            assert!(err.contains("`catalog::models::Item`"), "{path}: {err}");
+            assert!(err.contains("`shared::Item`"), "{path}: {err}");
+        }
+        let err = pick("crate::dto::Item", at("catalog", "api"), &types, None)
+            .expect_err("ambiguous without the graph too");
+        assert!(err.contains("`shared::Item`"), "{err}");
+    }
+
+    #[test]
+    fn a_crate_path_to_a_module_with_no_such_type_and_no_other_crate_is_the_local_type() {
+        let types = vec![ty("catalog", "models", "Item")];
+        assert_eq!(
+            pick("crate::dto::Item", at("catalog", "api"), &types, None),
+            Ok(Some("catalog::models::Item".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_dependency_path_to_a_module_with_no_such_type_beside_its_dependency_is_refused() {
+        let types = vec![ty("facade", "legacy", "Item"), ty("shared", "", "Item")];
+        let mut crates = Crates::default();
+        crates.add_dependency("catalog", "facade", "facade");
+        crates.add_dependency("facade", "shared", "shared");
+        let err =
+            pick("facade::Item", at("catalog", ""), &types, Some(&crates)).expect_err("ambiguous");
+        assert!(err.contains("`facade::legacy::Item`"), "{err}");
+        assert!(err.contains("`shared::Item`"), "{err}");
+    }
+
+    #[test]
+    fn a_crate_path_to_a_re_export_of_the_framework_no_body_is_refused_beside_a_user_no_body() {
+        let types = vec![ty("catalog", "dto", "NoBody")];
+        let err =
+            pick("crate::prelude::NoBody", at("catalog", ""), &types, None).expect_err("ambiguous");
+        assert!(err.contains("`catalog::dto::NoBody`"), "{err}");
+        assert_eq!(
+            pick("crate::dto::NoBody", at("catalog", ""), &types, None),
+            Ok(Some("catalog::dto::NoBody".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_crate_path_to_a_module_that_re_exports_its_child_fits_the_child_type() {
+        // `models/mod.rs` has `pub use item::Item;`.
+        let types = vec![
+            ty("catalog", "models::item", "Item"),
+            ty("shared", "", "Item"),
+        ];
+        assert_eq!(
+            pick("crate::models::Item", at("catalog", "api"), &types, None),
+            Ok(Some("catalog::models::item::Item".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_crate_path_into_an_inline_module_fits_the_type_of_its_file() {
+        let types = vec![ty("catalog", "api", "Item"), ty("shared", "", "Item")];
+        assert_eq!(
+            pick("crate::api::v1::Item", at("catalog", ""), &types, None),
+            Ok(Some("catalog::api::Item".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_path_from_the_binary_root_names_a_module_file_with_no_main_prefix() {
+        // `src/items.rs` is `items`, and `src/main.rs` is `main`.
+        let types = vec![
+            ty("catalog", "items", "Item"),
+            ty("catalog", "orders", "Item"),
+            ty("catalog", "main", "Item"),
+        ];
+        for path in ["crate::items::Item", "self::items::Item", "items::Item"] {
+            assert_eq!(
+                pick(path, at("catalog", "main"), &types, None),
+                Ok(Some("catalog::items::Item".to_owned())),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            pick("crate::Item", at("catalog", "main"), &types, None),
+            Ok(Some("catalog::main::Item".to_owned()))
         );
     }
 

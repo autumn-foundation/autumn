@@ -52,6 +52,9 @@ Type identity: option 2.
   same module. Else the candidates are the own crate and the crates it can
   reach in the dependency graph. More than one candidate is an error that
   asks for the full path.
+- A crate path whose module has no type of that name can go through a
+  re-export. If another crate the named crate reaches has a type of that
+  name, the resolver refuses. It does not take the lone local type.
 - The framework's `NoBody` is a candidate in `autumn-web` with no
   descriptor. A request with no `Json` parameter is the no-body case. The
   type name is not.
@@ -93,7 +96,8 @@ flowchart LR
 - The module of a type is the module of its file. An inline `mod` is not
   visible. Two types with one name in one file share one descriptor file. A
   binary root gets its own module name (`main`, `bin::<name>`), so it does
-  not share ids with the library.
+  not share ids with the library. A file below `src/` has no `main::`
+  prefix, so a path from `src/main.rs` such as `items::Item` names `items`.
 - A `routes()` function that the app builds and never mounts still counts.
   A crate whose endpoints no marker names counts as served. So a router that
   drops every endpoint of a crate does not show.
