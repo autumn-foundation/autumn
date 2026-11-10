@@ -215,7 +215,11 @@ pub enum BoundaryError {
 /// A key is the package name. A package that resolves at two versions has
 /// the key `name@version` for each, so their dependencies stay apart. The
 /// CLI fills this from `cargo metadata`.
+///
+/// A module path starts with the name of the library or binary that holds
+/// it. `libs` and `bins` map those names to the package.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CrateGraph {
     /// Package key to the package keys it depends on.
     pub deps: BTreeMap<String, BTreeSet<String>>,
@@ -238,13 +242,28 @@ impl CrateGraph {
     }
 
     /// The normalized names of a package key: the package name, without a
-    /// version, and the library name.
+    /// version, the library name and the binary names.
     fn names(&self, package: &str) -> Vec<String> {
         let mut names = vec![crate_key(package_name(package))];
-        if let Some(lib) = self.libs.get(package) {
-            names.push(crate_key(lib));
-        }
+        names.extend(self.targets_of(package).map(crate_key));
         names
+    }
+
+    /// The library name and the binary names of a package key.
+    fn targets_of<'a>(&'a self, package: &str) -> impl Iterator<Item = &'a str> {
+        let lib = self.libs.get(package).map(String::as_str);
+        let bins = self.bins.get(package).into_iter().flatten();
+        lib.into_iter().chain(bins.map(String::as_str))
+    }
+
+    /// Every pair of a package key and one of its library or binary names.
+    fn targets(&self) -> impl Iterator<Item = (&str, &str)> {
+        let libs = self.libs.iter().map(|(p, n)| (p.as_str(), n.as_str()));
+        let bins = self
+            .bins
+            .iter()
+            .flat_map(|(p, names)| names.iter().map(move |n| (p.as_str(), n.as_str())));
+        libs.chain(bins)
     }
 }
 
@@ -982,10 +1001,10 @@ struct Resolver<'a> {
     config: &'a BoundaryConfig,
     /// The tables of the models in the graph, lowercase.
     tables: BTreeSet<String>,
-    /// Normalized library name to the normalized names of its packages. A
-    /// module path starts with the library name; the config can name the
-    /// package.
-    aliases: BTreeMap<String, Vec<String>>,
+    /// Normalized library or binary name to the normalized names of its
+    /// packages. A module path starts with the target name; the config can
+    /// name the package.
+    aliases: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -999,12 +1018,12 @@ impl<'a> Resolver<'a> {
             .flat_map(|g| &g.nodes)
             .filter_map(|n| n.model.as_ref().map(|m| m.table.to_ascii_lowercase()))
             .collect();
-        let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (package, lib) in crates.iter().flat_map(|c| &c.libs) {
+        let mut aliases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (package, target) in crates.iter().flat_map(|c| c.targets()) {
             aliases
-                .entry(crate_key(lib))
+                .entry(crate_key(target))
                 .or_default()
-                .push(crate_key(package_name(package)));
+                .insert(crate_key(package_name(package)));
         }
         Self {
             config,
@@ -1029,8 +1048,8 @@ impl<'a> Resolver<'a> {
 
     /// The boundary of a graph node, by its crate or its module path.
     ///
-    /// The crate is the library name at the start of the module path, or the
-    /// name of a package that builds that library.
+    /// The crate is the library or binary name at the start of the module
+    /// path, or the name of a package that builds that target.
     fn node_boundary(&self, node: &GraphNode) -> Result<Option<&'a str>, BoundaryError> {
         let root = crate_key(crate_root(&node.module));
         let mut names = vec![root.clone()];
@@ -1052,7 +1071,7 @@ impl<'a> Resolver<'a> {
         pick("node", &node.id, &candidates)
     }
 
-    /// The boundary of a package, by its name or its library name.
+    /// The boundary of a package, by its name, library name or binary names.
     fn crate_boundary(
         &self,
         package: &str,
