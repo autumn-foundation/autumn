@@ -568,6 +568,8 @@ fn registers(
         .collect();
     let root = crate_root(&here);
     let local = |rest: &[&str]| child_module(&here, rest);
+    // A path that names a crate (`app::dto::list`) names its library.
+    let mut by_name = absolute;
     let (krate, module) = match prefix {
         [] => (own, marker.module.clone()),
         ["crate", rest @ ..] => (own, child_module(root, rest)),
@@ -606,8 +608,14 @@ fn registers(
                 |g| g.dependency(&marker.krate, first).map(norm),
             );
             match named_crate {
-                Some(krate) => (krate, rest.join("::")),
-                None if *first == own => (own, child_module(root, rest)),
+                Some(krate) => {
+                    by_name = true;
+                    (krate, rest.join("::"))
+                }
+                None if *first == own => {
+                    by_name = true;
+                    (own, child_module(root, rest))
+                }
                 None => (own, local(prefix)),
             }
         }
@@ -622,22 +630,13 @@ fn registers(
         .filter(|(_, e)| e.module == module)
         .map(|(i, _)| *i)
         .collect();
-    // `main` can hold an inline `mod` of that name, and the module file can be
-    // the library's. So a path from the binary root also registers a handler
-    // of `main`.
-    let in_binary_root = here.first() == Some(&"main")
+    let in_binary_root = !by_name
+        && here.first() == Some(&"main")
         && krate == norm(&marker.krate)
         && !module.is_empty()
         && module != "main";
     if in_binary_root && !in_module.is_empty() {
-        let mut both = in_module;
-        both.extend(
-            in_crate
-                .iter()
-                .filter(|(_, e)| e.module == "main")
-                .map(|(i, _)| *i),
-        );
-        return (both, true);
+        return (with_binary_root(in_module, &in_crate), true);
     }
     match (in_crate.is_empty(), in_module.len()) {
         (true, _) => {
@@ -651,6 +650,24 @@ fn registers(
         (false, 1) => (in_module, true),
         (false, _) => (in_crate.iter().map(|(i, _)| *i).collect(), true),
     }
+}
+
+/// `in_module` and each handler of `main` in `in_crate`.
+///
+/// `main` can hold an inline `mod` of the named module, and the module file
+/// can be the library's. So a path from the binary root also registers a
+/// handler of `main`.
+fn with_binary_root(
+    mut in_module: Vec<usize>,
+    in_crate: &[(usize, &EndpointDescriptor)],
+) -> Vec<usize> {
+    in_module.extend(
+        in_crate
+            .iter()
+            .filter(|(_, e)| e.module == "main")
+            .map(|(i, _)| *i),
+    );
+    in_module
 }
 
 /// A package name as source writes it: `-` becomes `_`.
@@ -1995,6 +2012,18 @@ mod tests {
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert!(
             !bundle
+                .endpoint("catalog", "main_list")
+                .expect("ep")
+                .unrouted
+        );
+        assert!(!bundle.endpoint("catalog", "dto_list").expect("ep").unrouted);
+        // A path that names the package names its library only.
+        let mut marker = routes("mesh-catalog", &["mesh_catalog::dto::list", "get_item"]);
+        marker.module = "main".to_owned();
+        write(dir.path(), "routes.mesh-catalog.k.json", &marker);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(
+            bundle
                 .endpoint("catalog", "main_list")
                 .expect("ep")
                 .unrouted

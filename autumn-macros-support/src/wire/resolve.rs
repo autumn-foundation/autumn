@@ -348,7 +348,10 @@ pub fn resolve_type<'a>(
     let refuse = |candidates: &[Candidate<'_>]| ambiguity(path, name, candidates, crates);
     let absolute = path.starts_with("::");
     let target = target(prefix, absolute, scope, &all, crates);
-    let doubt = binary_root_doubt(&target, scope, &all);
+    // A path that names the package (`app::dto::Item`) names its library.
+    let relative =
+        !absolute && matches!(prefix.first(), None | Some(&("crate" | "self" | "super")));
+    let doubt = binary_root_doubt(&target, relative, scope, &all);
     if !doubt.is_empty() {
         return Err(refuse(&doubt));
     }
@@ -420,18 +423,20 @@ pub fn resolve_type<'a>(
 }
 
 /// The types that a path from the binary root `src/main.rs` into a child
-/// module can mean, when more than one can.
+/// module can mean, when more than one can. `relative`: the path starts with
+/// `crate`, `self` or `super`, or names no crate.
 ///
 /// An inline `mod` of `src/main.rs` has the module `main`. A module file below
 /// `src/` can belong to the library of the package. So a type of `main` and a
 /// type of the named module are both candidates. Empty when not in doubt.
 fn binary_root_doubt<'a>(
     target: &Target,
+    relative: bool,
     scope: Scope<'_>,
     all: &[Candidate<'a>],
 ) -> Vec<Candidate<'a>> {
     let module = match target {
-        Target::Crate { krate, module } if norm(krate) == norm(scope.krate) => module,
+        Target::Crate { krate, module } if relative && norm(krate) == norm(scope.krate) => module,
         Target::Unqualified { module } => module,
         _ => return Vec::new(),
     };
@@ -1028,6 +1033,14 @@ mod tests {
             pick("crate::Item", at("app", "main"), &types, None),
             Ok(Some("app::main::Item".to_owned()))
         );
+        // A path that names the package names its library.
+        for path in ["::app::dto::Item", "app::dto::Item"] {
+            assert_eq!(
+                pick(path, at("app", "main"), &types, None),
+                Ok(Some("app::dto::Item".to_owned())),
+                "{path}"
+            );
+        }
     }
 
     #[test]
