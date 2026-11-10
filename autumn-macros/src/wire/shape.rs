@@ -24,7 +24,7 @@ struct Direction {
 
 pub fn derive_wire_shape(input: &DeriveInput) -> Result<TokenStream, syn::Error> {
     let shape = wire_type_descriptor(input)?;
-    let written = write_descriptor(&shape);
+    let written = write_descriptor(&shape, input.ident.span());
     let track = store::track_contract_dir();
     let shape_impl = wire_shape_tokens(&input.ident, &shape);
     Ok(quote! { #track #written #shape_impl })
@@ -53,17 +53,26 @@ pub fn wire_shape_tokens(name: &syn::Ident, shape: &WireTypeDescriptor) -> Token
 ///
 /// Best effort: the descriptor only enriches a diagnostic, so a build that
 /// cannot write it still holds the contract through the const tables above.
-fn write_descriptor(shape: &WireTypeDescriptor) -> TokenStream {
+fn write_descriptor(shape: &WireTypeDescriptor, span: proc_macro2::Span) -> TokenStream {
     let Some(dir) = store::contract_dir() else {
         return TokenStream::new();
     };
+    let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+    let module = store::source_module(span);
     store::write_outcome(store::write_type(
         &dir,
-        &TypeDescriptor {
-            krate: std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
-            shape: shape.clone(),
-        },
+        &type_descriptor(&krate, &module, shape),
     ))
+}
+
+/// The descriptor of a type in `krate`, in the module of its source file.
+#[must_use]
+pub fn type_descriptor(krate: &str, module: &str, shape: &WireTypeDescriptor) -> TypeDescriptor {
+    TypeDescriptor {
+        krate: krate.to_owned(),
+        module: module.to_owned(),
+        shape: shape.clone(),
+    }
 }
 
 /// Read a type's serde-visible shape, or say why it cannot be read.
@@ -100,6 +109,7 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
     };
 
     refuse_cfg(input, named)?;
+    check_wire_attrs(input)?;
 
     // A container attribute that replaces or reshapes the object makes every
     // field row below a fiction. The module's rule is to refuse what it cannot
@@ -149,11 +159,13 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
     let container_default = schema::has_serde_default(&input.attrs);
     let closed = schema::serde_bare_word(&input.attrs, &["deny_unknown_fields"]).is_some();
     let Some(named) = named else {
+        // serde writes a unit struct as `null`, not as an object.
         return Ok(WireTypeDescriptor {
             name: input.ident.to_string(),
             serialized: Vec::new(),
             deserialized: Vec::new(),
             closed,
+            unit: true,
         });
     };
     let (serialized, deserialized) = directions(named, rename_all.as_deref(), container_default)?;
@@ -162,6 +174,7 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
         serialized: serialized.fields,
         deserialized: deserialized.fields,
         closed,
+        unit: false,
     })
 }
 
@@ -267,6 +280,7 @@ fn directions(
             continue;
         };
         let ty = render_type(&field.ty);
+        let opaque = wire_opaque(field)?;
         let optional = schema::is_option_type(&field.ty);
         let defaulted = container_default || schema::has_serde_default(&field.attrs);
         // `#[serde(with)]` / `#[serde(deserialize_with)]` replace the whole
@@ -286,6 +300,8 @@ fn directions(
                 // so a caller cannot count on it arriving.
                 required: !schema::field_has_skip_serializing_if(field),
                 aliases: Vec::new(),
+                opaque,
+                nested: Vec::new(),
             });
         }
         if !skip_deserializing {
@@ -298,6 +314,8 @@ fn directions(
                 // deserializer takes the `Option` shortcut away.
                 required: !defaulted && (custom_de || !optional),
                 aliases: serde_aliases(field),
+                opaque,
+                nested: Vec::new(),
             });
         }
     }
@@ -308,6 +326,47 @@ fn directions(
             fields: deserialized,
         },
     ))
+}
+
+/// Refuse a `#[wire(…)]` that is not `#[wire(opaque)]` on a field.
+///
+/// `#[event(opaque)]` reads no shape, so it calls this alone.
+///
+/// # Errors
+/// A `#[wire]` on the container, or an unknown `wire` argument on a field.
+pub fn check_wire_attrs(input: &DeriveInput) -> Result<(), syn::Error> {
+    if let Some(attr) = input.attrs.iter().find(|a| a.path().is_ident("wire")) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[wire(…)]` goes on a field, not on the type",
+        ));
+    }
+    if let Data::Struct(data) = &input.data {
+        for field in &data.fields {
+            wire_opaque(field)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a field has `#[wire(opaque)]`. Any other `wire` argument is
+/// refused.
+///
+/// An opaque field is compared by its type name only. Use it for a type that
+/// cannot derive `WireShape`, such as an enum.
+fn wire_opaque(field: &syn::Field) -> Result<bool, syn::Error> {
+    let mut opaque = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("wire")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("opaque") {
+                opaque = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown `wire` argument; expected `opaque`"))
+            }
+        })?;
+    }
+    Ok(opaque)
 }
 
 /// Every `#[serde(alias = "…")]` on a field, in source order.
@@ -527,6 +586,26 @@ mod tests {
     }
 
     #[test]
+    fn a_unit_struct_is_marked_unit_and_an_empty_object_is_not() {
+        assert!(shape("struct Empty;").unit, "JSON null");
+        assert!(!shape("struct Empty {}").unit, "JSON object");
+        assert!(!shape("struct Item { id: String }").unit);
+    }
+
+    #[test]
+    fn wire_opaque_marks_a_field_in_both_directions() {
+        let s = shape("struct Item { #[wire(opaque)] status: Status, id: String }");
+        assert!(s.serialized[0].opaque && s.deserialized[0].opaque);
+        assert!(!s.serialized[1].opaque);
+    }
+
+    #[test]
+    fn an_unknown_wire_argument_is_refused() {
+        assert!(refusal("struct Item { #[wire(opaq)] status: Status }").contains("opaque"));
+        assert!(refusal("#[wire(opaque)] struct Item { id: String }").contains("on a field"));
+    }
+
+    #[test]
     fn a_raw_identifier_records_the_name_serde_uses() {
         let s = shape("struct Item { r#type: String }");
         assert_eq!(names(&s.serialized), ["type"]);
@@ -608,6 +687,15 @@ mod tests {
         assert!(out.contains("const SERIALIZED"), "{out}");
         assert!(out.contains("const DESERIALIZED"), "{out}");
         assert!(out.contains("\"id\""), "{out}");
+    }
+
+    #[test]
+    fn the_descriptor_records_the_module_given() {
+        let input: DeriveInput = syn::parse_str("struct Item;").expect("fixture parses");
+        let shape = wire_type_descriptor(&input).expect("shape");
+        let d = type_descriptor("catalog", "api::items", &shape);
+        assert_eq!(d.module, "api::items");
+        assert_eq!(d.artifact_file_name(), "type.catalog.api.items.Item.json");
     }
 
     #[test]

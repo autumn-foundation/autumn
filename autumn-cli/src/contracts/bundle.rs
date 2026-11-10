@@ -7,29 +7,34 @@
 //! its payload shape inline, and a consumer names the event by its topic. The
 //! bytes are the same on every rebuild: all lists are sorted, and no path or
 //! time goes in.
+//!
+//! A type that a field names is in [`Bundle::types`], once, by its id. The
+//! field holds the id in `nested`. An endpoint that no `routes![…]` registers
+//! is `unrouted`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use autumn_macros_support::wire::{
-    CallerCall, CallerDescriptor, ClientDescriptor, EndpointDescriptor, EventDescriptor,
-    ListenerDescriptor, TypeDescriptor, WireTypeDescriptor,
+    CallerCall, CallerDescriptor, ClientDescriptor, Crates, EndpointDescriptor, EventDescriptor,
+    ListenerDescriptor, Resolved, RoutesDescriptor, Scope, TypeDescriptor, WireTypeDescriptor,
+    crate_root, is_known_leaf, resolve_type, type_paths,
 };
 use serde::{Deserialize, Serialize};
 
-/// The bundle format of a bundle with no events. Its bytes are the same as
-/// before events existed.
+/// The oldest bundle format this CLI reads. Format 2 added events.
 pub const BUNDLE_FORMAT: u32 = 1;
 
-/// The bundle format of a bundle with events. An older CLI refuses it rather
-/// than skip the events it cannot read.
-pub const EVENTS_FORMAT: u32 = 2;
+/// The bundle format with type identity: nested types, the `unit` flag, and
+/// unrouted endpoints. The export always writes it. An older CLI refuses it,
+/// because it would ignore these and approve a break.
+pub const IDENTITY_FORMAT: u32 = 3;
 
 /// The type name of an endpoint with no request body.
-pub const NO_BODY: &str = "NoBody";
+pub use autumn_macros_support::wire::NO_BODY;
 
 /// The wire contract of one release.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bundle {
     /// The bundle format. A reader refuses a format it does not know.
     pub format: u32,
@@ -48,6 +53,19 @@ pub struct Bundle {
     /// Path: reason`, sorted. The check cannot protect them, so it says so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
+    /// Every type that a field of a request, a response, an event or
+    /// another such type names, sorted by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<BundleType>,
+}
+
+/// One nested type: a `WireShape` type that a field names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BundleType {
+    /// `krate::module::Name`. A field's `nested` list holds it.
+    pub id: String,
+    /// The type's shape.
+    pub shape: WireTypeDescriptor,
 }
 
 /// One event with its payload shape inline.
@@ -95,7 +113,11 @@ impl BundleListener {
 }
 
 /// One endpoint with its shapes inline.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// Each flag is one separate fact of the wire format, so an enum would not
+/// make it simpler.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BundleEndpoint {
     /// The service, from `#[endpoint(service = "…")]`.
     pub service: String,
@@ -117,6 +139,10 @@ pub struct BundleEndpoint {
     pub request: WireTypeDescriptor,
     /// What the endpoint produces.
     pub response: WireTypeDescriptor,
+    /// No `routes![…]` in the pass registers the handler, so the release
+    /// does not serve this route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unrouted: bool,
 }
 
 impl BundleEndpoint {
@@ -167,6 +193,15 @@ impl Bundle {
             .find(|e| e.service == service && e.name == name)
     }
 
+    /// The nested type with this id, if the bundle has it.
+    #[must_use]
+    pub fn nested(&self, id: &str) -> Option<&BundleType> {
+        self.types
+            .binary_search_by(|t| t.id.as_str().cmp(id))
+            .ok()
+            .map(|i| &self.types[i])
+    }
+
     /// The event with this topic, if the bundle has it.
     #[must_use]
     pub fn event(&self, topic: &str) -> Option<&BundleEvent> {
@@ -176,18 +211,26 @@ impl Bundle {
     /// Parse a bundle and refuse a format this CLI does not know.
     ///
     /// # Errors
-    /// The bytes are not a bundle, or the format is not [`BUNDLE_FORMAT`].
+    /// The bytes are not a bundle, or the format is not one this CLI knows.
     pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
-        let bundle: Self =
+        let mut bundle: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("not a contract bundle: {e}"))?;
-        if !(BUNDLE_FORMAT..=EVENTS_FORMAT).contains(&bundle.format) {
+        if !(BUNDLE_FORMAT..=IDENTITY_FORMAT).contains(&bundle.format) {
             return Err(format!(
                 "contract bundle format {} is not supported; this CLI reads formats \
-                 {BUNDLE_FORMAT} to {EVENTS_FORMAT}",
+                 {BUNDLE_FORMAT} to {IDENTITY_FORMAT}",
                 bundle.format
             ));
         }
+        // `nested` looks up by binary search.
+        bundle.types.sort();
         Ok(bundle)
+    }
+
+    /// Whether the bundle records the `unit` flag and nested types.
+    #[must_use]
+    pub const fn knows_types(&self) -> bool {
+        self.format >= IDENTITY_FORMAT
     }
 
     /// The canonical bytes: pretty JSON and a final newline.
@@ -199,18 +242,30 @@ impl Bundle {
         bytes
     }
 
-    /// Join the descriptors in `dir` into a bundle.
+    /// Join the descriptors in `dir` into a bundle, with no dependency graph.
     ///
     /// # Errors
-    /// A descriptor does not parse, a name resolves to zero or two targets,
-    /// or the directory holds no endpoint.
+    /// See [`Bundle::from_dir_with`].
     pub fn from_dir(dir: &Path) -> Result<Self, String> {
+        Self::from_dir_with(dir, None)
+    }
+
+    /// Join the descriptors in `dir` into a bundle. `crates` is the
+    /// workspace dependency graph. It limits which crates a bare type name
+    /// can come from. See [`resolve_type`].
+    ///
+    /// # Errors
+    /// A descriptor does not parse. A name resolves to no target, or can
+    /// mean more than one. A nested type has no descriptor. The directory
+    /// holds no endpoint and no event.
+    pub fn from_dir_with(dir: &Path, crates: Option<&Crates>) -> Result<Self, String> {
         let endpoints: Vec<EndpointDescriptor> = read_all(dir, "endpoint.")?;
         let types: Vec<TypeDescriptor> = read_all(dir, "type.")?;
         let clients: Vec<ClientDescriptor> = read_all(dir, "client.")?;
         let callers: Vec<CallerDescriptor> = read_all(dir, "caller.")?;
         let events: Vec<EventDescriptor> = read_all(dir, "event.")?;
         let listeners: Vec<ListenerDescriptor> = read_all(dir, "listener.")?;
+        let routes: Vec<RoutesDescriptor> = read_all(dir, "routes.")?;
         if endpoints.is_empty() && events.is_empty() {
             return Err(format!(
                 "no endpoint or event descriptor in {}: no crate in the pass has an \
@@ -219,27 +274,39 @@ impl Bundle {
             ));
         }
 
+        let mut nested = Nested::new(&types, crates);
+        let served = Served::new(&routes, &endpoints, crates);
         let mut seen = BTreeSet::new();
         let mut joined = Vec::with_capacity(endpoints.len());
-        for endpoint in &endpoints {
+        for (index, endpoint) in endpoints.iter().enumerate() {
             if !seen.insert((endpoint.service.clone(), endpoint.name.clone())) {
                 return Err(format!(
                     "two endpoints are named `{}`; give one a different name",
                     endpoint.id()
                 ));
             }
+            // A descriptor without the flag predates it: infer it.
+            let has_body = endpoint.has_body || endpoint.request_type != NO_BODY;
+            let request = if has_body {
+                body_shape(endpoint.request_path(), endpoint, &mut nested)?
+            } else {
+                WireTypeDescriptor {
+                    name: NO_BODY.to_owned(),
+                    ..WireTypeDescriptor::default()
+                }
+            };
             joined.push(BundleEndpoint {
                 service: endpoint.service.clone(),
                 name: endpoint.name.clone(),
                 krate: endpoint.krate.clone(),
                 method: endpoint.method.clone(),
                 path: endpoint.path.clone(),
-                // A descriptor without the flag predates it: infer it.
-                has_body: endpoint.has_body || endpoint.request_type != NO_BODY,
+                has_body,
                 request_list: endpoint.request_list,
                 response_list: endpoint.response_list,
-                request: resolve_type(&endpoint.request_type, endpoint, &types)?,
-                response: resolve_type(&endpoint.response_type, endpoint, &types)?,
+                request,
+                response: body_shape(endpoint.response_path(), endpoint, &mut nested)?,
+                unrouted: !served.serves(index, endpoint),
             });
         }
         joined.sort();
@@ -261,23 +328,295 @@ impl Bundle {
             }
         }
 
-        let joined_events = join_events(&events)?;
-        let (joined_listeners, unresolved) = join_listeners(&listeners, &events)?;
-        let format =
-            if joined_events.is_empty() && joined_listeners.is_empty() && unresolved.is_empty() {
-                BUNDLE_FORMAT
-            } else {
-                EVENTS_FORMAT
+        let mut filled = events.clone();
+        for event in filled
+            .iter_mut()
+            .filter(|e| !e.opaque && e.topic().is_some())
+        {
+            let scope = Scope {
+                krate: &event.krate,
+                module: &event.module,
             };
+            let owner = format!("event `{}::{}`", event.krate, event.type_name);
+            nested.fill(&mut event.shape, scope, &owner)?;
+        }
+        let joined_events = join_events(&filled)?;
+        let (joined_listeners, unresolved) = join_listeners(&listeners, &events)?;
         Ok(Self {
-            format,
+            format: IDENTITY_FORMAT,
             endpoints: joined,
             callers: calls.into_iter().collect(),
             events: joined_events,
             listeners: joined_listeners,
             unresolved,
+            types: nested.finish()?,
         })
     }
+}
+
+/// The shape of a request or response body type, with its nested types
+/// filled in.
+///
+/// The framework's `NoBody` has no descriptor. As a body it is JSON `null`.
+fn body_shape(
+    path: &str,
+    endpoint: &EndpointDescriptor,
+    nested: &mut Nested<'_>,
+) -> Result<WireTypeDescriptor, String> {
+    let scope = Scope {
+        krate: &endpoint.krate,
+        module: &endpoint.module,
+    };
+    let found = resolve_type(path, scope, nested.types, nested.crates)
+        .map_err(|e| format!("endpoint `{}`: {e}", endpoint.id()))?;
+    match found {
+        Some(Resolved::Type(t)) => {
+            let mut shape = t.shape.clone();
+            let owner = format!("type `{}`", t.id());
+            let scope = Scope {
+                krate: &t.krate,
+                module: &t.module,
+            };
+            nested.fill(&mut shape, scope, &owner)?;
+            Ok(canonical(shape))
+        }
+        Some(Resolved::NoBody) => Ok(WireTypeDescriptor {
+            name: NO_BODY.to_owned(),
+            unit: true,
+            ..WireTypeDescriptor::default()
+        }),
+        None => Err(format!(
+            "endpoint `{}` uses type `{path}`, which has no descriptor; derive `WireShape` on it",
+            endpoint.id()
+        )),
+    }
+}
+
+/// The nested types: each type a field names, resolved once.
+struct Nested<'a> {
+    types: &'a [TypeDescriptor],
+    crates: Option<&'a Crates>,
+    /// Every type found so far, by id. `None` while it waits in `queue`.
+    found: BTreeMap<String, Option<WireTypeDescriptor>>,
+    queue: Vec<&'a TypeDescriptor>,
+}
+
+impl<'a> Nested<'a> {
+    const fn new(types: &'a [TypeDescriptor], crates: Option<&'a Crates>) -> Self {
+        Self {
+            types,
+            crates,
+            found: BTreeMap::new(),
+            queue: Vec::new(),
+        }
+    }
+
+    /// Fill in `nested` on each field of `shape`, and queue each type found.
+    ///
+    /// A field type that names no descriptor must be a known leaf, or the
+    /// field must be `#[wire(opaque)]`. Else the export refuses: the check
+    /// cannot compare what it cannot see.
+    fn fill(
+        &mut self,
+        shape: &mut WireTypeDescriptor,
+        scope: Scope<'_>,
+        owner: &str,
+    ) -> Result<(), String> {
+        for field in shape
+            .serialized
+            .iter_mut()
+            .chain(shape.deserialized.iter_mut())
+        {
+            field.nested.clear();
+            if field.opaque {
+                continue;
+            }
+            for path in type_paths(&field.ty) {
+                let name = path.rsplit("::").next().unwrap_or_default();
+                let found = resolve_type(&path, scope, self.types, self.crates)
+                    .map_err(|e| format!("{owner}, field `{}`: {e}", field.rust_name))?;
+                match found {
+                    Some(Resolved::Type(t)) => {
+                        let id = t.id();
+                        if !self.found.contains_key(&id) {
+                            self.found.insert(id.clone(), None);
+                            self.queue.push(t);
+                        }
+                        field.nested.push(id);
+                    }
+                    Some(Resolved::NoBody) => {}
+                    None if is_known_leaf(name) => {}
+                    None => {
+                        return Err(format!(
+                            "{owner}, field `{}`: type `{path}` has no `WireShape` descriptor, \
+                             so the check cannot compare it. Derive `WireShape` on it, or mark \
+                             the field `#[wire(opaque)]` to compare it by type name only",
+                            field.rust_name
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve every queued type, and its own nested types, in id order.
+    fn finish(mut self) -> Result<Vec<BundleType>, String> {
+        while let Some(t) = self.queue.pop() {
+            let mut shape = t.shape.clone();
+            let owner = format!("type `{}`", t.id());
+            let scope = Scope {
+                krate: &t.krate,
+                module: &t.module,
+            };
+            self.fill(&mut shape, scope, &owner)?;
+            self.found.insert(t.id(), Some(canonical(shape)));
+        }
+        Ok(self
+            .found
+            .into_iter()
+            .filter_map(|(id, shape)| shape.map(|shape| BundleType { id, shape }))
+            .collect())
+    }
+}
+
+/// Which endpoints a `routes![…]` in the pass registers.
+///
+/// A crate is judged only when a marker in the pass names one of its
+/// endpoints. The endpoints of any other crate count as served: the router
+/// that mounts them may be outside the pass.
+struct Served {
+    judged: BTreeSet<String>,
+    /// Indices into the endpoint list.
+    registered: BTreeSet<usize>,
+}
+
+impl Served {
+    fn new(
+        routes: &[RoutesDescriptor],
+        endpoints: &[EndpointDescriptor],
+        crates: Option<&Crates>,
+    ) -> Self {
+        let mut judged = BTreeSet::new();
+        let mut registered = BTreeSet::new();
+        for marker in routes {
+            for handler in &marker.handlers {
+                let (found, sure) = registers(marker, handler, endpoints, crates);
+                for index in found {
+                    if sure {
+                        judged.insert(norm(&endpoints[index].krate));
+                    }
+                    registered.insert(index);
+                }
+            }
+        }
+        Self { judged, registered }
+    }
+
+    /// Whether the endpoint at `index` in `endpoints` is served.
+    fn serves(&self, index: usize, endpoint: &EndpointDescriptor) -> bool {
+        !self.judged.contains(&norm(&endpoint.krate)) || self.registered.contains(&index)
+    }
+}
+
+/// The endpoints one `routes![…]` entry registers.
+///
+/// A first segment that names a crate picks that crate. Any other path is in
+/// the marker's crate, and its module prefix picks between two handlers of
+/// one name. When the crate has no such handler, a handler of that name in
+/// another crate is taken: the path can be a re-export. When the path cannot
+/// pick one handler, it registers each candidate. A missed break is better
+/// than a false one here.
+///
+/// The flag is `false` when the handler was found only by its name in
+/// another crate. Such a guess registers, but does not judge that crate.
+fn registers(
+    marker: &RoutesDescriptor,
+    handler: &str,
+    endpoints: &[EndpointDescriptor],
+    crates: Option<&Crates>,
+) -> (Vec<usize>, bool) {
+    let segments: Vec<&str> = handler.split("::").collect();
+    let Some((&name, prefix)) = segments.split_last() else {
+        return (Vec::new(), false);
+    };
+    let named: Vec<(usize, &EndpointDescriptor)> = endpoints
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.handler() == name)
+        .collect();
+    let own = norm(&marker.krate);
+    let here: Vec<&str> = marker
+        .module
+        .split("::")
+        .filter(|m| !m.is_empty())
+        .collect();
+    let root = crate_root(&here).join("::");
+    let local = |rest: &[&str]| {
+        here.iter()
+            .chain(rest)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("::")
+    };
+    let (krate, module) = match prefix {
+        [] => (own, marker.module.clone()),
+        ["crate", rest @ ..] => (own, join_module(&root, rest)),
+        ["self", rest @ ..] => (own, local(rest)),
+        ["super", ..] => (own, root),
+        [first, rest @ ..] => {
+            let named_crate = crates.map_or_else(
+                || {
+                    named
+                        .iter()
+                        .find(|(_, e)| norm(&e.krate) == *first && norm(&e.krate) != own)
+                        .map(|(_, e)| norm(&e.krate))
+                },
+                |g| g.dependency(&marker.krate, first).map(norm),
+            );
+            match named_crate {
+                Some(krate) => (krate, rest.join("::")),
+                None if *first == own => (own, join_module(&root, rest)),
+                None => (own, local(prefix)),
+            }
+        }
+    };
+    let in_crate: Vec<(usize, &EndpointDescriptor)> = named
+        .iter()
+        .copied()
+        .filter(|(_, e)| norm(&e.krate) == krate)
+        .collect();
+    let in_module: Vec<usize> = in_crate
+        .iter()
+        .filter(|(_, e)| e.module == module)
+        .map(|(i, _)| *i)
+        .collect();
+    match (in_crate.is_empty(), in_module.len()) {
+        (true, _) => {
+            let guessed = named
+                .iter()
+                .filter(|(_, e)| crates.is_none_or(|g| g.reaches(&marker.krate, &e.krate)))
+                .map(|(i, _)| *i)
+                .collect();
+            (guessed, false)
+        }
+        (false, 1) => (in_module, true),
+        (false, _) => (in_crate.iter().map(|(i, _)| *i).collect(), true),
+    }
+}
+
+/// `root::rest`, or `rest` at the library root.
+fn join_module(root: &str, rest: &[&str]) -> String {
+    std::iter::once(root)
+        .filter(|r| !r.is_empty())
+        .chain(rest.iter().copied())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// A package name as source writes it: `-` becomes `_`.
+fn norm(name: &str) -> String {
+    name.replace('-', "_")
 }
 
 /// Every event with a `name`, keyed by topic. Two events with one topic are
@@ -452,44 +791,6 @@ fn canonical(mut shape: WireTypeDescriptor) -> WireTypeDescriptor {
     shape
 }
 
-/// The shape of type `name`, as the endpoint's crate sees it.
-///
-/// A type in the endpoint's own crate wins. Otherwise exactly one crate must
-/// define it. `NoBody` has no fields.
-fn resolve_type(
-    name: &str,
-    endpoint: &EndpointDescriptor,
-    types: &[TypeDescriptor],
-) -> Result<WireTypeDescriptor, String> {
-    if name == NO_BODY {
-        return Ok(WireTypeDescriptor {
-            name: NO_BODY.to_owned(),
-            ..WireTypeDescriptor::default()
-        });
-    }
-    let named: Vec<&TypeDescriptor> = types.iter().filter(|t| t.shape.name == name).collect();
-    let own = named.iter().find(|t| t.krate == endpoint.krate);
-    let found = match (own, named.as_slice()) {
-        (Some(own), _) => *own,
-        (None, [one]) => *one,
-        (None, []) => {
-            return Err(format!(
-                "endpoint `{}` uses type `{name}`, which has no descriptor; derive `WireShape` \
-                 on it",
-                endpoint.id()
-            ));
-        }
-        (None, _) => {
-            return Err(format!(
-                "endpoint `{}` uses type `{name}`, and more than one crate defines a type of \
-                 that name",
-                endpoint.id()
-            ));
-        }
-    };
-    Ok(canonical(found.shape.clone()))
-}
-
 /// The client a call goes through.
 ///
 /// A crate-qualified path (`shared::CatalogClient`) narrows the match to that
@@ -604,7 +905,8 @@ fn read_all<T: serde::de::DeserializeOwned>(dir: &Path, prefix: &str) -> Result<
 mod tests {
     use super::*;
     use autumn_macros_support::wire::{
-        CallerCall, ClientEndpoint, EventDescriptor, ListenerDescriptor, WireFieldDescriptor,
+        CallerCall, ClientEndpoint, Crates, EventDescriptor, ListenerDescriptor, RoutesDescriptor,
+        WireFieldDescriptor,
     };
 
     fn field(name: &str, required: bool) -> WireFieldDescriptor {
@@ -614,6 +916,7 @@ mod tests {
             ty: "String".to_owned(),
             required,
             aliases: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -643,11 +946,13 @@ mod tests {
     fn item() -> TypeDescriptor {
         TypeDescriptor {
             krate: "mesh-catalog".to_owned(),
+            module: String::new(),
             shape: WireTypeDescriptor {
                 name: "Item".to_owned(),
                 serialized: vec![field("name", true), field("id", true)],
                 deserialized: vec![field("name", true), field("id", true)],
                 closed: false,
+                ..Default::default()
             },
         }
     }
@@ -699,7 +1004,7 @@ mod tests {
     fn the_bundle_joins_endpoints_types_and_callers() {
         let dir = fixture();
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
-        assert_eq!(bundle.format, BUNDLE_FORMAT);
+        assert_eq!(bundle.format, IDENTITY_FORMAT);
         let [ep] = bundle.endpoints.as_slice() else {
             panic!("one endpoint: {bundle:?}");
         };
@@ -946,6 +1251,7 @@ mod tests {
     fn contact_event(krate: &str, version: u32) -> EventDescriptor {
         EventDescriptor {
             krate: krate.to_owned(),
+            module: String::new(),
             type_name: "ContactUpdated".to_owned(),
             name: Some("contact.updated".to_owned()),
             version,
@@ -956,6 +1262,7 @@ mod tests {
                 serialized: vec![field("id", true), field("email", true)],
                 deserialized: vec![field("id", true), field("email", true)],
                 closed: false,
+                ..Default::default()
             },
         }
     }
@@ -1084,7 +1391,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            bundle.format, EVENTS_FORMAT,
+            bundle.format, IDENTITY_FORMAT,
             "an older CLI must not drop it"
         );
     }
@@ -1119,14 +1426,18 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_with_events_has_the_events_format() {
+    fn a_bundle_with_or_without_events_has_the_identity_format() {
         let dir = event_fixture();
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
-        assert_eq!(bundle.format, EVENTS_FORMAT);
+        assert_eq!(bundle.format, IDENTITY_FORMAT);
         assert_eq!(
             Bundle::from_dir(fixture().path()).expect("bundle").format,
-            BUNDLE_FORMAT
+            IDENTITY_FORMAT
         );
+        for old in [BUNDLE_FORMAT, 2] {
+            let bytes = format!(r#"{{"format": {old}, "endpoints": [], "callers": []}}"#);
+            Bundle::from_slice(bytes.as_bytes()).expect("an older format still parses");
+        }
     }
 
     #[test]
@@ -1292,5 +1603,338 @@ mod tests {
         );
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert_eq!(bundle.callers[0].service, "catalog");
+    }
+
+    // --- type identity, nested types, unit bodies, route registration ---
+
+    fn typed(krate: &str, module: &str, name: &str, fields: &[(&str, &str)]) -> TypeDescriptor {
+        let fields: Vec<WireFieldDescriptor> = fields
+            .iter()
+            .map(|(n, ty)| WireFieldDescriptor {
+                ty: (*ty).to_owned(),
+                ..field(n, true)
+            })
+            .collect();
+        TypeDescriptor {
+            krate: krate.to_owned(),
+            module: module.to_owned(),
+            shape: WireTypeDescriptor {
+                name: name.to_owned(),
+                serialized: fields.clone(),
+                deserialized: fields,
+                ..WireTypeDescriptor::default()
+            },
+        }
+    }
+
+    fn field_names(shape: &WireTypeDescriptor) -> Vec<&str> {
+        shape
+            .serialized
+            .iter()
+            .map(|f| f.rust_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_crate_qualified_response_path_resolves_to_that_crate_beside_a_local_type() {
+        let dir = fixture();
+        let mut ep = endpoint("get_item", "/items/{id}", "NoBody");
+        ep.response_path = "shared::Item".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.get_item.json",
+            &ep,
+        );
+        write(
+            dir.path(),
+            "type.shared.Item.json",
+            &typed("shared", "", "Item", &[("id", "String"), ("sku", "String")]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let ep = bundle.endpoint("catalog", "get_item").expect("endpoint");
+        assert_eq!(field_names(&ep.response), ["id", "sku"]);
+    }
+
+    #[test]
+    fn a_bare_name_that_a_local_type_and_a_dependency_both_have_is_refused() {
+        let dir = fixture();
+        let mut ep = endpoint("get_item", "/items/{id}", "NoBody");
+        ep.module = "api".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.get_item.json",
+            &ep,
+        );
+        write(
+            dir.path(),
+            "type.shared.Item.json",
+            &typed("shared", "", "Item", &[("id", "String")]),
+        );
+        let err = Bundle::from_dir(dir.path()).expect_err("ambiguous");
+        assert!(err.contains("catalog.get_item"), "{err}");
+        assert!(err.contains("more than one type"), "{err}");
+        // With the dependency graph, `shared` is not reachable: no doubt.
+        let crates = Crates::default();
+        Bundle::from_dir_with(dir.path(), Some(&crates)).expect("one candidate");
+    }
+
+    /// A descriptor directory whose `Item` has a nested `Details`.
+    fn nested_fixture() -> tempfile::TempDir {
+        let dir = fixture();
+        write(
+            dir.path(),
+            "type.mesh-catalog.Item.json",
+            &typed(
+                "mesh-catalog",
+                "",
+                "Item",
+                &[("id", "String"), ("details", "Option<Vec<Details>>")],
+            ),
+        );
+        write(
+            dir.path(),
+            "type.mesh-catalog.Details.json",
+            &typed(
+                "mesh-catalog",
+                "",
+                "Details",
+                &[("size", "u32"), ("dims", "Dims")],
+            ),
+        );
+        write(
+            dir.path(),
+            "type.mesh-catalog.Dims.json",
+            &typed("mesh-catalog", "", "Dims", &[("w", "u32")]),
+        );
+        dir
+    }
+
+    #[test]
+    fn nested_types_are_in_the_bundle_recursively() {
+        let dir = nested_fixture();
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let ids: Vec<&str> = bundle.types.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["mesh-catalog::Details", "mesh-catalog::Dims"]);
+        let ep = bundle.endpoint("catalog", "get_item").expect("endpoint");
+        let details = ep.response.produced("details").expect("field");
+        assert_eq!(details.nested, ["mesh-catalog::Details"]);
+        let dims = bundle.types[0].shape.produced("dims").expect("field");
+        assert_eq!(dims.nested, ["mesh-catalog::Dims"]);
+    }
+
+    #[test]
+    fn a_nested_type_with_no_descriptor_is_refused() {
+        let dir = nested_fixture();
+        std::fs::remove_file(dir.path().join("type.mesh-catalog.Dims.json")).expect("rm");
+        let err = Bundle::from_dir(dir.path()).expect_err("refused");
+        assert!(err.contains("`dims`"), "{err}");
+        assert!(err.contains("`Dims`"), "{err}");
+        assert!(err.contains("#[wire(opaque)]"), "{err}");
+    }
+
+    #[test]
+    fn an_opaque_field_and_a_known_leaf_need_no_descriptor() {
+        let dir = nested_fixture();
+        let mut details = typed(
+            "mesh-catalog",
+            "",
+            "Details",
+            &[
+                ("dims", "Dims"),
+                ("at", "chrono::DateTime<Utc>"),
+                ("id", "Uuid"),
+            ],
+        );
+        for f in details
+            .shape
+            .serialized
+            .iter_mut()
+            .chain(details.shape.deserialized.iter_mut())
+        {
+            f.opaque = f.rust_name == "dims";
+        }
+        write(dir.path(), "type.mesh-catalog.Details.json", &details);
+        std::fs::remove_file(dir.path().join("type.mesh-catalog.Dims.json")).expect("rm");
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let dims = bundle.types[0].shape.produced("dims").expect("field");
+        assert!(dims.opaque && dims.nested.is_empty());
+    }
+
+    #[test]
+    fn a_unit_response_type_keeps_its_unit_flag() {
+        let dir = fixture();
+        let mut empty = typed("mesh-catalog", "", "Item", &[]);
+        empty.shape.unit = true;
+        write(dir.path(), "type.mesh-catalog.Item.json", &empty);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(
+            bundle
+                .endpoint("catalog", "get_item")
+                .expect("ep")
+                .response
+                .unit
+        );
+    }
+
+    #[test]
+    fn a_new_bundle_has_the_identity_format() {
+        let dir = fixture();
+        assert_eq!(
+            Bundle::from_dir(dir.path()).expect("bundle").format,
+            IDENTITY_FORMAT
+        );
+        Bundle::from_slice(br#"{"format": 3, "endpoints": [], "callers": []}"#)
+            .expect("format 3 parses");
+    }
+
+    fn routes(krate: &str, handlers: &[&str]) -> RoutesDescriptor {
+        RoutesDescriptor {
+            krate: krate.to_owned(),
+            module: String::new(),
+            handlers: handlers.iter().map(|h| (*h).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_endpoint_no_router_registers_is_unrouted() {
+        let dir = fixture();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.list.json",
+            &endpoint("list", "/items", "NoBody"),
+        );
+        write(
+            dir.path(),
+            "routes.mesh-catalog.k.json",
+            &routes("mesh-catalog", &["list"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(bundle.endpoint("catalog", "get_item").expect("ep").unrouted);
+        assert!(!bundle.endpoint("catalog", "list").expect("ep").unrouted);
+    }
+
+    #[test]
+    fn a_router_in_another_crate_registers_by_crate_path() {
+        let dir = fixture();
+        write(
+            dir.path(),
+            "routes.server.k.json",
+            &routes("server", &["mesh_catalog::get_item"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(!bundle.endpoint("catalog", "get_item").expect("ep").unrouted);
+    }
+
+    #[test]
+    fn a_module_path_registers_only_the_handler_in_that_module() {
+        let dir = fixture();
+        let mut items = endpoint("list", "/items", "NoBody");
+        items.module = "items".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.list.json",
+            &items,
+        );
+        let mut orders = endpoint("list_orders", "/orders", "NoBody");
+        orders.handler = "list".to_owned();
+        orders.module = "orders".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.list_orders.json",
+            &orders,
+        );
+        write(
+            dir.path(),
+            "routes.mesh-catalog.k.json",
+            &routes("mesh-catalog", &["items::list", "get_item"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(!bundle.endpoint("catalog", "list").expect("ep").unrouted);
+        assert!(
+            bundle
+                .endpoint("catalog", "list_orders")
+                .expect("ep")
+                .unrouted
+        );
+    }
+
+    #[test]
+    fn a_crate_that_routes_none_of_its_endpoints_counts_as_served() {
+        let dir = fixture();
+        write(
+            dir.path(),
+            "routes.mesh-catalog.k.json",
+            &routes("mesh-catalog", &["health"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(!bundle.endpoint("catalog", "get_item").expect("ep").unrouted);
+    }
+
+    #[test]
+    fn a_handler_found_by_name_in_another_crate_does_not_judge_that_crate() {
+        let dir = fixture();
+        let mut health = endpoint("health", "/health", "NoBody");
+        health.handler = "health".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.health.json",
+            &health,
+        );
+        write(
+            dir.path(),
+            "routes.gateway.k.json",
+            &routes("gateway", &["health"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(!bundle.endpoint("catalog", "get_item").expect("ep").unrouted);
+    }
+
+    #[test]
+    fn a_crate_with_no_router_in_the_pass_counts_as_served() {
+        let dir = fixture();
+        write(
+            dir.path(),
+            "routes.mesh-storefront.k.json",
+            &routes("mesh-storefront", &["show_item"]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(!bundle.endpoint("catalog", "get_item").expect("ep").unrouted);
+    }
+
+    #[test]
+    fn a_user_no_body_with_a_descriptor_is_resolved_like_any_type() {
+        let dir = fixture();
+        let mut ep = endpoint("get_item", "/items/{id}", "NoBody");
+        ep.response_type = "NoBody".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.get_item.json",
+            &ep,
+        );
+        write(
+            dir.path(),
+            "type.mesh-catalog.NoBody.json",
+            &typed("mesh-catalog", "", "NoBody", &[("token", "String")]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let ep = bundle.endpoint("catalog", "get_item").expect("ep");
+        assert_eq!(field_names(&ep.response), ["token"]);
+        assert!(!ep.has_body, "no `Json` parameter: no body");
+        assert!(ep.request.serialized.is_empty());
+    }
+
+    #[test]
+    fn the_framework_no_body_response_is_json_null() {
+        let dir = fixture();
+        let mut ep = endpoint("get_item", "/items/{id}", "NoBody");
+        ep.response_type = "NoBody".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.get_item.json",
+            &ep,
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let ep = bundle.endpoint("catalog", "get_item").expect("ep");
+        assert!(ep.response.unit && ep.response.serialized.is_empty());
     }
 }

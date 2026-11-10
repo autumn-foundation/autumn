@@ -1,0 +1,14 @@
+{
+  "krate": "mesh-storefront",
+  "function": "show_token",
+  "calls": [
+    {
+      "client": "CatalogClient",
+      "method": "get_token",
+      "reads": [
+        "token"
+      ],
+      "writes": null
+    }
+  ]
+}

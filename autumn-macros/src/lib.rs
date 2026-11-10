@@ -1354,7 +1354,11 @@ pub fn contract_checked(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Refused rather than guessed at: generics, enums, tuple structs,
 /// `#[serde(flatten)]`, and split `rename(serialize = …, deserialize = …)`.
-#[proc_macro_derive(WireShape)]
+///
+/// `#[wire(opaque)]` on a field tells `autumn contracts` to compare it by its
+/// type name only. Use it for a type that has no `WireShape`, such as an
+/// enum. Without it, the export stops on such a field.
+#[proc_macro_derive(WireShape, attributes(wire))]
 pub fn derive_wire_shape(input: TokenStream) -> TokenStream {
     let _guard = autumn_macros_support::crate_path::set_target(None);
     let parsed = syn::parse_macro_input!(input as syn::DeriveInput);

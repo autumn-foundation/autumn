@@ -145,6 +145,7 @@ mod tests {
             ty: "String".to_owned(),
             required,
             aliases: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -168,6 +169,7 @@ mod tests {
                 serialized: vec![field("name", true), field("price_cents", true)],
                 deserialized: vec![field("name", true), field("price_cents", true)],
                 closed: false,
+                ..Default::default()
             },
             response: WireTypeDescriptor {
                 name: "Item".to_owned(),
@@ -182,6 +184,7 @@ mod tests {
                     field("price_cents", true),
                 ],
                 closed: false,
+                ..Default::default()
             },
         }
     }

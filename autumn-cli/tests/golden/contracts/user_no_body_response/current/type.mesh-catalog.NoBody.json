@@ -1,0 +1,21 @@
+{
+  "krate": "mesh-catalog",
+  "name": "NoBody",
+  "serialized": [
+    {
+      "rust_name": "expires",
+      "wire_name": "expires",
+      "ty": "String",
+      "required": true
+    }
+  ],
+  "deserialized": [
+    {
+      "rust_name": "expires",
+      "wire_name": "expires",
+      "ty": "String",
+      "required": true
+    }
+  ],
+  "closed": false
+}

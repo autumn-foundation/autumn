@@ -124,6 +124,10 @@ CROSS_RELEASE = [
  ("method changed", [
     (LIB, '#[get("/items/{id}")]', '#[post("/items/{id}")]'),
  ], 1, 'not safe in any deploy order'),
+ # The handler keeps its `#[endpoint]`, and the router no longer serves it.
+ ("endpoint removed from the router", [
+    (LIB, "routes![get_item, create_item]", "routes![create_item]"),
+ ], 1, 'not safe in any deploy order'),
  ("event field a listener reads removed, listener stops reading it", [
     (LIB, EVENT, "}"),
     (MAIN, LISTENER_READ, "    let _price = event.id;\n"),
