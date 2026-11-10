@@ -6,6 +6,7 @@
 //!
 //! See `docs/guide/table-ownership.md`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -70,10 +71,16 @@ pub fn parse_cargo_metadata(metadata: &Value) -> Result<CargoFacts, String> {
             _ => name.to_owned(),
         };
         facts.crates.deps.entry(key.clone()).or_default();
-        if let Some(lib) = library_name(package)
-            && lib != name.replace('-', "_")
-        {
+        // A target with the package name adds nothing: the package name
+        // matches already.
+        let own = name.replace('-', "_");
+        let (lib, mut bins) = target_names(package);
+        if let Some(lib) = lib.filter(|lib| *lib != own) {
             facts.crates.libs.insert(key.clone(), lib);
+        }
+        bins.remove(&own);
+        if !bins.is_empty() {
+            facts.crates.bins.insert(key.clone(), bins);
         }
         names.insert(id.to_owned(), key);
         let owns = package
@@ -123,24 +130,36 @@ pub fn parse_cargo_metadata(metadata: &Value) -> Result<CargoFacts, String> {
     Ok(facts)
 }
 
-/// The library target name of a package, if it has one.
-fn library_name(package: &Value) -> Option<String> {
-    package
-        .get("targets")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|t| {
-            t.get("kind")
-                .and_then(Value::as_array)
-                .is_some_and(|kinds| {
-                    kinds
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|k| k.ends_with("lib") || k == "proc-macro")
-                })
-        })
-        .and_then(|t| t.get("name").and_then(Value::as_str))
-        .map(|n| n.replace('-', "_"))
+/// The library name and the binary names of a package, with `-` as `_`.
+///
+/// A test, bench, example or build script does not ship, so it adds no name.
+fn target_names(package: &Value) -> (Option<String>, BTreeSet<String>) {
+    let mut lib = None;
+    let mut bins = BTreeSet::new();
+    let targets = package.get("targets").and_then(Value::as_array);
+    for target in targets.into_iter().flatten() {
+        let Some(name) = target.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = name.replace('-', "_");
+        let kinds: Vec<&str> = target
+            .get("kind")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if kinds.contains(&"bin") {
+            bins.insert(name);
+        } else if lib.is_none()
+            && kinds
+                .iter()
+                .any(|k| k.ends_with("lib") || *k == "proc-macro")
+        {
+            lib = Some(name);
+        }
+    }
+    (lib, bins)
 }
 
 /// Whether one `resolve` dependency is a normal one.
@@ -547,7 +566,7 @@ mod tests {
         assert!(!facts.crates.libs.contains_key("crm-web"));
     }
 
-    fn names(list: &[&str]) -> std::collections::BTreeSet<String> {
+    fn names(list: &[&str]) -> BTreeSet<String> {
         list.iter().map(|n| (*n).to_owned()).collect()
     }
 
