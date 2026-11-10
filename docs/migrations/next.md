@@ -642,6 +642,8 @@ let crates = CrateGraph { deps, libs };
 let mut crates = CrateGraph::default();
 crates.deps = deps;
 crates.libs = libs;
+// A destructure ends with `..`.
+let CrateGraph { deps, libs, .. } = crates;
 ```
 
 **Automation:** `manual` — start from `CrateGraph::default()` and set the
@@ -747,6 +749,9 @@ If nothing changed, delete this section.
 - **Fleet:** the fleet core is in every `db` build, Postgres too. The `db`
   feature now pulls in `fd-lock`, which the `sqlite` feature pulled in
   before. No new crate.
+- **Graph:** `autumn graph check-boundaries` checks the nodes of a renamed
+  `[[bin]]` target in the boundary of its package (#3599). New violations
+  can show. Fix them, or run with `--update-baseline`.
 
 Changes that still compile but behave differently at runtime. Examples:
 

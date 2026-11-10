@@ -40,7 +40,7 @@ Each list holds glob patterns. `*` matches any run of characters.
 | Key | What it holds |
 |-----|---------------|
 | `owns` | The tables of the boundary. Case does not matter. |
-| `crates` | The crates and plugins in the boundary. `-` and `_` are equal. A package covers its library and its binaries, also when they have other names. |
+| `crates` | The crates and plugins in the boundary. `-` and `_` are equal. A package covers its library and its binaries. Their names can differ from the package name. |
 | `modules` | Module paths in the boundary. `app::billing` also matches `app::billing::routes`. |
 | `may_read` | Tables of other boundaries that this boundary may read. |
 | `may_write` | Tables of other boundaries that this boundary may read and write. |
@@ -58,8 +58,13 @@ wins over `crm-core*` for the crate `crm-core-ad-sync`. When two boundaries
 match one name equally, the check stops with an error. Make one pattern more
 specific.
 
-A node or a table in no boundary is not checked. Shared glue, for example
-`main.rs`, can stay outside all boundaries.
+A node is in the boundary of the name at the start of its module path. That
+name is a package, a library or a binary. When no pattern matches it, a
+binary name gives the package of that binary. A binary with the name of a
+library does not take the nodes of that library.
+
+A node or a table in no boundary is not checked. Shared glue, for example the
+`main.rs` of a package in no boundary, can stay outside all boundaries.
 
 ### A plugin declares its own tables
 
@@ -121,7 +126,8 @@ dependencies through crates in no boundary, for example a shared helper crate.
 It stops at a crate in a boundary, because the check examines that crate on its
 own. A crate whose name a `modules` pattern matches also stops the search. Dev
 and build dependencies do not ship, so the check ignores them. A package
-matches by its name, its library name and the names of its binaries.
+matches by its name and its library name. A dependent links the library
+only, so the crate rule does not use binary names.
 
 The schema crates of a boundary are the crates that declare the models of its
 tables. To name them yourself, set `schema_crates`. A `may_read` or
