@@ -911,10 +911,12 @@ mod tests {
             "matches('[data-autumn-busy]')",
             "ev && ev.submitter",
             // This request's own indicators, shared ones too: resolve the
-            // inherited `hx-indicator` as htmx does (Codex review).
+            // inherited `hx-indicator` as htmx does.
             "function indicatorsOf(elt)",
             "closest('[hx-indicator],[data-hx-indicator]')",
-            "s === 'this' ? host",
+            "if (sel === 'this') return [host]",
+            // The plain parts join again into one query.
+            "querySelectorAll(css.join(','))",
             "indicatorsOf(e.target)",
             "d.target",
             "busyCount",
@@ -922,14 +924,15 @@ mod tests {
             "addEventListener('loadend'",
             "removeAttribute('aria-busy')",
             // `next` and `previous` resolve as htmx does: the sibling, or
-            // the first match after or before the requester.
-            "nextElementSibling",
-            "previousElementSibling",
-            "compareDocumentPosition(elt)",
-            // A marker on each runtime `aria-busy`. A history restore
-            // removes a marked `aria-busy` that no request owns.
-            "data-autumn-busied",
-            "[data-autumn-busied]",
+            // the nearest match after or before the requester.
+            "(r ? scan(elt, r, 2) : elt.nextElementSibling)",
+            "r ? scan(elt, r, 4) : elt.previousElementSibling",
+            "el.compareDocumentPosition(elt) === pos",
+            // The runtime marks each `aria-busy` that it sets. A history
+            // restore removes a marked `aria-busy` that no request owns.
+            "setAttribute('data-autumn-busied', '')",
+            "each(document, '[data-autumn-busied]'",
+            "if (!busyCount.has(el)) unbusy(el)",
         ] {
             assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
         }

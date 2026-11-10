@@ -106,16 +106,18 @@ request ends, also after an error or an abort.
 htmx marks that element, not the button. The runtime still sets
 `aria-busy` on the button, so the spinner shows.
 
-The runtime reads `hx-indicator` as htmx 2 does: a CSS selector, `this`,
-`closest X`, `find X`, `next`, `next X`, `previous` and `previous X`.
-`next X` is the first match after the requester. `previous X` is the
-nearest match before it.
+The runtime reads these `hx-indicator` forms as htmx 2 does: a CSS
+selector list, `this`, `closest X`, `find X`, `next`, `next X`, `previous`
+and `previous X`. `this` must be the full value. `next` and `previous` are
+the sibling of the requester. `next X` is the first match after the
+requester. `previous X` is the last match before it. A descendant or an
+ancestor of the requester does not count.
 
 The runtime marks each `aria-busy` that it sets with
 `data-autumn-busied`. With `hx-push-url`, htmx saves the page before the
-request ends, so the saved page has these marks. After Back, the runtime
-removes the marked `aria-busy`. It does not remove an `aria-busy` that the
-app set.
+request ends, so the saved page has these marks. After Back or Forward,
+the runtime removes the marked `aria-busy`. It does not remove an
+`aria-busy` that the app set.
 
 The spinner covers the label, so the width does not change. CSS hides the
 icon and the label with `opacity: 0` only. They stay in the accessibility
