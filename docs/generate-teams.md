@@ -67,12 +67,12 @@ request errors instead of waiting for a lock.
 
 `POST /invitations` does not end on an error page for bad input. For a bad
 email, an unknown role, or a duplicate pending invitation, it shows the
-members page again with status 422. The form keeps the typed values. The
-error shows at the field that caused it, and that field gets
-`aria-invalid="true"`.
+members page again with status 422. The form keeps the email and the
+selected role. The error shows at the field that caused it, and that field
+gets `aria-invalid="true"`.
 
-An `Admin` who invites someone as `Owner` gets 403. That is a permission
-refusal, not an input error, so the page does not show again.
+An `Admin` who invites someone as `Owner` gets 403. This 403 is a permission
+refusal, not an input error. The members page does not show again.
 
 ## The composition boundary with your own auth
 

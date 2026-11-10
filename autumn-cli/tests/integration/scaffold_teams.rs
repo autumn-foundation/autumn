@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-/// Run the production `autumn` binary in `dir`, asserting success.
+/// Run the `autumn` binary in `dir`. Panic if the command fails.
 fn run_autumn(dir: &Path, args: &[&str]) {
     let output = Command::new(env!("CARGO_BIN_EXE_autumn"))
         .args(args)
@@ -48,8 +48,8 @@ fn patch_to_workspace(project: &Path) {
     fs::write(&cargo_toml, content).unwrap();
 }
 
-/// The generated app compiles, and the generated members page redisplays
-/// the invite form with field errors (its own unit tests pass).
+/// The generated app compiles. The generated unit tests for the invite form
+/// pass.
 #[test]
 #[ignore = "slow: cargo-tests a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
 fn teams_scaffold_cargo_tests() {

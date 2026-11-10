@@ -1682,16 +1682,12 @@ pub async fn create_invitation(
                     ));
                 }
 
-                // Reject rather than silently revoke-and-replace a still-pending
-                // invitation to this email — now that the organization lock
-                // above serializes concurrent `create_invitation` calls for
-                // this organization, a second request for an email that's
-                // already pending is a genuine conflict the caller should see,
-                // not a race to resolve by rewriting history underneath them.
-                // Revoking-and-replacing here also sent two invite emails out
-                // of release-lock order, so a reordered delivery could leave
-                // the invitee's newest message holding an already-revoked
-                // token (Codex review finding).
+                // Do not revoke and replace a pending invitation to this
+                // email. Return `Ok(false)`, and the caller shows the form
+                // again. The organization lock above makes a second request
+                // for a pending email a real duplicate, not a race. A
+                // revoke-and-replace also sent two invite emails. If they
+                // arrived out of order, the newest email held a revoked token.
                 let existing_pending: Option<Invitation> = invitations::table
                     .filter(invitations::tenant_id.eq(&tenant_id))
                     .filter(invitations::email.eq(&insert_email))
@@ -1723,8 +1719,9 @@ pub async fn create_invitation(
             .scope_boxed()
         })
         .await;
-    // The organization lock and the check above serialize concurrent calls,
-    // so this unique-index violation is a backstop only.
+    // The organization lock and the pending check stop concurrent
+    // duplicates. The unique index is a second guard. A violation of the
+    // index also shows the form again.
     let created = match created {
         Ok(created) => created,
         Err(err)
@@ -1780,7 +1777,7 @@ pub async fn create_invitation(
 
 // ── Accept (show) ───────────────────────────────────────────────────────
 
-/// The form of an email that comparisons use: trimmed and lowercase.
+/// Return `email` trimmed and in lowercase. Use this value to compare emails.
 fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
@@ -2352,8 +2349,8 @@ fn render_routes_members_rs() -> String {
     ROUTES_MEMBERS_RS.to_owned()
 }
 
-const ROUTES_MEMBERS_RS: &str = r##"//! Member-management surface: list members + pending invitations, invite,
-//! change role, remove member (issue #1261 AC7).
+const ROUTES_MEMBERS_RS: &str = r##"//! Member-management surface: list members and pending invitations, show
+//! the invite form, change role, remove member (issue #1261 AC7).
 //!
 //! Every mutating action is gated `require_role(&session, &membership_repo, Role::Admin)`,
 //! but an `Admin` may only change or remove `Member`/`Admin` memberships —
@@ -2399,7 +2396,7 @@ fn owner_count(memberships: &[Membership]) -> usize {
         .count()
 }
 
-/// The values and field errors of the "Send Invitation" form.
+/// The values and field errors of the invite form.
 #[derive(Clone, Copy)]
 pub(super) struct InviteFormView<'a> {
     /// The email as the admin typed it.
@@ -2422,7 +2419,7 @@ impl InviteFormView<'static> {
     };
 }
 
-/// The `aria-invalid` value for a field with this error.
+/// Return `"true"` if `error` is set. Otherwise return `"false"`.
 fn aria_invalid(error: Option<&str>) -> &'static str {
     if error.is_some() { "true" } else { "false" }
 }
@@ -2448,9 +2445,9 @@ pub async fn list_members(
     Ok(page.into_response())
 }
 
-/// Show the members page again at 422, with the rejected invite in the form
-/// and each error at its own field. Use it after `require_role(Role::Admin)`
-/// passes, so the form shows.
+/// Show the members page again with status 422. The form keeps the rejected
+/// input. Each error shows at its field. Call this function only after
+/// `require_role(Role::Admin)` passes. Otherwise the page has no form.
 pub(super) async fn redisplay_members(
     caller_role: Role,
     membership_repo: &PgMembershipRepository,
@@ -2463,8 +2460,8 @@ pub(super) async fn redisplay_members(
 }
 
 /// Load the roster and pending invitations, and render the full page.
-/// [`list_members`] and [`redisplay_members`] both use it, so the two views
-/// cannot drift apart.
+/// [`list_members`] and [`redisplay_members`] both call this function. Thus
+/// the two pages stay the same.
 async fn members_page(
     caller_role: Role,
     membership_repo: &PgMembershipRepository,
@@ -2491,8 +2488,8 @@ async fn members_page(
     ))
 }
 
-/// The members page body: the roster, the pending invitations, and, for an
-/// `Admin`+, the "Send Invitation" form with `form`'s values and errors.
+/// Render the members page body. Every member sees the roster. An `Admin` or
+/// `Owner` also sees the invite form and the pending invitations.
 pub(super) fn members_content(
     caller_role: Role,
     memberships: &[Membership],
@@ -4885,7 +4882,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
                 && body.contains("invitation_repo: PgInvitationRepository,"),
             "{body}"
         );
-        // An Admin who grants Owner is refused. That is not an input error.
+        // An Admin who invites an Owner gets 403. The form does not show again.
         assert!(
             body.contains(
                 "forbidden_msg(\n            \"Only an owner can invite someone as owner\""
@@ -4955,9 +4952,9 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             .collect()
     }
 
-    /// Example functions the generated module does not have, and why.
-    /// Each one needs the app's own `users` table. The generated module
-    /// does not own that table.
+    /// Example functions that the generated module does not have. Each one
+    /// needs the app's own `users` table. The generated module does not own
+    /// that table.
     const EXAMPLE_ONLY_FNS: &[(&str, &str)] = &[
         ("routes/invitations.rs", "accept_signup_form"),
         (
@@ -4977,14 +4974,14 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         ("routes/members.rs", "empty_emails"),
     ];
 
-    /// Drift tripwire for #3595. Every function in the `examples/teams`
-    /// files below has a same-name function in a `generate teams` template,
-    /// or an entry in [`EXAMPLE_ONLY_FNS`]. A fix that adds a function to
-    /// the example fails here until the generator gets it too.
+    /// Make sure that `examples/teams` and the `generate teams` templates
+    /// have the same functions (#3595). Each function in the example files
+    /// below must have a template function with the same name, or an entry
+    /// in [`EXAMPLE_ONLY_FNS`].
     ///
-    /// The check uses all templates together, so a function can move to a
-    /// different file. Function bodies are not compared: the generator
-    /// adapts them (no `users` table, `SQLite` row locks).
+    /// The test uses all templates together, so a function can be in a
+    /// different file. The test does not compare function bodies. The
+    /// generator changes them (no `users` table, `SQLite` row locks).
     #[test]
     fn every_example_teams_fn_has_a_generated_counterpart() {
         let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/teams/src");
@@ -5038,7 +5035,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         assert!(
             missing.is_empty(),
             "examples/teams has functions the `generate teams` templates lack. \
-             Port each one, or add it to EXAMPLE_ONLY_FNS with a reason:\n{}",
+             Port each one to a template, or add it to EXAMPLE_ONLY_FNS:\n{}",
             missing.join("\n"),
         );
         assert!(
