@@ -53,10 +53,10 @@ it gets its own budget and gate (issue #977).
 
 | Change class | p50 ms | p95 ms | max ms | Gate |
 |---|---:|---:|---:|---|
-| Cold start (`autumn new` → first 200, no-DB) | 100 000 | **130 000** | 160 000 | **Gated** |
+| Cold start (`autumn new` → first 200, no-DB) | 100 000 | **120 000** | 145 000 | **Gated** |
 | Cold start (`autumn new` → first 200, database-backed) | 120 000 | 180 000 | 300 000 | Informational |
 
-**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **130 s** on
+**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **120 s** on
 the CI reference runner. Autumn's stated goal is still "time-from-`cargo new`
 to first served route < 60 s"; the gate above is the realistic ceiling for
 today's code, not the goal. See [Cold-start budget history](#cold-start-budget-history)
@@ -141,17 +141,28 @@ Two fixes followed:
 A later change gated 16 more modules of `autumn-web` behind default-on
 features (ADR 0027). The daemon starter turns them off, and `psl` leaves its
 build. A default build does not change. On one 4 vCPU box a cold `hello`
-build fell from 118 s to 101 s. The CI gate budget is unchanged until the
-scheduled run confirms the gain.
+build fell from 118 s to 101 s.
 
-Both fixes are real and measured. Neither brings cold start under the
-original 60s/90s target. The reason: `autumn-web`'s own hand-written source
-is now the largest single compile unit, at roughly 43-55s, and no feature
-gates it (unlike the generated macro code above). The budget above (p95 130s
-/ max 160s) is recalibrated from real CI numbers. It stops the gate from
-failing on every run, while it still catches a genuine regression. This is a
-stopgap, not a fix: open work tracks lowering `autumn-web`'s own compile
-time and tightening this budget back toward the original target.
+The scheduled CI runs after ADR 0027 measured 89-104 s. The budget is now
+p95 120 s / max 145 s, about 15% above the slowest sample. It was p95 130 s
+/ max 160 s.
+
+ADR 0045 cut the LLVM IR of `autumn-web` for the daemon starter by 13.4%:
+
+1. Config is read through one serde deserializer (`config::value_de`).
+   Before, `toml::from_str` made one `Deserialize` copy of each config struct
+   for each toml access type, and the schema walk made one more.
+2. The `cluster` module has a default-on feature. The daemon starter turns
+   it off.
+
+On one 4 vCPU box, the cold `hello` build changed by about 3%. That is less
+than the run-to-run noise there. Backend work (LLVM) runs on all cores, and
+the front end does not, so fewer IR lines give a smaller time gain.
+
+The original 60 s / 90 s target is still open. `autumn-web` is still about
+half of the compile time, and it cannot start until `autumn-macros` is
+built. A larger gain needs a smaller front end, for example a split of
+`autumn-web` into crates that compile in parallel (issue #2795).
 
 ---
 

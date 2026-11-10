@@ -29,13 +29,13 @@ const DATETIME_KEY: &str = "$__toml_private_datetime";
 /// Deserialize `T` from a merged config value.
 ///
 /// An error names the key path, for example ``in `server.port` ``.
-pub(crate) fn from_value<T: DeserializeOwned>(value: toml::Value) -> Result<T, toml::de::Error> {
+pub(super) fn from_value<T: DeserializeOwned>(value: toml::Value) -> Result<T, toml::de::Error> {
     T::deserialize(ConfigDe::Value(value)).map_err(Error::into_toml)
 }
 
 /// An error and the key path where it occurred.
 #[derive(Debug)]
-pub(crate) struct Error {
+pub(super) struct Error {
     message: String,
     /// Path segments, innermost first.
     path: Vec<Segment>,
@@ -78,7 +78,7 @@ impl Error {
     }
 
     /// The error type of the public [`SchemaDeserializer`].
-    pub(crate) fn into_value_error(self) -> de::value::Error {
+    pub(super) fn into_value_error(self) -> de::value::Error {
         <de::value::Error as de::Error>::custom(self)
     }
 }
@@ -105,7 +105,7 @@ impl de::Error for Error {
 }
 
 /// The config deserializer. See the module docs.
-pub(crate) enum ConfigDe {
+pub(super) enum ConfigDe {
     /// Read this value.
     Value(toml::Value),
     /// Walk the type and record its fields.
@@ -829,7 +829,8 @@ mod tests {
             for file in inner {
                 let path = file.expect("entry").path();
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.starts_with("autumn") && name.ends_with(".toml") {
+                let toml = path.extension().is_some_and(|ext| ext == "toml");
+                if name.starts_with("autumn") && toml {
                     files.push(path);
                 }
             }
