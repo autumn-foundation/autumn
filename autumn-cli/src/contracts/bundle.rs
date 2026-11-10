@@ -622,6 +622,23 @@ fn registers(
         .filter(|(_, e)| e.module == module)
         .map(|(i, _)| *i)
         .collect();
+    // `main` can hold an inline `mod` of that name, and the module file can be
+    // the library's. So a path from the binary root also registers a handler
+    // of `main`.
+    let in_binary_root = here.first() == Some(&"main")
+        && krate == norm(&marker.krate)
+        && !module.is_empty()
+        && module != "main";
+    if in_binary_root && !in_module.is_empty() {
+        let mut both = in_module;
+        both.extend(
+            in_crate
+                .iter()
+                .filter(|(_, e)| e.module == "main")
+                .map(|(i, _)| *i),
+        );
+        return (both, true);
+    }
     match (in_crate.is_empty(), in_module.len()) {
         (true, _) => {
             let guessed = named
@@ -1955,6 +1972,34 @@ mod tests {
             std::fs::remove_file(dir.path().join(format!("routes.mesh-catalog.{key}.json")))
                 .expect("remove marker");
         }
+    }
+
+    #[test]
+    fn a_module_path_in_the_binary_root_also_registers_a_binary_root_handler() {
+        // `main` can hold an inline `mod dto`, and `src/dto.rs` can be the
+        // library's file.
+        let dir = fixture();
+        for module in ["main", "dto"] {
+            let mut list = endpoint(&format!("{module}_list"), &format!("/{module}"), "NoBody");
+            list.handler = "list".to_owned();
+            list.module = module.to_owned();
+            write(
+                dir.path(),
+                &format!("endpoint.mesh-catalog.catalog.{module}_list.json"),
+                &list,
+            );
+        }
+        let mut marker = routes("mesh-catalog", &["crate::dto::list", "get_item"]);
+        marker.module = "main".to_owned();
+        write(dir.path(), "routes.mesh-catalog.k.json", &marker);
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(
+            !bundle
+                .endpoint("catalog", "main_list")
+                .expect("ep")
+                .unrouted
+        );
+        assert!(!bundle.endpoint("catalog", "dto_list").expect("ep").unrouted);
     }
 
     #[test]
