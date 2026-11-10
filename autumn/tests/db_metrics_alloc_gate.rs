@@ -33,6 +33,7 @@
 //! |---------------------------------|--------|-------|
 //! | `record_db_query`, seen key     |      1 |     0 |
 //! | `run_instrumented`, seen route  |      3 |     0 |
+//! | `record_db_connection_hold`, seen route | new | 0 |
 //!
 //! A failure here means a refactor put an allocation back on the hit path;
 //! re-measure and re-derive rather than raising a ceiling.
@@ -89,6 +90,24 @@ fn db_query_with_a_seen_key_records_without_allocating() {
     assert_eq!(snapshot.db_queries.len(), 1);
     assert_eq!(
         snapshot.db_queries["GET /users/{id} SELECT"].count,
+        WARM_UP + SAMPLES
+    );
+}
+
+#[test]
+fn db_connection_hold_with_a_seen_route_records_without_allocating() {
+    let collector = MetricsCollector::new();
+    let allocs = per_sample("db connection hold, seen route", || {
+        collector.record_db_connection_hold("GET /users/{id}", black_box(5));
+    });
+    assert_eq!(
+        allocs, 0,
+        "a hold route the collector holds must be probed by borrow"
+    );
+    let snapshot = collector.snapshot();
+    assert!(snapshot.db_queries.is_empty());
+    assert_eq!(
+        snapshot.db_connection_holds["GET /users/{id}"].count,
         WARM_UP + SAMPLES
     );
 }

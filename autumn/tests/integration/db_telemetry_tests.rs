@@ -186,9 +186,20 @@ mod db_telemetry_tests {
                 );
                 // The exact key `Db`'s drop records: method, route template and
                 // verb, composed without an intermediate `String`.
+                // Deprecated: the hold under the old query key, kept one release.
                 assert!(
                     queries.get("GET /sleep-default SELECT").is_some(),
-                    "expected the exact Db key `GET /sleep-default SELECT`, got {queries}"
+                    "expected the deprecated Db key `GET /sleep-default SELECT`, got {queries}"
+                );
+                // The hold under its own key: the route, no verb.
+                let holds = &metrics["db_connection_holds"];
+                assert_eq!(
+                    holds["GET /sleep-default"]["count"], 1,
+                    "expected one hold for `GET /sleep-default`, got {holds}"
+                );
+                assert!(
+                    holds["GET /sleep-default"]["p50_ms"].as_u64() >= Some(1_000),
+                    "the hold covers the 1s sleep, got {holds}"
                 );
             });
     }

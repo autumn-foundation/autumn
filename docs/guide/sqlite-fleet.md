@@ -135,6 +135,7 @@ paths. For analytics, [query the lake](#query-the-lake) instead.
 
 When a handler holds a `Db` past `database.slow_query_threshold`, Autumn
 logs `database connection held past slow_query_threshold` with `held_ms`.
+`/actuator/metrics` records each hold in `db_connection_holds["<route>"]`.
 The time covers all work in the hold, not one statement. For a fan-out, take
 `LazyDb`. Call `checkout()` after the fan-out.
 

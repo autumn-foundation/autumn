@@ -526,6 +526,43 @@ in a const context, so no call changes.
 `..OutboxConfig::default()`. A codemod cannot know which ending the app
 wants.
 
+### Metrics: `MetricsSnapshot` has a `db_connection_holds` field
+
+**Why:** the `Db` extractor recorded its connection hold time as a query,
+under `db_queries["<route> SELECT"]` (issue #3579). The hold now has its own
+map, `db_connection_holds`, keyed by the route. See
+[Metrics: the `"<route> SELECT"` key is deprecated](#metrics-the-route-select-key-is-deprecated).
+
+**You are affected only if your code builds a `MetricsSnapshot` with a
+struct literal.** Code that reads `/actuator/metrics` or calls
+`MetricsCollector::snapshot` needs no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+MetricsSnapshot {
+    http,
+    idempotency,
+    db_queries,
+    read_your_writes_pins_total: 0,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+MetricsSnapshot {
+    http,
+    idempotency,
+    db_queries,
+    db_connection_holds: std::collections::HashMap::new(),
+    read_your_writes_pins_total: 0,
+}
+```
+
+**Automation:** `manual` — add the field. A codemod cannot know which holds
+the app wants in the map.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -661,6 +698,27 @@ What to do:
    does not show the new comment.
 4. Index the comments table: `(commentable_type, commentable_id, created_at,
    id) WHERE parent_id IS NULL AND deleted_at IS NULL`, and `parent_id`.
+
+### Metrics: the `"<route> SELECT"` key is deprecated
+
+`db_queries["<route> SELECT"]` from the `Db` extractor is not a query. It is
+the time a request held its connection, from checkout to release. It includes
+all statements and all other work in the hold, for example a fan-out. A route
+that only writes also shows it.
+
+This release records the same sample in two places:
+
+| Key | Status |
+| --- | --- |
+| `db_queries["POST /census SELECT"]` | Deprecated. The next release removes it. |
+| `db_connection_holds["POST /census"]` | New. Use this one. |
+
+What to do:
+
+1. Move each dashboard and alert that reads `db_queries["<route> SELECT"]`
+   to `db_connection_holds["<route>"]`. The new key has no verb.
+2. Read per-statement times from the other `db_queries` keys. These come
+   from `run_instrumented`.
 
 ## Deprecations retained from `{X.Y}`
 

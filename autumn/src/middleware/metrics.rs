@@ -55,6 +55,17 @@ pub struct MetricsCollector {
 struct Shard {
     by_route: HashMap<String, RouteMetrics>,
     by_query: HashMap<String, RouteMetrics>,
+    /// Connection hold time per route: checkout to release of one `Db`.
+    by_hold: HashMap<String, RouteMetrics>,
+}
+
+/// The database series a sample goes in.
+#[derive(Debug, Clone, Copy)]
+enum DbSeries {
+    /// One statement.
+    Query,
+    /// One connection hold.
+    Hold,
 }
 
 #[derive(Debug)]
@@ -598,19 +609,35 @@ impl MetricsCollector {
 
     /// Record a database query's duration.
     pub fn record_db_query(&self, key: &str, latency_ms: u64) {
+        self.record_db_series(DbSeries::Query, key, latency_ms);
+    }
+
+    /// Record how long one request held a database connection.
+    ///
+    /// The key is the route, for example `"POST /census"`. The time is from
+    /// checkout to release. It includes all statements and all other work in
+    /// the hold. It is not a query time, so it goes in
+    /// [`MetricsSnapshot::db_connection_holds`], not in `db_queries`.
+    pub fn record_db_connection_hold(&self, route: &str, held_ms: u64) {
+        self.record_db_series(DbSeries::Hold, route, held_ms);
+    }
+
+    fn record_db_series(&self, series: DbSeries, key: &str, latency_ms: u64) {
         let shard_idx = shard_index(key);
 
         if let Some(lock) = self.inner.shards.get(shard_idx)
             && let Ok(mut shard) = lock.write()
         {
-            // Probe by borrow first: every query after a key's first sighting
+            let map = match series {
+                DbSeries::Query => &mut shard.by_query,
+                DbSeries::Hold => &mut shard.by_hold,
+            };
+            // Probe by borrow first: every sample after a key's first sighting
             // finds its entry without building an owned key just to drop it.
-            if let Some(entry) = shard.by_query.get_mut(key) {
+            if let Some(entry) = map.get_mut(key) {
                 entry.observe_query(latency_ms);
             } else {
-                shard
-                    .by_query
-                    .entry(key.to_owned())
+                map.entry(key.to_owned())
                     .or_default()
                     .observe_query(latency_ms);
             }
@@ -624,6 +651,28 @@ impl MetricsCollector {
     /// byte-identical either way.
     #[cfg(feature = "db")]
     pub(crate) fn record_db_query_fmt(&self, key: std::fmt::Arguments<'_>, latency_ms: u64) {
+        self.record_db_series_fmt(DbSeries::Query, key, latency_ms);
+    }
+
+    /// [`record_db_connection_hold`](Self::record_db_connection_hold) under
+    /// the text `route` formats to. It does not allocate for a route of 256
+    /// bytes or less.
+    #[cfg(feature = "db")]
+    pub(crate) fn record_db_connection_hold_fmt(
+        &self,
+        route: std::fmt::Arguments<'_>,
+        held_ms: u64,
+    ) {
+        self.record_db_series_fmt(DbSeries::Hold, route, held_ms);
+    }
+
+    #[cfg(feature = "db")]
+    fn record_db_series_fmt(
+        &self,
+        series: DbSeries,
+        key: std::fmt::Arguments<'_>,
+        latency_ms: u64,
+    ) {
         // Same stack-buffer composition as `record_route`: `Cursor::position`
         // reports the bytes written, so the filled prefix is read back without
         // deriving a length from the remaining slice.
@@ -643,10 +692,10 @@ impl MetricsCollector {
             .and_then(|filled| std::str::from_utf8(filled).ok())
             .filter(|composed| !composed.is_empty());
         if let Some(composed) = composed {
-            self.record_db_query(composed, latency_ms);
+            self.record_db_series(series, composed, latency_ms);
             return;
         }
-        self.record_db_query(&std::fmt::format(key), latency_ms);
+        self.record_db_series(series, &std::fmt::format(key), latency_ms);
     }
 
     fn increment_active(&self) {
@@ -669,6 +718,7 @@ impl MetricsCollector {
 
         let mut by_route = HashMap::new();
         let mut db_queries = HashMap::new();
+        let mut db_connection_holds = HashMap::new();
         for shard_lock in &self.inner.shards {
             if let Ok(shard) = shard_lock.read() {
                 for (k, v) in &shard.by_route {
@@ -684,16 +734,10 @@ impl MetricsCollector {
                     );
                 }
                 for (k, v) in &shard.by_query {
-                    let pcts = compute_percentiles(&v.latencies_ms);
-                    db_queries.insert(
-                        k.clone(),
-                        DbQueryMetric {
-                            count: v.count,
-                            p50_ms: pcts.p50,
-                            p95_ms: pcts.p95,
-                            p99_ms: pcts.p99,
-                        },
-                    );
+                    db_queries.insert(k.clone(), DbQueryMetric::of(v));
+                }
+                for (k, v) in &shard.by_hold {
+                    db_connection_holds.insert(k.clone(), DbQueryMetric::of(v));
                 }
             }
         }
@@ -738,6 +782,7 @@ impl MetricsCollector {
                 conflicts: self.inner.idempotency_conflicts.load(Ordering::Relaxed),
             },
             db_queries,
+            db_connection_holds,
             read_your_writes_pins_total: self
                 .inner
                 .read_your_writes_pins_total
@@ -752,13 +797,28 @@ impl Default for MetricsCollector {
     }
 }
 
-/// Serializable DB query snapshot returned in the `/actuator/metrics` JSON object under "`db_queries`".
+/// Count and latency percentiles of one database series.
+///
+/// The `/actuator/metrics` JSON uses this shape under `db_queries` and under
+/// `db_connection_holds`.
 #[derive(Serialize, Clone, Debug)]
 pub struct DbQueryMetric {
     pub count: u64,
     pub p50_ms: u64,
     pub p95_ms: u64,
     pub p99_ms: u64,
+}
+
+impl DbQueryMetric {
+    fn of(series: &RouteMetrics) -> Self {
+        let pcts = compute_percentiles(&series.latencies_ms);
+        Self {
+            count: series.count,
+            p50_ms: pcts.p50,
+            p95_ms: pcts.p95,
+            p99_ms: pcts.p99,
+        }
+    }
 }
 
 /// Serializable metrics snapshot returned by `/actuator/metrics`.
@@ -769,8 +829,19 @@ pub struct MetricsSnapshot {
     /// Idempotency-key middleware counters (zero when middleware is not enabled).
     pub idempotency: IdempotencyMetricsSnapshot,
     /// Database queries tracked.
+    ///
+    /// The `"<route> SELECT"` key from the `Db` extractor is deprecated. It
+    /// holds the connection hold time, not a query time. Read
+    /// [`db_connection_holds`](Self::db_connection_holds) instead. The next
+    /// release removes it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub db_queries: HashMap<String, DbQueryMetric>,
+    /// Connection hold time per route, keyed `"METHOD /path"`.
+    ///
+    /// One sample for each `Db` the route held: the time from checkout to
+    /// release. It includes all statements and all other work in the hold.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub db_connection_holds: HashMap<String, DbQueryMetric>,
     /// Read-your-own-writes: number of replica reads redirected to the primary
     /// due to an active RYWW pin. Zero when `read_your_writes = "off"`.
     pub read_your_writes_pins_total: u64,
@@ -1294,6 +1365,94 @@ mod tests {
         assert_eq!(snap.db_queries.len(), 2);
         assert_eq!(snap.db_queries[exact_key.as_str()].count, 1);
         assert_eq!(snap.db_queries[straddle.as_str()].count, 1);
+    }
+
+    /// A connection hold goes in `db_connection_holds` under the route alone.
+    /// It is not a query, so `db_queries` stays empty.
+    #[test]
+    fn db_connection_hold_is_its_own_series() {
+        let collector = MetricsCollector::new();
+        collector.record_db_connection_hold("POST /census", 6_653);
+        collector.record_db_connection_hold("POST /census", 10);
+
+        let snap = collector.snapshot();
+        assert!(snap.db_queries.is_empty(), "{:?}", snap.db_queries);
+        assert_eq!(snap.db_connection_holds.len(), 1);
+        let hold = &snap.db_connection_holds["POST /census"];
+        assert_eq!(hold.count, 2);
+        assert_eq!(hold.p99_ms, 6_653);
+    }
+
+    /// A query and a hold with the same key text stay in their own series.
+    #[test]
+    fn db_query_and_db_connection_hold_do_not_share_an_entry() {
+        let collector = MetricsCollector::new();
+        collector.record_db_query("GET /users", 3);
+        collector.record_db_connection_hold("GET /users", 40);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.db_queries["GET /users"].count, 1);
+        assert_eq!(snap.db_queries["GET /users"].p50_ms, 3);
+        assert_eq!(snap.db_connection_holds["GET /users"].count, 1);
+        assert_eq!(snap.db_connection_holds["GET /users"].p50_ms, 40);
+    }
+
+    /// The hold counter stops at `u64::MAX`. It does not overflow.
+    #[test]
+    fn db_connection_hold_counter_saturates_at_the_ceiling() {
+        let collector = MetricsCollector::new();
+        collector.record_db_connection_hold("GET /held", 5);
+        {
+            let lock = collector
+                .inner
+                .shards
+                .get(shard_index("GET /held"))
+                .expect("shard_index always yields an in-bounds shard");
+            let mut shard = lock.write().expect("shard lock is not poisoned");
+            shard
+                .by_hold
+                .get_mut("GET /held")
+                .expect("the hold was just recorded")
+                .count = u64::MAX;
+        }
+        collector.record_db_connection_hold("GET /held", 5);
+        assert_eq!(
+            collector.snapshot().db_connection_holds["GET /held"].count,
+            u64::MAX
+        );
+    }
+
+    /// The `_fmt` form records under the formatted text, short or long.
+    #[cfg(feature = "db")]
+    #[test]
+    fn db_connection_hold_fmt_records_under_the_formatted_key() {
+        let collector = MetricsCollector::new();
+        let route = "GET /users/{id}";
+        collector.record_db_connection_hold_fmt(format_args!("{route}"), 5);
+        collector.record_db_connection_hold("GET /users/{id}", 7);
+        let long_route = format!("GET /{}", "a".repeat(300));
+        collector.record_db_connection_hold_fmt(format_args!("{long_route}"), 9);
+
+        let snap = collector.snapshot();
+        assert!(snap.db_queries.is_empty());
+        assert_eq!(snap.db_connection_holds.len(), 2);
+        assert_eq!(snap.db_connection_holds["GET /users/{id}"].count, 2);
+        assert_eq!(snap.db_connection_holds[long_route.as_str()].count, 1);
+    }
+
+    /// The JSON key is `db_connection_holds`. It is absent when no hold is
+    /// recorded, the same as `db_queries`.
+    #[test]
+    fn db_connection_holds_json_key() {
+        let collector = MetricsCollector::new();
+        let empty = serde_json::to_value(collector.snapshot()).expect("serializes");
+        assert!(empty.get("db_connection_holds").is_none(), "{empty}");
+
+        collector.record_db_connection_hold("POST /census", 6_653);
+        let json = serde_json::to_value(collector.snapshot()).expect("serializes");
+        assert_eq!(json["db_connection_holds"]["POST /census"]["count"], 1);
+        assert_eq!(json["db_connection_holds"]["POST /census"]["p50_ms"], 6_653);
+        assert!(json.get("db_queries").is_none(), "{json}");
     }
 
     #[test]

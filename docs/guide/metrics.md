@@ -412,6 +412,24 @@ of a single `value`.
 `autumn_web::metrics::snapshot()` returns the same view as Rust values, if you
 want to assert on recorded metrics from a test.
 
+### Database keys
+
+Two maps show database time:
+
+| Key | One sample is | Example key |
+| --- | --- | --- |
+| `db_queries` | one statement from `run_instrumented` | `"GET /users SELECT"` |
+| `db_connection_holds` | one `Db` hold, from checkout to release | `"POST /census"` |
+
+A hold includes all statements and all other work while the handler holds
+the connection. It is not a query time. A long hold with fast statements
+shows work outside the database. To make the hold short, take `LazyDb` and
+call `checkout()` only when you need the connection.
+
+The `db_queries["<route> SELECT"]` key from the `Db` extractor is
+deprecated. It holds the same hold time. The next release removes it. See
+the [migration guide](../migrations/next.md#metrics-the-route-select-key-is-deprecated).
+
 ---
 
 ## Actuator exposure config
