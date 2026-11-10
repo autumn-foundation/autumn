@@ -356,23 +356,9 @@ pub fn resolve_type<'a>(
                 .filter(|c| norm(c.krate) == norm(&krate))
                 .collect();
             if !in_crate.is_empty() {
-                // No type of the crate is in the named module, so the path
-                // can go through a re-export. Refuse when another crate has a
-                // type of that name.
-                if !in_crate.iter().any(|c| fits(c.module, &module)) {
-                    let elsewhere: Vec<Candidate<'a>> = all
-                        .iter()
-                        .copied()
-                        .filter(|c| {
-                            norm(c.krate) != norm(&krate)
-                                && (norm(&krate) == norm(scope.krate)
-                                    || norm(c.krate) != norm(scope.krate))
-                                && crates.is_none_or(|g| g.reaches(&krate, c.krate))
-                        })
-                        .collect();
-                    if !elsewhere.is_empty() {
-                        return Err(refuse(&[in_crate, elsewhere].concat()));
-                    }
+                let doubt = re_export_doubt(&in_crate, &all, &krate, &module, scope, types, crates);
+                if !doubt.is_empty() {
+                    return Err(refuse(&[in_crate, doubt].concat()));
                 }
                 return pick(&in_crate, &module).map(Some).map_err(|c| refuse(&c));
             }
@@ -426,6 +412,39 @@ pub fn resolve_type<'a>(
             }
         }
     }
+}
+
+/// The types of other crates that a crate path can also mean.
+///
+/// No type of the crate fits the named module, so the path can go through a
+/// re-export. Then each type of that name in another crate that the named
+/// crate reaches is a candidate too. Empty when a type fits.
+fn re_export_doubt<'a>(
+    in_crate: &[Candidate<'a>],
+    all: &[Candidate<'a>],
+    krate: &str,
+    module: &str,
+    scope: Scope<'_>,
+    types: &[TypeDescriptor],
+    crates: Option<&Crates>,
+) -> Vec<Candidate<'a>> {
+    let is_file = |m: &str| {
+        types.iter().any(|t| {
+            norm(&t.krate) == norm(krate)
+                && (t.module == m || t.module.starts_with(&format!("{m}::")))
+        })
+    };
+    if in_crate.iter().any(|c| fits(c.module, module, is_file)) {
+        return Vec::new();
+    }
+    all.iter()
+        .copied()
+        .filter(|c| {
+            norm(c.krate) != norm(krate)
+                && (norm(krate) == norm(scope.krate) || norm(c.krate) != norm(scope.krate))
+                && crates.is_none_or(|g| g.reaches(krate, c.krate))
+        })
+        .collect()
 }
 
 /// The error for a path that can name more than one type.
@@ -568,19 +587,21 @@ pub fn child_module(base: &[&str], rest: &[&str]) -> String {
 }
 
 /// Whether a type of the file module `module` can be the one that a path to
-/// `named` means.
+/// `named` means. `is_file` tells whether a module is a file of its own: some
+/// descriptor of the crate is in it.
 ///
-/// An inline `mod` is not visible, so a type of a parent file fits. A module
-/// often re-exports a type of its child (`pub use item::Item;`), so a type of
-/// a child file fits too. The crate root is not a parent here: every module
-/// is its child.
-fn fits(module: &str, named: &str) -> bool {
+/// An inline `mod` is not visible, so a type of a parent file fits a path
+/// into it, but not into a module file. A module often re-exports a type of
+/// its child (`pub use item::Item;`), so a type of a child file fits too. The
+/// crate root has no such child here: every module is its child.
+fn fits(module: &str, named: &str, is_file: impl Fn(&str) -> bool) -> bool {
     let below = |inner: &str, outer: &str| {
-        !outer.is_empty() && inner.starts_with(outer) && inner[outer.len()..].starts_with("::")
+        inner.starts_with(outer) && inner[outer.len()..].starts_with("::")
     };
+    let root = module.is_empty() || module == "main";
     module == named
-        || below(named, module)
-        || below(module, named)
+        || ((root || below(named, module)) && !named.is_empty() && !is_file(named))
+        || (!named.is_empty() && below(module, named))
         || (module == "main" && named.is_empty())
 }
 
@@ -884,6 +905,29 @@ mod tests {
             pick("crate::models::Item", at("catalog", "api"), &types, None),
             Ok(Some("catalog::models::item::Item".to_owned()))
         );
+    }
+
+    #[test]
+    fn a_crate_path_into_an_inline_module_of_the_library_root_fits_the_root_type() {
+        // `mod dto { pub struct Item }` in `src/lib.rs` has module "".
+        let types = vec![ty("catalog", "", "Item"), ty("shared", "", "Item")];
+        assert_eq!(
+            pick("crate::dto::Item", at("catalog", "api"), &types, None),
+            Ok(Some("catalog::Item".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_parent_file_type_does_not_fit_a_path_into_a_module_file() {
+        // `src/dto.rs` holds a descriptor, so `dto` is a file, not inline.
+        let types = vec![
+            ty("catalog", "", "Item"),
+            ty("catalog", "dto", "Other"),
+            ty("shared", "", "Item"),
+        ];
+        let err =
+            pick("crate::dto::Item", at("catalog", "api"), &types, None).expect_err("ambiguous");
+        assert!(err.contains("`shared::Item`"), "{err}");
     }
 
     #[test]

@@ -558,7 +558,9 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * A request or response type is found by the path in the signature. A path
   through a re-export, such as `crate::dto::Item` for `shared::Item`, is
   refused when another crate has a type of that name. Write the path where the
-  type is defined.
+  type is defined. The check cannot tell an inline `mod` from a module file
+  with no `WireShape` type. So a re-export in such a file can still resolve to
+  a type of a parent file.
 * A `use … as` alias or a `type` alias is read by its own name. If a local
   type has that name, the check compares that type. Write the path of the type
   itself.
