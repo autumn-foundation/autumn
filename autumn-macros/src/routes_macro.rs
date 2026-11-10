@@ -72,11 +72,18 @@ pub fn routes_descriptor(
     let handlers: Vec<String> = paths
         .iter()
         .map(|p| {
-            p.segments
+            let joined = p
+                .segments
                 .iter()
                 .map(|s| s.ident.to_string())
                 .collect::<Vec<_>>()
-                .join("::")
+                .join("::");
+            // A leading `::` marks an absolute path. It stays.
+            if p.leading_colon.is_some() {
+                format!("::{joined}")
+            } else {
+                joined
+            }
         })
         .collect();
     if handlers.is_empty() {
@@ -108,6 +115,12 @@ mod tests {
             d.handlers,
             ["get_item", "items::create", "mesh_catalog::list"]
         );
+    }
+
+    #[test]
+    fn an_absolute_handler_path_keeps_its_leading_colons() {
+        let d = routes_descriptor("app", "", &quote! { ::catalog::list }).expect("a list");
+        assert_eq!(d.handlers, ["::catalog::list"]);
     }
 
     #[test]

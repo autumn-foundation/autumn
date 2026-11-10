@@ -547,7 +547,8 @@ fn registers(
     endpoints: &[EndpointDescriptor],
     crates: Option<&Crates>,
 ) -> (Vec<usize>, bool) {
-    let segments: Vec<&str> = handler.split("::").collect();
+    let absolute = handler.starts_with("::");
+    let segments: Vec<&str> = handler.split("::").filter(|s| !s.is_empty()).collect();
     let Some((&name, prefix)) = segments.split_last() else {
         return (Vec::new(), false);
     };
@@ -593,6 +594,16 @@ fn registers(
                     .collect::<Vec<_>>()
                     .join("::"),
             )
+        }
+        // A child module of this one shadows a crate of the same name, as in
+        // Rust. An absolute path (`::catalog::list`) always names a crate.
+        [_, ..]
+            if !absolute
+                && named
+                    .iter()
+                    .any(|(_, e)| norm(&e.krate) == own && e.module == local(prefix)) =>
+        {
+            (own, local(prefix))
         }
         [first, rest @ ..] => {
             let named_crate = crates.map_or_else(
@@ -1959,6 +1970,35 @@ mod tests {
         let last = ep.response.produced("last").expect("field");
         assert_eq!(last.nested, ["core::ContactUpdated"]);
         assert!(bundle.nested("core::ContactUpdated").is_some());
+    }
+
+    #[test]
+    fn a_child_module_handler_shadows_a_dependency_handler() {
+        let dir = fixture();
+        let mut local = endpoint("local_list", "/local", "NoBody");
+        local.krate = "app".to_owned();
+        local.service = "app".to_owned();
+        local.handler = "list".to_owned();
+        local.module = "catalog".to_owned();
+        write(dir.path(), "endpoint.app.app.local_list.json", &local);
+        let mut remote = endpoint("list", "/items", "NoBody");
+        remote.handler = "list".to_owned();
+        write(
+            dir.path(),
+            "endpoint.mesh-catalog.catalog.list.json",
+            &remote,
+        );
+        write(
+            dir.path(),
+            "routes.app.k.json",
+            &routes("app", &["catalog::list", "mesh_catalog::get_item"]),
+        );
+        let mut crates = Crates::default();
+        crates.add_dependency("app", "catalog", "mesh-catalog");
+        crates.add_dependency("app", "mesh_catalog", "mesh-catalog");
+        let bundle = Bundle::from_dir_with(dir.path(), Some(&crates)).expect("bundle");
+        assert!(!bundle.endpoint("app", "local_list").expect("ep").unrouted);
+        assert!(bundle.endpoint("catalog", "list").expect("ep").unrouted);
     }
 
     #[test]

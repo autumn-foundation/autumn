@@ -309,17 +309,25 @@ fn body(ty: &syn::Type) -> Body {
     }
 }
 
-/// A type's path as written, with no generic arguments and no leading `::`:
-/// `::shared::Item` gives `shared::Item`. Another kind of type gives its name.
+/// A type's path as written, with no generic arguments. A leading `::`
+/// stays: `::shared::Item` names the crate even beside a local module
+/// `shared`. Another kind of type gives its name.
 fn type_path(ty: &syn::Type) -> String {
     match ty {
-        syn::Type::Path(path) if path.qself.is_none() => path
-            .path
-            .segments
-            .iter()
-            .map(|s| s.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::"),
+        syn::Type::Path(path) if path.qself.is_none() => {
+            let joined = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if path.path.leading_colon.is_some() {
+                format!("::{joined}")
+            } else {
+                joined
+            }
+        }
         syn::Type::Group(group) => type_path(&group.elem),
         syn::Type::Paren(paren) => type_path(&paren.elem),
         _ => autumn_macros_support::schema::type_name_str(ty),
@@ -583,7 +591,10 @@ mod tests {
             "async fn f(b: Json<shared::NewItem>) -> AutumnResult<Json<::shared::Item>> { todo!() }",
         );
         assert_eq!(d.request_path, "shared::NewItem");
-        assert_eq!(d.response_path, "shared::Item");
+        assert_eq!(
+            d.response_path, "::shared::Item",
+            "an absolute path stays absolute"
+        );
         assert_eq!(d.response_type, "Item");
         assert_eq!(d.handler, "f");
         let d = descriptor_of("async fn f() -> Json<Vec<crate::dto::Item>> { todo!() }");

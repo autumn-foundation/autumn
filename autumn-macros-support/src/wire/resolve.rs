@@ -146,8 +146,12 @@ pub fn type_paths(ty: &str) -> Vec<String> {
     let mut word = String::new();
     // A lifetime, or the length of an array after `;`, is not a type.
     let mut skip = false;
+    // After `>`, a `::` goes on from a qualified type (`<T as Tr>::X`). It
+    // does not start an absolute path.
+    let mut after_angle = false;
     let mut flush = |word: &mut String, skip: &mut bool| {
-        let path = word.trim_matches(':');
+        // A leading `::` marks an absolute path. It stays.
+        let path = word.trim_end_matches(':');
         let numeric = path.chars().next().is_some_and(|c| c.is_ascii_digit());
         if !path.is_empty() && !*skip && !numeric && !KEYWORDS.contains(&path) {
             out.push(path.to_owned());
@@ -156,6 +160,10 @@ pub fn type_paths(ty: &str) -> Vec<String> {
         *skip = false;
     };
     for ch in ty.chars() {
+        if ch == ':' && word.is_empty() && after_angle {
+            continue;
+        }
+        after_angle = ch == '>';
         if ch.is_alphanumeric() || ch == '_' || ch == ':' {
             word.push(ch);
         } else if ch == '\'' || ch == ';' {
@@ -290,7 +298,8 @@ enum Target {
     /// A bare name, or a prefix that names no crate in the pass: a module of
     /// the scope's crate, or a dependency the pass cannot name.
     Unqualified { module: String },
-    /// The standard library. It has no descriptor.
+    /// The standard library, or a crate that the pass has no type of. It
+    /// has no descriptor.
     Std,
 }
 
@@ -336,28 +345,9 @@ pub fn resolve_type<'a>(
     if all.is_empty() {
         return Ok(None);
     }
-    let refuse = |candidates: &[Candidate<'_>]| -> String {
-        let mut ids: Vec<String> = candidates
-            .iter()
-            .map(|c| format!("`{}`", c.id(name)))
-            .collect();
-        if is_known_leaf(name) {
-            ids.push(format!("a standard `{name}`"));
-        }
-        let graph = if crates.is_none() && is_known_leaf(name) {
-            " With no dependency graph (`export --from`), only a `std::` path names a \
-             standard type. Run the export without `--from`, or mark the field \
-             `#[wire(opaque)]`"
-        } else {
-            ""
-        };
-        format!(
-            "`{path}` can name more than one type: {}. Write the full path in the signature, \
-             for example `crate::…::{name}` or `<crate>::{name}`.{graph}",
-            ids.join(", ")
-        )
-    };
-    match target(prefix, scope, &all, crates) {
+    let refuse = |candidates: &[Candidate<'_>]| ambiguity(path, name, candidates, crates);
+    let absolute = path.starts_with("::");
+    match target(prefix, absolute, scope, &all, crates) {
         Target::Std => Ok(None),
         Target::Crate { krate, module } => {
             let in_crate: Vec<Candidate<'a>> = all
@@ -420,9 +410,38 @@ pub fn resolve_type<'a>(
     }
 }
 
+/// The error for a path that can name more than one type.
+fn ambiguity(
+    path: &str,
+    name: &str,
+    candidates: &[Candidate<'_>],
+    crates: Option<&Crates>,
+) -> String {
+    let mut ids: Vec<String> = candidates
+        .iter()
+        .map(|c| format!("`{}`", c.id(name)))
+        .collect();
+    if is_known_leaf(name) {
+        ids.push(format!("a standard `{name}`"));
+    }
+    let graph = if crates.is_none() && is_known_leaf(name) {
+        " With no dependency graph (`export --from`), only a `std::` path names a \
+         standard type. Run the export without `--from`, or mark the field \
+         `#[wire(opaque)]`"
+    } else {
+        ""
+    };
+    format!(
+        "`{path}` can name more than one type: {}. Write the full path in the signature, \
+         for example `crate::…::{name}` or `<crate>::{name}`.{graph}",
+        ids.join(", ")
+    )
+}
+
 /// Where a path prefix points.
 fn target(
     prefix: &[&str],
+    absolute: bool,
     scope: Scope<'_>,
     all: &[Candidate<'_>],
     crates: Option<&Crates>,
@@ -467,10 +486,12 @@ fn target(
         [first, rest @ ..] => {
             // A child module of this one shadows a crate of the same name,
             // as in Rust. The own crate must have the type in that module.
+            // An absolute path (`::catalog::Item`) always names a crate.
             let local = join(&here, prefix);
-            if all
-                .iter()
-                .any(|c| norm(c.krate) == norm(scope.krate) && c.module == local)
+            if !absolute
+                && all
+                    .iter()
+                    .any(|c| norm(c.krate) == norm(scope.krate) && c.module == local)
             {
                 return Target::Unqualified { module: local };
             }
@@ -488,7 +509,14 @@ fn target(
                 )
                 .or_else(|| (norm(scope.krate) == *first).then(|| own.clone()));
             named.map_or_else(
-                || Target::Unqualified { module: local },
+                || {
+                    if absolute {
+                        // A crate the pass has no type of: not a candidate.
+                        Target::Std
+                    } else {
+                        Target::Unqualified { module: local }
+                    }
+                },
                 |krate| Target::Crate {
                     krate,
                     module: rest.join("::"),
@@ -704,6 +732,29 @@ mod tests {
     }
 
     #[test]
+    fn an_absolute_path_names_the_crate_even_beside_a_local_module() {
+        let types = vec![
+            ty("storefront", "catalog", "Item"),
+            ty("catalog", "", "Item"),
+        ];
+        let mut crates = Crates::default();
+        crates.add_dependency("storefront", "catalog", "catalog");
+        assert_eq!(
+            pick(
+                "::catalog::Item",
+                at("storefront", ""),
+                &types,
+                Some(&crates)
+            ),
+            Ok(Some("catalog::Item".to_owned()))
+        );
+        assert_eq!(
+            pick("::chrono::Duration", at("storefront", ""), &types, None),
+            Ok(None)
+        );
+    }
+
+    #[test]
     fn a_standard_library_path_is_never_a_workspace_type() {
         let types = vec![ty("shared", "", "Duration")];
         assert_eq!(
@@ -838,7 +889,7 @@ mod tests {
         assert_eq!(type_paths("[Details;3]"), ["Details"]);
         assert_eq!(
             type_paths("(u8,::shared::Details)"),
-            ["u8", "shared::Details"]
+            ["u8", "::shared::Details"]
         );
         assert_eq!(type_paths("&'static mut dyn Trait"), ["Trait"]);
         assert_eq!(type_paths("Vec<Self>"), ["Vec"]);
