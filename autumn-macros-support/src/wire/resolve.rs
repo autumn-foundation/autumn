@@ -428,11 +428,12 @@ fn re_export_doubt<'a>(
     types: &[TypeDescriptor],
     crates: Option<&Crates>,
 ) -> Vec<Candidate<'a>> {
+    // A file below an inline `mod` has that module as a prefix, so only a
+    // descriptor in the module itself shows that it is a file.
     let is_file = |m: &str| {
-        types.iter().any(|t| {
-            norm(&t.krate) == norm(krate)
-                && (t.module == m || t.module.starts_with(&format!("{m}::")))
-        })
+        types
+            .iter()
+            .any(|t| norm(&t.krate) == norm(krate) && t.module == m)
     };
     if in_crate.iter().any(|c| fits(c.module, module, is_file)) {
         return Vec::new();
@@ -587,8 +588,8 @@ pub fn child_module(base: &[&str], rest: &[&str]) -> String {
 }
 
 /// Whether a type of the file module `module` can be the one that a path to
-/// `named` means. `is_file` tells whether a module is a file of its own: some
-/// descriptor of the crate is in it.
+/// `named` means. `is_file` tells whether a module is a file of its own: a
+/// descriptor of the crate is in that module.
 ///
 /// An inline `mod` is not visible, so a type of a parent file fits a path
 /// into it, but not into a module file. A module often re-exports a type of
@@ -911,6 +912,20 @@ mod tests {
     fn a_crate_path_into_an_inline_module_of_the_library_root_fits_the_root_type() {
         // `mod dto { pub struct Item }` in `src/lib.rs` has module "".
         let types = vec![ty("catalog", "", "Item"), ty("shared", "", "Item")];
+        assert_eq!(
+            pick("crate::dto::Item", at("catalog", "api"), &types, None),
+            Ok(Some("catalog::Item".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_file_below_an_inline_module_does_not_make_that_module_a_file() {
+        // `mod dto { pub struct Item; mod child; }` in `src/lib.rs`.
+        let types = vec![
+            ty("catalog", "", "Item"),
+            ty("catalog", "dto::child", "Other"),
+            ty("shared", "", "Item"),
+        ];
         assert_eq!(
             pick("crate::dto::Item", at("catalog", "api"), &types, None),
             Ok(Some("catalog::Item".to_owned()))
