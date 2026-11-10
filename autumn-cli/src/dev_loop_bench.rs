@@ -128,24 +128,17 @@ pub const fn budget_for(class: ChangeClass) -> LatencyBudget {
             p95_ms: 8_000,
             max_ms: 15_000,
         },
-        // Cold-start onboarding budget (issue #977). Issue #2309 lowered this
-        // budget from p95 60s / max 90s to the values below.
+        // Cold-start onboarding budget (issue #977). The original target was
+        // p95 60s / max 90s. Issue #2309 raised it to p95 130s / max 160s.
         //
-        // Two fixes cut the real cold-start time. The first: the
-        // `autumn-macros` `db` gate. The second: the removal of two unused
-        // default features from the no-DB daemon starter. Neither fix
-        // brings cold start under the original 60s/90s target. The reason:
-        // `autumn-web`'s own hand-written source now sets the pace. No
-        // feature gates that source.
-        //
-        // The values below come from measured CI runs (p50 about 108-117s,
-        // p95 and max about 120-122s), plus margin for runner noise. See
-        // docs/guide/dev-loop-latency.md for the full history and issue
-        // #2795, which tracks `autumn-web`'s own compile time.
+        // Issue #2795 gated rarely used modules of `autumn-web` (ADR 0027).
+        // The scheduled CI runs after that change measured 89-104s. The
+        // values below keep about 15% above the slowest sample. See
+        // docs/guide/dev-loop-latency.md for the full history.
         ChangeClass::ColdStartHello => LatencyBudget {
             p50_ms: 100_000,
-            p95_ms: 130_000,
-            max_ms: 160_000,
+            p95_ms: 120_000,
+            max_ms: 145_000,
         },
         // Database-backed cold start is informational only in this slice, so
         // these limits are not gated. The bundled managed-Postgres provider adds

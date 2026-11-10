@@ -618,6 +618,34 @@ let MetricsSnapshot { db_queries, db_connection_holds, .. } = snapshot;
 into a `MetricsCollector` and call `snapshot()`. A codemod cannot write those
 samples.
 
+---
+
+### Features: the `cluster` module is optional
+
+**Why:** `autumn_web::cluster` was 3% of the code that `autumn-web` compiles, in
+every app (issue #2795, ADR 0045). It now has the `cluster` feature. The
+feature is in `default`, so a default build does not change.
+
+**You are affected only if your app sets `default-features = false` and uses
+`autumn_web::cluster` or `[cluster] enabled = true`.** The compiler reports
+`could not find cluster`. Without the feature, `[cluster]` still parses, and
+`enabled = true` fails boot with a validation error.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "cluster"] }
+```
+
+**Automation:** `manual` — a codemod cannot know if the app uses the
+cluster. Add the feature only if it does.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -718,6 +746,10 @@ If nothing changed, delete this section.
 - **Fleet:** the fleet core is in every `db` build, Postgres too. The `db`
   feature now pulls in `fd-lock`, which the `sqlite` feature pulled in
   before. No new crate.
+- **Config:** a type error in `autumn.toml` now names the full key, for
+  example ``in `server.port` ``. Before, it showed a line of the merged
+  config, which is not a file you wrote. A message parser that read the
+  `TOML parse error at line` prefix must read the key instead.
 
 Changes that still compile but behave differently at runtime. Examples:
 

@@ -5,13 +5,346 @@
 //! reads a `toml::Value` through one map type and one sequence type. Each
 //! config struct then compiles once, and `autumn-web` builds faster.
 
-use serde::de::DeserializeOwned;
+use std::fmt;
+
+use serde::de::{
+    self, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
+    Visitor,
+};
+
+/// The key that toml uses to carry a datetime through serde.
+///
+/// `toml::Value` and `toml_datetime::Datetime` read a one-entry map with this
+/// key as a datetime. A test keeps the two in step.
+const DATETIME_KEY: &str = "$__toml_private_datetime";
 
 /// Deserialize `T` from a merged config value.
 ///
 /// An error names the key path, for example ``in `server.port` ``.
-pub(crate) fn from_value<T: DeserializeOwned>(_value: toml::Value) -> Result<T, toml::de::Error> {
-    Err(serde::de::Error::custom("not implemented"))
+pub(crate) fn from_value<T: DeserializeOwned>(value: toml::Value) -> Result<T, toml::de::Error> {
+    T::deserialize(ValueDe(value)).map_err(Error::into_toml)
+}
+
+/// An error and the key path where it occurred.
+#[derive(Debug)]
+pub(crate) struct Error {
+    message: String,
+    /// Path segments, innermost first.
+    path: Vec<Segment>,
+}
+
+#[derive(Debug)]
+enum Segment {
+    Key(String),
+    Index(usize),
+}
+
+impl Error {
+    fn at(mut self, segment: Segment) -> Self {
+        self.path.push(segment);
+        self
+    }
+
+    fn path(&self) -> String {
+        let mut out = String::new();
+        for segment in self.path.iter().rev() {
+            match segment {
+                Segment::Key(key) => {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    out.push_str(key);
+                }
+                Segment::Index(index) => {
+                    out.push('[');
+                    out.push_str(&index.to_string());
+                    out.push(']');
+                }
+            }
+        }
+        out
+    }
+
+    fn into_toml(self) -> toml::de::Error {
+        <toml::de::Error as de::Error>::custom(self)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.path.is_empty() {
+            f.write_str(&self.message)
+        } else {
+            write!(f, "{}\nin `{}`", self.message, self.path())
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl de::Error for Error {
+    fn custom<T: fmt::Display>(msg: T) -> Self {
+        Self {
+            message: msg.to_string(),
+            path: Vec::new(),
+        }
+    }
+}
+
+/// A deserializer over one `toml::Value`.
+struct ValueDe(toml::Value);
+
+impl<'de> de::Deserializer<'de> for ValueDe {
+    type Error = Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        match self.0 {
+            toml::Value::String(v) => visitor.visit_string(v),
+            toml::Value::Integer(v) => visitor.visit_i64(v),
+            toml::Value::Float(v) => visitor.visit_f64(v),
+            toml::Value::Boolean(v) => visitor.visit_bool(v),
+            toml::Value::Datetime(v) => {
+                let mut table = toml::Table::new();
+                table.insert(DATETIME_KEY.to_owned(), toml::Value::String(v.to_string()));
+                // `&mut`, as for a table: one map type for every visitor.
+                visitor.visit_map(&mut TableAccess::new(table))
+            }
+            toml::Value::Array(v) => {
+                let len = v.len();
+                let mut access = ArrayAccess::new(v);
+                let out = visitor.visit_seq(&mut access)?;
+                if access.iter.len() == 0 {
+                    Ok(out)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in array"))
+                }
+            }
+            toml::Value::Table(v) => {
+                let len = v.len();
+                let mut access = TableAccess::new(v);
+                let out = visitor.visit_map(&mut access)?;
+                if access.iter.len() == 0 {
+                    Ok(out)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in map"))
+                }
+            }
+        }
+    }
+
+    // A present value is `Some`. A missing key is `None`, as in toml.
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        match self.0 {
+            toml::Value::String(variant) => visitor.visit_enum(Variant {
+                name: variant,
+                value: None,
+            }),
+            toml::Value::Table(table) => {
+                if table.len() != 1 {
+                    return Err(de::Error::custom(format!(
+                        "wanted exactly 1 element, found {} elements",
+                        table.len()
+                    )));
+                }
+                let Some((name, value)) = table.into_iter().next() else {
+                    return Err(de::Error::custom(
+                        "wanted exactly 1 element, found 0 elements",
+                    ));
+                };
+                visitor.visit_enum(Variant {
+                    name,
+                    value: Some(value),
+                })
+            }
+            _ => Err(de::Error::invalid_type(
+                de::Unexpected::UnitVariant,
+                &"string only",
+            )),
+        }
+    }
+
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        drop(self);
+        visitor.visit_unit()
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf unit unit_struct seq tuple tuple_struct map struct
+        identifier
+    }
+}
+
+/// Map access over a table. A datetime uses it too, as a one-entry table.
+struct TableAccess {
+    iter: toml::map::IntoIter<String, toml::Value>,
+    value: Option<(String, toml::Value)>,
+}
+
+impl TableAccess {
+    fn new(table: toml::Table) -> Self {
+        Self {
+            iter: table.into_iter(),
+            value: None,
+        }
+    }
+}
+
+impl<'de> MapAccess<'de> for TableAccess {
+    type Error = Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Error> {
+        let Some((key, value)) = self.iter.next() else {
+            return Ok(None);
+        };
+        // The key goes through the value deserializer, so field-name enums
+        // compile once. A key error names the key itself, so the path stops
+        // at the table.
+        let out = seed.deserialize(ValueDe(toml::Value::String(key.clone())))?;
+        self.value = Some((key, value));
+        Ok(Some(out))
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
+        let Some((key, value)) = self.value.take() else {
+            return Err(de::Error::custom("value is missing"));
+        };
+        seed.deserialize(ValueDe(value))
+            .map_err(|e| e.at(Segment::Key(key)))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.iter.len())
+    }
+}
+
+/// Sequence access over an array.
+struct ArrayAccess {
+    iter: std::vec::IntoIter<toml::Value>,
+    index: usize,
+}
+
+impl ArrayAccess {
+    fn new(array: toml::value::Array) -> Self {
+        Self {
+            iter: array.into_iter(),
+            index: 0,
+        }
+    }
+}
+
+impl<'de> SeqAccess<'de> for ArrayAccess {
+    type Error = Error;
+
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Error> {
+        let Some(value) = self.iter.next() else {
+            return Ok(None);
+        };
+        let index = self.index;
+        self.index = index.saturating_add(1);
+        seed.deserialize(ValueDe(value))
+            .map(Some)
+            .map_err(|e| e.at(Segment::Index(index)))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.iter.len())
+    }
+}
+
+/// Enum access for a variant name and an optional payload.
+struct Variant {
+    name: String,
+    value: Option<toml::Value>,
+}
+
+impl<'de> EnumAccess<'de> for Variant {
+    type Error = Error;
+    type Variant = Self;
+
+    fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self), Error> {
+        let name = seed.deserialize(ValueDe(toml::Value::String(self.name.clone())))?;
+        Ok((name, self))
+    }
+}
+
+impl<'de> VariantAccess<'de> for Variant {
+    type Error = Error;
+
+    fn unit_variant(self) -> Result<(), Error> {
+        match self.value {
+            None => Ok(()),
+            Some(toml::Value::Table(table)) if table.is_empty() => Ok(()),
+            Some(_) => {
+                let err: Error = de::Error::invalid_type(de::Unexpected::Map, &"unit variant");
+                Err(err.at(Segment::Key(self.name)))
+            }
+        }
+    }
+
+    fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
+        let Variant { name, value } = self;
+        match value {
+            Some(value) => seed
+                .deserialize(ValueDe(value))
+                .map_err(|e| e.at(Segment::Key(name))),
+            None => Err(de::Error::invalid_type(
+                de::Unexpected::UnitVariant,
+                &"newtype variant",
+            )),
+        }
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
+        let Variant { name, value } = self;
+        match value {
+            Some(value) => de::Deserializer::deserialize_any(ValueDe(value), visitor)
+                .map_err(|e| e.at(Segment::Key(name))),
+            None => Err(de::Error::invalid_type(
+                de::Unexpected::UnitVariant,
+                &"tuple variant",
+            )),
+        }
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        let Variant { name, value } = self;
+        match value {
+            Some(value) => de::Deserializer::deserialize_any(ValueDe(value), visitor)
+                .map_err(|e| e.at(Segment::Key(name))),
+            None => Err(de::Error::invalid_type(
+                de::Unexpected::UnitVariant,
+                &"struct variant",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -595,7 +595,7 @@ pub fn profile_shutdown_defaults(profile: &str) -> (u64, u64) {
 /// their profile TOML file and env overrides.
 fn profile_defaults_as_toml(profile: &str) -> toml::Value {
     match profile {
-        "dev" => toml::from_str(
+        "dev" => toml::from_str::<toml::Value>(
             r#"
 [log]
 level = "debug"
@@ -648,7 +648,7 @@ ranges = ["127.0.0.0/8", "::1/128"]
                 feature = "sqlite",
                 allow(unused_mut, reason = "only the Postgres build adds to it")
             )]
-            let mut prod: toml::Value = toml::from_str(
+            let mut prod = toml::from_str::<toml::Value>(
                 r#"
 [log]
 level = "info"
@@ -700,7 +700,7 @@ secure = true
             #[cfg(not(feature = "sqlite"))]
             deep_merge(
                 &mut prod,
-                toml::from_str(
+                toml::from_str::<toml::Value>(
                     r#"
 [database]
 statement_timeout = "30s"
@@ -3315,8 +3315,14 @@ impl ClusterConfig {
     ///
     /// That build has no cluster runtime. A node that does not join is a
     /// fault, so boot fails and does not continue alone.
-    const fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
-        let _ = (enabled, built);
+    fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        if enabled && !built {
+            return Err(ConfigError::Validation(
+                "cluster.enabled is true, but this build lacks the `cluster` feature. \
+                 Turn on the feature, or set cluster.enabled = false"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -7134,10 +7140,8 @@ impl AutumnConfig {
             warn_profile_typo(&profile);
         }
 
-        // Deserialize the merged TOML table into AutumnConfig
-        let toml_str =
-            toml::to_string(&merged).expect("internal error: failed to serialize merged config");
-        let mut config: Self = toml::from_str(&toml_str)?;
+        // Read the merged table into AutumnConfig. An error names its key.
+        let mut config: Self = value_de::from_value(merged.clone())?;
         config.profile = Some(profile);
 
         // An `AUTUMN_ROLE` that is not a role name fails the load, as a bad
@@ -7161,6 +7165,8 @@ impl AutumnConfig {
                 || env
                     .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
                     .is_ok_and(|v| v == "true" || v == "1");
+            let toml_str = toml::to_string(&merged)
+                .expect("internal error: failed to serialize merged config");
             Self::run_strict_unknown_key_check(
                 &toml_str,
                 enforce_all,
@@ -7449,7 +7455,8 @@ impl AutumnConfig {
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let config: Self = toml::from_str(&contents)?;
+                let table = toml::from_str::<toml::Table>(&contents)?;
+                let config: Self = value_de::from_value(toml::Value::Table(table))?;
                 config.validate()?;
                 Ok(config)
             }
