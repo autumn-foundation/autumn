@@ -108,6 +108,59 @@ pub fn contains_letter_or_number(input: &str) -> bool {
     input.chars().any(char::is_alphanumeric)
 }
 
+/// The characters [`slugify_with_suffix`] draws from: digits and lowercase
+/// letters minus `i`, `l`, `o` and `u` (Crockford's base32 set). Dropping the
+/// lookalikes keeps a suffix readable aloud and safe to retype. 32 symbols is
+/// exactly 5 bits, so every symbol is equally likely.
+const SUFFIX_ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// [`slugify`] `input`, then append `-` and `suffix_len` random characters
+/// drawn from `entropy`.
+///
+/// This is the "short random tail" slug (`hello-world-k3x9q`): two posts with
+/// the same title get different URLs without a database probe for the next
+/// free `-2`, `-3`. Each character carries 5 bits, so a 6-character suffix
+/// gives about a billion values per title.
+///
+/// The randomness comes from the [`Entropy`](crate::entropy::Entropy) you pass,
+/// so a handler that takes the [`Rng`](crate::entropy::Rng) extractor and passes
+/// `rng.source()` mints the same slugs on every replay of a seeded simulation.
+///
+/// A `suffix_len` of `0` returns plain [`slugify`]. The suffix makes collisions
+/// unlikely, not impossible: keep a unique index on the column.
+///
+/// ```
+/// use autumn_web::entropy::SeededEntropy;
+/// use autumn_web::slugify_with_suffix;
+///
+/// let slug = slugify_with_suffix("Hello World", &SeededEntropy::new(7), 6);
+/// assert!(slug.starts_with("hello-world-"));
+/// assert_eq!(slug.len(), "hello-world-".len() + 6);
+/// ```
+#[must_use]
+pub fn slugify_with_suffix(
+    input: &str,
+    entropy: &(impl crate::entropy::Entropy + ?Sized),
+    suffix_len: usize,
+) -> String {
+    let mut slug = slugify(input);
+    if suffix_len == 0 {
+        return slug;
+    }
+    slug.reserve(suffix_len + 1);
+    slug.push('-');
+    // One u64 holds twelve 5-bit symbols; draw a fresh one when it runs out.
+    let mut bits = 0u64;
+    for i in 0..suffix_len {
+        if i % 12 == 0 {
+            bits = entropy.next_u64();
+        }
+        slug.push(char::from(SUFFIX_ALPHABET[(bits & 0x1f) as usize]));
+        bits >>= 5;
+    }
+    slug
+}
+
 /// A stable, non-empty fallback for input that slugifies to nothing. Derived
 /// from a plain FNV-1a hash of the raw input bytes (not the language's
 /// `DefaultHasher`, whose algorithm is explicitly unstable across Rust
@@ -260,5 +313,72 @@ mod tests {
             );
             assert_eq!(slugify(input), fallback_token(input));
         }
+    }
+
+    // ── slugify_with_suffix ──────────────────────────────────────────────
+
+    use crate::entropy::{Entropy, SeededEntropy};
+
+    #[test]
+    fn suffixed_slug_is_base_dash_suffix() {
+        let rng = SeededEntropy::new(7);
+        let slug = slugify_with_suffix("Hello World", &rng, 6);
+        let (base, suffix) = slug.rsplit_once('-').expect("has a dash");
+        assert_eq!(base, "hello-world");
+        assert_eq!(suffix.len(), 6);
+        assert!(suffix.bytes().all(|b| SUFFIX_ALPHABET.contains(&b)));
+    }
+
+    #[test]
+    fn suffixed_slug_replays_under_the_same_seed() {
+        let a = slugify_with_suffix("Ferris arrives", &SeededEntropy::new(42), 8);
+        let b = slugify_with_suffix("Ferris arrives", &SeededEntropy::new(42), 8);
+        assert_eq!(a, b);
+        let c = slugify_with_suffix("Ferris arrives", &SeededEntropy::new(43), 8);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn successive_draws_differ() {
+        let rng = SeededEntropy::new(1);
+        let a = slugify_with_suffix("post", &rng, 6);
+        let b = slugify_with_suffix("post", &rng, 6);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn long_suffix_spans_several_draws() {
+        let slug = slugify_with_suffix("x", &SeededEntropy::new(3), 40);
+        assert_eq!(slug.len(), "x-".len() + 40);
+        assert!(slug[2..].bytes().all(|b| SUFFIX_ALPHABET.contains(&b)));
+    }
+
+    #[test]
+    fn zero_length_suffix_is_plain_slugify() {
+        assert_eq!(
+            slugify_with_suffix("Hello World", &SeededEntropy::new(0), 0),
+            "hello-world"
+        );
+    }
+
+    #[test]
+    fn suffix_alphabet_skips_lookalike_letters() {
+        assert_eq!(SUFFIX_ALPHABET.len(), 32);
+        for c in *b"ilou" {
+            assert!(!SUFFIX_ALPHABET.contains(&c));
+        }
+    }
+
+    #[test]
+    fn fallback_base_still_gets_a_suffix() {
+        let slug = slugify_with_suffix("日本語", &SeededEntropy::new(9), 4);
+        assert!(slug.starts_with(&format!("{}-", slugify("日本語"))));
+    }
+
+    #[test]
+    fn works_through_a_shared_handle() {
+        let shared: std::sync::Arc<dyn Entropy> = SeededEntropy::shared(5);
+        let direct = slugify_with_suffix("a", &SeededEntropy::new(5), 6);
+        assert_eq!(slugify_with_suffix("a", &shared, 6), direct);
     }
 }

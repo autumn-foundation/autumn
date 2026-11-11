@@ -755,7 +755,7 @@ pub mod shadow;
 /// hand-written app. Also holds `contains_letter_or_number`, the input check
 /// `slugify` cannot answer because it never returns an empty string.
 pub mod slug;
-pub use slug::{contains_letter_or_number, slugify};
+pub use slug::{contains_letter_or_number, slugify, slugify_with_suffix};
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 // Calendar-aware SLA obligations (issue #1826). A plain comment, not `///`:
