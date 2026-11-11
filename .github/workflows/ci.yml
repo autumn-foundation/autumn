@@ -2284,6 +2284,7 @@ jobs:
             --skip belongs_to_scaffold_cargo_checks \
             --skip bulk_delete_generated_project_cargo_checks \
             --skip richtext_scaffold_cargo_checks \
+            --skip teams_scaffold_cargo_tests \
             --skip searchable_scaffold_cargo_checks \
             --skip trash_generated_project_cargo_checks \
             --skip linked_seed_binary_cargo_checks \

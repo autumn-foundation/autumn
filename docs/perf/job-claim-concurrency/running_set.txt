@@ -1,0 +1,6 @@
+claim.sql        running=50       Buffers: shared hit=56
+claim.sql        running=500      Buffers: shared hit=354
+claim.sql        running=2000     Buffers: shared hit=1361
+claim_after.sql  running=50       Buffers: shared hit=57
+claim_after.sql  running=500      Buffers: shared hit=366
+claim_after.sql  running=2000     Buffers: shared hit=1399
