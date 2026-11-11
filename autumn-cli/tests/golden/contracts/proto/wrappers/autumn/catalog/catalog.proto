@@ -75,5 +75,6 @@ service CatalogService {
   rpc ListItems(ListItemsRequest) returns (ItemListWrapper);
 
   // PUT /shelves/{shelf}/items
+  // Autumn sends no body.
   rpc PutItems(PutItemsRequest) returns (google.protobuf.Empty);
 }

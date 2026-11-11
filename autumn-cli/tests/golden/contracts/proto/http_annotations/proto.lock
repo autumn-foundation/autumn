@@ -1,5 +1,6 @@
 # Field numbers of `autumn contracts export --proto`. Commit this file.
-# A number never moves. A removed field keeps its number in `reserved`.
+# Only `#[wire(tag = N)]` moves a number. A removed or replaced number stays
+# in `reserved`.
 
 format = 1
 
@@ -9,8 +10,12 @@ id = 1
 [messages."autumn.catalog.Item".fields]
 id = 1
 
+[messages."autumn.catalog.Patch".fields]
+id = 1
+name = 2
+note = 3
+
 [messages."autumn.catalog.PatchItemRequest".fields]
+body = 3
 id = 2
-name = 3
-note = 4
 shop = 1

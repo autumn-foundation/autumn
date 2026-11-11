@@ -23,6 +23,12 @@ pub use resolve::{
     module_of_file, resolve_type, type_id, type_paths,
 };
 
+/// The largest protobuf field number.
+pub const MAX_FIELD_NUMBER: u32 = 536_870_911;
+
+/// The field numbers that protobuf keeps for its own use.
+pub const KEPT_FIELD_NUMBERS: std::ops::RangeInclusive<u32> = 19_000..=19_999;
+
 /// One field of a request or response type, as serde treats it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WireFieldDescriptor {

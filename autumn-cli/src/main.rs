@@ -642,22 +642,17 @@ impl ContractsPassArgs {
 }
 
 /// The protobuf options of `autumn contracts export`.
-///
-/// Each flag is one separate switch on the command line.
+// Each bool is one CLI flag.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
 pub struct ContractsProtoArgs {
     /// Write protobuf schemas to `--out <DIR>` instead of the bundle.
     #[arg(long, requires = "out")]
     proto: bool,
-    /// The lock file of protobuf field numbers. Commit it.
-    #[arg(
-        long,
-        value_name = "PATH",
-        default_value = "contracts/proto.lock",
-        requires = "proto"
-    )]
-    lock: PathBuf,
+    /// The lock file of protobuf field numbers. Commit it. The default is
+    /// `proto.lock` beside the `--out` directory.
+    #[arg(long, value_name = "PATH", requires = "proto")]
+    lock: Option<PathBuf>,
     /// Write nothing. Exit 1 when the lock or a `.proto` file would change.
     #[arg(long, requires = "proto")]
     check: bool,
@@ -696,7 +691,7 @@ pub enum ContractsSubcommands {
     /// and a `buf.yaml`. The lock file keeps each field number.
     Export {
         /// Write the bundle to this file. The default is stdout. With
-        /// `--proto`, the directory for the `.proto` files.
+        /// `--proto`, write the `.proto` files to this directory.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
         /// Use this bundle file, or join the descriptors in this directory.
@@ -10729,7 +10724,11 @@ mod tests {
             panic!("expected contracts export");
         };
         let proto = proto.into_proto().expect("proto");
-        assert_eq!(proto.lock, PathBuf::from("contracts/proto.lock"));
+        assert_eq!(proto.lock, None, "the default is beside `--out`");
+        assert_eq!(
+            contracts::default_lock(std::path::Path::new("contracts/proto")),
+            PathBuf::from("contracts/proto.lock")
+        );
         assert!(proto.check);
         assert!(proto.options.http_annotations && proto.options.well_known_types);
     }

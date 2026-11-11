@@ -510,3 +510,273 @@ fn the_buf_config_names_the_lint_exceptions() {
     assert!(yaml.contains("WIRE_JSON"), "{yaml}");
     assert!(!yaml.contains("googleapis"), "{yaml}");
 }
+
+#[test]
+fn a_type_reached_only_from_a_request_body_is_a_message() {
+    let body = shape(
+        "NewItem",
+        vec![field(
+            "detail",
+            WireType::object("mesh_catalog::Detail"),
+            true,
+        )],
+    );
+    let create = BundleEndpoint {
+        method: "POST".to_owned(),
+        has_body: true,
+        request: body,
+        ..get("create_item", "/items", no_body())
+    };
+    let detail = BundleType {
+        id: "mesh_catalog::Detail".to_owned(),
+        shape: shape("Detail", vec![field("color", WireType::string(), true)]),
+    };
+    let (files, _) = run(&bundle(vec![create], vec![detail]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(text.contains("Detail detail = 1"), "{text}");
+    assert!(text.contains("message Detail {"), "{text}");
+    assert!(!text.contains("google.protobuf.Value"), "{text}");
+}
+
+#[test]
+fn a_rust_type_named_like_a_wrapper_or_a_request_is_refused() {
+    let wrapper_named = shape(
+        "Item",
+        vec![
+            field("first", WireType::object("shop::StringListWrapper"), true),
+            field(
+                "second",
+                WireType::array(WireType::array(WireType::string())),
+                true,
+            ),
+        ],
+    );
+    let user = BundleType {
+        id: "shop::StringListWrapper".to_owned(),
+        shape: shape(
+            "StringListWrapper",
+            vec![field("code", WireType::string(), true)],
+        ),
+    };
+    let b = bundle(vec![get("get_item", "/items", wrapper_named)], vec![user]);
+    let err = export(&b, &Lock::default(), plain()).expect_err("refused");
+    assert!(err.contains("`StringListWrapper`"), "{err}");
+
+    let request_named = shape(
+        "Item",
+        vec![field("x", WireType::object("shop::GetItemRequest"), true)],
+    );
+    let user = BundleType {
+        id: "shop::GetItemRequest".to_owned(),
+        shape: shape("GetItemRequest", vec![field("q", WireType::string(), true)]),
+    };
+    let b = bundle(vec![get("get_item", "/items", request_named)], vec![user]);
+    let err = export(&b, &Lock::default(), plain()).expect_err("refused");
+    assert!(err.contains("`GetItemRequest`"), "{err}");
+}
+
+fn annotated() -> ProtoOptions {
+    ProtoOptions {
+        http_annotations: true,
+        ..plain()
+    }
+}
+
+#[test]
+fn an_http_template_names_the_proto_field_of_each_path_parameter() {
+    let b = bundle(
+        vec![get(
+            "get_file",
+            "/users/{userId}/files/{*rest}",
+            shape("Item", vec![field("id", WireType::string(), true)]),
+        )],
+        vec![],
+    );
+    let (files, _) = run(&b, annotated());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(
+        text.contains("get: \"/users/{user_id}/files/{rest=**}\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("string user_id = 1 [json_name = \"userId\"]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_body_field_that_is_also_a_path_parameter_keeps_the_body_whole() {
+    let body = shape(
+        "Patch",
+        vec![
+            field("id", WireType::string(), true),
+            field("name", WireType::string(), true),
+        ],
+    );
+    let patch = BundleEndpoint {
+        method: "PATCH".to_owned(),
+        has_body: true,
+        request: body,
+        ..get("patch_item", "/items/{id}", no_body())
+    };
+    let (files, _) = run(&bundle(vec![patch], vec![]), annotated());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(
+        text.contains("string id = 1 [json_name = \"id\"]; // path"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Patch body = 2 [json_name = \"body\"]; // body"),
+        "{text}"
+    );
+    assert!(text.contains("message Patch {"), "{text}");
+    assert!(text.contains("body: \"body\""), "{text}");
+}
+
+#[test]
+fn a_get_with_a_body_has_no_body_in_its_http_rule() {
+    let search = BundleEndpoint {
+        has_body: true,
+        request: shape("Query", vec![field("q", WireType::string(), true)]),
+        ..get("search", "/search", no_body())
+    };
+    let (files, _) = run(&bundle(vec![search], vec![]), annotated());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(!text.contains("body: \"*\""), "{text}");
+    assert!(
+        text.contains("google.api.http has no body for GET"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_list_response_names_the_wrapper_field_as_the_response_body() {
+    let item = shape("Item", vec![field("id", WireType::string(), true)]);
+    let list = BundleEndpoint {
+        response_list: true,
+        ..get("list_items", "/items", item)
+    };
+    let (files, _) = run(&bundle(vec![list], vec![]), annotated());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(text.contains("response_body: \"values\""), "{text}");
+}
+
+#[test]
+fn a_unit_response_says_that_autumn_sends_null() {
+    let unit = WireTypeDescriptor {
+        name: "Done".to_owned(),
+        unit: true,
+        ..WireTypeDescriptor::default()
+    };
+    let (files, _) = run(&bundle(vec![get("ping", "/ping", unit)], vec![]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(text.contains("returns (google.protobuf.Empty)"), "{text}");
+    assert!(text.contains("Autumn sends JSON null"), "{text}");
+}
+
+#[test]
+fn a_nullable_value_field_is_a_plain_field() {
+    let item = shape(
+        "Item",
+        vec![
+            field(
+                "big",
+                WireType::nullable(WireType::integer(128, false)),
+                false,
+            ),
+            field(
+                "other",
+                WireType::nullable(WireType::object("not::Here")),
+                false,
+            ),
+        ],
+    );
+    let (files, _) = run(&bundle(vec![get("get_item", "/i", item)], vec![]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(!text.contains("optional google.protobuf.Value"), "{text}");
+}
+
+#[test]
+fn two_body_types_with_one_name_and_two_shapes_are_refused() {
+    let a = shape("Item", vec![field("a", WireType::string(), true)]);
+    let b_shape = shape("Item", vec![field("b", WireType::string(), true)]);
+    let b = bundle(
+        vec![get("get_a", "/a", a), get("get_b", "/b", b_shape)],
+        vec![],
+    );
+    let err = export(&b, &Lock::default(), plain()).expect_err("refused");
+    assert!(err.contains("message `MeshCatalogItem`"), "{err}");
+}
+
+#[test]
+fn two_services_in_one_package_are_refused() {
+    let item = shape("Item", vec![field("id", WireType::string(), true)]);
+    let one = BundleEndpoint {
+        service: "order-api".to_owned(),
+        ..get("a", "/a", item.clone())
+    };
+    let two = BundleEndpoint {
+        service: "order_api".to_owned(),
+        ..get("b", "/b", item)
+    };
+    let err =
+        export(&bundle(vec![one, two], vec![]), &Lock::default(), plain()).expect_err("refused");
+    assert!(err.contains("autumn.order_api"), "{err}");
+}
+
+#[test]
+fn removing_a_field_does_not_rename_a_live_field() {
+    let mut camel = field("item_id_camel", WireType::string(), true);
+    camel.wire_name = "itemId".to_owned();
+    let both = bundle(
+        vec![get(
+            "get_item",
+            "/i",
+            shape(
+                "Item",
+                vec![field("item_id", WireType::string(), true), camel],
+            ),
+        )],
+        vec![],
+    );
+    let one = bundle(
+        vec![get(
+            "get_item",
+            "/i",
+            shape("Item", vec![field("item_id", WireType::string(), true)]),
+        )],
+        vec![],
+    );
+    let first = export(&both, &Lock::default(), plain()).expect("exports");
+    let second = export(&one, &first.lock, plain()).expect("exports");
+    let text = &second.files["autumn/catalog/catalog.proto"];
+    assert!(
+        text.contains("string item_id = 1 [json_name = \"item_id\"]"),
+        "{text}"
+    );
+    assert!(text.contains("reserved 2;"), "{text}");
+    assert!(!text.contains("reserved \"item_id\""), "{text}");
+}
+
+#[test]
+fn a_dedup_suffix_never_clashes_with_another_field() {
+    let mut upper = field("upper", WireType::string(), true);
+    upper.wire_name = "A".to_owned();
+    let item = shape(
+        "Item",
+        vec![
+            field("a", WireType::string(), true),
+            field("a_3", WireType::string(), true),
+            upper,
+        ],
+    );
+    let (files, _) = run(&bundle(vec![get("get_item", "/i", item)], vec![]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    let names: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("[json_name"))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+    let distinct: std::collections::BTreeSet<&&str> = names.iter().collect();
+    assert_eq!(distinct.len(), names.len(), "{text}");
+}

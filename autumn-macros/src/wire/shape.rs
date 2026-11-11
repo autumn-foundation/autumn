@@ -370,7 +370,7 @@ pub fn check_wire_attrs(input: &DeriveInput) -> Result<(), syn::Error> {
         ));
     }
     if let Data::Struct(data) = &input.data {
-        // Two fields with one protobuf number cannot be told apart.
+        // A consumer cannot tell apart two fields with one protobuf number.
         let mut tags: Vec<(u32, String)> = Vec::new();
         for field in &data.fields {
             let Some((number, span)) = wire_attrs(field)?.tag else {
@@ -1175,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_clash_on_an_opaque_event_payload_is_still_checked() {
+    fn check_wire_attrs_refuses_a_tag_clash() {
         let input: DeriveInput =
             syn::parse_str("struct T { #[wire(tag = 5)] a: String, #[wire(tag = 5)] b: String }")
                 .expect("parses");

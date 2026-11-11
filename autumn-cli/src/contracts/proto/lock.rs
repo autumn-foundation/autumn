@@ -13,11 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-/// The largest protobuf field number.
-pub const MAX_NUMBER: u32 = 536_870_911;
-
-/// The field numbers protobuf keeps for its own use.
-pub const KEPT_NUMBERS: std::ops::RangeInclusive<u32> = 19_000..=19_999;
+pub use autumn_macros_support::wire::{
+    KEPT_FIELD_NUMBERS as KEPT_NUMBERS, MAX_FIELD_NUMBER as MAX_NUMBER,
+};
 
 /// The lock format this CLI writes and reads.
 pub const LOCK_FORMAT: u32 = 1;
@@ -25,7 +23,8 @@ pub const LOCK_FORMAT: u32 = 1;
 /// The header of the lock file.
 const HEADER: &str = "\
 # Field numbers of `autumn contracts export --proto`. Commit this file.
-# A number never moves. A removed field keeps its number in `reserved`.
+# Only `#[wire(tag = N)]` moves a number. A removed or replaced number stays
+# in `reserved`.
 ";
 
 /// Every message's field numbers.
@@ -56,6 +55,33 @@ pub struct LockedMessage {
     /// Numbers that no field may use again, sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reserved: Vec<Reserved>,
+}
+
+impl LockedMessage {
+    /// Refuse a number that is not valid, or that two entries share. A git
+    /// merge of two changes can give two fields one number.
+    fn check(&self) -> Result<(), String> {
+        let mut owner: BTreeMap<u32, &str> = BTreeMap::new();
+        for (field, number) in &self.fields {
+            if !valid_number(*number) {
+                return Err(format!("{number} is not a protobuf field number"));
+            }
+            if let Some(other) = owner.insert(*number, field) {
+                return Err(format!(
+                    "fields `{other}` and `{field}` both have number {number}"
+                ));
+            }
+        }
+        for kept in &self.reserved {
+            if !valid_number(kept.number) {
+                return Err(format!("{} is not a protobuf field number", kept.number));
+            }
+            if owner.contains_key(&kept.number) {
+                return Err(format!("number {} is live and reserved", kept.number));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One number that no other field may use.
@@ -90,6 +116,11 @@ impl Lock {
                 "proto lock format {} is not supported; this CLI reads format {LOCK_FORMAT}",
                 lock.format
             ));
+        }
+        for (name, message) in &lock.messages {
+            message
+                .check()
+                .map_err(|e| format!("message `{name}`: {e}. Fix the lock by hand"))?;
         }
         Ok(lock)
     }
@@ -417,6 +448,27 @@ mod tests {
         assert!(text.find("a.Y").expect("a") < text.find("b.Z").expect("b"));
         assert_eq!(Lock::parse(&text).expect("parses"), lock);
         assert_eq!(Lock::parse(&text).expect("parses").render(), text);
+    }
+
+    #[test]
+    fn a_lock_with_a_shared_or_bad_number_is_refused() {
+        for (text, want) in [
+            (
+                "format = 1\n[messages.\"a.M\".fields]\na = 4\nz = 4\n",
+                "fields `a` and `z` both have number 4",
+            ),
+            (
+                "format = 1\n[messages.\"a.M\".fields]\na = 4\n\n[[messages.\"a.M\".reserved]]\nnumber = 4\n",
+                "number 4 is live and reserved",
+            ),
+            (
+                "format = 1\n[messages.\"a.M\".fields]\na = 19000\n",
+                "19000 is not a protobuf field number",
+            ),
+        ] {
+            let err = Lock::parse(text).expect_err("refused");
+            assert!(err.contains(want), "{text}: {err}");
+        }
     }
 
     #[test]

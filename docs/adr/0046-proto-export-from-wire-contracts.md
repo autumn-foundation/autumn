@@ -60,8 +60,12 @@ Option 2.
 - `autumn contracts check` stays the gate. proto3 has no required fields and
   buf has no read-sets, so buf approves some changes that the check refuses.
   `autumn-cli/tests/integration/contracts_proto.rs` names each case.
-- A message rename, also one caused by a new type with the same name, gives
-  new numbers under the new name.
+- A renamed message gets new numbers. A new type with the same name can
+  cause such a rename.
+- A wrapper is not Autumn's JSON. A consumer unwraps it by hand.
+- A protobuf JSON writer leaves out default values and writes 64-bit
+  integers as strings. A consumer that sends requests must turn on
+  unpopulated fields and must not send 64-bit integers.
 - `verification/proto_field_numbers.rs` proves that new numbers are valid,
   distinct and above every used number. A proptest checks the lock over
   random field sets.

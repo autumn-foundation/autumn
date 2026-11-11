@@ -585,9 +585,9 @@ protobuf schema of the contract:
 autumn contracts export --proto --out contracts/proto/
 ```
 
-The export uses the same pass, `-p` and feature flags as `export`. It writes
-text only. The CLI does not need `protoc`. The Rust types stay the source of
-truth, and JSON stays the wire format.
+`--proto` takes the same `-p`, feature and `--from` flags as the bundle
+export. It writes text only. The CLI does not need `protoc`. The Rust types
+stay the source of truth, and JSON stays the wire format.
 
 The export writes:
 
@@ -596,7 +596,7 @@ The export writes:
 | `autumn/<service>/<service>.proto` | one `<Service>Service`, its rpcs and their messages |
 | `autumn/<crate>/events/events.proto` | one message per `#[event]` of the crate |
 | `buf.yaml` | the lint and breaking rules for these files |
-| `contracts/proto.lock` | the field numbers (`--lock <path>` moves it) |
+| `proto.lock`, beside `--out` | the field numbers (`--lock <path>` moves it) |
 
 ```proto
 // Rust type `Item`.
@@ -613,29 +613,35 @@ service CatalogService {
 ```
 
 * `json_name` is always the serde wire name. A protobuf JSON parser reads the
-  JSON that Autumn sends.
+  JSON that Autumn sends. A wrapper is the exception. See below.
 * The path parameters and the body of an endpoint go into one
-  `<Rpc>Request` message. The HTTP method and path go in a comment.
-  `--http-annotations` also writes `google.api.http` options. Then
-  `buf.yaml` needs the `buf.build/googleapis/googleapis` dependency: run
-  `buf dep update`.
+  `<Rpc>Request` message. When a body field has the name of a path
+  parameter, the body is one field, `body`, so it stays whole.
+* The HTTP method and path go in a comment. `--http-annotations` also writes
+  `google.api.http` options, with each path parameter named by its proto
+  field. The export adds the googleapis dependency to `buf.yaml`. Run
+  `buf dep update` to fetch it. A GET or DELETE rule has no `body`.
 * An event message has the name of the event type. A comment gives its
   topic.
 * Each file holds every message it needs, so a consumer can use one file.
 * An endpoint that no router serves is not in the files.
+* A response with no body, or a unit struct, is `google.protobuf.Empty`. A
+  comment says what Autumn sends: no body, or JSON `null`.
+* A Rust type with the name of a generated message (`<Rpc>Request`, a
+  wrapper, `<Service>Service`) stops the export. Rename the type.
 
 ### Type mapping
 
 | Wire type | Proto |
 |---|---|
 | `string` (any format) | `string`. With `--well-known-types`, `date-time` is `google.protobuf.Timestamp` |
-| `integer` | `int32`, `int64`, `uint32` or `uint64` by width and sign. 128 bits is `google.protobuf.Value` |
-| `number` | `double` |
+| `integer` | `int32`, `int64`, `uint32` or `uint64` by width and sign. 128 bits is `google.protobuf.Value`, read as a double |
+| `number` | `double`. serde_json writes NaN and infinity as `null`, which reads as 0 |
 | `boolean` | `bool` |
 | `array` | `repeated T` |
 | `map` | `map<string, T>` |
 | `object` | a message |
-| `nullable` | `optional T`. A message field has presence, so it stays a plain field |
+| `nullable` | `optional T`. A message field and `google.protobuf.Value` hold null already, so they stay plain fields |
 | `any` | `google.protobuf.Value` |
 
 A format, such as `uuid`, goes in the field comment.
@@ -653,23 +659,42 @@ message for each. Its name ends in `Wrapper`, so it is easy to find:
 | a list response (`Json<Vec<Item>>`) | `ItemListWrapper` |
 | a list request body | a `repeated` field `items` in `<Rpc>Request` |
 
-A wrapper changes the JSON form. In the JSON, a wrapper is the bare value,
-not an object. A comment on each wrapper says so. A `nullable` list or map is
-a plain `repeated` or `map` field: protobuf JSON reads `null` as empty.
+A wrapper is not the JSON that Autumn sends. Autumn sends the bare value: an
+array, a map, or a value or `null`. A protobuf JSON parser expects an object
+with a `values` or `value` field, so it refuses Autumn's JSON for a wrapper
+field. Wrap the value yourself before you parse it: `[1, 2]` becomes
+`{"values": [1, 2]}`. A comment on each wrapper says so. With
+`--http-annotations`, a list response has `response_body: "values"`, so a
+transcoder uses the bare array.
+
+A `nullable` list or map is a plain `repeated` or `map` field. Protobuf JSON
+reads `null` as empty.
+
+### Requests from a protobuf consumer
+
+The schema is made to read Autumn's JSON. A consumer that writes a request
+with a protobuf JSON writer must do two things:
+
+* Write fields with default values. By default a writer leaves out `0`,
+  `""` and `false`, and serde then refuses a required field. Turn on the
+  writer's option to emit unpopulated fields.
+* Not send a 64-bit integer field. Protobuf JSON writes `int64` and `uint64`
+  as strings, and serde reads an integer only as a JSON number.
 
 ### Field numbers
 
 JSON has no field numbers, so the export gives them. A number must never move
 after you publish it.
 
-* `contracts/proto.lock` keeps each number, by message and wire name. It is
+* The lock keeps each number, by message and wire name. It is
   sorted TOML. Commit it.
 * A new field gets the next free number. The numbers 19000 to 19999 are not
   used.
 * A removed field moves to `reserved`, with its number and its name. No other
   field gets that number. When the field comes back with the same wire name,
   it gets its old number again.
-* `#[wire(tag = N)]` on a field sets its number. It wins over the lock. Two
+* `#[wire(tag = N)]` on a field sets its number. It wins over the lock, and
+  the number it replaces stays reserved. Two
   equal tags on one type, or a tag outside protobuf's range, is a compile
   error. A tag on the number of another field, or on a reserved number,
   stops the export.
@@ -682,21 +707,33 @@ pub struct Item {
 }
 ```
 
-* `--check` writes nothing. It exits 1 when the lock is missing, when the
-  export would add or change a lock entry, or when a `.proto` file would
-  change. Run it in CI, so a lock that is not committed fails the build:
+* The lock is `proto.lock` beside `--out`: `--out contracts/proto/` uses
+  `contracts/proto.lock`.
+* `--check` writes nothing. It exits 1 when the lock is missing or would
+  change, or when a file would change or go away. It reads CRLF as LF. Run
+  it in CI, so a lock that is not committed fails the build:
 
 ```bash
 autumn contracts export --proto --out contracts/proto/ --check
 ```
 
+The export removes a `.proto` file under `<out>/autumn/` that it wrote
+before and does not write now, and names it. A file without the export's
+first line stays.
+
 Two exports of the same source give the same bytes. `--from` takes a
 published bundle file, so you can export the schema of any release with no
-build:
+build. This updates the lock. Pass `--lock` with a scratch path to keep the
+committed lock as it is:
 
 ```bash
-autumn contracts export --from release-1.json --proto --out contracts/proto/
+autumn contracts export --from release-1.json --proto \
+  --out target/proto-1/ --lock target/proto-1.lock
 ```
+
+A lock key is the full message name. A message that gets a new name, for
+example because a second Rust type with the same name is now in the file,
+gets new numbers.
 
 ### Required fields
 
@@ -708,12 +745,14 @@ a field that a deployed caller reads.
 ### buf
 
 The `buf.yaml` uses the `STANDARD` lint rules, with three exceptions:
-`RPC_RESPONSE_STANDARD_NAME` and `RPC_REQUEST_RESPONSE_UNIQUE`, because an rpc
-returns the message that Autumn sends as the body, and
-`PACKAGE_VERSION_SUFFIX`, because the package is the service name. Breaking
-changes use `WIRE_JSON`, because JSON is the wire format.
 
-`buf breaking` and `autumn contracts check` agree on a change that the check
+* `RPC_RESPONSE_STANDARD_NAME`: an rpc returns the message that Autumn sends.
+* `RPC_REQUEST_RESPONSE_UNIQUE`: two rpcs can return one message.
+* `PACKAGE_VERSION_SUFFIX`: the package is the service name.
+
+Breaking changes use `WIRE_JSON`, because JSON is the wire format.
+
+`buf breaking` finds no break in a change that `autumn contracts check`
 approves. They differ by design on some changes that the check refuses:
 
 * A new required request field, or a removed required nested field. proto3

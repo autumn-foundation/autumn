@@ -42,9 +42,9 @@ field numbers (`autumn-cli/src/contracts/proto/lock.rs`). Verify it with:
 verus verification/proto_field_numbers.rs
 ```
 
-It proves that each new number is a valid protobuf field number, that new
-numbers are distinct and above every number the message used, and that a new
-name does not change the number of another name.
+It proves three rules. Each new number is a valid field number. New numbers
+are distinct and above every used number. A new name does not change the
+number of another name.
 
 ## Lease-lock fencing
 

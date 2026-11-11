@@ -4,7 +4,7 @@
 //! type it does not know is a nested `WireShape` type: an object, by the path
 //! as written. The export changes that path to the type's id.
 
-use autumn_macros_support::wire::format;
+use autumn_macros_support::wire::{KEPT_FIELD_NUMBERS, MAX_FIELD_NUMBER, format};
 use quote::quote;
 use syn::spanned::Spanned as _;
 
@@ -23,12 +23,6 @@ pub struct WireAttrs {
     /// `#[wire(tag = N)]`: the protobuf field number, with its span.
     pub tag: Option<(u32, proc_macro2::Span)>,
 }
-
-/// The largest protobuf field number.
-pub const MAX_TAG: u32 = 536_870_911;
-
-/// The field numbers protobuf keeps for its own use.
-pub const RESERVED_TAGS: std::ops::RangeInclusive<u32> = 19_000..=19_999;
 
 /// Parse every `#[wire(…)]` on a field.
 ///
@@ -135,15 +129,15 @@ fn checked_tag(lit: &syn::Lit) -> syn::Result<u32> {
     let number = int
         .base10_parse::<u64>()
         .ok()
-        .filter(|n| (1..=u64::from(MAX_TAG)).contains(n))
+        .filter(|n| (1..=u64::from(MAX_FIELD_NUMBER)).contains(n))
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| {
             syn::Error::new(
                 int.span(),
-                format!("a protobuf field number is 1 to {MAX_TAG}"),
+                format!("a protobuf field number is 1 to {MAX_FIELD_NUMBER}"),
             )
         })?;
-    if RESERVED_TAGS.contains(&number) {
+    if KEPT_FIELD_NUMBERS.contains(&number) {
         return Err(syn::Error::new(
             int.span(),
             "protobuf keeps field numbers 19000 to 19999 for its own use",

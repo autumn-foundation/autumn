@@ -2477,10 +2477,13 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   descriptor directory with no build. `--from <file>` reads a bundle file.
 - Outside the workspace: `autumn contracts export --proto --out contracts/proto/`
   writes `.proto` schemas (one file per service, one per crate for events, a
-  `buf.yaml`). `json_name` is the serde wire name. `contracts/proto.lock`
-  keeps field numbers; commit it, and run `--check` in CI (exit 1 when stale).
-  `#[wire(tag = N)]` pins a number. Wrapper messages (`…Wrapper`) hold shapes
-  protobuf cannot write in place. `--http-annotations`, `--well-known-types`.
+  `buf.yaml`). `json_name` is the serde wire name. `proto.lock` (beside
+  `--out`) keeps field numbers; commit it, and run `--check` in CI (exit 1
+  when stale). `#[wire(tag = N)]` pins a number. Wrapper messages
+  (`…Wrapper`) hold shapes protobuf cannot write in place; their JSON is not
+  Autumn's, so a consumer unwraps by hand. `--http-annotations` adds
+  `google.api.http` options. `--well-known-types` maps `date-time` to
+  `Timestamp`.
 
 Limits: one workspace, sync request/response, JSON over HTTP. Guide:
 `docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +

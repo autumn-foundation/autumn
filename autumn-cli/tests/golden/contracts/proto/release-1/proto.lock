@@ -1,5 +1,6 @@
 # Field numbers of `autumn contracts export --proto`. Commit this file.
-# A number never moves. A removed field keeps its number in `reserved`.
+# Only `#[wire(tag = N)]` moves a number. A removed or replaced number stays
+# in `reserved`.
 
 format = 1
 

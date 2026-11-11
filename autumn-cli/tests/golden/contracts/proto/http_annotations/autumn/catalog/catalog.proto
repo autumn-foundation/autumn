@@ -17,15 +17,24 @@ message Item {
   string id = 1 [json_name = "id"]; // required
 }
 
+// Rust type `Patch`.
+message Patch {
+  string id = 1 [json_name = "id"]; // required
+  string name = 2 [json_name = "name"]; // required
+  optional string note = 3 [json_name = "note"];
+}
+
+// Autumn reads the body as one `Patch`. A body field has the name of a path
+// parameter, so the body stays one field.
 message PatchItemRequest {
   string shop = 1 [json_name = "shop"]; // path
-  string id = 2 [json_name = "id"]; // path, required
-  string name = 3 [json_name = "name"]; // required
-  optional string note = 4 [json_name = "note"];
+  string id = 2 [json_name = "id"]; // path
+  Patch body = 3 [json_name = "body"]; // body
 }
 
 service CatalogService {
   // DELETE /items/{id}
+  // Autumn sends no body.
   rpc DeleteItem(DeleteItemRequest) returns (google.protobuf.Empty) {
     option (google.api.http) = {
       delete: "/items/{id}"
@@ -36,7 +45,7 @@ service CatalogService {
   rpc PatchItem(PatchItemRequest) returns (Item) {
     option (google.api.http) = {
       patch: "/shops/{shop}/items/{id}"
-      body: "*"
+      body: "body"
     };
   }
 }

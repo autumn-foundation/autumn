@@ -1,5 +1,5 @@
-// Two fields with one `#[wire(tag = N)]` would share one protobuf field
-// number, so a consumer could not tell them apart.
+// Two fields with one `#[wire(tag = N)]` share one protobuf field number.
+// A consumer cannot tell them apart.
 use autumn_web::prelude::*;
 
 #[derive(serde::Serialize, serde::Deserialize, WireShape)]
