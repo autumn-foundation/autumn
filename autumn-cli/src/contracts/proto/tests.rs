@@ -1001,3 +1001,28 @@ fn removing_the_first_of_two_like_names_keeps_the_second_name() {
     );
     assert!(text.contains("reserved \"item_id\";"), "{text}");
 }
+
+#[test]
+fn a_rust_type_name_becomes_a_valid_message_name() {
+    let raw = shape("r#Type", vec![field("id", WireType::string(), true)]);
+    let unicode = BundleEndpoint {
+        name: "get_cafe".to_owned(),
+        ..get(
+            "",
+            "/cafe",
+            shape("Café", vec![field("id", WireType::string(), true)]),
+        )
+    };
+    let (files, _) = run(
+        &bundle(vec![get("get_type", "/t", raw), unicode], vec![]),
+        plain(),
+    );
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(text.contains("message Type {"), "{text}");
+    assert!(text.contains("message Caf_ {"), "{text}");
+    let code: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect();
+    assert!(!code.contains("r#") && !code.contains('é'), "{text}");
+}

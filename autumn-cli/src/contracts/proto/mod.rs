@@ -463,14 +463,15 @@ impl<'b> File<'b> {
     /// The message name of an origin when no other origin in the file has
     /// it: the Rust type name.
     fn short_name(&self, origin: &Origin) -> String {
-        match origin {
+        let name = match origin {
             Origin::Type(id) => id.rsplit("::").next().unwrap_or(id).to_owned(),
             Origin::Body { name, .. } => name.clone(),
             Origin::Event(topic) => self
                 .bundle
                 .event(topic)
                 .map_or_else(|| pascal(topic), |e| e.type_name.clone()),
-        }
+        };
+        message_ident(&name)
     }
 
     /// The shape of an origin.
@@ -1309,6 +1310,28 @@ fn snake(text: &str) -> String {
         out.pop();
     }
     out
+}
+
+/// A Rust type name as a protobuf identifier: `r#` goes, and a character
+/// that protobuf does not allow becomes `_`. A name that would not start with
+/// a letter gets a `P` first.
+fn message_ident(name: &str) -> String {
+    let name: String = name
+        .trim_start_matches("r#")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        name
+    } else {
+        format!("P{name}")
+    }
 }
 
 /// `get_item` becomes `GetItem`; `catalog.item_repriced` becomes
