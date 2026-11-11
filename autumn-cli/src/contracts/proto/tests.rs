@@ -955,3 +955,15 @@ fn every_shape_that_maps_to_value_shares_one_wrapper() {
         "{text}"
     );
 }
+
+#[test]
+fn a_service_name_that_starts_with_a_digit_is_a_valid_identifier() {
+    let item = shape("Item", vec![field("id", WireType::string(), true)]);
+    let ep = BundleEndpoint {
+        service: "3d".to_owned(),
+        ..get("get_item", "/i", item)
+    };
+    let (files, _) = run(&bundle(vec![ep], vec![]), plain());
+    let text = &files["autumn/p_3d/p_3d.proto"];
+    assert!(text.contains("service P3dService {"), "{text}");
+}

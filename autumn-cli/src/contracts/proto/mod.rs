@@ -1302,8 +1302,12 @@ fn snake(text: &str) -> String {
 
 /// `get_item` becomes `GetItem`; `catalog.item_repriced` becomes
 /// `CatalogItemRepriced`.
+///
+/// A name that would start with a digit, or be empty, gets a `P` first, so
+/// it is a valid protobuf identifier: `3d` becomes `P3d`.
 fn pascal(text: &str) -> String {
-    text.split(|c: char| !c.is_ascii_alphanumeric())
+    let name: String = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|part| !part.is_empty())
         .map(|part| {
             let mut chars = part.chars();
@@ -1311,7 +1315,12 @@ fn pascal(text: &str) -> String {
                 first.to_ascii_uppercase().to_string() + chars.as_str()
             })
         })
-        .collect()
+        .collect();
+    if name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        name
+    } else {
+        format!("P{name}")
+    }
 }
 
 /// The message name of an origin that shares its short name.
