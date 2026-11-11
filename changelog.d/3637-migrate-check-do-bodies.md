@@ -1,7 +1,7 @@
 ### Fixed
 
-- **migrate check:** the statements in a Postgres `DO` body are now
-  classified (#3637). `DO $$ BEGIN DROP TABLE users; END $$;` is
+- **migrate check:** the check now classifies each statement in a Postgres
+  `DO` body (#3637). `DO $$ BEGIN DROP TABLE users; END $$;` is
   `destructive`. A `DO` block is `manual-review` when its body holds
   `EXECUTE`, or when the check cannot read the body. A comment in a `DO` or
   function body no longer hides a `standard_conforming_strings` change.

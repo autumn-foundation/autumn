@@ -43,8 +43,8 @@
 //!   above.
 //! - The scanner does not follow calls: `CALL p()`, `SELECT f()` or
 //!   `dblink_exec(..)` can run any statement.
-//! - A table made in a `DO` body is not a new table: the create is often
-//!   conditional.
+//! - A table made in a `DO` body is not a new table. A `CREATE TABLE` in a
+//!   body often has a condition.
 
 use std::fmt;
 
@@ -1098,9 +1098,13 @@ pub fn contains_concurrent_index(sql: &str) -> bool {
 const STANDARD_CONFORMING_STRINGS: &str = "standard_conforming_strings";
 
 /// A [`RiskLevel::ManualReview`] finding when a Postgres statement can change
-/// `standard_conforming_strings` (#3528).
-fn string_escape_mode_finding(normalized: &str) -> Option<SafetyFinding> {
-    changes_string_escape_mode(normalized, 0).then(|| SafetyFinding {
+/// `standard_conforming_strings` (#3528). `body` is the routine body of the
+/// statement.
+fn string_escape_mode_finding(
+    normalized: &str,
+    body: Option<&RoutineBody>,
+) -> Option<SafetyFinding> {
+    changes_string_escape_mode(normalized, body, false, 0).then(|| SafetyFinding {
         operation: STRING_ESCAPE_MODE_OP.to_owned(),
         risk: RiskLevel::ManualReview,
         why: "With standard_conforming_strings off, `\\'` does not end '..' text. Autumn \
@@ -1128,36 +1132,37 @@ fn string_escape_mode_finding(normalized: &str) -> Option<SafetyFinding> {
 /// A `SET` to an explicit true value does not match. Dynamic SQL can build
 /// the name in other ways. The scanner does not find those.
 ///
-/// `depth` is the number of routine bodies around the statement. In a body,
-/// `EXECUTE '..'` runs quoted text, so the rule reads quoted text as code in
-/// a body statement with `EXECUTE`. Comments in a body are not code.
-fn changes_string_escape_mode(normalized: &str, depth: usize) -> bool {
+/// `body` is the routine body of the statement. Comments in a body are not
+/// code. `text_runs` is true when the statement is in a body with dynamic SQL
+/// (see [`runs_dynamic_sql`]). Then its quoted text can run, and the rule
+/// reads it as code. `depth` is the number of bodies around the statement.
+fn changes_string_escape_mode(
+    normalized: &str,
+    body: Option<&RoutineBody>,
+    text_runs: bool,
+    depth: usize,
+) -> bool {
     let lower = normalized.to_ascii_lowercase();
     if sets_standard_conforming_strings_on(&lower) {
         return false;
     }
-    let mut code = if depth > 0 && has_word(normalized, "execute") {
-        lower.clone()
-    } else {
-        escape_mode_code(normalized)
-    };
-    if let Some(body) = routine_body(normalized) {
-        match body.statements {
+    let mut code = escape_mode_code(normalized, text_runs);
+    if let Some(body) = body {
+        let found = match &body.statements {
             Some(stmts) if depth < MAX_BODY_DEPTH => {
-                if stmts
-                    .iter()
-                    .any(|stmt| changes_string_escape_mode(stmt, depth + 1))
-                {
-                    return true;
-                }
+                let runs = stmts.iter().any(|stmt| runs_dynamic_sql(stmt));
+                stmts.iter().any(|stmt| {
+                    changes_string_escape_mode(stmt, routine_body(stmt).as_ref(), runs, depth + 1)
+                })
             }
             // The check cannot read the body. All of its text can be code.
             _ => {
                 let text = &lower[body.span.clone()];
-                if names_escape_mode(text, text) {
-                    return true;
-                }
+                names_escape_mode(text, text)
             }
+        };
+        if found {
+            return true;
         }
         code.replace_range(body.span.clone(), &" ".repeat(body.span.len()));
     }
@@ -1165,10 +1170,9 @@ fn changes_string_escape_mode(normalized: &str, depth: usize) -> bool {
 }
 
 /// Whether `code` holds a form that can change `standard_conforming_strings`.
-/// `lower` is `code` with its quoted text, at the same byte offsets.
+/// `lower` is the lowercase statement with its quoted text. Its byte offsets
+/// are the same as in `code`.
 fn names_escape_mode(code: &str, lower: &str) -> bool {
-    // A quoted table name such as `"pg_settings"` is the same table.
-    let unquoted = code.replace('"', "");
     code.match_indices(STANDARD_CONFORMING_STRINGS)
         .any(|(i, _)| ends_with_set_keyword(&code[..i]))
         || code
@@ -1176,37 +1180,123 @@ fn names_escape_mode(code: &str, lower: &str) -> bool {
             .any(|(i, _)| ends_with_set_keyword(&code[..i]))
         || set_config_can_change_it(code, lower)
         || resets_all(code)
-        || unquoted.contains("update pg_settings")
-        || unquoted.contains("update pg_catalog.pg_settings")
+        || updates_pg_settings(code)
 }
 
-/// `normalized` in lowercase, with the text of each quoted span replaced by
-/// spaces. The byte offsets do not change. A quoted name that the rule reads
-/// stays: a plain name after `SET` or `RESET`, and the names in
-/// [`ESCAPE_MODE_NAMES`].
-fn escape_mode_code(normalized: &str) -> String {
+/// Whether `code` holds `UPDATE [ONLY] [pg_catalog.]pg_settings`. White
+/// space can be around the `.`, and each name can be in quotes.
+fn updates_pg_settings(code: &str) -> bool {
+    if !code.contains("pg_settings") {
+        return false;
+    }
+    // The quotes become spaces, so a quoted name is a word.
+    let sql = code.replace('"', " ");
+    let items = items(&sql);
+    let word = |i: usize, w: &str| items.get(i).is_some_and(|it| it.is_word(&sql, w));
+    let dot = |i: usize| {
+        items
+            .get(i)
+            .is_some_and(|it| it.kind == ItemKind::Punct && it.text(&sql) == ".")
+    };
+    (0..items.len()).filter(|&i| word(i, "update")).any(|i| {
+        let mut j = i + 1;
+        if word(j, "only") {
+            j += 1;
+        }
+        if word(j, "pg_catalog") && dot(j + 1) {
+            j += 2;
+        }
+        word(j, "pg_settings")
+    })
+}
+
+/// `normalized` in lowercase. The text of each quoted span becomes spaces;
+/// a quoted name keeps its two quotes. The byte offsets do not change.
+///
+/// These quoted names stay, also when they are `U&".."` names:
+/// - a plain name after `SET` or `RESET`,
+/// - `standard_conforming_strings` and the names in [`ESCAPE_MODE_NAMES`].
+///
+/// When `text_runs` is true, `'..'` and `$..$` text also stays.
+fn escape_mode_code(normalized: &str, text_runs: bool) -> String {
     let mut out = String::with_capacity(normalized.len());
+    let mut end = 0;
     for (kind, text) in tokens(DatabaseBackend::Postgres, normalized) {
-        let lower = text.to_ascii_lowercase();
-        let name = lower
-            .strip_prefix('"')
-            .and_then(|t| t.strip_suffix('"'))
-            .filter(|name| !name.is_empty());
-        let keep = kind != TokenKind::Quoted
-            || name.is_some_and(|name| {
-                ESCAPE_MODE_NAMES.contains(&name)
+        end += text.len();
+        if kind != TokenKind::Quoted {
+            out.extend(text.chars().map(|c| c.to_ascii_lowercase()));
+            continue;
+        }
+        if text.starts_with('"') {
+            let unicode = out.ends_with("u&");
+            let name = quoted_name(text, unicode, &normalized[end..]).filter(|name| {
+                name == STANDARD_CONFORMING_STRINGS
+                    || ESCAPE_MODE_NAMES.contains(&name.as_str())
                     || (ends_with_set_keyword(&out)
                         && name.chars().all(|c| is_identifier_char(c) || c == '.'))
             });
-        if keep {
-            out.push_str(&lower);
+            // A decoded name is never longer than its quoted form.
+            let kept = name
+                .filter(|name| name.len() + 2 <= text.len())
+                .map_or_else(|| "\"\"".to_owned(), |name| format!("\"{name}\""));
+            let kept = &kept[..kept.len().min(text.len())];
+            out.push_str(kept);
+            out.extend(std::iter::repeat_n(' ', text.len() - kept.len()));
+        } else if text_runs {
+            out.extend(text.chars().map(|c| c.to_ascii_lowercase()));
         } else {
-            let open = if lower.starts_with("e'") { 2 } else { 1 };
-            out.push_str(&lower[..open]);
-            out.extend(std::iter::repeat_n(' ', text.len() - open));
+            out.extend(std::iter::repeat_n(' ', text.len()));
         }
     }
     out
+}
+
+/// The lowercase name in a `".."` identifier, or `None` when it is empty or
+/// does not decode. `unicode` is true for a `U&".."` name. `after` is the
+/// text after the identifier: it can hold `UESCAPE 'c'`.
+fn quoted_name(text: &str, unicode: bool, after: &str) -> Option<String> {
+    let name = text
+        .strip_prefix('"')?
+        .strip_suffix('"')
+        .filter(|name| !name.is_empty())?
+        .replace("\"\"", "\"");
+    let name = if unicode {
+        let escape = strip_word_prefix(after.trim_start_matches(is_sql_space), "uescape")
+            .and_then(|rest| rest.trim_start_matches(is_sql_space).strip_prefix('\''))
+            .and_then(|rest| rest.chars().next())
+            .unwrap_or('\\');
+        decode_unicode_escapes(&name, escape)?
+    } else {
+        name
+    };
+    Some(name.to_ascii_lowercase())
+}
+
+/// `text` with each Unicode escape decoded: `\XXXX`, `\+XXXXXX` and `\\`,
+/// with `escape` in place of `\`. `None` for an escape that is not valid.
+fn decode_unicode_escapes(text: &str, escape: char) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        rest = &rest[c.len_utf8()..];
+        if c != escape {
+            out.push(c);
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix(escape) {
+            out.push(escape);
+            rest = after;
+            continue;
+        }
+        let (digits, after) = rest.strip_prefix('+').map_or((4, rest), |after| (6, after));
+        let hex = after.get(..digits)?;
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        out.push(char::from_u32(u32::from_str_radix(hex, 16).ok()?)?);
+        rest = &after[digits..];
+    }
+    Some(out)
 }
 
 /// Whether `lower` holds `RESET ALL` or `DISCARD ALL`.
@@ -1260,16 +1350,19 @@ fn strip_word_suffix<'a>(text: &'a str, word: &str) -> Option<&'a str> {
 
 /// Whether a `set_config` call in `code` can name
 /// `standard_conforming_strings`. A call does not when its first argument is
-/// only a plain `'..'` literal with a different name. `lower` is `code` with
-/// its literal text, at the same byte offsets.
+/// only a plain `'..'` literal with a different name. `lower` is the lowercase
+/// statement with its quoted text. Its byte offsets are the same as in `code`.
 fn set_config_can_change_it(code: &str, lower: &str) -> bool {
     code.match_indices("set_config").any(|(i, word)| {
         // A quoted name such as `"set_config"` is the same function.
-        let after = &lower[i + word.len()..];
-        let after = after.strip_prefix('"').unwrap_or(after);
-        let Some(args) = after.trim_start().strip_prefix('(') else {
+        let after = &code[i + word.len()..];
+        let after = after.strip_prefix('"').unwrap_or(after).trim_start();
+        // A `U&".."` name can have a `UESCAPE '..'` clause. Its text is blank.
+        let after = strip_word_prefix(after, "uescape").map_or(after, str::trim_start);
+        let Some(args) = after.strip_prefix('(') else {
             return false;
         };
+        let args = &lower[code.len() - args.len()..];
         let Some(literal) = args.trim_start().strip_prefix('\'') else {
             return true;
         };
@@ -1311,8 +1404,8 @@ fn sets_standard_conforming_strings_on(lower: &str) -> bool {
 
 // ── routine bodies (#3637) ───────────────────────────────────────────────────
 
-/// The most `DO` blocks and routine bodies that nest in one statement before
-/// the check stops reading. A deeper body is [`RiskLevel::ManualReview`].
+/// The maximum number of nested routine bodies that the check reads. A
+/// deeper `DO` body is [`RiskLevel::ManualReview`].
 const MAX_BODY_DEPTH: usize = 8;
 
 /// Quoted names that the `standard_conforming_strings` rule reads.
@@ -1392,9 +1485,15 @@ fn items(sql: &str) -> Vec<Item> {
     items
 }
 
-/// Whether Postgres text holds `word` outside quoted spans and comments.
-fn has_word(sql: &str, word: &str) -> bool {
-    items(sql).iter().any(|item| item.is_word(sql, word))
+/// Whether a body statement from [`body_statements`] runs SQL text: the
+/// PL/pgSQL `EXECUTE` or `RETURN QUERY EXECUTE`. `FOR .. IN EXECUTE` and
+/// `OPEN .. FOR EXECUTE` give a part that starts with `EXECUTE`.
+fn runs_dynamic_sql(stmt: &str) -> bool {
+    let rest = strip_word_prefix(stmt, "return")
+        .map(|rest| rest.trim_start_matches(is_sql_space))
+        .and_then(|rest| strip_word_prefix(rest, "query"))
+        .map_or(stmt, |rest| rest.trim_start_matches(is_sql_space));
+    strip_word_prefix(rest, "execute").is_some()
 }
 
 /// The body of a `DO` block or of a `CREATE FUNCTION` or `CREATE PROCEDURE`.
@@ -1406,7 +1505,7 @@ struct RoutineBody {
     /// The byte range of the body in the statement.
     span: std::ops::Range<usize>,
     /// The normalized statements of the body. `None` when the check cannot
-    /// read the body: an other language, a `\` escape, or a body in parts.
+    /// read the body: another language, a `\` escape, or a body in parts.
     statements: Option<Vec<String>>,
 }
 
@@ -1549,40 +1648,59 @@ fn body_statements(body: &str, plpgsql: bool) -> Vec<String> {
         .collect()
 }
 
-/// A normalized PL/pgSQL statement cut after each control clause at its
-/// start. The last part is the statement after the clauses.
+/// Cuts a normalized PL/pgSQL statement after each control clause at its
+/// start. The last part is the statement after the clauses. The text is
+/// lowercase, so the words compare as they are.
 ///
-/// A clause is a block word (`BEGIN`, `DECLARE`, `ELSE`, `EXCEPTION`,
-/// `LOOP`), a condition to `THEN` (`IF`, `ELSIF`, `WHEN`, `CASE`) or a
-/// condition to `LOOP` (`WHILE`, `FOR`, `FOREACH`). The parts keep the
-/// conditions, so a search for `EXECUTE` sees `FOR r IN EXECUTE ..`.
+/// These are the clauses:
+/// - a block word: `BEGIN`, `DECLARE`, `ELSE`, `EXCEPTION`, `LOOP`,
+/// - a condition up to `THEN`: `IF`, `ELSIF`, `ELSEIF`, `WHEN`, `CASE`,
+/// - a header up to `LOOP`: `WHILE`, `FOR`, `FOREACH`,
+/// - a cursor up to `FOR`: `OPEN`.
+///
+/// The parts keep the conditions. The query of a `FOR .. IN` header is a
+/// part of its own, because it can change data (`FOR r IN UPDATE ..`).
 fn block_parts(normalized: &str) -> Vec<String> {
     let items = items(normalized);
+    let word = |i: usize| {
+        items
+            .get(i)
+            .filter(|it| it.kind == ItemKind::Word)
+            .map_or("", |it| it.text(normalized))
+    };
     let mut parts = Vec::new();
+    let mut push = |from: usize, to: usize| {
+        parts.push(normalized[from..to].trim_matches(is_sql_space).to_owned());
+    };
     let mut start = 0;
-    let mut i = skip_label(normalized, &items, 0);
-    while let Some(&first) = items.get(i) {
-        let word = if first.kind == ItemKind::Word {
-            first.text(normalized)
-        } else {
-            ""
-        };
-        let cut = match word {
-            "begin" | "declare" | "else" | "exception" | "loop" => Some(i),
-            "if" | "elsif" | "when" | "case" => clause_end(normalized, &items, i + 1, "then"),
-            "while" | "for" | "foreach" => clause_end(normalized, &items, i + 1, "loop"),
-            _ => None,
+    let mut i = skip_prefixes(normalized, &items, 0);
+    while i < items.len() {
+        let (cut, query) = match word(i) {
+            "begin" | "declare" | "else" | "exception" | "loop" => (Some(i), None),
+            "if" | "elsif" | "elseif" | "when" | "case" => {
+                (clause_end(normalized, &items, i + 1, "then"), None)
+            }
+            "while" => (clause_end(normalized, &items, i + 1, "loop"), None),
+            "for" | "foreach" => {
+                let cut = clause_end(normalized, &items, i + 1, "loop");
+                let query = clause_end(normalized, &items, i + 1, "in")
+                    .filter(|&q| cut.is_some_and(|c| q < c));
+                (cut, query)
+            }
+            "open" => (clause_end(normalized, &items, i + 1, "for"), None),
+            _ => (None, None),
         };
         let Some(cut) = cut else { break };
-        parts.push(
-            normalized[start..items[cut].start]
-                .trim_matches(is_sql_space)
-                .to_owned(),
-        );
+        if let Some(query) = query {
+            push(start, items[query].start);
+            push(items[query].end, items[cut].start);
+        } else {
+            push(start, items[cut].start);
+        }
         start = items[cut].end;
-        i = skip_label(normalized, &items, cut + 1);
+        i = skip_prefixes(normalized, &items, cut + 1);
     }
-    parts.push(normalized[start..].trim_matches(is_sql_space).to_owned());
+    push(start, normalized.len());
     parts
 }
 
@@ -1604,17 +1722,23 @@ fn clause_end(sql: &str, items: &[Item], from: usize, word: &str) -> Option<usiz
     None
 }
 
-/// The index after a `<<label>>` at `i`, or `i` when there is no label.
-fn skip_label(sql: &str, items: &[Item], i: usize) -> usize {
+/// The index after the labels (`<<name>>`) and compiler options
+/// (`#variable_conflict use_column`) at `i`.
+fn skip_prefixes(sql: &str, items: &[Item], mut i: usize) -> usize {
     let punct = |j: usize, c: &str| {
         items
             .get(j)
             .is_some_and(|it| it.kind == ItemKind::Punct && it.text(sql) == c)
     };
-    if punct(i, "<") && punct(i + 1, "<") && punct(i + 3, ">") && punct(i + 4, ">") {
-        i + 5
-    } else {
-        i
+    let word = |j: usize| items.get(j).is_some_and(|it| it.kind == ItemKind::Word);
+    loop {
+        if punct(i, "<") && punct(i + 1, "<") && punct(i + 3, ">") && punct(i + 4, ">") {
+            i += 5;
+        } else if punct(i, "#") && word(i + 1) && word(i + 2) {
+            i += 3;
+        } else {
+            return i;
+        }
     }
 }
 
@@ -1629,14 +1753,15 @@ fn do_block_findings(
         return vec![SafetyFinding {
             operation: DO_UNREAD_OP.to_owned(),
             risk: RiskLevel::ManualReview,
-            why: "Autumn cannot read the body of this DO block. The language is not PL/pgSQL, \
-                  the body is not plain quoted text, or the DO blocks nest too deeply.",
-            next_action: "Examine the body manually. If it is safe, add \
+            why: "Autumn cannot read the body of this DO block. The cause can be one of \
+                  these: the language is not PL/pgSQL, the body is not plain quoted text, or \
+                  the DO blocks nest too deeply.",
+            next_action: "Examine the body. If it is safe, add \
                           `-- autumn-safety: reviewed` above the DO statement.",
         }];
     };
     let mut findings = Vec::new();
-    if statements.iter().any(|stmt| has_word(stmt, "execute")) {
+    if statements.iter().any(|stmt| runs_dynamic_sql(stmt)) {
         findings.push(SafetyFinding {
             operation: DO_DYNAMIC_SQL_OP.to_owned(),
             risk: RiskLevel::ManualReview,
@@ -1690,10 +1815,10 @@ fn is_volatile_function_default(backend: DatabaseBackend, default_expr: &str) ->
 }
 
 /// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
-#[allow(clippy::too_many_lines)]
 ///
 /// `depth` is the number of `DO` bodies around the statement. It is 0 for a
 /// statement of the migration file.
+#[allow(clippy::too_many_lines)]
 fn classify_statement(
     backend: DatabaseBackend,
     normalized: &str,
@@ -1722,23 +1847,28 @@ fn classify_statement(
     }
 
     let mut findings = Vec::new();
+    let body = if sqlite {
+        None
+    } else {
+        routine_body(normalized)
+    };
     // The rule reads the routine bodies in the statement itself, so it runs
     // only for a statement of the migration file.
-    if !sqlite
-        && depth == 0
-        && let Some(f) = string_escape_mode_finding(normalized)
+    if depth == 0
+        && !sqlite
+        && let Some(f) = string_escape_mode_finding(normalized, body.as_ref())
     {
         findings.push(f);
     }
-    if !sqlite && let Some(body) = routine_body(normalized).filter(|b| b.is_do) {
+    if let Some(body) = body.filter(|b| b.is_do) {
         findings.extend(do_block_findings(&body, newly_created, depth));
         return findings;
     }
     // Some SQLite ADD COLUMN restrictions apply only to a table that already has
     // rows: NOT NULL without a usable default, a non-constant default, and a
     // STORED generated column. A table this same migration creates has none, so
-    // those statements apply cleanly — the suppression `classify_sql_for`
-    // already makes for index builds. UNIQUE and PRIMARY KEY are NOT in that
+    // those statements apply cleanly — the suppression that the index rule
+    // below makes for index builds. UNIQUE and PRIMARY KEY are NOT in that
     // set: SQLite rejects them on an empty table too.
     let fresh_table = sqlite
         && extract_altered_table_name(normalized)
@@ -2111,9 +2241,11 @@ fn classify_statement(
     let is_concurrent = normalized.starts_with("create index concurrently ")
         || normalized.starts_with("create unique index concurrently ");
     // A table that this migration made has no rows and no traffic.
-    let on_new_table = extract_index_table_name(normalized)
-        .is_some_and(|t| newly_created.iter().any(|c| same_table(backend, c, t)));
-    if is_create_index && !is_concurrent && !on_new_table {
+    let on_new_table = || {
+        extract_index_table_name(normalized)
+            .is_some_and(|t| newly_created.iter().any(|c| same_table(backend, c, t)))
+    };
+    if is_create_index && !is_concurrent && !on_new_table() {
         findings.push(SafetyFinding {
             operation: if sqlite {
                 CREATE_INDEX_SQLITE_OP
@@ -3857,16 +3989,16 @@ mod tests {
         // A review marker in the body is quoted text, not a marker.
         let sql = "DO $$\n-- autumn-safety: reviewed\nBEGIN DROP TABLE users; END $$;";
         assert_eq!(ops(pg, sql), ["DROP TABLE"]);
-        // A table that the block makes can exist already: the create is
-        // often conditional. So the index is not on a new table.
+        // A table that the block makes can exist already. A `CREATE TABLE`
+        // in a body often has a condition. So the index is not on a new table.
         let sql =
             "DO $$ BEGIN CREATE TABLE IF NOT EXISTS t (id int); END $$; CREATE INDEX i ON t (id);";
         assert_eq!(ops(pg, sql), [CREATE_INDEX_PG_OP]);
         // `SQLite` has no `DO`.
         let sqlite = DatabaseBackend::Sqlite;
-        assert!(
-            !ops(sqlite, "DO $$ BEGIN DROP TABLE users; END $$;")
-                .contains(&DO_UNREAD_OP.to_owned())
+        assert_eq!(
+            ops(sqlite, "DO $$ BEGIN DROP TABLE users; END $$;"),
+            Vec::<String>::new()
         );
     }
 
@@ -3990,6 +4122,151 @@ mod tests {
         }
     }
 
+    #[test]
+    fn do_block_control_forms_hide_no_statement() {
+        // Issue #3637. Each statement runs on Postgres 16.
+        let pg = DatabaseBackend::Postgres;
+        for (sql, want) in [
+            (
+                "DO $$ BEGIN IF false THEN NULL; ELSEIF true THEN DROP TABLE t1; END IF; END $$;",
+                "DROP TABLE",
+            ),
+            (
+                "DO $$ #variable_conflict use_column\nBEGIN CREATE INDEX i ON t4 (x); END $$;",
+                CREATE_INDEX_PG_OP,
+            ),
+            (
+                "DO $$ #print_strict_params on\n#option dump\nBEGIN DROP TABLE t1; END $$;",
+                "DROP TABLE",
+            ),
+            (
+                "DO $$ #variable_conflict error <<l>> DECLARE n int; BEGIN DROP TABLE t1; END l $$;",
+                "DROP TABLE",
+            ),
+            (
+                "DO $$ DECLARE r record; BEGIN FOR r IN UPDATE t2 SET x = 9 RETURNING * LOOP NULL; END LOOP; END $$;",
+                "Bulk DML (data backfill)",
+            ),
+            (
+                "DO $$ DECLARE r record; BEGIN FOR r IN DELETE FROM t3 RETURNING * LOOP NULL; END LOOP; END $$;",
+                "Bulk DML (data backfill)",
+            ),
+            (
+                "DO $$ DECLARE r record; BEGIN FOR r IN WITH d AS (DELETE FROM t3 RETURNING *) SELECT * FROM d LOOP NULL; END LOOP; END $$;",
+                "Bulk DML (data backfill via CTE)",
+            ),
+            (
+                "DO $$ DECLARE c refcursor; r record; BEGIN OPEN c FOR UPDATE t5 SET x = 7 RETURNING *; FETCH c INTO r; CLOSE c; END $$;",
+                "Bulk DML (data backfill)",
+            ),
+            (
+                "DO $$ DECLARE c refcursor; BEGIN OPEN c NO SCROLL FOR DELETE FROM t5 RETURNING *; END $$;",
+                "Bulk DML (data backfill)",
+            ),
+        ] {
+            assert_eq!(ops(pg, sql), [want], "{sql}");
+        }
+        // A loop over a range or a query that only reads makes no finding.
+        for sql in [
+            "DO $$ BEGIN FOR i IN 1..3 LOOP NULL; END LOOP; END $$;",
+            "DO $$ DECLARE r record; BEGIN FOR r IN SELECT * FROM t LOOP NULL; END LOOP; END $$;",
+            "DO $$ DECLARE c refcursor; BEGIN OPEN c FOR SELECT 1; CLOSE c; END $$;",
+        ] {
+            assert_eq!(ops(pg, sql), Vec::<String>::new(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn execute_word_outside_dynamic_sql_is_not_dynamic_sql() {
+        // Issue #3637. Only the PL/pgSQL `EXECUTE` statement runs SQL text.
+        let pg = DatabaseBackend::Postgres;
+        for sql in [
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'a') THEN \
+             CREATE TRIGGER a BEFORE UPDATE ON posts FOR EACH ROW EXECUTE FUNCTION f(); END IF; END $$;",
+            "DO $$ BEGIN CREATE TRIGGER a AFTER UPDATE ON t FOR EACH ROW \
+             EXECUTE FUNCTION audit_log('reset all'); END $$;",
+            "DO $$ BEGIN GRANT EXECUTE ON FUNCTION f() TO app; END $$;",
+            "DO $$ BEGIN REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC; END $$;",
+        ] {
+            assert_eq!(ops(pg, sql), ["Unclassified DDL"], "{sql}");
+        }
+        // These forms run SQL text.
+        for sql in [
+            "DO $$ DECLARE c refcursor; BEGIN OPEN c FOR EXECUTE 'SELECT 1'; END $$;",
+            "DO $a$ BEGIN DO $b$ BEGIN EXECUTE 'x'; END $b$; END $a$;",
+        ] {
+            assert_eq!(ops(pg, sql), [DO_DYNAMIC_SQL_OP], "{sql}");
+        }
+        // `EXECUTE` text can change the setting.
+        assert_eq!(
+            ops(pg, "DO $$ BEGIN EXECUTE 'RESET ALL'; END $$;"),
+            [STRING_ESCAPE_MODE_OP, DO_DYNAMIC_SQL_OP]
+        );
+    }
+
+    #[test]
+    fn string_escape_mode_rule_reads_more_name_forms() {
+        // Issue #3637.
+        let pg = DatabaseBackend::Postgres;
+        for sql in [
+            r#"DO $$ BEGIN PERFORM U&"set\005fconfig"('standard_conforming_strings', 'off', false); END $$;"#,
+            r#"SELECT U&"set\005fconfig"('standard_conforming_strings', 'off', false);"#,
+            r#"SELECT U&"set!005fconfig" UESCAPE '!' ('standard_conforming_strings', 'off', false);"#,
+            r#"SELECT U&"set\+00005fconfig"('standard_conforming_strings', 'off', false);"#,
+            r#"SET U&"\0073tandard_conforming_strings" = off;"#,
+            "UPDATE pg_catalog . pg_settings SET setting = 'off' WHERE name = 'x';",
+            "UPDATE \"pg_catalog\".\"pg_settings\" SET setting = 'off';",
+            "UPDATE ONLY pg_settings SET setting = 'off';",
+            "DO $$ BEGIN IF false THEN NULL; ELSEIF true THEN UPDATE pg_catalog . pg_settings \
+             SET setting = 'off' WHERE name = 'standard_conforming_strings'; END IF; END $$;",
+            // Text that a later `EXECUTE` in the same body runs.
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ DECLARE \
+             s text := 'SET standard_conforming_strings = off'; BEGIN EXECUTE s; END $$;",
+            "DO $$ DECLARE s text := 'RESET ALL'; BEGIN EXECUTE s; END $$;",
+            // A function body with no `LANGUAGE` clause is SQL.
+            "CREATE FUNCTION f() RETURNS void AS $$ RESET /* c */ ALL $$;",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE \"plpgsql\" AS $$ BEGIN SET /* c */ \
+             standard_conforming_strings = off; END $$;",
+        ] {
+            let findings = classify_sql_for(pg, sql);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.operation == STRING_ESCAPE_MODE_OP),
+                "{sql}: {findings:?}"
+            );
+        }
+        for sql in [
+            r#"SELECT U&"set\005fconfig2"('standard_conforming_strings', 'off', false);"#,
+            r#"SELECT U&"pg\005fsettings" FROM t;"#,
+            "CREATE FUNCTION f() RETURNS int AS 'lib', 'sym' LANGUAGE c;",
+            "CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$ SELECT CASE WHEN true \
+             THEN 'RESET ALL' ELSE 'x' END $$;",
+        ] {
+            assert!(
+                !ops(pg, sql).contains(&STRING_ESCAPE_MODE_OP.to_owned()),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_depth_limit_is_exact() {
+        // Issue #3637. The check reads `MAX_BODY_DEPTH` nested blocks.
+        let pg = DatabaseBackend::Postgres;
+        let nest = |levels: usize, stmt: &str| {
+            (0..levels).fold(stmt.to_owned(), |body, i| {
+                format!("DO $t{i}$ BEGIN {body} END $t{i}$;")
+            })
+        };
+        let sql = nest(MAX_BODY_DEPTH, "DROP TABLE users;");
+        assert_eq!(ops(pg, &sql), ["DROP TABLE"]);
+        let sql = nest(MAX_BODY_DEPTH + 1, "DROP TABLE users;");
+        assert_eq!(ops(pg, &sql), [DO_UNREAD_OP]);
+        let sql = nest(MAX_BODY_DEPTH, "RESET /* c */ ALL;");
+        assert_eq!(ops(pg, &sql), [STRING_ESCAPE_MODE_OP]);
+    }
+
     mod scanner_proptest {
         use super::*;
         use proptest::prelude::*;
@@ -4047,8 +4324,6 @@ mod tests {
                 upper in any::<bool>(),
             ) {
                 let pg = DatabaseBackend::Postgres;
-                // The comment must not close the body.
-                let comment = comment.replace("$body$", "");
                 let note = if block_comment {
                     format!("/* {comment} */")
                 } else {
@@ -4066,7 +4341,9 @@ mod tests {
                     _ => format!("BEGIN CASE 1 WHEN 1 THEN {stmt} END CASE; END"),
                 };
                 let body = if upper { body } else { body.to_lowercase() };
-                let sql = format!("DO $body$ {body} $body$;");
+                // The strategy makes no upper-case text, so the comment cannot
+                // close the body.
+                let sql = format!("DO $B$ {body} $B$;");
                 prop_assert_eq!(ops(pg, &sql), ["DROP TABLE"], "{}", sql);
             }
 
