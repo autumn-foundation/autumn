@@ -317,21 +317,17 @@ impl<'de> de::Deserializer<'de> for ConfigDe {
                 visitor.visit_enum(Variant::Value { name, value: None })
             }
             Self::Value(toml::Value::Table(table)) => {
-                if table.len() != 1 {
-                    return Err(de::Error::custom(format!(
-                        "wanted exactly 1 element, found {} elements",
-                        table.len()
-                    )));
+                let len = table.len();
+                let mut entries = table.into_iter();
+                match (entries.next(), entries.next()) {
+                    (Some((name, value)), None) => visitor.visit_enum(Variant::Value {
+                        name,
+                        value: Some(value),
+                    }),
+                    _ => Err(de::Error::custom(format!(
+                        "wanted exactly 1 element, found {len} elements"
+                    ))),
                 }
-                let Some((name, value)) = table.into_iter().next() else {
-                    return Err(de::Error::custom(
-                        "wanted exactly 1 element, found 0 elements",
-                    ));
-                };
-                visitor.visit_enum(Variant::Value {
-                    name,
-                    value: Some(value),
-                })
             }
             Self::Value(value) => Err(de::Error::invalid_type(
                 unexpected(&value),
@@ -994,6 +990,150 @@ sli = "availability"
         // `get_schema_keys` can walk again, so compare one table.
         let full = crate::config::AutumnConfig::get_schema_keys();
         assert_eq!(schema.get("server"), full.get("server"));
+    }
+
+    fn walk() -> super::ConfigDe {
+        super::ConfigDe::Schema(crate::config::SchemaDeserializer::new())
+    }
+
+    #[test]
+    fn an_enum_error_names_each_value_type() {
+        let rest = "b = \"off\"\nc = \"off\"\n";
+        for (head, expected) in [
+            ("a = 1.5\n", "floating point `1.5`"),
+            ("a = true\n", "boolean `true`"),
+            ("a = 2026-01-02\n", "datetime"),
+            ("a = [1]\n", "sequence"),
+            (
+                "a = { off = \"x\" }\n",
+                "string \"x\", expected unit variant",
+            ),
+        ] {
+            let err = parse::<Modes>(&format!("{head}{rest}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{head}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_enum_table_needs_exactly_one_key() {
+        let rest = "b = \"off\"\nc = \"off\"\n";
+        let two = parse::<Modes>(&format!("a = {{ off = {{}}, fixed = 1 }}\n{rest}"));
+        assert!(two.unwrap_err().to_string().contains("found 2 elements"));
+        let none = parse::<Modes>(&format!("a = {{}}\n{rest}"));
+        assert!(none.unwrap_err().to_string().contains("found 0 elements"));
+    }
+
+    #[test]
+    fn a_unit_variant_may_have_an_empty_table() {
+        let modes: Modes = parse("a = { off = {} }\nb = \"off\"\nc = \"off\"\n").unwrap();
+        assert_eq!(modes.a, Mode::Off);
+    }
+
+    #[test]
+    fn a_variant_without_its_payload_is_an_error() {
+        let newtype = parse::<Modes>("a = \"off\"\nb = \"fixed\"\nc = \"off\"\n");
+        assert!(newtype.unwrap_err().to_string().contains("newtype variant"));
+        let strukt = parse::<Modes>("a = \"off\"\nb = \"off\"\nc = \"window\"\n");
+        assert!(strukt.unwrap_err().to_string().contains("struct variant"));
+        let scalar = parse::<Modes>("a = \"off\"\nb = \"off\"\n[c]\nwindow = 3\n");
+        assert!(scalar.unwrap_err().to_string().contains("in `c.window`"));
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum Shape {
+        Pair(u8, u8),
+        Dot,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Shapes {
+        s: Shape,
+    }
+
+    #[test]
+    fn reads_a_tuple_variant() {
+        let shapes: Shapes = parse("s = { pair = [1, 2] }\n").unwrap();
+        assert_eq!(shapes.s, Shape::Pair(1, 2));
+        let bare = parse::<Shapes>("s = \"pair\"\n").unwrap_err().to_string();
+        assert!(bare.contains("tuple variant"), "{bare}");
+        let item = parse::<Shapes>("s = { pair = [1, \"x\"] }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(item.contains("in `s.pair[1]`"), "{item}");
+        let table = parse::<Shapes>("s = { pair = { x = 1 } }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(table.contains("in `s.pair`"), "{table}");
+        assert_eq!(parse::<Shapes>("s = \"dot\"\n").unwrap().s, Shape::Dot);
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Marker;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Named(u8, u8);
+
+    #[test]
+    fn reads_tuples_and_refuses_a_value_for_a_unit_struct() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct S {
+            pair: (u8, u8),
+            named: Named,
+        }
+        let s: S = parse("pair = [1, 2]\nnamed = [3, 4]\n").unwrap();
+        assert_eq!(s.named, Named(3, 4));
+        assert_eq!(s.pair, (1, 2));
+        let marker = Marker::deserialize(super::ConfigDe::Value(toml::Value::Boolean(true)));
+        assert!(marker.is_err());
+    }
+
+    /// The schema walk feeds placeholders for every shape and does not stop.
+    #[test]
+    fn the_schema_walk_handles_every_shape() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        enum Num {
+            Num(u8),
+            Off,
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only the walk is tested")]
+        enum Window {
+            Window { size: u32 },
+        }
+        assert_eq!(Marker::deserialize(walk()).unwrap(), Marker);
+        assert_eq!(Num::deserialize(walk()).unwrap(), Num::Num(0));
+        // A tuple or struct variant is a leaf: the walk gives a unit.
+        assert!(Shape::deserialize(walk()).is_err());
+        assert!(Window::deserialize(walk()).is_err());
+        // One probe item. A two-item tuple then reports its length.
+        assert!(<(u8, u8)>::deserialize(walk()).is_err());
+        assert!(Named::deserialize(walk()).is_err());
+    }
+
+    #[test]
+    fn the_schema_walk_probes_a_sequence_when_asked() {
+        let walk = crate::config::SchemaDeserializer::new();
+        walk.any_probe
+            .lock()
+            .unwrap()
+            .insert(String::new(), crate::config::AnyProbe::Seq);
+        let value = toml::Value::deserialize(super::ConfigDe::Schema(walk)).unwrap();
+        assert_eq!(value, toml::Value::Array(Vec::new()));
+    }
+
+    /// serde always asks for a key before its value. A value without a key is
+    /// an error, not a panic.
+    #[test]
+    fn a_value_without_a_key_is_an_error() {
+        use serde::de::MapAccess as _;
+        let mut table = super::Entries::table(toml::Table::new());
+        assert_eq!(table.size_hint(), Some(0));
+        assert!(table.next_value::<u8>().is_err());
+        let mut fields = super::Entries::fields(&[], crate::config::SchemaDeserializer::new());
+        assert!(fields.next_value::<u8>().is_err());
     }
 
     /// The lines of the pretty `Debug` output, sorted. Two `HashMap`s with the
