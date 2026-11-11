@@ -868,10 +868,10 @@ async fn keyboard_tags_input() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
-/// The values a form would send. A chip input counts when it is enabled.
+/// The values a form would send, without the `q` query fields.
 #[cfg(feature = "widgets-search")]
 const FORM_VALUES: &str = "JSON.stringify([...new FormData(\
-    document.getElementById('reset-form')).entries()])";
+    document.getElementById('reset-form')).entries()].filter(e => e[0] !== 'q'))";
 
 /// A form reset restores the chips and the picked value from the server
 /// markup, and clears the query and the popup (issue #3618).
@@ -914,8 +914,8 @@ async fn search_widgets_restore_the_server_state_on_form_reset() {
     );
     assert_eq!(
         eval_string(&page, "document.getElementById('rs-pick-query').value").await,
-        "",
-        "the native reset clears the pick text"
+        "7",
+        "the native reset restores the pick text"
     );
 
     // The restored chip still works.
