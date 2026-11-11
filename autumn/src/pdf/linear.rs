@@ -111,12 +111,15 @@ mod tests {
 
     #[test]
     fn assert_linear_returns_the_output_of_the_large_run() {
+        // This test checks the return value, not the timing. Keep the large
+        // run under `FAST_ENOUGH`. At 4M items the large input does not fit
+        // in the CPU cache and the small one does, so the ratio is not linear.
         let sum = assert_linear(
             "sum",
-            4_000_000,
+            400_000,
             |k| vec![1_u64; k],
             |v| v.iter().sum::<u64>(),
         );
-        assert_eq!(sum, 4_000_000);
+        assert_eq!(sum, 400_000);
     }
 }
