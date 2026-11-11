@@ -1,0 +1,20 @@
+# Field numbers of `autumn contracts export --proto`. Commit this file.
+# A number never moves. A removed field keeps its number in `reserved`.
+
+format = 1
+
+[messages."autumn.mesh_catalog.events.ItemRepriced".fields]
+id = 1
+price = 2
+
+[messages."autumn.mesh_catalog.events.Price".fields]
+cents = 1
+
+[messages."autumn.mesh_orders.events.Audit".fields]
+
+[messages."autumn.mesh_orders.events.OrderPlaced".fields]
+id = 1
+price = 2
+
+[messages."autumn.mesh_orders.events.Price".fields]
+cents = 1

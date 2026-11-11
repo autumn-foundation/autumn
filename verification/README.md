@@ -33,6 +33,19 @@ scripts/verify-verus.sh                          # uses `verus` on PATH
 VERUS_BIN=/path/to/verus scripts/verify-verus.sh
 ```
 
+## Protobuf field numbers
+
+`proto_field_numbers.rs` models how `autumn contracts export --proto` gives
+field numbers (`autumn-cli/src/contracts/proto/lock.rs`). Verify it with:
+
+```sh
+verus verification/proto_field_numbers.rs
+```
+
+It proves that each new number is a valid protobuf field number, that new
+numbers are distinct and above every number the message used, and that a new
+name does not change the number of another name.
+
 ## Lease-lock fencing
 
 `lease_fencing.rs` models the `autumn_lease_locks` statements in

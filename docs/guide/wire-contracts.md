@@ -213,7 +213,7 @@ source file:
 
 `--from <dir>` joins a directory of descriptors that a build already wrote.
 No build runs, and there is no dependency graph, so a bare name can come
-from any crate in the directory.
+from any crate in the directory. `--from <file>` reads a bundle file.
 
 Use `-p` to export some packages only. The default is the whole workspace. The
 pass checks libraries and binaries. Callers in tests and examples are not part
@@ -575,9 +575,161 @@ const _: () = assert!(
 See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 [Events across releases](#events-across-releases) for the deploy rules.
 
+## Consumers outside the workspace
+
+The check protects callers in one Cargo workspace. A consumer in another
+repository, team or language cannot build against the Rust types. Give it a
+protobuf schema of the contract:
+
+```bash
+autumn contracts export --proto --out contracts/proto/
+```
+
+The export uses the same pass, `-p` and feature flags as `export`. It writes
+text only. The CLI does not need `protoc`. The Rust types stay the source of
+truth, and JSON stays the wire format.
+
+The export writes:
+
+| File | Holds |
+|---|---|
+| `autumn/<service>/<service>.proto` | one `<Service>Service`, its rpcs and their messages |
+| `autumn/<crate>/events/events.proto` | one message per `#[event]` of the crate |
+| `buf.yaml` | the lint and breaking rules for these files |
+| `contracts/proto.lock` | the field numbers (`--lock <path>` moves it) |
+
+```proto
+// Rust type `Item`.
+message Item {
+  string id = 1 [json_name = "id"]; // required
+  string name = 2 [json_name = "name"]; // required
+  optional string sku = 3 [json_name = "sku"];
+}
+
+service CatalogService {
+  // GET /items/{id}
+  rpc GetItem(GetItemRequest) returns (Item);
+}
+```
+
+* `json_name` is always the serde wire name. A protobuf JSON parser reads the
+  JSON that Autumn sends.
+* The path parameters and the body of an endpoint go into one
+  `<Rpc>Request` message. The HTTP method and path go in a comment.
+  `--http-annotations` also writes `google.api.http` options. Then
+  `buf.yaml` needs the `buf.build/googleapis/googleapis` dependency: run
+  `buf dep update`.
+* An event message has the name of the event type. A comment gives its
+  topic.
+* Each file holds every message it needs, so a consumer can use one file.
+* An endpoint that no router serves is not in the files.
+
+### Type mapping
+
+| Wire type | Proto |
+|---|---|
+| `string` (any format) | `string`. With `--well-known-types`, `date-time` is `google.protobuf.Timestamp` |
+| `integer` | `int32`, `int64`, `uint32` or `uint64` by width and sign. 128 bits is `google.protobuf.Value` |
+| `number` | `double` |
+| `boolean` | `bool` |
+| `array` | `repeated T` |
+| `map` | `map<string, T>` |
+| `object` | a message |
+| `nullable` | `optional T`. A message field has presence, so it stays a plain field |
+| `any` | `google.protobuf.Value` |
+
+A format, such as `uuid`, goes in the field comment.
+
+Protobuf cannot write some shapes in place. The export writes a wrapper
+message for each. Its name ends in `Wrapper`, so it is easy to find:
+
+| Shape | Proto |
+|---|---|
+| `Vec<Vec<T>>` | `repeated TListWrapper` |
+| `Vec<Option<T>>` | `repeated NullableTWrapper` |
+| `HashMap<String, Option<T>>` | `map<string, NullableTWrapper>` |
+| a map of lists or maps | `map<string, TListWrapper>`, `map<string, TMapWrapper>` |
+| a list of maps | `repeated TMapWrapper` |
+| a list response (`Json<Vec<Item>>`) | `ItemListWrapper` |
+| a list request body | a `repeated` field `items` in `<Rpc>Request` |
+
+A wrapper changes the JSON form. In the JSON, a wrapper is the bare value,
+not an object. A comment on each wrapper says so. A `nullable` list or map is
+a plain `repeated` or `map` field: protobuf JSON reads `null` as empty.
+
+### Field numbers
+
+JSON has no field numbers, so the export gives them. A number must never move
+after you publish it.
+
+* `contracts/proto.lock` keeps each number, by message and wire name. It is
+  sorted TOML. Commit it.
+* A new field gets the next free number. The numbers 19000 to 19999 are not
+  used.
+* A removed field moves to `reserved`, with its number and its name. No other
+  field gets that number. When the field comes back with the same wire name,
+  it gets its old number again.
+* `#[wire(tag = N)]` on a field sets its number. It wins over the lock. Two
+  equal tags on one type, or a tag outside protobuf's range, is a compile
+  error. A tag on the number of another field, or on a reserved number,
+  stops the export.
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    #[wire(tag = 1)]
+    pub id: String,
+}
+```
+
+* `--check` writes nothing. It exits 1 when the lock is missing, when the
+  export would add or change a lock entry, or when a `.proto` file would
+  change. Run it in CI, so a lock that is not committed fails the build:
+
+```bash
+autumn contracts export --proto --out contracts/proto/ --check
+```
+
+Two exports of the same source give the same bytes. `--from` takes a
+published bundle file, so you can export the schema of any release with no
+build:
+
+```bash
+autumn contracts export --from release-1.json --proto --out contracts/proto/
+```
+
+### Required fields
+
+proto3 has no `required`. A field that serde requires stays a plain field,
+with `// required` in its comment. The `.proto` files are a schema for
+consumers. They are not the gate: `autumn contracts check` stays the gate for
+a field that a deployed caller reads.
+
+### buf
+
+The `buf.yaml` uses the `STANDARD` lint rules, with three exceptions:
+`RPC_RESPONSE_STANDARD_NAME` and `RPC_REQUEST_RESPONSE_UNIQUE`, because an rpc
+returns the message that Autumn sends as the body, and
+`PACKAGE_VERSION_SUFFIX`, because the package is the service name. Breaking
+changes use `WIRE_JSON`, because JSON is the wire format.
+
+`buf breaking` and `autumn contracts check` agree on a change that the check
+approves. They differ by design on some changes that the check refuses:
+
+* A new required request field, or a removed required nested field. proto3
+  has no required fields.
+* A removed response field that a caller reads, and a new field that a new
+  caller reads. buf cannot see read-sets.
+* A changed path or method, and an endpoint removed from its router. buf
+  does not compare comments, and `WIRE_JSON` does not check removed rpcs.
+
+`autumn-cli/tests/integration/contracts_proto.rs` names each case.
+
 ## Limits of the first slice
 
-* One workspace. Both ends must be present at build time.
+* One workspace. Both ends must be present at build time. A consumer outside
+  the workspace gets a protobuf schema, not a build check. See
+  [Consumers outside the workspace](#consumers-outside-the-workspace).
 * Synchronous request/response and events, as JSON. No streaming or
   websockets.
 * Path parameters and a JSON body. Query parameters are not part of the
@@ -610,7 +762,9 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * The cross-release check compares two releases: the deployed one and the
   current one. More than two live releases need one check per pair.
 * The cross-release check knows only the callers in the bundle. It cannot see
-  a client outside the workspace, so it keeps every deployed route.
+  a client outside the workspace, so it keeps every deployed route. Give such
+  a client a protobuf schema. See
+  [Consumers outside the workspace](#consumers-outside-the-workspace).
 * A field with `#[wire(opaque)]` is compared by its type name only. A change
   inside its type does not show.
 * A nested type pair reports at most 100 issues. The verdict does not

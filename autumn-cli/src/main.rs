@@ -641,6 +641,47 @@ impl ContractsPassArgs {
     }
 }
 
+/// The protobuf options of `autumn contracts export`.
+///
+/// Each flag is one separate switch on the command line.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+pub struct ContractsProtoArgs {
+    /// Write protobuf schemas to `--out <DIR>` instead of the bundle.
+    #[arg(long, requires = "out")]
+    proto: bool,
+    /// The lock file of protobuf field numbers. Commit it.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "contracts/proto.lock",
+        requires = "proto"
+    )]
+    lock: PathBuf,
+    /// Write nothing. Exit 1 when the lock or a `.proto` file would change.
+    #[arg(long, requires = "proto")]
+    check: bool,
+    /// Add `google.api.http` options to each rpc.
+    #[arg(long, requires = "proto")]
+    http_annotations: bool,
+    /// Map a `date-time` string to `google.protobuf.Timestamp`.
+    #[arg(long, requires = "proto")]
+    well_known_types: bool,
+}
+
+impl ContractsProtoArgs {
+    fn into_proto(self) -> Option<contracts::ProtoArgs> {
+        self.proto.then_some(contracts::ProtoArgs {
+            lock: self.lock,
+            check: self.check,
+            options: contracts::proto::ProtoOptions {
+                http_annotations: self.http_annotations,
+                well_known_types: self.well_known_types,
+            },
+        })
+    }
+}
+
 /// Subcommands for `autumn contracts`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum ContractsSubcommands {
@@ -649,14 +690,21 @@ pub enum ContractsSubcommands {
     /// Runs a dedicated `cargo check` pass, so a cached build cannot leave a
     /// descriptor out. The bundle is sorted JSON. Two exports of the same
     /// source give the same bytes. Store it with each release.
+    ///
+    /// With `--proto`, write protobuf schemas for consumers outside the
+    /// workspace instead: one file per service, one per crate for events,
+    /// and a `buf.yaml`. The lock file keeps each field number.
     Export {
-        /// Write the bundle to this file. The default is stdout.
+        /// Write the bundle to this file. The default is stdout. With
+        /// `--proto`, the directory for the `.proto` files.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
-        /// Join the descriptors already in this directory. No build runs,
-        /// and there is no dependency graph.
-        #[arg(long, value_name = "DIR")]
+        /// Use this bundle file, or join the descriptors in this directory.
+        /// No build runs, and there is no dependency graph.
+        #[arg(long, value_name = "BUNDLE|DIR")]
         from: Option<PathBuf>,
+        #[command(flatten)]
+        proto: ContractsProtoArgs,
         #[command(flatten)]
         pass: ContractsPassArgs,
     },
@@ -6169,11 +6217,17 @@ fn run_command(command: Commands) {
             });
         }
         Commands::Graph(command) => run_graph(command),
-        Commands::Contracts(ContractsSubcommands::Export { out, from, pass }) => {
+        Commands::Contracts(ContractsSubcommands::Export {
+            out,
+            from,
+            proto,
+            pass,
+        }) => {
             contracts::run_export(&contracts::ExportOptions {
                 out,
                 from,
                 pass: pass.into_pass(),
+                proto: proto.into_proto(),
             });
         }
         Commands::Contracts(ContractsSubcommands::Check {
@@ -10639,13 +10693,59 @@ mod tests {
     fn parse_contracts_export_defaults_to_the_workspace_and_stdout() {
         let cli = Cli::try_parse_from(["autumn", "contracts", "export"]).expect("parses");
         match cli.command {
-            Commands::Contracts(ContractsSubcommands::Export { out, from, pass }) => {
+            Commands::Contracts(ContractsSubcommands::Export {
+                out,
+                from,
+                proto,
+                pass,
+            }) => {
                 assert!(out.is_none());
                 assert!(from.is_none(), "the default runs the pass");
                 assert!(pass.package.is_empty());
+                assert!(
+                    proto.into_proto().is_none(),
+                    "the default writes the bundle"
+                );
             }
             _ => panic!("expected contracts export"),
         }
+    }
+
+    #[test]
+    fn parse_contracts_export_proto_with_its_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "export",
+            "--proto",
+            "--out",
+            "contracts/proto",
+            "--check",
+            "--http-annotations",
+            "--well-known-types",
+        ])
+        .expect("parses");
+        let Commands::Contracts(ContractsSubcommands::Export { proto, .. }) = cli.command else {
+            panic!("expected contracts export");
+        };
+        let proto = proto.into_proto().expect("proto");
+        assert_eq!(proto.lock, PathBuf::from("contracts/proto.lock"));
+        assert!(proto.check);
+        assert!(proto.options.http_annotations && proto.options.well_known_types);
+    }
+
+    #[test]
+    fn parse_contracts_export_proto_needs_out_and_its_options_need_proto() {
+        assert!(Cli::try_parse_from(["autumn", "contracts", "export", "--proto"]).is_err());
+        for flag in ["--check", "--http-annotations", "--well-known-types"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "contracts", "export", flag]).is_err(),
+                "{flag} without --proto"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "contracts", "export", "--lock", "x.lock"]).is_err()
+        );
     }
 
     #[test]

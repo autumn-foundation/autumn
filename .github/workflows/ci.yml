@@ -2242,6 +2242,8 @@ jobs:
           # modules DOES need a line added here (and a step in
           # generator-conformance.yml) — that omission just makes it run
           # here too until skipped, never silently dark.
+          # The two `buf_` tests need the `buf` binary, not Docker. They run
+          # in wire-contracts.yml, which installs buf.
           # `scrubbed_database_migrates_clean_and_boots_the_app` additionally
           # compiles and boots a generated app and needs the diesel CLI, so it
           # runs in generator-conformance.yml's Postgres gate instead.
@@ -2291,7 +2293,9 @@ jobs:
             --skip serve_daemon_start_status_stop_over_unix_socket \
             --skip scaffolded_json_field_generates_compiles_inserts_and_selects \
             --skip scrubbed_database_migrates_clean_and_boots_the_app \
-            --skip documented_scaffold_example_builds_without_warnings
+            --skip documented_scaffold_example_builds_without_warnings \
+            --skip buf_lint_and_buf_build_pass_on_each_proto_export \
+            --skip buf_breaking_finds_no_break_that_contracts_check_approved
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
           # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)

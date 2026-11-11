@@ -8,6 +8,7 @@
 
 pub mod bundle;
 pub mod compat;
+pub mod proto;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,14 +48,31 @@ impl PassOptions {
 /// Options for `autumn contracts export`.
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
-    /// Where to write the bundle. `None` writes to stdout.
+    /// Where to write the bundle, or the proto directory. `None` writes the
+    /// bundle to stdout.
     pub out: Option<PathBuf>,
-    /// Join the descriptors in this directory, with no build and no
-    /// dependency graph. `None` runs the export pass.
+    /// A bundle file, or a directory of descriptors to join with no build
+    /// and no dependency graph. `None` runs the export pass.
     pub from: Option<PathBuf>,
     /// The crates to check.
     pub pass: PassOptions,
+    /// Write protobuf files instead of the bundle.
+    pub proto: Option<ProtoArgs>,
 }
+
+/// Options for `autumn contracts export --proto`.
+#[derive(Debug, Clone)]
+pub struct ProtoArgs {
+    /// The lock file of field numbers.
+    pub lock: PathBuf,
+    /// Write nothing. Fail when the lock or a file would change.
+    pub check: bool,
+    /// What the export adds to the plain mapping.
+    pub options: proto::ProtoOptions,
+}
+
+/// Exit code of `--check`: the export would change a file.
+pub const EXIT_STALE: i32 = 1;
 
 /// Options for `autumn contracts check`.
 #[derive(Debug, Clone)]
@@ -102,8 +120,43 @@ pub fn run_export(opts: &ExportOptions) {
     let bundle = opts
         .from
         .as_deref()
-        .map_or_else(|| export_pass(Path::new("."), &opts.pass), Bundle::from_dir)
+        .map_or_else(
+            || export_pass(Path::new("."), &opts.pass),
+            |from| {
+                if from.is_file() {
+                    read_bundle(from)
+                } else {
+                    Bundle::from_dir(from)
+                }
+            },
+        )
         .unwrap_or_else(|e| fail(&e));
+    if let Some(args) = &opts.proto {
+        let Some(out) = &opts.out else {
+            fail("`--proto` needs `--out <DIR>`");
+        };
+        match run_proto(&bundle, out, args) {
+            Ok(changes) if args.check && !changes.is_empty() => {
+                for change in &changes {
+                    eprintln!("\u{2717} {change}");
+                }
+                eprintln!(
+                    "The proto export is not up to date. Run `autumn contracts export --proto` \
+                     and commit the files and the lock."
+                );
+                std::process::exit(EXIT_STALE);
+            }
+            Ok(_) if args.check => eprintln!("The proto export and its lock are up to date."),
+            Ok(changes) => eprintln!(
+                "Wrote the proto export to {} ({} change(s)) and the lock to {}.",
+                out.display(),
+                changes.len(),
+                args.lock.display()
+            ),
+            Err(e) => fail(&e),
+        }
+        return;
+    }
     let bytes = bundle.to_bytes();
     let Some(path) = &opts.out else {
         use std::io::Write as _;
@@ -129,6 +182,102 @@ pub fn run_export(opts: &ExportOptions) {
         bundle.listeners.len(),
         path.display()
     );
+}
+
+/// Export `bundle` as protobuf files in `out`, with the numbers in the lock.
+///
+/// Returns each change: a file or the lock that differs, and a stale
+/// `.proto` file under `out/autumn/`. With `check`, it writes nothing.
+///
+/// # Errors
+/// The lock does not parse, the export fails, or a file cannot be written.
+pub fn run_proto(bundle: &Bundle, out: &Path, args: &ProtoArgs) -> Result<Vec<String>, String> {
+    let old_text = match std::fs::read_to_string(&args.lock) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read {}: {e}", args.lock.display())),
+    };
+    let base = match &old_text {
+        Some(text) => {
+            proto::lock::Lock::parse(text).map_err(|e| format!("{}: {e}", args.lock.display()))?
+        }
+        None => proto::lock::Lock::default(),
+    };
+    let export = proto::export(bundle, &base, args.options)?;
+
+    let mut changes = Vec::new();
+    let lock_text = export.lock.render();
+    match &old_text {
+        None => changes.push(format!("{}: the lock file is missing", args.lock.display())),
+        Some(old) if *old != lock_text => changes.push(format!(
+            "{}: the export adds, moves or reserves a field number",
+            args.lock.display()
+        )),
+        Some(_) => {}
+    }
+    for (path, text) in &export.files {
+        let file = out.join(path);
+        if std::fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
+            changes.push(format!("{}: differs from the export", file.display()));
+        }
+    }
+    let mut stale = Vec::new();
+    list_protos(&out.join("autumn"), &mut stale);
+    stale.retain(|file| {
+        let relative = file
+            .strip_prefix(out)
+            .map(|p| {
+                p.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default();
+        !export.files.contains_key(&relative)
+    });
+    for file in &stale {
+        changes.push(format!(
+            "{}: the export no longer writes it",
+            file.display()
+        ));
+    }
+    if args.check {
+        return Ok(changes);
+    }
+
+    for (path, text) in &export.files {
+        let file = out.join(path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&file, text).map_err(|e| format!("write {}: {e}", file.display()))?;
+    }
+    for file in &stale {
+        std::fs::remove_file(file).map_err(|e| format!("remove {}: {e}", file.display()))?;
+    }
+    if let Some(parent) = args.lock.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&args.lock, lock_text)
+        .map_err(|e| format!("write {}: {e}", args.lock.display()))?;
+    Ok(changes)
+}
+
+/// Every `.proto` file under `dir`, sorted.
+fn list_protos(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            list_protos(&path, out);
+        } else if path.extension().is_some_and(|e| e == "proto") {
+            out.push(path);
+        }
+    }
 }
 
 /// Run `autumn contracts check`. Exits with the report's code.

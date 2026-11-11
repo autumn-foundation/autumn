@@ -20,7 +20,15 @@ pub struct WireAttrs {
     pub opaque: bool,
     /// `#[wire(type = …)]`, with its `format` and `nullable`.
     pub wire_type: Option<WireType>,
+    /// `#[wire(tag = N)]`: the protobuf field number, with its span.
+    pub tag: Option<(u32, proc_macro2::Span)>,
 }
+
+/// The largest protobuf field number.
+pub const MAX_TAG: u32 = 536_870_911;
+
+/// The field numbers protobuf keeps for its own use.
+pub const RESERVED_TAGS: std::ops::RangeInclusive<u32> = 19_000..=19_999;
 
 /// Parse every `#[wire(…)]` on a field.
 ///
@@ -32,6 +40,7 @@ pub fn wire_attrs(field: &syn::Field) -> Result<WireAttrs, syn::Error> {
     let mut ty: Option<syn::LitStr> = None;
     let mut fmt: Option<syn::LitStr> = None;
     let mut nullable: Option<proc_macro2::Span> = None;
+    let mut tag: Option<(u32, proc_macro2::Span)> = None;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("wire")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("opaque") {
@@ -42,9 +51,17 @@ pub fn wire_attrs(field: &syn::Field) -> Result<WireAttrs, syn::Error> {
                 set_once(&mut fmt, meta.value()?.parse()?, "format")?;
             } else if meta.path.is_ident("nullable") {
                 nullable = Some(meta.path.span());
+            } else if meta.path.is_ident("tag") {
+                let lit: syn::Lit = meta.value()?.parse()?;
+                let number = checked_tag(&lit)?;
+                if tag.is_some() {
+                    return Err(syn::Error::new(lit.span(), "`tag` is set twice"));
+                }
+                tag = Some((number, lit.span()));
             } else {
                 return Err(meta.error(
-                    "unknown `wire` argument; expected `opaque`, `type`, `format` or `nullable`",
+                    "unknown `wire` argument; expected `opaque`, `type`, `format`, `nullable` \
+                     or `tag`",
                 ));
             }
             Ok(())
@@ -60,6 +77,7 @@ pub fn wire_attrs(field: &syn::Field) -> Result<WireAttrs, syn::Error> {
         return Ok(WireAttrs {
             opaque,
             wire_type: None,
+            tag,
         });
     };
     let kind = ty.value();
@@ -102,7 +120,36 @@ pub fn wire_attrs(field: &syn::Field) -> Result<WireAttrs, syn::Error> {
     Ok(WireAttrs {
         opaque,
         wire_type: Some(wire_type),
+        tag,
     })
+}
+
+/// The field number in `#[wire(tag = N)]`, if protobuf allows it.
+fn checked_tag(lit: &syn::Lit) -> syn::Result<u32> {
+    let syn::Lit::Int(int) = lit else {
+        return Err(syn::Error::new(
+            lit.span(),
+            "`tag` is an integer, such as `tag = 3`",
+        ));
+    };
+    let number = int
+        .base10_parse::<u64>()
+        .ok()
+        .filter(|n| (1..=u64::from(MAX_TAG)).contains(n))
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            syn::Error::new(
+                int.span(),
+                format!("a protobuf field number is 1 to {MAX_TAG}"),
+            )
+        })?;
+    if RESERVED_TAGS.contains(&number) {
+        return Err(syn::Error::new(
+            int.span(),
+            "protobuf keeps field numbers 19000 to 19999 for its own use",
+        ));
+    }
+    Ok(number)
 }
 
 /// Store `value` in `slot`, or refuse a key that is set twice.

@@ -2474,7 +2474,13 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
 - An `#[endpoint]` must be in a `routes![…]` call. Taking it out of the router
   is a removed route. For a handler of another crate, write its crate path
   (`routes![mesh_catalog::get_item]`), so the check judges that crate. `autumn contracts export --from <dir>` joins an existing
-  descriptor directory with no build.
+  descriptor directory with no build. `--from <file>` reads a bundle file.
+- Outside the workspace: `autumn contracts export --proto --out contracts/proto/`
+  writes `.proto` schemas (one file per service, one per crate for events, a
+  `buf.yaml`). `json_name` is the serde wire name. `contracts/proto.lock`
+  keeps field numbers; commit it, and run `--check` in CI (exit 1 when stale).
+  `#[wire(tag = N)]` pins a number. Wrapper messages (`…Wrapper`) hold shapes
+  protobuf cannot write in place. `--http-annotations`, `--well-known-types`.
 
 Limits: one workspace, sync request/response, JSON over HTTP. Guide:
 `docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +

@@ -11,6 +11,12 @@ name: Wire contracts
 #   * Byte stability: two real exports must give the same bytes as the
 #     committed bundle. An edit to the examples that changes the contract
 #     must also export the bundle again.
+#   * Proto export: two real `--proto` exports must give the same bytes as
+#     the committed `examples/mesh-storefront/contracts/proto/`, and
+#     `--check` must pass on the committed lock.
+#   * buf: `buf lint` and `buf build` on each golden proto export, and
+#     `buf breaking` agrees with `autumn contracts check` on each golden
+#     release pair (`autumn-cli/tests/integration/contracts_proto.rs`).
 #
 # The path filter keeps this job off PRs that do not touch wire code.
 
@@ -18,6 +24,9 @@ on:
   pull_request:
     branches: [trunk, trunk-dev]
     paths:
+      - "autumn-cli/tests/golden/contracts/**"
+      - "autumn-cli/tests/integration/contracts_proto.rs"
+      - "autumn-cli/tests/fixtures/googleapis-stub/**"
       - "autumn-macros/src/wire/**"
       - "autumn-macros/src/event.rs"
       - "autumn-macros/src/listener.rs"
@@ -33,6 +42,9 @@ on:
   push:
     branches: [trunk, trunk-dev]
     paths:
+      - "autumn-cli/tests/golden/contracts/**"
+      - "autumn-cli/tests/integration/contracts_proto.rs"
+      - "autumn-cli/tests/fixtures/googleapis-stub/**"
       - "autumn-macros/src/wire/**"
       - "autumn-macros/src/event.rs"
       - "autumn-macros/src/listener.rs"
@@ -84,3 +96,19 @@ jobs:
         env:
           AUTUMN_BIN: target/debug/autumn
         run: python3 scripts/wire-contract-sweep.py
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install buf
+        run: |
+          npm install --prefix "$RUNNER_TEMP/buf" @bufbuild/buf@1.75.0
+          "$RUNNER_TEMP/buf/node_modules/.bin/buf" --version
+      - name: buf lint, build and breaking on the proto export
+        env:
+          BUF: ${{ runner.temp }}/buf/node_modules/.bin/buf
+        run: |
+          cargo test -p autumn-cli --test cli_tests -- --ignored --exact \
+            integration::contracts_proto::buf_lint_and_buf_build_pass_on_each_proto_export \
+            integration::contracts_proto::buf_breaking_finds_no_break_that_contracts_check_approved \
+            | tee "$RUNNER_TEMP/buf.log"
+          grep -Eq "test result: ok\. 2 passed" "$RUNNER_TEMP/buf.log"

@@ -55,6 +55,10 @@ pub struct WireFieldDescriptor {
     /// source order. The export fills them in. See [`type_id`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nested: Vec<String>,
+    /// `#[wire(tag = N)]`: the protobuf field number of this field. It wins
+    /// over the number in the proto lock file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<u32>,
 }
 
 /// The serde-visible shape of one request or response type.

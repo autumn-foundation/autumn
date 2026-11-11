@@ -1,0 +1,32 @@
+# Field numbers of `autumn contracts export --proto`. Commit this file.
+# A number never moves. A removed field keeps its number in `reserved`.
+
+format = 1
+
+[messages."autumn.catalog.Detail".fields]
+color = 1
+
+[messages."autumn.catalog.GetItemRequest".fields]
+id = 1
+
+[messages."autumn.catalog.Item".fields]
+at = 2
+big = 6
+count = 5
+detail = 14
+extra = 18
+huge = 9
+id = 3
+labels = 13
+maybe_detail = 16
+maybe_extra = 19
+maybe_tags = 17
+note = 15
+on = 11
+ratio = 10
+seconds = 20
+size = 7
+small = 4
+tags = 12
+text = 1
+total = 8
