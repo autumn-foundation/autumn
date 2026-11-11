@@ -13,7 +13,10 @@ Reproduce: Postgres 16 with `pg_stat_statements` preloaded (autovacuum off,
 so the counters do not depend on when it runs), PG* env set, then
 `run.sh 20000`, `explain.sh`, `lock_probe.sh`, `contention.sh 40000` and
 `equivalence.sh 857350f`. Every script reads the SQL from the working tree,
-so a checkout of 857350f reproduces the baseline.
+or from the file `SQL_STORE_RS` names. For the baseline, run them with
+`SQL_STORE_RS=<(git show 857350f:autumn/src/webhook_outbound/sql_store.rs)`.
+(857350f holds the baseline numbers. The scripts were left out of it by the
+`*.sh`/`*.py` ignore rule and were added in a later commit.)
 
 Fixture: 200 subscriptions (194 healthy, 3 with 1-4 failures in a row, 2
 disabled, 1 failed) and 1,000,000 delivery logs over 30 days (97.5% 2xx, 1%
