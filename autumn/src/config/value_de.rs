@@ -23,7 +23,7 @@ use super::{AnyProbe, SchemaDeserializer};
 /// The key that toml uses to carry a datetime through serde.
 ///
 /// `toml::Value` and `toml_datetime::Datetime` read a one-entry map with this
-/// key as a datetime. A test keeps the two in step.
+/// key as a datetime. A test checks that the two agree.
 const DATETIME_KEY: &str = "$__toml_private_datetime";
 
 /// Deserialize `T` from a merged config value.
@@ -130,29 +130,25 @@ fn read_value<'de, V: Visitor<'de>>(value: toml::Value, visitor: V) -> Result<V:
             table.insert(DATETIME_KEY.to_owned(), toml::Value::String(v.to_string()));
             visitor.visit_map(&mut Entries::table(table))
         }
-        toml::Value::Array(v) => {
-            let len = v.len();
-            let mut access = Items::Array {
-                iter: v.into_iter(),
-                index: 0,
-            };
-            let out = visitor.visit_seq(&mut access)?;
-            if access.is_empty() {
-                Ok(out)
-            } else {
-                Err(de::Error::invalid_length(len, &"fewer elements in array"))
-            }
-        }
-        toml::Value::Table(v) => {
-            let len = v.len();
-            let mut access = Entries::table(v);
-            let out = visitor.visit_map(&mut access)?;
-            if access.is_empty() {
-                Ok(out)
-            } else {
-                Err(de::Error::invalid_length(len, &"fewer elements in map"))
-            }
-        }
+        // As in toml, a visitor can stop before the last item.
+        toml::Value::Array(v) => visitor.visit_seq(&mut Items::Array {
+            iter: v.into_iter(),
+            index: 0,
+        }),
+        toml::Value::Table(v) => visitor.visit_map(&mut Entries::table(v)),
+    }
+}
+
+/// The serde name of a value's type, for an error.
+fn unexpected(value: &toml::Value) -> de::Unexpected<'_> {
+    match value {
+        toml::Value::String(v) => de::Unexpected::Str(v),
+        toml::Value::Integer(v) => de::Unexpected::Signed(*v),
+        toml::Value::Float(v) => de::Unexpected::Float(*v),
+        toml::Value::Boolean(v) => de::Unexpected::Bool(*v),
+        toml::Value::Datetime(_) => de::Unexpected::Other("datetime"),
+        toml::Value::Array(_) => de::Unexpected::Seq,
+        toml::Value::Table(_) => de::Unexpected::Map,
     }
 }
 
@@ -337,9 +333,9 @@ impl<'de> de::Deserializer<'de> for ConfigDe {
                     value: Some(value),
                 })
             }
-            Self::Value(_) => Err(de::Error::invalid_type(
-                de::Unexpected::UnitVariant,
-                &"string only",
+            Self::Value(value) => Err(de::Error::invalid_type(
+                unexpected(&value),
+                &"string or table",
             )),
             // The first real variant name. An empty name is an unknown
             // variant, and that error stops the walk for every later
@@ -383,13 +379,6 @@ impl Entries {
             fields: fields.iter(),
             current: None,
             walk,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Table { iter, .. } => iter.len() == 0,
-            Self::Fields { fields, .. } => fields.len() == 0,
         }
     }
 }
@@ -467,15 +456,6 @@ enum Items {
     },
 }
 
-impl Items {
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Array { iter, .. } => iter.len() == 0,
-            Self::Probe { done, .. } => *done,
-        }
-    }
-}
-
 impl<'de> SeqAccess<'de> for Items {
     type Error = Error;
 
@@ -545,8 +525,11 @@ impl<'de> VariantAccess<'de> for Variant {
                 value: Some(toml::Value::Table(table)),
                 ..
             } if table.is_empty() => Ok(()),
-            Self::Value { name, .. } => {
-                let err: Error = de::Error::invalid_type(de::Unexpected::Map, &"unit variant");
+            Self::Value {
+                name,
+                value: Some(value),
+            } => {
+                let err: Error = de::Error::invalid_type(unexpected(&value), &"unit variant");
                 Err(err.at(Segment::Key(name)))
             }
         }
@@ -570,29 +553,34 @@ impl<'de> VariantAccess<'de> for Variant {
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
-        self.compound_variant(visitor, "tuple variant")
+        self.compound_variant(visitor, &[], "tuple variant")
     }
 
     fn struct_variant<V: Visitor<'de>>(
         self,
-        _fields: &'static [&'static str],
+        fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        self.compound_variant(visitor, "struct variant")
+        self.compound_variant(visitor, fields, "struct variant")
     }
 }
 
 impl Variant {
+    /// Read a tuple or struct variant. A struct variant refuses a key that
+    /// is not one of its `fields`, as toml does.
     fn compound_variant<'de, V: Visitor<'de>>(
         self,
         visitor: V,
+        fields: &'static [&'static str],
         expected: &'static str,
     ) -> Result<V::Value, Error> {
         match self {
             Self::Value {
                 name,
                 value: Some(value),
-            } => read_value(value, visitor).map_err(|e| e.at(Segment::Key(name))),
+            } => check_struct_keys(&value, fields)
+                .and_then(|()| read_value(value, visitor))
+                .map_err(|e| e.at(Segment::Key(name))),
             Self::Value { value: None, .. } => Err(de::Error::invalid_type(
                 de::Unexpected::UnitVariant,
                 &expected,
@@ -600,6 +588,29 @@ impl Variant {
             Self::Schema(_) => visitor.visit_unit(),
         }
     }
+}
+
+/// Refuse a table key that the struct variant does not have.
+fn check_struct_keys(value: &toml::Value, fields: &'static [&'static str]) -> Result<(), Error> {
+    let toml::Value::Table(table) = value else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let extra: Vec<&str> = table
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !fields.contains(key))
+        .collect();
+    if extra.is_empty() {
+        return Ok(());
+    }
+    Err(de::Error::custom(format!(
+        "unexpected keys in table: {}, available keys: {}",
+        extra.join(", "),
+        fields.join(", ")
+    )))
 }
 
 #[cfg(test)]
@@ -842,7 +853,11 @@ mod tests {
         );
         for path in files {
             let text = std::fs::read_to_string(&path).expect("read config");
-            assert_same_config(&text, &path.display().to_string());
+            let label = path.display().to_string();
+            if let Err(err) = toml::from_str::<crate::config::AutumnConfig>(&text) {
+                panic!("{label} must be a valid config: {err}");
+            }
+            assert_same_config(&text, &label);
         }
     }
 
@@ -906,13 +921,96 @@ sli = "availability"
         assert!(text.contains("in `server.port`"), "{text}");
     }
 
+    #[test]
+    fn a_datetime_into_a_string_field_is_an_error_as_in_toml() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only the error is read")]
+        struct S {
+            at: String,
+        }
+        let text = "at = 2026-11-10T08:00:00Z\n";
+        assert!(toml::from_str::<S>(text).is_err());
+        let err = parse::<S>(text).unwrap_err().to_string();
+        assert!(err.contains("in `at`"), "{err}");
+    }
+
+    #[test]
+    fn a_unit_variant_with_a_payload_is_an_error() {
+        let err = parse::<Modes>("b = \"off\"\nc = \"off\"\n[a.off]\nx = 1\n").unwrap_err();
+        assert!(err.to_string().contains("in `a.off`"), "{err}");
+    }
+
+    #[test]
+    fn an_enum_of_the_wrong_type_names_the_type() {
+        let err = parse::<Modes>("a = 1\nb = \"off\"\nc = \"off\"\n").unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("integer `1`, expected string or table"),
+            "{text}"
+        );
+    }
+
+    /// toml refuses an unknown key in a struct variant. So does this path.
+    #[test]
+    fn a_struct_variant_refuses_an_unknown_key() {
+        let text = "a = \"off\"\nb = \"off\"\n[c.window]\nsize = 9\nsiez = 1\n";
+        assert!(toml::from_str::<Modes>(text).is_err());
+        let err = parse::<Modes>(text).unwrap_err().to_string();
+        assert!(err.contains("unexpected keys in table: siez"), "{err}");
+        assert!(err.contains("in `c.window`"), "{err}");
+    }
+
+    #[test]
+    fn load_from_reads_a_file_and_names_the_key_of_a_bad_value() {
+        use crate::config::{AutumnConfig, ConfigError};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("autumn.toml");
+        std::fs::write(&path, "[server]\nport = 4000\n").expect("write");
+        assert_eq!(
+            AutumnConfig::load_from(&path).expect("load").server.port,
+            4000
+        );
+        std::fs::write(&path, "[server]\nport = \"x\"\n").expect("write");
+        let err = AutumnConfig::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("in `server.port`"), "{err}");
+        std::fs::write(&path, "[server\n").expect("write");
+        assert!(matches!(
+            AutumnConfig::load_from(&path),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    /// The public `SchemaDeserializer` runs the walk of `get_schema_keys`.
+    #[test]
+    fn the_public_schema_deserializer_records_the_same_schema() {
+        use serde::Deserialize as _;
+        let walk = crate::config::SchemaDeserializer::new();
+        let _ = crate::config::AutumnConfig::deserialize(walk.clone());
+        let schema = walk.into_schema();
+        assert!(
+            schema.get("server").is_some_and(|f| f.contains("port")),
+            "{schema:?}"
+        );
+        // `get_schema_keys` can walk again, so compare one table.
+        let full = crate::config::AutumnConfig::get_schema_keys();
+        assert_eq!(schema.get("server"), full.get("server"));
+    }
+
+    /// The lines of the pretty `Debug` output, sorted. Two `HashMap`s with the
+    /// same entries can list them in a different order.
+    fn sorted_debug(config: &crate::config::AutumnConfig) -> Vec<String> {
+        let mut lines: Vec<String> = format!("{config:#?}").lines().map(str::to_owned).collect();
+        lines.sort();
+        lines
+    }
+
     fn assert_same_config(text: &str, label: &str) {
         let expected = toml::from_str::<crate::config::AutumnConfig>(text);
         let actual = from_value::<crate::config::AutumnConfig>(value(text));
         match (expected, actual) {
             (Ok(expected), Ok(actual)) => assert_eq!(
-                format!("{expected:?}"),
-                format!("{actual:?}"),
+                sorted_debug(&expected),
+                sorted_debug(&actual),
                 "config differs for {label}"
             ),
             (Err(_), Err(_)) => {}
@@ -929,11 +1027,16 @@ sli = "availability"
     /// `toml::Table` or `toml::Value`.
     #[test]
     fn config_code_parses_text_only_into_raw_toml() {
-        let src = include_str!("../config.rs");
+        // A Windows checkout can have CRLF line ends.
+        let src = include_str!("../config.rs").replace("\r\n", "\n");
         let body = src
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("source");
+        assert!(
+            body.len() < src.len(),
+            "config.rs has no test module marker"
+        );
         for (number, line) in body.lines().enumerate() {
             let Some(at) = line.find("toml::from_str") else {
                 continue;

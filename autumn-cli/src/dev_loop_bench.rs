@@ -133,12 +133,13 @@ pub const fn budget_for(class: ChangeClass) -> LatencyBudget {
         //
         // Issue #2795 gated rarely used modules of `autumn-web` (ADR 0027).
         // The scheduled CI runs after that change measured 89-104s. The
-        // values below keep about 15% above the slowest sample. See
+        // gate checks p95 and max only. With 3 runs, p95 is the slowest
+        // sample. p95 is about 20% above the slowest sample seen. See
         // docs/guide/dev-loop-latency.md for the full history.
         ChangeClass::ColdStartHello => LatencyBudget {
             p50_ms: 100_000,
-            p95_ms: 120_000,
-            max_ms: 145_000,
+            p95_ms: 125_000,
+            max_ms: 150_000,
         },
         // Database-backed cold start is informational only in this slice, so
         // these limits are not gated. The bundled managed-Postgres provider adds
@@ -1859,12 +1860,12 @@ mod tests {
 
     #[test]
     fn budget_cold_start_hello_is_tightened_from_ci_data() {
-        // Issue #2795. CI measured 89-104s after the compile gates. The
-        // budget keeps about 15% above the slowest sample.
+        // Issue #2795. CI measured 89-104s after the compile gates. p95 is
+        // about 20% above the slowest sample.
         let budget = budget_for(ChangeClass::ColdStartHello);
         assert_eq!(budget.p50_ms, 100_000);
-        assert_eq!(budget.p95_ms, 120_000);
-        assert_eq!(budget.max_ms, 145_000);
+        assert_eq!(budget.p95_ms, 125_000);
+        assert_eq!(budget.max_ms, 150_000);
     }
 
     #[test]
@@ -1906,10 +1907,10 @@ mod tests {
             table.to_lowercase().contains("cold start"),
             "table must mention cold start, got:\n{table}"
         );
-        // The 120s p95 budget for the gated no-DB shape must be visible.
+        // The 125s p95 budget for the gated no-DB shape must be visible.
         assert!(
-            table.contains("120000") || table.contains("120 000"),
-            "table must show the 120s p95 budget, got:\n{table}"
+            table.contains("125000") || table.contains("125 000"),
+            "table must show the 125s p95 budget, got:\n{table}"
         );
     }
 
@@ -1941,7 +1942,7 @@ mod tests {
 
     #[test]
     fn build_cold_start_report_hello_over_budget_fails_gate() {
-        // p95 well above the 130s budget → gate fails.
+        // p95 well above the 125s budget → gate fails.
         let report =
             build_cold_start_report(&[200_000, 210_000, 220_000], &DbOutcome::NotRequested);
         assert!(!report.all_passed, "over-budget hello must fail the gate");

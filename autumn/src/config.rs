@@ -3131,9 +3131,11 @@ fn default_channels_redis_prefix() -> String {
 ///
 /// Off by default. When enabled, the node binds a small authenticated gossip
 /// listener, discovers the peers named in `seed_peers`, and exposes a
-/// cluster-wide counter through
-/// [`ClusterHandle`](crate::cluster::ClusterHandle). No external coordination
-/// service is involved — see `docs/guide/clustering.md`.
+/// cluster-wide counter through `autumn_web::cluster::ClusterHandle`. No
+/// external coordination service is involved — see `docs/guide/clustering.md`.
+///
+/// `enabled = true` needs the `cluster` feature. The section parses without
+/// it, and boot fails.
 ///
 /// The transport is **authenticated (HMAC-SHA256), not encrypted**: run it on a
 /// trusted network.
@@ -3314,12 +3316,18 @@ impl ClusterConfig {
     /// Refuse `enabled = true` in a build without the `cluster` feature.
     ///
     /// That build has no cluster runtime. A node that does not join is a
-    /// fault, so boot fails and does not continue alone.
-    fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+    /// fault, so boot fails and does not continue alone. Only boot calls
+    /// this. `validate` does not, because the CLI reads the config of an
+    /// app that it does not run.
+    #[cfg_attr(
+        all(feature = "cluster", not(test)),
+        allow(dead_code, reason = "boot calls it only without the `cluster` feature")
+    )]
+    pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
         if enabled && !built {
             return Err(ConfigError::Validation(
-                "cluster.enabled is true, but this build lacks the `cluster` feature. \
-                 Turn on the feature, or set cluster.enabled = false"
+                "cluster.enabled is true, but this build does not have the `cluster` \
+                 feature. Turn on the feature, or set cluster.enabled = false"
                     .to_owned(),
             ));
         }
@@ -3352,7 +3360,6 @@ impl ClusterConfig {
     ///
     /// Returns [`ConfigError::Validation`] describing the first violated rule.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        Self::check_feature(self.enabled, cfg!(feature = "cluster"))?;
         // Operational rules: only meaningful for a node that will actually
         // bind and gossip.
         if self.enabled {

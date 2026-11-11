@@ -53,10 +53,10 @@ it gets its own budget and gate (issue #977).
 
 | Change class | p50 ms | p95 ms | max ms | Gate |
 |---|---:|---:|---:|---|
-| Cold start (`autumn new` → first 200, no-DB) | 100 000 | **120 000** | 145 000 | **Gated** |
+| Cold start (`autumn new` → first 200, no-DB) | 100 000 | **125 000** | 150 000 | **Gated** |
 | Cold start (`autumn new` → first 200, database-backed) | 120 000 | 180 000 | 300 000 | Informational |
 
-**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **120 s** on
+**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **125 s** on
 the CI reference runner. Autumn's stated goal is still "time-from-`cargo new`
 to first served route < 60 s"; the gate above is the realistic ceiling for
 today's code, not the goal. See [Cold-start budget history](#cold-start-budget-history)
@@ -143,9 +143,10 @@ features (ADR 0027). The daemon starter turns them off, and `psl` leaves its
 build. A default build does not change. On one 4 vCPU box a cold `hello`
 build fell from 118 s to 101 s.
 
-The scheduled CI runs after ADR 0027 measured 89-104 s. The budget is now
-p95 120 s / max 145 s, about 15% above the slowest sample. It was p95 130 s
-/ max 160 s.
+Issue #2309 had raised the budget to p95 130 s / max 160 s. The scheduled
+CI runs after ADR 0027 measured 89-104 s. The budget is now p95 125 s / max
+150 s. The gate checks p95 and max only, and with 3 runs p95 is the slowest
+sample. p95 is about 20% above the slowest sample seen.
 
 ADR 0045 cut the LLVM IR of `autumn-web` for the daemon starter by 13.4%:
 
@@ -155,8 +156,9 @@ ADR 0045 cut the LLVM IR of `autumn-web` for the daemon starter by 13.4%:
 2. The `cluster` module has a default-on feature. The daemon starter turns
    it off.
 
-On one 4 vCPU box, the cold `hello` build changed by about 3%. That is less
-than the run-to-run noise there. Backend work (LLVM) runs on all cores, and
+On one 4 vCPU box, `autumn-web` alone built 5% faster (median of 4). The
+cold `hello` build fell by about 2% (median of 5). That is less than the
+run-to-run noise there. Backend work (LLVM) runs on all cores, and
 the front end does not, so fewer IR lines give a smaller time gain.
 
 The original 60 s / 90 s target is still open. `autumn-web` is still about

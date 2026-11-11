@@ -6010,9 +6010,9 @@ impl AppBuilder {
         #[cfg(feature = "cluster")]
         let installed =
             crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown);
-        // Without the `cluster` feature, this refuses `enabled = true`.
+        // Without the `cluster` feature, boot refuses `enabled = true`.
         #[cfg(not(feature = "cluster"))]
-        let installed = config.cluster.validate();
+        let installed = crate::config::ClusterConfig::check_feature(config.cluster.enabled, false);
         if let Err(error) = installed {
             tracing::error!(error = %error, "cluster installation failed");
             #[cfg(feature = "managed-pg")]

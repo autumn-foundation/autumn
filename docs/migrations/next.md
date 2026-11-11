@@ -628,8 +628,9 @@ feature is in `default`, so a default build does not change.
 
 **You are affected only if your app sets `default-features = false` and uses
 `autumn_web::cluster` or `[cluster] enabled = true`.** The compiler reports
-`could not find cluster`. Without the feature, `[cluster]` still parses, and
-`enabled = true` fails boot with a validation error.
+``error[E0432]: unresolved import `autumn_web::cluster` ``. Without the
+feature, `[cluster]` still parses, and `enabled = true` fails boot with a
+validation error.
 
 **Before (`{X.Y}`):**
 
@@ -747,9 +748,11 @@ If nothing changed, delete this section.
   feature now pulls in `fd-lock`, which the `sqlite` feature pulled in
   before. No new crate.
 - **Config:** a type error in `autumn.toml` now names the full key, for
-  example ``in `server.port` ``. Before, it showed a line of the merged
-  config, which is not a file you wrote. A message parser that read the
-  `TOML parse error at line` prefix must read the key instead.
+  example ``in `server.port` ``. Before, `AutumnConfig::load` showed a line
+  of the merged config, which is not a file you wrote. `load_from` errors
+  also give the key, not the line. A syntax error keeps its line. A message
+  parser that read the `TOML parse error at line` prefix of a type error
+  must read the key instead.
 
 Changes that still compile but behave differently at runtime. Examples:
 

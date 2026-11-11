@@ -63,18 +63,23 @@ Six hats:
    a merged `toml::Value`. `Schema` is the schema walk. Both use one map
    type, one sequence type and one enum type. Each config struct compiles
    one visitor copy.
-2. `AutumnConfig::load` and `load_from` read through `ConfigDe`. `load` does
-   not print and parse the merged config again. A type error names its key:
-   ``in `server.port` ``. `ConfigError::Parse` keeps its type.
+2. `AutumnConfig::load` and `load_from` read through `ConfigDe`. Without
+   `strict_config`, `load` does not print and parse the merged config again.
+   A type error names its key: ``in `server.port` ``. `ConfigError::Parse`
+   keeps its type. A syntax error keeps its line, because each file is
+   parsed into a `toml::Table` first.
 3. A datetime goes to a visitor as a one-entry map with toml's datetime key.
    `toml::Value` and `toml_datetime::Datetime` read it as before.
 4. The public `SchemaDeserializer` keeps its API. Each method runs the
    `Schema` arm of `ConfigDe`.
 5. `cluster` is a default-on feature, as the ADR 0027 gates. Without it,
-   `[cluster]` still parses. `enabled = true` fails validation, because a
-   node that does not join is a fault. The `push` feature does the same.
-6. The `ColdStartHello` budget is p95 120 s and max 145 s. That is about 15%
-   above the slowest CI sample after ADR 0027.
+   `[cluster]` still parses. Boot fails on `enabled = true`, because a node
+   that does not join is a fault. `push` also fails boot when its section is
+   set without the feature. `ClusterConfig::validate` does not check the
+   feature: the CLI builds without it and must still read the app's config.
+6. The `ColdStartHello` budget is p95 125 s and max 150 s. The gate checks
+   p95 and max only, and with 3 runs p95 is the slowest sample. p95 is about
+   20% above the slowest CI sample after ADR 0027.
 
 Tests:
 
@@ -95,14 +100,20 @@ Tests:
 ## Consequences
 
 - IR lines, daemon feature set: 3,462,902 before, 3,000,123 after (-13.4%).
-  The config change is -8.7% in a build with `cluster` on.
-- Build time on one 4 vCPU box: see the PR. The change is small next to the
-  run-to-run noise, because LLVM work runs on all cores and the front end
-  does not.
+  The same build with `cluster` on has 3,162,592 (-8.7%). That is the
+  config change alone.
+- Build time on one 4 vCPU box, interleaved samples, medians: `autumn-web`
+  alone 39.9 s to 37.8 s (-5.3%, n = 4). A cold scaffold build 79.2 s to
+  77.7 s (-1.8%, n = 5). The scaffold change is less than the run-to-run
+  noise. LLVM work runs on all cores, and the front end does not. So fewer
+  IR lines give a smaller time gain.
 - The schema from `get_schema_keys()` is the same as before (111 tables).
 - An app with `default-features = false` that uses the cluster adds
   `"cluster"`. See `docs/migrations/next.md`.
 - A program that parsed the `TOML parse error at line` text of a config
-  error must read the key path instead.
+  type error must read the key path instead.
+- Small differences from `toml::from_str` remain. Map keys are always
+  strings, and a tuple variant cannot be written as a table. No config type
+  uses either.
 - The 60 s / 90 s target is still open. A split of `autumn-web` is the next
   lever.

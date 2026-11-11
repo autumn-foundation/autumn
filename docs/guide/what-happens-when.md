@@ -120,7 +120,7 @@ This is intentional -- static sites and API gateways don't need a database.
 Startup fails immediately with a clear parse error:
 
 ```
-Failed to load configuration: TOML parse error at line 3, column 5
+Failed to load configuration: invalid autumn.toml: TOML parse error at line 3, column 5
 ```
 
 ### A value of the wrong type
@@ -128,7 +128,7 @@ Failed to load configuration: TOML parse error at line 3, column 5
 Startup fails immediately. The error names the full key:
 
 ```
-invalid autumn.toml: invalid type: string "eighty", expected u16
+Failed to load configuration: invalid autumn.toml: invalid type: string "eighty", expected u16
 in `server.port`
 ```
 
