@@ -583,7 +583,7 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * One workspace. Both ends must be present at build time.
 * Contracts come from Rust types only. Autumn does not import `.proto` or
   Avro files. [ADR 0046](../adr/0046-wire-contracts-idl-at-the-edge.md) gives
-  the reasons, and tells which growth of this list reopens the decision.
+  the reasons. It also says which new limits reopen the decision.
 * Synchronous request/response and events, as JSON. No streaming or
   websockets.
 * Path parameters and a JSON body. Query parameters are not part of the
