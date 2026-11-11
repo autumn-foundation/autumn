@@ -9,6 +9,10 @@
 //! tests, so this file is excluded from coverage (see `codecov.yml`), mirroring
 //! `build.rs` and `dev.rs`.
 //!
+//! Before the samples, one untimed step does the network work of a first
+//! build: toolchain install, index update, crate downloads. The report shows
+//! its time apart from the samples.
+//!
 //! The **pure**, unit-tested half — budgets, statistics, budget checking, report
 //! building, and the dry-run budget table — lives in
 //! [`crate::dev_loop_bench`]; this driver calls into it.
@@ -19,8 +23,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::dev_loop_bench::{
-    ChangeClass, DbOutcome, budget_for, build_cold_start_report, cargo_executable_path,
-    emit_report, format_cold_start_budget_table,
+    COLD_BUILD_ENV, ChangeClass, ColdStartPreparation, DbOutcome, budget_for,
+    build_cold_start_report, cargo_executable_path, cold_start_fetch_args, emit_report,
+    format_cold_start_budget_table, record_preparation,
 };
 
 /// Which scaffolded project shape to measure for cold start.
@@ -98,22 +103,9 @@ pub fn repoint_autumn_web(project_dir: &Path, autumn_web: &Path) -> Result<(), S
     Ok(())
 }
 
-/// Measure a single cold-start journey end-to-end: scaffold a throwaway project,
-/// compile it from a cold target, start it, and time until the first HTTP 200.
-///
-/// Returns the elapsed milliseconds from just before `autumn new` to the first
-/// successful response on `/`.
-fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
-    let autumn_web = cached_autumn_web().ok_or_else(|| {
-        "could not locate (or canonicalize) the workspace autumn-web crate; \
-         set AUTUMN_BENCH_AUTUMN_WEB_PATH to its directory"
-            .to_string()
-    })?;
-
-    let tmp = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
-    let project_name = "coldstart_app";
-
-    let opts = match shape {
+/// The scaffold options of a cold-start shape.
+fn options_for(shape: ColdStartShape) -> crate::new::GenerateOptions {
+    match shape {
         // The DB-free daemon starter compiles and serves without Postgres.
         ColdStartShape::Hello => crate::new::GenerateOptions {
             with_daemon: true,
@@ -127,19 +119,95 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
             with_bundled_pg: true,
             ..Default::default()
         },
-    };
+    }
+}
+
+/// Scaffold a throwaway project of this shape and point it at the local
+/// `autumn-web`. Returns the project directory.
+fn scaffold(shape: ColdStartShape, parent: &Path, project_name: &str) -> Result<PathBuf, String> {
+    let autumn_web = cached_autumn_web().ok_or_else(|| {
+        "could not locate (or canonicalize) the workspace autumn-web crate; \
+         set AUTUMN_BENCH_AUTUMN_WEB_PATH to its directory"
+            .to_string()
+    })?;
+    // Quiet scaffold: keep stdout clean so `--cold-start --json` emits only the
+    // JSON report.
+    crate::new::generate_with_quiet(project_name, parent, options_for(shape))
+        .map_err(|e| format!("autumn new failed: {e}"))?;
+    let project_dir = parent.join(project_name);
+    repoint_autumn_web(&project_dir, &autumn_web)?;
+    Ok(project_dir)
+}
+
+/// Remove the inherited target settings and set [`COLD_BUILD_ENV`].
+fn apply_cold_env(cargo: &mut Command) {
+    cargo
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET");
+    for (name, value) in COLD_BUILD_ENV {
+        cargo.env(name, value);
+    }
+}
+
+/// Do the network work of a first build before the clock starts.
+///
+/// `cargo fetch` in a throwaway scaffold installs the toolchain that the
+/// scaffold pins, updates the index and downloads the crates. It compiles
+/// nothing and its project is deleted, so each sample still builds from cold.
+/// See [`ColdStartPreparation`].
+fn prepare_cold_start(shape: ColdStartShape) -> Result<ColdStartPreparation, String> {
+    let tmp = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
+    let start = Instant::now();
+    let project_dir = scaffold(shape, tmp.path(), "coldstart_prepare")?;
+
+    let mut fetch = Command::new("cargo");
+    fetch
+        .args(cold_start_fetch_args(
+            cached_host_target_triple().as_deref(),
+        ))
+        .current_dir(&project_dir);
+    apply_cold_env(&mut fetch);
+    let output = fetch
+        .output()
+        .map_err(|e| format!("cargo fetch spawn failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo fetch failed for the scaffolded project:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    // The scaffold's own `rust-toolchain.toml` selects this compiler.
+    let rust_version = Command::new("rustc")
+        .arg("--version")
+        .current_dir(&project_dir)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .filter(|version| !version.is_empty());
+
+    Ok(ColdStartPreparation {
+        elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        rust_version,
+    })
+}
+
+/// Measure a single cold-start journey end-to-end: scaffold a throwaway project,
+/// compile it from a cold target, start it, and time until the first HTTP 200.
+///
+/// Returns the elapsed milliseconds from just before `autumn new` to the first
+/// successful response on `/`.
+fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
+    let tmp = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
+    let project_name = "coldstart_app";
 
     // Start the clock just before `autumn new` so the whole onboarding journey
     // (scaffold → first clean compile → boot → first 200) is captured.
     let start = Instant::now();
 
-    // Quiet scaffold: keep stdout clean so `--cold-start --json` emits only the
-    // JSON report.
-    crate::new::generate_with_quiet(project_name, tmp.path(), opts)
-        .map_err(|e| format!("autumn new failed: {e}"))?;
-    let project_dir = tmp.path().join(project_name);
-
-    repoint_autumn_web(&project_dir, &autumn_web)?;
+    let project_dir = scaffold(shape, tmp.path(), project_name)?;
 
     let bin = cold_build(&project_dir, project_name)?;
 
@@ -255,22 +323,10 @@ fn cold_build(project_dir: &Path, project_name: &str) -> Result<PathBuf, String>
     build
         .args(["build", "--message-format=json", "--target-dir"])
         .arg(&target_dir)
-        .current_dir(project_dir)
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET");
-    // Disable any compiler wrapper (e.g. `sccache`) so the measurement is a genuine
-    // first clean compile. Setting each to an empty string is Cargo's documented
-    // way to disable wrapping, and an env var overrides a config-file
-    // `build.rustc-wrapper` — which `env_remove` alone cannot neutralise.
-    for var in [
-        "RUSTC_WRAPPER",
-        "RUSTC_WORKSPACE_WRAPPER",
-        "CARGO_BUILD_RUSTC_WRAPPER",
-        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
-    ] {
-        build.env(var, "");
-    }
+        .current_dir(project_dir);
+    // No inherited target settings, no compiler wrapper (e.g. `sccache`), and
+    // no incremental mode: a genuine first clean compile.
+    apply_cold_env(&mut build);
     // An explicit `--target` overrides a config-file `build.target` and keeps the
     // artifact host-runnable. If the host triple can't be determined we omit it
     // and fall back to Cargo's default (the host unless config overrides it).
@@ -362,8 +418,15 @@ pub fn stop_child(child: &mut std::process::Child) {
     }
 }
 
-/// Run the cold-start measurement `runs` times, returning the samples (ms).
-fn measure_cold_start(shape: ColdStartShape, runs: u32) -> Result<Vec<u64>, String> {
+/// Prepare, then run the cold-start measurement `runs` times. Returns the
+/// preparation and the samples (ms).
+fn measure_cold_start(
+    shape: ColdStartShape,
+    runs: u32,
+) -> Result<(ColdStartPreparation, Vec<u64>), String> {
+    eprintln!("  cold-start {shape:?} preparation (not in the samples)…");
+    let preparation = prepare_cold_start(shape)?;
+    eprintln!("    → {} ms", preparation.elapsed_ms);
     let mut samples = Vec::with_capacity(runs as usize);
     for i in 1..=runs {
         eprintln!("  cold-start {shape:?} run {i}/{runs}…");
@@ -371,7 +434,7 @@ fn measure_cold_start(shape: ColdStartShape, runs: u32) -> Result<Vec<u64>, Stri
         eprintln!("    → {ms} ms");
         samples.push(ms);
     }
-    Ok(samples)
+    Ok((preparation, samples))
 }
 
 /// Run the `autumn dev-loop-bench --cold-start` command.
@@ -412,7 +475,7 @@ pub fn run_cold_start(
          expect minutes per run.\n"
     );
 
-    let hello_samples = match measure_cold_start(ColdStartShape::Hello, runs) {
+    let (preparation, hello_samples) = match measure_cold_start(ColdStartShape::Hello, runs) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: cold-start (hello) measurement failed: {e}");
@@ -422,7 +485,7 @@ pub fn run_cold_start(
 
     let db = if include_db {
         match measure_cold_start(ColdStartShape::Db, runs) {
-            Ok(s) => DbOutcome::Measured(s),
+            Ok((_, s)) => DbOutcome::Measured(s),
             Err(e) => {
                 // The DB shape is informational; a failure must not break the run,
                 // but it is recorded in the report rather than silently dropped.
@@ -434,7 +497,8 @@ pub fn run_cold_start(
         DbOutcome::NotRequested
     };
 
-    let report = build_cold_start_report(&hello_samples, &db);
+    let mut report = build_cold_start_report(&hello_samples, &db);
+    record_preparation(&mut report, &preparation);
     emit_report(&report, json, output, fail_on_regression)
 }
 

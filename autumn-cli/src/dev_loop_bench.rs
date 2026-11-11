@@ -356,6 +356,10 @@ pub struct FullReport {
     pub example_name: String,
     pub all_passed: bool,
     pub results: Vec<BudgetCheckResult>,
+    /// Milliseconds of the cold-start preparation: toolchain install, index
+    /// update and crate downloads. The samples do not include it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prepare_ms: Option<u64>,
 }
 
 // ── Formatters ───────────────────────────────────────────────────────────────
@@ -390,6 +394,9 @@ pub fn format_human_summary(report: &FullReport) -> String {
     )
     .unwrap();
     writeln!(out, "Example: {}", report.example_name).unwrap();
+    if let Some(ms) = report.prepare_ms {
+        writeln!(out, "Preparation (not in the samples): {ms} ms").unwrap();
+    }
     out.push('\n');
 
     let col_w = 46usize;
@@ -460,6 +467,7 @@ pub fn run(
         example_name: example.to_string(),
         all_passed,
         results,
+        prepare_ms: None,
     };
 
     emit_report(&report, json, output, fail_on_regression)
@@ -677,6 +685,56 @@ pub fn build_cold_start_report(hello_samples: &[u64], db: &DbOutcome) -> FullRep
         example_name: "cold-start".to_string(),
         all_passed,
         results,
+        prepare_ms: None,
+    }
+}
+
+/// The untimed step before the cold-start samples.
+///
+/// The scaffold pins its own toolchain and has no lockfile. The first `cargo`
+/// call in a scaffold can install a toolchain, update the index and download
+/// crates. That is network time, not compile time, and it made the first
+/// sample the slowest one. The driver does this work once before the clock
+/// starts and reports the time here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdStartPreparation {
+    /// How long the preparation took.
+    pub elapsed_ms: u64,
+    /// `rustc --version` in the scaffold directory: the compiler that the
+    /// samples use. `None` when the probe failed.
+    pub rust_version: Option<String>,
+}
+
+/// The `cargo` arguments of the preparation step. It downloads. It never
+/// compiles, so the timed build stays cold.
+pub fn cold_start_fetch_args(target: Option<&str>) -> Vec<String> {
+    let mut args = vec!["fetch".to_owned()];
+    if let Some(triple) = target {
+        args.push("--target".to_owned());
+        args.push(triple.to_owned());
+    }
+    args
+}
+
+/// Environment of the timed build and of the preparation step.
+///
+/// An empty wrapper variable turns a compiler wrapper off, also one set in a
+/// config file. `CARGO_INCREMENTAL=0` builds the patched `autumn-web` as Cargo
+/// builds a registry dependency. The `[patch]` makes it a path dependency,
+/// which is incremental by default and slower to build from cold.
+pub const COLD_BUILD_ENV: &[(&str, &str)] = &[
+    ("RUSTC_WRAPPER", ""),
+    ("RUSTC_WORKSPACE_WRAPPER", ""),
+    ("CARGO_BUILD_RUSTC_WRAPPER", ""),
+    ("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", ""),
+    ("CARGO_INCREMENTAL", "0"),
+];
+
+/// Put the preparation step into a cold-start report.
+pub fn record_preparation(report: &mut FullReport, preparation: &ColdStartPreparation) {
+    report.prepare_ms = Some(preparation.elapsed_ms);
+    if let Some(version) = &preparation.rust_version {
+        report.rust_version.clone_from(version);
     }
 }
 
@@ -1587,6 +1645,7 @@ mod tests {
             example_name: "examples/hello".to_string(),
             all_passed: computed_all_passed,
             results,
+            prepare_ms: None,
         }
     }
 
@@ -1926,6 +1985,98 @@ mod tests {
             with.to_lowercase().contains("database"),
             "DB row must appear when include_db, got:\n{with}"
         );
+    }
+
+    // ── cold-start preparation ────────────────────────────────────────────
+
+    #[test]
+    fn the_preparation_step_fetches_and_never_builds() {
+        assert_eq!(cold_start_fetch_args(None), ["fetch"]);
+        let args = cold_start_fetch_args(Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(args, ["fetch", "--target", "x86_64-unknown-linux-gnu"]);
+        for compile in ["build", "check", "run", "test", "rustc"] {
+            assert!(!args.iter().any(|a| a == compile), "{compile} compiles");
+        }
+    }
+
+    #[test]
+    fn the_cold_build_turns_incremental_off_and_wrappers_off() {
+        let get = |name: &str| {
+            COLD_BUILD_ENV
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(get("CARGO_INCREMENTAL"), Some("0"));
+        for wrapper in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert_eq!(get(wrapper), Some(""), "{wrapper}");
+        }
+    }
+
+    #[test]
+    fn the_report_shows_the_preparation_and_the_scaffold_toolchain() {
+        let mut report = build_cold_start_report(&[40_000], &DbOutcome::NotRequested);
+        report.rust_version = "rustc 1.99.0".to_owned();
+        record_preparation(
+            &mut report,
+            &ColdStartPreparation {
+                elapsed_ms: 9_500,
+                rust_version: Some("rustc 1.97.0".to_owned()),
+            },
+        );
+        assert_eq!(report.prepare_ms, Some(9_500));
+        assert_eq!(report.rust_version, "rustc 1.97.0");
+        let json: serde_json::Value = serde_json::from_str(&format_json_report(&report)).unwrap();
+        assert_eq!(json["prepare_ms"], 9_500);
+        let text = format_human_summary(&report);
+        assert!(
+            text.contains("Preparation (not in the samples): 9500 ms"),
+            "{text}"
+        );
+        assert!(text.contains("Rust: rustc 1.97.0"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_toolchain_probe_keeps_the_reported_version() {
+        let mut report = build_cold_start_report(&[40_000], &DbOutcome::NotRequested);
+        report.rust_version = "rustc 1.99.0".to_owned();
+        record_preparation(
+            &mut report,
+            &ColdStartPreparation {
+                elapsed_ms: 1,
+                rust_version: None,
+            },
+        );
+        assert_eq!(report.rust_version, "rustc 1.99.0");
+    }
+
+    /// The preparation is not a sample. It does not change the gate.
+    #[test]
+    fn the_preparation_time_does_not_change_the_gate() {
+        let mut report = build_cold_start_report(&[40_000], &DbOutcome::NotRequested);
+        let stats_before = report.results[0].stats.p95_ms;
+        record_preparation(
+            &mut report,
+            &ColdStartPreparation {
+                elapsed_ms: 900_000,
+                rust_version: None,
+            },
+        );
+        assert!(report.all_passed);
+        assert_eq!(report.results[0].stats.p95_ms, stats_before);
+    }
+
+    #[test]
+    fn a_report_without_a_preparation_has_no_field() {
+        let report = make_test_report(true);
+        let json: serde_json::Value = serde_json::from_str(&format_json_report(&report)).unwrap();
+        assert!(json.get("prepare_ms").is_none());
+        assert!(!format_human_summary(&report).contains("Preparation"));
     }
 
     // ── cold-start report builder ─────────────────────────────────────────
