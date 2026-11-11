@@ -113,6 +113,11 @@ missing.
   macro body (`html! { (item.name) }`);
 * the **write-set** — every request field an inline struct literal sets.
 
+A field inside a field is a dotted path. `item.details.color` reads
+`details.color`. `NewItem { details: Details { color, .. }, .. }` writes
+`details` and `details.color`. The const assertions check the first segment
+only. Both ends of one build share the nested type, so rustc checks the rest.
+
 Each becomes a const assertion against the callee's own const field table:
 
 ```rust
@@ -273,8 +278,9 @@ serves with the types of its release. The rules:
   both orders. This also holds for list elements and nested types.
 * **Nested types.** A field whose type is a `WireShape` type is compared
   field by field, with the same rules. A break names the path, for example
-  `details.color`. A caller's read-set is known at the top level only (see
-  [Limits](#limits-of-the-first-slice)).
+  `details.color`. The read-set and the write-set apply at each level. So the
+  removal of an optional nested field that a caller reads is a break. A
+  nested field that the call site sets, and the callee drops, is a break.
 * **Field types.** A field's Rust type must not change. Path prefixes do not
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.
@@ -345,10 +351,12 @@ the removal of a topic that no bundled consumer reads. An event without
 `name` is not in the bundle. A bundle from an older CLI has no events. Then
 the check finds no deployed consumer to protect.
 
-The export writes bundle format 4. It records the wire type of each field,
-nested types, the `unit` flag, and endpoints that no router registers. An
-older CLI refuses it. This CLI reads formats 1 to 4. When one of the two
-bundles is format 3 or older, the check does not compare wire types. With a
+The export writes bundle format 5. It records dotted paths in read-sets and
+write-sets, the wire type of each field, nested types, the `unit` flag, and
+endpoints that no router registers. An older CLI refuses it. This CLI reads
+formats 1 to 5. A bundle older than format 5 has top-level paths only. When
+one of the two bundles is format 3 or older, the check does not compare wire
+types. With a
 bundle of format 1 or 2, the check compares nested types by name only. It
 does not compare the `unit` flag of a body or a nested type. It compares the
 `unit` flag of an event in every format.
@@ -645,11 +653,17 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
   crate (through a `use`), registers that handler. It does not judge that
   crate, because the name can also be a local function. Write
   `routes![mesh_catalog::get_item]` to have the check judge it.
-* A caller's read-set is known at the top level only. `item.details.color`
-  reads `details`. So the check does not see the removal of an *optional*
-  field of a nested type that a caller reads. A *required* nested field is
-  safe: the caller's type cannot decode without it. A write-set is also top
-  level only.
+* A nested read is found through a field (`item.details.color`), a binding
+  of a field (`let d = &item.details;`), a struct pattern, an adapter such as
+  `.unwrap()` or `.as_ref()`, and a callback such as `.map(|d| d.color)`. A
+  read through an index, a loop or another function stops at the field
+  before it. `item.lines[0].sku` reads `lines`. Then the check does not see
+  the removal of an *optional* field inside it. A *required* nested field is
+  safe: the caller's type cannot decode without it.
+* A nested write is found in a struct literal, also in `Some(…)` or
+  `Box::new(…)`. A nested value from a variable has an unknown write-set.
+  Then the check counts a field as sent when the caller's own release
+  requires it.
 * A request or response type is found by the path in the signature. A path
   through a re-export, such as `crate::dto::Item` for `shared::Item`, is
   refused when another crate has a type of that name. Write the path where the

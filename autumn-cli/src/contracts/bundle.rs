@@ -30,10 +30,18 @@ pub const BUNDLE_FORMAT: u32 = 1;
 /// and approve a break.
 pub const IDENTITY_FORMAT: u32 = 3;
 
-/// The bundle format with a wire type on each field. The export always
-/// writes it. An older CLI refuses it, because it would not compare the wire
-/// types and would approve a change of the JSON form.
+/// The bundle format with a wire type on each field. An older CLI refuses
+/// it, because it would not compare the wire types and would approve a
+/// change of the JSON form. Only tests use it now: the reader does not need
+/// it to compare wire types.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const WIRE_TYPE_FORMAT: u32 = 4;
+
+/// The bundle format with dotted paths in read-sets and write-sets
+/// (`details.color`). The export always writes it. An older CLI refuses it,
+/// because it would not find a dotted path and would approve the removal of
+/// a nested field that a caller reads.
+pub const NESTED_PATHS_FORMAT: u32 = 5;
 
 /// The type name of an endpoint with no request body.
 pub use autumn_macros_support::wire::NO_BODY;
@@ -105,7 +113,8 @@ pub struct BundleListener {
     pub function: String,
     /// The topic of the event it consumes.
     pub topic: String,
-    /// Payload fields the consumer reads, by Rust name.
+    /// Payload fields the consumer reads, by Rust name. A nested read is a
+    /// dotted path: `address.city`.
     pub reads: Vec<String>,
 }
 
@@ -175,9 +184,11 @@ pub struct BundleCall {
     pub service: String,
     /// The endpoint called.
     pub endpoint: String,
-    /// Response fields the caller reads, by Rust name.
+    /// Response fields the caller reads, by Rust name. A nested read is a
+    /// dotted path: `details.color`.
     pub reads: Vec<String>,
-    /// Request fields the call site sets, by Rust name. `None` when unknown.
+    /// Request fields the call site sets, by Rust name. A field of a nested
+    /// literal is a dotted path. `None` when unknown.
     pub writes: Option<Vec<String>>,
 }
 
@@ -220,10 +231,10 @@ impl Bundle {
     pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
         let mut bundle: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("not a contract bundle: {e}"))?;
-        if !(BUNDLE_FORMAT..=WIRE_TYPE_FORMAT).contains(&bundle.format) {
+        if !(BUNDLE_FORMAT..=NESTED_PATHS_FORMAT).contains(&bundle.format) {
             return Err(format!(
                 "contract bundle format {} is not supported; this CLI reads formats \
-                 {BUNDLE_FORMAT} to {WIRE_TYPE_FORMAT}",
+                 {BUNDLE_FORMAT} to {NESTED_PATHS_FORMAT}",
                 bundle.format
             ));
         }
@@ -359,7 +370,7 @@ impl Bundle {
         let joined_events = join_events(&filled)?;
         let (joined_listeners, unresolved) = join_listeners(&listeners, &events)?;
         Ok(Self {
-            format: WIRE_TYPE_FORMAT,
+            format: NESTED_PATHS_FORMAT,
             endpoints: joined,
             callers: calls.into_iter().collect(),
             events: joined_events,
@@ -1077,7 +1088,7 @@ mod tests {
     fn the_bundle_joins_endpoints_types_and_callers() {
         let dir = fixture();
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
-        assert_eq!(bundle.format, WIRE_TYPE_FORMAT);
+        assert_eq!(bundle.format, NESTED_PATHS_FORMAT);
         let [ep] = bundle.endpoints.as_slice() else {
             panic!("one endpoint: {bundle:?}");
         };
@@ -1464,7 +1475,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            bundle.format, WIRE_TYPE_FORMAT,
+            bundle.format, NESTED_PATHS_FORMAT,
             "an older CLI must not drop it"
         );
     }
@@ -1499,15 +1510,15 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_with_or_without_events_has_the_wire_type_format() {
+    fn a_bundle_with_or_without_events_has_the_nested_paths_format() {
         let dir = event_fixture();
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
-        assert_eq!(bundle.format, WIRE_TYPE_FORMAT);
+        assert_eq!(bundle.format, NESTED_PATHS_FORMAT);
         assert_eq!(
             Bundle::from_dir(fixture().path()).expect("bundle").format,
-            WIRE_TYPE_FORMAT
+            NESTED_PATHS_FORMAT
         );
-        for old in [BUNDLE_FORMAT, 2, IDENTITY_FORMAT] {
+        for old in [BUNDLE_FORMAT, 2, IDENTITY_FORMAT, WIRE_TYPE_FORMAT] {
             let bytes = format!(r#"{{"format": {old}, "endpoints": [], "callers": []}}"#);
             Bundle::from_slice(bytes.as_bytes()).expect("an older format still parses");
         }
@@ -2164,10 +2175,10 @@ mod tests {
 
     #[test]
     fn a_newer_format_is_refused_and_names_the_formats_this_cli_reads() {
-        let err = Bundle::from_slice(br#"{"format": 5, "endpoints": [], "callers": []}"#)
+        let err = Bundle::from_slice(br#"{"format": 6, "endpoints": [], "callers": []}"#)
             .expect_err("refused");
-        assert!(err.contains("format 5"), "{err}");
-        assert!(err.contains("formats 1 to 4"), "{err}");
+        assert!(err.contains("format 6"), "{err}");
+        assert!(err.contains("formats 1 to 5"), "{err}");
     }
 
     #[test]

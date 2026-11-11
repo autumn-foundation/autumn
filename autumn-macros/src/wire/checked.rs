@@ -8,6 +8,12 @@
 //!   itself (`…await?.name`);
 //! * the **write-set** — every request field an inline struct literal sets.
 //!
+//! A field inside a field is a dotted path: `item.details.color` reads
+//! `details.color`, and `Details { color, .. }` inside the request literal
+//! writes `details.color`. The descriptor holds the paths. The const
+//! assertions use the first segment only: one build shares the nested type,
+//! so rustc itself rejects a nested field that is gone.
+//!
 //! Each set becomes a const assertion against the callee's own const field
 //! table, so the check is a cross-crate compile-time fact rather than a
 //! snapshot: rustc rebuilds the caller whenever the callee's table changes.
@@ -183,14 +189,14 @@ struct Call {
     method: Ident,
     /// Where the call is written.
     span: Span,
-    /// Response fields the caller names.
+    /// Response fields the caller names, as dotted paths.
     reads: Vec<String>,
     /// The span of the first read of each field.
     read_spans: BTreeMap<String, Span>,
     /// In payload mode: whether the walk bound the payload anywhere.
     payload_seen: bool,
-    /// Request fields the caller sets, or `None` when the request is not an
-    /// inline struct literal.
+    /// Request fields the caller sets, as dotted paths, or `None` when the
+    /// request is not an inline struct literal.
     writes: Option<Vec<String>>,
 }
 
@@ -199,11 +205,31 @@ struct Call {
 enum Bound {
     /// One of the declared clients.
     Client(usize),
-    /// The response of call `n`.
-    Response(usize),
+    /// A value inside the response of a call.
+    Response(Target),
     /// Anything else. Recorded rather than omitted, so a rebinding shadows the
     /// name instead of leaving the old meaning in force.
     Other,
+}
+
+/// A value inside one call's response: the response itself, or a field of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Target {
+    /// The index of the call in `Analyzer::calls`.
+    call: usize,
+    /// The field path from the response, as an index into `Analyzer::paths`.
+    /// [`ROOT`] is the response itself.
+    path: usize,
+}
+
+/// The `Analyzer::paths` index of the empty path: the response itself.
+const ROOT: usize = 0;
+
+impl Target {
+    /// The response of call `call`.
+    const fn root(call: usize) -> Self {
+        Self { call, path: ROOT }
+    }
 }
 
 /// Methods the generated client owns that are not endpoints.
@@ -247,6 +273,8 @@ struct Analyzer<'a> {
     payload: Option<&'a Path>,
     /// Whether a name was bound to the payload.
     payload_found: std::cell::Cell<bool>,
+    /// Each field path a [`Target`] names. Index [`ROOT`] is the empty path.
+    paths: std::cell::RefCell<Vec<String>>,
 }
 
 /// How a consumer function holds its event payload.
@@ -262,6 +290,7 @@ pub enum PayloadBinding {
 #[derive(Debug, Clone, Default)]
 pub struct PayloadReads {
     /// Each field read, by Rust name, sorted, with the span of its first read.
+    /// A field inside a field is a dotted path: `address.city`.
     pub reads: Vec<(String, Span)>,
     /// Whether the function binds the payload at all.
     pub found: bool,
@@ -316,14 +345,35 @@ impl<'a> Analyzer<'a> {
             calls: Vec::new(),
             payload: None,
             payload_found: std::cell::Cell::new(false),
+            paths: std::cell::RefCell::new(vec![String::new()]),
         }
     }
 
-    /// Record that call `index` has `field` read at `span`.
-    fn read(&mut self, index: usize, field: String, span: Span) {
-        let call = &mut self.calls[index];
-        call.read_spans.entry(field.clone()).or_insert(span);
-        call.reads.push(field);
+    /// The path of `field` inside `target`, for example `details.color`.
+    fn path_of(&self, target: Target, field: &str) -> String {
+        join_path(&self.paths.borrow()[target.path], field)
+    }
+
+    /// The target of `field` inside `target`.
+    fn child(&self, target: Target, field: &str) -> Target {
+        let path = self.path_of(target, field);
+        let mut paths = self.paths.borrow_mut();
+        let index = paths.iter().position(|p| *p == path).unwrap_or_else(|| {
+            paths.push(path);
+            paths.len() - 1
+        });
+        Target {
+            call: target.call,
+            path: index,
+        }
+    }
+
+    /// Record that `field` inside `target` is read at `span`.
+    fn read(&mut self, target: Target, field: &str, span: Span) {
+        let path = self.path_of(target, field);
+        let call = &mut self.calls[target.call];
+        call.read_spans.entry(path.clone()).or_insert(span);
+        call.reads.push(path);
     }
 
     /// Whether `ty` names the payload's event type.
@@ -399,7 +449,7 @@ impl<'a> Analyzer<'a> {
         for (index, arg) in func.sig.inputs.iter().enumerate() {
             if let syn::FnArg::Typed(pat) = arg {
                 let bound = if payload_param == Some(index) || self.is_payload(&pat.ty) {
-                    Bound::Response(0)
+                    Bound::Response(Target::root(0))
                 } else {
                     self.client_index(&pat.ty)
                         .map_or(Bound::Other, Bound::Client)
@@ -410,8 +460,7 @@ impl<'a> Analyzer<'a> {
         self.visit_block(&func.block);
         let found = self.payload_found.get();
         for call in &mut self.calls {
-            call.reads.sort();
-            call.reads.dedup();
+            call.reads = without_prefixes(std::mem::take(&mut call.reads));
             call.payload_seen = found;
         }
         self.calls
@@ -422,7 +471,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn bind(&mut self, name: String, bound: Bound) {
-        if self.payload.is_some() && bound == Bound::Response(0) {
+        if self.payload.is_some() && matches!(bound, Bound::Response(t) if t.call == 0) {
             self.payload_found.set(true);
         }
         if let Some(scope) = self.scopes.last_mut() {
@@ -432,9 +481,10 @@ impl<'a> Analyzer<'a> {
 
     /// Bind every name a pattern introduces.
     ///
-    /// Only a plain `x` carries the incoming meaning; a destructuring pattern
-    /// binds pieces of the value, not the value, so its names bind to
-    /// [`Bound::Other`] and stop attribution rather than inheriting it.
+    /// Only a plain `x` carries the incoming meaning. A struct pattern over a
+    /// response binds each field to that field's path, so `Item { details,
+    /// .. }` then `details.color` reads `details.color`. Other destructuring
+    /// patterns bind [`Bound::Other`] and stop attribution.
     fn bind_pattern(&mut self, pat: &syn::Pat, bound: Bound) {
         match pat {
             syn::Pat::Ident(ident) => {
@@ -450,7 +500,7 @@ impl<'a> Analyzer<'a> {
             }
             syn::Pat::Type(p) => {
                 let bound = if self.is_payload(&p.ty) {
-                    Bound::Response(0)
+                    Bound::Response(Target::root(0))
                 } else {
                     self.client_index(&p.ty).map_or(bound, Bound::Client)
                 };
@@ -463,22 +513,28 @@ impl<'a> Analyzer<'a> {
                 // it reads. A pattern that names the payload type is the
                 // payload, whatever its value comes from.
                 let bound = if self.is_payload_path(&p.path) {
-                    Bound::Response(0)
+                    Bound::Response(Target::root(0))
                 } else {
                     bound
                 };
-                if let Bound::Response(index) = bound {
-                    if self.payload.is_some() && index == 0 {
+                if let Bound::Response(target) = bound {
+                    if self.payload.is_some() && target.call == 0 {
                         self.payload_found.set(true);
                     }
                     for field in &p.fields {
                         if let syn::Member::Named(ident) = &field.member {
-                            self.read(index, field_name(ident), ident.span());
+                            self.read(target, &field_name(ident), ident.span());
                         }
                     }
                 }
                 for field in &p.fields {
-                    self.bind_pattern(&field.pat, Bound::Other);
+                    let inner = match (bound, &field.member) {
+                        (Bound::Response(target), syn::Member::Named(ident)) => {
+                            Bound::Response(self.child(target, &field_name(ident)))
+                        }
+                        _ => Bound::Other,
+                    };
+                    self.bind_pattern(&field.pat, inner);
                 }
             }
             syn::Pat::TupleStruct(p) => {
@@ -580,7 +636,7 @@ impl<'a> Analyzer<'a> {
     /// What an expression evaluates to, when that is knowable.
     fn bound_of(&self, expr: &Expr) -> Option<Bound> {
         if self.is_payload_turbofish(expr) {
-            return Some(Bound::Response(0));
+            return Some(Bound::Response(Target::root(0)));
         }
         let recorded = |call: &syn::ExprMethodCall| {
             let node = std::ptr::from_ref(call);
@@ -593,8 +649,15 @@ impl<'a> Analyzer<'a> {
                 self.calls
                     .iter()
                     .position(|c| c.node == node)
-                    .map(Bound::Response)
+                    .map(|call| Bound::Response(Target::root(call)))
             }
+            // `item.details`: a field of a response is a value inside it.
+            Expr::Field(field) => match (self.bound_of(&field.base)?, &field.member) {
+                (Bound::Response(target), syn::Member::Named(ident)) => {
+                    Some(Bound::Response(self.child(target, &field_name(ident))))
+                }
+                _ => None,
+            },
             Expr::Match(m) => self.match_passes_through(m).map(Bound::Response),
             // `{ m.payload_as::<E>()? }`: a block that is only its tail. A
             // block with more statements can rebind a name the tail uses, so
@@ -613,8 +676,8 @@ impl<'a> Analyzer<'a> {
     /// the payload: each arm either gives back the value its pattern binds
     /// (`x`, `Ok(x)`, `Some(x)`), or does not finish (`return`, `break`,
     /// `continue`, `panic!`, `unreachable!`, `todo!`).
-    fn match_passes_through(&self, m: &syn::ExprMatch) -> Option<usize> {
-        let index = self.response_of(&m.expr)?;
+    fn match_passes_through(&self, m: &syn::ExprMatch) -> Option<Target> {
+        let target = self.response_of(&m.expr)?;
         let mut passes = false;
         for arm in &m.arms {
             if diverges(&arm.body) {
@@ -629,13 +692,13 @@ impl<'a> Analyzer<'a> {
             }
             passes = true;
         }
-        passes.then_some(index)
+        passes.then_some(target)
     }
 
-    /// The call index an expression's response came from.
-    fn response_of(&self, expr: &Expr) -> Option<usize> {
+    /// The value inside a response that an expression holds.
+    fn response_of(&self, expr: &Expr) -> Option<Target> {
         match self.bound_of(expr) {
-            Some(Bound::Response(index)) => Some(index),
+            Some(Bound::Response(target)) => Some(target),
             _ => None,
         }
     }
@@ -719,14 +782,14 @@ impl<'a> Analyzer<'a> {
         scan_tokens(
             &mac.tokens,
             &|name| match self.lookup(name) {
-                Some(Bound::Response(index)) => Some(index),
+                Some(Bound::Response(target)) => Some(target),
                 _ => None,
             },
             &std::collections::BTreeSet::new(),
             &mut reads,
         );
-        for (index, field, span) in reads {
-            self.read(index, field, span);
+        for (target, field, span) in reads {
+            self.read(target, &field, span);
         }
     }
 }
@@ -784,10 +847,10 @@ impl Visit<'_> for Analyzer<'_> {
             }
             Expr::Field(field) => {
                 self.visit_expr(&field.base);
-                if let (Some(index), syn::Member::Named(name)) =
+                if let (Some(target), syn::Member::Named(name)) =
                     (self.response_of(&field.base), &field.member)
                 {
-                    self.read(index, field_name(name), name.span());
+                    self.read(target, &field_name(name), name.span());
                 }
             }
             Expr::Closure(closure) => {
@@ -997,23 +1060,100 @@ fn strip_refs(ty: &syn::Type) -> &syn::Type {
     }
 }
 
-/// The write-set of a request argument.
+/// The write-set of a request argument, sorted.
 ///
 /// `None` when the request is not an inline struct literal, because then the
-/// fields the call site sets are not visible here.
+/// fields the call site sets are not visible here. A field whose value is a
+/// struct literal adds the fields it sets as dotted paths: `details` and
+/// `details.color`.
 fn request_write_set(arg: Option<&Expr>) -> Option<Vec<String>> {
     let Some(Expr::Struct(lit)) = arg.map(peel) else {
         return None;
     };
-    Some(
-        lit.fields
-            .iter()
-            .filter_map(|f| match &f.member {
-                syn::Member::Named(ident) => Some(field_name(ident)),
-                syn::Member::Unnamed(_) => None,
-            })
-            .collect(),
-    )
+    let mut writes = Vec::new();
+    literal_writes(lit, "", &mut writes);
+    writes.sort();
+    writes.dedup();
+    Some(writes)
+}
+
+/// Push each named field that `lit` sets, under `prefix`, and the fields of
+/// each nested literal.
+fn literal_writes(lit: &syn::ExprStruct, prefix: &str, out: &mut Vec<String>) {
+    for field in &lit.fields {
+        let syn::Member::Named(ident) = &field.member else {
+            continue;
+        };
+        let path = join_path(prefix, &field_name(ident));
+        if let Some(inner) = nested_literal(&field.expr) {
+            literal_writes(inner, &path, out);
+        }
+        out.push(path);
+    }
+}
+
+/// The struct literal a field value holds: `Details { … }`, also in
+/// `Some(…)` or `Box::new(…)`.
+fn nested_literal(expr: &Expr) -> Option<&syn::ExprStruct> {
+    match peel(expr) {
+        Expr::Struct(lit) => Some(lit),
+        Expr::Call(call) if call.args.len() == 1 => {
+            let Expr::Path(func) = call.func.as_ref() else {
+                return None;
+            };
+            let names: Vec<String> = func
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            let wraps = matches!(names.last().map(String::as_str), Some("Some"))
+                || names.ends_with(&["Box".to_owned(), "new".to_owned()]);
+            if wraps {
+                nested_literal(&call.args[0])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `field` under `prefix`: `prefix.field`, or `field` for an empty prefix.
+fn join_path(prefix: &str, field: &str) -> String {
+    if prefix.is_empty() {
+        field.to_owned()
+    } else {
+        format!("{prefix}.{field}")
+    }
+}
+
+/// The first segment of a dotted path: `details` of `details.color`.
+#[must_use]
+pub fn top_field(path: &str) -> &str {
+    path.split_once('.').map_or(path, |(top, _)| top)
+}
+
+/// The first segment of each path, sorted and without duplicates.
+fn top_fields(paths: &[String]) -> Vec<String> {
+    let set: std::collections::BTreeSet<&str> = paths.iter().map(|p| top_field(p)).collect();
+    set.into_iter().map(str::to_owned).collect()
+}
+
+/// `reads` sorted, without duplicates, and without a path that a longer read
+/// holds: `details.color` also reads `details`.
+fn without_prefixes(mut reads: Vec<String>) -> Vec<String> {
+    reads.sort();
+    reads.dedup();
+    let all = reads.clone();
+    reads.retain(|read| {
+        !all.iter().any(|other| {
+            other
+                .strip_prefix(read.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
+        })
+    });
+    reads
 }
 
 /// A name a macro body binds for itself, and the token range it covers.
@@ -1102,17 +1242,18 @@ fn is_operand(token: Option<&proc_macro2::TokenTree>) -> bool {
 }
 
 /// Record every `binding.field` in a token stream, resolving the binding
-/// through `resolve`.
+/// through `resolve`. `binding.a.b` records the path `a.b`.
 ///
 /// Token-level, because a macro body is not parsed Rust. Four shapes that look
 /// the same are excluded: `binding.method(…)`, `binding.field::<T>()`,
 /// `binding.mac!(…)`, and `other.binding.field` — where `binding` is itself a
-/// field of something else.
-fn scan_tokens(
+/// field of something else. A method, a turbofish or a macro after a later
+/// segment ends the path before that segment.
+fn scan_tokens<T: Copy>(
     tokens: &proc_macro2::TokenStream,
-    resolve: &dyn Fn(&str) -> Option<usize>,
+    resolve: &dyn Fn(&str) -> Option<T>,
     shadowed: &std::collections::BTreeSet<String>,
-    reads: &mut Vec<(usize, String, Span)>,
+    reads: &mut Vec<(T, String, Span)>,
 ) {
     let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
     let bindings = macro_bindings(&tts);
@@ -1136,35 +1277,47 @@ fn scan_tokens(
         if here.contains(&base.to_string()) {
             continue;
         }
-        let Some(index) = resolve(&base.to_string()) else {
+        let Some(target) = resolve(&base.to_string()) else {
             continue;
         };
-        if !matches!(tts.get(i + 1), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '.') {
-            continue;
+        let mut path: Vec<String> = Vec::new();
+        let mut span = None;
+        let mut at = i + 1;
+        while let Some(field) = field_after(&tts, at) {
+            path.push(field_name(field));
+            span.get_or_insert_with(|| field.span());
+            at += 2;
         }
-        let Some(proc_macro2::TokenTree::Ident(field)) = tts.get(i + 2) else {
-            continue;
-        };
-        if field == "await" {
-            continue;
+        if let Some(span) = span {
+            reads.push((target, path.join("."), span));
         }
-        // A call, a turbofish, or a macro — none of them a field read. The
-        // `!` of `!=` is joined to its `=`: that is a comparison, so a read.
-        let next = tts.get(i + 3);
-        let not_equal = matches!(next, Some(proc_macro2::TokenTree::Punct(p))
-            if p.as_char() == '!' && p.spacing() == proc_macro2::Spacing::Joint)
-            && matches!(tts.get(i + 4), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '=');
-        if !not_equal
-            && (matches!(
-                next,
-                Some(proc_macro2::TokenTree::Group(g))
-                    if g.delimiter() == proc_macro2::Delimiter::Parenthesis
-            ) || matches!(next, Some(proc_macro2::TokenTree::Punct(p)) if matches!(p.as_char(), ':' | '!')))
-        {
-            continue;
-        }
-        reads.push((index, field_name(field), field.span()));
     }
+}
+
+/// The field that `.field` at `tts[at]` reads, if it is a field read.
+///
+/// `.await`, a call, a turbofish and a macro are not field reads. The `!` of
+/// `!=` is joined to its `=`: that is a comparison, so a read.
+fn field_after(tts: &[proc_macro2::TokenTree], at: usize) -> Option<&Ident> {
+    if !matches!(tts.get(at), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '.') {
+        return None;
+    }
+    let Some(proc_macro2::TokenTree::Ident(field)) = tts.get(at + 1) else {
+        return None;
+    };
+    if field == "await" {
+        return None;
+    }
+    let next = tts.get(at + 2);
+    let not_equal = matches!(next, Some(proc_macro2::TokenTree::Punct(p))
+        if p.as_char() == '!' && p.spacing() == proc_macro2::Spacing::Joint)
+        && matches!(tts.get(at + 3), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '=');
+    let call = matches!(
+        next,
+        Some(proc_macro2::TokenTree::Group(g))
+            if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+    ) || matches!(next, Some(proc_macro2::TokenTree::Punct(p)) if matches!(p.as_char(), ':' | '!'));
+    (not_equal || !call).then_some(field)
 }
 
 /// The const assertions for one call site.
@@ -1197,12 +1350,16 @@ fn assertions_for(call: &Call, client: &Path, caller: &str) -> Vec<TokenStream> 
     };
     let method_lit = LitStr::new(&method.to_string(), span);
     let snippet = snippet_of(method);
+    // One build shares each nested type, so rustc checks a nested field. The
+    // assertions check the first segment of each path.
+    let reads = top_fields(&call.reads);
+    let writes = call.writes.as_deref().map(top_fields);
     let site = CallSite {
         caller: caller.to_owned(),
         snippet: snippet.clone(),
         method: method.to_string(),
-        reads: call.reads.clone(),
-        writes: call.writes.clone(),
+        reads: reads.clone(),
+        writes: writes.clone(),
     };
     let named = named_violations(&site);
     let enriched = |kind: &ViolationKind, fallback: String| -> String {
@@ -1213,7 +1370,7 @@ fn assertions_for(call: &Call, client: &Path, caller: &str) -> Vec<TokenStream> 
     };
 
     let mut out = Vec::new();
-    for read in &call.reads {
+    for read in &reads {
         let message = enriched(
             &ViolationKind::ResponseFieldMissing(read.clone()),
             format!(
@@ -1231,7 +1388,7 @@ fn assertions_for(call: &Call, client: &Path, caller: &str) -> Vec<TokenStream> 
         });
     }
 
-    let Some(writes) = &call.writes else {
+    let Some(writes) = &writes else {
         return out;
     };
     for write in writes {
@@ -1585,6 +1742,202 @@ mod tests {
             "async fn page(catalog: CatalogClient) { let item = catalog.get_item(&id, NoBody).await.unwrap(); let _ = stringify!(item.not_read); }",
         );
         assert!(calls[0].reads.is_empty(), "{:?}", calls[0].reads);
+    }
+
+    // ── Nested paths ─────────────────────────────────────────────────────
+
+    /// The read-set of the one `get_item` call in `body`.
+    fn nested_reads(body: &str) -> Vec<String> {
+        let calls = calls_of(&format!(
+            "async fn page(catalog: CatalogClient) {{ \
+             let item = catalog.get_item(&id, NoBody).await.unwrap(); {body} }}"
+        ));
+        calls[0].reads.clone()
+    }
+
+    #[test]
+    fn a_field_of_a_field_is_a_dotted_read() {
+        assert_eq!(
+            nested_reads("let _ = item.details.color;"),
+            ["details.color"]
+        );
+        assert_eq!(
+            nested_reads("let _ = item.a.b.c;"),
+            ["a.b.c"],
+            "every level is in the path"
+        );
+    }
+
+    #[test]
+    fn a_read_that_a_longer_read_holds_is_dropped() {
+        assert_eq!(
+            nested_reads("let _ = &item.details; let _ = item.details.color;"),
+            ["details.color"]
+        );
+        assert_eq!(
+            nested_reads("let _ = item.details_x; let _ = item.details.color;"),
+            ["details.color", "details_x"],
+            "a name that only starts the same is another field"
+        );
+    }
+
+    #[test]
+    fn a_method_call_ends_the_dotted_path() {
+        assert_eq!(
+            nested_reads("let _ = item.details.color.len();"),
+            ["details.color"]
+        );
+        assert_eq!(nested_reads("let _ = item.details.label();"), ["details"]);
+    }
+
+    #[test]
+    fn a_tuple_index_ends_the_dotted_path() {
+        assert_eq!(nested_reads("let _ = item.pair.0.color;"), ["pair"]);
+    }
+
+    #[test]
+    fn a_dotted_read_inside_a_macro_body_is_in_the_read_set() {
+        assert_eq!(
+            nested_reads("html! { (item.details.color) }"),
+            ["details.color"]
+        );
+        assert_eq!(
+            nested_reads("html! { (item.details.size.max(1)) }"),
+            ["details.size"]
+        );
+        assert_eq!(
+            nested_reads("html! { (item.details.color != x) }"),
+            ["details.color"]
+        );
+        for call in ["label()", "parse::<u32>()", "mac!()"] {
+            assert_eq!(
+                nested_reads(&format!("html! {{ (item.details.{call}) }}")),
+                ["details"],
+                "{call}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_binding_of_a_nested_field_keeps_its_path() {
+        assert_eq!(
+            nested_reads("let details = &item.details; let _ = details.color;"),
+            ["details.color"]
+        );
+        assert_eq!(
+            nested_reads("let d = item.details.clone(); html! { (d.size) }"),
+            ["details.size"]
+        );
+    }
+
+    #[test]
+    fn a_rebound_sub_binding_stops_attribution() {
+        assert_eq!(
+            nested_reads("let d = &item.details; let d = other(); let _ = d.color;"),
+            ["details"]
+        );
+    }
+
+    #[test]
+    fn a_destructured_nested_field_keeps_its_path() {
+        assert_eq!(
+            nested_reads("let Item { details, .. } = item; let _ = details.color;"),
+            ["details.color"]
+        );
+        assert_eq!(
+            nested_reads("let Item { details: Details { color, .. }, id } = item;"),
+            ["details.color", "id"]
+        );
+    }
+
+    #[test]
+    fn an_unwrapped_optional_nested_field_keeps_its_path() {
+        assert_eq!(
+            nested_reads("let _ = item.details.as_ref().unwrap().color;"),
+            ["details.color"]
+        );
+        assert_eq!(
+            nested_reads("let _ = item.details.map(|d| d.color);"),
+            ["details.color"]
+        );
+    }
+
+    #[test]
+    fn a_nested_request_literal_gives_dotted_writes() {
+        let calls = calls_of(
+            "async fn page(catalog: CatalogClient) { let _ = catalog.create_item(NewItem { \
+             name, details: Details { color: Some(c), ..Default::default() } }); }",
+        );
+        assert_eq!(
+            calls[0].writes.as_deref(),
+            Some(
+                [
+                    "details".to_owned(),
+                    "details.color".to_owned(),
+                    "name".to_owned()
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn a_nested_literal_in_some_or_a_box_gives_dotted_writes() {
+        for wrapped in ["Some(Details { color })", "Box::new(Details { color })"] {
+            let calls = calls_of(&format!(
+                "async fn page(catalog: CatalogClient) {{ \
+                 let _ = catalog.create_item(NewItem {{ details: {wrapped} }}); }}"
+            ));
+            assert_eq!(
+                calls[0].writes.as_deref(),
+                Some(["details".to_owned(), "details.color".to_owned()].as_slice()),
+                "{wrapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_value_that_is_not_a_literal_has_no_dotted_writes() {
+        let calls = calls_of(
+            "async fn page(catalog: CatalogClient) { \
+             let _ = catalog.create_item(NewItem { details: d, name: Some(n) }); }",
+        );
+        assert_eq!(
+            calls[0].writes.as_deref(),
+            Some(["details".to_owned(), "name".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn the_assertions_use_the_first_segment_of_a_nested_path() {
+        let out = expand_str(
+            "client = CatalogClient",
+            "async fn page(catalog: CatalogClient) { \
+             let item = catalog.get_item(&id, NoBody).await.unwrap(); let _ = item.details.color; \
+             catalog.create_item(NewItem { details: Details { color: c } }).await.unwrap(); }",
+        );
+        assert!(out.contains("reads response field `details`"), "{out}");
+        assert!(out.contains("sets request field `details`"), "{out}");
+        assert!(!out.contains("\"details.color\""), "{out}");
+        assert!(!out.contains("`details.color`"), "{out}");
+    }
+
+    #[test]
+    fn the_caller_descriptor_holds_dotted_paths() {
+        let func: ItemFn = syn::parse_str(
+            "async fn page(catalog: CatalogClient) { \
+               let item = catalog.get_item(&id, NoBody).await.unwrap(); let _ = item.details.color; \
+               catalog.create_item(NewItem { details: Details { color: c } }).await.unwrap(); }",
+        )
+        .expect("fixture parses");
+        let clients: Vec<Path> = vec![syn::parse_str("CatalogClient").expect("client path")];
+        let calls = Analyzer::new(&clients).run(&func);
+        let got = caller_descriptor("storefront", "page", &calls, &clients);
+        assert_eq!(got.calls[0].reads, ["details.color"]);
+        assert_eq!(
+            got.calls[1].writes.as_deref(),
+            Some(["details".to_owned(), "details.color".to_owned()].as_slice())
+        );
     }
 
     // ── Other ────────────────────────────────────────────────────────────

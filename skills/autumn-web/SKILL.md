@@ -2455,13 +2455,16 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   windows (new callees with deployed callers, new callers with deployed
   callees). Exit 0 safe, 1 not safe, 3 safe in one order only (the report
   names it; `--order callee-first|caller-first` declares it), 4 tool error.
-- The bundle (format 4) finds a type by its path, not its last name: write
+- The bundle (format 5) finds a type by its path, not its last name: write
   the path where the type is defined (`Json<shared::Item>`,
   `Json<crate::dto::Item>`) when two reachable crates have an `Item`, or the
   export stops. A path through a re-export or a `use … as` alias does not
   name the type. Nested `WireShape` types are compared
-  field by field (`details.color`). `struct Empty;` (JSON `null`) and
-  `struct Empty {}` (`{}`) are different shapes.
+  field by field (`details.color`). A read-set and a write-set hold dotted
+  paths (`item.details.color` reads `details.color`), so the removal of an
+  optional nested field that a caller reads is a break. A read through an
+  index or a loop stops at the field before it. `struct Empty;` (JSON
+  `null`) and `struct Empty {}` (`{}`) are different shapes.
 - A field whose type has no `WireShape` and is not a known leaf (an enum, for
   example) stops the export: mark it `#[wire(opaque)]` to compare it by type
   name only. Do not add `WireShape` to an enum: the derive refuses it.

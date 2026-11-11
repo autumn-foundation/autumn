@@ -158,6 +158,44 @@ fn a_required_field_removed_from_a_nested_type_is_a_break() {
 }
 
 #[test]
+fn an_optional_nested_field_a_caller_reads_removed_is_a_break() {
+    // `item.details.color` with `color: Option<String>`. Its decode does not
+    // fail, so only the read-set shows the break.
+    let report = golden_descriptors("nested_optional_read_field_removed", 3);
+    assert!(
+        report.contains("reads response field `details.color`, which the new callee"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Deploy mesh-storefront before catalog"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_new_optional_nested_field_a_new_caller_reads_names_the_deploy_order() {
+    let report = golden_descriptors("nested_optional_field_read_by_new_caller", 3);
+    assert!(
+        report.contains("reads response field `details.color`, which the deployed callee"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Deploy catalog before mesh-storefront"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_nested_field_the_call_sets_and_the_callee_drops_is_a_break() {
+    // `NewItem { details: Details { color: Some(..), .. }, .. }` inline.
+    let report = golden_descriptors("nested_request_field_dropped", 3);
+    assert!(
+        report.contains("sets request field `details.color`, and the new callee ignores it"),
+        "{report}"
+    );
+}
+
+#[test]
 fn a_unit_struct_that_becomes_an_empty_object_breaks_both_windows() {
     let report = golden_descriptors("unit_to_empty_object", 1);
     assert!(

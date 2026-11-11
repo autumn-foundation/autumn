@@ -15,7 +15,9 @@ use proc_macro2::TokenStream;
 use quote::{ToTokens as _, quote, quote_spanned};
 use syn::{ItemFn, LitStr, Path};
 
-use crate::wire::checked::{PayloadBinding, PayloadReads, escape_for_assert, payload_reads};
+use crate::wire::checked::{
+    PayloadBinding, PayloadReads, escape_for_assert, payload_reads, top_field,
+};
 use crate::wire::ir::{ListenerDescriptor, stable_key};
 use crate::wire::store;
 
@@ -38,7 +40,16 @@ pub fn with_checks(func: &ItemFn, event: &Path, reads: &PayloadReads) -> ItemFn 
 pub fn consumer_checks(func: &ItemFn, event: &Path, reads: &PayloadReads) -> TokenStream {
     let function = func.sig.ident.to_string();
     let event_text = path_text(event);
-    let assertions = reads.reads.iter().map(|(field, span)| {
+    // A nested read asserts its first segment: one build shares the nested
+    // type, so rustc checks the rest. The descriptor keeps the whole path.
+    let mut seen = std::collections::BTreeSet::new();
+    let top: Vec<(&str, proc_macro2::Span)> = reads
+        .reads
+        .iter()
+        .map(|(path, span)| (top_field(path), *span))
+        .filter(|(field, _)| seen.insert(*field))
+        .collect();
+    let assertions = top.iter().map(|(field, span)| {
         let message = escape_for_assert(&format!(
             "event contract broken in `{function}`: reads field `{field}` of event \
              `{event_text}`, which the event does not send"
@@ -434,6 +445,31 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("AUTUMN_CONTRACT_DIR"), "{out}");
+    }
+
+    #[test]
+    fn a_nested_payload_field_is_a_dotted_read() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 let _ = event.address.city; tracing::info!(\"{}\", event.address.zip); Ok(()) }"
+            ),
+            ["address.city", "address.zip"]
+        );
+    }
+
+    #[test]
+    fn event_consumer_asserts_the_first_segment_of_a_nested_read() {
+        let out = event_consumer_macro(
+            quote! { ContactUpdated },
+            &quote! { async fn h(c: ContactUpdated) -> R { let _ = c.address.city; Ok(()) } },
+        )
+        .to_string();
+        assert!(
+            out.contains("reads field `address` of event `ContactUpdated`"),
+            "{out}"
+        );
+        assert!(!out.contains("address.city"), "{out}");
     }
 
     #[test]
