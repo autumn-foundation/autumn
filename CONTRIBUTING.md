@@ -212,13 +212,14 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `bulk_delete_generated_project_cargo_checks` | `integration/scaffold_bulk_delete.rs` | bulk-delete scaffold → `cargo check --tests` |
 | `richtext_scaffold_cargo_checks` | `integration/scaffold_rich_text.rs` | `{rich_text}` scaffold → `cargo check --tests` |
 | `searchable_scaffold_cargo_checks` | `integration/scaffold_search.rs` | `--searchable` scaffold → `cargo check --tests` |
+| `teams_scaffold_cargo_tests` | `integration/scaffold_teams.rs` | `generate teams` → `cargo test teams::` (the generated unit tests) (#3595) |
 | `trash_generated_project_cargo_checks` | `integration/scaffold_trash.rs` | soft-delete trash scaffold → `cargo check --tests` |
 | `linked_seed_binary_cargo_checks` | `integration/seed_model_linking.rs` | scaffolded model linked into `src/bin/seed.rs` → `cargo check --tests` (#1718) |
 | `serve_daemon_start_status_stop_over_unix_socket` | `integration/serve.rs` | fresh scaffold's `autumn serve --daemon` lifecycle over a Unix socket |
 | `generated_form_for_scaffold_cargo_checks` | `integration/scaffold_form_for.rs` | `form_for` view scaffold → `cargo check --tests` |
 | `generated_scaffold_with_missing_reference_target_cargo_checks` | `integration/scaffold_form_for.rs` | `{references}` with a missing target falls back to a number input → `cargo check --tests` |
 
-The `console.rs`, `scaffold_encrypted.rs`, `scaffold_validation.rs`, and the 15
+The `console.rs`, `scaffold_encrypted.rs`, `scaffold_validation.rs`, and the 16
 rows above compile into the consolidated `cli_tests` binary. `ci.yml`'s Docker
 sweep explicitly `--skip`s each of their tests **by exact name** — never by
 module prefix, which would also silently swallow any Docker test later added
