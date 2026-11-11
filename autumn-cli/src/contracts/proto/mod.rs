@@ -1101,9 +1101,15 @@ fn spec<'a>(
     // not use.
     let side =
         |f: Option<&WireFieldDescriptor>| f.map(|f| f.wire_type.clone().unwrap_or(WireType::Any));
+    // One message serves both sides. When the two forms differ, only a
+    // nullable form of the other still fits both; else the field is `any`.
     let wire_type = match (side(produced), side(accepted)) {
         (Some(WireType::Any), _) | (_, Some(WireType::Any)) | (None, None) => WireType::Any,
-        (Some(t), _) | (None, Some(t)) => t,
+        (Some(t), None) | (None, Some(t)) => t,
+        (Some(p), Some(a)) if p == a => p,
+        (Some(p), Some(a)) if WireType::nullable(p.clone()) == a => a,
+        (Some(p), Some(a)) if WireType::nullable(a.clone()) == p => p,
+        (Some(_), Some(_)) => WireType::Any,
     };
     let mut notes = Vec::new();
     if accepted.is_some_and(|f| f.required) {

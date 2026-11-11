@@ -916,3 +916,21 @@ fn a_field_with_one_custom_side_is_a_value() {
         "{text}"
     );
 }
+
+#[test]
+fn a_field_with_two_known_forms_is_a_value() {
+    let mut item = shape("Item", vec![field("a", WireType::integer(32, false), true)]);
+    item.serialized[0].wire_type = Some(WireType::string());
+    let (files, _) = run(&bundle(vec![get("get_item", "/i", item)], vec![]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(text.contains("google.protobuf.Value a = 1"), "{text}");
+}
+
+#[test]
+fn a_field_that_is_nullable_on_one_side_is_optional() {
+    let mut item = shape("Item", vec![field("a", WireType::string(), true)]);
+    item.deserialized[0].wire_type = Some(WireType::nullable(WireType::string()));
+    let (files, _) = run(&bundle(vec![get("get_item", "/i", item)], vec![]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(text.contains("optional string a = 1"), "{text}");
+}

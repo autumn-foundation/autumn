@@ -646,7 +646,8 @@ service CatalogService {
 
 A format, such as `uuid`, goes in the field comment. When one side of a
 field is `any`, for example with a custom serde function on that side only,
-the field is `google.protobuf.Value`.
+the field is `google.protobuf.Value`. So is a field whose two sides have
+different forms, for example a `#[wire(type = …)]` on the serializer only.
 
 Protobuf cannot write some shapes in place. The export writes a wrapper
 message for each. Its name ends in `Wrapper`, so it is easy to find:
