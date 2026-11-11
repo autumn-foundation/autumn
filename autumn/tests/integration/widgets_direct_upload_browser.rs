@@ -142,10 +142,11 @@ async fn hx() -> Markup {
         ("hx-include", "#f"),
         ("hx-target", "#out"),
     ]);
-    // htmx reads `<main/>` as `main`.
+    // htmx reads `<form, main/>` as one selector: a comma in `<.../>` does
+    // not split it.
     let outside_data = ButtonConfig::new().id("outside-data").attrs(&[
         ("hx-post", "/save"),
-        ("data-hx-include", "closest <main/>"),
+        ("data-hx-include", "closest <form, main/>"),
         ("hx-target", "#out"),
     ]);
     let lone = ButtonConfig::new()

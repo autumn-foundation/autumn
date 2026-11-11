@@ -962,8 +962,9 @@ mod tests {
             "ev.type === 'click' || ev.type === 'submit'",
             // A request on `autumn:upload` sends the new key, so it goes.
             "ev.type.indexOf('autumn:upload') === 0",
-            // `<sel/>` is `sel`, as in htmx.
+            // `<sel/>` is `sel`, and a comma in it does not split, as in htmx.
             "function bare(s)",
+            "parts(sel).forEach",
         ] {
             assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
         }

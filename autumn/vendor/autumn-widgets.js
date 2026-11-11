@@ -1397,6 +1397,17 @@
   }
   // `<sel/>` is `sel`, as in htmx.
   function bare(s) { return /^<.*\/>$/.test(s) ? s.slice(1, -2) : s; }
+  // Split on each comma outside `<.../>`, as htmx does.
+  function parts(sel) {
+    var out = [], depth = 0, from = 0;
+    for (var i = 0; i < sel.length; i++) {
+      var c = sel.charAt(i);
+      if (c === ',' && !depth) { out.push(sel.slice(from, i)); from = i + 1; }
+      else if (c === '<') depth++;
+      else if (c === '/' && sel.charAt(i + 1) === '>') depth--;
+    }
+    return out.concat(sel.slice(from));
+  }
   // The elements that the inherited `attr` names, or null with no `attr`.
   // As htmx: `this` is the whole value. A keyword part resolves from `elt`.
   // The other parts join again into one query, so a comma in :is() stays.
@@ -1407,8 +1418,8 @@
     if (sel === 'this') return [host];
     var out = [], css = [];
     try {
-      sel.split(',').forEach(function (s) {
-        var m = REL.exec(s = s.trim()), k = m && (m[1] || m[2]), r = m && bare(s.slice(m[0].length).trim());
+      parts(sel).forEach(function (s) {
+        var m = REL.exec(s = bare(s.trim())), k = m && (m[1] || m[2]), r = m && bare(s.slice(m[0].length).trim());
         // An empty part (after a last comma) adds nothing, as in htmx.
         if (!m) return s && css.push(bare(s));
         var one = k === 'closest' ? elt.closest(r) : k === 'find' ? elt.querySelector(r)
