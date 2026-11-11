@@ -3006,6 +3006,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- plugin::remove:: \
             | tee "$RUNNER_TEMP/cli-plugin-remove-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-plugin-remove-cov.log"
+          # Issue #2828: same gap for `plugin_check::`, `plugin::curate::` and
+          # `plugin_sandbox::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- plugin_check:: plugin::curate:: \
+            plugin_sandbox:: \
+            | tee "$RUNNER_TEMP/cli-plugin-check-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-plugin-check-cov.log"
           # Issues #2468 and #2497: same gap for `posture::` and
           # `routes_audit::`. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: routes_audit:: \

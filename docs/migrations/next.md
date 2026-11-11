@@ -732,6 +732,17 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   `FleetDatabase::sidecar_replica`. A `SlotOwnershipStore` gets a default
   `ensure_schema`, so an existing store needs no change. See
   [Writing a fleet extractor](../guide/sqlite-fleet.md#writing-a-fleet-extractor).
+- **New stable surface (conformance, #2828):**
+  `plugin_conformance::run_route_checks` and `RouteSource::from_wire`.
+  `autumn plugin-check --plugin-name <your-plugin>` calls
+  `run_route_checks`, so your conformance test and the CLI give the same
+  result for the same routes.
+- **Stable surface behavior (conformance, #2828):** `run_conformance` with a
+  contract uses the contract's `registered_as` when no route carries the
+  config name and a route carries `registered_as`. Routes under more than one name of the
+  plugin fail `route-attribution`. No signature changes. A test that passed
+  its crate name while the routes carry `Plugin::name()` now passes. Some
+  CLI diagnostic text changes; do not match on it.
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
