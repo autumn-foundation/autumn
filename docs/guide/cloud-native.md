@@ -560,6 +560,16 @@ are not flagged. With the setting off, `\'` does not end `'..'` text. The check 
 possibly misses a later risky statement. Use `E'..'` text for backslash
 escapes. The check does not find a name that dynamic SQL builds.
 
+A `DO` body runs at migrate time, so the check classifies each statement in
+it (#3637). `DO $$ BEGIN DROP TABLE users; END $$;` is `destructive`. A
+common block, such as a conditional `CREATE TYPE`, makes no finding. A `DO`
+block is `manual-review` when its body holds `EXECUTE`, or when the check
+cannot read the body: a language other than PL/pgSQL, a `\` escape in
+`E'..'` text, or a body in more than one part. To accept such a block, add
+`-- autumn-safety: reviewed` above the `DO` statement. A marker in the body
+does not count. A function body does not run at migrate time. The
+`CREATE FUNCTION` statement is `manual-review`.
+
 ### Adding `autumn migrate check` to CI
 
 ```yaml
