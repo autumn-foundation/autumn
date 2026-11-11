@@ -270,7 +270,7 @@
           "provenance": "provable"
         },
         {
-          "path": "/static/js/autumn-widgets.f303bdbd.js",
+          "path": "/static/js/autumn-widgets.96e415d5.js",
           "method": "GET",
           "name": "autumn_widgets",
           "classification": "framework",
@@ -696,7 +696,7 @@
           "mtls_required": false
         },
         {
-          "path": "/static/js/autumn-widgets.f303bdbd.js",
+          "path": "/static/js/autumn-widgets.96e415d5.js",
           "method": "GET",
           "mtls_required": false
         },

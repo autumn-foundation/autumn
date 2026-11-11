@@ -1314,12 +1314,9 @@
     var root = e.target.querySelector && e.target.querySelector(BUSY);
     if (root) hold(e, root, true);
   }, true);
-  // htmx sends a button request on `click`, with no `submit`. As in htmx 2,
-  // a request sends the requester form, the closest form if the verb is not
-  // GET, and each `hx-include` target. The guard cancels the request. Only a
-  // click or a submit gets the message: focus must not leave a field during
-  // live validation. A request on `autumn:upload` sends the new key, so it
-  // goes.
+  // htmx sends a button request on `click`, not `submit`. Cancel a request
+  // that sends a busy upload, by the htmx 2 rule. Only a click or a submit
+  // moves focus. A request on `autumn:upload` sends the key, so it goes.
   document.addEventListener('htmx:beforeRequest', function (e) {
     var elt = e.detail.elt, cfg = e.detail.requestConfig || {}, ev = cfg.triggeringEvent, root;
     if (!elt || !elt.closest || (ev && ev.type.indexOf('autumn:upload') === 0)) return;
@@ -1395,9 +1392,8 @@
     if (pos === 4) all.reverse();
     return all.filter(function (el) { return el.compareDocumentPosition(elt) === pos; })[0];
   }
-  // `<sel/>` is `sel`, as in htmx.
+  // As in htmx: `<sel/>` is `sel`, and a comma in it does not split.
   function bare(s) { return /^<.*\/>$/.test(s) ? s.slice(1, -2) : s; }
-  // Split on each comma outside `<.../>`, as htmx does.
   function parts(sel) {
     var out = [], depth = 0, from = 0;
     for (var i = 0; i < sel.length; i++) {
@@ -1416,12 +1412,16 @@
     if (!host) return null;
     var sel = host.getAttribute(attr) || host.getAttribute('data-' + attr);
     if (sel === 'this') return [host];
-    var out = [], css = [];
+    var out = [], css = [], top = elt.getRootNode(), html = document.documentElement;
+    // The htmx words for one node. A document is its root element here.
+    var word = { document: html, root: top.host ? null : html, body: document.body, host: top.host, window: null };
     try {
-      parts(sel).forEach(function (s) {
-        var m = REL.exec(s = bare(s.trim())), k = m && (m[1] || m[2]), r = m && bare(s.slice(m[0].length).trim());
+      parts(sel.replace(/^global /, '')).forEach(function (s) {
+        s = bare(s.trim()).replace(/ElementSibling$/, '');
+        if (word.hasOwnProperty(s)) return word[s] && out.push(word[s]);
+        var m = REL.exec(s), k = m && (m[1] || m[2]), r = m && bare(s.slice(m[0].length).trim());
         // An empty part (after a last comma) adds nothing, as in htmx.
-        if (!m) return s && css.push(bare(s));
+        if (!m) return s && css.push(s);
         var one = k === 'closest' ? elt.closest(r) : k === 'find' ? elt.querySelector(r)
           : k === 'next' ? (r ? scan(elt, r, 2) : elt.nextElementSibling)
           : r ? scan(elt, r, 4) : elt.previousElementSibling;

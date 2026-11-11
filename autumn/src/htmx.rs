@@ -964,7 +964,10 @@ mod tests {
             "ev.type.indexOf('autumn:upload') === 0",
             // `<sel/>` is `sel`, and a comma in it does not split, as in htmx.
             "function bare(s)",
-            "parts(sel).forEach",
+            "parts(sel.replace(/^global /, '')).forEach",
+            // `nextElementSibling`, `document`, `body`, `root` and `host`.
+            "replace(/ElementSibling$/, '')",
+            "if (word.hasOwnProperty(s)) return word[s] && out.push(word[s])",
         ] {
             assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
         }

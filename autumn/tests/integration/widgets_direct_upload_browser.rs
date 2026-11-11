@@ -149,10 +149,22 @@ async fn hx() -> Markup {
         ("data-hx-include", "closest <form, main/>"),
         ("hx-target", "#out"),
     ]);
+    // htmx keywords: the next sibling (the form), and the whole page.
+    let sibling = ButtonConfig::new().id("sibling").attrs(&[
+        ("hx-post", "/save?sibling"),
+        ("hx-include", "nextElementSibling"),
+        ("hx-target", "#out"),
+    ]);
+    let page_wide = ButtonConfig::new().id("page-wide").attrs(&[
+        ("hx-post", "/save?page"),
+        ("hx-include", "global body"),
+        ("hx-target", "#out"),
+    ]);
     let lone = ButtonConfig::new()
         .id("lone")
         .attrs(&[("hx-post", "/lone"), ("hx-target", "#out")]);
     let body = html! {
+        (button("Save with the next form", &sibling))
         form id="f" method="post" action="/save" {
             (field)
             label for="title" { "Title" }
@@ -164,6 +176,7 @@ async fn hx() -> Markup {
         (button("Save from outside", &outside))
         (button("Save the page", &outside_data))
         (button("Ping", &lone))
+        (button("Save everything", &page_wide))
         div id="check" {}
         div id="out" {}
     };
@@ -1139,4 +1152,18 @@ async fn an_autosave_form_waits_on_change_and_sends_the_key_on_autumn_upload() {
         "document.getElementById('out').textContent.includes('up-slow-n8.txt')",
     )
     .await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn hx_include_keywords_wait_too() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n9.txt").await;
+    page.click("#sibling").await.expect("click");
+    assert_held(&page, "/save?sibling").await;
+    assert_told(&page).await;
+    page.click("#page-wide").await.expect("click");
+    assert_held(&page, "/save?page").await;
 }
