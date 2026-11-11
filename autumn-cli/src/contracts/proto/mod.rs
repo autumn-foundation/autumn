@@ -663,28 +663,39 @@ impl<'b> File<'b> {
         }
         fields.sort_by_key(|f| f.number);
 
-        // A proto name is unique in the message: a later field with a taken
-        // name gets a number suffix. A live field keeps its name, and a
-        // reserved name that a live field has is left out.
+        // A proto name is unique in the message. Names are given in number
+        // order over live and removed fields together, so a name never moves:
+        // a field keeps its name when another field is removed. A later field
+        // with a taken name gets a number suffix.
+        let entry = &lock.messages[&full];
+        let mut slots: Vec<(u32, String, Option<usize>)> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.number, f.name.clone(), Some(i)))
+            .chain(entry.reserved.iter().filter_map(|r| {
+                r.name
+                    .as_deref()
+                    .map(|n| (r.number, field_name(n, n), None))
+            }))
+            .collect();
+        slots.sort();
         let mut used = BTreeSet::new();
-        for field in &mut fields {
-            let mut name = field.name.clone();
-            let mut n = field.number;
+        let mut reserved_names = BTreeSet::new();
+        for (number, base, live) in slots {
+            let mut name = base.clone();
+            let mut n = number;
             while used.contains(&name) {
-                name = format!("{}_{n}", field.name);
+                name = format!("{base}_{n}");
                 n = n.saturating_add(1);
             }
             used.insert(name.clone());
-            field.name = name;
+            match live {
+                Some(i) => fields[i].name = name,
+                None => {
+                    reserved_names.insert(name);
+                }
+            }
         }
-        let entry = &lock.messages[&full];
-        let reserved_names: BTreeSet<String> = entry
-            .reserved
-            .iter()
-            .filter_map(|r| r.name.as_deref())
-            .map(|n| field_name(n, n))
-            .filter(|n| !used.contains(n))
-            .collect();
         Ok(Message {
             comments,
             fields,

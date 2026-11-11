@@ -967,3 +967,37 @@ fn a_service_name_that_starts_with_a_digit_is_a_valid_identifier() {
     let text = &files["autumn/p_3d/p_3d.proto"];
     assert!(text.contains("service P3dService {"), "{text}");
 }
+
+#[test]
+fn removing_the_first_of_two_like_names_keeps_the_second_name() {
+    let mut camel = field("item_id_camel", WireType::string(), true);
+    camel.wire_name = "itemId".to_owned();
+    let both = bundle(
+        vec![get(
+            "get_item",
+            "/i",
+            shape(
+                "Item",
+                vec![field("item_id", WireType::string(), true), camel.clone()],
+            ),
+        )],
+        vec![],
+    );
+    let second_only = bundle(
+        vec![get("get_item", "/i", shape("Item", vec![camel]))],
+        vec![],
+    );
+    let first = export(&both, &Lock::default(), plain()).expect("exports");
+    let text = &first.files["autumn/catalog/catalog.proto"];
+    assert!(
+        text.contains("string item_id_2 = 2 [json_name = \"itemId\"]"),
+        "{text}"
+    );
+    let second = export(&second_only, &first.lock, plain()).expect("exports");
+    let text = &second.files["autumn/catalog/catalog.proto"];
+    assert!(
+        text.contains("string item_id_2 = 2 [json_name = \"itemId\"]"),
+        "the live field keeps its name: {text}"
+    );
+    assert!(text.contains("reserved \"item_id\";"), "{text}");
+}
