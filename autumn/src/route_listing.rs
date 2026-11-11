@@ -300,16 +300,25 @@ impl Serialize for RouteSource {
     }
 }
 
-impl<'de> Deserialize<'de> for RouteSource {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Ok(if s == "framework" {
+impl RouteSource {
+    /// Reads the dump form that [`Display`](std::fmt::Display) writes:
+    /// `framework` and `plugin:<name>`. Any other string is `User`.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Self {
+        if s == "framework" {
             Self::Framework
         } else if let Some(name) = s.strip_prefix("plugin:") {
             Self::Plugin(name.to_owned())
         } else {
             Self::User
-        })
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RouteSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&s))
     }
 }
 
@@ -1918,6 +1927,20 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let decoded: RouteSource = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// `from_wire` reads the dump form, the same as `Deserialize` (#2828).
+    #[test]
+    fn route_source_from_wire_reads_the_dump_form() {
+        for source in [
+            RouteSource::User,
+            RouteSource::Framework,
+            RouteSource::Plugin("admin".to_owned()),
+            RouteSource::Plugin(String::new()),
+        ] {
+            assert_eq!(RouteSource::from_wire(&source.to_string()), source);
+        }
+        assert_eq!(RouteSource::from_wire("something-else"), RouteSource::User);
     }
 
     // ── append_framework_routes ────────────────────────────────────────────

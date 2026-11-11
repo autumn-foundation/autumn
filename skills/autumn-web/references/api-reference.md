@@ -1207,6 +1207,8 @@ in **Typed accessible primitives** above.)
 | `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required` (not on a checkbox: check "one or more" on the server), `aria-invalid`, passthrough. |
 | `widget_pack::element(tag, attrs, &FieldOptions, body)` | Root of a non-input widget with the app `data-*`/`hx-*` passthrough. |
 | `plugin_conformance::run_conformance(&ConformanceConfig::new(name).contract(c).no_routes(), &routes)` | For a plugin that mounts no routes (cache, background runtime): no route under the config name or the contract's `plugin`/`registered_as` skips `route-attribution`; such a route fails it. Take the contract from `builder.plugin_contracts()` (it carries `registered_as`); without that, every plugin route fails. Do not set a `prefix` with it. Library counterpart of `autumn plugin-check --no-routes`. |
+| `plugin_conformance::run_route_checks(&config, &routes)` | The route checks of `run_conformance` (all but `experimental-surface`). With a contract, if no route carries the config name and a route carries `registered_as`, the checks use `registered_as`. `autumn plugin-check` calls it on its route dump, so the CLI and the library give the same results, except that `--no-routes` needs `registered_as` to skip (#2828). |
+| `RouteSource::from_wire("plugin:<name>")` | Reads the route-dump source string: `framework`, `plugin:<name>`, else `User`. |
 | `plugin_conformance::widgets::run_widget_conformance(&pack)` | Static: `widget-pack-name`, `widget-stories`, `widget-class-names`, `widget-markup-csp`, `widget-tokens`, `widget-scripts`. |
 | `plugin_conformance::widgets::browser::run_widget_browser_conformance(&pack, axe_src).await` | Feature `system-tests`: `widget-axe` (light + dark), `widget-console`, `widget-keyboard`. |
 | `Page::axe_violations(axe_src)` / `SystemTest::plugin_assets(&ASSETS)` | Shared axe check; serve a bundle in a system test. |
@@ -1363,8 +1365,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 
 - `autumn_web::cluster` — zero-dependency two-node clustering: authenticated
   TCP gossip membership plus one shared primitive, an eventually consistent
-  cluster-wide grow-only counter. Always compiled (no cargo feature); inert
-  unless `[cluster] enabled = true`. Not leader election, not mutual
+  cluster-wide grow-only counter. Needs the `cluster` feature (in `default`;
+  #2795). Inert unless `[cluster] enabled = true`. Without the feature,
+  `[cluster]` parses and `enabled = true` fails boot. Not leader election, not mutual
   exclusion, not durable — for run-once work use `Lock` above.
 - Handle: `state.extension::<ClusterHandle>() -> Option<Arc<ClusterHandle>>`
   (`None` when disabled). `ClusterHandle::{node_id() -> &str, local_addr() ->

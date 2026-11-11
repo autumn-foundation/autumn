@@ -213,7 +213,7 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 72 KiB |
+| `autumn-widgets.js`, raw | 74 KiB |
 | `autumn-widgets.js`, gzip level 9 | 21 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
@@ -225,6 +225,7 @@ and 11 KiB. The busy state for htmx requests raised them from 44 KiB and
 tags mode of the combobox (chips) raised them from 54 KiB and 16 KiB. The
 password reveal, the strength hint and the one-time code format raised them
 from 61 KiB and 18 KiB. The tree keys raised them from 70 KiB and 20 KiB. The
+direct upload hold for htmx requests raised the raw budget from 72 KiB. The
 measure includes the search part of the bundle.
 
 ## Tests

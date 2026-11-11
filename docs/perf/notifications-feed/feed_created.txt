@@ -1,0 +1,63 @@
+variant=feed_created
+PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+rows recipient=1 49209
+rows recipient=58 1092
+rows recipient=6373 40
+recipient statement                 buffers   rows
+1        unread count                 41.2    1.0
+1        total count                 247.2    1.0
+1        page id desc                 16.2   20.0
+1        page 5 id desc               62.2   20.0
+1        unread page                  19.2   20.0
+1        kind page                    55.2   20.0
+1        page created_at desc         23.2   20.0
+58       unread count                  6.2    1.0
+58       total count                  10.2    1.0
+58       page id desc                 23.2   20.0
+58       page 5 id desc              101.2   20.0
+58       unread page                  23.2   20.0
+58       kind page                    98.2   20.0
+58       page created_at desc         23.2   20.0
+6373     unread count                  4.2    1.0
+6373     total count                  12.2    1.0
+6373     page id desc                 23.2   20.0
+6373     page 5 id desc               44.2    0.0
+6373     unread page                  11.2    7.0
+6373     kind page                    44.2   12.0
+6373     page created_at desc         23.2   20.0
+size idx_notifications_created 95 MB
+size idx_notifications_feed 77 MB
+size idx_notifications_unread 12 MB
+size notifications_pkey 43 MB
+size table 303 MB
+md5 id DESC r=1 7ca98ca36f4bfc77fa67fd06431a7330
+md5 id DESC r=58 8088a1988b4bb33f5add7efec8f7ca34
+md5 id DESC r=6373 74c1556b4fa4a9453d533c28b147269d
+md5 created_at DESC, id DESC r=1 b3d49b1e2f68ac35f8613f6df802845c
+md5 created_at DESC, id DESC r=58 09ee92cc1a2ab42b4ba86e7ab21b0f6b
+md5 created_at DESC, id DESC r=6373 13274e8bef7143bbdd0584a0c4f3cfc4
+--- plan, recipient 1, page id desc
+Limit (actual rows=20 loops=1)
+  Buffers: shared hit=19
+  ->  Index Scan Backward using idx_notifications_feed on notifications (actual rows=20 loops=1)
+        Index Cond: ((tenant_id = ''::text) AND (recipient_id = 1))
+        Buffers: shared hit=19
+Planning:
+  Buffers: shared hit=175
+--- plan, recipient 58, page id desc
+Limit (actual rows=20 loops=1)
+  Buffers: shared hit=26
+  ->  Index Scan Backward using idx_notifications_feed on notifications (actual rows=20 loops=1)
+        Index Cond: ((tenant_id = ''::text) AND (recipient_id = 58))
+        Buffers: shared hit=26
+Planning:
+  Buffers: shared hit=175
+--- plan, recipient 1, total count
+Aggregate (actual rows=1 loops=1)
+  Buffers: shared hit=250
+  ->  Index Only Scan using idx_notifications_feed on notifications (actual rows=49209 loops=1)
+        Index Cond: ((tenant_id = ''::text) AND (recipient_id = 1))
+        Heap Fetches: 0
+        Buffers: shared hit=250
+Planning:
+  Buffers: shared hit=145

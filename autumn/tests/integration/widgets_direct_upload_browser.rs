@@ -19,6 +19,7 @@ use std::time::Duration;
 use autumn_web::prelude::*;
 use autumn_web::storage::form_helper::{DirectUploadConfig, direct_upload_field};
 use autumn_web::system_test::{Page, SystemTest, SystemTestRunner};
+use autumn_web::widgets::{ButtonConfig, button};
 use maud::{DOCTYPE, Markup, html};
 
 /// A stored object: its content type and bytes.
@@ -52,6 +53,10 @@ struct PresignResponse {
 }
 
 fn page(script: bool, body: &Markup) -> Markup {
+    page_with(script, false, body)
+}
+
+fn page_with(script: bool, htmx: bool, body: &Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -60,6 +65,9 @@ fn page(script: bool, body: &Markup) -> Markup {
                 meta name="csrf-token" content="tok-123";
                 title { "Direct upload" }
                 link rel="stylesheet" href="/static/css/autumn-widgets.css";
+                @if htmx {
+                    script src="/static/js/htmx.min.js" defer {}
+                }
                 @if script {
                     script src="/static/js/autumn-widgets.js" defer {}
                 }
@@ -108,6 +116,104 @@ async fn images() -> Markup {
         &DirectUploadConfig::new().label("Picture").accept("image/*"),
     );
     page(true, &form("/save", &field))
+}
+
+/// htmx sends this form: from buttons in it, from a button outside it with
+/// `hx-include`, and from live validation on a text field.
+#[get("/hx")]
+async fn hx() -> Markup {
+    let field = direct_upload_field(
+        "avatar",
+        "/presign",
+        &DirectUploadConfig::new().label("Avatar"),
+    );
+    let send = ButtonConfig::new()
+        .submit()
+        .id("send")
+        .attrs(&[("hx-post", "/save"), ("hx-target", "#out")]);
+    let draft = ButtonConfig::new()
+        .id("draft")
+        .attrs(&[("hx-post", "/save"), ("hx-target", "#out")]);
+    let preview = ButtonConfig::new()
+        .id("preview")
+        .attrs(&[("hx-get", "/preview"), ("hx-target", "#out")]);
+    let outside = ButtonConfig::new().id("outside").attrs(&[
+        ("hx-post", "/save"),
+        ("hx-include", "#f"),
+        ("hx-target", "#out"),
+    ]);
+    // htmx reads `<form, main/>` as one selector: a comma in `<.../>` does
+    // not split it.
+    let outside_data = ButtonConfig::new().id("outside-data").attrs(&[
+        ("hx-post", "/save"),
+        ("data-hx-include", "closest <form, main/>"),
+        ("hx-target", "#out"),
+    ]);
+    // htmx keywords: the next sibling (the form), and the whole page.
+    let sibling = ButtonConfig::new().id("sibling").attrs(&[
+        ("hx-post", "/save?sibling"),
+        ("hx-include", "nextElementSibling"),
+        ("hx-target", "#out"),
+    ]);
+    let page_wide = ButtonConfig::new().id("page-wide").attrs(&[
+        ("hx-post", "/save?page"),
+        ("hx-include", "global body"),
+        ("hx-target", "#out"),
+    ]);
+    let lone = ButtonConfig::new()
+        .id("lone")
+        .attrs(&[("hx-post", "/lone"), ("hx-target", "#out")]);
+    let body = html! {
+        (button("Save with the next form", &sibling))
+        form id="f" method="post" action="/save" {
+            (field)
+            label for="title" { "Title" }
+            input id="title" name="title" hx-post="/check" hx-trigger="keyup" hx-target="#check";
+            (button("Save", &send))
+            (button("Save draft", &draft))
+            (button("Preview", &preview))
+        }
+        (button("Save from outside", &outside))
+        (button("Save the page", &outside_data))
+        (button("Ping", &lone))
+        (button("Save everything", &page_wide))
+        div id="check" {}
+        div id="out" {}
+    };
+    page_with(true, true, &body)
+}
+
+/// An autosave form. It sends on each change and on each new key.
+#[get("/hx-auto")]
+async fn hx_auto() -> Markup {
+    let field = direct_upload_field(
+        "avatar",
+        "/presign",
+        &DirectUploadConfig::new().label("Avatar"),
+    );
+    let body = html! {
+        form id="f" method="post" action="/save" hx-post="/save"
+            hx-trigger="change, autumn:upload" hx-target="#out" {
+            (field)
+        }
+        div id="out" {}
+    };
+    page_with(true, true, &body)
+}
+
+#[post("/lone")]
+async fn lone() -> &'static str {
+    "lone"
+}
+
+#[post("/check")]
+async fn check() -> &'static str {
+    "checked"
+}
+
+#[get("/preview")]
+async fn preview() -> &'static str {
+    "preview"
 }
 
 /// The same form, with no script: the no-JS fallback.
@@ -193,7 +299,10 @@ async fn save(headers: axum::http::HeaderMap, body: axum::body::Bytes) -> String
 async fn runner() -> SystemTestRunner {
     Box::pin(
         SystemTest::new()
-            .routes(routes![index, multi, images, nojs, presign, put_mem, save])
+            .routes(routes![
+                index, multi, images, hx, hx_auto, lone, check, preview, nojs, presign, put_mem,
+                save
+            ])
             .build(),
     )
     .await
@@ -811,4 +920,250 @@ async fn a_form_reset_drops_the_keys_and_stops_a_running_upload() {
         "",
         "the old upload adds no key after the reset"
     );
+}
+
+/// Open `/hx` and record each htmx request.
+async fn open_hx(page: &Page) {
+    open_hx_at(page, "/hx").await;
+}
+
+/// Open `path` and record each htmx request. `asked` gets each request that
+/// htmx starts. `sent` gets only the requests that it sends.
+async fn open_hx_at(page: &Page, path: &str) {
+    open_with_script(page, path).await;
+    wait_for(page, "!!window.htmx").await;
+    assert!(
+        eval_bool(
+            page,
+            "(() => { window.__asked = []; window.__sent = []; \
+             window.addEventListener('htmx:beforeRequest', e => \
+               window.__asked.push(e.detail.requestConfig.path), true); \
+             document.addEventListener('htmx:beforeSend', e => \
+               window.__sent.push(e.detail.requestConfig.path)); \
+             return true; })()"
+        )
+        .await,
+        "record the htmx requests"
+    );
+}
+
+async fn text_by_id(page: &Page, id: &str) -> String {
+    eval_string(
+        page,
+        &format!("document.getElementById('{id}').textContent.trim()"),
+    )
+    .await
+}
+
+/// Start a slow upload on `/hx` and wait until it runs.
+async fn start_slow_upload(page: &Page, name: &str) {
+    choose(page, &[(name, "text/plain", "slow")]).await;
+    wait_for(
+        page,
+        &format!("document.querySelector('{ROOT}').hasAttribute('aria-busy')"),
+    )
+    .await;
+}
+
+/// htmx started a request to `path`, and the guard held it.
+async fn assert_held(page: &Page, path: &str) {
+    wait_for(page, &format!("window.__asked.includes('{path}')")).await;
+    assert!(
+        eval_bool(page, &format!("!window.__sent.includes('{path}')")).await,
+        "htmx sent {path}"
+    );
+    assert_eq!(text_by_id(page, "out").await, "", "no swap");
+    assert!(eval_bool(page, "!location.pathname.startsWith('/save')").await);
+}
+
+/// The guard showed the alert and moved focus to the file input.
+async fn assert_told(page: &Page) {
+    assert_eq!(
+        text_of(page, "[role=alert]").await,
+        "Wait for the upload to finish, then send the form again."
+    );
+    assert!(
+        eval_bool(
+            page,
+            &format!(
+                "document.activeElement === document.querySelector('{ROOT} input[type=file]')"
+            )
+        )
+        .await,
+        "focus is on the file input"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn an_htmx_submit_button_waits_for_a_running_upload() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n1.txt").await;
+    page.click("#send").await.expect("click");
+    assert_held(&page, "/save").await;
+    assert_told(&page).await;
+    // After the upload the button sends the key.
+    wait_for(
+        &page,
+        &format!("!!document.querySelector('{ROOT} input[type=hidden]')"),
+    )
+    .await;
+    page.click("#send").await.expect("click");
+    wait_for(
+        &page,
+        "document.getElementById('out').textContent.includes('up-slow-n1.txt')",
+    )
+    .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn an_htmx_button_with_type_button_waits_too() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n2.txt").await;
+    page.click("#draft").await.expect("click");
+    assert_held(&page, "/save").await;
+    assert_told(&page).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_button_outside_the_form_with_hx_include_waits_too() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n3.txt").await;
+    page.click("#outside").await.expect("click");
+    assert_held(&page, "/save").await;
+    assert_told(&page).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn live_validation_waits_with_no_message_and_keeps_focus() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n4.txt").await;
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { document.getElementById('title').focus(); return true; })()"
+        )
+        .await
+    );
+    page.press("g").await.expect("type");
+    assert_held(&page, "/check").await;
+    assert_eq!(text_by_id(&page, "check").await, "");
+    assert_eq!(text_of(&page, "[role=alert]").await, "", "no message");
+    assert!(
+        eval_bool(&page, "document.activeElement.id === 'title'").await,
+        "focus stays in the text field"
+    );
+    // After the upload, htmx sends the next request: the guard released it.
+    wait_for(
+        &page,
+        &format!("!document.querySelector('{ROOT}').hasAttribute('aria-busy')"),
+    )
+    .await;
+    page.press("h").await.expect("type");
+    wait_for(
+        &page,
+        "document.getElementById('check').textContent === 'checked'",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn an_htmx_get_button_does_not_wait() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n5.txt").await;
+    page.click("#preview").await.expect("click");
+    wait_for(&page, "window.__sent.includes('/preview')").await;
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.querySelector('{ROOT}').hasAttribute('aria-busy')")
+        )
+        .await,
+        "the upload still ran when htmx sent the request"
+    );
+    wait_for(
+        &page,
+        "document.getElementById('out').textContent === 'preview'",
+    )
+    .await;
+    assert_eq!(text_of(&page, "[role=alert]").await, "");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn an_hx_include_with_an_extended_selector_waits_too() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n6.txt").await;
+    page.click("#outside-data").await.expect("click");
+    assert_held(&page, "/save").await;
+    assert_told(&page).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_request_that_does_not_send_the_form_does_not_wait() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n7.txt").await;
+    page.click("#lone").await.expect("click");
+    wait_for(&page, "window.__sent.includes('/lone')").await;
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.querySelector('{ROOT}').hasAttribute('aria-busy')")
+        )
+        .await,
+        "the upload still ran when htmx sent the request"
+    );
+    assert_eq!(text_of(&page, "[role=alert]").await, "");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn an_autosave_form_waits_on_change_and_sends_the_key_on_autumn_upload() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx_at(&page, "/hx-auto").await;
+    // The `change` of the file input starts the upload and an autosave.
+    start_slow_upload(&page, "slow-n8.txt").await;
+    assert_held(&page, "/save").await;
+    assert_eq!(text_of(&page, "[role=alert]").await, "", "no message");
+    // `autumn:upload` sends the form with the new key.
+    wait_for(
+        &page,
+        "document.getElementById('out').textContent.includes('up-slow-n8.txt')",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn hx_include_keywords_wait_too() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_hx(&page).await;
+    start_slow_upload(&page, "slow-n9.txt").await;
+    page.click("#sibling").await.expect("click");
+    assert_held(&page, "/save?sibling").await;
+    assert_told(&page).await;
+    page.click("#page-wide").await.expect("click");
+    assert_held(&page, "/save?page").await;
 }

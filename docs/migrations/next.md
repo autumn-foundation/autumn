@@ -508,6 +508,36 @@ or stay opaque.
 
 ---
 
+### Wire contracts: bundle format 4
+
+**Why:** each field now records its wire type, the JSON form serde writes.
+The check compares it, so a new JSON form with the same Rust type is
+reported. An older CLI would not compare wire types, so it refuses the new
+format.
+
+**You are affected only if a job reads a bundle from
+`autumn contracts export` with an older CLI.** The build does not change.
+
+**Before (`{X.Y}`):**
+
+```bash
+autumn contracts check --against deployed.json  # CLI {X.Y}, bundle format 3
+```
+
+**After (`{(X+1).0}`):**
+
+```bash
+autumn contracts check --against deployed.json  # CLI {(X+1).0}, bundle format 4
+```
+
+Upgrade the CLI on every job that reads the bundle. This CLI reads formats
+1 to 4. When one of the two bundles is format 3 or older, the check
+does not compare wire types.
+
+**Automation:** `manual` — upgrade the CLI in each job.
+
+---
+
 ### State: `AppState` getters are no longer `const fn`
 
 **Why:** `AppState` holds its fields behind one `Arc`, so a clone is one
@@ -649,6 +679,35 @@ let CrateGraph { deps, libs, .. } = crates;
 **Automation:** `manual` — start from `CrateGraph::default()` and set the
 fields.
 
+---
+
+### Features: the `cluster` module is optional
+
+**Why:** `autumn_web::cluster` was 3% of the code that `autumn-web` compiles, in
+every app (issue #2795, ADR 0045). It now has the `cluster` feature. The
+feature is in `default`, so a default build does not change.
+
+**You are affected only if your app sets `default-features = false` and uses
+`autumn_web::cluster` or `[cluster] enabled = true`.** The compiler reports
+``error[E0432]: unresolved import `autumn_web::cluster` ``. Without the
+feature, `[cluster]` still parses, and `enabled = true` fails boot with a
+validation error.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "cluster"] }
+```
+
+**Automation:** `manual` — a codemod cannot know if the app uses the
+cluster. Add the feature only if it does.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -702,6 +761,17 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   `FleetDatabase::sidecar_replica`. A `SlotOwnershipStore` gets a default
   `ensure_schema`, so an existing store needs no change. See
   [Writing a fleet extractor](../guide/sqlite-fleet.md#writing-a-fleet-extractor).
+- **New stable surface (conformance, #2828):**
+  `plugin_conformance::run_route_checks` and `RouteSource::from_wire`.
+  `autumn plugin-check --plugin-name <your-plugin>` calls
+  `run_route_checks`, so your conformance test and the CLI give the same
+  result for the same routes.
+- **Stable surface behavior (conformance, #2828):** `run_conformance` with a
+  contract uses the contract's `registered_as` when no route carries the
+  config name and a route carries `registered_as`. Routes under more than one name of the
+  plugin fail `route-attribution`. No signature changes. A test that passed
+  its crate name while the routes carry `Plugin::name()` now passes. Some
+  CLI diagnostic text changes; do not match on it.
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -752,6 +822,12 @@ If nothing changed, delete this section.
 - **Graph:** `autumn graph check-boundaries` checks the nodes of a renamed
   `[[bin]]` target in the boundary of its package (#3599). New violations
   can show. Fix them, or run with `--update-baseline`.
+- **Config:** a type error in `autumn.toml` now names the full key, for
+  example ``in `server.port` ``. Before, `AutumnConfig::load` showed a line
+  of the merged config, which is not a file you wrote. `load_from` errors
+  also give the key, not the line. A syntax error keeps its line. A message
+  parser that read the `TOML parse error at line` prefix of a type error
+  must read the key instead.
 
 Changes that still compile but behave differently at runtime. Examples:
 

@@ -26,9 +26,14 @@ use serde::{Deserialize, Serialize};
 pub const BUNDLE_FORMAT: u32 = 1;
 
 /// The bundle format with type identity: nested types, the `unit` flag, and
-/// unrouted endpoints. The export always writes it. An older CLI refuses it,
-/// because it would ignore these and approve a break.
+/// unrouted endpoints. An older CLI refuses it, because it would ignore these
+/// and approve a break.
 pub const IDENTITY_FORMAT: u32 = 3;
+
+/// The bundle format with a wire type on each field. The export always
+/// writes it. An older CLI refuses it, because it would not compare the wire
+/// types and would approve a change of the JSON form.
+pub const WIRE_TYPE_FORMAT: u32 = 4;
 
 /// The type name of an endpoint with no request body.
 pub use autumn_macros_support::wire::NO_BODY;
@@ -215,10 +220,10 @@ impl Bundle {
     pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
         let mut bundle: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("not a contract bundle: {e}"))?;
-        if !(BUNDLE_FORMAT..=IDENTITY_FORMAT).contains(&bundle.format) {
+        if !(BUNDLE_FORMAT..=WIRE_TYPE_FORMAT).contains(&bundle.format) {
             return Err(format!(
                 "contract bundle format {} is not supported; this CLI reads formats \
-                 {BUNDLE_FORMAT} to {IDENTITY_FORMAT}",
+                 {BUNDLE_FORMAT} to {WIRE_TYPE_FORMAT}",
                 bundle.format
             ));
         }
@@ -354,7 +359,7 @@ impl Bundle {
         let joined_events = join_events(&filled)?;
         let (joined_listeners, unresolved) = join_listeners(&listeners, &events)?;
         Ok(Self {
-            format: IDENTITY_FORMAT,
+            format: WIRE_TYPE_FORMAT,
             endpoints: joined,
             callers: calls.into_iter().collect(),
             events: joined_events,
@@ -469,6 +474,18 @@ impl<'a> Nested<'a> {
                         ));
                     }
                 }
+            }
+            // The macro writes an object by the path as written. The bundle
+            // holds the type id, as `nested` does. The loop above reports a
+            // path that does not resolve, so a miss here keeps the path.
+            if let Some(wire) = field.wire_type.as_mut() {
+                wire.for_each_object(&mut |type_ref: &mut String| {
+                    if let Ok(Some(Resolved::Type(t))) =
+                        resolve_type(type_ref, scope, self.types, self.crates)
+                    {
+                        *type_ref = t.id();
+                    }
+                });
             }
         }
         Ok(())
@@ -962,7 +979,7 @@ mod tests {
     use super::*;
     use autumn_macros_support::wire::{
         CallerCall, ClientEndpoint, Crates, EventDescriptor, ListenerDescriptor, RoutesDescriptor,
-        WireFieldDescriptor,
+        WireFieldDescriptor, WireType,
     };
 
     fn field(name: &str, required: bool) -> WireFieldDescriptor {
@@ -1060,7 +1077,7 @@ mod tests {
     fn the_bundle_joins_endpoints_types_and_callers() {
         let dir = fixture();
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
-        assert_eq!(bundle.format, IDENTITY_FORMAT);
+        assert_eq!(bundle.format, WIRE_TYPE_FORMAT);
         let [ep] = bundle.endpoints.as_slice() else {
             panic!("one endpoint: {bundle:?}");
         };
@@ -1447,7 +1464,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            bundle.format, IDENTITY_FORMAT,
+            bundle.format, WIRE_TYPE_FORMAT,
             "an older CLI must not drop it"
         );
     }
@@ -1482,15 +1499,15 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_with_or_without_events_has_the_identity_format() {
+    fn a_bundle_with_or_without_events_has_the_wire_type_format() {
         let dir = event_fixture();
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
-        assert_eq!(bundle.format, IDENTITY_FORMAT);
+        assert_eq!(bundle.format, WIRE_TYPE_FORMAT);
         assert_eq!(
             Bundle::from_dir(fixture().path()).expect("bundle").format,
-            IDENTITY_FORMAT
+            WIRE_TYPE_FORMAT
         );
-        for old in [BUNDLE_FORMAT, 2] {
+        for old in [BUNDLE_FORMAT, 2, IDENTITY_FORMAT] {
             let bytes = format!(r#"{{"format": {old}, "endpoints": [], "callers": []}}"#);
             Bundle::from_slice(bytes.as_bytes()).expect("an older format still parses");
         }
@@ -1833,14 +1850,13 @@ mod tests {
     }
 
     #[test]
-    fn a_new_bundle_has_the_identity_format() {
+    fn a_new_bundle_knows_types_and_an_identity_bundle_still_parses() {
         let dir = fixture();
-        assert_eq!(
-            Bundle::from_dir(dir.path()).expect("bundle").format,
-            IDENTITY_FORMAT
-        );
-        Bundle::from_slice(br#"{"format": 3, "endpoints": [], "callers": []}"#)
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        assert!(bundle.knows_types());
+        let old = Bundle::from_slice(br#"{"format": 3, "endpoints": [], "callers": []}"#)
             .expect("format 3 parses");
+        assert!(old.knows_types());
     }
 
     fn routes(krate: &str, handlers: &[&str]) -> RoutesDescriptor {
@@ -2051,6 +2067,107 @@ mod tests {
         let bundle = Bundle::from_dir(dir.path()).expect("bundle");
         assert!(!bundle.endpoint("catalog", "api_list").expect("ep").unrouted);
         assert!(bundle.endpoint("catalog", "list").expect("ep").unrouted);
+    }
+
+    /// Set the same wire type on the field `name` in both directions.
+    fn set_wire_type(t: &mut TypeDescriptor, name: &str, wire: &WireType) {
+        for field in t
+            .shape
+            .serialized
+            .iter_mut()
+            .chain(t.shape.deserialized.iter_mut())
+            .filter(|f| f.rust_name == name)
+        {
+            field.wire_type = Some(wire.clone());
+        }
+    }
+
+    #[test]
+    fn the_export_writes_each_object_wire_type_as_a_type_id() {
+        let dir = nested_fixture();
+        let mut item = typed(
+            "mesh-catalog",
+            "",
+            "Item",
+            &[("id", "String"), ("details", "Option<Vec<Details>>")],
+        );
+        set_wire_type(&mut item, "id", &WireType::string());
+        set_wire_type(
+            &mut item,
+            "details",
+            &WireType::nullable(WireType::array(WireType::object("Details"))),
+        );
+        write(dir.path(), "type.mesh-catalog.Item.json", &item);
+        let mut details = typed(
+            "mesh-catalog",
+            "",
+            "Details",
+            &[("size", "u32"), ("dims", "Dims")],
+        );
+        set_wire_type(&mut details, "dims", &WireType::object("Dims"));
+        write(dir.path(), "type.mesh-catalog.Details.json", &details);
+
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let ep = bundle.endpoint("catalog", "get_item").expect("endpoint");
+        for field in [
+            ep.response.produced("details").expect("field"),
+            ep.response.accepted("details").expect("field"),
+        ] {
+            assert_eq!(
+                field.wire_type,
+                Some(WireType::nullable(WireType::array(WireType::object(
+                    "mesh-catalog::Details"
+                ))))
+            );
+        }
+        assert_eq!(
+            ep.response.produced("id").expect("field").wire_type,
+            Some(WireType::string())
+        );
+        let dims = bundle
+            .nested("mesh-catalog::Details")
+            .expect("nested")
+            .shape
+            .produced("dims")
+            .expect("field");
+        assert_eq!(dims.wire_type, Some(WireType::object("mesh-catalog::Dims")));
+        let back = Bundle::from_slice(&bundle.to_bytes()).expect("parses");
+        assert_eq!(back, bundle);
+    }
+
+    #[test]
+    fn the_export_writes_the_type_id_of_an_object_in_an_event_payload() {
+        let dir = event_fixture();
+        let mut event = contact_event("core", 1);
+        for field in event
+            .shape
+            .serialized
+            .iter_mut()
+            .chain(event.shape.deserialized.iter_mut())
+        {
+            field.ty = "Address".to_owned();
+            field.wire_type = Some(WireType::object("Address"));
+        }
+        write(dir.path(), "event.core.ContactUpdated.json", &event);
+        write(
+            dir.path(),
+            "type.core.Address.json",
+            &typed("core", "", "Address", &[("street", "String")]),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let payload = &bundle.event("contact.updated").expect("event").shape;
+        assert!(!payload.serialized.is_empty());
+        for field in payload.serialized.iter().chain(&payload.deserialized) {
+            assert_eq!(field.wire_type, Some(WireType::object("core::Address")));
+        }
+    }
+
+    #[test]
+    fn a_newer_format_is_refused_and_names_the_formats_this_cli_reads() {
+        let err = Bundle::from_slice(br#"{"format": 5, "endpoints": [], "callers": []}"#)
+            .expect_err("refused");
+        assert!(err.contains("format 5"), "{err}");
+        assert!(err.contains("formats 1 to 4"), "{err}");
     }
 
     #[test]

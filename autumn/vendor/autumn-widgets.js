@@ -1301,14 +1301,30 @@
   }, true);
 
   // A key is missing until its upload ends, so hold the form. One listener
-  // for the page, so a swap leaves no stale listener on the form.
-  document.addEventListener('submit', function (e) {
-    var root = e.target.querySelector && e.target.querySelector(UPLOAD + '[aria-busy]');
-    if (!root) return;
+  // for each event on the page, so a swap leaves no stale listener.
+  var BUSY = UPLOAD + '[aria-busy]';
+  function hold(e, root, tell) {
     e.preventDefault();
     e.stopImmediatePropagation();
+    if (!tell) return;
     root.querySelector('[role="alert"]').textContent = 'Wait for the upload to finish, then send the form again.';
     root.querySelector('input[type="file"]').focus();
+  }
+  document.addEventListener('submit', function (e) {
+    var root = e.target.querySelector && e.target.querySelector(BUSY);
+    if (root) hold(e, root, true);
+  }, true);
+  // htmx sends a button request on `click`, not `submit`. Cancel a request
+  // that sends a busy upload, by the htmx 2 rule. Only a click or a submit
+  // moves focus. A request on `autumn:upload` sends the key, so it goes.
+  document.addEventListener('htmx:beforeRequest', function (e) {
+    var elt = e.detail.elt, cfg = e.detail.requestConfig || {}, ev = cfg.triggeringEvent, root;
+    if (!elt || !elt.closest || (ev && ev.type.indexOf('autumn:upload') === 0)) return;
+    var sent = (targetsOf(elt, 'hx-include') || []).concat(
+      elt.matches('form') ? elt : [],
+      cfg.verb !== 'get' ? elt.closest('form') || [] : []);
+    sent.some(function (n) { return (root = n.querySelector(BUSY) || n.closest(BUSY)); });
+    if (root) hold(e, root, ev && (ev.type === 'click' || ev.type === 'submit'));
   }, true);
 
   // Run `fn` on `root` (when it matches) and on each match inside it.
@@ -1376,17 +1392,34 @@
     if (pos === 4) all.reverse();
     return all.filter(function (el) { return el.compareDocumentPosition(elt) === pos; })[0];
   }
+  // As in htmx: `<sel/>` is `sel`, and a comma in it does not split.
+  function bare(s) { return /^<.*\/>$/.test(s) ? s.slice(1, -2) : s; }
+  function parts(sel) {
+    var out = [], depth = 0, from = 0;
+    for (var i = 0; i < sel.length; i++) {
+      var c = sel.charAt(i);
+      if (c === ',' && !depth) { out.push(sel.slice(from, i)); from = i + 1; }
+      else if (c === '<') depth++;
+      else if (c === '/' && sel.charAt(i + 1) === '>') depth--;
+    }
+    return out.concat(sel.slice(from));
+  }
+  // The elements that the inherited `attr` names, or null with no `attr`.
   // As htmx: `this` is the whole value. A keyword part resolves from `elt`.
   // The other parts join again into one query, so a comma in :is() stays.
-  function indicatorsOf(elt) {
-    var host = elt.closest('[hx-indicator],[data-hx-indicator]');
-    if (!host) return [elt];
-    var sel = host.getAttribute('hx-indicator') || host.getAttribute('data-hx-indicator');
+  function targetsOf(elt, attr) {
+    var host = elt.closest('[' + attr + '],[data-' + attr + ']');
+    if (!host) return null;
+    var sel = host.getAttribute(attr) || host.getAttribute('data-' + attr);
     if (sel === 'this') return [host];
-    var out = [], css = [];
+    var out = [], css = [], top = elt.getRootNode(), html = document.documentElement;
+    // The htmx words for one node. A document is its root element here.
+    var word = { document: html, root: top.host ? null : html, body: document.body, host: top.host, window: null };
     try {
-      sel.split(',').forEach(function (s) {
-        var m = REL.exec(s = s.trim()), k = m && (m[1] || m[2]), r = m && s.slice(m[0].length).trim();
+      parts(sel.replace(/^global /, '')).forEach(function (s) {
+        s = bare(s.trim()).replace(/ElementSibling$/, '');
+        if (word.hasOwnProperty(s)) return word[s] && out.push(word[s]);
+        var m = REL.exec(s), k = m && (m[1] || m[2]), r = m && bare(s.slice(m[0].length).trim());
         // An empty part (after a last comma) adds nothing, as in htmx.
         if (!m) return s && css.push(s);
         var one = k === 'closest' ? elt.closest(r) : k === 'find' ? elt.querySelector(r)
@@ -1396,6 +1429,9 @@
       });
       return out.concat(css.length ? Array.from(document.querySelectorAll(css.join(','))) : []);
     } catch (err) { return out; }
+  }
+  function indicatorsOf(elt) {
+    return targetsOf(elt, 'hx-indicator') || [elt];
   }
   function unbusy(el) {
     el.removeAttribute('aria-busy');
