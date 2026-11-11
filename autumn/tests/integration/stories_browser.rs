@@ -143,10 +143,14 @@ async fn seeded_busy_history() -> Markup {
 /// with a server value. Empty without `widgets-search`.
 #[get("/seeded/search-reset")]
 async fn seeded_search_reset() -> Markup {
-    #[cfg(not(feature = "widgets-search"))]
-    return busy_page(&html! {});
     #[cfg(feature = "widgets-search")]
-    search_reset_page()
+    {
+        search_reset_page()
+    }
+    #[cfg(not(feature = "widgets-search"))]
+    {
+        busy_page(&html! {})
+    }
 }
 
 #[cfg(feature = "widgets-search")]
@@ -156,7 +160,7 @@ fn search_reset_page() -> Markup {
     let tags = AutocompleteConfig::new("/_stories/demo/tags/suggest", "tags")
         .multiple()
         .free_text()
-        .selected(&[("rust", "rust")]);
+        .selected(&[("rust", "rust"), ("say", "say \"hi\"")]);
     let pick = AutocompleteConfig::new("/_stories/demo/tags/suggest", "pick").initial_value("7");
     busy_page(&html! {
         form id="reset-form" {
@@ -882,12 +886,18 @@ async fn search_widgets_restore_the_server_state_on_form_reset() {
     let page = runner.page().await.expect("page");
     open(&page, "/seeded/search-reset").await;
     let start = eval_string(&page, FORM_VALUES).await;
-    assert_eq!(start, r#"[["tags","rust"],["pick","7"]]"#, "server state");
+    assert_eq!(
+        start, r#"[["tags","rust"],["tags","say"],["pick","7"]]"#,
+        "server state"
+    );
 
-    // Edit the tags: remove "rust", add "zig" and "axum" (Enter adds free text).
-    page.click("#rs-tags-chips [data-ac-chip-remove]")
-        .await
-        .expect("remove chip");
+    // Edit the tags: remove both chips, add "zig" and "axum" (Enter adds
+    // free text).
+    for _ in 0..2 {
+        page.click("#rs-tags-chips [data-ac-chip-remove]")
+            .await
+            .expect("remove chip");
+    }
     for tag in ["zig", "axum"] {
         page.fill("#rs-tags-query", tag).await.expect("type");
         focus(&page, "#rs-tags-query").await;
@@ -908,6 +918,25 @@ async fn search_widgets_restore_the_server_state_on_form_reset() {
         "the query is clear"
     );
     assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#rs-tags [data-ac-status]').textContent"
+        )
+        .await,
+        "",
+        "the status text is clear"
+    );
+    assert_eq!(
+        eval_string(
+            &page,
+            "[...document.querySelectorAll('#rs-tags-chips [data-ac-chip-label]')]\
+             .map(e => e.textContent).join('|')"
+        )
+        .await,
+        "rust|say \"hi\"",
+        "labels come back exactly"
+    );
+    assert_eq!(
         eval_string(&page, "document.getElementById('rs-pick-query').value").await,
         "7",
         "the native reset restores the pick text"
@@ -919,7 +948,7 @@ async fn search_widgets_restore_the_server_state_on_form_reset() {
         .expect("remove restored chip");
     assert_eq!(
         eval_string(&page, FORM_VALUES).await,
-        r#"[["pick","7"]]"#,
+        r#"[["tags","say"],["pick","7"]]"#,
         "a restored chip is live"
     );
 

@@ -103,6 +103,9 @@
         c.querySelector('[data-ac-chip-label]').textContent];
     });
     function reset() {
+      // A removed chip must not take focus with it.
+      if (list.contains(document.activeElement)) queryInput.focus();
+      if (status) status.textContent = '';
       chips().forEach(function (c) { c.remove(); });
       initial.forEach(function (v) { put(v[0], v[1]); });
       rove();
@@ -208,7 +211,8 @@
     // The picked value at init. A form reset brings it back.
     var start = tags ? null : { name: getHidden().name, value: getHidden().value };
     resets.set(wrapper, function () {
-      dismissed = false;
+      // The query is empty now. A late response must not open the popup.
+      dismissed = true;
       listbox.innerHTML = '';
       if (tags) {
         tags.reset();
@@ -321,9 +325,9 @@
     });
   }
 
-  // A native reset does not undo what a script changed: chips, and the
-  // value of a hidden input. It does reset the query text. Wait one task, so
-  // a page that cancels the reset keeps its state.
+  // A native reset does not undo script changes to chips or to a hidden
+  // input. It does reset the query text. Wait one task. Then a page that
+  // cancels the reset keeps its state.
   var ROOTS = '[data-ac-value-id],[data-ac-multiple]';
   var resets = new WeakMap();
   document.addEventListener('reset', function (e) {
