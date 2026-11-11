@@ -774,7 +774,7 @@ fn unmatched_patterns(
         };
         if let Some(graph) = graph {
             for p in &b.owns {
-                let p_lower = p.to_ascii_lowercase();
+                let p_lower = table_pattern(p);
                 if !r.tables.iter().any(|t| glob(&p_lower, t)) {
                     warn("owns", p, "table of a #[model] in the graph");
                 }
@@ -807,7 +807,16 @@ fn unmatched_patterns(
         }
         for (list, entries) in [("may_read", &b.may_read), ("may_write", &b.may_write)] {
             for t in entries {
-                if r.exception_owners(t).is_empty() {
+                if !r.exception_owners(t).is_empty() {
+                    continue;
+                }
+                if graph.is_none() && is_wildcard(&table_pattern(t)) {
+                    warn(
+                        list,
+                        t,
+                        "table, because there is no graph. Write the table name, or check a graph",
+                    );
+                } else {
                     warn(list, t, "table that a boundary owns");
                 }
             }
@@ -1136,16 +1145,19 @@ impl<'a> Resolver<'a> {
 
     /// The boundaries that own a table an exception pattern matches.
     ///
-    /// The pattern is matched against the tables in the graph, and read as a
-    /// table name too. A tie between two boundaries counts for neither.
+    /// A pattern with no `*` is a table name, so it works with no graph. A
+    /// pattern with a `*` matches the tables in the graph only. A tie
+    /// between two boundaries counts for neither.
     fn exception_owners(&self, pattern: &str) -> BTreeSet<&'a str> {
         let lower = table_pattern(pattern);
+        let owner = |table: &str| self.owner(table).ok().flatten();
+        if !is_wildcard(&lower) {
+            return owner(&lower).into_iter().collect();
+        }
         self.tables
             .iter()
             .filter(|t| glob(&lower, t))
-            .map(String::as_str)
-            .chain(std::iter::once(lower.as_str()))
-            .filter_map(|t| self.owner(t).ok().flatten())
+            .filter_map(|t| owner(t))
             .collect()
     }
 
@@ -1198,6 +1210,11 @@ fn table_pattern(pattern: &str) -> String {
         Some((_, table)) => table.to_owned(),
         None => lower,
     }
+}
+
+/// Whether a table pattern from [`table_pattern`] has a `*`.
+fn is_wildcard(table: &str) -> bool {
+    table.contains('*')
 }
 
 /// How specific a pattern is: its count of characters that are not `*`.
@@ -1998,7 +2015,12 @@ may_read = ["campaign*"]
         }
         let deps = crates(&[("crm-reporting", "crm-marketing")]);
         let report = check(&config, None, Some(&deps)).expect("runs");
-        assert_eq!(crate_violations(&report).len(), 1, "{:?}", report.violations);
+        assert_eq!(
+            crate_violations(&report).len(),
+            1,
+            "{:?}",
+            report.violations
+        );
         let warnings = report.warnings.join("\n");
         assert!(
             warnings.contains("`may_read` pattern `campaign*`") && warnings.contains("no graph"),
@@ -2008,14 +2030,14 @@ may_read = ["campaign*"]
 
     #[test]
     fn an_owns_pattern_with_a_schema_matches_its_table_in_the_graph() {
-        let text = CONFIG.replace(
-            "owns = [\"contacts\"]",
-            "owns = [\"public.contacts\"]",
-        );
+        let text = CONFIG.replace("owns = [\"contacts\"]", "owns = [\"public.contacts\"]");
         let config = BoundaryConfig::parse(&text).expect("valid config");
         let report = check(&config, Some(&graph()), None).expect("runs");
         assert!(
-            !report.warnings.iter().any(|w| w.contains("public.contacts")),
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("public.contacts")),
             "{:?}",
             report.warnings
         );
