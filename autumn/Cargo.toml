@@ -494,7 +494,6 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
-tokio-cron-scheduler.workspace = true
 validator.workspace = true
 # `serde` is library-side, not test-only: `db::sqlite_types::SqliteUuid` is
 # `#[serde(transparent)]` over `uuid::Uuid`, so the lib does not compile under
