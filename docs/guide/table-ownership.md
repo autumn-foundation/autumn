@@ -138,10 +138,11 @@ entry as follows:
 * The check reads the table part only. `public.contacts` and `*.contacts`
   both mean `contacts`.
 * An entry with no `*` in its table part is a table name. It needs no graph.
-* An entry with a `*` in its table part matches the tables of the models in
-  the graph only. For example, core has `owns = ["*"]` and marketing owns
-  `campaigns`. `may_read = ["campaign*"]` on a third boundary allows the
-  schema crate of marketing. It does not allow the schema crate of core.
+* An entry with a `*` in its table part matches only the tables in the
+  graph: the tables of the models and repositories. For example, core has
+  `owns = ["*"]` and marketing owns `campaigns`. `may_read = ["campaign*"]`
+  on a third boundary allows the schema crate of marketing. It does not allow
+  the schema crate of core.
 * With no graph, an entry with a `*` matches no table. It allows no
   dependency, and the check gives a warning. Write the table name, or check
   a graph.

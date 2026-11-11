@@ -776,7 +776,7 @@ fn unmatched_patterns(
             for p in &b.owns {
                 let p_lower = table_pattern(p);
                 if !r.tables.iter().any(|t| glob(&p_lower, t)) {
-                    warn("owns", p, "table of a #[model] in the graph");
+                    warn("owns", p, "table of a model or repository in the graph");
                 }
             }
             for p in &b.modules {
@@ -1027,7 +1027,7 @@ pub fn ratchet(report: Report, baseline: Option<&Baseline>) -> Ratchet {
 /// Finds the boundary of a table, node or crate.
 struct Resolver<'a> {
     config: &'a BoundaryConfig,
-    /// The tables of the models in the graph, lowercase.
+    /// The tables of the models and repositories in the graph, lowercase.
     tables: BTreeSet<String>,
     /// Library name to its packages. A module path starts with the library
     /// name; the config can name the package.
@@ -1046,7 +1046,12 @@ impl<'a> Resolver<'a> {
         let tables = graph
             .iter()
             .flat_map(|g| &g.nodes)
-            .filter_map(|n| n.model.as_ref().map(|m| m.table.to_ascii_lowercase()))
+            .flat_map(|n| {
+                let model = n.model.as_ref().map(|m| &m.table);
+                let repository = n.repository.as_ref().map(|r| &r.table);
+                model.into_iter().chain(repository)
+            })
+            .map(|t| t.to_ascii_lowercase())
             .collect();
         let (lib_aliases, bin_aliases) = crates.map(aliases).unwrap_or_default();
         Self {
