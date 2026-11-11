@@ -53,10 +53,10 @@ it gets its own budget and gate (issue #977).
 
 | Change class | p50 ms | p95 ms | max ms | Gate |
 |---|---:|---:|---:|---|
-| Cold start (`autumn new` → first 200, no-DB) | 100 000 | **125 000** | 150 000 | **Gated** |
+| Cold start (`autumn new` → first 200, no-DB) | 80 000 | **100 000** | 120 000 | **Gated** |
 | Cold start (`autumn new` → first 200, database-backed) | 120 000 | 180 000 | 300 000 | Informational |
 
-**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **125 s** on
+**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **100 s** on
 the CI reference runner. Autumn's stated goal is still "time-from-`cargo new`
 to first served route < 60 s"; the gate above is the realistic ceiling for
 today's code, not the goal. See [Cold-start budget history](#cold-start-budget-history)
@@ -173,8 +173,8 @@ build. A default build does not change. On one 4 vCPU box a cold `hello`
 build fell from 118 s to 101 s.
 
 Issue #2309 had raised the budget to p95 130 s / max 160 s. The scheduled
-CI runs after ADR 0027 measured 89-104 s. The budget is now p95 125 s / max
-150 s. The gate checks p95 and max only, and with 3 runs p95 is the slowest
+CI runs after ADR 0027 measured 89-104 s. The budget then became p95 125 s /
+max 150 s. The gate checks p95 and max only, and with 3 runs p95 is the slowest
 sample. p95 is about 20% above the slowest sample seen.
 
 ADR 0045 cut the LLVM IR of `autumn-web` for the daemon starter by 13.4%:
@@ -212,10 +212,17 @@ use all cores. `autumn-web` then takes about 32 s, mostly on one core. The
 app takes 2.5 s. One second less in `autumn-web` saves one second. One
 unit-second less in a dependency saves a quarter of a second.
 
-The original 60 s / 90 s target is still open. The work of today's build
-packs into about 48 s on four cores at best. A larger gain needs less code
-in `autumn-web` and a shorter single-core phase: a split of `autumn-web`
-into crates that compile in parallel (issue #2795, ADR 0046 "Roadmap").
+Two CI runs of 5 samples on that tree measured 50.4-52.8 s on one runner
+and 75.8-76.9 s on another. The last scheduled run before it measured
+101.2 s, 89.3 s and 90.0 s. The budget is now p95 100 s / max 120 s: p95 is
+30% above the slowest of the ten samples.
+
+The original 60 s / 90 s target is met on the faster runner and not on the
+slower one. To meet it on each runner, the build needs less code in
+`autumn-web` and a shorter single-core phase: a split of `autumn-web` into
+crates that compile in parallel (issue #2795, ADR 0046 "Roadmap"). The work
+of today's build packs into about 48 s on four cores of the test box at
+best.
 
 ---
 

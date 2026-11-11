@@ -522,12 +522,26 @@ pub fn run_cold_start(
 mod tests {
     use super::*;
 
-    /// `Some(None)` is a removed variable. `Some(Some(v))` is a set one.
-    fn env_of(cargo: &Command, name: &str) -> Option<Option<String>> {
+    /// What a command does with one environment variable.
+    #[derive(Debug, PartialEq, Eq)]
+    enum EnvSetting {
+        /// The command inherits the variable.
+        Inherited,
+        /// The command removes the variable.
+        Removed,
+        /// The command sets the variable to this value.
+        Set(String),
+    }
+
+    fn env_of(cargo: &Command, name: &str) -> EnvSetting {
         cargo
             .get_envs()
             .find(|(key, _)| key.to_str() == Some(name))
-            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+            .map_or(EnvSetting::Inherited, |(_, value)| {
+                value.map_or(EnvSetting::Removed, |v| {
+                    EnvSetting::Set(v.to_string_lossy().into_owned())
+                })
+            })
     }
 
     fn args_of(cargo: &Command) -> Vec<String> {
@@ -543,7 +557,7 @@ mod tests {
             "CARGO_BUILD_TARGET_DIR",
             "CARGO_BUILD_TARGET",
         ] {
-            assert_eq!(env_of(cargo, removed), Some(None), "{removed}");
+            assert_eq!(env_of(cargo, removed), EnvSetting::Removed, "{removed}");
         }
         for wrapper in [
             "RUSTC_WRAPPER",
@@ -553,14 +567,16 @@ mod tests {
         ] {
             assert_eq!(
                 env_of(cargo, wrapper),
-                Some(Some(String::new())),
+                EnvSetting::Set(String::new()),
                 "{wrapper}"
             );
         }
         assert_eq!(
             env_of(cargo, "CARGO_INCREMENTAL"),
-            Some(Some("0".to_owned()))
+            EnvSetting::Set("0".to_owned())
         );
+        // The driver leaves every other variable as it is.
+        assert_eq!(env_of(cargo, "CARGO_HOME"), EnvSetting::Inherited);
     }
 
     /// The preparation step downloads in the project directory. It compiles

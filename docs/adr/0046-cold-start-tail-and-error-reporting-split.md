@@ -118,8 +118,11 @@ Six hats:
    sample count does not change.
 7. New apps build their dependencies with no debug info. See "Scaffold
    profile".
-8. The `ColdStartHello` budget does not change here. The measure job does not
-   run on a pull request. The budget follows CI samples of the merged tree.
+8. The `ColdStartHello` budget is p95 100 s and max 120 s, from p95 125 s and
+   max 150 s. The measure job does not run on a pull request, so two manual
+   runs of the gate on this branch gave the samples. p95 is 30% above the
+   slowest of the ten samples. Two runs on two runners differ by 25 s, so the
+   margin is wider than the 20% of ADR 0045.
 
 Tests:
 
@@ -173,14 +176,22 @@ target, `CARGO_INCREMENTAL=0`, the gate's `cargo build --target <host>`.
   change: two pairs of cold builds took 145.1 and 145.1 s on trunk, and
   144.2 and 146.8 s here.
   Its macro crates wait for `diesel`, not for the support crate.
-- These are single-box numbers. CI is about 1.1 times this box. The steady CI
-  sample was 89-90 s, so the estimate is about 78 s. No CI sample exists for
-  this tree: the measure job does not run on a pull request.
-- The gate's p95 was the first sample, 6-12 s above the others. If the
-  preparation step removes that gap, p95 comes down by that much with no
-  faster build. The report shows the preparation time, so the cost stays
-  visible.
-- The 60 s / 90 s target is still open.
+- CI, two manual runs of the gate on this branch, 5 samples each:
+
+  | Run | Preparation | Samples (s) | p95 = max |
+  |---|---:|---|---:|
+  | 43101462273 | 10.6 s | 76.9, 76.3, 76.1, 75.8, 76.0 | 76.9 |
+  | 43103677335 | 10.8 s | 50.4, 51.9, 51.7, 52.8, 52.7 | 52.8 |
+
+  The last scheduled run on trunk (2026-11-09) measured 101.2 s, 89.3 s and
+  90.0 s. The two runs here used two runners, and the runners differ by
+  25 s. So a comparison with the scheduled run has that much uncertainty.
+- The first sample is no longer the slowest by seconds. The preparation step
+  took 10.6 s and 10.8 s, which is the size of the old gap (6-12 s). That
+  part of the fall in p95 is not a faster build. The report shows the
+  preparation time, so the cost stays visible.
+- The 60 s / 90 s target is met on the faster runner (p95 52.8 s) and not on
+  the slower one (p95 76.9 s). It is still open as a target for each runner.
 - An app with `default-features = false`, no `reporting`, and
   `[failure_capture] enabled = true` fails boot. See `docs/migrations/next.md`.
 - A new app builds its dependencies with no debug info. A backtrace frame in

@@ -27,6 +27,10 @@
   shows the function name only. The template comment says how to get file
   and line back. An existing app does not change.
 
+- **dev-loop:** the gated cold-start budget (`ColdStartHello`) is now p95
+  100 s and max 120 s, from p95 125 s and max 150 s. Two CI runs of the gate
+  on the changed tree measured 50.4-52.8 s and 75.8-76.9 s.
+
 ### Performance
 
 - **build:** the no-DB daemon starter builds 12% faster from cold: 81.5 s
