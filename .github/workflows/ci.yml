@@ -1894,8 +1894,16 @@ jobs:
           # end-to-end test (#1607) drives the real `autumn deploy` over ssh/scp
           # against a privileged systemd container, and ubuntu-latest does not
           # guarantee the ssh *client* on PATH.
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client openssh-client
+          # Use apt only for a missing tool: the runner's Ubuntu mirror can
+          # fail DNS, and the image usually has these tools.
+          has() { command -v "$1" >/dev/null 2>&1; }
+          missing=()
+          has pg_dump && has pg_restore || missing+=(postgresql-client)
+          has ssh && has scp || missing+=(openssh-client)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y "${missing[@]}"
+          fi
           pg_dump --version
           pg_restore --version
           ssh -V
@@ -2468,9 +2476,13 @@ jobs:
         continue-on-error: true
       - name: Install the ssh client
         # The test drives the real `ssh`/`scp`. The runner may lack them.
+        # Use apt only when ssh or scp is missing: the runner's Ubuntu
+        # mirror can fail DNS.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-client
+          if ! command -v ssh >/dev/null 2>&1 || ! command -v scp >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y openssh-client
+          fi
           ssh -V
       - name: Pull Docker Hub images through a mirror
         # The unauthenticated Docker Hub pull limit is often spent.
