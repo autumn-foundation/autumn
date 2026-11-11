@@ -2473,7 +2473,7 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   `#[wire(type = "integer", format = "unix-seconds")]`. `type` is `string`,
   `integer`, `number`, `boolean` or `any`; another value does not compile.
   Add `nullable` for an `Option` under another name. The check reports a new
-  JSON form with the same Rust type (bundle format 4).
+  JSON form with the same Rust type (bundle format 4 or newer).
 - An `#[endpoint]` must be in a `routes![…]` call. Taking it out of the router
   is a removed route. For a handler of another crate, write its crate path
   (`routes![mesh_catalog::get_item]`), so the check judges that crate. `autumn contracts export --from <dir>` joins an existing

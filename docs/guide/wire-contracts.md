@@ -114,8 +114,8 @@ missing.
 * the **write-set** — every request field an inline struct literal sets.
 
 A field inside a field is a dotted path. `item.details.color` reads
-`details.color`. `NewItem { details: Details { color, .. }, .. }` writes
-`details` and `details.color`. The const assertions check the first segment
+`details.color`. `NewItem { name, details: Details { color } }` writes
+`details`, `details.color` and `name`. The const assertions check the first segment
 only. Both ends of one build share the nested type, so rustc checks the rest.
 
 Each becomes a const assertion against the callee's own const field table:
@@ -314,8 +314,9 @@ The rules:
 
 * **A producer may add fields.** A new field is not a break, unless the
   consumer's type has `#[serde(deny_unknown_fields)]`.
-* **A producer may not remove a field any deployed consumer reads.** Remove
-  it from the consumers first.
+* **A producer may not remove a field any deployed consumer reads.** This
+  includes a nested field, such as `address.city`. Remove it from the
+  consumers first.
 * **A consumer may not start to require a field that deployed producers do
   not send.** Add it to the producer first.
 * **A field's type must not change**, with the same rules as a response.
@@ -356,10 +357,9 @@ write-sets, the wire type of each field, nested types, the `unit` flag, and
 endpoints that no router registers. An older CLI refuses it. This CLI reads
 formats 1 to 5. A bundle older than format 5 has top-level paths only. When
 one of the two bundles is format 3 or older, the check does not compare wire
-types. With a
-bundle of format 1 or 2, the check compares nested types by name only. It
-does not compare the `unit` flag of a body or a nested type. It compares the
-`unit` flag of an event in every format.
+types. With a bundle of format 1 or 2, the check compares nested types by
+name only. It does not compare the `unit` flag of a body or a nested type. It
+compares the `unit` flag of an event in every format.
 
 ### Deploy order
 
@@ -656,14 +656,15 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * A nested read is found through a field (`item.details.color`), a binding
   of a field (`let d = &item.details;`), a struct pattern, an adapter such as
   `.unwrap()` or `.as_ref()`, and a callback such as `.map(|d| d.color)`. A
-  read through an index, a loop or another function stops at the field
-  before it. `item.lines[0].sku` reads `lines`. Then the check does not see
+  read through an index, a loop, a method or another function stops at the
+  field before it. `item.lines[0].sku` reads `lines`. Then the check does not see
   the removal of an *optional* field inside it. A *required* nested field is
   safe: the caller's type cannot decode without it.
 * A nested write is found in a struct literal, also in `Some(…)` or
-  `Box::new(…)`. A nested value from a variable has an unknown write-set.
-  Then the check counts a field as sent when the caller's own release
-  requires it.
+  `Box::new(…)`. A nested value that is not a struct literal, such as a
+  variable or a function call, has an unknown write-set. Then the check
+  counts a field that serde can skip as sent only when the caller's own
+  release requires it.
 * A request or response type is found by the path in the signature. A path
   through a re-export, such as `crate::dto::Item` for `shared::Item`, is
   refused when another crate has a type of that name. Write the path where the

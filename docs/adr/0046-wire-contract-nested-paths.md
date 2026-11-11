@@ -39,9 +39,11 @@ Option 1.
 - The const assertions use the first segment of each path.
 - The check splits the paths at each level. The first segments are the
   fields of the level. The rest goes to the nested type of that field. A
-  field with no nested write has an unknown write-set.
-- The memo and the recursion guard key on the type pair and the set. A set
-  gets shorter at each level, so a read through a recursive type resolves.
+  field that the call site does not set with a struct literal has an unknown
+  write-set.
+- The result cache and the recursion guard use the type pair and the set as
+  the key. A set gets shorter at each level, so a recursive type does not
+  stop a deep read.
 - The export writes bundle format 5. The reader accepts formats 1 to 5.
 
 ```mermaid

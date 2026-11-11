@@ -15,7 +15,6 @@
 
 ### Documentation
 
-- **contracts:** the wire contracts guide lists more limits: a caller's
-  read-set is top level only, a `routes![…]` entry with no crate path does
-  not judge another crate, and a `use … as` or `type` alias is read by its
+- **contracts:** the wire contracts guide lists more limits: a `routes![…]`
+  entry with no crate path does not judge another crate, and a `use … as` or `type` alias is read by its
   own name.

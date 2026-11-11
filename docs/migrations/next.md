@@ -542,8 +542,9 @@ does not compare wire types.
 
 **Why:** a read-set and a write-set now hold dotted paths, for example
 `details.color`. The check uses them at each nested level. So it reports the
-removal of an optional nested field that a caller reads. An older CLI does
-not find a dotted path, so it refuses the new format.
+removal of an optional nested field that a caller reads. An older CLI would
+not find a dotted path and would pass the break. So it refuses the new
+format.
 
 **You are affected only if a job reads a bundle from
 `autumn contracts export` with an older CLI.** The build does not change.
@@ -562,7 +563,8 @@ autumn contracts check --against deployed.json  # CLI {(X+1).0}, bundle format 5
 
 Upgrade the CLI on every job that reads the bundle. This CLI reads formats
 1 to 5. A bundle older than format 5 has top-level paths only. Export the
-deployed release again to get nested paths for its callers.
+deployed release again to get nested paths for its callers. A job that
+upgrades from format 3 also reads the bundle format 4 entry above.
 
 **Automation:** `manual` — upgrade the CLI in each job.
 
