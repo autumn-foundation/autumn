@@ -1,0 +1,6 @@
+{
+  "krate": "mesh-catalog",
+  "handlers": [
+    "list_items"
+  ]
+}

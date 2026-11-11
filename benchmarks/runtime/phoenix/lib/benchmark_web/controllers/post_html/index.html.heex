@@ -1,16 +1,17 @@
 <!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Posts</title></head>
-<body>
-<h1>Posts</h1>
-<ul>
-  <%= for post <- @posts do %>
-    <li>
-      <a href={"/posts/#{post.id}"}><%= post.title %></a>
-      &mdash; <%= post.author %>
-      <%= if !post.published, do: raw(" <em>[draft]</em>") %>
-    </li>
-  <% end %>
-</ul>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <title>Posts</title>
+  </head>
+  <body>
+    <h1>Posts</h1>
+    <ul>
+      <li :for={post <- @posts}>
+        <a href={"/posts/#{post.id}"}>{post.title}</a>
+        &mdash; {post.author}
+        <em :if={!post.published}>[draft]</em>
+      </li>
+    </ul>
+  </body>
 </html>

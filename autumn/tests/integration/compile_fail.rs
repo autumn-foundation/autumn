@@ -254,6 +254,8 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_managed_with_args.rs");
     #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_schema_bad_name.rs");
+    #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_unique_with_args.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
@@ -616,6 +618,23 @@ fn compile_fail_wire_contract_tests() {
     t.compile_fail("tests/compile-fail/wire_shape_rejects_transparent.rs");
     t.compile_fail("tests/compile-fail/wire_shape_rejects_container_rewrites.rs");
     t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_unknown_wire_type.rs");
+}
+
+/// Event contracts: a consumer that reads a field the event does not send
+/// fails the build at the read, and names the event and the field.
+#[test]
+fn compile_fail_event_contract_tests() {
+    let t = trybuild::TestCases::new();
+
+    t.compile_fail("tests/compile-fail/event_listener_reads_missing_field.rs");
+    t.compile_fail("tests/compile-fail/event_listener_reads_unsent_field.rs");
+    // `OutboxMessage` is behind `db`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/event_consumer_reads_unsent_field.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/event_consumer_payload_not_found.rs");
+    t.compile_fail("tests/compile-fail/event_rejects_flatten.rs");
 }
 
 // Split into `_a` / `_b` halves so CI can run them as two parallel trybuild
@@ -706,6 +725,10 @@ fn compile_pass_tests_a() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_schema_markers.rs");
 
+    // `#[model(schema = "...")]` is accepted and changes no codegen.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_schema_arg.rs");
+
     // Model field enum (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_field_enum.rs");
@@ -763,6 +786,10 @@ fn compile_pass_tests_a() {
     // caller that reads only produced fields and supplies every required one
     // compiles, including across a serde rename and a `skip_serializing_if`.
     t.pass("tests/compile-pass/wire_contract_holds.rs");
+    // Nested read and write paths: the const assertions check the first
+    // segment, so a nested read, a nested literal and a nested event read
+    // compile.
+    t.pass("tests/compile-pass/wire_contract_nested_paths.rs");
 
     // #1771: the escape hatch the confidential build failure names. A finder
     // over the blind-index companion column has to compile, or the diagnostic

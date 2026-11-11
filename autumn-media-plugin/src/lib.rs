@@ -21,6 +21,23 @@
 //! [`recordings_root`](MediaPlugin::recordings_root). If the storage config is
 //! not valid, the plugin installs no storage, workflows, jobs or sweep.
 //!
+//! # Background tasks and roles
+//!
+//! The plugin registers its loops as background tasks. The role of the
+//! process decides where each one runs:
+//!
+//! | Task | Capability | Runs on |
+//! |---|---|---|
+//! | [`ROOM_REAPER_TASK`], `db` store | [`MEDIA_MAINTENANCE`] | `combined`, `worker` |
+//! | [`ROOM_REAPER_TASK`], `memory` store | `serves_http` | `combined`, `web` |
+//! | [`RETENTION_TASK`] | [`MEDIA_RETENTION`], the media queue | roles that drain the media queue |
+//!
+//! The `memory` store is in the memory of the process that serves the room
+//! routes, so its reaper must run in that process. The recordings root is a
+//! local path. The encode jobs read it, so the sweep runs where they run. If
+//! each replica has its own recordings disk, use
+//! [`retention_on_every_role`](MediaPlugin::retention_on_every_role).
+//!
 //! If you enable neither primitive, the plugin installs no routes, extensions or
 //! jobs. It logs a warning.
 //!
@@ -68,16 +85,20 @@ pub use encode::{
     recording_segments_covering_window, slugify,
 };
 pub use error::MediaError;
+#[allow(deprecated)]
+pub use retention::spawn_retention_sweep_loop;
 pub use retention::{
-    RetentionDefer, RetentionReport, is_expired, recording_expires_at, spawn_retention_sweep_loop,
+    RetentionDefer, RetentionReport, is_expired, recording_expires_at, run_retention_sweep,
     sweep_recordings_root, within_root,
 };
+#[allow(deprecated)]
+pub use rooms::spawn_room_reaper_loop;
 pub use rooms::{
     HeartbeatRequest, HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse,
     LeaveRequest, ParticipantView, PublishTarget, ReapFuture, ReapStats, RoomError,
     RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore, RoomStoreFuture, SessionToken,
     SubscribeTarget, renewed_expiry, room_participant_path, room_route_infos, room_router,
-    spawn_room_reaper_loop, validate_room_segment,
+    run_room_reaper, validate_room_segment,
 };
 pub use rooms_db::DbRoomStore;
 pub use sink::{
@@ -99,6 +120,8 @@ pub use workflows::{
 
 /// Common downstream imports for configuring and mounting the media plugin.
 pub mod prelude {
+    #[allow(deprecated)]
+    pub use crate::spawn_room_reaper_loop;
     pub use crate::{
         FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand,
         FfmpegPosterCommand, FfmpegPreviewSpriteCommand, FfmpegRoomCompositeCommand,
@@ -116,7 +139,7 @@ pub mod prelude {
     pub use crate::{
         HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats,
         RoomError, RoomService, RoomSnapshot, RoomStore, SessionToken, renewed_expiry,
-        room_participant_path, room_route_infos, room_router, spawn_room_reaper_loop,
+        room_participant_path, room_route_infos, room_router, run_room_reaper,
         validate_room_segment,
     };
     pub use crate::{
@@ -125,6 +148,7 @@ pub mod prelude {
         recording_available, recording_mediamtx_path, stream_status_from_path_json,
         viewer_count_from_path_json, viewer_counts_from_paths_json,
     };
+    pub use crate::{MEDIA_MAINTENANCE, MEDIA_RETENTION, RETENTION_TASK, ROOM_REAPER_TASK};
 }
 
 use std::borrow::Cow;
@@ -133,12 +157,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use autumn_web::app::AppBuilder;
+use autumn_web::background::{BackgroundTask, PluginCapability};
 use autumn_web::plugin::Plugin;
+use autumn_web::{AutumnError, Capability};
 
 use crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS;
 use crate::retention::RetentionDefer as RetentionDeferHook;
 use crate::sink::MediaArtifactSink as MediaArtifactSinkTrait;
 use crate::workflows::MediaWorkflowDelegate as MediaWorkflowDelegateHook;
+
+/// The capability of the room reaper on a shared (`db`) store. A role runs
+/// it when it runs `maintenance`: `combined` and `worker`.
+pub const MEDIA_MAINTENANCE: PluginCapability =
+    PluginCapability::new("media.maintenance", Capability::Maintenance);
+
+/// The capability of the recording retention sweep. A role runs it when it
+/// runs `retention`: `combined` and `worker`.
+pub const MEDIA_RETENTION: PluginCapability =
+    PluginCapability::new("media.retention", Capability::Retention);
+
+/// The background task name of the room reaper.
+pub const ROOM_REAPER_TASK: &str = "media.room_reaper";
+
+/// The background task name of the recording retention sweep.
+pub const RETENTION_TASK: &str = "media.recording_retention";
 
 /// The live-streaming media plugin.
 ///
@@ -174,6 +216,24 @@ pub struct MediaPlugin {
     recordings_root: Option<PathBuf>,
     /// App-overridable retention-defer predicate.
     retention_defer: Option<RetentionDeferHook>,
+    /// The tasks that run on every role.
+    every_role: EveryRole,
+}
+
+/// The background tasks that a plugin config runs on every role.
+#[derive(Debug, Default, Clone, Copy)]
+struct EveryRole {
+    /// The retention sweep.
+    retention: bool,
+    /// The room reaper.
+    room_reaper: bool,
+}
+
+impl EveryRole {
+    /// The explicit switch of a task: `Some(true)` or `None`.
+    const fn switch(on: bool) -> Option<bool> {
+        if on { Some(true) } else { None }
+    }
 }
 
 impl MediaPlugin {
@@ -194,6 +254,10 @@ impl MediaPlugin {
             retention_days: None,
             recordings_root: None,
             retention_defer: None,
+            every_role: EveryRole {
+                retention: false,
+                room_reaper: false,
+            },
         }
     }
 
@@ -358,7 +422,7 @@ impl MediaPlugin {
     }
 
     /// Set the filesystem root the retention sweep deletes expired recordings
-    /// from. Required to spawn the sweep — without it, no retention loop runs.
+    /// from. Required for the sweep: without it, no retention task starts.
     #[must_use]
     pub fn recordings_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.recordings_root = Some(root.into());
@@ -371,6 +435,33 @@ impl MediaPlugin {
     #[must_use]
     pub fn retention_defer(mut self, defer: RetentionDeferHook) -> Self {
         self.retention_defer = Some(defer);
+        self
+    }
+
+    /// Run the retention sweep on every role, `web` too.
+    ///
+    /// By default the sweep runs only where the media queue is drained. Use
+    /// this when each replica has its own recordings disk. This switch also
+    /// overrides `"media.retention" = false` on a role. The framework logs a
+    /// warning on each role that does not run [`MEDIA_RETENTION`] or does not
+    /// drain the media queue.
+    #[must_use]
+    pub const fn retention_on_every_role(mut self) -> Self {
+        self.every_role.retention = true;
+        self
+    }
+
+    /// Run the room reaper on every role, `web` too.
+    ///
+    /// With the `db` store, the reaper runs only on roles that run
+    /// [`MEDIA_MAINTENANCE`]. Use this for a fleet of only `web` replicas.
+    /// Reapers on many processes converge: the `db` sweep is last write
+    /// wins. This switch also overrides `"media.maintenance" = false` on a
+    /// role. The framework logs a warning on each role that does not run the
+    /// reaper capability.
+    #[must_use]
+    pub const fn room_reaper_on_every_role(mut self) -> Self {
+        self.every_role.room_reaper = true;
         self
     }
 }
@@ -419,6 +510,7 @@ impl Plugin for MediaPlugin {
             retention_days,
             recordings_root,
             retention_defer,
+            every_role,
         } = self;
 
         // Declare the plugin-owned `[media]` top-level config table so a host app
@@ -429,6 +521,11 @@ impl Plugin for MediaPlugin {
         // owns and validates itself. Applied first so every return path below
         // (including the early room-misconfig abort) carries the declaration.
         let app = app.config_section("media");
+        // Declare both capabilities on every path, so that a
+        // `[roles.<name>] capabilities` key for them never fails the boot.
+        let app = app
+            .plugin_capability(MEDIA_MAINTENANCE)
+            .plugin_capability(MEDIA_RETENTION);
 
         let retention_days = retention_days.unwrap_or(config.recording.retention_days);
 
@@ -508,14 +605,11 @@ impl Plugin for MediaPlugin {
         if enable_rooms {
             // Select the room-state backend (config, default `memory`).
             //
-            // The `memory` store is per-process, so the `RoomService` and the
-            // reaper MUST share ONE instance — built once here and cloned into
-            // both hooks. The `db` store is stateless w.r.t. process memory (all
-            // room state lives in the shared database), so per-hook instances
-            // over the same pool are equivalent; it is built lazily from
-            // `state.pool()` inside each hook via `build_room_store`, which
-            // degrades to a warned in-memory store if `db` was selected without
-            // a configured database.
+            // The `db` store needs `state.pool()`, so the initializer builds
+            // it. With no pool it falls back to a memory store and logs a
+            // warning. The
+            // reaper reads the store from the `RoomService`, so both always
+            // use one store.
             let backend = config.room_store_backend;
             let shared_memory_store: Option<Arc<dyn rooms::RoomStore>> = match backend {
                 config::RoomStoreBackend::Memory => Some(Arc::new(rooms::InMemoryRoomStore::new(
@@ -535,12 +629,18 @@ impl Plugin for MediaPlugin {
                 chrono::Duration::seconds(i64::from(config.room_session_max_seconds));
             let room_rate_limit = config.room_rate_limit_per_minute;
 
-            let init_store = shared_memory_store.clone();
+            // The `memory` store lives in the process that serves the room
+            // routes, so its reaper runs there. A shared `db` store does not
+            // need a reaper on each web replica. The workers reap it.
+            let reaper_capability: autumn_web::background::BackgroundCapability = match backend {
+                config::RoomStoreBackend::Memory => Capability::ServesHttp.into(),
+                config::RoomStoreBackend::Db => MEDIA_MAINTENANCE.into(),
+            };
             app = app
                 .nest(&api_prefix, rooms::room_router())
                 .declare_plugin_routes(rooms::room_route_infos(&api_prefix))
                 .state_initializer(move |state| {
-                    let store = init_store
+                    let store = shared_memory_store
                         .clone()
                         .unwrap_or_else(|| build_room_store(state, room_max_participants));
                     let room_service = rooms::RoomService::new(
@@ -554,19 +654,22 @@ impl Plugin for MediaPlugin {
                     .with_rate_limit_per_minute(room_rate_limit);
                     state.insert_extension(room_service);
                 })
-                // Spawn from `on_startup` so the reaper shares the running app's
-                // tokio runtime (matching the retention sweep below). For the
-                // `db` backend it builds its own store instance over the same
-                // pool the service uses — sweeping the same shared rows.
-                .on_startup(move |state| {
-                    let store = shared_memory_store
-                        .clone()
-                        .unwrap_or_else(|| build_room_store(&state, room_max_participants));
-                    async move {
-                        rooms::spawn_room_reaper_loop(store);
-                        Ok(())
-                    }
-                });
+                .background(
+                    BackgroundTask::new(
+                        ROOM_REAPER_TASK,
+                        reaper_capability,
+                        |state, shutdown| async move {
+                            let store = reaper_store(&state).ok_or_else(|| {
+                                AutumnError::internal_server_error_msg(
+                                    "autumn-media: the room reaper found no RoomService",
+                                )
+                            })?;
+                            rooms::run_room_reaper(store, shutdown).await;
+                            Ok(())
+                        },
+                    )
+                    .explicit(EveryRole::switch(every_role.room_reaper)),
+                );
         }
 
         // The broadcast transport does not need storage, so install it before
@@ -620,28 +723,49 @@ impl Plugin for MediaPlugin {
             // priority, so the media queue drains without extra config.
             .jobs(workflows::media_job_infos(&queue));
 
-        // Recording-retention sweep: spawn only when a recordings root is
-        // configured and retention is enabled. Spawned from `on_startup` so it
-        // shares the running app's runtime, matching how the thumbnail/retention
-        // loops are spawned in an Autumn app.
-        if let Some(root) = recordings_root {
-            app.on_startup(move |_state| {
-                let root = root.clone();
-                let defer = retention_defer.clone();
-                async move {
-                    retention::spawn_retention_sweep_loop(root, retention_days, defer);
-                    Ok(())
-                }
-            })
-        } else {
-            if retention_days > 0 {
-                tracing::debug!(
-                    "🍂 Autumn Media: retention window set but no recordings_root; sweep not spawned"
-                );
+        // The recordings root is a local path. The encode jobs read it, so the
+        // sweep runs where the media queue is drained.
+        match recordings_root {
+            Some(root) if retention_days > 0 => app.background(
+                BackgroundTask::new(RETENTION_TASK, MEDIA_RETENTION, move |_state, shutdown| {
+                    let sweep = retention::run_retention_sweep(
+                        root.clone(),
+                        retention_days,
+                        retention_defer.clone(),
+                        shutdown,
+                    );
+                    async move {
+                        sweep.await;
+                        Ok(())
+                    }
+                })
+                .queues([queue.as_str()])
+                .explicit(EveryRole::switch(every_role.retention)),
+            ),
+            Some(_) => {
+                tracing::info!("🍂 Autumn Media: retention_days = 0; no retention sweep");
+                app
             }
-            app
+            None => {
+                if retention_days > 0 {
+                    tracing::debug!(
+                        "🍂 Autumn Media: retention window set but no recordings_root; no sweep"
+                    );
+                }
+                app
+            }
         }
     }
+}
+
+/// The room store that the reaper sweeps: the store of the [`RoomService`].
+///
+/// The reaper and the service then always use one store, also when a `db`
+/// store falls back to memory.
+fn reaper_store(state: &autumn_web::AppState) -> Option<Arc<dyn rooms::RoomStore>> {
+    state
+        .extension::<rooms::RoomService>()
+        .map(|service| Arc::clone(service.store()))
 }
 
 /// Validate an effective mesh-room seat count against the ABSOLUTE ceiling.
@@ -1429,7 +1553,7 @@ mod primitive_surface_tests {
 
     /// Build `plugin` over a root with one expired file. Return `true` if the
     /// retention sweep looks at the file within `wait`.
-    async fn sweep_runs(plugin: MediaPlugin, wait: Duration) -> bool {
+    async fn sweep_runs(plugin: MediaPlugin, role: &str, wait: Duration) -> bool {
         let root = tempfile::tempdir().expect("tempdir");
         let old = root.path().join("old.mp4");
         std::fs::write(&old, b"old").expect("write");
@@ -1449,7 +1573,10 @@ mod primitive_surface_tests {
             .recordings_root(root.path())
             .retention_days(1)
             .retention_defer(defer);
-        let _client = TestApp::new().plugin(plugin).build();
+        let _client = TestApp::new()
+            .config(role_config(role))
+            .plugin(plugin)
+            .build();
         let seen = tokio::time::timeout(wait, rx.recv()).await;
         assert!(Path::new(&old).exists(), "the defer hook keeps the file");
         matches!(seen, Ok(Some(_)))
@@ -1457,7 +1584,226 @@ mod primitive_surface_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn retention_sweep_starts_only_with_a_primitive() {
-        assert!(sweep_runs(MediaPlugin::new().with_rooms(), Duration::from_secs(5)).await);
-        assert!(!sweep_runs(MediaPlugin::new(), Duration::from_millis(300)).await);
+        assert!(
+            sweep_runs(
+                MediaPlugin::new().with_rooms(),
+                "combined",
+                Duration::from_secs(5)
+            )
+            .await
+        );
+        assert!(!sweep_runs(MediaPlugin::new(), "combined", Duration::from_millis(300)).await);
+    }
+
+    /// A config with `role`, the sensitive actuator endpoints and `extra`.
+    fn role_config_with(role: &str, extra: &str) -> autumn_web::config::AutumnConfig {
+        toml::from_str(&format!(
+            "role = \"{role}\"\n{extra}\n[actuator]\nsensitive = true\n"
+        ))
+        .expect("config parses")
+    }
+
+    /// A config with `role` and the sensitive actuator endpoints.
+    fn role_config(role: &str) -> autumn_web::config::AutumnConfig {
+        role_config_with(role, "")
+    }
+
+    /// The `/actuator/tasks` entry of background task `name` when `plugin`
+    /// runs on `role`, with `extra` config.
+    ///
+    /// It reads the entry after a short wait. A task that fails or returns at
+    /// once then shows `failed` or `exited`, not `running`.
+    async fn background_task_with(
+        plugin: MediaPlugin,
+        role: &str,
+        extra: &str,
+        name: &str,
+    ) -> serde_json::Value {
+        let client = TestApp::new()
+            .config(role_config_with(role, extra))
+            .plugin(plugin)
+            .build();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let body: serde_json::Value = client
+            .get("/actuator/tasks")
+            .send()
+            .await
+            .assert_ok()
+            .json();
+        body["background_tasks"][name].clone()
+    }
+
+    /// [`background_task_with`] with no extra config.
+    async fn background_task(plugin: MediaPlugin, role: &str, name: &str) -> serde_json::Value {
+        background_task_with(plugin, role, "", name).await
+    }
+
+    fn rooms_on(backend: crate::config::RoomStoreBackend) -> MediaPlugin {
+        let config = MediaConfig {
+            room_store_backend: backend,
+            ..MediaConfig::default()
+        };
+        MediaPlugin::new().config(config).with_rooms()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_room_reaper_runs_on_worker_and_not_on_web() {
+        let db = crate::config::RoomStoreBackend::Db;
+        let web = background_task(rooms_on(db), "web", crate::ROOM_REAPER_TASK).await;
+        assert_eq!(web["capability"], "media.maintenance", "{web}");
+        assert_eq!(web["runs_here"], false, "{web}");
+        assert_eq!(web["status"], "not_placed", "{web}");
+        assert_eq!(web["roles"], serde_json::json!(["combined", "worker"]));
+
+        let worker = background_task(rooms_on(db), "worker", crate::ROOM_REAPER_TASK).await;
+        assert_eq!(worker["runs_here"], true, "{worker}");
+        assert_eq!(worker["status"], "running", "{worker}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_named_role_turns_the_media_tasks_off() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let preset = "[roles.quiet]\nbase = \"worker\"\n\
+                      capabilities = { \"media.maintenance\" = false, \"media.retention\" = false }\n";
+        let plugin = || rooms_on(crate::config::RoomStoreBackend::Db).recordings_root(root.path());
+        for name in [crate::ROOM_REAPER_TASK, crate::RETENTION_TASK] {
+            let task = background_task_with(plugin(), "quiet", preset, name).await;
+            assert_eq!(task["status"], "not_placed", "{name}: {task}");
+            assert_eq!(task["roles"], serde_json::json!(["combined", "worker"]));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_media_capability_keys_are_valid_with_a_memory_store() {
+        // No `db` reaper and no sweep: the plugin still declares both keys,
+        // so the boot of the role does not fail.
+        let preset = "[roles.quiet]\nbase = \"worker\"\n\
+                      capabilities = { \"media.maintenance\" = false, \"media.retention\" = false }\n";
+        let task = background_task_with(
+            rooms_on(crate::config::RoomStoreBackend::Memory),
+            "quiet",
+            preset,
+            crate::ROOM_REAPER_TASK,
+        )
+        .await;
+        assert_eq!(task["capability"], "serves_http", "{task}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_pinned_away_from_the_media_queue_does_not_sweep() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let task = background_task_with(
+            MediaPlugin::new().with_rooms().recordings_root(root.path()),
+            "worker",
+            "[jobs]\npin = [\"critical\"]\n",
+            crate::RETENTION_TASK,
+        )
+        .await;
+        assert_eq!(task["status"], "not_placed", "{task}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn room_reaper_on_every_role_runs_the_shared_reaper_on_web() {
+        let plugin = rooms_on(crate::config::RoomStoreBackend::Db).room_reaper_on_every_role();
+        let web = background_task(plugin, "web", crate::ROOM_REAPER_TASK).await;
+        assert_eq!(web["explicit"], true, "{web}");
+        assert_eq!(web["runs_here"], true, "{web}");
+        assert_eq!(web["status"], "running", "{web}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_room_reaper_runs_where_the_rooms_are_served() {
+        let memory = crate::config::RoomStoreBackend::Memory;
+        let web = background_task(rooms_on(memory), "web", crate::ROOM_REAPER_TASK).await;
+        assert_eq!(web["capability"], "serves_http", "{web}");
+        assert_eq!(web["runs_here"], true, "{web}");
+        assert_eq!(web["roles"], serde_json::json!(["combined", "web"]));
+
+        let worker = background_task(rooms_on(memory), "worker", crate::ROOM_REAPER_TASK).await;
+        assert_eq!(worker["runs_here"], false, "{worker}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_room_reaper_without_rooms() {
+        let task = background_task(
+            MediaPlugin::new().with_broadcast(),
+            "combined",
+            crate::ROOM_REAPER_TASK,
+        )
+        .await;
+        assert!(task.is_null(), "{task}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reaper_reaps_the_store_of_the_room_service() {
+        // A `db` store with no pool falls back to memory. The reaper must
+        // see that same store, not a second one.
+        let same = probe(rooms_on(crate::config::RoomStoreBackend::Db), |state| {
+            let service = state.extension::<RoomService>().expect("rooms installed");
+            let reaped = crate::reaper_store(state).expect("reaper store");
+            Arc::ptr_eq(service.store(), &reaped)
+        });
+        assert!(same, "the reaper and the service use two stores");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retention_sweep_runs_on_worker_and_not_on_web() {
+        let rooms = || MediaPlugin::new().with_rooms();
+        assert!(sweep_runs(rooms(), "worker", Duration::from_secs(5)).await);
+        assert!(!sweep_runs(rooms(), "web", Duration::from_millis(300)).await);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let web = background_task(
+            rooms().recordings_root(root.path()),
+            "web",
+            crate::RETENTION_TASK,
+        )
+        .await;
+        assert_eq!(web["capability"], "media.retention", "{web}");
+        assert_eq!(web["queues"], serde_json::json!(["media"]), "{web}");
+        assert_eq!(web["status"], "not_placed", "{web}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retention_on_every_role_runs_the_sweep_on_web() {
+        let plugin = MediaPlugin::new().with_rooms().retention_on_every_role();
+        assert!(sweep_runs(plugin, "web", Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retention_sweep_follows_a_custom_queue() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let task = background_task(
+            MediaPlugin::new()
+                .with_rooms()
+                .queue("encode")
+                .recordings_root(root.path()),
+            "worker",
+            crate::RETENTION_TASK,
+        )
+        .await;
+        assert_eq!(task["queues"], serde_json::json!(["encode"]), "{task}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_retention_task_when_retention_is_off() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let task = background_task(
+            MediaPlugin::new()
+                .with_rooms()
+                .recordings_root(root.path())
+                .retention_days(0),
+            "combined",
+            crate::RETENTION_TASK,
+        )
+        .await;
+        assert!(task.is_null(), "{task}");
+    }
+
+    #[test]
+    fn media_jobs_carry_the_configured_queue() {
+        let infos = media_job_infos("encode");
+        assert!(!infos.is_empty());
+        assert!(infos.iter().all(|info| info.queue == "encode"));
     }
 }

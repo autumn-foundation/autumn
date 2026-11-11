@@ -3,7 +3,9 @@
 pub mod check;
 pub mod checked;
 pub mod client;
+pub mod consumer;
 pub mod endpoint;
 pub mod ir;
 pub mod shape;
 pub mod store;
+pub mod wire_type;

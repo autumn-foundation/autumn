@@ -231,6 +231,124 @@ pub proof fn lake_files_not_under_root(
     }
 }
 
+// ---- Part 3: a sink that keeps its lake between loads ----
+//
+// Core runs `included` first. Then it asks the sink `has(key, generation)`.
+// If yes, core calls `keep` and restores nothing. Else core restores the
+// member and calls `add`. At `finish`, the sink drops each member that it
+// did not get from `add` or `keep`. The model has no member that fails.
+
+/// What a sink holds for one member from an earlier load.
+pub struct Held {
+    /// The replica state it holds: the generation and the WAL position.
+    pub generation: int,
+    /// The rows it holds for that state.
+    pub rows: nat,
+}
+
+/// The rows one member gives to a kept lake after a load. An excluded
+/// member gives none: the sink drops it at `finish`.
+pub open spec fn kept_rows(c: Candidate, generation: int, held: Option<Held>) -> nat {
+    if !included(c) {
+        0
+    } else {
+        match held {
+            Some(h) => if h.generation == generation {
+                h.rows
+            } else {
+                c.rows
+            },
+            None => c.rows,
+        }
+    }
+}
+
+/// The sink invariant: the rows it holds for a state are the rows of that
+/// state.
+pub open spec fn held_valid(c: Candidate, generation: int, held: Option<Held>) -> bool {
+    match held {
+        Some(h) => (h.generation == generation ==> h.rows == c.rows),
+        None => true,
+    }
+}
+
+/// The rows of a kept lake after it loads `s`. `generations[i]` is the
+/// replica state of `s[i]` now. `held[i]` is what the sink holds for it.
+pub open spec fn kept_lake_rows(
+    s: Seq<Candidate>,
+    generations: Seq<int>,
+    held: Seq<Option<Held>>,
+) -> nat
+    decreases s.len(),
+{
+    if s.len() == 0 || generations.len() == 0 || held.len() == 0 {
+        0
+    } else {
+        kept_lake_rows(s.drop_last(), generations.drop_last(), held.drop_last()) + kept_rows(
+            s.last(),
+            generations.last(),
+            held.last(),
+        )
+    }
+}
+
+/// A held member that is now excluded (deleted) gives no rows.
+pub proof fn an_excluded_held_member_is_dropped(c: Candidate, generation: int, held: Option<Held>)
+    requires
+        !included(c),
+    ensures
+        kept_rows(c, generation, held) == 0,
+{
+}
+
+/// One member gives the same rows to a kept lake as to a new lake.
+pub proof fn kept_member_matches_new(c: Candidate, generation: int, held: Option<Held>)
+    requires
+        held_valid(c, generation, held),
+    ensures
+        kept_rows(c, generation, held) == if included(c) {
+            c.rows
+        } else {
+            0
+        },
+{
+}
+
+/// A load that skips held members gives the same rows as a load that
+/// restores every member.
+pub proof fn kept_lake_matches_new(
+    s: Seq<Candidate>,
+    generations: Seq<int>,
+    held: Seq<Option<Held>>,
+)
+    requires
+        s.len() == generations.len(),
+        s.len() == held.len(),
+        forall|i: int| 0 <= i < s.len() ==> held_valid(#[trigger] s[i], generations[i], held[i]),
+    ensures
+        kept_lake_rows(s, generations, held) == lake_rows(s),
+    decreases s.len(),
+{
+    if s.len() > 0 {
+        let rest = s.drop_last();
+        let rest_generations = generations.drop_last();
+        let rest_held = held.drop_last();
+        assert forall|i: int| 0 <= i < rest.len() implies held_valid(
+            #[trigger] rest[i],
+            rest_generations[i],
+            rest_held[i],
+        ) by {
+            assert(rest[i] == s[i]);
+            assert(rest_generations[i] == generations[i]);
+            assert(rest_held[i] == held[i]);
+        }
+        kept_lake_matches_new(rest, rest_generations, rest_held);
+        let last = s.len() - 1;
+        assert(held_valid(s[last], generations[last], held[last]));
+        kept_member_matches_new(s[last], generations[last], held[last]);
+    }
+}
+
 fn main() {}
 
 } // verus!

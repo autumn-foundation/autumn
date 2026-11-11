@@ -6,7 +6,10 @@ port = 8080
 # Overridden at runtime via DATABASE_URL env var.
 url = "postgres://benchmark:benchmark@localhost:5432/benchmark"
 pool_size = 20
+# Apply the packaged migrations at startup, as every other app in the suite
+# does. One process, so there is no rolling-deploy hazard.
+auto_migrate = true
 
-[logging]
+[log]
 level = "warn"
-format = "json"
+format = "Json"

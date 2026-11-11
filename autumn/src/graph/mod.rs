@@ -50,6 +50,7 @@
 //! See `docs/guide/architecture-graph.md`.
 
 pub mod boundaries;
+pub mod grants;
 pub mod manifest;
 pub mod query;
 
@@ -432,6 +433,8 @@ pub enum NodeKind {
     ScheduledTask,
     /// A `#[task]` handler.
     OneOffTask,
+    /// A task registered with `AppBuilder::background_task` (#3545).
+    BackgroundTask,
 }
 
 impl NodeKind {
@@ -443,6 +446,7 @@ impl NodeKind {
             Self::Model => "model",
             Self::Repository => "repository",
             Self::Job | Self::ScheduledTask | Self::OneOffTask => "job",
+            Self::BackgroundTask => "background_task",
         }
     }
 
@@ -453,7 +457,12 @@ impl NodeKind {
     pub const fn is_entry_point(self) -> bool {
         matches!(
             self,
-            Self::Route | Self::StaticRoute | Self::Job | Self::ScheduledTask | Self::OneOffTask
+            Self::Route
+                | Self::StaticRoute
+                | Self::Job
+                | Self::ScheduledTask
+                | Self::OneOffTask
+                | Self::BackgroundTask
         )
     }
 }
@@ -468,6 +477,7 @@ impl std::fmt::Display for NodeKind {
             Self::Job => "job",
             Self::ScheduledTask => "scheduled task",
             Self::OneOffTask => "one-off task",
+            Self::BackgroundTask => "background task",
         })
     }
 }

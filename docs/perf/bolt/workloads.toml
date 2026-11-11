@@ -115,6 +115,14 @@ args = ["--bench", "--profile-time", "1"]
 
 [[workload]]
 package = "autumn-web"
+bench = "metrics_held"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 10000
+dhat_n = 10000
+
+[[workload]]
+package = "autumn-web"
 bench = "pdf_render"
 features = ["pdf"]
 mode = "marginal"
@@ -146,8 +154,16 @@ ledger = "postgres"
 package = "autumn-web"
 bench = "request_pipeline"
 exempt = """Exhausted: repeated callgrind and dhat passes took it to the floor \
-(about 95.2M Ir at --iterations 300). The rest is allocator cost from the \
+(about 84.9M Ir at --iterations 300). The rest is allocator cost from the \
 tower layer-clone cascade (#2830). AGENTS.md forbids profiling it again."""
+
+[[workload]]
+package = "autumn-web"
+bench = "sqlite_mmap_read"
+features = ["sqlite"]
+mode = "criterion"
+args = ["--bench", "--profile-time", "1"]
+env = ["AUTUMN_BENCH_SQLITE_ROWS=8192"]
 
 [[workload]]
 package = "autumn-web"

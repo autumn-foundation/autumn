@@ -58,10 +58,19 @@ async fn add_item(http: Client) -> AutumnResult<Markup> {
     Ok(html! { p { "created " (created.id) } })
 }
 
+/// Keep the storefront's price copy fresh. Reads `id` and `price_cents` off
+/// the event, and `#[listener]` holds both reads to what the event sends.
+#[listener(mesh_catalog::ItemRepriced)]
+async fn on_item_repriced(_state: AppState, event: mesh_catalog::ItemRepriced) -> AutumnResult<()> {
+    let _price = (event.id, event.price_cents);
+    Ok(())
+}
+
 #[autumn_web::main]
 async fn main() {
     autumn_web::app()
         .routes(routes![show_item, add_item])
+        .listeners(listeners![on_item_repriced])
         .run()
         .await;
 }

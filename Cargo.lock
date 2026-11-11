@@ -649,6 +649,7 @@ name = "autumn-cli"
 version = "0.10.0"
 dependencies = [
  "autumn-edge",
+ "autumn-macros-support",
  "autumn-schema-core",
  "autumn-web",
  "base64 0.23.1",
@@ -732,6 +733,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syn 3.0.9",
+ "temp-env",
 ]
 
 [[package]]
@@ -764,6 +766,8 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
+ "serde",
+ "serde_json",
  "syn 3.0.9",
  "temp-env",
 ]
@@ -801,7 +805,9 @@ dependencies = [
  "autumn-web",
  "maud",
  "serde",
+ "serde_json",
  "tokio",
+ "toml 1.1.8+spec-1.1.0",
 ]
 
 [[package]]
@@ -10917,6 +10923,7 @@ dependencies = [
  "clap",
  "regex",
  "smop",
+ "toml 1.1.8+spec-1.1.0",
  "unicase",
  "unicode-general-category",
 ]

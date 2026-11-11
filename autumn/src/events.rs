@@ -58,6 +58,45 @@ pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Stable identifier used to route the event to its listeners and to name
     /// the durable listener jobs.
     const NAME: &'static str;
+
+    /// The payload's schema version, from `#[event(version = N)]`. Default 1.
+    ///
+    /// A version above 1 adds `.vN` to [`Event::NAME`], so two versions of
+    /// one event live side by side on the bus.
+    const VERSION: u32 = 1;
+
+    /// The payload's wire shape. `#[event]` sets it. It is `None` for
+    /// `#[event(opaque)]` and for a hand-written impl: a `#[listener]` then
+    /// has no table to check its reads against.
+    const SHAPE: Option<crate::wire::EventShape> = None;
+}
+
+/// One `#[event(name = "...")]` type in this binary.
+///
+/// `#[event]` registers one for each event with a `name`: those events
+/// have a descriptor in the release bundle. A remote outbox destination
+/// accepts only these topics, so the cross-release check covers them.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventContract {
+    /// The topic: [`Event::NAME`].
+    pub topic: &'static str,
+    /// The schema version: [`Event::VERSION`].
+    pub version: u32,
+    /// `false` for `#[event(opaque)]`: the payload has no shape to check.
+    pub shaped: bool,
+}
+
+inventory::collect!(EventContract);
+
+/// The [`EventContract`] of `topic`, if an `#[event(name = "...")]` in this
+/// binary has that topic.
+#[doc(hidden)]
+#[must_use]
+pub fn event_contract(topic: &str) -> Option<&'static EventContract> {
+    inventory::iter::<EventContract>
+        .into_iter()
+        .find(|contract| contract.topic == topic)
 }
 
 /// How a listener is dispatched when its event is published.

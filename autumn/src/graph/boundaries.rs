@@ -77,7 +77,34 @@ pub struct Boundary {
     /// that declare the models of the owned tables are used.
     #[serde(default)]
     pub schema_crates: Vec<String>,
+    /// The Postgres schema of the owned tables. When unset, `public`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// The database role of this boundary. When set, `autumn db grants`
+    /// gives this role access to the owned tables and the exceptions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
+
+impl Boundary {
+    /// The Postgres schema of the owned tables: [`Self::schema`] or `public`.
+    #[must_use]
+    pub fn schema_name(&self) -> &str {
+        self.schema.as_deref().unwrap_or(DEFAULT_SCHEMA)
+    }
+}
+
+/// Role names that Postgres reserves. `PUBLIC` means every role.
+const RESERVED_ROLES: &[&str] = &[
+    "public",
+    "none",
+    "current_user",
+    "session_user",
+    "current_role",
+];
+
+/// The schema of a boundary that sets no `schema`.
+pub const DEFAULT_SCHEMA: &str = "public";
 
 impl BoundaryConfig {
     /// Parse `boundaries.toml`.
@@ -92,6 +119,24 @@ impl BoundaryConfig {
             if boundary.owns.is_empty() && boundary.crates.is_empty() && boundary.modules.is_empty()
             {
                 return Err(BoundaryError::Empty(name.clone()));
+            }
+            for (key, value) in [("schema", &boundary.schema), ("role", &boundary.role)] {
+                let Some(value) = value.as_deref() else {
+                    continue;
+                };
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err(BoundaryError::Parse(format!(
+                        "boundary `{name}` has an empty `{key}`, or one with a control character"
+                    )));
+                }
+            }
+            if let Some(role) = boundary.role.as_deref()
+                && (RESERVED_ROLES.contains(&role.to_ascii_lowercase().as_str())
+                    || role.to_ascii_lowercase().starts_with("pg_"))
+            {
+                return Err(BoundaryError::Parse(format!(
+                    "boundary `{name}` names the reserved role `{role}`; use a role of its own"
+                )));
             }
         }
         Ok(config)
@@ -171,12 +216,16 @@ pub enum BoundaryError {
 /// the key `name@version` for each, so their dependencies stay apart. The
 /// CLI fills this from `cargo metadata`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CrateGraph {
     /// Package key to the package keys it depends on.
     pub deps: BTreeMap<String, BTreeSet<String>>,
     /// Package key to library name, where the two differ. A module path
     /// starts with the library name.
     pub libs: BTreeMap<String, String>,
+    /// Package key to its binary target names that differ from the package
+    /// name. A module path in a binary starts with the binary name.
+    pub bins: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl CrateGraph {
@@ -191,6 +240,8 @@ impl CrateGraph {
 
     /// The normalized names of a package key: the package name, without a
     /// version, and the library name.
+    ///
+    /// A dependent links the library only. Binary names are not here.
     fn names(&self, package: &str) -> Vec<String> {
         let mut names = vec![crate_key(package_name(package))];
         if let Some(lib) = self.libs.get(package) {
@@ -198,6 +249,41 @@ impl CrateGraph {
         }
         names
     }
+}
+
+/// Normalized target name to the normalized names of its packages.
+type Aliases = BTreeMap<String, BTreeSet<String>>;
+
+/// The library aliases and the binary aliases of the packages.
+///
+/// A binary name that is also a package or library name is not an alias. A
+/// module path with that name stays with the library.
+fn aliases(crates: &CrateGraph) -> (Aliases, Aliases) {
+    let mut libs = Aliases::new();
+    for (package, lib) in &crates.libs {
+        libs.entry(crate_key(lib))
+            .or_default()
+            .insert(crate_key(package_name(package)));
+    }
+    let direct: BTreeSet<String> = crates
+        .deps
+        .keys()
+        .chain(crates.libs.keys())
+        .chain(crates.bins.keys())
+        .map(|p| crate_key(package_name(p)))
+        .chain(libs.keys().cloned())
+        .collect();
+    let mut bins = Aliases::new();
+    for (package, names) in &crates.bins {
+        for bin in names.iter().map(|b| crate_key(b)) {
+            if !direct.contains(&bin) {
+                bins.entry(bin)
+                    .or_default()
+                    .insert(crate_key(package_name(package)));
+            }
+        }
+    }
+    (libs, bins)
 }
 
 // ── Findings ─────────────────────────────────────────────────────────
@@ -934,10 +1020,12 @@ struct Resolver<'a> {
     config: &'a BoundaryConfig,
     /// The tables of the models in the graph, lowercase.
     tables: BTreeSet<String>,
-    /// Normalized library name to the normalized names of its packages. A
-    /// module path starts with the library name; the config can name the
-    /// package.
-    aliases: BTreeMap<String, Vec<String>>,
+    /// Library name to its packages. A module path starts with the library
+    /// name; the config can name the package.
+    lib_aliases: Aliases,
+    /// Binary name to its packages. These apply only to a node that no
+    /// pattern claims by its own names.
+    bin_aliases: Aliases,
 }
 
 impl<'a> Resolver<'a> {
@@ -951,17 +1039,12 @@ impl<'a> Resolver<'a> {
             .flat_map(|g| &g.nodes)
             .filter_map(|n| n.model.as_ref().map(|m| m.table.to_ascii_lowercase()))
             .collect();
-        let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (package, lib) in crates.iter().flat_map(|c| &c.libs) {
-            aliases
-                .entry(crate_key(lib))
-                .or_default()
-                .push(crate_key(package_name(package)));
-        }
+        let (lib_aliases, bin_aliases) = crates.map(aliases).unwrap_or_default();
         Self {
             config,
             tables,
-            aliases,
+            lib_aliases,
+            bin_aliases,
         }
     }
 
@@ -971,7 +1054,7 @@ impl<'a> Resolver<'a> {
         let mut candidates = Vec::new();
         for (name, b) in &self.config.boundaries {
             for p in &b.owns {
-                if glob(&p.to_ascii_lowercase(), &table) {
+                if glob(&table_pattern(p), &table) {
                     candidates.push((name.as_str(), specificity(p)));
                 }
             }
@@ -981,12 +1064,32 @@ impl<'a> Resolver<'a> {
 
     /// The boundary of a graph node, by its crate or its module path.
     ///
-    /// The crate is the library name at the start of the module path, or the
-    /// name of a package that builds that library.
+    /// The crate is the name at the start of the module path, or the name
+    /// of a package whose library has that name. When no pattern matches
+    /// these names, the package of a binary with that name is the crate.
     fn node_boundary(&self, node: &GraphNode) -> Result<Option<&'a str>, BoundaryError> {
         let root = crate_key(crate_root(&node.module));
         let mut names = vec![root.clone()];
-        names.extend(self.aliases.get(&root).into_iter().flatten().cloned());
+        names.extend(self.lib_aliases.get(&root).into_iter().flatten().cloned());
+        let mut candidates = self.crate_candidates(&names);
+        for (name, b) in &self.config.boundaries {
+            for p in &b.modules {
+                if module_matches(p, &node.module) {
+                    candidates.push((name.as_str(), specificity(p)));
+                }
+            }
+        }
+        if candidates.is_empty()
+            && let Some(packages) = self.bin_aliases.get(&root)
+        {
+            let packages: Vec<String> = packages.iter().cloned().collect();
+            candidates = self.crate_candidates(&packages);
+        }
+        pick("node", &node.id, &candidates)
+    }
+
+    /// The boundaries with a `crates` pattern that matches one of `names`.
+    fn crate_candidates(&self, names: &[String]) -> Vec<(&'a str, usize)> {
         let mut candidates = Vec::new();
         for (name, b) in &self.config.boundaries {
             for p in &b.crates {
@@ -995,13 +1098,8 @@ impl<'a> Resolver<'a> {
                     candidates.push((name.as_str(), specificity(p)));
                 }
             }
-            for p in &b.modules {
-                if module_matches(p, &node.module) {
-                    candidates.push((name.as_str(), specificity(p)));
-                }
-            }
         }
-        pick("node", &node.id, &candidates)
+        candidates
     }
 
     /// The boundary of a package, by its name or its library name.
@@ -1010,16 +1108,7 @@ impl<'a> Resolver<'a> {
         package: &str,
         crates: &CrateGraph,
     ) -> Result<Option<&'a str>, BoundaryError> {
-        let names = crates.names(package);
-        let mut candidates = Vec::new();
-        for (name, b) in &self.config.boundaries {
-            for p in &b.crates {
-                let p_key = crate_key(p);
-                if names.iter().any(|n| glob(&p_key, n)) {
-                    candidates.push((name.as_str(), specificity(p)));
-                }
-            }
-        }
+        let candidates = self.crate_candidates(&crates.names(package));
         pick("crate", package, &candidates)
     }
 
@@ -1041,7 +1130,7 @@ impl<'a> Resolver<'a> {
             return false;
         };
         let table = table.to_ascii_lowercase();
-        let hit = |list: &[String]| list.iter().any(|p| glob(&p.to_ascii_lowercase(), &table));
+        let hit = |list: &[String]| list.iter().any(|p| glob(&table_pattern(p), &table));
         hit(&b.may_write) || (access == Access::Read && hit(&b.may_read))
     }
 
@@ -1050,7 +1139,7 @@ impl<'a> Resolver<'a> {
     /// The pattern is matched against the tables in the graph, and read as a
     /// table name too. A tie between two boundaries counts for neither.
     fn exception_owners(&self, pattern: &str) -> BTreeSet<&'a str> {
-        let lower = pattern.to_ascii_lowercase();
+        let lower = table_pattern(pattern);
         self.tables
             .iter()
             .filter(|t| glob(&lower, t))
@@ -1075,7 +1164,7 @@ impl<'a> Resolver<'a> {
 
 /// The boundary with the most specific match. A tie between two boundaries
 /// is an error, because the config does not say which one is meant.
-fn pick<'a>(
+pub(super) fn pick<'a>(
     what: &'static str,
     name: &str,
     candidates: &[(&'a str, usize)],
@@ -1100,8 +1189,19 @@ fn pick<'a>(
     }
 }
 
+/// A table pattern as the graph reads it: lower case, with no schema. The
+/// graph names a table without its Postgres schema, so `public.contacts`
+/// matches the table `contacts` here. The grant planner reads the schema.
+fn table_pattern(pattern: &str) -> String {
+    let lower = pattern.to_ascii_lowercase();
+    match lower.rsplit_once('.') {
+        Some((_, table)) => table.to_owned(),
+        None => lower,
+    }
+}
+
 /// How specific a pattern is: its count of characters that are not `*`.
-fn specificity(pattern: &str) -> usize {
+pub(super) fn specificity(pattern: &str) -> usize {
     pattern.chars().filter(|c| *c != '*').count()
 }
 
@@ -1135,7 +1235,7 @@ fn base_id(id: &str) -> &str {
 }
 
 /// Whether `text` matches `pattern`, where `*` matches any run.
-fn glob(pattern: &str, text: &str) -> bool {
+pub(super) fn glob(pattern: &str, text: &str) -> bool {
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or_default();
     let Some(mut rest) = text.strip_prefix(first) else {
@@ -1390,6 +1490,20 @@ schema_crates = ["billing-schema"]
     fn may_read_clears_a_read_violation() {
         let report = check(&config("may_read = [\"contacts\"]\n"), Some(&graph()), None)
             .expect("check runs");
+        assert!(table_violation(&report, "report").is_none());
+        assert!(table_violation(&report, "joined").is_none());
+    }
+
+    /// The grant planner reads `public.contacts` as one schema and table;
+    /// the graph has no schemas, so it reads the table part.
+    #[test]
+    fn a_schema_qualified_exception_clears_a_read_violation() {
+        let report = check(
+            &config("may_read = [\"public.contacts\"]\n"),
+            Some(&graph()),
+            None,
+        )
+        .expect("check runs");
         assert!(table_violation(&report, "report").is_none());
         assert!(table_violation(&report, "joined").is_none());
     }
@@ -1873,6 +1987,178 @@ crates = ["crm-core-ad*"]
         let report = check(&config, Some(&graph), Some(&deps)).expect("runs");
         let v = table_violation(&report, "lib_report").expect("the route is in marketing");
         assert_eq!(v.boundary, "marketing");
+    }
+
+    /// `core` owns `contacts`. `marketing` is the package `crm-marketing`.
+    fn package_config() -> BoundaryConfig {
+        BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.marketing]\nowns = [\"campaigns\"]\ncrates = [\"crm-marketing\"]\n",
+        )
+        .expect("valid")
+    }
+
+    fn bins(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_node_joins_the_boundary_of_its_package_by_binary_name() {
+        // `crm-marketing` has `[[bin]] name = "marketing-server"`. Its module
+        // paths start with `marketing_server`.
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("bin_report", "marketing_server::routes", "GET", "/bin")
+        }];
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let mut deps = crates(&[("crm-marketing", "crm-core")]);
+        let report = check(&package_config(), Some(&graph), Some(&deps)).expect("runs");
+        assert!(
+            table_violation(&report, "bin_report").is_none(),
+            "with no binary name, no boundary claims the route"
+        );
+        deps.bins
+            .insert("crm-marketing".into(), bins(&["marketing_server"]));
+        let report = check(&package_config(), Some(&graph), Some(&deps)).expect("runs");
+        let v = table_violation(&report, "bin_report").expect("the route is in marketing");
+        assert_eq!(v.boundary, "marketing");
+    }
+
+    #[test]
+    fn a_package_with_a_library_and_a_binary_claims_nodes_of_both() {
+        const ROUTES: &[RouteGraphDescriptor] = &[
+            RouteGraphDescriptor {
+                body_symbols: &["contacts"],
+                ..route("lib_report", "crm_mkt::routes", "GET", "/lib")
+            },
+            RouteGraphDescriptor {
+                body_symbols: &["contacts"],
+                ..route("bin_report", "marketing_server::routes", "GET", "/bin")
+            },
+        ];
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let mut deps = crates(&[("crm-marketing@1.0.0", "crm-core")]);
+        deps.libs
+            .insert("crm-marketing@1.0.0".into(), "crm_mkt".into());
+        deps.bins
+            .insert("crm-marketing@1.0.0".into(), bins(&["marketing_server"]));
+        let report = check(&package_config(), Some(&graph), Some(&deps)).expect("runs");
+        for handler in ["lib_report", "bin_report"] {
+            let v = table_violation(&report, handler).expect("the route is in marketing");
+            assert_eq!(v.boundary, "marketing", "{handler}");
+        }
+    }
+
+    #[test]
+    fn a_binary_name_of_two_packages_in_two_boundaries_is_an_error() {
+        // Two packages build a binary `server`. The module path cannot tell
+        // which package the node is in.
+        const ROUTES: &[RouteGraphDescriptor] = &[route("home", "server::routes", "GET", "/")];
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let config = BoundaryConfig::parse(
+            "[boundaries.a]\nowns = [\"contacts\"]\ncrates = [\"crm-a\"]\n\
+             [boundaries.b]\nowns = [\"campaigns\"]\ncrates = [\"crm-b\"]\n",
+        )
+        .expect("valid");
+        let mut deps = CrateGraph::default();
+        deps.bins.insert("crm-a".into(), bins(&["server"]));
+        deps.bins.insert("crm-b".into(), bins(&["server"]));
+        let err = check(&config, Some(&graph), Some(&deps)).expect_err("ambiguous");
+        assert!(
+            matches!(err, BoundaryError::Ambiguous { what: "node", .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_binary_with_a_library_name_does_not_claim_its_nodes() {
+        // `crm-marketing` has a binary `crm-shared`, the name of the library
+        // of the package `crm-shared`. A node under `crm_shared` stays with
+        // that library, which is in no boundary.
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("shared_report", "crm_shared::routes", "GET", "/shared")
+        }];
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let mut deps = crates(&[("crm-marketing", "crm-shared")]);
+        deps.bins
+            .insert("crm-marketing".into(), bins(&["crm_shared"]));
+        let report = check(&package_config(), Some(&graph), Some(&deps)).expect("runs");
+        assert!(table_violation(&report, "shared_report").is_none());
+    }
+
+    #[test]
+    fn a_pattern_on_a_binary_name_wins_over_its_package() {
+        // `workers` names the binary. `billing` names its package.
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("work", "crm_billing_worker::jobs", "POST", "/work")
+        }];
+        let config = BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.billing]\nowns = [\"invoices\"]\ncrates = [\"crm-billing\"]\n\
+             [boundaries.workers]\nowns = [\"jobs\"]\ncrates = [\"crm-*-worker\"]\n",
+        )
+        .expect("valid");
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let mut deps = crates(&[("crm-billing", "crm-core")]);
+        deps.bins
+            .insert("crm-billing".into(), bins(&["crm_billing_worker"]));
+        let report = check(&config, Some(&graph), Some(&deps)).expect("runs");
+        let v = table_violation(&report, "work").expect("the node is in workers");
+        assert_eq!(v.boundary, "workers");
+        // The package stays in billing for the crate rule.
+        let found = crate_violations(&report);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.krate == "crm-billing" && v.boundary == "billing"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_model_in_a_binary_does_not_make_its_package_a_schema_crate() {
+        // A dependent links the library of `crm-marketing`, not its binary.
+        const MODELS: &[ModelGraphDescriptor] = &[
+            model("Contact", "contacts", "crm_core::models"),
+            model("Campaign", "campaigns", "marketing_server::models"),
+        ];
+        let config = BoundaryConfig::parse(
+            "[boundaries.marketing]\nowns = [\"campaigns\"]\ncrates = [\"crm-marketing\"]\n\
+             [boundaries.sales]\nowns = [\"deals\"]\ncrates = [\"crm-sales\"]\n",
+        )
+        .expect("valid");
+        let graph = build(&[], 0, &[], MODELS, &[], &[]);
+        let mut deps = crates(&[("crm-sales", "crm-marketing")]);
+        deps.bins
+            .insert("crm-marketing".into(), bins(&["marketing_server"]));
+        let report = check(&config, Some(&graph), Some(&deps)).expect("runs");
+        let found = crate_violations(&report);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_modules_pattern_on_a_binary_does_not_stop_the_crate_search() {
+        // `modules` names a binary of `crm-shared`. Its library is in no
+        // boundary, so the search goes through it to the core schema.
+        let config = BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.admin]\nowns = [\"admins\"]\nmodules = [\"shared_admin\"]\n\
+             [boundaries.marketing]\nowns = [\"campaigns\"]\ncrates = [\"crm-marketing\"]\n",
+        )
+        .expect("valid");
+        let mut deps = crates(&[("crm-marketing", "crm-shared"), ("crm-shared", "crm-core")]);
+        deps.bins
+            .insert("crm-shared".into(), bins(&["shared_admin"]));
+        let report = check(&config, Some(&graph()), Some(&deps)).expect("runs");
+        let found = crate_violations(&report);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.path == ["crm-marketing", "crm-shared", "crm-core"]),
+            "{found:?}"
+        );
     }
 
     #[test]

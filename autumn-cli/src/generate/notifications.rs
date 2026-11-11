@@ -252,15 +252,28 @@ fn migration_up_sql(backend: DatabaseBackend) -> String {
         DatabaseBackend::Sqlite => sql,
     };
     // `tenant_id` is `""` outside a tenant scope, so it is `NOT NULL DEFAULT ''`.
-    // The composite index serves every feed query: all filter on both columns.
     let sql = sql.replace(
         "tenant_id TEXT NOT NULL",
         "tenant_id TEXT NOT NULL DEFAULT ''",
     );
-    format!(
-        "{sql}CREATE INDEX idx_notifications_tenant_recipient ON notifications \
-         (tenant_id, recipient_id);\n"
-    )
+    let indexes = match backend {
+        // The feed index is in the default feed order (`id DESC`), so a page
+        // reads only its own rows and does not sort. The partial index holds
+        // only unread rows: the badge and the `unread` page skip read history.
+        DatabaseBackend::Postgres => {
+            "CREATE INDEX idx_notifications_feed ON notifications \
+             (tenant_id, recipient_id, id);\n\
+             CREATE INDEX idx_notifications_unread ON notifications \
+             (tenant_id, recipient_id, id) WHERE read_at IS NULL;\n"
+        }
+        // `id` is the rowid, and every SQLite index ends with the rowid. So
+        // this index is already in the default feed order.
+        DatabaseBackend::Sqlite => {
+            "CREATE INDEX idx_notifications_tenant_recipient ON notifications \
+             (tenant_id, recipient_id);\n"
+        }
+    };
+    format!("{sql}{indexes}")
 }
 
 /// The session key, `NotifyBody` type, `current_recipient_id` helper, and
@@ -775,8 +788,8 @@ async fn main() {
             // Column-for-column the diesel `table!` in
             // `autumn_web::notifications` (BigInt / Text / Text /
             // Nullable<Timestamptz> / Timestamptz) and the framework
-            // integration test's CREATE_NOTIFICATIONS_SQL constant — plus
-            // the recipient_id index the feed queries want.
+            // integration test's CREATE_NOTIFICATIONS_SQL constant. Then the
+            // feed index, in the default sort order, and the unread index.
             assert_eq!(
                 up,
                 "CREATE TABLE notifications (\n\
@@ -788,12 +801,45 @@ async fn main() {
                  \x20   read_at TIMESTAMPTZ NULL,\n\
                  \x20   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n\
                  );\n\
-                 CREATE INDEX idx_notifications_tenant_recipient ON notifications (tenant_id, recipient_id);\n"
+                 CREATE INDEX idx_notifications_feed ON notifications (tenant_id, recipient_id, id);\n\
+                 CREATE INDEX idx_notifications_unread ON notifications (tenant_id, recipient_id, id) WHERE read_at IS NULL;\n"
             );
 
             let down = fs::read_to_string(dir.join("down.sql")).unwrap();
             assert_eq!(down, "DROP TABLE notifications;\n");
         });
+    }
+
+    /// The framework's Docker tests build the table from their own DDL. The
+    /// Ledger query catalog plans every store statement against that table.
+    /// It must hold the indexes the generator emits, or the catalog plans
+    /// against a schema no app has.
+    #[test]
+    fn framework_integration_ddl_has_every_generated_postgres_index() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../autumn/tests/integration/notifications.rs");
+        let test_ddl =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let up = migration_up_sql(DatabaseBackend::Postgres);
+        let indexes: Vec<&str> = up
+            .lines()
+            .filter(|line| line.starts_with("CREATE INDEX"))
+            .map(|line| line.trim_end_matches(';'))
+            .collect();
+        assert_eq!(indexes.len(), 2, "{up}");
+        assert_eq!(
+            test_ddl.matches("\"CREATE INDEX").count(),
+            indexes.len(),
+            "{} has an index the generator does not emit",
+            path.display()
+        );
+        for index in indexes {
+            assert!(
+                test_ddl.contains(&format!("\"{index}\"")),
+                "{} has no `{index}`",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -824,10 +870,16 @@ async fn main() {
                 up.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
                 "{up}"
             );
+            // `id` is the rowid, so this index already reads in `id` order.
+            // SQLite needs no feed index and no partial unread index.
             assert!(
-                up.contains("CREATE INDEX idx_notifications_tenant_recipient"),
+                up.ends_with(
+                    "CREATE INDEX idx_notifications_tenant_recipient ON notifications \
+                     (tenant_id, recipient_id);\n"
+                ),
                 "{up}"
             );
+            assert_eq!(up.matches("CREATE INDEX").count(), 1, "{up}");
             // No Postgres-only DDL may leak into a SQLite migration.
             for leak in ["BIGSERIAL", "TIMESTAMPTZ", "NOW()", "BIGINT"] {
                 assert!(!up.contains(leak), "SQLite up.sql leaked `{leak}`: {up}");

@@ -1,0 +1,64 @@
+--- pg_stat_statements: notifications statements (buffers = hit+read)
+ calls | buffers | hit  | read | temp_w | rows | pct_buffers | pct_calls |                                             q                                              
+-------+---------+------+------+--------+------+-------------+-----------+--------------------------------------------------------------------------------------------
+   100 |    1400 | 1391 |    9 |      0 | 1050 |        75.6 |      50.0 | SELECT id, tenant_id, recipient_id, kind, payload, read_at, created_at FROM notifications 
+   100 |     453 |  449 |    4 |      0 |  100 |        24.4 |      50.0 | SELECT COUNT(*) FROM notifications WHERE tenant_id = $1 AND recipient_id = $2 AND read_at 
+(2 rows)
+
+--- EXPLAIN (heavy recipient): unread_count
+                                                                            QUERY PLAN                                                                            
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1135.61..1135.62 rows=1 width=8) (actual time=0.019..0.019 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=5
+   ->  Index Only Scan using idx_notifications_unread on public.notifications  (cost=0.41..1069.47 rows=26453 width=0) (actual time=0.012..0.015 rows=20 loops=1)
+         Output: tenant_id, recipient_id, id
+         Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1))
+         Heap Fetches: 0
+         Buffers: shared hit=5
+ Query Identifier: 136958619351159913
+ Planning Time: 0.049 ms
+ Execution Time: 0.060 ms
+(11 rows)
+
+--- EXPLAIN (heavy recipient): unread page
+                                                                               QUERY PLAN                                                                                
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.41..27.62 rows=20 width=167) (actual time=0.008..0.025 rows=20 loops=1)
+   Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+   Buffers: shared hit=23
+   ->  Index Scan Backward using idx_notifications_unread on public.notifications  (cost=0.41..35985.72 rows=26453 width=167) (actual time=0.007..0.023 rows=20 loops=1)
+         Output: id, tenant_id, recipient_id, kind, payload, read_at, created_at
+         Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1))
+         Buffers: shared hit=23
+ Query Identifier: -4621968532518804497
+ Planning Time: 0.043 ms
+ Execution Time: 0.032 ms
+(10 rows)
+
+--- EXPLAIN (median recipient): unread_count
+                                                                        QUERY PLAN                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=4.44..4.45 rows=1 width=8) (actual time=0.006..0.007 rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=4
+   ->  Index Only Scan using idx_notifications_unread on public.notifications  (cost=0.41..4.43 rows=1 width=0) (actual time=0.004..0.004 rows=1 loops=1)
+         Output: tenant_id, recipient_id, id
+         Index Cond: ((notifications.tenant_id = ''::text) AND (notifications.recipient_id = 1500))
+         Heap Fetches: 0
+         Buffers: shared hit=4
+ Query Identifier: 136958619351159913
+ Planning Time: 0.029 ms
+ Execution Time: 0.014 ms
+(11 rows)
+
+--- equivalence: md5 of ordered unread ids, plus counts, per recipient
+ recipient_id | count |               md5                
+--------------+-------+----------------------------------
+            1 |    20 | a85f1afc118e3d9c3deaa7e46490513d
+         1001 |     1 | b69f378b8b00e843f4b677aa57fe4ec5
+         1500 |     1 | 0b97be8b4b408a3a0780a32e0a143a7f
+        20999 |     1 | 937a099ea83f875440a0320911adc1a4
+(4 rows)
+
+sizes: table=303 MB idx_shipped=11 MB idx_unread=1624 kB

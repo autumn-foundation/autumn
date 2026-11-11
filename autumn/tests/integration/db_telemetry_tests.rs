@@ -159,10 +159,10 @@ mod db_telemetry_tests {
     #[ignore = "requires Docker (testcontainers)"]
     async fn test_slow_query_telemetry_logging_and_metrics() {
         let pool = setup().await;
-        // Slow query threshold = 50ms. SELECT pg_sleep(0.1) should trigger slow query metrics/logs.
+        // Slow query threshold = 50ms. The handler runs `SELECT pg_sleep(1)`.
         let client = build_client(pool, None, Duration::from_millis(50));
 
-        // Sleep for 100ms
+        // Sleep for 1s.
         let resp = client.get("/sleep-default").send().await;
         resp.assert_ok();
 
@@ -184,11 +184,21 @@ mod db_telemetry_tests {
                     found_sleep,
                     "Expected a metrics entry for GET /sleep-default"
                 );
-                // The exact key `Db`'s drop records: method, route template and
-                // verb, composed without an intermediate `String`.
+                // `Db`'s drop still records the deprecated key: the route, then
+                // `SELECT`. It stays for one release.
                 assert!(
                     queries.get("GET /sleep-default SELECT").is_some(),
-                    "expected the exact Db key `GET /sleep-default SELECT`, got {queries}"
+                    "expected the deprecated Db key `GET /sleep-default SELECT`, got {queries}"
+                );
+                // The hold under its own key: the route, no verb.
+                let holds = &metrics["db_connection_holds"];
+                assert_eq!(
+                    holds["GET /sleep-default"]["count"], 1,
+                    "expected one hold for `GET /sleep-default`, got {holds}"
+                );
+                assert!(
+                    holds["GET /sleep-default"]["p50_ms"].as_u64() >= Some(1_000),
+                    "the hold covers the 1s sleep, got {holds}"
                 );
             });
     }

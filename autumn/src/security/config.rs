@@ -350,6 +350,23 @@ impl ResolvedSigningKeys {
         mac_hex(&self.current_mac, message)
     }
 
+    /// Returns `true` when one of `hex_sigs` is a valid HMAC-SHA256 of
+    /// `message` under any key. It computes one MAC per key, whatever the
+    /// number of candidates. All comparisons are constant-time.
+    pub fn verify_any(&self, message: &[u8], hex_sigs: &[&str]) -> bool {
+        let expected: Vec<String> = std::iter::once(&self.current_mac)
+            .chain(&self.previous_macs)
+            .map(|mac| mac_hex(mac, message))
+            .collect();
+        let mut matched = false;
+        for candidate in hex_sigs {
+            for mac in &expected {
+                matched |= ct_eq_str(mac, candidate);
+            }
+        }
+        matched
+    }
+
     /// Returns `true` when `hex_sig` is a valid HMAC-SHA256 of `message` under
     /// any key (current first, then previous). All comparisons are constant-time.
     pub fn verify(&self, message: &[u8], hex_sig: &str) -> bool {
@@ -1616,6 +1633,16 @@ mod tests {
     use crate::config::IdempotencyBackend;
 
     // ── submit-token backend resolution (Finding D: inherit idempotency) ─────
+
+    #[test]
+    fn verify_any_matches_one_of_many_candidates_under_any_key() {
+        let keys = ResolvedSigningKeys::new(b"new".to_vec(), vec![b"old".to_vec()]);
+        let old = hmac_sha256_hex(b"old", b"msg");
+        assert!(keys.verify_any(b"msg", &["00", &old]));
+        assert!(keys.verify_any(b"msg", &[&keys.sign(b"msg")]));
+        assert!(!keys.verify_any(b"msg", &["00", "zz"]));
+        assert!(!keys.verify_any(b"msg", &[]));
+    }
 
     #[test]
     fn submit_token_backend_defaults_to_none_and_inherits_idempotency() {

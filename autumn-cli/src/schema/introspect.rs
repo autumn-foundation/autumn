@@ -205,11 +205,25 @@ pub enum IntrospectError {
 /// [`IntrospectError::Query`] if a catalog query fails. Neither ever leaks the
 /// database URL.
 pub fn introspect_postgres(url: &str) -> Result<Vec<Table>, IntrospectError> {
+    introspect_postgres_in(url, &[])
+}
+
+/// [`introspect_postgres`], also reading the named `schemas` besides `public`.
+/// A table outside `public` carries its [`Table::schema`].
+///
+/// # Errors
+///
+/// As [`introspect_postgres`]. It also fails when one table name is in two of
+/// the schemas, because the diff keys tables by name.
+pub fn introspect_postgres_in(
+    url: &str,
+    schemas: &[String],
+) -> Result<Vec<Table>, IntrospectError> {
     // `PgConnection::establish` accepts both URL and libpq key-value DSNs; defer
     // URL parsing to the error path so a valid key-value string still connects
     // (host/port are only needed for a credential-safe message). Mirrors db_pull.
     let mut conn = connect_postgres(url)?;
-    introspect_postgres_conn(&mut conn)
+    introspect_postgres_conn_in(&mut conn, schemas)
 }
 
 /// Open a Postgres connection. The error carries only the host and port.
@@ -224,38 +238,99 @@ pub fn connect_postgres(url: &str) -> Result<PgConnection, IntrospectError> {
     })
 }
 
-/// [`introspect_postgres`] on an open connection (for example one inside the
-/// `--dev-url` replay transaction).
+/// [`introspect_postgres_in`] on an open connection.
 ///
 /// # Errors
 ///
-/// Returns [`IntrospectError::Query`] if a catalog query fails.
-pub fn introspect_postgres_conn(conn: &mut PgConnection) -> Result<Vec<Table>, IntrospectError> {
-    let table_names = list_tables(conn)?;
-    if table_names.is_empty() {
+/// See [`introspect_postgres_in`].
+pub fn introspect_postgres_conn_in(
+    conn: &mut PgConnection,
+    schemas: &[String],
+) -> Result<Vec<Table>, IntrospectError> {
+    let scope = schema_scope(schemas)?;
+    let listed = list_tables(conn, &scope)?;
+    if listed.is_empty() {
         return Ok(Vec::new());
     }
+    check_unique_names(&listed)?;
 
     // Batched catalog reads — a constant number of queries regardless of table
     // count (never one query per table).
-    let columns_by_table = fetch_columns(conn, &table_names)?;
-    let pks_by_table = fetch_primary_keys(conn, &table_names)?;
-    let indexes_by_table = fetch_indexes(conn, &table_names)?;
-    let fks_by_table = fetch_foreign_keys(conn, &table_names)?;
-    let checks_by_table = fetch_checks(conn, &table_names)?;
+    let columns_by_table = fetch_columns(conn, &listed)?;
+    let pks_by_table = fetch_primary_keys(conn, &listed)?;
+    let indexes_by_table = fetch_indexes(conn, &listed)?;
+    let fks_by_table = fetch_foreign_keys(conn, &listed)?;
+    let checks_by_table = fetch_checks(conn, &listed)?;
 
-    let mut tables = Vec::with_capacity(table_names.len());
-    for name in &table_names {
-        tables.push(build_table(
+    let mut tables = Vec::with_capacity(listed.len());
+    for (schema, name) in &listed {
+        let mut table = build_table(
             name,
             columns_by_table.get(name).map_or(&[][..], Vec::as_slice),
             pks_by_table.get(name).map_or(&[][..], Vec::as_slice),
             indexes_by_table.get(name).map_or(&[][..], Vec::as_slice),
             fks_by_table.get(name).map_or(&[][..], Vec::as_slice),
             checks_by_table.get(name).map_or(&[][..], Vec::as_slice),
-        ));
+        );
+        if schema != "public" {
+            table.schema = Some(schema.clone());
+            bare_same_schema_fks(&mut table, schema);
+        }
+        tables.push(table);
     }
     Ok(tables)
+}
+
+/// The `IN (...)` body for the schemas to read: `public` and `schemas`.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Query`] for a schema name that is not a plain
+/// identifier, so the name is safe in SQL.
+pub fn schema_scope(schemas: &[String]) -> Result<String, IntrospectError> {
+    let mut all = vec!["public".to_owned()];
+    for schema in schemas {
+        if !autumn_schema_core::is_valid_schema_name(schema) {
+            return Err(IntrospectError::Query(format!(
+                "the schema name `{schema}` is not a plain lower-case identifier"
+            )));
+        }
+        if !all.contains(schema) {
+            all.push(schema.clone());
+        }
+    }
+    Ok(quoted_in_list(&all))
+}
+
+/// The table names of `listed`, once each.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Query`] when a name is in two schemas.
+fn check_unique_names(listed: &[(String, String)]) -> Result<Vec<String>, IntrospectError> {
+    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+    for (schema, name) in listed {
+        if let Some(first) = seen.insert(name.as_str(), schema.as_str()) {
+            return Err(IntrospectError::Query(format!(
+                "table `{name}` is in schemas `{first}` and `{schema}`; \
+                 the schema tools need one name per schema"
+            )));
+        }
+    }
+    Ok(seen.into_keys().map(str::to_owned).collect())
+}
+
+/// A foreign key to a table of its own schema keeps the bare table name, like
+/// a model `#[references]`.
+fn bare_same_schema_fks(table: &mut Table, schema: &str) {
+    let prefix = format!("{schema}.");
+    for column in &mut table.columns {
+        if let Some(fk) = &mut column.references
+            && let Some(bare) = fk.table.strip_prefix(&prefix)
+        {
+            fk.table = bare.to_owned();
+        }
+    }
 }
 
 /// Parse host/port from a connection URL for credential-safe error messages.
@@ -497,18 +572,27 @@ struct CheckRow {
 /// List the `public` base tables, excluding Diesel's bookkeeping table and
 /// Autumn/Diesel framework-owned tables (mirrors [`crate::db_pull`]'s unscoped
 /// rule).
-fn list_tables(conn: &mut PgConnection) -> Result<Vec<String>, IntrospectError> {
-    let query = "SELECT table_name AS name FROM information_schema.tables \
-         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+fn list_tables(
+    conn: &mut PgConnection,
+    scope: &str,
+) -> Result<Vec<(String, String)>, IntrospectError> {
+    let query = format!(
+        "SELECT table_schema || '.' || table_name AS name FROM information_schema.tables \
+         WHERE table_schema IN ({scope}) AND table_type = 'BASE TABLE' \
          AND table_name <> '__diesel_schema_migrations' \
-         ORDER BY table_name";
+         ORDER BY table_schema, table_name"
+    );
     let rows: Vec<NameRow> = sql_query(query)
         .load(conn)
         .map_err(|e| IntrospectError::Query(e.to_string()))?;
     Ok(rows
         .into_iter()
-        .map(|r| r.name)
-        .filter(|t| !is_framework_table(t))
+        .filter_map(|r| {
+            // A schema name has no `.` (see `schema_scope`).
+            let (schema, name) = r.name.split_once('.')?;
+            Some((schema.to_owned(), name.to_owned()))
+        })
+        .filter(|(_, t)| !is_framework_table(t))
         .collect())
 }
 
@@ -521,6 +605,23 @@ fn is_framework_table(table: &str) -> bool {
             table,
             "api_tokens" | "feature_flag_changes" | "__diesel_schema_migrations"
         )
+}
+
+/// `(schema_col, name_col) IN (('s', 'n'), ...)`: matches the exact schema and
+/// table pairs of `listed`, not each name in every schema.
+fn pair_filter(schema_col: &str, name_col: &str, listed: &[(String, String)]) -> String {
+    let pairs = listed
+        .iter()
+        .map(|(s, n)| {
+            format!(
+                "({}, {})",
+                crate::db::quote_literal(s),
+                crate::db::quote_literal(n)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({schema_col}, {name_col}) IN ({pairs})")
 }
 
 /// Build a comma-separated SQL string-literal list (`'a', 'b'`) for an `IN (..)`
@@ -537,7 +638,7 @@ fn quoted_in_list(tables: &[String]) -> String {
 /// table.
 fn fetch_columns(
     conn: &mut PgConnection,
-    tables: &[String],
+    listed: &[(String, String)],
 ) -> Result<BTreeMap<String, Vec<ColumnRow>>, IntrospectError> {
     // `numeric_precision`, `numeric_scale`, and `character_maximum_length` are the
     // `information_schema` `cardinal_number` domain, not a plain `int4`. Decoding that
@@ -564,6 +665,7 @@ fn fetch_columns(
     // fresh owned `BIGSERIAL`, and the column classifies as `Some(Plain)`. A plain shared
     // or custom-sequence PK owns nothing and likewise has no `deptype = 'a'` row.
     // `pg_depend` and `pg_attrdef` exist in every supported Postgres.
+    let filter = pair_filter("c.table_schema", "c.table_name", listed);
     let query = format!(
         "SELECT c.table_name, c.column_name, c.udt_name, c.is_nullable, c.column_default, \
          c.numeric_precision::integer AS numeric_precision, \
@@ -588,14 +690,13 @@ fn fetch_columns(
              ON usedby.objid = ad.oid AND usedby.classid = 'pg_attrdef'::regclass \
              AND usedby.refobjid = seq.oid AND usedby.refclassid = 'pg_class'::regclass \
              AND usedby.deptype = 'n' \
-           WHERE tn.nspname = 'public' \
+           WHERE tn.nspname = c.table_schema \
              AND tbl.relname = c.table_name \
              AND att.attnum > 0 \
          ) AS owns_sequence \
          FROM information_schema.columns c \
-         WHERE c.table_schema = 'public' AND c.table_name IN ({}) \
+         WHERE {filter} \
          ORDER BY c.table_name, c.ordinal_position",
-        quoted_in_list(tables)
     );
     let rows: Vec<ColumnRow> = sql_query(query)
         .load(conn)
@@ -614,11 +715,12 @@ fn fetch_columns(
 /// table.
 fn fetch_primary_keys(
     conn: &mut PgConnection,
-    tables: &[String],
+    listed: &[(String, String)],
 ) -> Result<BTreeMap<String, Vec<String>>, IntrospectError> {
     // `array_position(i.indkey::int2[]::int[], a.attnum::int)` recovers the true
     // key position. The `int2vector -> text -> int[]` cast chain is the portable
     // way to turn `indkey` into a subscriptable array for `array_position`.
+    let filter = pair_filter("n.nspname", "c.relname", listed);
     let query = format!(
         "SELECT c.relname AS table_name, a.attname AS column_name, \
          array_position(string_to_array(i.indkey::text, ' ')::int[], a.attnum::int) AS ord \
@@ -626,9 +728,8 @@ fn fetch_primary_keys(
          JOIN pg_class c ON c.oid = i.indrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-         WHERE n.nspname = 'public' AND i.indisprimary AND c.relname IN ({}) \
+         WHERE {filter} AND i.indisprimary \
          ORDER BY c.relname, ord",
-        quoted_in_list(tables)
     );
     let rows: Vec<TablePkRow> = sql_query(query)
         .load(conn)
@@ -675,12 +776,13 @@ fn fetch_primary_keys(
 /// index's column-dependency detection is exact, not a string scan.
 fn fetch_indexes(
     conn: &mut PgConnection,
-    tables: &[String],
+    listed: &[(String, String)],
 ) -> Result<BTreeMap<String, Vec<IndexRow>>, IntrospectError> {
     // The `int2vector -> text -> int[]` cast chain (mirroring `fetch_primary_keys`)
     // turns `indkey` into a subscriptable/unnestable array. The correlated
     // subquery keeps only `> 0` (ordinary-column) keys and preserves key order
     // via `WITH ORDINALITY`; an all-expression index yields an empty string.
+    let filter = pair_filter("n.nspname", "t.relname", listed);
     let query = format!(
         "SELECT t.relname AS table_name, ic.relname AS index_name, \
          i.indisunique AS is_unique, pg_get_indexdef(i.indexrelid) AS definition, \
@@ -731,9 +833,8 @@ fn fetch_indexes(
          JOIN pg_class t ON t.oid = i.indrelid \
          JOIN pg_class ic ON ic.oid = i.indexrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
-         WHERE n.nspname = 'public' AND NOT i.indisprimary AND t.relname IN ({}) \
+         WHERE {filter} AND NOT i.indisprimary \
          ORDER BY t.relname, ic.relname",
-        quoted_in_list(tables)
     );
     let rows: Vec<IndexRow> = sql_query(query)
         .load(conn)
@@ -753,8 +854,9 @@ fn fetch_indexes(
 /// note); the model parser never emits a composite FK.
 fn fetch_foreign_keys(
     conn: &mut PgConnection,
-    tables: &[String],
+    listed: &[(String, String)],
 ) -> Result<BTreeMap<String, Vec<ForeignKeyRow>>, IntrospectError> {
+    let filter = pair_filter("n.nspname", "t.relname", listed);
     let query = format!(
         "SELECT t.relname AS table_name, att.attname AS column_name, \
          ft.relname AS foreign_table, fn.nspname AS foreign_schema, \
@@ -767,8 +869,7 @@ fn fetch_foreign_keys(
          JOIN pg_namespace fn ON fn.oid = ft.relnamespace \
          JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = con.conkey[1] \
          JOIN pg_attribute fatt ON fatt.attrelid = con.confrelid AND fatt.attnum = con.confkey[1] \
-         WHERE con.contype = 'f' AND n.nspname = 'public' AND t.relname IN ({})",
-        quoted_in_list(tables)
+         WHERE con.contype = 'f' AND {filter}",
     );
     let rows: Vec<ForeignKeyRow> = sql_query(query)
         .load(conn)
@@ -802,17 +903,17 @@ fn fetch_foreign_keys(
 /// match the emitter's `CHECK ({expression})` wrapping.
 fn fetch_checks(
     conn: &mut PgConnection,
-    tables: &[String],
+    listed: &[(String, String)],
 ) -> Result<BTreeMap<String, Vec<CheckRow>>, IntrospectError> {
+    let filter = pair_filter("n.nspname", "t.relname", listed);
     let query = format!(
         "SELECT t.relname AS table_name, con.conname AS constraint_name, \
          pg_get_constraintdef(con.oid) AS definition \
          FROM pg_constraint con \
          JOIN pg_class t ON t.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
-         WHERE con.contype = 'c' AND n.nspname = 'public' AND t.relname IN ({}) \
+         WHERE con.contype = 'c' AND {filter} \
          ORDER BY t.relname, con.conname",
-        quoted_in_list(tables)
     );
     let rows: Vec<CheckRow> = sql_query(query)
         .load(conn)
@@ -2939,6 +3040,72 @@ mod sqlite {
 
 #[cfg(test)]
 mod tests {
+    use super::{bare_same_schema_fks, check_unique_names, pair_filter, schema_scope};
+
+    #[test]
+    fn pair_filter_matches_exact_schema_table_pairs() {
+        let listed = [
+            ("marketing".to_owned(), "campaigns".to_owned()),
+            ("public".to_owned(), "it's".to_owned()),
+        ];
+        assert_eq!(
+            pair_filter("n.nspname", "c.relname", &listed),
+            "(n.nspname, c.relname) IN (('marketing', 'campaigns'), ('public', 'it''s'))"
+        );
+    }
+
+    #[test]
+    fn scope_is_public_plus_the_named_schemas() {
+        assert_eq!(schema_scope(&[]).unwrap(), "'public'");
+        let two = [
+            "marketing".to_owned(),
+            "public".to_owned(),
+            "admin".to_owned(),
+        ];
+        assert_eq!(
+            schema_scope(&two).unwrap(),
+            "'public', 'marketing', 'admin'"
+        );
+    }
+
+    #[test]
+    fn scope_refuses_a_name_that_is_not_an_identifier() {
+        for bad in ["a'b", "a.b", "Mixed", "", "a b", "x;drop"] {
+            assert!(schema_scope(&[bad.to_owned()]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn one_table_name_in_two_schemas_is_refused() {
+        let listed = [
+            ("marketing".to_owned(), "posts".to_owned()),
+            ("public".to_owned(), "posts".to_owned()),
+        ];
+        let err = check_unique_names(&listed).unwrap_err().to_string();
+        assert!(err.contains("posts") && err.contains("marketing"), "{err}");
+        let ok = [
+            ("marketing".to_owned(), "campaigns".to_owned()),
+            ("public".to_owned(), "posts".to_owned()),
+        ];
+        assert_eq!(check_unique_names(&ok).unwrap(), ["campaigns", "posts"]);
+    }
+
+    #[test]
+    fn a_same_schema_fk_target_is_bare_and_another_stays_qualified() {
+        let mut t = Table::new("posts", Backend::Postgres);
+        let mut a = Column::new("campaign_id", ColumnType::Int64);
+        a.references = Some(ForeignKey::new("marketing.campaigns", "id"));
+        let mut b = Column::new("owner_id", ColumnType::Int64);
+        b.references = Some(ForeignKey::new("auth.users", "id"));
+        t.columns = vec![a, b];
+        bare_same_schema_fks(&mut t, "marketing");
+        assert_eq!(t.columns[0].references.as_ref().unwrap().table, "campaigns");
+        assert_eq!(
+            t.columns[1].references.as_ref().unwrap().table,
+            "auth.users"
+        );
+    }
+
     use super::*;
 
     #[test]

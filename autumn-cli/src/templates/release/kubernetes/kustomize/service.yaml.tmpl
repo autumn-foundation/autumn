@@ -1,7 +1,9 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{k8s_name}}
+  name: {{role_object}}
+  labels:
+    app.kubernetes.io/component: {{role}}
 spec:
   type: ClusterIP
   ports:
@@ -10,4 +12,4 @@ spec:
       targetPort: http
       protocol: TCP
   selector:
-    app.kubernetes.io/name: {{k8s_name}}
+    app.kubernetes.io/component: {{role}}

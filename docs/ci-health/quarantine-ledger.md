@@ -149,7 +149,69 @@ quarantine, per the rule above.
   reproduce it (0/70 above), so the rate has to come from Windows trunk runs:
   2 Windows fleet failures in the 7 non-cancelled `ci.yml` trunk runs from 2026-10-23 onward.
   Diagnose-by stays 2026-11-09.
+- **Review 2026-11-09**: the 2026-11-09 trunk runs read for this review
+  (1e7d12c0, e5ab87ce) show no Windows fleet failure, but only one page of
+  runs was read, so this is not a recurrence rate. Entry stays open.
+  Diagnose-by moves to 2026-11-23 and the Windows timing log is still the
+  next step.
 
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none; the test still runs.
+
+### `Build tests (macos-15-intel)`: toolchain install step failed (observed, infra, not quarantined)
+
+- **Observed**: 2026-11-09, trunk-dev run 42539687568 (head `1e7d12c0`),
+  step "Run dtolnay/rust-toolchain@1.99.0". The `Test suite` gate failed
+  at "Check shard results" because this build job failed. No test ran.
+- **Owner**: Semaphore (CI-health routine) - triage only.
+- **Diagnose-by**: 2026-11-23. Close as "runner infra" if it does not recur.
+- **Rerun-rate baseline**: 1 occurrence, no same-commit rerun possible from
+  the routine. The log tail only shows post-job cleanup, so the error text
+  was not read.
+- **Mechanism (if known)**: undiagnosed; failed before any repo code ran.
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none.
+
+### `Quickstart Gate` "README quickstart vs published crates (stable)": `autumn setup` step failed (observed, not quarantined)
+
+- **Observed**: 2026-11-09, trunk-dev run 42567277627 (head `e5ab87ce`), step
+  "Quickstart: setup (autumn setup)", 05:36Z, after 19s. The `1.97.0` sibling
+  job on the same commit passed the same step (22s), so this commit has one
+  pass and one fail on the same step.
+- **Owner**: Semaphore (CI-health routine) - triage only.
+- **Diagnose-by**: 2026-11-23.
+- **Rerun-rate baseline**: 1 fail / 2 same-commit legs. Not a rerun rate.
+- **Failure signature**: not read. The log tail returned only the Postgres
+  service container output.
+- **Mechanism (if known)**: undiagnosed. The step installs from published
+  crates, so it may depend on an external registry. Read the step log
+  before any change.
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none.
+
+### `pdf::html::tests::long_run_of_unterminated_ampersands_is_linear_not_quadratic`: wall-clock ratio over the limit on macOS (observed, not quarantined)
+
+- **Observed**: 2026-11-09, PR #3680 run 42598713645 (head `4eb134af`), job
+  `Test (macos-15-intel, 3/4)`. The PR changes only this ledger, so the
+  failure is not from its diff. Nothing was skipped.
+- **Owner**: Semaphore (CI-health routine) - triage only.
+- **Diagnose-by**: 2026-11-23. If still n=1, close as "transient, runner
+  load". If it recurs, replace the wall-clock ratio with an operation count.
+- **Rerun-rate baseline**: 1 failure in CI, no same-commit rerun possible
+  from the routine. Local, Linux, debug build, `--features pdf`: the ratio
+  was 6.7-8.5 in 13 unloaded runs that reached the ratio check (the other
+  17 of 30 finished the large input under the 50 ms floor) and 6.2-14.5 in
+  20 runs pinned to one CPU beside four busy loops. Limit is 32. The test
+  needs `--features pdf`; without it the filter matches 0 tests and exits 0.
+- **Failure signature**: `decode_entities took 664.92915ms at 200000 and
+  18.396818ms at 25000: 36.1 times for 8 times the input. That looks
+  quadratic again.` (`autumn/src/pdf/linear.rs:56`). The large input ran
+  about 13x slower than the local 51 ms, the small one about 2.8x slower.
+- **Mechanism (if known)**: hypothesis. Resource contention on the macOS
+  runner during the large run: all three best-of runs were slow, so a sustained
+  stall, not one blip. The parser is not shown to be quadratic: the local
+  ratio stays near 8 even under oversubscription. Verdict: not made tolerant,
+  so `MAX_RATIO` and `FAST_ENOUGH` are unchanged.
 - **Linked issue/PR**: none.
 - **Skip mechanism**: none; the test still runs.
 

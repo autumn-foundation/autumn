@@ -269,3 +269,147 @@ fn migrate_postgres_control_with_sqlite_shard_is_rejected_before_applying() {
         "sqlite shard file must not be created/migrated"
     );
 }
+
+/// Whether the `SQLite` file at `db_path` has `table`.
+fn table_exists(db_path: &Path, table: &str) -> bool {
+    let mut conn = SqliteConnection::establish(db_path.to_str().expect("utf-8 path"))
+        .expect("open sqlite file");
+    let rows: Vec<TableName> = sql_query(format!(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+    ))
+    .load(&mut conn)
+    .expect("query sqlite_master");
+    !rows.is_empty()
+}
+
+/// Write one migration that creates `table` under `root/<dir>/<name>/`.
+fn write_migration(root: &Path, dir: &str, name: &str, table: &str) {
+    let migration = root.join(dir).join(name);
+    std::fs::create_dir_all(&migration).expect("mkdir migration");
+    std::fs::write(
+        migration.join("up.sql"),
+        format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY);\n"),
+    )
+    .expect("write up.sql");
+    std::fs::write(migration.join("down.sql"), format!("DROP TABLE {table};\n"))
+        .expect("write down.sql");
+}
+
+/// A project with one migration in each scope directory.
+fn write_scoped_project(root: &Path) {
+    write_posts_migration(root);
+    write_migration(
+        root,
+        "migrations-control",
+        "20990102000000_create_tenants",
+        "tenants",
+    );
+    write_migration(
+        root,
+        "migrations-shards",
+        "20990103000000_create_orders",
+        "orders",
+    );
+}
+
+/// On a fleet app, `autumn migrate` applies `migrations/` and
+/// `migrations-control/` to the control database, as boot applies the
+/// `Everywhere` and `Control` sets. `migrations-shards/` stays off it.
+#[test]
+fn migrate_applies_the_control_directory_to_the_control_database_of_a_fleet() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_scoped_project(root);
+    std::fs::write(
+        root.join("autumn.toml"),
+        "[database.fleet]\nmode = \"tenant\"\nroot = \"fleet\"\n",
+    )
+    .expect("write autumn.toml");
+
+    let db_path = root.join("control.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(code, Some(0), "migrate failed: {err}");
+    assert!(table_exists(&db_path, "posts"), "{err}");
+    assert!(table_exists(&db_path, "tenants"), "{err}");
+    assert!(
+        !table_exists(&db_path, "orders"),
+        "a shard set stays off the control database: {err}"
+    );
+}
+
+/// With no fleet and no shard, `autumn migrate` applies every scope
+/// directory to the one database, as boot does.
+#[test]
+fn migrate_applies_every_scope_directory_to_the_only_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_scoped_project(root);
+
+    let db_path = root.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(code, Some(0), "migrate failed: {err}");
+    for table in ["posts", "tenants", "orders"] {
+        assert!(table_exists(&db_path, table), "{table}: {err}");
+    }
+
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(code, Some(0), "second migrate failed: {err}");
+    assert!(err.contains("already up to date"), "{err}");
+}
+
+/// `autumn migrate down` reads `migrations/` only. With a scope directory
+/// it stops before it reverts anything.
+#[test]
+fn migrate_down_refuses_a_scope_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_scoped_project(root);
+
+    let db_path = root.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(code, Some(0), "migrate failed: {err}");
+
+    let (_out, err, code) = run_autumn(root, &["migrate", "down"], &envs);
+    assert_eq!(code, Some(1), "down must stop: {err}");
+    assert!(err.contains("migrations-control/"), "{err}");
+    for table in ["posts", "tenants", "orders"] {
+        assert!(table_exists(&db_path, table), "nothing reverted: {table}");
+    }
+}
+
+/// An app can keep every set in scope directories, with no `migrations/`.
+#[test]
+fn migrate_applies_scope_directories_with_no_migrations_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    write_migration(
+        root,
+        "migrations-control",
+        "20990102000000_create_tenants",
+        "tenants",
+    );
+    write_migration(
+        root,
+        "migrations-shards",
+        "20990103000000_create_orders",
+        "orders",
+    );
+
+    let db_path = root.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_out, err, code) = run_autumn(root, &["migrate"], &envs);
+    assert_eq!(code, Some(0), "migrate failed: {err}");
+    for table in ["tenants", "orders"] {
+        assert!(table_exists(&db_path, table), "{table}: {err}");
+    }
+    let (_out, err, code) = run_autumn(root, &["migrate", "check"], &[]);
+    assert_eq!(code, Some(0), "check failed: {err}");
+    assert!(err.contains("migrations-control/"), "{err}");
+}

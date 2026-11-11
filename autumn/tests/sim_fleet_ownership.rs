@@ -114,6 +114,7 @@ async fn host(dir: &std::path::Path, name: &str) -> Host {
         root: dir.join(name).display().to_string(),
         path: None,
         max_open: 8,
+        max_resident_bytes: 0,
         pool_size: 2,
         create_on_demand: Some(true),
         idle_close_secs: 0,
@@ -123,6 +124,9 @@ async fn host(dir: &std::path::Path, name: &str) -> Host {
         restore_check_sample: 0,
         replication_workers: 4,
         min_residency: std::time::Duration::from_secs(2),
+        max_open_policy: autumn_web::config::FleetMaxOpenPolicy::Soft,
+        mmap_size: 0,
+        cache_size_kib: 0,
     })
     .build()
     .unwrap();

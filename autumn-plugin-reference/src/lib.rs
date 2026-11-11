@@ -72,6 +72,31 @@ static ASSETS: autumn_web::assets::PluginAssets = autumn_web::assets::PluginAsse
     &[("reference.js", b"window.autumnPluginReference = true;\n")],
 );
 
+// surface: background
+//
+// A plugin capability. A role runs it when the role runs job workers. A named
+// role can set it with `[roles.<name>] capabilities = { "reference.sweeper" = false }`.
+/// The capability of the reference sweeper.
+pub const SWEEPER: autumn_web::background::PluginCapability =
+    autumn_web::background::PluginCapability::new(
+        "reference.sweeper",
+        autumn_web::Capability::JobWorkers,
+    );
+
+/// A capability that no task uses. The plugin reads it with
+/// `state.role().runs_plugin(WARMER)`.
+pub const WARMER: autumn_web::background::PluginCapability =
+    autumn_web::background::PluginCapability::new(
+        "reference.warmer",
+        autumn_web::Capability::ServesHttp,
+    );
+
+/// The background task name of the reference heartbeat.
+pub const HEARTBEAT_TASK: &str = "reference.heartbeat";
+
+/// The interval of the reference heartbeat.
+const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A plugin that exercises every stable plugin-facing API.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReferencePlugin;
@@ -104,10 +129,57 @@ impl Plugin for ReferencePlugin {
         let app = app.routes(routes![index]);
 
         // surface: AppBuilder::on_startup
+        //
+        // One-time setup that every role needs. Every role runs every
+        // startup hook, so do not start a loop here.
         let app = app.on_startup(|_state| async move {
             autumn_web::reexports::tracing::debug!("autumn-plugin-reference started");
             Ok(())
         });
+
+        // surface: AppBuilder::background_task
+        //
+        // A loop that runs until shutdown. The framework starts it only on
+        // roles that run `maintenance` (`combined` and `worker`), and the
+        // drain waits for it. Select on `shutdown` at each wait.
+        let app = app.background_task(
+            HEARTBEAT_TASK,
+            autumn_web::Capability::Maintenance,
+            |_state, shutdown| async move {
+                let mut ticker = autumn_web::reexports::tokio::time::interval(HEARTBEAT_EVERY);
+                loop {
+                    autumn_web::reexports::tokio::select! {
+                        () = shutdown.cancelled() => return Ok(()),
+                        _ = ticker.tick() => {
+                            autumn_web::reexports::tracing::trace!("reference heartbeat");
+                        }
+                    }
+                }
+            },
+        );
+
+        // surface: AppBuilder::background
+        //
+        // The full form: a plugin capability, a queue and the plugin's own
+        // switch. `None` lets the role decide.
+        let app = app.background(
+            autumn_web::background::BackgroundTask::new(
+                "reference.sweeper",
+                SWEEPER,
+                |state, shutdown| async move {
+                    if state.role().runs_plugin(WARMER) {
+                        autumn_web::reexports::tracing::debug!("reference sweeper on an HTTP role");
+                    }
+                    shutdown.cancelled().await;
+                    Ok(())
+                },
+            )
+            .queues(["reference"])
+            .explicit(None),
+        );
+
+        // surface: AppBuilder::plugin_capability
+        let app = app.plugin_capability(WARMER);
 
         // surface: AppBuilder::on_shutdown
         let app = app.on_shutdown(|| async move {
@@ -421,6 +493,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The sweeper runs where the role drains `reference`. A named role turns
+    /// it off.
+    #[tokio::test]
+    async fn the_sweeper_follows_the_role() {
+        let config: autumn_web::config::AutumnConfig = toml::from_str(
+            "[actuator]\nsensitive = true\n\n[roles.quiet]\nbase = \"worker\"\n\
+             capabilities = { \"reference.sweeper\" = false }\n",
+        )
+        .expect("config parses");
+        let client = autumn_web::test::TestApp::new()
+            .config(config)
+            .plugin(ReferencePlugin::new())
+            .build();
+        let body: serde_json::Value = client
+            .get("/actuator/tasks")
+            .send()
+            .await
+            .assert_ok()
+            .json();
+        let tasks = &body["background_tasks"];
+        assert_eq!(
+            tasks["reference.sweeper"]["roles"],
+            serde_json::json!(["combined", "worker"])
+        );
+        assert_eq!(
+            tasks["reference.sweeper"]["queues"],
+            serde_json::json!(["reference"])
+        );
+        assert_eq!(
+            tasks["reference.heartbeat"]["roles"],
+            serde_json::json!(["combined", "worker", "quiet"])
+        );
+        assert_eq!(tasks["reference.heartbeat"]["runs_here"], true);
+    }
+
+    /// The heartbeat status on `role`.
+    async fn heartbeat_on(role: &str) -> serde_json::Value {
+        let config: autumn_web::config::AutumnConfig = toml::from_str(&format!(
+            "role = \"{role}\"\n[actuator]\nsensitive = true\n"
+        ))
+        .expect("config parses");
+        let client = autumn_web::test::TestApp::new()
+            .config(config)
+            .plugin(ReferencePlugin::new())
+            .build();
+        let body: serde_json::Value = client
+            .get("/actuator/tasks")
+            .send()
+            .await
+            .assert_ok()
+            .json();
+        body["background_tasks"][HEARTBEAT_TASK].clone()
+    }
+
+    /// The heartbeat runs on `maintenance` roles. `web` does not start it.
+    #[tokio::test]
+    async fn the_heartbeat_runs_on_worker_and_not_on_web() {
+        let web = heartbeat_on("web").await;
+        assert_eq!(web["runs_here"], false, "{web}");
+        assert_eq!(web["status"], "not_placed", "{web}");
+        let worker = heartbeat_on("worker").await;
+        assert_eq!(worker["runs_here"], true, "{worker}");
+        assert_eq!(worker["status"], "running", "{worker}");
     }
 
     #[test]

@@ -111,15 +111,17 @@ the framework almost certainly already generates or ships it:
 | A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (0.6.0, issue #1350, see `docs/guide/rate-limiting.md`) |
 | Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (0.6.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (0.6.0). For a hint, `required`, `placeholder`/`autocomplete`/`data-*`/`hx-*`, use the `*_with` helper + `FieldOptions` (or `FormFor::field_options`) — never hand-write the input to add one attribute |
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
-| Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
+| Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work, `app.background_task(name, capability, ..)` for a long-running loop placed by role (#3545) |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. Sweeps run on Postgres and SQLite. See `docs/guide/data-retention.md` |
 | A hand-written script that copies production data and masks PII for staging, on Postgres or SQLite | `autumn db scrub` (`--check`, `--dry-run`, `--artifact`, `--output`). A `sqlite://` target or `.sqlite` backup scrubs in one transaction, then `VACUUM`s. An unclassified column aborts the run; declare columns in `scrub.toml`. `--sample` is Postgres-only. See `docs/guide/data-scrubbing.md` |
+| A `custom_setup` hook or raw `PRAGMA mmap_size` / `PRAGMA cache_size` to speed up reads on a large SQLite file | `[database] mmap_size` (bytes) and `cache_size_kib` (KiB), both `0` = off; `[database.fleet]` has its own pair. Env `AUTUMN_DATABASE__MMAP_SIZE`, `..._CACHE_SIZE_KIB`. mmap halves random and range reads on a large, read-heavy file, does nothing for small fleet files, and turns an I/O error into `SIGBUS`. See `docs/guide/sqlite-in-production.md` ("Memory-mapped reads and the page cache") |
 | A hand-written GDPR export job that zips CSV/JSON a user cannot open, verify, or import again | `GdprRegistry::capsule(CapsuleModel::new(table, subject_column).belongs_to(..))` + `autumn data capsule export --subject <id> --out <dir>` (issue #1811) — one signed directory with records, a `manifest.json`, blobs, and an offline HTML viewer; `autumn data capsule import` verifies every file, then imports with no loss of data. Use `.exclude(column)` for secrets. See `docs/guide/data-capsules.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0); `.stale_if_error(window)` serves the last value when a fill fails |
 | Calling `cache.invalidate(key)` by hand after a repository write | `#[repository(Model, invalidates(cached_fn))]`: each generated write drops the read after it commits (#3056). Async code uses `Cache::invalidate_async`, which returns the error |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | `Db` taken before a body extractor (`Form`/`Json`/`Multipart`) in the same handler — pins a pooled connection for as long as the client takes to send the body | `LazyDb` in the same argument spot; call `.checkout().await?` after the body extractor runs — for `Form`/`Json` that means right at handler entry, but `Multipart` doesn't buffer anything during extraction, so checkout must wait until every field this handler needs has been read from the `next_field()` loop, not before it (issue #2264) |
+| Reading `/actuator/metrics` `db_queries["<route> SELECT"]` as a slow `SELECT` — the `Db` extractor writes its connection hold time there (checkout to release, all work in the hold), also on routes that only write | `db_connection_holds["<route>"]` for the hold; `db_queries` for statements timed with `run_instrumented`. The `Db` write to `"<route> SELECT"` is deprecated and stops next release (issue #3579). A long hold with fast statements is work outside the database: take `LazyDb` and check out late. See `docs/guide/metrics.md` |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
 | Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (0.6.0) |
 | Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (0.6.0) |
@@ -1070,6 +1072,7 @@ raw Diesel:
 | `save_many`, `save_many_skip_invalid`, `update_many`, `delete_many`, `upsert_many` | Bulk ops, hook-aware, auto-chunked under the 65,535-param ceiling; `upsert_many` is a compile error on hooked repositories |
 | `with_lock` | `SELECT ... FOR UPDATE` row locking in a transaction |
 | `primary_reads` (attr) / `on_primary()` | Pin reads to primary; read-your-writes after a save |
+| `boundary = B` (attr) | Run as the Postgres role of boundary `B`; implies `primary_reads`; not with `sharded` |
 | `soft_delete`, `tenant_scoped` (attrs), `across_tenants()` | Soft deletion and tenant scoping |
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
@@ -1942,6 +1945,24 @@ can fan out without inline coupling: `#[event]` on a struct, publish via the
 register with `.listeners(listeners![...])`. Do not also list durable
 listeners in `jobs![...]`. See `docs/guide/events.md`.
 
+Event wire contracts: `#[event(name = "contact.updated", version = 2)]` sets
+the topic (`contact.updated.v2`) and derives `WireShape` (do not derive it
+again). A `#[listener]` that reads a field the event does not send fails the
+build. Put `#[event_consumer(E)]` on an outbox topic handler for the same
+check. `#[event(opaque)]` turns the check off for a payload `WireShape`
+refuses. `autumn contracts check` covers events across releases.
+
+Send an event to another Autumn service with an outbox destination, not a
+hand-written HTTP call. The producer sets `[outbox.destinations.<name>]`
+(`url`, `signing_secret = "${VAR}"`, `topics`) and writes the event with
+`outbox.write(conn, aggregate, Event::NAME, &event)` in its transaction. Each
+topic must be an `#[event(name = "...")]`, or the boot fails. The receiver
+sets `[outbox.inbox]` (`enabled`, the same `signing_secret`) and handles the
+topic with a `#[listener]`; it serves `POST /_autumn/inbox`, drops copies
+with `Inbox::seen`, and returns `503` for a topic it does not know yet, which
+the producer relay sends again. Both apps need `outbox.enabled = true`. See
+`docs/guide/outbox.md`.
+
 ## Distributed locks (0.6.0)
 
 For "run this exactly once across replicas right now" work (nightly cleanup,
@@ -2428,7 +2449,37 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
 - `#[derive(WireShape)]` refuses generics, enums, tuple structs,
   `#[serde(flatten)]` and split renames rather than describing them wrongly.
 
-First slice: one workspace, sync request/response, JSON over HTTP. Guide:
+- Across releases: `autumn contracts export --out contracts.json` writes a
+  sorted, byte-stable bundle; store it with each release.
+  `autumn contracts check --against <bundle|url|git-ref>` checks both deploy
+  windows (new callees with deployed callers, new callers with deployed
+  callees). Exit 0 safe, 1 not safe, 3 safe in one order only (the report
+  names it; `--order callee-first|caller-first` declares it), 4 tool error.
+- The bundle (format 5) finds a type by its path, not its last name: write
+  the path where the type is defined (`Json<shared::Item>`,
+  `Json<crate::dto::Item>`) when two reachable crates have an `Item`, or the
+  export stops. A path through a re-export or a `use … as` alias does not
+  name the type. Nested `WireShape` types are compared
+  field by field (`details.color`). A read-set and a write-set hold dotted
+  paths (`item.details.color` reads `details.color`), so the removal of an
+  optional nested field that a caller reads is a break. A read through an
+  index or a loop stops at the field before it. `struct Empty;` (JSON
+  `null`) and `struct Empty {}` (`{}`) are different shapes.
+- A field whose type has no `WireShape` and is not a known leaf (an enum, for
+  example) stops the export: mark it `#[wire(opaque)]` to compare it by type
+  name only. Do not add `WireShape` to an enum: the derive refuses it.
+- Each field records its wire type (the JSON form). A field with
+  `#[serde(with)]` is `any`: name its form with
+  `#[wire(type = "integer", format = "unix-seconds")]`. `type` is `string`,
+  `integer`, `number`, `boolean` or `any`; another value does not compile.
+  Add `nullable` for an `Option` under another name. The check reports a new
+  JSON form with the same Rust type (bundle format 4 or newer).
+- An `#[endpoint]` must be in a `routes![…]` call. Taking it out of the router
+  is a removed route. For a handler of another crate, write its crate path
+  (`routes![mesh_catalog::get_item]`), so the check judges that crate. `autumn contracts export --from <dir>` joins an existing
+  descriptor directory with no build.
+
+Limits: one workspace, sync request/response, JSON over HTTP. Guide:
 `docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +
 `examples/mesh-storefront`.
 
@@ -2603,16 +2654,42 @@ subset of queues — all config-only, no app-code change:
   backend keeps the in-process mark path. See `docs/guide/jobs.md`.
 - **`Role` on `AppState`** — `state.role()` returns the resolved
   `Role` (exported at `autumn_web::Role`) with `serves_http()` /
-  `runs_workers()` predicates, so app-owned background loops in `on_startup`
-  self-gate to the right tier instead of re-reading `AUTUMN_ROLE` (issue #1726).
+  `runs_workers()` predicates (issue #1726).
   `state.capabilities()` returns the `RoleCapabilities` resolved at boot: one
   field for each subsystem (`job_workers`, `scheduler`, `outbox_relay`,
-  `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `serves_http`).
+  `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `maintenance`,
+  `serves_http`).
   Gate on the field that matches the work. `/actuator/info` shows the set
   (0.10.0, issue #3542). See `docs/guide/jobs.md#role-capabilities`.
+- **Background tasks (issue #3545)** — do not `tokio::spawn` a loop in
+  `on_startup`: every role runs it. Use
+  `app.background_task("media.reaper", Capability::Maintenance, |state, shutdown| async move { .. })`.
+  The framework starts it only where the role runs the capability and waits
+  for it in the drain. `PluginCapability::new("harvest.worker",
+  Capability::JobWorkers)` follows its parent; a preset sets it with
+  `capabilities = { "harvest.worker" = false }` (the base must run the parent
+  for `true`; an unknown key stops the boot of that role). `app.background(BackgroundTask::new(..)
+  .queues([..]).explicit(cfg))` adds queues (job workers and the pin apply) and the plugin
+  switch (wins, with a warning). `/actuator/tasks` (`background_tasks`) and
+  `autumn graph` (`background_task` nodes) list the roles that run each task.
+  See `docs/guide/jobs.md#background-tasks-for-plugins-and-apps`.
+- **In-repo plugin tasks (issue #3546)** — `autumn-media-plugin` registers
+  `media.room_reaper` (`db` store: `media.maintenance`, on `combined`/`worker`;
+  `memory` store: `serves_http`, on `combined`/`web`) and
+  `media.recording_retention` (`media.retention` + the media queue). For a
+  fleet of only `web` replicas, call `MediaPlugin::room_reaper_on_every_role()`
+  and `retention_on_every_role()`. `autumn-billing` registers
+  `billing.dunning_rearm` (`billing.dunning` + queue `billing`): `web` does
+  not re-arm. Turn one off on a named role with
+  `capabilities = { "media.maintenance" = false }`. `spawn_room_reaper_loop`
+  and `spawn_retention_sweep_loop` are deprecated: call `run_room_reaper` /
+  `run_retention_sweep` from a `background_task`. The xtask test
+  `plugin_spawns` fails on a spawn in a plugin's `on_startup` or
+  `state_initializer`. See `docs/guide/media.md#background-tasks-and-roles`.
 - **Named roles (`[roles.<name>]`, 0.10.0, issue #3543)** — declare a tier once as a
   preset: `base` (`combined`/`web`/`worker`), `pin`, `workers` and capability
-  overrides that can only turn a capability off. Select it with
+  overrides that can only turn a built-in capability off (a plugin capability
+  in `capabilities` can be `true` where the base runs its parent). Select it with
   `AUTUMN_ROLE=<name>`. `state.role()` returns `&Role`: `.name()` is the
   preset name, `.base()` the `ProcessRole`. Guards read the base; an
   undeclared name stops the boot. `autumn doctor --strict` derives
@@ -2749,10 +2826,12 @@ the build.
   `{ id = "RUSTSEC-…", reason = "why this is acceptable here; review-by <date>" }`.
   A waiver lets exactly one id through; the gate stays on and every other
   advisory still fails.
-- A fresh scaffold ships two waivers already — RUSTSEC-2023-0071 (`rsa`) and
+- A fresh scaffold ships three waivers already — RUSTSEC-2023-0071 (`rsa`) and
   RUSTSEC-2026-0387 (`crypto-bigint` 0.5), both reached through the
-  unconditional `jsonwebtoken` dependency, no patched release exists — which is
-  why day-one CI is green. Do not remove either without checking
+  unconditional `jsonwebtoken` dependency, no patched release exists — and a
+  third, RUSTSEC-2026-0441 (`pin-utils`, unmaintained, via autumn-web's
+  `cfg(loom_models)` `loom` dependency). That is why day-one CI is green. Do
+  not remove one without checking
   whether a fixed release has shipped. An unused-waiver warning means one of the
   app author's own waivers went stale.
 - An app upgraded from a release before this gate existed receives the workflow
@@ -3067,14 +3146,28 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - `DatabaseFleet` (`autumn_web::db::fleet`): `open_for`, `provision`,
   `delete` (`410` meanwhile), `backup` (`VACUUM INTO`), `import` (copy a
   file into the fleet: check, migrate, publish; `409` when the key has a
-  file, `422` for a bad file),
+  file, `422` for a bad file), `restore_from_file(&key, &src,
+  LocalRestore::new())` (replace a live database with a local backup; no
+  replication needed; openers wait for the swap; another key's backup or a
+  deleted key is refused unless `allow_rekey` / `clear_tombstone`),
   `restore`, `list`, `each`, `migrate_all`, `stats`. Health: `db:fleet`.
-  Use `import`, not a `FleetLifecycle::restore_missing` hook, for a local
-  backup.
-- `max_open` is a soft limit: a database in use or used within
+  Use `import` or `restore_from_file`, not a
+  `FleetLifecycle::restore_missing` hook, for a local backup. CLI:
+  `autumn fleet restore <key> --from <file> --force`.
+- `max_open` is a soft limit by default: a database in use or used within
   `min_residency` (default `"2s"`) is not closed, and an open never waits.
   A burst can open far more files than `max_open`. Size `ulimit -n` for the
-  peak (about `2 × pool_size + 1` fds per open database).
+  peak (about `2 × pool_size + 1` fds per open database). `db:fleet` reports
+  `peak_open`, `over_cap_opens_total` and `refused_total`.
+- `[database.fleet] max_open_policy = "wait"` or `"refuse"` makes `max_open`
+  hard: open and closing databases never pass it. `wait` parks an open for
+  at most `database.connect_timeout_secs`, then answers `503`. `refuse`
+  answers `503` with `Retry-After` when no idle database can close. Check the
+  tenant id before `open`: the cap counts any key.
+- `max_resident_bytes` (default `0`, off) is a soft memory budget with the
+  same rules as `max_open`. The SQLite engine counts about 2 MB per open
+  connection. The fleet keeps one database open. `db:fleet` reports
+  `resident_bytes`.
 - Control-only or tenant-only tables: `.migrations_for(MigrationScope::Control,
   SET)` / `.migrations_for(MigrationScope::Shards, SET)`
   (`autumn_web::migrate::MigrationScope`), not one set for both.
@@ -3087,11 +3180,19 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - With `[replication]` on, each open database ships its WAL under
   `fleet/tenant/<id>` / `fleet/slot/<n>` (health `replication:fleet`);
   `restore_missing = true` serves a missing database from its replica on a
-  fresh volume. A replicated fleet root is served by one process (one
-  replicator per database). `replication_workers` (default `4`) threads ship
-  the databases. With many busy databases per host, monitor
-  `worst_lag_seconds` and `last_pass_ms` in `replication:fleet`.
-- Delete with replication (0.10.0, issue #3235): `delete` also purges the replica.
+  fresh volume. It holds what the old owner shipped: after a crash, up to
+  `rpo_secs` of committed writes that already returned success are missing.
+  A replicated fleet root is served by one process (one replicator per
+  database).
+- A write that spans two databases (move a row: upsert into `dst`, delete
+  from `src`): do the second half only after the first is in the replica.
+  `fleet.wait_replicated(&dst, committed_at, timeout)` with `committed_at`
+  read from the app clock after the commit; `fleet.replicated_through(&key)`
+  gives the instant itself. Errors: `NotReplicating`, `Fenced`, `TimedOut`
+  (not a loss: keep the source row, retry). Do not use `worst_lag_seconds`
+  or `last_success_at` for this. Guide: "Know when a write is in the
+  replica" in `docs/guide/sqlite-fleet.md`.
+- Delete with replication (issue #3235): `delete` also purges the replica.
   It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
   database first; no row, no delete (`503`). A failed purge keeps the row,
   and the maintenance task retries it (`purge_deleted_replicas`).
@@ -3112,12 +3213,22 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `restore_missing`. Replication is asynchronous: a takeover loses the
   unshipped writes (`rpo_secs` in steady state), and a fail-back does not
   recover them. A crash costs up to `lease_secs + lease_secs / 3` of outage.
-  Guide: "What a failover costs".
+  Guide: "What a failover costs". An open refuses a file stamped with a
+  newer epoch than this host's (`FleetError::NewerEpoch`, `421`).
   Health: `fleet:ownership`. The built-in table is
   on the control database, so it fences the processes of one host only;
-  hosts on different machines implement `SlotOwnershipStore`
-  (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
-  `docs/guide/sqlite-fleet.md`.
+  for hosts on different machines, use
+  `.fleet_ownership_store(PgSlotOwnership::new(pg_pool, clock))` (needs the
+  `postgres` feature next to `sqlite`; one store per fleet) or another
+  `SlotOwnershipStore` (`autumn_web::db::fleet_ownership`). Guide:
+  "Failover: slot ownership" in `docs/guide/sqlite-fleet.md`.
+- An engine plugin (DuckDB, RocksDB) writes its own extractor over
+  `autumn_web::fleet::resolve::<E>(parts, state)`: routing key, owner check
+  (`421`), open, `FleetLease<E>`. Jobs use `resolve_key::<E>(state, id)`.
+  Put the `DatabaseFleet<E>` in the state with `insert_extension`. A sidecar
+  hook ships through `db.sidecar_replica("duckdb")`, a `ScopedDestination`
+  that refuses keys outside `<key prefix>/duckdb/` and writes after a close or
+  a fence. Guide: "Writing a fleet extractor" in `docs/guide/sqlite-fleet.md`.
 - Cross-tenant analytics (0.10.0, issue #3236): query the lake, not the volume.
   `fleet.lake()?.materialize().await?.query(sql)`
   (`autumn_web::db::fleet_lake`) restores each live tenant from its replica
@@ -3128,7 +3239,45 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   tombstone source: `markers_only()`. Each tenant is consistent on its own;
   no atomic snapshot. CLI: `autumn fleet lake q.sql --out q.csv`. Never
   pass request input as the SQL. Guide: "Query the lake".
+- Another lake format (ADR 0040 §6): implement `LakeSink` and call
+  `fleet.lake()?.load(sink)`. Core runs the inclusion rule, restores, and
+  checks the identity row. The sink gets `add(LakeMember { key, generation,
+  file })` and gives its lake from `finish()`. To keep a lake between
+  loads, return `true` from `has(key, generation)`: core calls `keep` and
+  restores nothing. At `finish`, drop each member that got neither `add`
+  nor `keep`. `LakeGeneration` holds the WAL position, so compare all of
+  it. `TAKES_SLOTS = true` gets slot databases. Keep the catalog in files
+  under the sink's own prefix, never under `<base>/fleet/`. Guide: "Lake
+  sinks".
 - The control database lives outside `root` (validation refuses it inside).
+- `[database.fleet] mmap_size` / `cache_size_kib` tune fleet files on their
+  own; `[database] mmap_size` does not reach the fleet. Keep them `0` for
+  small tenant files. Guide: "Memory-mapped reads" in
+  `docs/guide/sqlite-fleet.md`.
+- Another engine (ADR 0040): the fleet core is `DatabaseFleet<E: FleetEngine>`
+  (`autumn_web::db::fleet_engine`, experimental surface). With `sqlite`,
+  `DatabaseFleet` means `DatabaseFleet<SqliteEngine>`, so SQLite code does
+  not change. An engine plugin implements `FleetEngine` (async `open` that
+  stamps the key and the epoch, `close`, `in_use`, `snapshot`, `remove`,
+  `resident_bytes`, `ship_mode`), builds with
+  `DatabaseFleet::with_engine(&config, engine)`, reads `db.handle()`, and
+  runs `plugin_conformance::fleet::run_fleet_conformance` with a
+  `FleetFixture` in its CI. Engines go in their plugin, never in core.
+- Shipping another engine: return `ShipMode::Generations { every }` from
+  `ship_mode` and call `fleet.install_replication(replication)` (needs
+  `sqlite`). Core snapshots every `every` and at close, puts only files with
+  a new SHA-256, and restores the newest generation on a new volume. The
+  engine never writes the replica: core checks the fence before each put
+  (`FleetError::Fenced`, `421`). Make a snapshot of unchanged data the same
+  bytes, and return the stamp from `epoch_stamp`. `ShipMode::Rebuild` ships
+  nothing: `restore_latest` calls `FleetEngine::rebuild`. Operators:
+  `fleet.ship_now(&key)`, `fleet.restore_latest(&key)`. `FleetStats` has
+  `ship_mode` and `rpo_secs`. A close-time generation that did not ship
+  stays as unshipped work: the replication loop (`spawn_loop`) and the
+  shutdown flush ship it again, and `release_ownership` lets the ranges
+  lapse until then. Watch `replication:fleet` `unshipped` and
+  `FleetReplication::unshipped_generations()`. Do not write your own retry.
+  Guide: "Shipping a plugin engine" in `docs/guide/sqlite-fleet.md`.
 - Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
   databases, also closed ones (issue #3234). Write outbox rows in a
   transaction on the tenant connection: the write records the database in
@@ -3337,7 +3486,13 @@ duration_secs = 300   # or: autumn deploy up --bake-secs 300
 Kubernetes: `autumn release init --target kubernetes` writes a Helm chart
 (`deploy/helm/`, set `trustedHosts`) and a Kustomize base with probes, a
 `preStop` hook, a safe grace period, a PDB, and opt-in Argo Rollouts or Flagger
-canaries. See `docs/guide/slo.md` and `docs/guide/kubernetes.md`.
+canaries. Each role gets its own workload (`roles:` in `values.yaml`, one
+Kustomize component per role); only HTTP roles get a Service and an Ingress.
+`--roles` picks the roles. `--target fly` writes one `[processes]` entry per
+role. A fleet sets a role per host group with a `[[deploy.groups]]` table
+(`role = "worker"` and `hosts = ["10.0.0.3"]`). `autumn doctor` warns when a
+manifest names an undeclared role. See `docs/guide/slo.md`, `docs/guide/kubernetes.md` and
+`docs/guide/fleet-deploys.md`.
 
 ## Shadow (differential) deploys
 
@@ -3697,6 +3852,7 @@ autumn graph show --manifest architecture-graph.json --check architecture-graph.
 # `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 autumn graph check-boundaries    # fail when one boundary queries a table another boundary owns (0.10.0, #3549)
+autumn db grants --apply         # GRANT/REVOKE so each boundary `role` reads only its own tables and exceptions; `autumn doctor --strict` checks it as each role
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
 autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
@@ -3731,7 +3887,12 @@ one is that a call into a helper in another module is not followed. See
 To keep one module out of another module's tables, declare boundaries in
 `boundaries.toml` and run `autumn graph check-boundaries`. A baseline holds
 today's violations, so an existing app can adopt it. See
-`docs/guide/table-ownership.md`.
+`docs/guide/table-ownership.md`. To make the database refuse
+the same queries, give a boundary `schema` and `role`, connect it with
+`[database.roles.<boundary>]`, and use `state.pool_for::<B>()` or
+`BoundaryDb<B>`. Put a model in the schema with
+`#[model(managed, schema = "marketing")]`. Run a repository as the role with
+`#[repository(Model, boundary = B)]`. See `docs/guide/database-boundaries.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 

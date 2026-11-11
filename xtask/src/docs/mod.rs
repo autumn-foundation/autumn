@@ -6,6 +6,7 @@
 //! - [`links`]: the markdown link gate.
 //! - [`aliases`]: every capability page carries the word readers search by.
 //! - [`guide_index`]: every guide page listed in the index that owns it.
+//! - [`routes`]: every documented `/actuator/…` path is one the framework mounts.
 //!
 //! A ported gate replaces its script only once it gives the same result on
 //! the tree, with the script's self-test carried over as `#[test]`s. See
@@ -17,6 +18,7 @@ pub mod guide_index;
 pub mod links;
 pub mod markdown;
 mod re;
+pub mod routes;
 
 use std::io::Write;
 use std::path::Path;
@@ -32,7 +34,14 @@ pub struct Gate {
     /// One line on what it checks.
     pub about: &'static str,
     run: fn(&Path, &mut dyn Write) -> Result<bool>,
+    /// The pages it reads, for `cargo xtask docs <name> --corpus`.
+    corpus: Option<Listing>,
+    /// The truth set it checks against, for `cargo xtask docs <name> --list`.
+    list: Option<Listing>,
 }
+
+/// A gate's answer to `--corpus` or `--list`: one entry per line.
+type Listing = fn(&Path) -> Result<Vec<String>>;
 
 impl Gate {
     /// Run the gate over `root`, printing its report. Returns whether it
@@ -44,6 +53,24 @@ impl Gate {
     pub fn run(&self, root: &Path, out: &mut dyn Write) -> Result<bool> {
         (self.run)(root, out)
     }
+
+    /// The pages the gate reads, if it can say.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the gate cannot list its corpus.
+    pub fn corpus(&self, root: &Path) -> Option<Result<Vec<String>>> {
+        self.corpus.map(|f| f(root))
+    }
+
+    /// The truth set the gate checks against, if it has one to show.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the gate cannot read its truth set.
+    pub fn list(&self, root: &Path) -> Option<Result<Vec<String>>> {
+        self.list.map(|f| f(root))
+    }
 }
 
 /// Every ported docs gate.
@@ -52,16 +79,29 @@ pub const GATES: &[Gate] = &[
         name: "docs-links",
         about: "Markdown link gate: every relative link and heading anchor in the tracked markdown corpus must resolve.",
         run: |root, mut out| links::run(root, &mut out),
+        corpus: None,
+        list: None,
     },
     Gate {
         name: "docs-guide-index",
         about: "Guide-index gate: every page in docs/guide/ is listed once in the index that owns it, and README.md links the index.",
         run: |root, mut out| guide_index::run(root, &mut out),
+        corpus: None,
+        list: None,
     },
     Gate {
         name: "docs-aliases",
         about: "Reader-vocabulary gate: the page that documents a capability carries the word a reader searches for it by.",
         run: |root, mut out| aliases::run(root, &mut out),
+        corpus: None,
+        list: None,
+    },
+    Gate {
+        name: "docs-routes",
+        about: "Actuator-path gate: every `/actuator/…` path the reader-facing docs show is one the framework mounts.",
+        run: |root, mut out| routes::run(root, &mut out),
+        corpus: Some(routes::sorted_corpus),
+        list: Some(routes::surface),
     },
 ];
 

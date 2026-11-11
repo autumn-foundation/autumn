@@ -2736,10 +2736,24 @@ mod tests {
 
     #[test]
     fn unterminated_tags_parse_in_linear_time() {
-        let started = std::time::Instant::now();
-        let _ = md(&"<a b".repeat(200_000));
-        let _ = md(&"<a b=\"".repeat(200_000));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // The growth rate, not a wall-clock budget, as in the test below: four
+        // times the input must take about four times as long (a quadratic
+        // parse takes sixteen). Best of three runs.
+        let time = |html: &str| {
+            (0..3)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    let _ = md(html);
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        for unit in ["<a b", "<a b=\""] {
+            let small = time(&unit.repeat(50_000));
+            let large = time(&unit.repeat(200_000));
+            assert!(large < small * 10, "{unit:?}: {small:?} -> {large:?}");
+        }
     }
 
     #[test]

@@ -96,6 +96,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod background;
 pub mod backoff;
 // The build-time agent authority envelope (issue #1691): what an MCP-exposed,
 // agent-operable handler is allowed to do -- which models it writes, whether it
@@ -165,6 +166,7 @@ mod media_type;
 pub mod classify;
 // A plain comment, not a doc comment: the module carries its own `//!` docs
 // and an outer `///` here would be merged with them.
+#[cfg(feature = "cluster")]
 pub mod cluster;
 #[cfg(feature = "collab")]
 pub mod collab;
@@ -190,7 +192,12 @@ pub mod custom_domain;
 pub mod db;
 #[cfg(feature = "db")]
 pub(crate) mod db_ping;
+pub mod db_roles;
 pub(crate) mod db_url;
+// `fleet` has its own `//!` docs. An outer doc here would make rustdoc
+// resolve its links in this module.
+#[cfg(feature = "db")]
+pub mod fleet;
 pub mod fleet_layout;
 // Request deadlines (issue #3058). The module carries its own `//!` docs.
 pub mod deadline;
@@ -1737,6 +1744,9 @@ pub use autumn_macros::ws;
 
 /// Declare a typed domain event. See [`mod@events`] module.
 pub use autumn_macros::event;
+/// Check a function that reads an `#[event]` payload, such as an outbox
+/// topic handler. See [`mod@events`] module.
+pub use autumn_macros::event_consumer;
 /// Declare an on-demand background job. See [`mod@job`] module.
 pub use autumn_macros::job;
 /// Declare an event listener. See [`mod@events`] module.

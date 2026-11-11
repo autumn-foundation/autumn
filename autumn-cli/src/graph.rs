@@ -136,6 +136,11 @@ fn completeness_changes(committed: &Completeness, current: &Completeness) -> Vec
     count("repositories", committed.repositories, current.repositories);
     count("jobs", committed.jobs, current.jobs);
     count(
+        "background tasks",
+        committed.background_tasks,
+        current.background_tasks,
+    );
+    count(
         "repository auto-API routes",
         committed.generated_routes,
         current.generated_routes,
@@ -588,6 +593,23 @@ mod tests {
     };
 
     use super::*;
+
+    /// A new background task shows in the `--check` drift report (#3545).
+    #[test]
+    fn completeness_changes_reports_background_tasks() {
+        let committed = Completeness::default();
+        let current = Completeness {
+            background_tasks: 2,
+            ..Completeness::default()
+        };
+        let lines = completeness_changes(&committed, &current);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "  completeness background tasks 0 -> 2"),
+            "{lines:?}"
+        );
+    }
 
     /// A route that moves to another role shows in the `--check` drift
     /// report (#3544).

@@ -1084,7 +1084,7 @@ fn test_shards_partition_the_workspace_nextest_archive() {
     let shards = test_matrix_shards(job);
     assert_eq!(
         shards.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["macos-latest", "ubuntu-latest", "windows-latest"],
+        ["macos-15-intel", "ubuntu-latest", "windows-latest"],
         "`test` must shard every OS; got {shards:?}"
     );
     for (os, list) in &shards {
@@ -1124,8 +1124,21 @@ fn test_shards_partition_the_workspace_nextest_archive() {
         );
     }
     assert!(
-        ci_job(&ci, "test-archive").contains("os: [macos-latest, windows-latest]"),
-        "`test-archive` must build macOS and Windows"
+        ci_job(&ci, "test-archive").contains("os: [macos-15-intel, windows-latest]"),
+        "`test-archive` must build macOS (on the 14 GB Intel image) and Windows"
+    );
+    // The `integration_tests` rustc needs about 13.5 GB: it must compile alone.
+    assert!(
+        ci_job(&ci, "test-archive").contains(
+            "if [ \"${RUNNER_OS}\" = \"macOS\" ]; then\n            cargo test --workspace --no-run --test integration_tests\n"
+        ),
+        "`test-archive` must build `integration_tests` alone on macOS"
+    );
+    // A cold macOS build fills the disk, and the runner is lost with no log.
+    assert!(
+        ci_job(&ci, "test-archive")
+            .contains("- name: Free disk space (macOS)\n        if: runner.os == 'macOS'\n"),
+        "`test-archive` must free disk space on macOS before the build"
     );
 
     let doctest = ci_job(&ci, "doctest");
@@ -1545,6 +1558,7 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
         "integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks",
         "integration::scaffold_rich_text::richtext_scaffold_cargo_checks",
         "integration::scaffold_search::searchable_scaffold_cargo_checks",
+        "integration::scaffold_teams::teams_scaffold_cargo_tests",
         "integration::scaffold_trash::trash_generated_project_cargo_checks",
         "integration::seed_model_linking::linked_seed_binary_cargo_checks",
         "integration::serve::serve_daemon_start_status_stop_over_unix_socket",
@@ -1979,8 +1993,8 @@ fn benchmark_runtime_startup_applies_packaged_migrations() {
     let rails_dockerfile = std::fs::read_to_string(&rails_dockerfile_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", rails_dockerfile_path.display()));
     assert!(
-        rails_dockerfile.contains("bundle exec rails db:migrate && bundle exec puma"),
-        "{} must run Rails migrations before starting Puma",
+        rails_dockerfile.contains("bundle exec rails db:migrate && exec bundle exec puma"),
+        "{} must run Rails migrations before starting Puma (exec'd so it receives SIGTERM)",
         rails_dockerfile_path.display(),
     );
 
@@ -9878,8 +9892,9 @@ fn capacity_contract_scheduled_probe_uses_declared_defaults() {
     }
 }
 
-/// CI lints the Kubernetes release templates and the golden SLO files with
-/// the real tools (issue #3069): `helm lint`, `kubeconform` and `promtool`.
+/// CI lints the golden Kubernetes release output and the golden SLO files
+/// with the real tools (issue #3069): `helm lint`, `kubeconform`, `kustomize`
+/// and `promtool`. One golden app has the web, worker and a named role.
 #[test]
 fn ci_lints_the_kubernetes_manifests_and_slo_files() {
     let root = workspace_root();
@@ -9902,7 +9917,9 @@ fn ci_lints_the_kubernetes_manifests_and_slo_files() {
     for needle in [
         "lint --strict",
         "kubeconform",
-        "build \"${rendered}/kustomize\"",
+        "build \"${app}/kustomize/base\"",
+        "autumn-cli/tests/golden/release/kubernetes-roles/deploy",
+        "autumn-cli/tests/golden/release/kubernetes-combined/deploy",
         "check rules",
         "test rules",
         "checksum mismatch",

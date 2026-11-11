@@ -15,10 +15,10 @@ autotests = false
 exclude = ["tests/fixtures/axe-core/"]
 
 [features]
-# The last 18 names are the compile gates (#2795, ADR 0027). Default-on; the
+# The last 19 names are the compile gates (#2795, ADR 0027, ADR 0045). Default-on; the
 # no-DB daemon starter drops them. Keep this on one line: the panic gate
 # (scripts/check-panic-gate.sh) reads it with grep.
-default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push"]
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push", "cluster"]
 # Compile gates (#2795, ADR 0027). Each gates one module. See the default list.
 ledger = ["version-history"]
 experiments = ["feature-flags"]
@@ -36,6 +36,9 @@ money = []
 gdpr = []
 slo = []
 graph = ["autumn-macros/graph"]
+# Embedded node clustering (`autumn_web::cluster`, issue #1762). The
+# `[cluster]` section parses without it, but `enabled = true` fails boot.
+cluster = []
 # JWT verification: the `jwt` tenancy source and the OIDC `id_token` check.
 # `jsonwebtoken`'s RustCrypto backend compiles `rsa` 0.9 (RUSTSEC-2023-0071,
 # no fixed release) and the elliptic-curve 0.13 stack, which carries
@@ -124,6 +127,8 @@ db = [
     "dep:diesel_migrations",
     "dep:libsqlite3-sys",
     "dep:scoped-futures",
+    # The fleet core takes OS file locks on its root (path and volume locks).
+    "dep:fd-lock",
     "diesel/chrono",
     "diesel/serde_json",
     # The repository layer records history, money and retention itself.
@@ -689,7 +694,7 @@ features = [
   "ledger", "experiments", "feature-flags", "idempotency", "custom-domains",
   "job-tracking", "upgrade", "nested-form", "alerts", "data-retention",
   "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt",
-  "push",
+  "push", "cluster",
   # The widget families (#3408). Default-on, named for the same reason.
   "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts",
 ]
@@ -726,6 +731,11 @@ harness = false
 # allocation half is pinned by `tests/metrics_alloc_gate.rs`.
 [[bench]]
 name = "metrics_record"
+harness = false
+
+# Fixed-iteration held-handle recording workload (profilers).
+[[bench]]
+name = "metrics_held"
 harness = false
 
 [[bench]]
@@ -813,6 +823,13 @@ harness = false
 # See the file header for the exact commands.
 [[bench]]
 name = "ledger_post"
+harness = false
+required-features = ["sqlite"]
+
+# Criterion benches for SQLite memory-mapped reads: point and range reads on a
+# file database, with `mmap_size` off and on. See the file header.
+[[bench]]
+name = "sqlite_mmap_read"
 harness = false
 required-features = ["sqlite"]
 
@@ -1425,6 +1442,14 @@ path = "tests/sqlite_fleet.rs"
 name = "sqlite_fleet_sweeper"
 path = "tests/sqlite_fleet_sweeper.rs"
 
+# The fleet conformance kit (`plugin_conformance::fleet`) against the
+# `SQLite` engine, with replication and tombstones. The file is
+# `#![cfg(feature = "sqlite")]`. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_conformance`.
+[[test]]
+name = "sqlite_fleet_conformance"
+path = "tests/sqlite_fleet_conformance.rs"
+
 # Sim-testing W4 SQLite DB lane (issue #1797): proves the job/scheduler drain
 # runs end-to-end against a fresh, migrated, in-process in-memory SQLite substrate
 # (`sim::substrate::SqliteSubstrate`) over the representative local scheduler
@@ -1518,6 +1543,10 @@ path = "tests/sim_outbox_mail.rs"
 [[test]]
 name = "sqlite_outbox_writers"
 path = "tests/sqlite_outbox_writers.rs"
+
+[[test]]
+name = "sqlite_outbox_remote"
+path = "tests/sqlite_outbox_remote.rs"
 
 # W5.a (item 5, issue #1797): deterministic per-send SMTP transport fault
 # schedule ("send #7 fails, #8 times out") over the in-memory SQLite sim

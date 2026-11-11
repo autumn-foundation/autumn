@@ -15,7 +15,7 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use axum::Json;
@@ -806,6 +806,8 @@ pub struct TaskStatus {
 #[derive(Clone)]
 pub struct TaskRegistry {
     inner: Arc<RwLock<HashMap<String, TaskStatus>>>,
+    /// Role-aware background tasks (#3545), by name.
+    background: Arc<RwLock<BTreeMap<String, crate::background::BackgroundTaskStatus>>>,
 }
 
 /// On-demand background job status information.
@@ -1894,7 +1896,43 @@ impl TaskRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            background: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    /// Record the status of the background task `name` (#3545).
+    pub(crate) fn register_background(
+        &self,
+        name: &str,
+        status: crate::background::BackgroundTaskStatus,
+    ) {
+        if let Ok(mut guard) = self.background.write() {
+            guard.insert(name.to_owned(), status);
+        }
+    }
+
+    /// Record that the background task `name` ended with `state`.
+    pub(crate) fn record_background_end(
+        &self,
+        name: &str,
+        state: crate::background::BackgroundTaskState,
+        error: Option<String>,
+    ) {
+        if let Ok(mut guard) = self.background.write()
+            && let Some(task) = guard.get_mut(name)
+        {
+            task.status = state;
+            task.last_error = error;
+        }
+    }
+
+    /// A snapshot of every background task status, by name.
+    #[must_use]
+    pub fn background_snapshot(&self) -> BTreeMap<String, crate::background::BackgroundTaskStatus> {
+        self.background
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     /// Register a task with its schedule description.
@@ -2034,6 +2072,7 @@ impl std::fmt::Debug for TaskRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TaskRegistry")
             .field("count", &self.snapshot().len())
+            .field("background", &self.background_snapshot().len())
             .finish()
     }
 }
@@ -4708,10 +4747,11 @@ pub(crate) async fn logfile_endpoint<S: ProvideActuatorState + Send + Sync + 'st
 pub(crate) async fn tasks_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
-    let tasks = state.task_registry().snapshot();
+    let registry = state.task_registry();
 
     Json(serde_json::json!({
-        "scheduled_tasks": tasks,
+        "scheduled_tasks": registry.snapshot(),
+        "background_tasks": registry.background_snapshot(),
     }))
 }
 
@@ -7684,7 +7724,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         use crate::config::{Capability, ProcessRole};
         for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
             let mut state = crate::AppState::for_test();
-            state.role = role.into();
+            state.fields_mut().role = role.into();
             let json = info_json_for(state).await;
             assert_eq!(json["role"]["name"], role.as_str(), "{json}");
             assert_eq!(json["role"]["base"], role.as_str(), "{json}");
@@ -7735,7 +7775,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
     #[tokio::test]
     async fn actuator_info_reports_a_named_role() {
         let mut state = crate::AppState::for_test();
-        state.role = critical_role_3543();
+        state.fields_mut().role = critical_role_3543();
         let json = info_json_for(state).await;
         assert_eq!(json["role"]["name"], "critical", "{json}");
         assert_eq!(json["role"]["base"], "worker", "{json}");
@@ -7752,7 +7792,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         )
         .expect("roles config");
         let mut state = crate::AppState::for_test();
-        state.role = config.resolve_role().expect("marketing resolves");
+        state.fields_mut().role = config.resolve_role().expect("marketing resolves");
         let json = info_json_for(state).await;
         assert_eq!(
             json["role"]["mount"],
@@ -7768,7 +7808,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
     #[tokio::test]
     async fn actuator_jobs_reports_the_role() {
         let mut state = crate::AppState::for_test();
-        state.role = critical_role_3543();
+        state.fields_mut().role = critical_role_3543();
         let body = get_body(state, "/actuator/jobs").await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["role"]["name"], "critical", "{json}");
@@ -7794,7 +7834,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
     #[tokio::test]
     async fn actuator_prometheus_labels_framework_metrics_with_a_named_role() {
         let mut state = crate::AppState::for_test();
-        state.role = critical_role_3543();
+        state.fields_mut().role = critical_role_3543();
         state.metrics().record("GET", "/x", 200, 10);
         let text = get_body(state, "/actuator/prometheus").await;
         assert!(

@@ -171,6 +171,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/replication/sqlite.rs:db
   autumn/src/replication/restore.rs:db
   autumn/src/replication/engine.rs:db
+  autumn/src/replication/fence.rs:db
   autumn/src/replication/status.rs:db
   autumn/src/replication/s3.rs:http-client
   autumn/src/sigv4.rs:default
