@@ -118,6 +118,19 @@ autumn dev-loop-bench --cold-start \
 autumn dev-loop-bench --cold-start --include-db
 ```
 
+Before the samples, the driver does one preparation step for each shape. It
+runs `cargo fetch` in a throwaway scaffold. That installs the toolchain that
+the scaffold pins, updates the index and downloads the crates. It compiles
+nothing, so each sample still builds from cold. The report shows the time as
+`prepare_ms`. It is not in the samples: it is network time, and it made the
+first sample the slowest one. A new user who does not have the pinned
+toolchain pays it once.
+
+`rust_version` in a cold-start report is the compiler that the scaffold
+selects. `AUTUMN_BENCH_RUST_VERSION` is the fallback when that probe fails.
+The driver sets `CARGO_INCREMENTAL=0` for the timed build, as Cargo builds a
+dependency from the registry.
+
 ### Cold-start budget history
 
 The `Cold-Start Onboarding Gate` began at p95 60s / max 90s. It
@@ -161,10 +174,31 @@ cold `hello` build fell by about 2% (median of 5). That is less than the
 run-to-run noise there. Backend work (LLVM) runs on all cores, and
 the front end does not, so fewer IR lines give a smaller time gain.
 
-The original 60 s / 90 s target is still open. `autumn-web` is still about
-half of the compile time, and it cannot start until `autumn-macros` is
-built. A larger gain needs a smaller front end, for example a split of
-`autumn-web` into crates that compile in parallel (issue #2795).
+ADR 0046 cut the cold `hello` build on one 4 vCPU box from 81.5 s to 71.4 s
+(medians of 5 interleaved samples):
+
+1. The panic-catch layer has its own feature, `error-reporting`. The daemon
+   starter names it, and does not compile failure capture (the `capsule`
+   module, 6.5% of `autumn-web`).
+2. The two largest macro analysers moved from `autumn-macros` to the
+   `autumn-macros-support` library. `autumn-web` waits for the proc-macro
+   crate, and Cargo starts that crate late.
+3. The unused `tokio-cron-scheduler` dependency is gone.
+4. A new app builds its dependencies with no debug info.
+
+The same ADR changed the gate. The first sample was always the slowest, by
+6-12 s, because the first `cargo` call in a scaffold installs a toolchain and
+downloads crates. That work is now a preparation step before the samples.
+
+The build has three phases on four cores. Dependencies take about 36 s and
+use all cores. `autumn-web` then takes about 32 s, mostly on one core. The
+app takes 2.5 s. One second less in `autumn-web` saves one second. One
+unit-second less in a dependency saves a quarter of a second.
+
+The original 60 s / 90 s target is still open. The work of today's build
+packs into about 48 s on four cores at best. A larger gain needs less code
+in `autumn-web` and a shorter single-core phase: a split of `autumn-web`
+into crates that compile in parallel (issue #2795, ADR 0046 "Roadmap").
 
 ---
 

@@ -29,8 +29,8 @@
 
 ### Performance
 
-- **build:** the no-DB daemon starter builds faster from cold (issue #2795,
-  ADR 0046). The two largest macro analysers moved from `autumn-macros` to
+- **build:** the no-DB daemon starter builds 12% faster from cold: 81.5 s
+  to 71.4 s on one 4 vCPU box (issue #2795, ADR 0046). The two largest macro analysers moved from `autumn-macros` to
   the `autumn-macros-support` library, which Cargo builds in parallel with
   other crates. The unused `tokio-cron-scheduler` dependency is gone. The
   daemon starter does not compile the `capsule` module.
