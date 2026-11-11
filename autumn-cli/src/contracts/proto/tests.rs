@@ -864,3 +864,22 @@ fn a_synthetic_body_field_never_takes_a_path_parameter_name() {
     assert!(text.contains("Patch body_body = 2"), "{text}");
     assert!(text.contains("body: \"body_body\""), "{text}");
 }
+
+#[test]
+fn a_list_of_unit_structs_stays_a_list() {
+    let ping = WireTypeDescriptor {
+        name: "Ping".to_owned(),
+        unit: true,
+        ..WireTypeDescriptor::default()
+    };
+    let list = BundleEndpoint {
+        response_list: true,
+        ..get("pings", "/pings", ping)
+    };
+    let (files, _) = run(&bundle(vec![list], vec![]), annotated());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(text.contains("returns (PingListWrapper)"), "{text}");
+    assert!(text.contains("repeated Ping values = 1"), "{text}");
+    assert!(text.contains("message Ping {}"), "{text}");
+    assert!(!text.contains("google.protobuf.Empty"), "{text}");
+}

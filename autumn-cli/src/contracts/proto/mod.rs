@@ -241,7 +241,7 @@ impl<'b> File<'b> {
             } else if endpoint.has_body {
                 seeds.push(&endpoint.request);
             }
-            if !endpoint.response.unit {
+            if !endpoint.response.unit || endpoint.response_list {
                 roots.push(self.body_origin(endpoint, true));
             }
         }
@@ -272,7 +272,7 @@ impl<'b> File<'b> {
             let mut notes = Vec::new();
             if endpoint.response.name == NO_BODY {
                 notes.push("Autumn sends no body.".to_owned());
-            } else if endpoint.response.unit {
+            } else if endpoint.response.unit && !endpoint.response_list {
                 notes.push("Autumn sends JSON null, not an empty object.".to_owned());
             }
             rpcs.push(Rpc {
@@ -575,7 +575,7 @@ impl<'b> File<'b> {
 
     /// The response message name.
     fn response(&mut self, endpoint: &BundleEndpoint, lock: &mut Lock) -> Result<String, String> {
-        if endpoint.response.unit {
+        if endpoint.response.unit && !endpoint.response_list {
             self.imports.insert(EMPTY_PROTO);
             return Ok(EMPTY.to_owned());
         }
