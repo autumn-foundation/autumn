@@ -40,7 +40,7 @@ pub mod format {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireType {
-    /// A JSON string. `format` names its text form. See [`format`].
+    /// A JSON string. `format` names its text form. See [`mod@format`].
     String {
         /// The text form, such as `date-time` or `uuid`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
