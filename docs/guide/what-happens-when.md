@@ -123,6 +123,15 @@ Startup fails immediately with a clear parse error:
 Failed to load configuration: TOML parse error at line 3, column 5
 ```
 
+### A value of the wrong type
+
+Startup fails immediately. The error names the full key:
+
+```
+invalid autumn.toml: invalid type: string "eighty", expected u16
+in `server.port`
+```
+
 ### Unknown or misspelled profile
 
 Autumn logs a warning with a "did you mean?" suggestion (Levenshtein distance
