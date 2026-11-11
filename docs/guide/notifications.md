@@ -112,10 +112,10 @@ The first page reads about 20 rows. Page `n` reads about `20 × n` rows. The
 length of the history has no effect. On SQLite, `id` is the rowid, so
 `(tenant_id, recipient_id)` already reads in `id` order.
 
-An app with an older generated migration can have
-`idx_notifications_tenant_recipient` on `(tenant_id, recipient_id)`, and no
-`idx_notifications_unread`. To change to the new indexes, add one migration
-for each statement below. A `CONCURRENTLY` statement cannot run in a
+An app with an older generated migration has
+`idx_notifications_tenant_recipient` on `(tenant_id, recipient_id)`. It can
+also have no `idx_notifications_unread`. To change to the new indexes, add one
+migration for each statement below that your schema needs. A `CONCURRENTLY` statement cannot run in a
 transaction, and Postgres runs all statements of one `up.sql` in one
 transaction. So give each migration a `metadata.toml` with this line:
 
@@ -123,7 +123,8 @@ transaction. So give each migration a `metadata.toml` with this line:
 run_in_transaction = false
 ```
 
-Then put one statement in each `up.sql`, in this order:
+Then put one statement in each `up.sql`, in this order. If your schema
+already has `idx_notifications_unread`, do not add the second migration.
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_notifications_feed
