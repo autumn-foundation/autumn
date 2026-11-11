@@ -157,8 +157,7 @@ fn search_reset_page() -> Markup {
         .multiple()
         .free_text()
         .selected(&[("rust", "rust")]);
-    let pick = AutocompleteConfig::new("/_stories/demo/tags/suggest", "pick")
-        .initial_value("7");
+    let pick = AutocompleteConfig::new("/_stories/demo/tags/suggest", "pick").initial_value("7");
     busy_page(&html! {
         form id="reset-form" {
             (autocomplete_input("rs-tags", "Tags", &tags))
@@ -902,11 +901,7 @@ async fn search_widgets_restore_the_server_state_on_form_reset() {
     assert_eq!(edited, r#"[["tags","zig"],["tags","axum"]]"#, "edited");
 
     page.click("#reset-go").await.expect("reset");
-    wait_for(
-        &page,
-        &format!("{FORM_VALUES} === '{start}'"),
-    )
-    .await;
+    wait_for(&page, &format!("{FORM_VALUES} === '{start}'")).await;
     assert_eq!(
         eval_string(&page, "document.getElementById('rs-tags-query').value").await,
         "",
