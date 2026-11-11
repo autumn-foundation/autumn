@@ -1096,13 +1096,15 @@ fn spec<'a>(
     accepted: Option<&'a WireFieldDescriptor>,
     field: &'a WireFieldDescriptor,
 ) -> Spec<'a> {
-    let known = |f: Option<&WireFieldDescriptor>| {
-        f.and_then(|f| f.wire_type.clone())
-            .filter(|t| *t != WireType::Any)
+    // A side with no wire type, or `any`, can write any JSON. Then the
+    // field is `any`, so the schema does not claim a form that one side may
+    // not use.
+    let side =
+        |f: Option<&WireFieldDescriptor>| f.map(|f| f.wire_type.clone().unwrap_or(WireType::Any));
+    let wire_type = match (side(produced), side(accepted)) {
+        (Some(WireType::Any), _) | (_, Some(WireType::Any)) | (None, None) => WireType::Any,
+        (Some(t), _) | (None, Some(t)) => t,
     };
-    let wire_type = known(produced)
-        .or_else(|| known(accepted))
-        .unwrap_or(WireType::Any);
     let mut notes = Vec::new();
     if accepted.is_some_and(|f| f.required) {
         notes.push("required".to_owned());

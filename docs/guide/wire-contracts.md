@@ -644,7 +644,9 @@ service CatalogService {
 | `nullable` | `optional T`. A message field and `google.protobuf.Value` hold null already, so they stay plain fields |
 | `any` | `google.protobuf.Value` |
 
-A format, such as `uuid`, goes in the field comment.
+A format, such as `uuid`, goes in the field comment. When one side of a
+field is `any`, for example with a custom serde function on that side only,
+the field is `google.protobuf.Value`.
 
 Protobuf cannot write some shapes in place. The export writes a wrapper
 message for each. Its name ends in `Wrapper`, so it is easy to find:

@@ -904,3 +904,15 @@ fn the_http_body_names_the_final_proto_field() {
     assert!(text.contains(&format!("body: \"{field}\"")), "{text}");
     assert!(text.contains("put: \"/lists/{items}\""), "{text}");
 }
+
+#[test]
+fn a_field_with_one_custom_side_is_a_value() {
+    let mut item = shape("Item", vec![field("code", WireType::string(), true)]);
+    item.serialized[0].wire_type = Some(WireType::Any);
+    let (files, _) = run(&bundle(vec![get("get_item", "/i", item)], vec![]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(
+        text.contains("google.protobuf.Value code = 1 [json_name = \"code\"]"),
+        "{text}"
+    );
+}
