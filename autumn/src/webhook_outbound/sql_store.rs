@@ -114,10 +114,13 @@ const FAILURE_SQL: &str = "UPDATE autumn_webhook_subscriptions \
          status = CASE WHEN consecutive_failures + 1 >= $1 THEN 'failed' ELSE status END \
      WHERE id = $2 AND status = 'active'";
 
+/// Every successful delivery runs this. The last condition skips a row it
+/// would leave unchanged, so a healthy subscription is not rewritten and
+/// its row is not locked until the delivery's transaction commits.
 const REACTIVATE_SQL: &str = "UPDATE autumn_webhook_subscriptions \
      SET consecutive_failures = 0, \
          status = CASE WHEN status = 'failed' THEN 'active' ELSE status END \
-     WHERE id = $1";
+     WHERE id = $1 AND (consecutive_failures <> 0 OR status = 'failed')";
 
 fn sql(pg: &str) -> String {
     crate::backend_select! {
