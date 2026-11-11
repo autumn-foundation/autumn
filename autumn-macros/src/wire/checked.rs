@@ -1178,7 +1178,7 @@ fn with_parents(call: &mut Call) {
 /// next `,` at the same level, or the end of the group. A `for item in … { }`
 /// binding covers its `{ }` block. An `if let` or `while let` covers its
 /// `{ }` block, and a plain `let … ;` covers the tokens after the `;`. The
-/// names a `match` arm binds cover the `{ }` block of the `match`. Outside
+/// names a `match` arm binds cover that arm's guard and body. Outside
 /// that range the name keeps its outer meaning, so a read of the payload
 /// there is still a read.
 struct MacroBinding {
@@ -1273,44 +1273,51 @@ fn let_binding(tts: &[proc_macro2::TokenTree], i: usize) -> Option<MacroBinding>
     })
 }
 
-/// The names the arms of a `match` body bind: each arm's pattern, up to its
-/// `if` guard or its `=>`.
-fn match_arm_names(body: &[proc_macro2::TokenTree]) -> Vec<String> {
-    let mut names = Vec::new();
+/// The bindings of the arms of a `match` body. Each arm's pattern names,
+/// up to its `if` guard, cover that arm only: its guard and its body.
+fn match_arms(body: &[proc_macro2::TokenTree]) -> Vec<MacroBinding> {
+    let mut out = Vec::new();
     let mut start = 0;
     let mut k = 0;
     while k < body.len() {
-        let arrow = is_punct(body.get(k), '=') && is_punct(body.get(k + 1), '>');
-        if arrow {
-            let pat_end = (start..k)
-                .find(|&j| matches!(&body[j], proc_macro2::TokenTree::Ident(id) if id == "if"))
-                .unwrap_or(k);
-            idents_in(&body[start..pat_end], &mut names);
-            k += 2;
-            // The arm body: one `{ }` group, or the tokens up to a `,`.
-            if body.get(k).is_some_and(is_brace) {
-                k += 1;
-                if is_punct(body.get(k), ',') {
-                    k += 1;
-                }
-            } else {
-                while k < body.len() && !is_punct(body.get(k), ',') {
-                    k += 1;
-                }
-                k += 1;
-            }
-            start = k;
+        if !(is_punct(body.get(k), '=') && is_punct(body.get(k + 1), '>')) {
+            k += 1;
             continue;
         }
-        k += 1;
+        let pat_end = (start..k)
+            .find(|&j| matches!(&body[j], proc_macro2::TokenTree::Ident(id) if id == "if"))
+            .unwrap_or(k);
+        let mut names = Vec::new();
+        idents_in(&body[start..pat_end], &mut names);
+        k += 2;
+        // The arm body: one `{ }` group, or the tokens up to a `,`.
+        if body.get(k).is_some_and(is_brace) {
+            k += 1;
+        } else {
+            while k < body.len() && !is_punct(body.get(k), ',') {
+                k += 1;
+            }
+        }
+        out.push(MacroBinding {
+            names,
+            from: start,
+            to: k,
+            value: None,
+        });
+        if is_punct(body.get(k), ',') {
+            k += 1;
+        }
+        start = k;
     }
-    names
+    out
 }
 
-/// The bindings one level of a macro body makes. Nested groups are scanned
-/// on their own.
-fn macro_bindings(tts: &[proc_macro2::TokenTree]) -> Vec<MacroBinding> {
-    let mut out = Vec::new();
+/// The bindings one level of a macro body makes, and the index of each
+/// `match` body at this level. Nested groups are scanned on their own. `arms`
+/// says that this level is a `match` body.
+fn macro_bindings(tts: &[proc_macro2::TokenTree], arms: bool) -> (Vec<MacroBinding>, Vec<usize>) {
+    let mut out = if arms { match_arms(tts) } else { Vec::new() };
+    let mut match_bodies = Vec::new();
     let mut i = 0;
     while i < tts.len() {
         match &tts[i] {
@@ -1352,23 +1359,13 @@ fn macro_bindings(tts: &[proc_macro2::TokenTree]) -> Vec<MacroBinding> {
                 i += 1;
             }
             proc_macro2::TokenTree::Ident(id) if id == "match" => {
-                if let Some(body) = (i + 1..tts.len()).find(|&k| is_brace(&tts[k]))
-                    && let proc_macro2::TokenTree::Group(g) = &tts[body]
-                {
-                    let inner: Vec<_> = g.stream().into_iter().collect();
-                    out.push(MacroBinding {
-                        names: match_arm_names(&inner),
-                        from: body,
-                        to: body + 1,
-                        value: None,
-                    });
-                }
+                match_bodies.extend((i + 1..tts.len()).find(|&k| is_brace(&tts[k])));
                 i += 1;
             }
             _ => i += 1,
         }
     }
-    out
+    (out, match_bodies)
 }
 
 /// Whether the `|` at `i` opens a closure's parameters.
@@ -1424,8 +1421,20 @@ fn scan_tokens<T: Copy>(
     outer: &MacroNames<T>,
     reads: &mut Vec<(T, String, Span)>,
 ) {
+    scan_level(tokens, scope, outer, false, reads);
+}
+
+/// [`scan_tokens`] for one level. `arms` says that the level is the body of
+/// a `match`.
+fn scan_level<T: Copy>(
+    tokens: &proc_macro2::TokenStream,
+    scope: &MacroScope<'_, T>,
+    outer: &MacroNames<T>,
+    arms: bool,
+    reads: &mut Vec<(T, String, Span)>,
+) {
     let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
-    let bindings = macro_bindings(&tts);
+    let (bindings, match_bodies) = macro_bindings(&tts, arms);
     // The names in force at token `i`: the outer ones, then each binding of
     // this level that covers `i`.
     let names_at = |i: usize, values: &[Option<T>]| {
@@ -1456,7 +1465,8 @@ fn scan_tokens<T: Copy>(
     for (i, tt) in tts.iter().enumerate() {
         let here = names_at(i, &values);
         if let proc_macro2::TokenTree::Group(group) = tt {
-            scan_tokens(&group.stream(), scope, &here, reads);
+            let is_match_body = match_bodies.contains(&i);
+            scan_level(&group.stream(), scope, &here, is_match_body, reads);
             continue;
         }
         let proc_macro2::TokenTree::Ident(base) = tt else {
@@ -2071,6 +2081,25 @@ mod tests {
             nested_reads("html! { @if let Some(item) = item.next { (item.foo) } (item.bar) }"),
             ["bar", "next", "next.foo"],
             "the right side and the code after the body see the outer name"
+        );
+    }
+
+    #[test]
+    fn a_match_arm_binding_covers_only_its_own_arm() {
+        assert_eq!(
+            nested_reads(
+                "html! { @match other { Some(item) => { (item.foo) }, \
+                 None => { (item.details.color) } } }"
+            ),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads(
+                "html! { @match other { Some(item) if item.ok => (item.foo), \
+                 _ => (item.bar), } }"
+            ),
+            ["bar"],
+            "the guard sees the arm's binding; the next arm sees the response"
         );
     }
 
