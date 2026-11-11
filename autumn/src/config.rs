@@ -270,6 +270,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+mod value_de;
+
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
 use std::sync::OnceLock;
 
@@ -593,7 +595,7 @@ pub fn profile_shutdown_defaults(profile: &str) -> (u64, u64) {
 /// their profile TOML file and env overrides.
 fn profile_defaults_as_toml(profile: &str) -> toml::Value {
     match profile {
-        "dev" => toml::from_str(
+        "dev" => toml::from_str::<toml::Value>(
             r#"
 [log]
 level = "debug"
@@ -646,7 +648,7 @@ ranges = ["127.0.0.0/8", "::1/128"]
                 feature = "sqlite",
                 allow(unused_mut, reason = "only the Postgres build adds to it")
             )]
-            let mut prod: toml::Value = toml::from_str(
+            let mut prod = toml::from_str::<toml::Value>(
                 r#"
 [log]
 level = "info"
@@ -698,7 +700,7 @@ secure = true
             #[cfg(not(feature = "sqlite"))]
             deep_merge(
                 &mut prod,
-                toml::from_str(
+                toml::from_str::<toml::Value>(
                     r#"
 [database]
 statement_timeout = "30s"
@@ -3129,9 +3131,11 @@ fn default_channels_redis_prefix() -> String {
 ///
 /// Off by default. When enabled, the node binds a small authenticated gossip
 /// listener, discovers the peers named in `seed_peers`, and exposes a
-/// cluster-wide counter through
-/// [`ClusterHandle`](crate::cluster::ClusterHandle). No external coordination
-/// service is involved — see `docs/guide/clustering.md`.
+/// cluster-wide counter through `autumn_web::cluster::ClusterHandle`. No
+/// external coordination service is involved — see `docs/guide/clustering.md`.
+///
+/// `enabled = true` needs the `cluster` feature. The section parses without
+/// it, and boot fails.
 ///
 /// The transport is **authenticated (HMAC-SHA256), not encrypted**: run it on a
 /// trusted network.
@@ -3309,6 +3313,27 @@ impl Default for ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Refuse `enabled = true` in a build without the `cluster` feature.
+    ///
+    /// That build has no cluster runtime. A node that does not join is a
+    /// fault, so boot fails and does not continue alone. Only boot calls
+    /// this. `validate` does not, because the CLI reads the config of an
+    /// app that it does not run.
+    #[cfg_attr(
+        all(feature = "cluster", not(test)),
+        allow(dead_code, reason = "boot calls it only without the `cluster` feature")
+    )]
+    pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        if enabled && !built {
+            return Err(ConfigError::Validation(
+                "cluster.enabled is true, but this build does not have the `cluster` \
+                 feature. Turn on the feature, or set cluster.enabled = false"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Fail fast on a `[cluster]` section that would boot an insecure or
     /// flapping cluster.
     ///
@@ -6572,7 +6597,7 @@ impl AutumnConfig {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
-            let _ = Self::deserialize(de.clone());
+            let _ = Self::deserialize(value_de::ConfigDe::Schema(de.clone()));
             let mut rejected: Vec<String> = std::mem::take(
                 &mut de
                     .rejected
@@ -7122,10 +7147,8 @@ impl AutumnConfig {
             warn_profile_typo(&profile);
         }
 
-        // Deserialize the merged TOML table into AutumnConfig
-        let toml_str =
-            toml::to_string(&merged).expect("internal error: failed to serialize merged config");
-        let mut config: Self = toml::from_str(&toml_str)?;
+        // Read the merged table into AutumnConfig. An error names its key.
+        let mut config: Self = value_de::from_value(merged.clone())?;
         config.profile = Some(profile);
 
         // An `AUTUMN_ROLE` that is not a role name fails the load, as a bad
@@ -7149,6 +7172,8 @@ impl AutumnConfig {
                 || env
                     .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
                     .is_ok_and(|v| v == "true" || v == "1");
+            let toml_str = toml::to_string(&merged)
+                .expect("internal error: failed to serialize merged config");
             Self::run_strict_unknown_key_check(
                 &toml_str,
                 enforce_all,
@@ -7437,7 +7462,8 @@ impl AutumnConfig {
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let config: Self = toml::from_str(&contents)?;
+                let table = toml::from_str::<toml::Table>(&contents)?;
+                let config: Self = value_de::from_value(toml::Value::Table(table))?;
                 config.validate()?;
                 Ok(config)
             }
@@ -15309,7 +15335,7 @@ impl AutumnConfig {
     }
 }
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Visitor};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -15360,413 +15386,56 @@ impl SchemaDeserializer {
     }
 }
 
+/// Each method runs the schema walk of [`value_de::ConfigDe`]. The walk
+/// lives there, so the config types compile one walk, not two.
+macro_rules! schema_walk {
+    ($($method:ident($($arg:ident: $ty:ty),*);)*) => {$(
+        fn $method<V: Visitor<'de>>(
+            self,
+            $($arg: $ty,)*
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            de::Deserializer::$method(value_de::ConfigDe::Schema(self), $($arg,)* visitor)
+                .map_err(value_de::Error::into_value_error)
+        }
+    )*};
+}
+
 impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     type Error = serde::de::value::Error;
 
-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        // `deserialize_any` is inherently ambiguous for a placeholder walker:
-        // untagged SCALAR parsers (e.g. `deserialize_duration`) need a string,
-        // while a visitor that accepts only seq/map (e.g. `JobQueuesConfig` at
-        // `jobs.queues`) rejects a string and aborts the whole remaining walk
-        // (#1890). We can't know which shape a given visitor wants, and serde
-        // seeds can't be retried mid-walk, so we probe with a scalar by default
-        // and let `get_schema_keys` re-run the walk, escalating any REJECTED
-        // path to a map/seq probe on the next pass until none reject.
-        let path = self.path.join(".");
-        let probe = self
-            .any_probe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&path)
-            .copied()
-            .unwrap_or(AnyProbe::Str);
-        let result = match probe {
-            // "0" is a valid non-empty string that also parses as an int/duration,
-            // so untagged string- and number-shaped scalar parsers both accept it.
-            AnyProbe::Str => visitor.visit_str("0"),
-            // Empty map/seq: a seq/map-only visitor accepts it and yields an empty
-            // value, so the walk records the field as a leaf and CONTINUES past it
-            // (we intentionally do NOT descend — e.g. jobs.queues has dynamic keys).
-            AnyProbe::Map => visitor.visit_map(SchemaMapAccess {
-                fields: [].iter(),
-                current_field: None,
-                deserializer: self.clone(),
-            }),
-            AnyProbe::Seq => visitor.visit_seq(SchemaSeqAccess {
-                done: true,
-                deserializer: self.clone(),
-            }),
-        };
-        if result.is_err() {
-            self.rejected
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(path);
-        }
-        result
-    }
-
-    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_bool(false)
-    }
-
-    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i8(0)
-    }
-
-    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i16(0)
-    }
-
-    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i32(0)
-    }
-
-    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i64(0)
-    }
-
-    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u8(0)
-    }
-
-    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u16(0)
-    }
-
-    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u32(0)
-    }
-
-    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u64(0)
-    }
-
-    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_f32(0.0)
-    }
-
-    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_f64(0.0)
-    }
-
-    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_char('\0')
-    }
-
-    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_str("")
-    }
-
-    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_string(String::new())
-    }
-
-    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_bytes(&[])
-    }
-
-    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_byte_buf(Vec::new())
-    }
-
-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_some(self)
-    }
-
-    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn deserialize_unit_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn deserialize_newtype_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_newtype_struct(self)
-    }
-
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_seq(SchemaSeqAccess {
-            done: false,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_tuple_struct<V>(
-        self,
-        _name: &'static str,
-        _len: usize,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_map(SchemaMapAccess {
-            fields: [].iter(),
-            current_field: None,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_struct<V>(
-        self,
-        _name: &'static str,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let path_str = self.path.join(".");
-        {
-            let mut schema = self.schema.lock().unwrap();
-            schema.insert(path_str, fields.iter().map(|&s| s.to_string()).collect());
-        }
-
-        visitor.visit_map(SchemaMapAccess {
-            fields: fields.iter(),
-            current_field: None,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_enum<V>(
-        self,
-        _name: &'static str,
-        variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        // Feed the FIRST declared variant name (not `""`) so serde's derived
-        // variant-identifier visitor accepts it. An empty tag is an "unknown
-        // variant" error that aborts the ENTIRE remaining schema traversal, so a
-        // single enum field (e.g. `server.tls.acme.directory`) would drop every
-        // sibling/subsequent section (`database`, …) from the derived schema —
-        // silently disabling the strict unknown-key validator for them. The enum
-        // is still treated as an opaque leaf: every `SchemaEnumAccess` variant
-        // arm resolves to `visit_unit` without recursing.
-        visitor.visit_enum(SchemaEnumAccess {
-            variant: variants.first().copied().unwrap_or_default(),
-        })
-    }
-
-    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_str("")
-    }
-
-    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-}
-
-struct SchemaSeqAccess {
-    done: bool,
-    deserializer: SchemaDeserializer,
-}
-
-impl<'de> SeqAccess<'de> for SchemaSeqAccess {
-    type Error = serde::de::value::Error;
-
-    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
-    where
-        T: DeserializeSeed<'de>,
-    {
-        if self.done {
-            Ok(None)
-        } else {
-            self.done = true;
-            seed.deserialize(self.deserializer.clone()).map(Some)
-        }
-    }
-}
-
-struct SchemaMapAccess {
-    fields: std::slice::Iter<'static, &'static str>,
-    current_field: Option<&'static str>,
-    deserializer: SchemaDeserializer,
-}
-
-impl<'de> MapAccess<'de> for SchemaMapAccess {
-    type Error = serde::de::value::Error;
-
-    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
-    where
-        K: DeserializeSeed<'de>,
-    {
-        if let Some(&field) = self.fields.next() {
-            self.current_field = Some(field);
-            seed.deserialize(de::value::StrDeserializer::new(field))
-                .map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
-    where
-        V: DeserializeSeed<'de>,
-    {
-        let field = self.current_field.take().unwrap();
-        let mut new_path = self.deserializer.path.clone();
-        new_path.push(field.to_string());
-
-        let nested = SchemaDeserializer {
-            path: new_path,
-            schema: self.deserializer.schema.clone(),
-            any_probe: self.deserializer.any_probe.clone(),
-            rejected: self.deserializer.rejected.clone(),
-        };
-        seed.deserialize(nested)
-    }
-}
-
-struct SchemaEnumAccess {
-    /// The variant name to report to serde's derived variant-identifier visitor.
-    /// Must be a REAL variant name (the first declared one), never `""`, or
-    /// serde returns an "unknown variant" error that aborts schema traversal.
-    variant: &'static str,
-}
-
-impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
-    type Error = serde::de::value::Error;
-    type Variant = Self;
-
-    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
-    where
-        V: de::DeserializeSeed<'de>,
-    {
-        let val = seed.deserialize(de::value::StrDeserializer::new(self.variant))?;
-        Ok((val, self))
-    }
-}
-
-impl<'de> de::VariantAccess<'de> for SchemaEnumAccess {
-    type Error = serde::de::value::Error;
-
-    fn unit_variant(self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
-    where
-        T: de::DeserializeSeed<'de>,
-    {
-        seed.deserialize(SchemaDeserializer::new())
-    }
-
-    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn struct_variant<V>(
-        self,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
+    schema_walk! {
+        deserialize_any();
+        deserialize_bool();
+        deserialize_i8();
+        deserialize_i16();
+        deserialize_i32();
+        deserialize_i64();
+        deserialize_i128();
+        deserialize_u8();
+        deserialize_u16();
+        deserialize_u32();
+        deserialize_u64();
+        deserialize_u128();
+        deserialize_f32();
+        deserialize_f64();
+        deserialize_char();
+        deserialize_str();
+        deserialize_string();
+        deserialize_bytes();
+        deserialize_byte_buf();
+        deserialize_option();
+        deserialize_unit();
+        deserialize_unit_struct(name: &'static str);
+        deserialize_newtype_struct(name: &'static str);
+        deserialize_seq();
+        deserialize_tuple(len: usize);
+        deserialize_tuple_struct(name: &'static str, len: usize);
+        deserialize_map();
+        deserialize_struct(name: &'static str, fields: &'static [&'static str]);
+        deserialize_enum(name: &'static str, variants: &'static [&'static str]);
+        deserialize_identifier();
+        deserialize_ignored_any();
     }
 }
 
@@ -18134,6 +17803,15 @@ path = "/healthz"
     }
 
     // ── [cluster] (issue #1762) ──────────────────────────────────────────
+
+    #[test]
+    fn cluster_enabled_without_the_feature_fails() {
+        let err = ClusterConfig::check_feature(true, false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`cluster` feature"), "{text}");
+        assert!(ClusterConfig::check_feature(true, true).is_ok());
+        assert!(ClusterConfig::check_feature(false, false).is_ok());
+    }
 
     /// A cluster with no shared secret is an unauthenticated cluster: anyone
     /// who can reach the port can inject state. Boot must fail, not warn.

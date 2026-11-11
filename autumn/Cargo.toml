@@ -15,10 +15,10 @@ autotests = false
 exclude = ["tests/fixtures/axe-core/"]
 
 [features]
-# The last 18 names are the compile gates (#2795, ADR 0027). Default-on; the
+# The last 19 names are the compile gates (#2795, ADR 0027, ADR 0045). Default-on; the
 # no-DB daemon starter drops them. Keep this on one line: the panic gate
 # (scripts/check-panic-gate.sh) reads it with grep.
-default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push"]
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push", "cluster"]
 # Compile gates (#2795, ADR 0027). Each gates one module. See the default list.
 ledger = ["version-history"]
 experiments = ["feature-flags"]
@@ -36,6 +36,9 @@ money = []
 gdpr = []
 slo = []
 graph = ["autumn-macros/graph"]
+# Embedded node clustering (`autumn_web::cluster`, issue #1762). The
+# `[cluster]` section parses without it, but `enabled = true` fails boot.
+cluster = []
 # JWT verification: the `jwt` tenancy source and the OIDC `id_token` check.
 # `jsonwebtoken`'s RustCrypto backend compiles `rsa` 0.9 (RUSTSEC-2023-0071,
 # no fixed release) and the elliptic-curve 0.13 stack, which carries
@@ -691,7 +694,7 @@ features = [
   "ledger", "experiments", "feature-flags", "idempotency", "custom-domains",
   "job-tracking", "upgrade", "nested-form", "alerts", "data-retention",
   "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt",
-  "push",
+  "push", "cluster",
   # The widget families (#3408). Default-on, named for the same reason.
   "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts",
 ]

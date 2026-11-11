@@ -366,7 +366,7 @@ for crate in "${CRATES[@]}"; do
     # alone, and the module features (#2795), `jwt` and `push` gate items the
     # baseline compiled with no feature of its own. Without them here, those
     # items look removed.
-    autumn_web_semver_current_only="widgets-search,widgets-social,widgets-workflow,widgets-charts,alerts,custom-domains,data-retention,experiments,feature-flags,gdpr,graph,idempotency,job-tracking,ledger,money,nested-form,slo,upgrade,version-history,wizard,jwt,push"
+    autumn_web_semver_current_only="widgets-search,widgets-social,widgets-workflow,widgets-charts,alerts,custom-domains,data-retention,experiments,feature-flags,gdpr,graph,idempotency,job-tracking,ledger,money,nested-form,slo,upgrade,version-history,wizard,jwt,push,cluster"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
     pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \

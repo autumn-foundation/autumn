@@ -1365,8 +1365,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 
 - `autumn_web::cluster` — zero-dependency two-node clustering: authenticated
   TCP gossip membership plus one shared primitive, an eventually consistent
-  cluster-wide grow-only counter. Always compiled (no cargo feature); inert
-  unless `[cluster] enabled = true`. Not leader election, not mutual
+  cluster-wide grow-only counter. Needs the `cluster` feature (in `default`;
+  #2795). Inert unless `[cluster] enabled = true`. Without the feature,
+  `[cluster]` parses and `enabled = true` fails boot. Not leader election, not mutual
   exclusion, not durable — for run-once work use `Lock` above.
 - Handle: `state.extension::<ClusterHandle>() -> Option<Arc<ClusterHandle>>`
   (`None` when disabled). `ClusterHandle::{node_id() -> &str, local_addr() ->

@@ -6005,10 +6005,15 @@ impl AppBuilder {
         // nothing replicates and die with the process. The cluster is therefore
         // cancelled after the drain completes (see `cluster_shutdown.cancel()`
         // below), inside the same budget.
+        #[cfg(feature = "cluster")]
         let cluster_shutdown = tokio_util::sync::CancellationToken::new();
-        if let Err(error) =
-            crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown)
-        {
+        #[cfg(feature = "cluster")]
+        let installed =
+            crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown);
+        // Without the `cluster` feature, boot refuses `enabled = true`.
+        #[cfg(not(feature = "cluster"))]
+        let installed = crate::config::ClusterConfig::check_feature(config.cluster.enabled, false);
+        if let Err(error) = installed {
             tracing::error!(error = %error, "cluster installation failed");
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
@@ -7078,6 +7083,7 @@ impl AppBuilder {
         // up to the budget rather than budget + `LEAVE_BUDGET`. A departure that is
         // budgeted away leaves the peer to converge on the suspicion timeout, which
         // is the actual contract.
+        #[cfg(feature = "cluster")]
         if config.cluster.enabled {
             cluster_shutdown.cancel();
             let departure_wait =
@@ -13217,6 +13223,7 @@ fn fleet_flush_budget(
 /// Returns zero when the drain has already consumed the budget: the departure
 /// is skipped and the peer converges on the suspicion timeout, which is the
 /// documented contract for a shutdown that overran.
+#[cfg(feature = "cluster")]
 fn cluster_departure_wait(
     shutdown_budget: std::time::Duration,
     drain_elapsed: std::time::Duration,
@@ -20504,6 +20511,7 @@ mod tests {
     /// replicate it and die with the process: a write accepted and silently
     /// thrown away. Source-order test in the house style, because the ordering
     /// is a property of this function and nothing smaller.
+    #[cfg(feature = "cluster")]
     #[test]
     fn cluster_departs_after_the_request_drain() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
@@ -20575,6 +20583,7 @@ mod tests {
     /// `LEAVE_BUDGET` sleep between the drain and the hooks would make the
     /// worst case `shutdown_timeout_secs + LEAVE_BUDGET`, so the wait is
     /// clamped to the budget the drain left over.
+    #[cfg(feature = "cluster")]
     #[test]
     fn the_cluster_departure_wait_fits_inside_the_shutdown_budget() {
         use std::time::Duration;

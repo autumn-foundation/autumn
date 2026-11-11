@@ -679,6 +679,35 @@ let CrateGraph { deps, libs, .. } = crates;
 **Automation:** `manual` — start from `CrateGraph::default()` and set the
 fields.
 
+---
+
+### Features: the `cluster` module is optional
+
+**Why:** `autumn_web::cluster` was 3% of the code that `autumn-web` compiles, in
+every app (issue #2795, ADR 0045). It now has the `cluster` feature. The
+feature is in `default`, so a default build does not change.
+
+**You are affected only if your app sets `default-features = false` and uses
+`autumn_web::cluster` or `[cluster] enabled = true`.** The compiler reports
+``error[E0432]: unresolved import `autumn_web::cluster` ``. Without the
+feature, `[cluster]` still parses, and `enabled = true` fails boot with a
+validation error.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "cluster"] }
+```
+
+**Automation:** `manual` — a codemod cannot know if the app uses the
+cluster. Add the feature only if it does.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -793,6 +822,12 @@ If nothing changed, delete this section.
 - **Graph:** `autumn graph check-boundaries` checks the nodes of a renamed
   `[[bin]]` target in the boundary of its package (#3599). New violations
   can show. Fix them, or run with `--update-baseline`.
+- **Config:** a type error in `autumn.toml` now names the full key, for
+  example ``in `server.port` ``. Before, `AutumnConfig::load` showed a line
+  of the merged config, which is not a file you wrote. `load_from` errors
+  also give the key, not the line. A syntax error keeps its line. A message
+  parser that read the `TOML parse error at line` prefix of a type error
+  must read the key instead.
 
 Changes that still compile but behave differently at runtime. Examples:
 

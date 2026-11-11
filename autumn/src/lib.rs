@@ -166,6 +166,7 @@ mod media_type;
 pub mod classify;
 // A plain comment, not a doc comment: the module carries its own `//!` docs
 // and an outer `///` here would be merged with them.
+#[cfg(feature = "cluster")]
 pub mod cluster;
 #[cfg(feature = "collab")]
 pub mod collab;

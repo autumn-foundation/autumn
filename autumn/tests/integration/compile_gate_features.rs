@@ -26,6 +26,7 @@ const GATES: &[(&str, &str)] = &[
     ("slo", "slo"),
     ("graph", "graph"),
     ("push", "push"),
+    ("cluster", "cluster"),
 ];
 
 /// A feature that must switch on another one.
@@ -59,6 +60,7 @@ const ALL_FEATURES: &[&str] = &[
     "graph",
     "jwt",
     "push",
+    "cluster",
 ];
 
 fn manifest() -> toml::Table {
@@ -164,6 +166,25 @@ fn jwt_and_push_crates_are_optional_and_owned_by_their_feature() {
             }
         }
     }
+}
+
+/// The cluster runtime is gated. Its `[cluster]` section is not: an app
+/// without the feature still parses the section, so config stays portable.
+#[test]
+fn cluster_config_parses_in_every_build() {
+    let config = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config.rs"))
+        .expect("read config.rs");
+    let decl = config
+        .lines()
+        .position(|l| l.trim() == "pub cluster: ClusterConfig,")
+        .expect("`cluster` field in config.rs");
+    let lines: Vec<&str> = config.lines().collect();
+    let gated = lines[..decl]
+        .iter()
+        .rev()
+        .take_while(|l| l.trim_start().starts_with("#[") || l.trim_start().starts_with("///"))
+        .any(|l| l.contains("cfg(") && l.contains("cluster"));
+    assert!(!gated, "`[cluster]` must parse with the feature off");
 }
 
 #[test]
