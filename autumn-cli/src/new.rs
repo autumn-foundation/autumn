@@ -2099,8 +2099,9 @@ mod tests {
     }
 
     /// Windows PDB files cap public symbols (LNK4319, issue #2448). Every
-    /// starter shape must set a reduced dev profile, for the app and for its
-    /// dependencies.
+    /// starter shape must set a reduced dev profile. The app keeps file and
+    /// line. Dependencies have no debug info, which also makes the first
+    /// build faster (#2795).
     #[test]
     fn every_generated_shape_scaffolds_reduced_dev_debug_info() {
         let shapes = [
@@ -2145,9 +2146,9 @@ mod tests {
                 "{name}: {raw}"
             );
             assert_eq!(
-                dev["package"]["*"]["debug"].as_str(),
-                Some("line-tables-only"),
-                "{name}: dependencies need their own setting: {raw}"
+                dev["package"]["*"]["debug"].as_bool(),
+                Some(false),
+                "{name}: dependencies build with no debug info: {raw}"
             );
         }
     }

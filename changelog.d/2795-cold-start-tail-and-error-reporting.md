@@ -19,6 +19,14 @@
   The report also names the compiler that the scaffold selects, not the one
   of the repository root.
 
+### Changed
+
+- **scaffold:** a new app builds its dependencies with no debug info
+  (`[profile.dev.package."*"] debug = false`, issue #2795). The first build
+  is faster. The app keeps file and line. A backtrace frame in a dependency
+  shows the function name only. The template comment says how to get file
+  and line back. An existing app does not change.
+
 ### Performance
 
 - **build:** the no-DB daemon starter builds faster from cold (issue #2795,
