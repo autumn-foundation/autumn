@@ -7,9 +7,16 @@
 //! but the per-dylib compile cost stays proportional to the macros that
 //! dylib actually registers.
 //!
+//! One exception: the `analysers` module (feature `analysers`) holds the
+//! bodies of `#[query_budget]` and `#[agent_operable]`, which only
+//! `autumn-macros` registers. They are here because `autumn-web` waits for
+//! the proc-macro crate, and Cargo builds a library in parallel with other
+//! crates (#2795).
+//!
 //! Users should not depend on this crate directly — use `autumn-web`
 //! instead, which re-exports everything.
 
+#[cfg(any(test, feature = "analysers"))]
 mod agent_authority;
 pub mod cascade;
 pub mod crate_path;
@@ -17,6 +24,7 @@ pub mod graph;
 pub mod naming;
 #[doc(hidden)]
 pub mod parse;
+#[cfg(any(test, feature = "analysers"))]
 mod query_budget;
 pub mod schema;
 pub mod wire;
@@ -26,6 +34,7 @@ pub mod wire;
 /// They live in this library, not in the proc-macro crate. Cargo builds a
 /// library in parallel with other crates. It builds a proc-macro crate late,
 /// and `autumn-web` waits for that crate (#2795).
+#[cfg(any(test, feature = "analysers"))]
 #[doc(hidden)]
 pub mod analysers {
     use proc_macro2::TokenStream;

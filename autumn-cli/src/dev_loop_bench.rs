@@ -356,8 +356,9 @@ pub struct FullReport {
     pub example_name: String,
     pub all_passed: bool,
     pub results: Vec<BudgetCheckResult>,
-    /// Milliseconds of the cold-start preparation: toolchain install, index
-    /// update and crate downloads. The samples do not include it.
+    /// Milliseconds of the cold-start preparation of the gated `hello` shape:
+    /// toolchain install, index update and crate downloads. The samples do
+    /// not include it. The database shape's preparation is not recorded here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prepare_ms: Option<u64>,
 }
@@ -693,9 +694,10 @@ pub fn build_cold_start_report(hello_samples: &[u64], db: &DbOutcome) -> FullRep
 ///
 /// The scaffold pins its own toolchain and has no lockfile. The first `cargo`
 /// call in a scaffold can install a toolchain, update the index and download
-/// crates. That is network time, not compile time, and it made the first
-/// sample the slowest one. The driver does this work once before the clock
-/// starts and reports the time here.
+/// crates. That is network time, not compile time. In the scheduled runs the
+/// first sample was always the slowest one, and this work is the probable
+/// cause. The driver does this work once before the clock starts and reports
+/// the time here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColdStartPreparation {
     /// How long the preparation took.
@@ -721,7 +723,10 @@ pub fn cold_start_fetch_args(target: Option<&str>) -> Vec<String> {
 /// An empty wrapper variable turns a compiler wrapper off, also one set in a
 /// config file. `CARGO_INCREMENTAL=0` builds the patched `autumn-web` as Cargo
 /// builds a registry dependency. The `[patch]` makes it a path dependency,
-/// which is incremental by default and slower to build from cold.
+/// which is incremental by default and slower to build from cold. The
+/// variable applies to the whole build, so the app crate also builds without
+/// incremental mode. A new user's first build compiles the app crate in
+/// incremental mode.
 pub const COLD_BUILD_ENV: &[(&str, &str)] = &[
     ("RUSTC_WRAPPER", ""),
     ("RUSTC_WORKSPACE_WRAPPER", ""),
@@ -1994,9 +1999,6 @@ mod tests {
         assert_eq!(cold_start_fetch_args(None), ["fetch"]);
         let args = cold_start_fetch_args(Some("x86_64-unknown-linux-gnu"));
         assert_eq!(args, ["fetch", "--target", "x86_64-unknown-linux-gnu"]);
-        for compile in ["build", "check", "run", "test", "rustc"] {
-            assert!(!args.iter().any(|a| a == compile), "{compile} compiles");
-        }
     }
 
     #[test]

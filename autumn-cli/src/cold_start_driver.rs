@@ -9,9 +9,9 @@
 //! tests, so this file is excluded from coverage (see `codecov.yml`), mirroring
 //! `build.rs` and `dev.rs`.
 //!
-//! Before the samples, one untimed step does the network work of a first
-//! build: toolchain install, index update, crate downloads. The report shows
-//! its time apart from the samples.
+//! Before the samples, one untimed step does the large network work of a
+//! first build: toolchain install, first index update, crate downloads. The
+//! report shows its time apart from the samples.
 //!
 //! The **pure**, unit-tested half — budgets, statistics, budget checking, report
 //! building, and the dry-run budget table — lives in
@@ -74,8 +74,10 @@ pub fn locate_autumn_web() -> Option<PathBuf> {
 
 /// Canonicalized workspace `autumn-web` path, resolved once per process.
 ///
-/// The repo location is invariant across samples, so the ancestor walk + file
-/// reads + canonicalize run only on the first sample and are cached for the rest.
+/// The repo location is invariant, so the ancestor walk + file reads +
+/// canonicalize run only on the first call and are cached for the rest. In the
+/// cold-start gate the first call is the untimed preparation step, so no
+/// sample's timed window includes them.
 pub fn cached_autumn_web() -> Option<PathBuf> {
     static AUTUMN_WEB: OnceLock<Option<PathBuf>> = OnceLock::new();
     AUTUMN_WEB
@@ -150,25 +152,51 @@ fn apply_cold_env(cargo: &mut Command) {
     }
 }
 
-/// Do the network work of a first build before the clock starts.
+/// The `cargo fetch` command of the preparation step.
+fn fetch_command(project_dir: &Path, target: Option<&str>) -> Command {
+    let mut fetch = Command::new("cargo");
+    fetch
+        .args(cold_start_fetch_args(target))
+        .current_dir(project_dir);
+    apply_cold_env(&mut fetch);
+    fetch
+}
+
+/// The timed `cargo build` command.
+///
+/// An explicit `--target` overrides a config-file `build.target` and keeps the
+/// artifact host-runnable. Without a known host triple, Cargo's default
+/// applies (the host, unless a config file overrides it).
+fn build_command(project_dir: &Path, target: Option<&str>) -> Command {
+    let mut build = Command::new("cargo");
+    build
+        .args(["build", "--message-format=json", "--target-dir"])
+        .arg(project_dir.join("target"))
+        .current_dir(project_dir);
+    // No inherited target settings, no compiler wrapper (e.g. `sccache`), and
+    // no incremental mode. See `COLD_BUILD_ENV`.
+    apply_cold_env(&mut build);
+    if let Some(triple) = target {
+        build.arg("--target").arg(triple);
+    }
+    build
+}
+
+/// Do the toolchain install and the crate downloads of a first build before
+/// the clock starts.
 ///
 /// `cargo fetch` in a throwaway scaffold installs the toolchain that the
 /// scaffold pins, updates the index and downloads the crates. It compiles
 /// nothing and its project is deleted, so each sample still builds from cold.
-/// See [`ColdStartPreparation`].
+/// A sample has no lockfile, so it still checks the index. `cargo fetch` runs
+/// no build script, so a sample with bundled Postgres still downloads the
+/// archive. See [`ColdStartPreparation`].
 fn prepare_cold_start(shape: ColdStartShape) -> Result<ColdStartPreparation, String> {
     let tmp = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
     let start = Instant::now();
     let project_dir = scaffold(shape, tmp.path(), "coldstart_prepare")?;
 
-    let mut fetch = Command::new("cargo");
-    fetch
-        .args(cold_start_fetch_args(
-            cached_host_target_triple().as_deref(),
-        ))
-        .current_dir(&project_dir);
-    apply_cold_env(&mut fetch);
-    let output = fetch
+    let output = fetch_command(&project_dir, cached_host_target_triple().as_deref())
         .output()
         .map_err(|e| format!("cargo fetch spawn failed: {e}"))?;
     if !output.status.success() {
@@ -318,22 +346,7 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
 /// binary. Compiler wrappers (e.g. `sccache`) are disabled so the measurement is
 /// a genuine first clean compile.
 fn cold_build(project_dir: &Path, project_name: &str) -> Result<PathBuf, String> {
-    let target_dir = project_dir.join("target");
-    let mut build = Command::new("cargo");
-    build
-        .args(["build", "--message-format=json", "--target-dir"])
-        .arg(&target_dir)
-        .current_dir(project_dir);
-    // No inherited target settings, no compiler wrapper (e.g. `sccache`), and
-    // no incremental mode: a genuine first clean compile.
-    apply_cold_env(&mut build);
-    // An explicit `--target` overrides a config-file `build.target` and keeps the
-    // artifact host-runnable. If the host triple can't be determined we omit it
-    // and fall back to Cargo's default (the host unless config overrides it).
-    if let Some(triple) = cached_host_target_triple() {
-        build.arg("--target").arg(triple);
-    }
-    let output = build
+    let output = build_command(project_dir, cached_host_target_triple().as_deref())
         .output()
         .map_err(|e| format!("cargo build spawn failed: {e}"))?;
     if !output.status.success() {
@@ -367,7 +380,8 @@ fn host_target_triple() -> Option<String> {
 /// Host target triple, resolved once per process.
 ///
 /// The triple is invariant, so the `rustc -vV` subprocess runs only on the first
-/// sample; caching also keeps it out of every subsequent sample's timed window.
+/// call. In the gate that is the untimed preparation step, which keeps it out of
+/// every sample's timed window.
 fn cached_host_target_triple() -> Option<String> {
     static HOST_TRIPLE: OnceLock<Option<String>> = OnceLock::new();
     HOST_TRIPLE.get_or_init(host_target_triple).clone()
@@ -507,6 +521,86 @@ pub fn run_cold_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Some(None)` is a removed variable. `Some(Some(v))` is a set one.
+    fn env_of(cargo: &Command, name: &str) -> Option<Option<String>> {
+        cargo
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some(name))
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    fn args_of(cargo: &Command) -> Vec<String> {
+        cargo
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn assert_cold_env(cargo: &Command) {
+        for removed in [
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_BUILD_TARGET",
+        ] {
+            assert_eq!(env_of(cargo, removed), Some(None), "{removed}");
+        }
+        for wrapper in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert_eq!(
+                env_of(cargo, wrapper),
+                Some(Some(String::new())),
+                "{wrapper}"
+            );
+        }
+        assert_eq!(
+            env_of(cargo, "CARGO_INCREMENTAL"),
+            Some(Some("0".to_owned()))
+        );
+    }
+
+    /// The preparation step downloads in the project directory. It compiles
+    /// nothing and names no target directory.
+    #[test]
+    fn the_fetch_command_runs_in_the_project_with_the_cold_env() {
+        let project = Path::new("/tmp/project");
+        let fetch = fetch_command(project, Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(fetch.get_program(), "cargo");
+        assert_eq!(
+            args_of(&fetch),
+            ["fetch", "--target", "x86_64-unknown-linux-gnu"]
+        );
+        assert_eq!(fetch.get_current_dir(), Some(project));
+        assert_cold_env(&fetch);
+    }
+
+    #[test]
+    fn the_build_command_uses_the_project_target_dir_and_the_cold_env() {
+        let project = Path::new("/tmp/project");
+        let build = build_command(project, Some("x86_64-unknown-linux-gnu"));
+        let args = args_of(&build);
+        assert_eq!(args[0], "build");
+        let target_dir = project.join("target").to_string_lossy().into_owned();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--target-dir" && pair[1] == target_dir),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--target" && pair[1] == "x86_64-unknown-linux-gnu"),
+            "{args:?}"
+        );
+        assert_eq!(build.get_current_dir(), Some(project));
+        assert_cold_env(&build);
+        // Without a known host triple, the build names no target.
+        let args = args_of(&build_command(project, None));
+        assert!(!args.iter().any(|arg| arg == "--target"), "{args:?}");
+    }
 
     #[test]
     fn class_for_maps_each_shape_to_its_change_class() {

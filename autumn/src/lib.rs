@@ -739,7 +739,7 @@ pub mod redis_tls;
 /// responses to configured [`ErrorReporter`](reporting::ErrorReporter)s.
 ///
 /// Enabled by the `error-reporting` Cargo feature (on by default). The
-/// `reporting` feature adds failure capture, the [`capsule`] module.
+/// `reporting` feature adds failure capture, the `capsule` module.
 #[cfg(feature = "error-reporting")]
 pub mod reporting;
 pub mod scheduler;

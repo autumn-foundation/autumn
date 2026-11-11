@@ -96,19 +96,24 @@ Six hats:
    and keeps the `capsule` module and its hooks. Both are in `default`. A
    manifest that names `reporting` builds the same code as before. The daemon
    starter names `error-reporting`.
-2. `ErrorEvent::capsule` and `CapsuleRef` are in every build. The field is
-   `None` without `reporting`. A reporter compiles the same in both builds.
+2. `ErrorEvent::capsule` and `CapsuleRef` are in every build that has
+   `error-reporting`. The field is `None` without `reporting`. A reporter
+   compiles the same in both builds.
 3. `[failure_capture]` parses in every build. Boot fails on `enabled = true`
    without `reporting`, as for `cluster` and `push`.
 4. `query_budget.rs` and `agent_authority.rs` move to `autumn-macros-support`.
    That crate is a library, so Cargo builds it in the parallel phase.
-   `autumn-macros` keeps the two `#[proc_macro_attribute]` entries.
+   `autumn-macros` keeps the two `#[proc_macro_attribute]` entries. The two
+   files are behind the `analysers` feature, which only `autumn-macros`
+   turns on. `autumn-cli` links the support crate for its wire types, and
+   that copy does not compile the analysers.
 5. `tokio-cron-scheduler` leaves the manifests. A test fails when a
    dependency that always compiles is named by no source file.
 6. The cold-start driver does one untimed preparation step for each shape:
    `cargo fetch` in a throwaway scaffold. It installs the pinned toolchain,
    updates the index and downloads the crates. It compiles nothing. The report
-   shows its time as `prepare_ms`, and the compiler that the scaffold selects.
+   shows the `hello` shape's time as `prepare_ms`, and the compiler that the
+   scaffold selects. The database shape's time goes to stderr only.
    The driver sets `CARGO_INCREMENTAL=0` itself. No sample is dropped, and the
    sample count does not change.
 7. New apps build their dependencies with no debug info. See "Scaffold
@@ -124,9 +129,10 @@ Tests:
 - The `error-reporting` lane of `test-features` compiles the daemon feature
   set and runs the reporter specs with `reporting` off.
 - `autumn-macros-support` fails if an analyser file goes back.
-- `dev_loop_bench`: the preparation step is `fetch` and never a compile; the
-  build environment has `CARGO_INCREMENTAL=0`; the preparation time is not a
-  sample.
+- `dev_loop_bench` and `cold_start_driver`: the preparation command is
+  `cargo fetch` in the project directory; the fetch and build commands have
+  the cold environment with `CARGO_INCREMENTAL=0`; the preparation time is
+  not a sample.
 
 ## Options not selected
 
@@ -184,9 +190,10 @@ target, `CARGO_INCREMENTAL=0`, the gate's `cargo build --target <host>`.
 ## Scaffold profile
 
 The maintainer chose `[profile.dev.package."*"] debug = false` for new apps.
-The app keeps `line-tables-only`. An earlier report (2026-09-17) left the
-debug level as a maintainer decision, because a lower level costs file and
-line in backtraces. This choice keeps them for the app's own frames.
+The app keeps `line-tables-only`. An earlier report,
+`docs/reports/2026-09-17-onramp-devprofile-debuginfo-cold-start-findings.md`,
+left the debug level as a maintainer decision, because a lower level costs
+file and line in backtraces. This choice keeps them for the app's own frames.
 
 ## Roadmap to 60 s / 90 s
 

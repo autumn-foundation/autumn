@@ -1685,7 +1685,7 @@ See `docs/guide/system-tests.md`.
 
 ```toml
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "error-reporting"]
 ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]

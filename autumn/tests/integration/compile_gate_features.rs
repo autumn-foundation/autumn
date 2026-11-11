@@ -1,7 +1,8 @@
 //! Spec for the compile-gate features (#2795).
 //!
-//! Each feature gates one module that most apps never use. All are default-on,
-//! so a default build is unchanged. The no-DB daemon starter turns them off.
+//! Each feature gates one module. All are default-on, so a default build is
+//! unchanged. The no-DB daemon starter turns them off, except
+//! `error-reporting`, the panic-catch layer.
 
 use std::collections::BTreeSet;
 
@@ -178,8 +179,8 @@ fn field_is_gated(field: &str) -> bool {
         .any(|l| l.contains("cfg("))
 }
 
-/// Each dependency that always compiles is named in the source. A crate that
-/// no code names costs build time in every app.
+/// Each dependency that always compiles is named in a line of code. A crate
+/// that no code names costs build time in every app.
 #[test]
 fn every_always_on_dependency_is_named_in_the_source() {
     let mut source = String::new();
@@ -187,6 +188,12 @@ fn every_always_on_dependency_is_named_in_the_source() {
         std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
         &mut source,
     );
+    // A comment that mentions a crate is not a use of it.
+    let code: String = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(|line| [line, "\n"])
+        .collect();
     let m = manifest();
     let deps = m["dependencies"].as_table().expect("[dependencies]");
     let mut unused = Vec::new();
@@ -196,22 +203,29 @@ fn every_always_on_dependency_is_named_in_the_source() {
             continue;
         }
         let ident = name.replace('-', "_");
-        let named = [
-            format!("{ident}::"),
-            format!("{ident}!"),
-            format!("{ident};"),
-            format!("{ident} as "),
-        ]
-        .iter()
-        .any(|use_site| source.contains(use_site.as_str()));
+        let named = ["::", "!", ";", " as "]
+            .iter()
+            .any(|suffix| names_crate(&code, &format!("{ident}{suffix}")));
         if !named {
             unused.push(name.as_str());
         }
     }
     assert!(
         unused.is_empty(),
-        "no source file names these dependencies: {unused:?}"
+        "no line of code under src/ names these dependencies: {unused:?}. \
+         Remove each one, or make it optional behind the feature that uses it."
     );
+}
+
+/// True when `use_site` starts an identifier somewhere in `code`, so `url::`
+/// does not match inside `database_url::`.
+fn names_crate(code: &str, use_site: &str) -> bool {
+    code.match_indices(use_site).any(|(at, _)| {
+        !code[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
 }
 
 fn read_rust_sources(dir: &std::path::Path, out: &mut String) {

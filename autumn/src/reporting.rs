@@ -805,7 +805,7 @@ mod capture {
         problem_type: Option<&str>,
     ) -> Option<Sealed> {
         // A body that is not yet materialized can run more handler code as it is
-        // polled — database queries, clock reads — after the snapshot below, so
+        // polled — database queries, clock reads — after the capsule snapshot, so
         // those effects would be missing from the tape while the capsule claims to
         // be complete. A replay drains the body and would report divergences that
         // never happened. Probed only when a capsule is actually being written: with
@@ -1044,8 +1044,9 @@ mod capture {
 
 /// Stand-ins for a build without the `reporting` feature.
 ///
-/// That build has no capsule. No request has a capture handle, so the
-/// functions that take one cannot run.
+/// That build has no capsule. No request has a capture handle, so
+/// `for_status` and `for_panic` always return `None`. `persist` cannot run,
+/// because `Sealed` has no value.
 #[cfg(not(feature = "reporting"))]
 mod capture {
     use super::{ErrorEvent, Request, Response};
@@ -1360,10 +1361,10 @@ mod tests {
 
     #[cfg(feature = "reporting")]
     #[test]
-    fn capture_context_can_cross_to_the_blocking_pool() {
-        // `persist_capsule` hands the context to `spawn_blocking`, which needs
-        // `Send + 'static`. A future field that is neither would only show up
-        // as a confusing error inside `dispatch`, so pin it here.
+    fn a_sealed_capture_can_cross_to_the_blocking_pool() {
+        // `capture::persist` moves the `Sealed` value into `spawn_blocking`,
+        // which needs `Send + 'static`. A future field that is neither would
+        // only show up as a confusing error inside `dispatch`, so pin it here.
         const fn assert_send_static<T: Send + 'static>() {}
         assert_send_static::<capture::Sealed>();
     }

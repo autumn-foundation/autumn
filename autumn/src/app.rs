@@ -4947,12 +4947,8 @@ impl AppBuilder {
         }
         state.insert_extension(crate::background::BackgroundQueues(background.queues()));
 
-        // Without the `reporting` feature, boot refuses failure capture.
-        #[cfg(not(feature = "reporting"))]
-        if let Err(error) = crate::config::FailureCaptureConfig::check_feature(
-            config.failure_capture.enabled,
-            false,
-        ) {
+        // A build without the `reporting` feature refuses failure capture.
+        if let Err(error) = config.failure_capture.check_build() {
             tracing::error!(error = %error, "failure capture cannot start");
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
@@ -12860,7 +12856,7 @@ fn make_acme_alert_recovery(state: &AppState) -> crate::acme::renewal::RecoveryF
     })
 }
 
-/// The no-op ACME reporter used when the `reporting` feature is off (failures
+/// The no-op ACME reporter used when the `error-reporting` feature is off (failures
 /// still log via `tracing`).
 #[cfg(all(feature = "acme", not(feature = "error-reporting")))]
 fn make_acme_reporter() -> crate::acme::renewal::ReporterFn {

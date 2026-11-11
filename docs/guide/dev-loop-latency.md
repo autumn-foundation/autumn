@@ -73,15 +73,20 @@ this slice and never fails the gate.
 
 ### Cold-start methodology
 
-`autumn dev-loop-bench --cold-start` measures a genuine first-run, not a warm
-cache:
+`autumn dev-loop-bench --cold-start` measures a first clean compile, not a warm
+build cache. One untimed preparation step runs before the samples (see
+[Running the cold-start benchmark](#running-the-cold-start-benchmark)), so the
+pinned toolchain is installed and the crates are downloaded before the clock
+starts. Each sample then:
 
 1. Scaffolds a **throwaway project** in a fresh temp directory (`autumn new`).
    The no-DB `hello` shape uses the daemon starter; the database-backed shape
    (`--include-db`) uses the **bundled managed-Postgres** starter, so the app
    self-provisions a real Postgres (via `postgresql_embedded`), runs migrations,
    and connects before serving — no external database service required. The clock
-   starts just before scaffolding so the whole journey is captured.
+   starts just before scaffolding, so a sample covers scaffold, first clean
+   compile, boot and first `200`. It does not cover the downloads of the
+   preparation step.
 2. Repoints the project's `autumn-web` dependency at the repository's local
    source via `[patch.crates-io]`, so the number reflects the code in the repo
    rather than a possibly-unpublished crates.io release — still a genuine clean
@@ -118,18 +123,29 @@ autumn dev-loop-bench --cold-start \
 autumn dev-loop-bench --cold-start --include-db
 ```
 
-Before the samples, the driver does one preparation step for each shape. It
+Before the samples of each shape, the driver does one preparation step. It
 runs `cargo fetch` in a throwaway scaffold. That installs the toolchain that
 the scaffold pins, updates the index and downloads the crates. It compiles
-nothing, so each sample still builds from cold. The report shows the time as
-`prepare_ms`. It is not in the samples: it is network time, and it made the
-first sample the slowest one. A new user who does not have the pinned
-toolchain pays it once.
+nothing, so each sample still builds from cold. The report shows the time of
+the `hello` shape's step as `prepare_ms`. With `--include-db`, the time of
+the database shape's step goes to stderr only. The preparation is not in the
+samples, because it is network time and not build time. A new user pays it
+once, on the first build: the crate downloads, and the toolchain install
+when the pinned toolchain is missing.
+
+Two pieces of network work stay in each sample. A scaffold has no lockfile,
+so each timed build resolves again and checks the index entry of each crate.
+A sample of the database-backed shape also downloads the Postgres archive:
+a build script fetches it, and `cargo fetch` runs no build script.
 
 `rust_version` in a cold-start report is the compiler that the scaffold
 selects. `AUTUMN_BENCH_RUST_VERSION` is the fallback when that probe fails.
-The driver sets `CARGO_INCREMENTAL=0` for the timed build, as Cargo builds a
-dependency from the registry.
+
+The driver sets `CARGO_INCREMENTAL=0` for the timed build. The `[patch]`
+makes `autumn-web` a path dependency, which Cargo builds in incremental mode
+by default. With the variable, Cargo builds it the way it builds a registry
+dependency: without incremental mode. The variable also applies to the app
+crate. A new user's first build compiles the app crate in incremental mode.
 
 ### Cold-start budget history
 
@@ -186,9 +202,10 @@ ADR 0046 cut the cold `hello` build on one 4 vCPU box from 81.5 s to 71.4 s
 3. The unused `tokio-cron-scheduler` dependency is gone.
 4. A new app builds its dependencies with no debug info.
 
-The same ADR changed the gate. The first sample was always the slowest, by
-6-12 s, because the first `cargo` call in a scaffold installs a toolchain and
-downloads crates. That work is now a preparation step before the samples.
+The same ADR changed the gate. In each of the last three scheduled runs, the
+first sample was the slowest, by 6-12 s. The probable cause is that the first
+`cargo` call in a scaffold installs a toolchain and downloads crates. That
+work is now a preparation step before the samples.
 
 The build has three phases on four cores. Dependencies take about 36 s and
 use all cores. `autumn-web` then takes about 32 s, mostly on one core. The

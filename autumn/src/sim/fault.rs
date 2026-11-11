@@ -597,7 +597,7 @@ pub struct FaultOutcome {
     /// Planned faults whose ordinal was never reached, sorted.
     pub unfired: Vec<PlannedFault>,
     /// 5xx responses captured through autumn's error-reporting layer, in report
-    /// order. Always present; empty when the `reporting` feature is off.
+    /// order. Always present; empty when the `error-reporting` feature is off.
     pub server_errors: Vec<ReportedError>,
     /// Totals for the whole run.
     pub final_state: FinalState,
@@ -830,7 +830,7 @@ impl FaultState {
         counter.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Only the `reporting`-gated [`FaultReporter`] pushes here; without that
+    /// Only the `error-reporting`-gated [`FaultReporter`] pushes here; without that
     /// feature [`FaultOutcome::server_errors`] is always empty (by contract).
     #[cfg(feature = "error-reporting")]
     fn record_server_error(&self, error: ReportedError) {

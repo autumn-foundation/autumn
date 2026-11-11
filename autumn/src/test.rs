@@ -3514,7 +3514,7 @@ impl TestClient {
     /// no [`crate::sim::FaultPlan`] is attached (so an ordinary test app never
     /// touches an atomic per request).
     ///
-    /// Also `None` without the `reporting` feature: nothing can ever populate
+    /// Also `None` without the `error-reporting` feature: nothing can ever populate
     /// `FaultOutcome::server_errors` then, so counting observed 5xx would only
     /// make [`fault_outcome`](Self::fault_outcome) spin out its whole settle
     /// budget against a list that stays empty by contract.
@@ -3523,7 +3523,7 @@ impl TestClient {
         allow(
             clippy::unused_self,
             clippy::missing_const_for_fn,
-            reason = "without `reporting` the answer is a constant `None`, but the \
+            reason = "without `error-reporting` the answer is a constant `None`, but the \
                       signature has to stay one method so every request builder \
                       keeps a single call site"
         )

@@ -1493,8 +1493,8 @@ pub struct AutumnConfig {
     /// # Field ordering (load-bearing — do not move below `database`)
     ///
     /// Declared here, before [`database`](Self::database), for the same reason
-    /// [`deploy`](Self::deploy) and `failure_capture` (a field only present
-    /// with the `reporting` feature, hence not linked) are: `DatabaseConfig`'s
+    /// [`deploy`](Self::deploy) and [`failure_capture`](Self::failure_capture)
+    /// are: `DatabaseConfig`'s
     /// `deserialize_with` duration field aborts the
     /// `SchemaDeserializer` traversal, so a section declared after it is
     /// recorded only as an opaque root leaf and strict unknown-key validation
@@ -1749,7 +1749,7 @@ pub struct AutumnConfig {
     /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
     ///
     /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
-    /// to registered reporters. Honored only when the `reporting` cargo
+    /// to registered reporters. Honored only when the `error-reporting` cargo
     /// feature is enabled.
     #[cfg(feature = "error-reporting")]
     #[serde(default)]
@@ -2547,8 +2547,8 @@ const fn default_reporting_sample_rate() -> f64 {
 /// result rows are not. Read `docs/guide/failure-capsules.md` before enabling
 /// this outside development.
 ///
-/// `enabled = true` needs the `reporting` feature. The section parses without
-/// it, and boot fails.
+/// The section parses in every build. `enabled = true` needs the `reporting`
+/// feature: without it, boot fails.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FailureCaptureConfig {
     /// Whether failing requests are recorded as capsules.
@@ -2603,13 +2603,12 @@ impl FailureCaptureConfig {
     /// expects one after a failure, so boot fails. Only boot calls this.
     /// `validate` does not, because the CLI reads the config of an app that
     /// it does not run.
-    #[cfg_attr(
-        all(feature = "reporting", not(test)),
-        allow(
-            dead_code,
-            reason = "boot calls it only without the `reporting` feature"
-        )
-    )]
+    pub(crate) fn check_build(&self) -> Result<(), ConfigError> {
+        Self::check_feature(self.enabled, cfg!(feature = "reporting"))
+    }
+
+    /// [`check_build`](Self::check_build) for a build with (`built`) or
+    /// without the feature.
     pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
         if enabled && !built {
             return Err(ConfigError::Validation(
@@ -17828,6 +17827,28 @@ path = "/healthz"
         assert!(text.contains("`reporting` feature"), "{text}");
         assert!(FailureCaptureConfig::check_feature(true, true).is_ok());
         assert!(FailureCaptureConfig::check_feature(false, false).is_ok());
+    }
+
+    #[test]
+    fn boot_accepts_or_refuses_failure_capture_by_the_build() {
+        let on = FailureCaptureConfig {
+            enabled: true,
+            ..FailureCaptureConfig::default()
+        };
+        // A build with `reporting` can capture. A build without it cannot.
+        assert_eq!(on.check_build().is_ok(), cfg!(feature = "reporting"));
+        assert!(FailureCaptureConfig::default().check_build().is_ok());
+    }
+
+    #[cfg(not(feature = "reporting"))]
+    #[test]
+    fn boot_refuses_failure_capture_in_a_build_without_reporting() {
+        let on = FailureCaptureConfig {
+            enabled: true,
+            ..FailureCaptureConfig::default()
+        };
+        let text = on.check_build().unwrap_err().to_string();
+        assert!(text.contains("`reporting` feature"), "{text}");
     }
 
     #[test]

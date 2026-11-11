@@ -22,7 +22,8 @@ Two things happen automatically, out of the box:
 
 The pipeline is the `error-reporting` Cargo feature. It is in `default`. The
 `reporting` feature turns it on and adds [failure capsules](failure-capsules.md).
-An app with `default-features = false` names one of the two.
+An app with `default-features = false` names one of the two to keep the
+pipeline.
 
 ---
 
