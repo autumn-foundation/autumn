@@ -134,6 +134,13 @@ tables. To name them yourself, set `schema_crates`. A `may_read` or
 `may_write` entry for a table of B also allows the dependency on B's schema
 crate, because the exception needs it.
 
+* An entry with no `*` is a table name. It works with no graph.
+* An entry with a `*` matches the tables of the models in the graph only.
+  With `owns = ["*"]` on core, `may_read = ["campaign*"]` allows the schema
+  crate of `campaigns` only, not the schema crate of core.
+* With no graph, an entry with a `*` matches no table, and the check gives a
+  warning. Write the table name, or check a graph.
+
 The crate rule only applies to boundaries with `crates`. A single-crate app
 with `modules` boundaries uses the graph rule only.
 

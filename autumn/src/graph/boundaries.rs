@@ -1894,6 +1894,133 @@ crates = ["crm-core-ad*"]
         );
     }
 
+    /// `core` owns all tables that no other boundary owns.
+    const CATCH_ALL: &str = r#"
+[boundaries.core]
+owns = ["*"]
+crates = ["crm-core"]
+
+[boundaries.marketing]
+owns = ["campaigns"]
+crates = ["crm-marketing"]
+
+[boundaries.reporting]
+crates = ["crm-reporting"]
+may_read = ["campaign*"]
+"#;
+
+    fn catch_all() -> BoundaryConfig {
+        BoundaryConfig::parse(CATCH_ALL).expect("valid config")
+    }
+
+    /// One `contacts` model in `crm-core` and one `campaigns` model in
+    /// `crm-marketing`.
+    fn catch_all_graph() -> ArchitectureGraph {
+        build(&[], 0, &[], &MODELS[..2], &[], &[])
+    }
+
+    #[test]
+    fn a_wildcard_exception_resolves_against_graph_tables_only() {
+        let config = catch_all();
+        let graph = catch_all_graph();
+        let with_graph = Resolver::new(&config, Some(&graph), None);
+        assert_eq!(
+            with_graph.exception_owners("campaign*"),
+            BTreeSet::from(["marketing"])
+        );
+        assert_eq!(
+            with_graph.exception_owners("public.campaign*"),
+            BTreeSet::from(["marketing"])
+        );
+        let no_graph = Resolver::new(&config, None, None);
+        assert!(no_graph.exception_owners("campaign*").is_empty());
+        assert!(no_graph.exception_owners("public.campaign*").is_empty());
+        assert_eq!(
+            no_graph.exception_owners("contacts"),
+            BTreeSet::from(["core"])
+        );
+        // A `*` in the schema part only leaves a table name.
+        assert_eq!(
+            no_graph.exception_owners("*.campaigns"),
+            BTreeSet::from(["marketing"])
+        );
+    }
+
+    #[test]
+    fn a_wildcard_exception_does_not_allow_the_schema_of_a_catch_all_owner() {
+        let deps = crates(&[
+            ("crm-reporting", "crm-core"),
+            ("crm-reporting", "crm-marketing"),
+        ]);
+        let report = check(&catch_all(), Some(&catch_all_graph()), Some(&deps)).expect("runs");
+        let found: Vec<_> = crate_violations(&report)
+            .into_iter()
+            .map(|v| {
+                (
+                    v.boundary.as_str(),
+                    v.owner.as_str(),
+                    v.schema_crate.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(found, [("reporting", "core", "crm-core")]);
+    }
+
+    #[test]
+    fn a_literal_exception_allows_the_dependency_with_no_graph() {
+        let mut config = config("may_read = [\"contacts\"]\n");
+        for (name, schema) in [("core", "crm-core"), ("marketing", "crm-marketing")] {
+            config
+                .boundaries
+                .get_mut(name)
+                .expect("boundary")
+                .schema_crates = vec![schema.into()];
+        }
+        let deps = crates(&[("crm-marketing", "crm-core")]);
+        let report = check(&config, None, Some(&deps)).expect("runs");
+        assert!(
+            crate_violations(&report).is_empty(),
+            "{:?}",
+            report.violations
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[test]
+    fn with_no_graph_a_wildcard_exception_is_a_warning() {
+        let mut config = catch_all();
+        for (name, schema) in [("core", "crm-core"), ("marketing", "crm-marketing")] {
+            config
+                .boundaries
+                .get_mut(name)
+                .expect("boundary")
+                .schema_crates = vec![schema.into()];
+        }
+        let deps = crates(&[("crm-reporting", "crm-marketing")]);
+        let report = check(&config, None, Some(&deps)).expect("runs");
+        assert_eq!(crate_violations(&report).len(), 1, "{:?}", report.violations);
+        let warnings = report.warnings.join("\n");
+        assert!(
+            warnings.contains("`may_read` pattern `campaign*`") && warnings.contains("no graph"),
+            "{warnings}"
+        );
+    }
+
+    #[test]
+    fn an_owns_pattern_with_a_schema_matches_its_table_in_the_graph() {
+        let text = CONFIG.replace(
+            "owns = [\"contacts\"]",
+            "owns = [\"public.contacts\"]",
+        );
+        let config = BoundaryConfig::parse(&text).expect("valid config");
+        let report = check(&config, Some(&graph()), None).expect("runs");
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("public.contacts")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
     #[test]
     fn the_search_stops_at_a_crate_in_a_boundary() {
         // `crm-core-api` is in core (by `crm-core*`) and depends on the core
