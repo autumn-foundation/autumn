@@ -920,7 +920,7 @@ async fn search_widgets_restore_the_server_state_on_form_reset() {
     assert_eq!(
         eval_string(
             &page,
-            "document.querySelector('#rs-tags [data-ac-status]').textContent"
+            "document.querySelector('#rs-tags-wrapper [data-ac-status]').textContent"
         )
         .await,
         "",
