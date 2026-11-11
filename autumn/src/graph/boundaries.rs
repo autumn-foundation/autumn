@@ -1145,9 +1145,10 @@ impl<'a> Resolver<'a> {
 
     /// The boundaries that own a table an exception pattern matches.
     ///
-    /// A pattern with no `*` is a table name, so it works with no graph. A
-    /// pattern with a `*` matches the tables in the graph only. A tie
-    /// between two boundaries counts for neither.
+    /// The check reads the pattern without its schema. With no `*`, the
+    /// pattern is a table name, and it needs no graph. With a `*`, it matches
+    /// the tables in the graph only. A tie between two boundaries counts for
+    /// neither.
     fn exception_owners(&self, pattern: &str) -> BTreeSet<&'a str> {
         let lower = table_pattern(pattern);
         let owner = |table: &str| self.owner(table).ok().flatten();
@@ -1956,7 +1957,7 @@ may_read = ["campaign*"]
             no_graph.exception_owners("contacts"),
             BTreeSet::from(["core"])
         );
-        // A `*` in the schema part only leaves a table name.
+        // With a `*` in the schema part only, the pattern is a table name.
         assert_eq!(
             no_graph.exception_owners("*.campaigns"),
             BTreeSet::from(["marketing"])

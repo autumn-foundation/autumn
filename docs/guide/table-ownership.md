@@ -132,14 +132,19 @@ only, so the crate rule does not use binary names.
 The schema crates of a boundary are the crates that declare the models of its
 tables. To name them yourself, set `schema_crates`. A `may_read` or
 `may_write` entry for a table of B also allows the dependency on B's schema
-crate, because the exception needs it.
+crate, because the exception needs it. The check finds the tables of an
+entry as follows:
 
-* An entry with no `*` is a table name. It works with no graph.
-* An entry with a `*` matches the tables of the models in the graph only.
-  With `owns = ["*"]` on core, `may_read = ["campaign*"]` allows the schema
-  crate of `campaigns` only, not the schema crate of core.
-* With no graph, an entry with a `*` matches no table, and the check gives a
-  warning. Write the table name, or check a graph.
+* The check reads the table part only. `public.contacts` and `*.contacts`
+  both mean `contacts`.
+* An entry with no `*` in its table part is a table name. It needs no graph.
+* An entry with a `*` in its table part matches the tables of the models in
+  the graph only. For example, core has `owns = ["*"]` and marketing owns
+  `campaigns`. `may_read = ["campaign*"]` on a third boundary allows the
+  schema crate of marketing. It does not allow the schema crate of core.
+* With no graph, an entry with a `*` matches no table. It allows no
+  dependency, and the check gives a warning. Write the table name, or check
+  a graph.
 
 The crate rule only applies to boundaries with `crates`. A single-crate app
 with `modules` boundaries uses the graph rule only.
