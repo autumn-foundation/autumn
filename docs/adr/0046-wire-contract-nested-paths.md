@@ -32,8 +32,10 @@ Option 1.
 
 - The macros record a read as a dotted path. A field access, a binding of a
   field, a struct pattern, a value adapter (`.unwrap()`, `.as_ref()`) and a
-  value callback (`.map(|d| d.color)`) extend the path. A read that a longer
-  read holds is dropped: `details.color` also reads `details`.
+  value callback (`.map(|d| d.color)`) extend the path. A `let`, an
+  `if let` or a `match` inside a macro body binds its own names. Each parent
+  path stays in the read-set: `details.color` also reads `details`. So an
+  older CLI that exports these descriptors still finds the top-level read.
 - A nested struct literal in a request records its fields as dotted paths.
   The parent stays in the write-set: `details` and `details.color`.
 - The const assertions use the first segment of each path.
@@ -62,8 +64,9 @@ flowchart LR
 - A new optional nested field that a new caller reads needs the callee
   first.
 - A nested field that a call site sets, and the callee drops, is a break.
-- A nested literal that leaves out a field the type may skip, and the callee
-  requires, is a break.
+- A field the type may skip (`skip_serializing_if`) counts as sent only when
+  the caller's own release requires it. A call site that sets it is not
+  enough: serde can still leave it out. This also holds at the top level.
 - A bundle from this CLI cannot be read by an older CLI.
 - A read through an index, a loop or another function stops at the field
   before it.

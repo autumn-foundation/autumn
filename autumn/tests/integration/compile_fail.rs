@@ -786,6 +786,10 @@ fn compile_pass_tests_a() {
     // caller that reads only produced fields and supplies every required one
     // compiles, including across a serde rename and a `skip_serializing_if`.
     t.pass("tests/compile-pass/wire_contract_holds.rs");
+    // Nested read and write paths: the const assertions check the first
+    // segment, so a nested read, a nested literal and a nested event read
+    // compile.
+    t.pass("tests/compile-pass/wire_contract_nested_paths.rs");
 
     // #1771: the escape hatch the confidential build failure names. A finder
     // over the blind-index companion column has to compile, or the diagnostic

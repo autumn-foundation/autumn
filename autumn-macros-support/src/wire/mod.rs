@@ -274,8 +274,8 @@ pub struct CallerCall {
     /// The client method called. It is also the endpoint's name.
     pub method: String,
     /// Response fields the caller reads, by Rust name, sorted. A field inside
-    /// a field is a dotted path: `details.color`. A path that a longer read
-    /// holds is not in the list.
+    /// a field is a dotted path: `details.color`. Each parent path is also in
+    /// the list: `details`.
     pub reads: Vec<String>,
     /// Request fields the call site sets, by Rust name, sorted. A field of a
     /// nested struct literal is a dotted path, and its parent is also in the
@@ -373,7 +373,8 @@ pub struct ListenerDescriptor {
     /// The event type's path, as the attribute gives it.
     pub event: String,
     /// Payload fields the consumer reads, by Rust name, sorted. A field
-    /// inside a field is a dotted path: `address.city`.
+    /// inside a field is a dotted path: `address.city`. Each parent path is
+    /// also in the list: `address`.
     pub reads: Vec<String>,
 }
 

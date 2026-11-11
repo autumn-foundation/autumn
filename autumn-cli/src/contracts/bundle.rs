@@ -32,8 +32,8 @@ pub const IDENTITY_FORMAT: u32 = 3;
 
 /// The bundle format with a wire type on each field. An older CLI refuses
 /// it, because it would not compare the wire types and would approve a
-/// change of the JSON form. Only tests use it now: the reader does not need
-/// it to compare wire types.
+/// change of the JSON form. Only tests use it. The reader does not need it
+/// to compare wire types.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const WIRE_TYPE_FORMAT: u32 = 4;
 
@@ -2171,6 +2171,53 @@ mod tests {
         for field in payload.serialized.iter().chain(&payload.deserialized) {
             assert_eq!(field.wire_type, Some(WireType::object("core::Address")));
         }
+    }
+
+    #[test]
+    fn the_export_keeps_dotted_paths_and_sorts_them_by_byte() {
+        let dir = event_fixture();
+        let mut call = caller(
+            "show_item",
+            &["details_x", "details.size", "details", "details.color"],
+        );
+        call.calls[0].writes = Some(vec![
+            "details.color".to_owned(),
+            "name".to_owned(),
+            "details".to_owned(),
+        ]);
+        write(dir.path(), "caller.mesh-storefront.show_item.1.json", &call);
+        write(
+            dir.path(),
+            "listener.marketing.on_contact.1.json",
+            &listener(
+                "on_contact",
+                "core::ContactUpdated",
+                &["address.zip", "id", "address", "address.city"],
+            ),
+        );
+        let bundle = Bundle::from_dir(dir.path()).expect("bundle");
+        let [call] = bundle.callers.as_slice() else {
+            panic!("one call: {bundle:?}");
+        };
+        assert_eq!(
+            call.reads,
+            ["details", "details.color", "details.size", "details_x"]
+        );
+        assert_eq!(
+            call.writes.as_deref(),
+            Some(
+                [
+                    "details".to_owned(),
+                    "details.color".to_owned(),
+                    "name".to_owned()
+                ]
+                .as_slice()
+            )
+        );
+        let [l] = bundle.listeners.as_slice() else {
+            panic!("one listener: {bundle:?}");
+        };
+        assert_eq!(l.reads, ["address", "address.city", "address.zip", "id"]);
     }
 
     #[test]

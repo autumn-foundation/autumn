@@ -187,7 +187,7 @@ fn a_new_optional_nested_field_a_new_caller_reads_names_the_deploy_order() {
 
 #[test]
 fn a_nested_field_the_call_sets_and_the_callee_drops_is_a_break() {
-    // `NewItem { details: Details { color: Some(..), .. }, .. }` inline.
+    // `NewItem { details: Details { color: Some(c), ..Default::default() }, ..Default::default() }`.
     let report = golden_descriptors("nested_request_field_dropped", 3);
     assert!(
         report.contains("sets request field `details.color`, and the new callee ignores it"),

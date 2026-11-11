@@ -6,6 +6,7 @@
       "client": "CatalogClient",
       "method": "get_item",
       "reads": [
+        "details",
         "details.size"
       ],
       "writes": null

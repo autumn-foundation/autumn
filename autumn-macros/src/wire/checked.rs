@@ -9,8 +9,8 @@
 //! * the **write-set** — every request field an inline struct literal sets.
 //!
 //! A field inside a field is a dotted path: `item.details.color` reads
-//! `details.color`, and `Details { color, .. }` inside the request literal
-//! writes `details.color`. The descriptor holds the paths. The const
+//! `details` and `details.color`, and `Details { color }` inside the request
+//! literal writes `details.color`. The descriptor holds the paths. The const
 //! assertions use the first segment only: one build shares the nested type,
 //! so rustc itself rejects a nested field that is gone.
 //!
@@ -250,6 +250,30 @@ const VALUE_CALLBACKS: [&str; 7] = [
     "map_or_else",
 ];
 
+/// Methods that hand back the same value, or the value it wraps:
+/// `.unwrap()` on a call's result is still that call's result, and
+/// `catalog.clone()` is still that client. An adapter that changes only the
+/// error, only wraps the value, or only borrows it (`.map_err(f)`,
+/// `.context(…)`, `.ok()`, `.as_ref()`), keeps it too.
+const VALUE_ADAPTERS: [&str; 16] = [
+    "unwrap",
+    "expect",
+    "unwrap_or_default",
+    "clone",
+    "to_owned",
+    "map_err",
+    "inspect_err",
+    "context",
+    "with_context",
+    "ok",
+    "ok_or",
+    "ok_or_else",
+    "as_ref",
+    "as_mut",
+    "as_deref",
+    "as_deref_mut",
+];
+
 /// Macros whose tokens are never evaluated, so a field named inside one is not
 /// a read. `matches!` is not one: it evaluates its first argument, and its
 /// pattern cannot hold a `binding.field` read.
@@ -460,7 +484,7 @@ impl<'a> Analyzer<'a> {
         self.visit_block(&func.block);
         let found = self.payload_found.get();
         for call in &mut self.calls {
-            call.reads = without_prefixes(std::mem::take(&mut call.reads));
+            with_parents(call);
             call.payload_seen = found;
         }
         self.calls
@@ -482,8 +506,8 @@ impl<'a> Analyzer<'a> {
     /// Bind every name a pattern introduces.
     ///
     /// Only a plain `x` carries the incoming meaning. A struct pattern over a
-    /// response binds each field to that field's path, so `Item { details,
-    /// .. }` then `details.color` reads `details.color`. Other destructuring
+    /// response binds each field to its path: after `let Item { details, .. }
+    /// = item;`, `details.color` reads `details.color`. Other destructuring
     /// patterns bind [`Bound::Other`] and stop attribution.
     fn bind_pattern(&mut self, pat: &syn::Pat, bound: Bound) {
         match pat {
@@ -781,11 +805,14 @@ impl<'a> Analyzer<'a> {
         let mut reads = Vec::new();
         scan_tokens(
             &mac.tokens,
-            &|name| match self.lookup(name) {
-                Some(Bound::Response(target)) => Some(target),
-                _ => None,
+            &MacroScope {
+                resolve: &|name| match self.lookup(name) {
+                    Some(Bound::Response(target)) => Some(target),
+                    _ => None,
+                },
+                child: &|target, field| self.child(target, field),
             },
-            &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
             &mut reads,
         );
         for (target, field, span) in reads {
@@ -1025,26 +1052,7 @@ fn peel_until<'e>(expr: &'e Expr, stop: &dyn Fn(&syn::ExprMethodCall) -> bool) -
         // that client. An adapter that changes only the error, only wraps the
         // value, or only borrows it (`.map_err(f)`, `.context(…)`, `.ok()`,
         // `.as_ref()`), keeps it too.
-        Expr::MethodCall(e)
-            if matches!(
-                e.method.to_string().as_str(),
-                "unwrap"
-                    | "expect"
-                    | "clone"
-                    | "to_owned"
-                    | "map_err"
-                    | "inspect_err"
-                    | "context"
-                    | "with_context"
-                    | "ok"
-                    | "ok_or"
-                    | "ok_or_else"
-                    | "as_ref"
-                    | "as_mut"
-                    | "as_deref"
-                    | "as_deref_mut"
-            ) =>
-        {
+        Expr::MethodCall(e) if VALUE_ADAPTERS.contains(&e.method.to_string().as_str()) => {
             peel(&e.receiver)
         }
         other => other,
@@ -1140,32 +1148,163 @@ fn top_fields(paths: &[String]) -> Vec<String> {
     set.into_iter().map(str::to_owned).collect()
 }
 
-/// `reads` sorted, without duplicates, and without a path that a longer read
-/// holds: `details.color` also reads `details`.
-fn without_prefixes(mut reads: Vec<String>) -> Vec<String> {
-    reads.sort();
-    reads.dedup();
-    let all = reads.clone();
-    reads.retain(|read| {
-        !all.iter().any(|other| {
-            other
-                .strip_prefix(read.as_str())
-                .is_some_and(|rest| rest.starts_with('.'))
-        })
-    });
-    reads
+/// Sort the reads of `call`, drop duplicates, and add each parent path:
+/// `details.color` also reads `details`. A parent gets the span of its first
+/// read when it has none of its own.
+///
+/// The parent keeps the top-level read in the descriptor. An older CLI does
+/// not find a dotted path, but it still finds `details`.
+fn with_parents(call: &mut Call) {
+    let mut all = Vec::new();
+    for read in &call.reads {
+        let span = call.read_spans.get(read).copied();
+        for (at, _) in read.match_indices('.') {
+            let parent = &read[..at];
+            if let Some(span) = span {
+                call.read_spans.entry(parent.to_owned()).or_insert(span);
+            }
+            all.push(parent.to_owned());
+        }
+        all.push(read.clone());
+    }
+    all.sort();
+    all.dedup();
+    call.reads = all;
 }
 
 /// A name a macro body binds for itself, and the token range it covers.
 ///
 /// A closure's parameters (`|item| …`) cover its body: the tokens up to the
 /// next `,` at the same level, or the end of the group. A `for item in … { }`
-/// binding covers its `{ }` block. Outside that range the name keeps its outer
-/// meaning, so a read of the payload there is still a read.
+/// binding covers its `{ }` block. An `if let` or `while let` covers its
+/// `{ }` block, and a plain `let … ;` covers the tokens after the `;`. The
+/// names a `match` arm binds cover the `{ }` block of the `match`. Outside
+/// that range the name keeps its outer meaning, so a read of the payload
+/// there is still a read.
 struct MacroBinding {
     names: Vec<String>,
     from: usize,
     to: usize,
+    /// For a `let` that binds one name to the whole value (`d`, `Some(d)`):
+    /// that name, and the token range of the value.
+    value: Option<(String, std::ops::Range<usize>)>,
+}
+
+/// Whether `tt` is the punctuation `ch`.
+fn is_punct(tt: Option<&proc_macro2::TokenTree>, ch: char) -> bool {
+    matches!(tt, Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ch)
+}
+
+/// Whether `tt` is a `{ }` group.
+fn is_brace(tt: &proc_macro2::TokenTree) -> bool {
+    matches!(tt, proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace)
+}
+
+/// Every identifier in `tts`, also inside groups.
+fn idents_in(tts: &[proc_macro2::TokenTree], out: &mut Vec<String>) {
+    for tt in tts {
+        match tt {
+            proc_macro2::TokenTree::Ident(id) => out.push(field_name(id)),
+            proc_macro2::TokenTree::Group(g) => {
+                let inner: Vec<_> = g.stream().into_iter().collect();
+                idents_in(&inner, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The one name a pattern binds to the whole value: `d`, `mut d`, `Some(d)`
+/// or `Ok(d)`.
+fn whole_value_name(pat: &[proc_macro2::TokenTree]) -> Option<String> {
+    match pat {
+        [proc_macro2::TokenTree::Ident(name)] => Some(field_name(name)),
+        [
+            proc_macro2::TokenTree::Ident(m),
+            proc_macro2::TokenTree::Ident(name),
+        ] if m == "mut" => Some(field_name(name)),
+        [
+            proc_macro2::TokenTree::Ident(wrap),
+            proc_macro2::TokenTree::Group(g),
+        ] if (wrap == "Some" || wrap == "Ok")
+            && g.delimiter() == proc_macro2::Delimiter::Parenthesis =>
+        {
+            let inner: Vec<_> = g.stream().into_iter().collect();
+            whole_value_name(&inner)
+        }
+        _ => None,
+    }
+}
+
+/// The `let` binding whose keyword is at `i`, if its `=` is found.
+fn let_binding(tts: &[proc_macro2::TokenTree], i: usize) -> Option<MacroBinding> {
+    // The `=` of the binding: not part of `==`, `=>`, `<=` or `>=`.
+    let eq = (i + 1..tts.len()).find(|&k| match &tts[k] {
+        proc_macro2::TokenTree::Punct(p) => {
+            p.as_char() == '='
+                && p.spacing() == proc_macro2::Spacing::Alone
+                && !matches!(&tts[k - 1], proc_macro2::TokenTree::Punct(q)
+                    if q.spacing() == proc_macro2::Spacing::Joint)
+        }
+        _ => false,
+    })?;
+    let pat = &tts[i + 1..eq];
+    let mut names = Vec::new();
+    idents_in(pat, &mut names);
+    let conditional = matches!(
+        i.checked_sub(1).and_then(|k| tts.get(k)),
+        Some(proc_macro2::TokenTree::Ident(kw)) if kw == "if" || kw == "while"
+    );
+    let (value_end, from, to) = if conditional {
+        let body = (eq + 1..tts.len()).find(|&k| is_brace(&tts[k]))?;
+        (body, body, body + 1)
+    } else {
+        let semi = (eq + 1..tts.len())
+            .find(|&k| is_punct(tts.get(k), ';'))
+            .unwrap_or(tts.len());
+        (semi, semi + 1, tts.len())
+    };
+    let value = whole_value_name(pat).map(|name| (name, eq + 1..value_end));
+    Some(MacroBinding {
+        names,
+        from,
+        to,
+        value,
+    })
+}
+
+/// The names the arms of a `match` body bind: each arm's pattern, up to its
+/// `if` guard or its `=>`.
+fn match_arm_names(body: &[proc_macro2::TokenTree]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut start = 0;
+    let mut k = 0;
+    while k < body.len() {
+        let arrow = is_punct(body.get(k), '=') && is_punct(body.get(k + 1), '>');
+        if arrow {
+            let pat_end = (start..k)
+                .find(|&j| matches!(&body[j], proc_macro2::TokenTree::Ident(id) if id == "if"))
+                .unwrap_or(k);
+            idents_in(&body[start..pat_end], &mut names);
+            k += 2;
+            // The arm body: one `{ }` group, or the tokens up to a `,`.
+            if body.get(k).is_some_and(is_brace) {
+                k += 1;
+                if is_punct(body.get(k), ',') {
+                    k += 1;
+                }
+            } else {
+                while k < body.len() && !is_punct(body.get(k), ',') {
+                    k += 1;
+                }
+                k += 1;
+            }
+            start = k;
+            continue;
+        }
+        k += 1;
+    }
+    names
 }
 
 /// The bindings one level of a macro body makes. Nested groups are scanned
@@ -1178,34 +1317,50 @@ fn macro_bindings(tts: &[proc_macro2::TokenTree]) -> Vec<MacroBinding> {
             proc_macro2::TokenTree::Punct(p) if p.as_char() == '|' && opens_closure(tts, i) => {
                 let mut names = Vec::new();
                 let mut j = i + 1;
-                while j < tts.len()
-                    && !matches!(&tts[j], proc_macro2::TokenTree::Punct(p) if p.as_char() == '|')
-                {
+                while j < tts.len() && !is_punct(tts.get(j), '|') {
                     if let proc_macro2::TokenTree::Ident(id) = &tts[j] {
                         names.push(id.to_string());
                     }
                     j += 1;
                 }
                 let to = (j + 1..tts.len())
-                    .find(|&k| matches!(&tts[k], proc_macro2::TokenTree::Punct(p) if p.as_char() == ','))
+                    .find(|&k| is_punct(tts.get(k), ','))
                     .unwrap_or(tts.len());
                 out.push(MacroBinding {
                     names,
                     from: j + 1,
                     to,
+                    value: None,
                 });
                 i = j + 1;
             }
             proc_macro2::TokenTree::Ident(id) if id == "for" => {
                 if let Some(proc_macro2::TokenTree::Ident(name)) = tts.get(i + 1)
-                    && let Some(body) = (i + 2..tts.len()).find(|&k| {
-                        matches!(&tts[k], proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace)
-                    })
+                    && let Some(body) = (i + 2..tts.len()).find(|&k| is_brace(&tts[k]))
                 {
                     out.push(MacroBinding {
                         names: vec![name.to_string()],
                         from: body,
                         to: body + 1,
+                        value: None,
+                    });
+                }
+                i += 1;
+            }
+            proc_macro2::TokenTree::Ident(id) if id == "let" => {
+                out.extend(let_binding(tts, i));
+                i += 1;
+            }
+            proc_macro2::TokenTree::Ident(id) if id == "match" => {
+                if let Some(body) = (i + 1..tts.len()).find(|&k| is_brace(&tts[k]))
+                    && let proc_macro2::TokenTree::Group(g) = &tts[body]
+                {
+                    let inner: Vec<_> = g.stream().into_iter().collect();
+                    out.push(MacroBinding {
+                        names: match_arm_names(&inner),
+                        from: body,
+                        to: body + 1,
+                        value: None,
                     });
                 }
                 i += 1;
@@ -1241,56 +1396,141 @@ fn is_operand(token: Option<&proc_macro2::TokenTree>) -> bool {
     }
 }
 
+/// How a macro body's names resolve: the outer scope, and how to step into
+/// a field of a value.
+struct MacroScope<'s, T> {
+    /// What an outer name holds.
+    resolve: &'s dyn Fn(&str) -> Option<T>,
+    /// The value of a field inside a value.
+    child: &'s dyn Fn(T, &str) -> T,
+}
+
+/// The names a macro body binds over one token: `None` hides the outer
+/// meaning, `Some` is a value inside a response.
+type MacroNames<T> = BTreeMap<String, Option<T>>;
+
 /// Record every `binding.field` in a token stream, resolving the binding
-/// through `resolve`. `binding.a.b` records the path `a.b`.
+/// through `scope`. `binding.a.b` records the path `a.b`.
 ///
 /// Token-level, because a macro body is not parsed Rust. Four shapes that look
 /// the same are excluded: `binding.method(…)`, `binding.field::<T>()`,
 /// `binding.mac!(…)`, and `other.binding.field` — where `binding` is itself a
 /// field of something else. A method, a turbofish or a macro after a later
-/// segment ends the path before that segment.
+/// segment ends the path before that segment. A `?` between segments does
+/// not.
 fn scan_tokens<T: Copy>(
     tokens: &proc_macro2::TokenStream,
-    resolve: &dyn Fn(&str) -> Option<T>,
-    shadowed: &std::collections::BTreeSet<String>,
+    scope: &MacroScope<'_, T>,
+    outer: &MacroNames<T>,
     reads: &mut Vec<(T, String, Span)>,
 ) {
     let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
     let bindings = macro_bindings(&tts);
-    for (i, tt) in tts.iter().enumerate() {
-        // The names the macro binds over this token, on top of the outer ones.
-        let mut here = shadowed.clone();
-        for b in bindings.iter().filter(|b| (b.from..b.to).contains(&i)) {
-            here.extend(b.names.iter().cloned());
+    // The names in force at token `i`: the outer ones, then each binding of
+    // this level that covers `i`.
+    let names_at = |i: usize, values: &[Option<T>]| {
+        let mut here = outer.clone();
+        for (b, value) in bindings.iter().zip(values) {
+            if !(b.from..b.to).contains(&i) {
+                continue;
+            }
+            for name in &b.names {
+                here.insert(name.clone(), None);
+            }
+            if let (Some((name, _)), Some(target)) = (&b.value, value) {
+                here.insert(name.clone(), Some(*target));
+            }
         }
+        here
+    };
+    // A `let` over a response value binds its name to that value. The value
+    // is read in the names in force where it is written.
+    let mut values: Vec<Option<T>> = Vec::with_capacity(bindings.len());
+    for b in &bindings {
+        let value = b.value.as_ref().and_then(|(_, range)| {
+            let here = names_at(range.start, &values);
+            value_of(&tts[range.clone()], scope, &here)
+        });
+        values.push(value);
+    }
+    for (i, tt) in tts.iter().enumerate() {
+        let here = names_at(i, &values);
         if let proc_macro2::TokenTree::Group(group) = tt {
-            scan_tokens(&group.stream(), resolve, &here, reads);
+            scan_tokens(&group.stream(), scope, &here, reads);
             continue;
         }
         let proc_macro2::TokenTree::Ident(base) = tt else {
             continue;
         };
-        if matches!(tts.get(i.wrapping_sub(1)), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '.')
-        {
+        if is_punct(i.checked_sub(1).and_then(|k| tts.get(k)), '.') {
             continue;
         }
-        if here.contains(&base.to_string()) {
-            continue;
-        }
-        let Some(target) = resolve(&base.to_string()) else {
+        let Some(target) = lookup_name(&base.to_string(), scope, &here) else {
             continue;
         };
         let mut path: Vec<String> = Vec::new();
         let mut span = None;
-        let mut at = i + 1;
+        let mut at = skip_try(&tts, i + 1);
         while let Some(field) = field_after(&tts, at) {
             path.push(field_name(field));
             span.get_or_insert_with(|| field.span());
-            at += 2;
+            at = skip_try(&tts, at + 2);
         }
         if let Some(span) = span {
             reads.push((target, path.join("."), span));
         }
+    }
+}
+
+/// What `name` holds in a macro body: a binding of the body, else the outer
+/// meaning.
+fn lookup_name<T: Copy>(name: &str, scope: &MacroScope<'_, T>, here: &MacroNames<T>) -> Option<T> {
+    here.get(name)
+        .map_or_else(|| (scope.resolve)(name), |bound| *bound)
+}
+
+/// The value inside a response that `tts` holds: `&item.details`,
+/// `item.details.as_ref()`. `None` for any other expression.
+fn value_of<T: Copy>(
+    tts: &[proc_macro2::TokenTree],
+    scope: &MacroScope<'_, T>,
+    here: &MacroNames<T>,
+) -> Option<T> {
+    let mut k = 0;
+    while is_punct(tts.get(k), '&')
+        || matches!(tts.get(k), Some(proc_macro2::TokenTree::Ident(m)) if m == "mut")
+    {
+        k += 1;
+    }
+    let Some(proc_macro2::TokenTree::Ident(base)) = tts.get(k) else {
+        return None;
+    };
+    let mut target = lookup_name(&base.to_string(), scope, here)?;
+    k = skip_try(tts, k + 1);
+    loop {
+        if let Some(field) = field_after(tts, k) {
+            target = (scope.child)(target, &field_name(field));
+            k = skip_try(tts, k + 2);
+        } else if is_punct(tts.get(k), '.')
+            && matches!(tts.get(k + 1), Some(proc_macro2::TokenTree::Ident(m))
+                if VALUE_ADAPTERS.contains(&m.to_string().as_str()))
+            && matches!(tts.get(k + 2), Some(proc_macro2::TokenTree::Group(g))
+                if g.delimiter() == proc_macro2::Delimiter::Parenthesis)
+        {
+            k = skip_try(tts, k + 3);
+        } else {
+            break;
+        }
+    }
+    (k == tts.len()).then_some(target)
+}
+
+/// `at`, or the index after it when `tts[at]` is a `?`.
+fn skip_try(tts: &[proc_macro2::TokenTree], at: usize) -> usize {
+    if is_punct(tts.get(at), '?') {
+        at + 1
+    } else {
+        at
     }
 }
 
@@ -1759,24 +1999,24 @@ mod tests {
     fn a_field_of_a_field_is_a_dotted_read() {
         assert_eq!(
             nested_reads("let _ = item.details.color;"),
-            ["details.color"]
+            ["details", "details.color"]
         );
         assert_eq!(
             nested_reads("let _ = item.a.b.c;"),
-            ["a.b.c"],
-            "every level is in the path"
+            ["a", "a.b", "a.b.c"],
+            "every level is in the read-set"
         );
     }
 
     #[test]
-    fn a_read_that_a_longer_read_holds_is_dropped() {
+    fn a_dotted_read_keeps_each_parent_path() {
         assert_eq!(
             nested_reads("let _ = &item.details; let _ = item.details.color;"),
-            ["details.color"]
+            ["details", "details.color"]
         );
         assert_eq!(
             nested_reads("let _ = item.details_x; let _ = item.details.color;"),
-            ["details.color", "details_x"],
+            ["details", "details.color", "details_x"],
             "a name that only starts the same is another field"
         );
     }
@@ -1785,9 +2025,64 @@ mod tests {
     fn a_method_call_ends_the_dotted_path() {
         assert_eq!(
             nested_reads("let _ = item.details.color.len();"),
-            ["details.color"]
+            ["details", "details.color"]
         );
         assert_eq!(nested_reads("let _ = item.details.label();"), ["details"]);
+    }
+
+    #[test]
+    fn a_try_between_segments_keeps_the_dotted_path() {
+        assert_eq!(
+            nested_reads("html! { (item.details?.color) }"),
+            ["details", "details.color"]
+        );
+    }
+
+    #[test]
+    fn unwrap_or_default_keeps_the_dotted_path() {
+        assert_eq!(
+            nested_reads("let _ = item.details.unwrap_or_default().color;"),
+            ["details", "details.color"]
+        );
+    }
+
+    #[test]
+    fn a_let_inside_a_macro_body_binds_a_nested_field() {
+        for body in [
+            "html! { @let d = &item.details; (d.color) }",
+            "html! { @if let Some(d) = &item.details { (d.color) } }",
+            "html! { @if let Some(d) = item.details.as_ref() { (d.color) } }",
+        ] {
+            assert_eq!(nested_reads(body), ["details", "details.color"], "{body}");
+        }
+    }
+
+    #[test]
+    fn a_let_inside_a_macro_body_shadows_the_outer_name() {
+        for body in [
+            "html! { @if let Some(item) = other { (item.foo) } }",
+            "html! { @let item = other(); (item.foo) }",
+            "html! { @match other { Some(item) => (item.foo), None => {} } }",
+            "html! { @while let Some(item) = it.next() { (item.foo) } }",
+        ] {
+            assert!(nested_reads(body).is_empty(), "{body}");
+        }
+        assert_eq!(
+            nested_reads("html! { @if let Some(item) = item.next { (item.foo) } (item.bar) }"),
+            ["bar", "next", "next.foo"],
+            "the right side and the code after the body see the outer name"
+        );
+    }
+
+    #[test]
+    fn a_let_inside_a_macro_body_over_a_sub_binding_extends_its_path() {
+        assert_eq!(
+            nested_reads(
+                "let Item { details, .. } = item; \
+                 html! { @if let Some(details) = details.extra { (details.color) } }"
+            ),
+            ["details", "details.extra", "details.extra.color"]
+        );
     }
 
     #[test]
@@ -1799,15 +2094,15 @@ mod tests {
     fn a_dotted_read_inside_a_macro_body_is_in_the_read_set() {
         assert_eq!(
             nested_reads("html! { (item.details.color) }"),
-            ["details.color"]
+            ["details", "details.color"]
         );
         assert_eq!(
             nested_reads("html! { (item.details.size.max(1)) }"),
-            ["details.size"]
+            ["details", "details.size"]
         );
         assert_eq!(
             nested_reads("html! { (item.details.color != x) }"),
-            ["details.color"]
+            ["details", "details.color"]
         );
         for call in ["label()", "parse::<u32>()", "mac!()"] {
             assert_eq!(
@@ -1822,11 +2117,11 @@ mod tests {
     fn a_binding_of_a_nested_field_keeps_its_path() {
         assert_eq!(
             nested_reads("let details = &item.details; let _ = details.color;"),
-            ["details.color"]
+            ["details", "details.color"]
         );
         assert_eq!(
             nested_reads("let d = item.details.clone(); html! { (d.size) }"),
-            ["details.size"]
+            ["details", "details.size"]
         );
     }
 
@@ -1842,11 +2137,11 @@ mod tests {
     fn a_destructured_nested_field_keeps_its_path() {
         assert_eq!(
             nested_reads("let Item { details, .. } = item; let _ = details.color;"),
-            ["details.color"]
+            ["details", "details.color"]
         );
         assert_eq!(
             nested_reads("let Item { details: Details { color, .. }, id } = item;"),
-            ["details.color", "id"]
+            ["details", "details.color", "id"]
         );
     }
 
@@ -1854,11 +2149,11 @@ mod tests {
     fn an_unwrapped_optional_nested_field_keeps_its_path() {
         assert_eq!(
             nested_reads("let _ = item.details.as_ref().unwrap().color;"),
-            ["details.color"]
+            ["details", "details.color"]
         );
         assert_eq!(
             nested_reads("let _ = item.details.map(|d| d.color);"),
-            ["details.color"]
+            ["details", "details.color"]
         );
     }
 
@@ -1933,7 +2228,7 @@ mod tests {
         let clients: Vec<Path> = vec![syn::parse_str("CatalogClient").expect("client path")];
         let calls = Analyzer::new(&clients).run(&func);
         let got = caller_descriptor("storefront", "page", &calls, &clients);
-        assert_eq!(got.calls[0].reads, ["details.color"]);
+        assert_eq!(got.calls[0].reads, ["details", "details.color"]);
         assert_eq!(
             got.calls[1].writes.as_deref(),
             Some(["details".to_owned(), "details.color".to_owned()].as_slice())

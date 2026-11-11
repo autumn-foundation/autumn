@@ -9,6 +9,16 @@
   new caller reads. It reports a nested field that the call site sets and
   the callee drops.
 
+### Fixed
+
+- **wire contracts:** `autumn contracts check` no longer counts a request
+  field that the type may skip (`skip_serializing_if`) as sent only because
+  the call site sets it. It counts as sent when the caller's own release
+  also requires it. A field such as `tags: vec![]` is not on the wire.
+- **wire contracts:** a `let`, an `if let`, a `while let` or a `match` inside
+  a macro body (maud `@let`, `@if let`, `@match`) binds its own names. A
+  name it binds no longer counts as a response read.
+
 ### Breaking Changes
 
 - **Breaking:** `autumn contracts export` writes bundle format 5, which an

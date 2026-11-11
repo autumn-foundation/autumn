@@ -454,7 +454,7 @@ mod tests {
                 "async fn on(s: AppState, event: ContactUpdated) -> R { \
                  let _ = event.address.city; tracing::info!(\"{}\", event.address.zip); Ok(()) }"
             ),
-            ["address.city", "address.zip"]
+            ["address", "address.city", "address.zip"]
         );
     }
 

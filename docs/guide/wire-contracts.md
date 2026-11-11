@@ -114,7 +114,7 @@ missing.
 * the **write-set** — every request field an inline struct literal sets.
 
 A field inside a field is a dotted path. `item.details.color` reads
-`details.color`. `NewItem { name, details: Details { color } }` writes
+`details` and `details.color`. `NewItem { name, details: Details { color } }` writes
 `details`, `details.color` and `name`. The const assertions check the first segment
 only. Both ends of one build share the nested type, so rustc checks the rest.
 
@@ -265,8 +265,11 @@ serves with the types of its release. The rules:
 * **Response decode.** The callee must always produce each field the caller's
   type needs to decode, also when the caller does not read it.
 * **Request required.** The caller must always send each field the callee
-  requires. A field is sent when the caller's type always serializes it, or
-  when the call site sets it.
+  requires. A field is sent when the caller's type always serializes it. A
+  field the type may skip (`skip_serializing_if`) is sent when the caller's
+  own release requires it and the call site sets it. A set field alone is
+  not enough: `tags: vec![]` is not on the wire. When the request is not an
+  inline literal, the first condition is enough.
 * **Request dropped.** The callee must accept each field the call site sets.
 * **Closed objects.** With `#[serde(deny_unknown_fields)]`, the other side must
   not send an unknown key.
@@ -655,7 +658,8 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
   `routes![mesh_catalog::get_item]` to have the check judge it.
 * A nested read is found through a field (`item.details.color`), a binding
   of a field (`let d = &item.details;`), a struct pattern, an adapter such as
-  `.unwrap()` or `.as_ref()`, and a callback such as `.map(|d| d.color)`. A
+  `.unwrap()` or `.as_ref()`, a callback such as `.map(|d| d.color)`, and a
+  maud `@let` or `@if let` such as `@if let Some(d) = &item.details`. A
   read through an index, a loop, a method or another function stops at the
   field before it. `item.lines[0].sku` reads `lines`. Then the check does not see
   the removal of an *optional* field inside it. A *required* nested field is
