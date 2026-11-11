@@ -92,9 +92,10 @@ jobs:
       # protoc is required by telemetry-otlp in both Phase A (each-feature sweep)
       # and Phase B (curated combo). It is not available in the standard ubuntu-latest image.
       - name: Install protoc (required for telemetry-otlp)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+        # GitHub Releases, not apt: the runner's Ubuntu mirror can fail DNS.
+        uses: taiki-e/install-action@v2.89.0
+        with:
+          tool: protoc
 
       - name: Install cargo-hack
         # Pin @v2 and pass the tool explicitly. The bare @cargo-hack tag form can

@@ -3214,9 +3214,10 @@ jobs:
         run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
       - name: Install protoc (required for telemetry-otlp)
         # prost/tonic build scripts want it, and ubuntu-latest does not ship it.
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+        # GitHub Releases, not apt: the runner's Ubuntu mirror can fail DNS.
+        uses: taiki-e/install-action@v2.89.0
+        with:
+          tool: protoc
       - name: Clippy (autumn-web lib, sqlite + telemetry-otlp)
         # The durable SQLite job backend persists a W3C trace context, so its
         # `telemetry-otlp` arms only compile under this pair (#1907). Without
