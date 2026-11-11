@@ -1,0 +1,9 @@
+Wire contracts: the current build against the deployed release.
+
+If the callees ship first (new callees, deployed callers): 1 break(s)
+  - catalog.get_item (GET /items/{id}): response field `created_at` is `DateTime<Utc> as integer(i64, unix-seconds)` in the new callee, and caller `mesh-storefront::show_item` decodes it as `DateTime<Utc> as string(date-time)`
+
+If the callers ship first (new callers, deployed callees): 1 break(s)
+  - catalog.get_item (GET /items/{id}): response field `created_at` is `DateTime<Utc> as string(date-time)` in the deployed callee, and caller `mesh-storefront::show_item` decodes it as `DateTime<Utc> as integer(i64, unix-seconds)`
+
+Verdict: not safe in any deploy order. Keep the old shape or route until no deployed release needs it.

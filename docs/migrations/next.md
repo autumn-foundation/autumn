@@ -508,6 +508,36 @@ or stay opaque.
 
 ---
 
+### Wire contracts: bundle format 4
+
+**Why:** each field now records its wire type, the JSON form serde writes.
+The check compares it, so a new JSON form with the same Rust type is
+reported. An older CLI would not compare wire types, so it refuses the new
+format.
+
+**You are affected only if a job reads a bundle from
+`autumn contracts export` with an older CLI.** The build does not change.
+
+**Before (`{X.Y}`):**
+
+```bash
+autumn contracts check --against deployed.json  # CLI {X.Y}, bundle format 3
+```
+
+**After (`{(X+1).0}`):**
+
+```bash
+autumn contracts check --against deployed.json  # CLI {(X+1).0}, bundle format 4
+```
+
+Upgrade the CLI on every job that reads the bundle. This CLI reads formats
+1 to 4. When one of the two bundles is format 3 or older, the check
+does not compare wire types.
+
+**Automation:** `manual` — upgrade the CLI in each job.
+
+---
+
 ### State: `AppState` getters are no longer `const fn`
 
 **Why:** `AppState` holds its fields behind one `Arc`, so a clone is one

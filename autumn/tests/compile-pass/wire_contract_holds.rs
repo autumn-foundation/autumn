@@ -11,6 +11,27 @@ pub struct Item {
     // Renamed on the wire, and sometimes absent: neither is a break.
     #[serde(rename = "priceCents", skip_serializing_if = "Option::is_none")]
     pub price_cents: Option<u32>,
+    // A custom serde function, with its wire type named.
+    #[serde(with = "seconds")]
+    #[wire(type = "integer", format = "unix-seconds")]
+    pub created_at: u64,
+    // An `Option` under another name.
+    #[wire(type = "string", nullable)]
+    pub nickname: Nickname,
+}
+
+/// An `Option` under another name.
+pub type Nickname = Option<String>;
+
+/// Writes seconds as a plain integer.
+mod seconds {
+    pub fn serialize<S: serde::Serializer>(value: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(*value)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        <u64 as serde::Deserialize>::deserialize(d)
+    }
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize, WireShape)]

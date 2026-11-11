@@ -13,8 +13,9 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, FieldsNamed};
 
-use crate::wire::ir::{TypeDescriptor, WireFieldDescriptor, WireTypeDescriptor};
+use crate::wire::ir::{TypeDescriptor, WireFieldDescriptor, WireType, WireTypeDescriptor};
 use crate::wire::store;
+use crate::wire::wire_type::{wire_attrs, wire_type_of};
 use autumn_macros_support::schema;
 
 /// One field's shape in one direction, ready to emit or to serialize.
@@ -168,7 +169,9 @@ pub fn wire_type_descriptor(input: &DeriveInput) -> Result<WireTypeDescriptor, s
             unit: true,
         });
     };
-    let (serialized, deserialized) = directions(named, rename_all.as_deref(), container_default)?;
+    let own = input.ident.to_string();
+    let (serialized, deserialized) =
+        directions(named, &own, rename_all.as_deref(), container_default)?;
     Ok(WireTypeDescriptor {
         name: input.ident.to_string(),
         serialized: serialized.fields,
@@ -233,6 +236,7 @@ fn cfg_attr_refusal(attr: &syn::Attribute) -> syn::Error {
 /// Split a struct's fields into what it produces and what it accepts.
 fn directions(
     named: &FieldsNamed,
+    own: &str,
     rename_all: Option<&str>,
     container_default: bool,
 ) -> Result<(Direction, Direction), syn::Error> {
@@ -280,8 +284,7 @@ fn directions(
             continue;
         };
         let ty = render_type(&field.ty);
-        let opaque = wire_opaque(field)?;
-        let optional = schema::is_option_type(&field.ty);
+        let wire = wire_attrs(field)?;
         let defaulted = container_default || schema::has_serde_default(&field.attrs);
         // `#[serde(with)]` / `#[serde(deserialize_with)]` replace the whole
         // field deserializer, and serde's generated code then returns
@@ -290,17 +293,39 @@ fn directions(
         // fills it in.
         let custom_de =
             schema::serde_valued_key(&field.attrs, &["with", "deserialize_with"]).is_some();
+        let custom_ser =
+            schema::serde_valued_key(&field.attrs, &["with", "serialize_with"]).is_some();
+        // A custom serde function can write any JSON, and only an override
+        // names it. With a custom function on one side only, the override
+        // names that side, and serde's own form holds on the other.
+        let one_sided = custom_ser != custom_de;
+        let named = |custom: bool| wire.wire_type.as_ref().filter(|_| custom || !one_sided);
+        let option = schema::is_option_type(&field.ty);
+        let mapped = wire_type_of(&field.ty, own, wire.opaque);
+        let wire_type = |custom: bool| match named(custom) {
+            Some(named) if custom => named.clone(),
+            // serde still writes `null` for `None`.
+            Some(named) if option => WireType::nullable(named.clone()),
+            Some(named) => named.clone(),
+            None if custom => WireType::Any,
+            None => mapped.clone(),
+        };
+        // An override says what is on the wire, so the export does not look
+        // for a shape of the Rust type on that side.
+        let opaque = |custom: bool| wire.opaque || named(custom).is_some();
+        let optional = option || matches!(named(custom_de), Some(WireType::Nullable { .. }));
 
         if !skip_serializing {
             serialized.push(WireFieldDescriptor {
                 rust_name: rust_name.clone(),
                 wire_name: wire_name.clone(),
                 ty: ty.clone(),
+                wire_type: Some(wire_type(custom_ser)),
                 // A conditionally-skipped field may be absent from a response,
                 // so a caller cannot count on it arriving.
                 required: !schema::field_has_skip_serializing_if(field),
                 aliases: Vec::new(),
-                opaque,
+                opaque: opaque(custom_ser),
                 nested: Vec::new(),
             });
         }
@@ -309,12 +334,13 @@ fn directions(
                 rust_name,
                 wire_name,
                 ty,
+                wire_type: Some(wire_type(custom_de)),
                 // `Option<T>`, a field default, or a container default each
                 // let the key be absent from a request body — but a custom
                 // deserializer takes the `Option` shortcut away.
                 required: !defaulted && (custom_de || !optional),
                 aliases: serde_aliases(field),
-                opaque,
+                opaque: opaque(custom_de),
                 nested: Vec::new(),
             });
         }
@@ -328,12 +354,12 @@ fn directions(
     ))
 }
 
-/// Refuse a `#[wire(…)]` that is not `#[wire(opaque)]` on a field.
+/// Refuse a `#[wire(…)]` on the container, or a bad one on a field.
 ///
 /// `#[event(opaque)]` reads no shape, so it calls this alone.
 ///
 /// # Errors
-/// A `#[wire]` on the container, or an unknown `wire` argument on a field.
+/// A `#[wire]` on the container, or a bad `#[wire(…)]` on a field.
 pub fn check_wire_attrs(input: &DeriveInput) -> Result<(), syn::Error> {
     if let Some(attr) = input.attrs.iter().find(|a| a.path().is_ident("wire")) {
         return Err(syn::Error::new_spanned(
@@ -343,30 +369,10 @@ pub fn check_wire_attrs(input: &DeriveInput) -> Result<(), syn::Error> {
     }
     if let Data::Struct(data) = &input.data {
         for field in &data.fields {
-            wire_opaque(field)?;
+            wire_attrs(field)?;
         }
     }
     Ok(())
-}
-
-/// Whether a field has `#[wire(opaque)]`. Any other `wire` argument is
-/// refused.
-///
-/// An opaque field is compared by its type name only. Use it for a type that
-/// cannot derive `WireShape`, such as an enum.
-fn wire_opaque(field: &syn::Field) -> Result<bool, syn::Error> {
-    let mut opaque = false;
-    for attr in field.attrs.iter().filter(|a| a.path().is_ident("wire")) {
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("opaque") {
-                opaque = true;
-                Ok(())
-            } else {
-                Err(meta.error("unknown `wire` argument; expected `opaque`"))
-            }
-        })?;
-    }
-    Ok(opaque)
 }
 
 /// Every `#[serde(alias = "…")]` on a field, in source order.
@@ -601,7 +607,8 @@ mod tests {
 
     #[test]
     fn an_unknown_wire_argument_is_refused() {
-        assert!(refusal("struct Item { #[wire(opaq)] status: Status }").contains("opaque"));
+        let err = refusal("struct Item { #[wire(opaq)] status: Status }");
+        assert!(err.contains("opaque") && err.contains("type"), "{err}");
         assert!(refusal("#[wire(opaque)] struct Item { id: String }").contains("on a field"));
     }
 
@@ -696,6 +703,406 @@ mod tests {
         let d = type_descriptor("catalog", "api::items", &shape);
         assert_eq!(d.module, "api::items");
         assert_eq!(d.artifact_file_name(), "type.catalog.api.items.Item.json");
+    }
+
+    /// One field of each mapped type, and each override form.
+    const ALL_TYPES: &str = r#"
+        struct Everything {
+            text: String,
+            borrowed: &'static str,
+            letter: char,
+            cow: std::borrow::Cow<'static, str>,
+            boxed: Box<str>,
+            path: std::path::PathBuf,
+            i_8: i8,
+            i_16: i16,
+            i_32: i32,
+            i_64: i64,
+            i_128: i128,
+            i_size: isize,
+            u_8: u8,
+            u_16: u16,
+            u_32: u32,
+            u_64: u64,
+            u_128: u128,
+            u_size: usize,
+            non_zero: std::num::NonZeroU32,
+            non_zero_generic: NonZero<i16>,
+            f_32: f32,
+            f_64: f64,
+            flag: bool,
+            list: Vec<u32>,
+            deque: VecDeque<bool>,
+            set: HashSet<String>,
+            tree_set: BTreeSet<i64>,
+            array: [u8; 4],
+            slice: &'static [i64],
+            bytes: Vec<u8>,
+            maybe: Option<String>,
+            maybe_twice: Option<Option<u8>>,
+            map: HashMap<String, u64>,
+            tree_map: std::collections::BTreeMap<String, Vec<String>>,
+            index_map: IndexMap<String, bool>,
+            uuid_keys: HashMap<Uuid, f64>,
+            int_keys: BTreeMap<u32, String>,
+            tuple_keys: HashMap<(u8, u8), bool>,
+            json_map: serde_json::Map<String, serde_json::Value>,
+            date_time: chrono::DateTime<chrono::Utc>,
+            date_time_offset: DateTime<FixedOffset>,
+            naive_date: chrono::NaiveDate,
+            naive_date_time: NaiveDateTime,
+            naive_time: NaiveTime,
+            offset_date_time: time::OffsetDateTime,
+            primitive_date_time: time::PrimitiveDateTime,
+            time_date: time::Date,
+            uuid: uuid::Uuid,
+            decimal: rust_decimal::Decimal,
+            big_decimal: BigDecimal,
+            value: serde_json::Value,
+            number: serde_json::Number,
+            duration: std::time::Duration,
+            url: url::Url,
+            ip: std::net::IpAddr,
+            ipv4: Ipv4Addr,
+            ipv6: Ipv6Addr,
+            socket: SocketAddr,
+            raw: bytes::Bytes,
+            byte_buf: serde_bytes::ByteBuf,
+            rc: std::rc::Rc<str>,
+            path_ref: &'static std::path::Path,
+            linked: LinkedList<u8>,
+            heap: BinaryHeap<u16>,
+            index_set: IndexSet<String>,
+            cell: std::cell::Cell<bool>,
+            ref_cell: RefCell<String>,
+            reverse: std::cmp::Reverse<i32>,
+            wrapping: std::num::Wrapping<u64>,
+            small_vec: SmallVec<[u32; 4]>,
+            small_vec_2: SmallVec<u32, 4>,
+            boxed_alloc: Box<Details, Global>,
+            phantom: PhantomData<u8>,
+            naive_alias: sea_orm::prelude::DateTime,
+            bson_date_time: bson::DateTime,
+            nested: Details,
+            nested_path: crate::dto::Details,
+            nested_list: Vec<shared::Details>,
+            nested_box: Box<Details>,
+            nested_arc: std::sync::Arc<Details>,
+            recursive: Vec<Box<Self>>,
+            tuple: (u8, u8),
+            unit: (),
+            #[wire(opaque)]
+            status: Status,
+            #[wire(opaque)]
+            maybe_status: Option<Status>,
+            #[serde(with = "chrono::serde::ts_seconds")]
+            with_no_override: chrono::DateTime<chrono::Utc>,
+            #[serde(serialize_with = "as_text")]
+            serialize_with: u32,
+            #[serde(deserialize_with = "from_text")]
+            deserialize_with: u32,
+            #[serde(with = "chrono::serde::ts_seconds")]
+            #[wire(type = "integer", format = "unix-seconds")]
+            stamp: chrono::DateTime<chrono::Utc>,
+            #[wire(type = "string", nullable)]
+            nickname: MaybeName,
+            #[wire(type = "number")]
+            score: Score,
+            #[wire(type = "boolean")]
+            on: Toggle,
+            #[wire(type = "any")]
+            blob: Blob,
+            #[wire(type = "string", format = "email")]
+            email: Email,
+            #[serde(serialize_with = "as_text")]
+            #[wire(type = "string")]
+            text_out: u32,
+            #[serde(deserialize_with = "from_text")]
+            #[wire(type = "string")]
+            text_in: u32,
+            #[wire(type = "number")]
+            maybe_score: Option<Score>,
+            #[serde(with = "text")]
+            #[wire(type = "string")]
+            maybe_text: Option<u32>,
+            #[wire(opaque)]
+            opaque_self: Vec<Self>,
+        }
+    "#;
+
+    /// One line per field: name, Rust type, the serialized and the
+    /// deserialized wire type, and whether a request needs it.
+    fn wire_table(s: &WireTypeDescriptor) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (ser, de) in s.serialized.iter().zip(&s.deserialized) {
+            assert_eq!(ser.rust_name, de.rust_name);
+            let ser_type = ser.wire_type.as_ref().expect("serialized wire type");
+            let de_type = de.wire_type.as_ref().expect("deserialized wire type");
+            let both = if ser_type == de_type {
+                ser_type.to_string()
+            } else {
+                format!("{ser_type} / {de_type}")
+            };
+            let need = if de.required { "required" } else { "optional" };
+            let opaque = if de.opaque { ", opaque" } else { "" };
+            writeln!(
+                out,
+                "{}: {} => {both} ({need}{opaque})",
+                ser.rust_name, ser.ty
+            )
+            .expect("write to a string");
+        }
+        out
+    }
+
+    #[test]
+    fn the_wire_type_of_each_mapped_type_matches_the_golden_file() {
+        let golden = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/wire_types.txt");
+        let table = wire_table(&shape(ALL_TYPES));
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::write(golden, &table).expect("write golden");
+        }
+        let want = std::fs::read_to_string(golden).expect("golden file");
+        assert_eq!(
+            table, want,
+            "the wire types differ from {golden}. If the change is intended, run \
+             `UPDATE_GOLDEN=1 cargo test -p autumn-macros --lib wire_type` and review the diff."
+        );
+    }
+
+    fn wire(fields: &[WireFieldDescriptor], name: &str) -> WireType {
+        fields
+            .iter()
+            .find(|f| f.rust_name == name)
+            .and_then(|f| f.wire_type.clone())
+            .unwrap_or_else(|| panic!("no wire type for `{name}`"))
+    }
+
+    #[test]
+    fn serde_with_without_an_override_is_any() {
+        let s =
+            shape("struct T { #[serde(with = \"chrono::serde::ts_seconds\")] at: DateTime<Utc> }");
+        assert_eq!(wire(&s.serialized, "at"), WireType::Any);
+        assert_eq!(wire(&s.deserialized, "at"), WireType::Any);
+        // Any is not a nested shape: the field is not opaque.
+        assert!(!s.serialized[0].opaque);
+    }
+
+    #[test]
+    fn serialize_with_and_deserialize_with_change_one_direction_only() {
+        let s = shape(
+            "struct T { #[serde(serialize_with = \"f\")] a: u32, #[serde(deserialize_with = \"g\")] b: u32 }",
+        );
+        assert_eq!(wire(&s.serialized, "a"), WireType::Any);
+        assert_eq!(wire(&s.deserialized, "a"), WireType::integer(32, false));
+        assert_eq!(wire(&s.serialized, "b"), WireType::integer(32, false));
+        assert_eq!(wire(&s.deserialized, "b"), WireType::Any);
+    }
+
+    #[test]
+    fn a_wire_type_override_wins_over_serde_with() {
+        let s = shape(
+            "struct T { #[serde(with = \"ts_seconds\")] #[wire(type = \"integer\", format = \"unix-seconds\")] at: DateTime<Utc> }",
+        );
+        let want = WireType::Integer {
+            bits: 64,
+            signed: true,
+            format: Some("unix-seconds".to_owned()),
+        };
+        assert_eq!(wire(&s.serialized, "at"), want);
+        assert_eq!(wire(&s.deserialized, "at"), want);
+        assert_eq!(s.serialized[0].ty, "DateTime<Utc>", "ty is kept");
+        assert!(
+            s.serialized[0].opaque,
+            "an override is not looked up as a shape"
+        );
+    }
+
+    #[test]
+    fn an_option_alias_with_a_wire_type_override_is_nullable_and_optional() {
+        // `type MaybeName = Option<String>;` The name does not say `Option`.
+        let plain = shape("struct T { nickname: MaybeName }");
+        assert!(required(&plain.deserialized, "nickname"));
+        assert_eq!(
+            wire(&plain.deserialized, "nickname"),
+            WireType::object("MaybeName")
+        );
+
+        let s = shape("struct T { #[wire(type = \"string\", nullable)] nickname: MaybeName }");
+        assert_eq!(
+            wire(&s.deserialized, "nickname"),
+            WireType::nullable(WireType::string())
+        );
+        assert!(!required(&s.deserialized, "nickname"));
+        // serde still writes `null`, so a response always has the key.
+        assert!(required(&s.serialized, "nickname"));
+        assert!(s.deserialized[0].opaque);
+    }
+
+    #[test]
+    fn a_nullable_override_with_a_custom_deserializer_stays_required() {
+        let s = shape(
+            "struct T { #[serde(deserialize_with = \"f\")] #[wire(type = \"string\", nullable)] n: MaybeName }",
+        );
+        assert!(required(&s.deserialized, "n"));
+    }
+
+    #[test]
+    fn an_override_with_a_one_sided_custom_function_names_that_side_only() {
+        let s = shape(
+            "struct T { #[serde(serialize_with = \"f\")] #[wire(type = \"string\")] a: u32, #[serde(deserialize_with = \"g\")] #[wire(type = \"string\")] b: u32 }",
+        );
+        assert_eq!(wire(&s.serialized, "a"), WireType::string());
+        assert_eq!(wire(&s.deserialized, "a"), WireType::integer(32, false));
+        assert_eq!(wire(&s.serialized, "b"), WireType::integer(32, false));
+        assert_eq!(wire(&s.deserialized, "b"), WireType::string());
+    }
+
+    #[test]
+    fn a_one_sided_nullable_override_leaves_the_other_side_required() {
+        let s = shape(
+            "struct T { #[serde(serialize_with = \"f\")] #[wire(type = \"string\", nullable)] n: Name }",
+        );
+        assert_eq!(
+            wire(&s.serialized, "n"),
+            WireType::nullable(WireType::string())
+        );
+        assert!(required(&s.deserialized, "n"));
+    }
+
+    #[test]
+    fn a_one_sided_override_keeps_the_other_side_a_nested_shape() {
+        let s = shape(
+            "struct T { #[serde(serialize_with = \"f\")] #[wire(type = \"string\")] d: Details }",
+        );
+        assert_eq!(wire(&s.serialized, "d"), WireType::string());
+        assert!(s.serialized[0].opaque);
+        assert_eq!(wire(&s.deserialized, "d"), WireType::object("Details"));
+        assert!(!s.deserialized[0].opaque);
+    }
+
+    #[test]
+    fn an_override_on_an_option_field_keeps_null() {
+        let s = shape("struct T { #[wire(type = \"number\")] score: Option<Score> }");
+        assert_eq!(
+            wire(&s.serialized, "score"),
+            WireType::nullable(WireType::Number)
+        );
+        assert_eq!(
+            wire(&s.deserialized, "score"),
+            WireType::nullable(WireType::Number)
+        );
+        // A custom function writes what the override says.
+        let s = shape(
+            "struct T { #[serde(with = \"text\")] #[wire(type = \"string\")] n: Option<u32> }",
+        );
+        assert_eq!(wire(&s.serialized, "n"), WireType::string());
+    }
+
+    #[test]
+    fn a_date_time_with_no_time_zone_argument_is_any() {
+        let s = shape("struct T { a: sea_orm::prelude::DateTime, b: bson::DateTime }");
+        assert_eq!(wire(&s.serialized, "a"), WireType::Any);
+        assert_eq!(wire(&s.serialized, "b"), WireType::Any);
+    }
+
+    #[test]
+    fn self_in_an_opaque_field_is_any() {
+        let s = shape("struct T { #[wire(opaque)] kids: Vec<Self> }");
+        assert_eq!(wire(&s.serialized, "kids"), WireType::array(WireType::Any));
+    }
+
+    #[test]
+    fn a_wrapper_maps_its_first_type_argument() {
+        let s =
+            shape("struct T { a: Box<Item, Global>, b: SmallVec<u8, 4>, c: SmallVec<[u8; 4]> }");
+        assert_eq!(wire(&s.serialized, "a"), WireType::object("Item"));
+        let bytes = WireType::array(WireType::integer(8, false));
+        assert_eq!(wire(&s.serialized, "b"), bytes);
+        assert_eq!(wire(&s.serialized, "c"), bytes);
+    }
+
+    #[test]
+    fn an_unknown_type_in_an_opaque_field_is_any() {
+        let s = shape("struct T { #[wire(opaque)] status: Option<Status> }");
+        assert_eq!(
+            wire(&s.serialized, "status"),
+            WireType::nullable(WireType::Any)
+        );
+    }
+
+    #[test]
+    fn a_nested_type_is_an_object_by_the_path_as_written() {
+        let s = shape("struct T { a: shared::Item, b: Vec<::shop::Item>, c: Box<Self> }");
+        assert_eq!(wire(&s.serialized, "a"), WireType::object("shared::Item"));
+        assert_eq!(
+            wire(&s.serialized, "b"),
+            WireType::array(WireType::object("::shop::Item"))
+        );
+        assert_eq!(wire(&s.serialized, "c"), WireType::object("T"));
+    }
+
+    #[test]
+    fn an_event_payload_records_wire_types_too() {
+        // `#[event]` reads its shape through `wire_type_descriptor`.
+        let s = shape("struct ContactUpdated { id: uuid::Uuid, at: Option<DateTime<Utc>> }");
+        assert_eq!(wire(&s.serialized, "id"), WireType::string_in("uuid"));
+        assert_eq!(
+            wire(&s.deserialized, "at"),
+            WireType::nullable(WireType::string_in("date-time"))
+        );
+    }
+
+    #[test]
+    fn an_unknown_wire_type_is_refused() {
+        let err = refusal("struct T { #[wire(type = \"timestamp\")] at: DateTime<Utc> }");
+        assert!(err.contains("unknown wire type `timestamp`"), "{err}");
+        assert!(
+            err.contains("`string`, `integer`, `number`, `boolean`, `any`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bad_wire_override_is_refused() {
+        for (src, want) in [
+            (
+                "struct T { #[wire(format = \"date\")] a: Day }",
+                "`format` needs `type`",
+            ),
+            (
+                "struct T { #[wire(nullable)] a: Day }",
+                "`nullable` needs `type`",
+            ),
+            (
+                "struct T { #[wire(type = \"boolean\", format = \"yes-no\")] a: Flag }",
+                "`format` applies to `string` and `integer` only",
+            ),
+            (
+                "struct T { #[wire(type = \"string\", format = \"Date Time\")] a: Day }",
+                "a format is lowercase words joined by `-`",
+            ),
+            (
+                "struct T { #[wire(type = \"string\")] #[wire(type = \"integer\")] a: Day }",
+                "`type` is set twice",
+            ),
+            (
+                "struct T { #[wire(type = \"string\", format = \"date\", format = \"uuid\")] a: Day }",
+                "`format` is set twice",
+            ),
+        ] {
+            let err = refusal(src);
+            assert!(err.contains(want), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_override_on_an_opaque_event_payload_is_still_checked() {
+        let input: DeriveInput =
+            syn::parse_str("struct T { #[wire(type = \"date\")] a: Day }").expect("parses");
+        let err = check_wire_attrs(&input).expect_err("refused").to_string();
+        assert!(err.contains("unknown wire type"), "{err}");
     }
 
     #[test]

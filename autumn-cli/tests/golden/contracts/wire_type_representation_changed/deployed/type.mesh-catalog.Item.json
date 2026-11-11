@@ -1,0 +1,47 @@
+{
+  "krate": "mesh-catalog",
+  "name": "Item",
+  "serialized": [
+    {
+      "rust_name": "id",
+      "wire_name": "id",
+      "ty": "String",
+      "wire_type": {
+        "kind": "string"
+      },
+      "required": true
+    },
+    {
+      "rust_name": "created_at",
+      "wire_name": "created_at",
+      "ty": "DateTime<Utc>",
+      "wire_type": {
+        "kind": "string",
+        "format": "date-time"
+      },
+      "required": true
+    }
+  ],
+  "deserialized": [
+    {
+      "rust_name": "id",
+      "wire_name": "id",
+      "ty": "String",
+      "wire_type": {
+        "kind": "string"
+      },
+      "required": true
+    },
+    {
+      "rust_name": "created_at",
+      "wire_name": "created_at",
+      "ty": "DateTime<Utc>",
+      "wire_type": {
+        "kind": "string",
+        "format": "date-time"
+      },
+      "required": true
+    }
+  ],
+  "closed": false
+}
