@@ -97,18 +97,8 @@
     chips().forEach(function (c) { c.querySelector('input').disabled = false; });
     list.hidden = false;
 
-    // The chips from the server. A form reset brings them back.
-    var initial = chips().map(function (c) {
-      return [c.querySelector('input').value,
-        c.querySelector('[data-ac-chip-label]').textContent];
-    });
-    function reset() {
-      chips().forEach(function (c) { c.remove(); });
-      initial.forEach(function (v) { put(v[0], v[1]); });
-      rove();
-    }
-
-    function put(value, label) {
+    function add(value, label) {
+      if (!value || has(value)) return;
       var chip = tpl.content.firstElementChild.cloneNode(true);
       chip.querySelector('[data-ac-chip-label]').textContent = label;
       var input = chip.querySelector('input');
@@ -116,11 +106,6 @@
       input.value = value;
       button(chip).setAttribute('aria-label', fill(d.acRemoveLabel || 'Remove {label}', label));
       list.appendChild(chip);
-    }
-
-    function add(value, label) {
-      if (!value || has(value)) return;
-      put(value, label);
       rove();
       say(d.acAdded || '{label} added', label);
     }
@@ -173,7 +158,7 @@
       if (btn) remove(btn.closest('[data-ac-chip]'), e.detail === 0);
     });
 
-    return { has: has, add: add, reset: reset };
+    return { has: has, add: add };
   }
 
   function initAutocomplete(wrapper) {
@@ -204,20 +189,6 @@
       // re-render). Name the field so it submits. Typing clears it again.
       getHidden().name = valueName;
     }
-
-    // The picked value at init. A form reset brings it back.
-    var start = tags ? null : { name: getHidden().name, value: getHidden().value };
-    resets.set(wrapper, function () {
-      dismissed = false;
-      listbox.innerHTML = '';
-      if (tags) {
-        tags.reset();
-      } else {
-        getHidden().name = start.name;
-        getHidden().value = start.value;
-      }
-      sync();
-    });
 
     // A dismissal (Escape, Tab, a click outside) holds until the user types
     // or presses ArrowDown/ArrowUp. Thus a late response stays closed.
@@ -321,24 +292,6 @@
     });
   }
 
-  // A native reset does not undo what a script changed: chips, and the
-  // value of a hidden input. It does reset the query text. Wait one task, so
-  // a page that cancels the reset keeps its state.
-  var ROOTS = '[data-ac-value-id],[data-ac-multiple]';
-  var resets = new WeakMap();
-  document.addEventListener('reset', function (e) {
-    var form = e.target;
-    if (!form || !form.querySelectorAll) return;
-    var roots = form.querySelectorAll(ROOTS);
-    setTimeout(function () {
-      if (e.defaultPrevented) return;
-      roots.forEach(function (w) {
-        var again = resets.get(w);
-        if (again) again();
-      });
-    }, 0);
-  }, true);
-
   // The capture listener runs before htmx reads the form.
   var pending = new WeakMap();
   document.addEventListener('submit', function (e) {
@@ -352,6 +305,7 @@
 
   // The core fires `autumn:init` on each new root. This part is first in
   // the bundle, so the listener exists before the core boots.
+  var ROOTS = '[data-ac-value-id],[data-ac-multiple]';
   document.addEventListener('autumn:init', function (e) {
     var root = e.target;
     if (root.matches && root.matches(ROOTS)) initAutocomplete(root);

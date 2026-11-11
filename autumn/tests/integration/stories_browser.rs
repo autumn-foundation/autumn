@@ -140,10 +140,17 @@ async fn seeded_busy_history() -> Markup {
 }
 
 /// A form with a tags box, an ID box and a reset button. Each box starts
-/// with a server value.
-#[cfg(feature = "widgets-search")]
+/// with a server value. Empty without `widgets-search`.
 #[get("/seeded/search-reset")]
 async fn seeded_search_reset() -> Markup {
+    #[cfg(not(feature = "widgets-search"))]
+    return busy_page(&html! {});
+    #[cfg(feature = "widgets-search")]
+    search_reset_page()
+}
+
+#[cfg(feature = "widgets-search")]
+fn search_reset_page() -> Markup {
     use autumn_web::widgets::{AutocompleteConfig, autocomplete_input};
 
     let tags = AutocompleteConfig::new("/_stories/demo/tags/suggest", "tags")
@@ -202,7 +209,6 @@ async fn runner() -> SystemTestRunner {
                 seeded_tabs,
                 seeded_busy_indicators,
                 seeded_busy_history,
-                #[cfg(feature = "widgets-search")]
                 seeded_search_reset
             ])
             .build(),
