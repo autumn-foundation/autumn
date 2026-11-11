@@ -147,14 +147,19 @@ fn failure_capture_stays_with_the_reporting_feature() {
     assert!(module_has_cfg(&lines, "capsule", "reporting"));
     assert!(!module_has_cfg(&lines, "capsule", "error-reporting"));
     let default = names(&features(&manifest())["default"]);
-    assert!(default.contains("reporting"), "`reporting` stays default-on");
+    assert!(
+        default.contains("reporting"),
+        "`reporting` stays default-on"
+    );
 }
 
 /// `[failure_capture]` parses in every build. Boot refuses `enabled = true`
 /// in a build without `reporting`.
 #[test]
 fn failure_capture_config_parses_in_every_build() {
-    assert!(!field_is_gated("pub failure_capture: FailureCaptureConfig,"));
+    assert!(!field_is_gated(
+        "pub failure_capture: FailureCaptureConfig,"
+    ));
 }
 
 /// True when a `cfg` attribute sits on this `AutumnConfig` field.

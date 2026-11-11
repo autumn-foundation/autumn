@@ -279,6 +279,8 @@ MACRO_SRCS = (
     ROOT / "autumn-macros" / "src",
     ROOT / "autumn-macros-model" / "src",
     ROOT / "autumn-macros-repository" / "src",
+    # `query_budget.rs` and `agent_authority.rs` live in the support library.
+    ROOT / "autumn-macros-support" / "src",
 )
 
 
