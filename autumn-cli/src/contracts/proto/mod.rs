@@ -876,14 +876,14 @@ impl<'b> File<'b> {
                     WireType::string()
                 }
             }
-            WireType::Integer { bits, signed, .. } => {
-                let bits = match bits {
-                    0..=32 => 32,
-                    33..=64 => 64,
-                    _ => 128,
-                };
-                WireType::integer(bits, *signed)
-            }
+            WireType::Integer { bits, signed, .. } => match bits {
+                0..=32 => WireType::integer(32, *signed),
+                33..=64 => WireType::integer(64, *signed),
+                // `google.protobuf.Value`, as `single` maps it.
+                _ => WireType::Any,
+            },
+            // An object with no message is `google.protobuf.Value` too.
+            WireType::Object { .. } if !self.is_message(wire) => WireType::Any,
             WireType::Object { .. } => WireType::object(&self.shape_name(wire)),
             WireType::Array { of } => WireType::array(self.proto_shape(of)),
             WireType::Map { of } => WireType::map(self.proto_shape(of)),

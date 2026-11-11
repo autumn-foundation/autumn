@@ -934,3 +934,24 @@ fn a_field_that_is_nullable_on_one_side_is_optional() {
     let text = &files["autumn/catalog/catalog.proto"];
     assert!(text.contains("optional string a = 1"), "{text}");
 }
+
+#[test]
+fn every_shape_that_maps_to_value_shares_one_wrapper() {
+    let nested = |inner| WireType::array(WireType::array(inner));
+    let item = shape(
+        "Item",
+        vec![
+            field("a", nested(WireType::integer(128, true)), true),
+            field("b", nested(WireType::integer(128, false)), true),
+            field("c", nested(WireType::Any), true),
+            field("d", nested(WireType::object("not::Here")), true),
+        ],
+    );
+    let (files, _) = run(&bundle(vec![get("get_item", "/i", item)], vec![]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert_eq!(
+        text.matches("message ValueListWrapper {").count(),
+        1,
+        "{text}"
+    );
+}
