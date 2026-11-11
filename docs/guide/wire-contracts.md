@@ -5,7 +5,10 @@ the callee's handler signatures. A breaking change to a request or response
 fails the caller's build, at the call site, naming the field — instead of
 failing a customer's request.
 
-There is no IDL, no codegen step, and nothing to keep in sync by hand.
+Inside the workspace there is no IDL, no codegen step, and nothing to keep in
+sync by hand. For a consumer outside the workspace, an IDL is an export of the
+contract, not its source. See
+[ADR 0046](../adr/0046-wire-contracts-idl-at-the-edge.md).
 
 ## The shape of it
 
@@ -578,6 +581,9 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 ## Limits of the first slice
 
 * One workspace. Both ends must be present at build time.
+* Contracts come from Rust types only. Autumn does not import `.proto` or
+  Avro files. [ADR 0046](../adr/0046-wire-contracts-idl-at-the-edge.md) gives
+  the reasons, and tells which growth of this list reopens the decision.
 * Synchronous request/response and events, as JSON. No streaming or
   websockets.
 * Path parameters and a JSON body. Query parameters are not part of the

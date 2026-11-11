@@ -74,3 +74,4 @@ mod test_command;
 mod upgrade_codemod;
 mod upgrade_scaffold;
 mod webhook_sim;
+mod wire_contracts_adr;
