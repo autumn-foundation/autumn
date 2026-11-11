@@ -1426,6 +1426,7 @@ jobs:
             ledger-capture,
             widgets,
             jwt-push,
+            error-reporting,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1488,6 +1489,13 @@ jobs:
         # names, then runs the specs with both off: the boot checks that refuse
         # `[push]` and `tenancy.source = "jwt"`, and the fail-closed tenancy arm.
         run: ./scripts/check-jwt-push-features.sh
+      - name: Check the error-reporting feature without reporting
+        if: matrix.lane == 'error-reporting'
+        # `reporting` is default-on and turns `error-reporting` on, so
+        # `cargo test --workspace` never builds the panic-catch layer without
+        # failure capture. The no-DB daemon starter does. The script compiles
+        # that feature set, then runs the reporter specs with `reporting` off.
+        run: ./scripts/check-error-reporting-feature.sh
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'
         # `markdown` is not a default feature, so the `test` job's `cargo test

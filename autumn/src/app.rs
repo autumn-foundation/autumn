@@ -127,7 +127,7 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "storage")]
         blob_store: None,
         cache_backend: None,
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         error_reporters: Vec::new(),
         #[cfg(feature = "alerts")]
         alert_channels: Vec::new(),
@@ -540,7 +540,7 @@ pub struct AppBuilder {
     /// [`ReportingLayer`](crate::reporting::ReportingLayer) delivers panic and
     /// 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s to each. Empty means
     /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
     #[cfg(feature = "alerts")]
     /// Operator-alert channels registered via [`AppBuilder::with_alert_channel`].
@@ -2894,7 +2894,7 @@ impl AppBuilder {
     /// #   ;
     /// # }
     /// ```
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[must_use]
     pub fn with_error_reporter<R: crate::reporting::ErrorReporter>(mut self, reporter: R) -> Self {
         self.error_reporters
@@ -4532,7 +4532,7 @@ impl AppBuilder {
             #[cfg(feature = "storage")]
             blob_store,
             cache_backend,
-            #[cfg(feature = "reporting")]
+            #[cfg(feature = "error-reporting")]
             error_reporters,
             #[cfg(feature = "alerts")]
             alert_channels,
@@ -4947,6 +4947,18 @@ impl AppBuilder {
         }
         state.insert_extension(crate::background::BackgroundQueues(background.queues()));
 
+        // Without the `reporting` feature, boot refuses failure capture.
+        #[cfg(not(feature = "reporting"))]
+        if let Err(error) = crate::config::FailureCaptureConfig::check_feature(
+            config.failure_capture.enabled,
+            false,
+        ) {
+            tracing::error!(error = %error, "failure capture cannot start");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         // Tee clock reads into the capsule of whatever request took them, so a
         // replayed handler sees the same `now()` sequence the failure did.
         // Mirrored by `TestApp::build` so test apps exercise the same wiring.
@@ -5268,13 +5280,13 @@ impl AppBuilder {
         // task (spawned below) so each renewal failure reaches the same
         // Sentry/etc. sinks a request-path 5xx would. Empty is fine — failures
         // still log via `tracing` inside the loop.
-        #[cfg(all(feature = "acme", feature = "reporting"))]
+        #[cfg(all(feature = "acme", feature = "error-reporting"))]
         let acme_reporters = error_reporters.clone();
 
         // Install registered error reporters so the reporting layer (wired in
         // `apply_middleware`) can deliver panic + 5xx events. Empty is fine —
         // the layer falls back to the built-in `LogReporter`.
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         if !error_reporters.is_empty() {
             state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
@@ -6381,9 +6393,9 @@ impl AppBuilder {
                 tracing::warn!(scheduler_backend = coordinator.backend(), "{message}");
             }
 
-            #[cfg(feature = "reporting")]
+            #[cfg(feature = "error-reporting")]
             let reporter = make_acme_reporter(acme_reporters);
-            #[cfg(not(feature = "reporting"))]
+            #[cfg(not(feature = "error-reporting"))]
             let reporter = make_acme_reporter();
             // Certificate renewal is a framework-scheduled operation, so a
             // failed issuance/renewal raises #1610's `scheduled_task_failure`
@@ -7185,7 +7197,7 @@ impl AppBuilder {
             #[cfg(feature = "storage")]
             blob_store,
             cache_backend,
-            #[cfg(feature = "reporting")]
+            #[cfg(feature = "error-reporting")]
             error_reporters,
             #[cfg(feature = "alerts")]
                 alert_channels: _,
@@ -7447,7 +7459,7 @@ impl AppBuilder {
         } else {
             crate::cache::clear_global_cache();
         }
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         if !error_reporters.is_empty() {
             state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
@@ -12543,7 +12555,7 @@ fn acme_placeholder_key(
 /// [`ErrorEvent`](crate::reporting::ErrorEvent) to the registered reporter chain
 /// on a detached task, so failures reach Sentry/etc. when configured (failures
 /// also always log via `tracing` inside the loop).
-#[cfg(all(feature = "acme", feature = "reporting"))]
+#[cfg(all(feature = "acme", feature = "error-reporting"))]
 fn make_acme_reporter(
     reporters: Vec<std::sync::Arc<dyn crate::reporting::ErrorReporter>>,
 ) -> crate::acme::renewal::ReporterFn {
@@ -12850,7 +12862,7 @@ fn make_acme_alert_recovery(state: &AppState) -> crate::acme::renewal::RecoveryF
 
 /// The no-op ACME reporter used when the `reporting` feature is off (failures
 /// still log via `tracing`).
-#[cfg(all(feature = "acme", not(feature = "reporting")))]
+#[cfg(all(feature = "acme", not(feature = "error-reporting")))]
 fn make_acme_reporter() -> crate::acme::renewal::ReporterFn {
     std::sync::Arc::new(|_message: String| {})
 }

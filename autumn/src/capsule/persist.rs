@@ -136,17 +136,7 @@ fn is_pinned_for_reporting(path: &Path) -> bool {
         .is_ok_and(|pinned| pinned.contains_key(path))
 }
 
-/// Where a persisted capsule ended up.
-///
-/// Carried on [`ErrorEvent::capsule`](crate::reporting::ErrorEvent::capsule) so
-/// a reporter can attach the path (or the id) to whatever it ships upstream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapsuleRef {
-    /// Capsule id — the request id when one was available.
-    pub id: String,
-    /// Absolute or project-relative path to the written capsule.
-    pub path: PathBuf,
-}
+pub use crate::reporting::CapsuleRef;
 
 /// Resolve the capsule directory from the configured path.
 #[must_use]

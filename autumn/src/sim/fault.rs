@@ -832,7 +832,7 @@ impl FaultState {
 
     /// Only the `reporting`-gated [`FaultReporter`] pushes here; without that
     /// feature [`FaultOutcome::server_errors`] is always empty (by contract).
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     fn record_server_error(&self, error: ReportedError) {
         self.server_errors
             .lock()
@@ -954,7 +954,7 @@ impl FaultLedger {
 
     /// The error reporter that projects 5xx events into
     /// [`FaultOutcome::server_errors`].
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     pub(crate) fn reporter(&self) -> Arc<dyn crate::reporting::ErrorReporter> {
         Arc::new(FaultReporter {
             state: Arc::clone(&self.0),
@@ -1134,12 +1134,12 @@ impl crate::interceptor::DbConnectionInterceptor for FaultDbInterceptor {
 ///
 /// Registered alongside (never instead of) the app's own reporters. The
 /// projection drops the request id on purpose — see [`ReportedError`].
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 struct FaultReporter {
     state: Arc<FaultState>,
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 impl crate::reporting::ErrorReporter for FaultReporter {
     fn report<'a>(
         &'a self,

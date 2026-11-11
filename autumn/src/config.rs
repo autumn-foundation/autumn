@@ -1482,7 +1482,6 @@ pub struct AutumnConfig {
     /// unknown-key validation never descends into its children. The regression
     /// guard `failure_capture_child_keys_are_strictly_validated` fails if this
     /// ordering breaks.
-    #[cfg(feature = "reporting")]
     #[serde(default)]
     pub failure_capture: FailureCaptureConfig,
 
@@ -1752,7 +1751,7 @@ pub struct AutumnConfig {
     /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
     /// to registered reporters. Honored only when the `reporting` cargo
     /// feature is enabled.
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[serde(default)]
     pub reporting: ReportingConfig,
 
@@ -2490,7 +2489,7 @@ pub struct RobotsConfig {
 /// Note: `enabled = false` only suppresses *delivery* to reporters. Handler
 /// panics are still caught and converted to a clean 500 response regardless of
 /// this setting.
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReportingConfig {
     /// Whether error events are delivered to registered reporters.
@@ -2508,7 +2507,7 @@ pub struct ReportingConfig {
     pub sample_rate: f64,
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 impl Default for ReportingConfig {
     fn default() -> Self {
         Self {
@@ -2518,12 +2517,12 @@ impl Default for ReportingConfig {
     }
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 const fn default_reporting_enabled() -> bool {
     true
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 const fn default_reporting_sample_rate() -> f64 {
     1.0
 }
@@ -2547,7 +2546,9 @@ const fn default_reporting_sample_rate() -> f64 {
 /// through `[log] filter_parameters`, but unstructured bodies, URL paths and
 /// result rows are not. Read `docs/guide/failure-capsules.md` before enabling
 /// this outside development.
-#[cfg(feature = "reporting")]
+///
+/// `enabled = true` needs the `reporting` feature. The section parses without
+/// it, and boot fails.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FailureCaptureConfig {
     /// Whether failing requests are recorded as capsules.
@@ -2583,7 +2584,6 @@ pub struct FailureCaptureConfig {
     pub max_capsules: usize,
 }
 
-#[cfg(feature = "reporting")]
 impl Default for FailureCaptureConfig {
     fn default() -> Self {
         Self {
@@ -2596,27 +2596,49 @@ impl Default for FailureCaptureConfig {
     }
 }
 
-#[cfg(feature = "reporting")]
+impl FailureCaptureConfig {
+    /// Refuse `enabled = true` in a build without the `reporting` feature.
+    ///
+    /// That build cannot write a capsule. An operator who turns capture on
+    /// expects one after a failure, so boot fails. Only boot calls this.
+    /// `validate` does not, because the CLI reads the config of an app that
+    /// it does not run.
+    #[cfg_attr(
+        all(feature = "reporting", not(test)),
+        allow(
+            dead_code,
+            reason = "boot calls it only without the `reporting` feature"
+        )
+    )]
+    pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        if enabled && !built {
+            return Err(ConfigError::Validation(
+                "failure_capture.enabled is true, but this build does not have the \
+                 `reporting` feature. Turn on the feature, or set \
+                 failure_capture.enabled = false"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 const fn default_failure_capture_enabled() -> bool {
     false
 }
 
-#[cfg(feature = "reporting")]
 fn default_failure_capture_dir() -> String {
     "tmp/autumn-capsules".to_owned()
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_body_bytes() -> usize {
     65_536
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_capsule_bytes() -> usize {
     1_048_576
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_capsules() -> usize {
     50
 }
@@ -7836,9 +7858,8 @@ impl AutumnConfig {
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         self.apply_metrics_env_overrides_with_env(env);
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         self.apply_reporting_env_overrides_with_env(env);
-        #[cfg(feature = "reporting")]
         self.apply_failure_capture_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
@@ -8151,7 +8172,7 @@ impl AutumnConfig {
         );
     }
 
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     fn apply_reporting_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(
             env,
@@ -8165,7 +8186,6 @@ impl AutumnConfig {
         );
     }
 
-    #[cfg(feature = "reporting")]
     fn apply_failure_capture_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(
             env,
@@ -17717,7 +17737,7 @@ path = "/healthz"
         assert_eq!(config.database.pool_size, 25);
     }
 
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[test]
     fn env_override_reporting() {
         let env = MockEnv::new()
@@ -17731,7 +17751,6 @@ path = "/healthz"
         assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
     }
 
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_defaults_are_off() {
         let config = AutumnConfig::default();
@@ -17745,7 +17764,6 @@ path = "/healthz"
         assert_eq!(config.failure_capture.max_capsules, 50);
     }
 
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_env_overrides_apply() {
         let env = MockEnv::new()
@@ -17772,7 +17790,6 @@ path = "/healthz"
     /// `deserialize_with` duration field aborts the schema walk. If someone
     /// moves `failure_capture` below `database`, its child keys silently
     /// vanish from the schema and this fails.
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_child_keys_are_strictly_validated() {
         let leaves = AutumnConfig::schema_leaf_paths();
@@ -17803,6 +17820,15 @@ path = "/healthz"
     }
 
     // ── [cluster] (issue #1762) ──────────────────────────────────────────
+
+    #[test]
+    fn failure_capture_enabled_without_the_feature_fails() {
+        let err = FailureCaptureConfig::check_feature(true, false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`reporting` feature"), "{text}");
+        assert!(FailureCaptureConfig::check_feature(true, true).is_ok());
+        assert!(FailureCaptureConfig::check_feature(false, false).is_ok());
+    }
 
     #[test]
     fn cluster_enabled_without_the_feature_fails() {

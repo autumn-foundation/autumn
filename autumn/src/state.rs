@@ -530,7 +530,7 @@ impl AppState {
     /// Returns an empty `Vec` when none are registered; the
     /// [`ReportingLayer`](crate::reporting::ReportingLayer) then falls back to
     /// the built-in [`LogReporter`](crate::reporting::LogReporter).
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[must_use]
     pub(crate) fn error_reporters(
         &self,

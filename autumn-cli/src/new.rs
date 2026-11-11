@@ -877,9 +877,11 @@ fn strip_migrations(main_rs: &str) -> String {
 /// dropped here, not just `db`. Dropping `http-client` also drops `reqwest`
 /// and its TLS stack from the build.
 ///
-/// `reporting` stays on. It adds no extra dependency, and it drives the
-/// panic-catch middleware every app should keep by default.
-const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "reporting"];
+/// `error-reporting` stays on. It adds no extra dependency, and it drives the
+/// panic-catch middleware every app should keep by default. The wider
+/// `reporting` feature adds failure capture and `autumn replay`. The starter
+/// does not use them, so it does not compile them (#2795).
+const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "error-reporting"];
 
 /// Default `autumn-web` features minus the HTML view stack (`maud`/`htmx`/
 /// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` and its
@@ -2264,6 +2266,24 @@ mod tests {
             !cargo.contains("diesel_migrations"),
             "daemon starter must not depend on diesel_migrations"
         );
+    }
+
+    /// The daemon starter catches handler panics. It does not compile failure
+    /// capture, which the wider `reporting` feature adds (#2795).
+    #[test]
+    fn daemon_starter_keeps_error_reporting_and_drops_failure_capture() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-report-app", tmp.path(), daemon_opts()).unwrap();
+        let raw = fs::read_to_string(tmp.path().join("daemon-report-app/Cargo.toml")).unwrap();
+        let doc: toml::Table = raw.parse().unwrap();
+        let features: Vec<&str> = doc["dependencies"]["autumn-web"]["features"]
+            .as_array()
+            .expect("feature list")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert!(features.contains(&"error-reporting"), "{raw}");
+        assert!(!features.contains(&"reporting"), "{raw}");
     }
 
     #[test]
