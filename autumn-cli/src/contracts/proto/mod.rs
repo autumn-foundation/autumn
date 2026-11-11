@@ -568,7 +568,7 @@ impl<'b> File<'b> {
                 .find(|f| f.json_name == param)
                 .map_or_else(|| param.to_owned(), |f| f.name.clone())
         };
-        let pattern = http_pattern(&endpoint.path, &field_of);
+        let pattern = http_pattern(&endpoint.path, field_of);
         // The rule names the final proto field, after names are made unique.
         let body = body.map(|b| if b == "*" { b } else { field_of(&b) });
         self.insert(name, message)?;
