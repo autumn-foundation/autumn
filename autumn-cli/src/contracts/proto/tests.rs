@@ -780,3 +780,87 @@ fn a_dedup_suffix_never_clashes_with_another_field() {
     let distinct: std::collections::BTreeSet<&&str> = names.iter().collect();
     assert_eq!(distinct.len(), names.len(), "{text}");
 }
+
+#[test]
+fn two_wire_types_with_one_proto_shape_share_a_wrapper() {
+    let item = shape(
+        "Item",
+        vec![
+            field(
+                "small",
+                WireType::array(WireType::array(WireType::integer(16, true))),
+                true,
+            ),
+            field(
+                "wide",
+                WireType::array(WireType::array(WireType::integer(32, true))),
+                true,
+            ),
+            field(
+                "ids",
+                WireType::array(WireType::array(WireType::string_in(format::UUID))),
+                true,
+            ),
+            field(
+                "names",
+                WireType::array(WireType::array(WireType::string())),
+                true,
+            ),
+        ],
+    );
+    let (files, _) = run(&bundle(vec![get("get_item", "/i", item)], vec![]), plain());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert_eq!(
+        text.matches("message Int32ListWrapper {").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("message StringListWrapper {").count(),
+        1,
+        "{text}"
+    );
+    assert!(
+        !text.contains("format: uuid\n}"),
+        "a shared wrapper has no format note: {text}"
+    );
+}
+
+#[test]
+fn a_synthetic_body_field_never_takes_a_path_parameter_name() {
+    let item = shape("Item", vec![field("id", WireType::string(), true)]);
+    let list = BundleEndpoint {
+        method: "PUT".to_owned(),
+        has_body: true,
+        request_list: true,
+        request: item,
+        ..get("put_items", "/lists/{items}", no_body())
+    };
+    let patch_body = shape(
+        "Patch",
+        vec![
+            field("body", WireType::string(), true),
+            field("name", WireType::string(), true),
+        ],
+    );
+    let patch = BundleEndpoint {
+        method: "PATCH".to_owned(),
+        has_body: true,
+        request: patch_body,
+        ..get("patch_item", "/notes/{body}", no_body())
+    };
+    let (files, _) = run(&bundle(vec![list, patch], vec![]), annotated());
+    let text = &files["autumn/catalog/catalog.proto"];
+    assert!(
+        text.contains("string items = 1 [json_name = \"items\"]; // path"),
+        "{text}"
+    );
+    assert!(text.contains("repeated Item items_body = 2"), "{text}");
+    assert!(text.contains("body: \"items_body\""), "{text}");
+    assert!(
+        text.contains("string body = 1 [json_name = \"body\"]; // path"),
+        "{text}"
+    );
+    assert!(text.contains("Patch body_body = 2"), "{text}");
+    assert!(text.contains("body: \"body_body\""), "{text}");
+}

@@ -498,6 +498,9 @@ impl<'b> File<'b> {
         lock: &mut Lock,
     ) -> Result<(Option<String>, String), String> {
         let params = path_params(&endpoint.path);
+        // A body field the export adds gets a name no path parameter has.
+        let items_name = free_name("items", &params);
+        let body_name = free_name("body", &params);
         let mut fields: Vec<Spec<'_>> = Vec::new();
         let mut body = None;
         let mut comments = Vec::new();
@@ -506,8 +509,8 @@ impl<'b> File<'b> {
             let element = self.names[&origin].clone();
             self.message_of(&origin, lock)?;
             fields.push(Spec {
-                wire_name: "items",
-                rust_name: "items",
+                wire_name: &items_name,
+                rust_name: &items_name,
                 wire_type: WireType::array(WireType::object(&element)),
                 tag: None,
                 notes: vec!["body".to_owned()],
@@ -515,14 +518,14 @@ impl<'b> File<'b> {
             comments.push(format!(
                 "Autumn reads the body as a bare JSON array of `{element}`, not as this object."
             ));
-            body = Some("items".to_owned());
+            body = Some(items_name.clone());
         } else if endpoint.has_body && body_meets_path(endpoint) {
             let origin = self.body_origin(endpoint, false);
             let element = self.names[&origin].clone();
             self.message_of(&origin, lock)?;
             fields.push(Spec {
-                wire_name: "body",
-                rust_name: "body",
+                wire_name: &body_name,
+                rust_name: &body_name,
                 wire_type: WireType::object(&element),
                 tag: None,
                 notes: vec!["body".to_owned()],
@@ -531,7 +534,7 @@ impl<'b> File<'b> {
                 "Autumn reads the body as one `{element}`. A body field has the name of a \
                  path parameter, so the body stays one field."
             ));
-            body = Some("body".to_owned());
+            body = Some(body_name.clone());
         } else if endpoint.has_body {
             if endpoint.request.unit {
                 comments.push("Autumn reads the body as JSON null.".to_owned());
@@ -804,8 +807,9 @@ impl<'b> File<'b> {
     /// A wrapper message for a shape that protobuf cannot write in place.
     fn wrapper(&mut self, wire: &WireType, lock: &mut Lock) -> Result<String, String> {
         let name = format!("{}Wrapper", self.shape_name(wire));
+        let shape = self.proto_shape(wire);
         match self.wrappers.get(&name) {
-            Some(shape) if shape == wire => return Ok(name),
+            Some(known) if *known == shape => return Ok(name),
             Some(_) => {
                 return Err(format!(
                     "package `{}`: two shapes map to wrapper `{name}`; rename the Rust type \
@@ -816,7 +820,7 @@ impl<'b> File<'b> {
             None => {}
         }
         self.refuse_rust_name(&name, "the name of a generated wrapper")?;
-        self.wrappers.insert(name.clone(), wire.clone());
+        self.wrappers.insert(name.clone(), shape);
         let (field_name, comment) = match wire {
             WireType::Array { .. } => (
                 "values",
@@ -833,6 +837,12 @@ impl<'b> File<'b> {
         };
         self.messages.insert(name.clone(), Message::default());
         let (label, ty, notes) = self.field_type(wire, lock)?;
+        // Wire types with other formats or widths can share this wrapper, so
+        // its field names no format.
+        let notes = notes
+            .into_iter()
+            .filter(|n| !n.starts_with("format:") && !n.ends_with("-bit integer"))
+            .collect();
         self.messages.insert(
             name.clone(),
             Message {
@@ -849,6 +859,35 @@ impl<'b> File<'b> {
             },
         );
         Ok(name)
+    }
+
+    /// The shape as protobuf sees it: an integer by its proto width, a string
+    /// with no format (but a `Timestamp` with `--well-known-types`), an object
+    /// by its message name. Two wire types with one proto shape share a
+    /// wrapper.
+    fn proto_shape(&self, wire: &WireType) -> WireType {
+        match wire {
+            WireType::String { .. } => {
+                if self.is_message(wire) {
+                    WireType::string_in(format::DATE_TIME)
+                } else {
+                    WireType::string()
+                }
+            }
+            WireType::Integer { bits, signed, .. } => {
+                let bits = match bits {
+                    0..=32 => 32,
+                    33..=64 => 64,
+                    _ => 128,
+                };
+                WireType::integer(bits, *signed)
+            }
+            WireType::Object { .. } => WireType::object(&self.shape_name(wire)),
+            WireType::Array { of } => WireType::array(self.proto_shape(of)),
+            WireType::Map { of } => WireType::map(self.proto_shape(of)),
+            WireType::Nullable { of } => WireType::nullable(self.proto_shape(of)),
+            WireType::Number | WireType::Boolean | WireType::Any => wire.clone(),
+        }
     }
 
     /// A short name for a shape: `DoubleList`, `NullableString`, `ItemMap`.
@@ -1101,6 +1140,15 @@ fn format_note(wire: &WireType) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `base`, or `base` with `_body` added until no path parameter has it.
+fn free_name(base: &str, params: &[String]) -> String {
+    let mut name = base.to_owned();
+    while params.contains(&name) {
+        name.push_str("_body");
+    }
+    name
 }
 
 /// Whether a body field has the wire name of a path parameter.
