@@ -883,3 +883,24 @@ fn a_list_of_unit_structs_stays_a_list() {
     assert!(text.contains("message Ping {}"), "{text}");
     assert!(!text.contains("google.protobuf.Empty"), "{text}");
 }
+
+#[test]
+fn the_http_body_names_the_final_proto_field() {
+    let item = shape("Item", vec![field("id", WireType::string(), true)]);
+    let list = BundleEndpoint {
+        method: "PUT".to_owned(),
+        has_body: true,
+        request_list: true,
+        request: item,
+        ..get("put_items", "/lists/{Items}", no_body())
+    };
+    let (files, _) = run(&bundle(vec![list], vec![]), annotated());
+    let text = &files["autumn/catalog/catalog.proto"];
+    let body_line = text
+        .lines()
+        .find(|l| l.contains("// body"))
+        .expect("body field");
+    let field = body_line.split_whitespace().nth(2).expect("field name");
+    assert!(text.contains(&format!("body: \"{field}\"")), "{text}");
+    assert!(text.contains("put: \"/lists/{items}\""), "{text}");
+}
