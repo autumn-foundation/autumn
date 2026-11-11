@@ -1026,3 +1026,39 @@ fn a_rust_type_name_becomes_a_valid_message_name() {
         .collect();
     assert!(!code.contains("r#") && !code.contains('é'), "{text}");
 }
+
+#[test]
+fn a_recursive_event_in_a_hyphenated_crate_is_one_message() {
+    let node = shape(
+        "Node",
+        vec![
+            field("id", WireType::string(), true),
+            field(
+                "child",
+                WireType::nullable(WireType::object("mesh-catalog::Node")),
+                false,
+            ),
+        ],
+    );
+    let mut b = bundle(
+        vec![],
+        vec![BundleType {
+            id: "mesh-catalog::Node".to_owned(),
+            shape: node.clone(),
+        }],
+    );
+    b.events = vec![BundleEvent {
+        topic: "mesh_catalog.node".to_owned(),
+        name: "mesh_catalog.node".to_owned(),
+        version: 1,
+        krate: "mesh-catalog".to_owned(),
+        type_name: "Node".to_owned(),
+        opaque: false,
+        unit: false,
+        shape: node,
+    }];
+    let (files, _) = run(&b, plain());
+    let text = &files["autumn/mesh_catalog/events/events.proto"];
+    assert_eq!(text.matches("message ").count(), 1, "{text}");
+    assert!(text.contains("Node child = 2"), "{text}");
+}

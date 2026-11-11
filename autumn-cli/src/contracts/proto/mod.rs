@@ -375,7 +375,11 @@ impl<'b> File<'b> {
             .iter()
             .find(|t| {
                 t.id.rsplit("::").next() == Some(name)
-                    && krate.is_none_or(|k| t.id.split("::").next() == Some(&package_part(k)))
+                    && krate.is_none_or(|k| {
+                        // A type id keeps the package name as written.
+                        t.id.split("::").next().map(|c| c.replace('-', "_"))
+                            == Some(k.replace('-', "_"))
+                    })
                     && t.shape.serialized == shape.serialized
                     && t.shape.deserialized == shape.deserialized
                     && t.shape.unit == shape.unit
