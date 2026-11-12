@@ -53,10 +53,10 @@ it gets its own budget and gate (issue #977).
 
 | Change class | p50 ms | p95 ms | max ms | Gate |
 |---|---:|---:|---:|---|
-| Cold start (`autumn new` → first 200, no-DB) | 100 000 | **125 000** | 150 000 | **Gated** |
+| Cold start (`autumn new` → first 200, no-DB) | 80 000 | **100 000** | 120 000 | **Gated** |
 | Cold start (`autumn new` → first 200, database-backed) | 120 000 | 180 000 | 300 000 | Informational |
 
-**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **125 s** on
+**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **100 s** on
 the CI reference runner. Autumn's stated goal is still "time-from-`cargo new`
 to first served route < 60 s"; the gate above is the realistic ceiling for
 today's code, not the goal. See [Cold-start budget history](#cold-start-budget-history)
@@ -73,15 +73,20 @@ this slice and never fails the gate.
 
 ### Cold-start methodology
 
-`autumn dev-loop-bench --cold-start` measures a genuine first-run, not a warm
-cache:
+`autumn dev-loop-bench --cold-start` measures a first clean compile, not a warm
+build cache. One untimed preparation step runs before the samples (see
+[Running the cold-start benchmark](#running-the-cold-start-benchmark)), so the
+pinned toolchain is installed and the crates are downloaded before the clock
+starts. Each sample then:
 
 1. Scaffolds a **throwaway project** in a fresh temp directory (`autumn new`).
    The no-DB `hello` shape uses the daemon starter; the database-backed shape
    (`--include-db`) uses the **bundled managed-Postgres** starter, so the app
    self-provisions a real Postgres (via `postgresql_embedded`), runs migrations,
    and connects before serving — no external database service required. The clock
-   starts just before scaffolding so the whole journey is captured.
+   starts just before scaffolding, so a sample covers scaffold, first clean
+   compile, boot and first `200`. It does not cover the downloads of the
+   preparation step.
 2. Repoints the project's `autumn-web` dependency at the repository's local
    source via `[patch.crates-io]`, so the number reflects the code in the repo
    rather than a possibly-unpublished crates.io release — still a genuine clean
@@ -118,6 +123,30 @@ autumn dev-loop-bench --cold-start \
 autumn dev-loop-bench --cold-start --include-db
 ```
 
+Before the samples of each shape, the driver does one preparation step. It
+runs `cargo fetch` in a throwaway scaffold. That installs the toolchain that
+the scaffold pins, updates the index and downloads the crates. It compiles
+nothing, so each sample still builds from cold. The report shows the time of
+the `hello` shape's step as `prepare_ms`. With `--include-db`, the time of
+the database shape's step goes to stderr only. The preparation is not in the
+samples, because it is network time and not build time. A new user pays it
+once, on the first build: the crate downloads, and the toolchain install
+when the pinned toolchain is missing.
+
+Two pieces of network work stay in each sample. A scaffold has no lockfile,
+so each timed build resolves again and checks the index entry of each crate.
+A sample of the database-backed shape also downloads the Postgres archive:
+a build script fetches it, and `cargo fetch` runs no build script.
+
+`rust_version` in a cold-start report is the compiler that the scaffold
+selects. `AUTUMN_BENCH_RUST_VERSION` is the fallback when that probe fails.
+
+The driver sets `CARGO_INCREMENTAL=0` for the timed build. The `[patch]`
+makes `autumn-web` a path dependency, which Cargo builds in incremental mode
+by default. With the variable, Cargo builds it the way it builds a registry
+dependency: without incremental mode. The variable also applies to the app
+crate. A new user's first build compiles the app crate in incremental mode.
+
 ### Cold-start budget history
 
 The `Cold-Start Onboarding Gate` began at p95 60s / max 90s. It
@@ -144,8 +173,8 @@ build. A default build does not change. On one 4 vCPU box a cold `hello`
 build fell from 118 s to 101 s.
 
 Issue #2309 had raised the budget to p95 130 s / max 160 s. The scheduled
-CI runs after ADR 0027 measured 89-104 s. The budget is now p95 125 s / max
-150 s. The gate checks p95 and max only, and with 3 runs p95 is the slowest
+CI runs after ADR 0027 measured 89-104 s. The budget then became p95 125 s /
+max 150 s. The gate checks p95 and max only, and with 3 runs p95 is the slowest
 sample. p95 is about 20% above the slowest sample seen.
 
 ADR 0045 cut the LLVM IR of `autumn-web` for the daemon starter by 13.4%:
@@ -161,10 +190,39 @@ cold `hello` build fell by about 2% (median of 5). That is less than the
 run-to-run noise there. Backend work (LLVM) runs on all cores, and
 the front end does not, so fewer IR lines give a smaller time gain.
 
-The original 60 s / 90 s target is still open. `autumn-web` is still about
-half of the compile time, and it cannot start until `autumn-macros` is
-built. A larger gain needs a smaller front end, for example a split of
-`autumn-web` into crates that compile in parallel (issue #2795).
+ADR 0046 cut the cold `hello` build on one 4 vCPU box from 81.5 s to 71.4 s
+(medians of 5 interleaved samples):
+
+1. The panic-catch layer has its own feature, `error-reporting`. The daemon
+   starter names it, and does not compile failure capture (the `capsule`
+   module, 6.5% of `autumn-web`).
+2. The two largest macro analysers moved from `autumn-macros` to the
+   `autumn-macros-support` library. `autumn-web` waits for the proc-macro
+   crate, and Cargo starts that crate late.
+3. The unused `tokio-cron-scheduler` dependency is gone.
+4. A new app builds its dependencies with no debug info.
+
+The same ADR changed the gate. In each of the last three scheduled runs, the
+first sample was the slowest, by 6-12 s. The probable cause is that the first
+`cargo` call in a scaffold installs a toolchain and downloads crates. That
+work is now a preparation step before the samples.
+
+The build has three phases on four cores. Dependencies take about 36 s and
+use all cores. `autumn-web` then takes about 32 s, mostly on one core. The
+app takes 2.5 s. One second less in `autumn-web` saves one second. One
+unit-second less in a dependency saves a quarter of a second.
+
+Two CI runs of 5 samples on that tree measured 50.4-52.8 s on one runner
+and 75.8-76.9 s on another. The last scheduled run before it measured
+101.2 s, 89.3 s and 90.0 s. The budget is now p95 100 s / max 120 s: p95 is
+30% above the slowest of the ten samples.
+
+The original 60 s / 90 s target is met on the faster runner and not on the
+slower one. To meet it on each runner, the build needs less code in
+`autumn-web` and a shorter single-core phase: a split of `autumn-web` into
+crates that compile in parallel (issue #2795, ADR 0046 "Roadmap"). The work
+of today's build packs into about 48 s on four cores of the test box at
+best.
 
 ---
 

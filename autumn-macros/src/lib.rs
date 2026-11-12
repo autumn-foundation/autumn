@@ -33,7 +33,6 @@
 //! argument naming the extern-prelude identifier to use instead, e.g.
 //! `#[get("/x", crate = "autumn_web_05")]`.
 
-mod agent_authority;
 mod api_doc;
 mod authorize;
 mod cached;
@@ -65,7 +64,6 @@ mod param_helpers;
 mod parse;
 mod paths_macro;
 mod public;
-mod query_budget;
 mod request_gate;
 mod route;
 mod routes_macro;
@@ -1073,7 +1071,7 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
     autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
-        query_budget::query_budget_macro(attr, item)
+        autumn_macros_support::analysers::query_budget(attr, item)
     })
     .into()
 }
@@ -1159,7 +1157,7 @@ pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
     autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
-        agent_authority::agent_operable_macro(attr, item)
+        autumn_macros_support::analysers::agent_operable(attr, item)
     })
     .into()
 }

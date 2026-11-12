@@ -1,0 +1,40 @@
+pgbench: setting random seed to 3742
+== totals (pg_stat_statements, this database)
+ calls  | buffers | dirtied | temp_written | wal_records | wal_bytes | wal_fpi 
+--------+---------+---------+--------------+-------------+-----------+---------
+ 366252 | 5509046 |    9738 |            0 |      331834 |  69867011 |      26
+
+== top statements by buffers
+ calls  |  rows   | buffers | pct_buf | pct_calls | dirtied | wal_records | wal_bytes | pct_wal |                                                     query                                                      
+--------+---------+---------+---------+-----------+---------+-------------+-----------+---------+----------------------------------------------------------------------------------------------------------------
+  80000 |   80000 | 1885993 |    34.2 |      21.8 |     304 |      106813 |   7412757 |    10.6 | UPDATE autumn_webhook_subscriptions SET consecutive_failures = $2, status = CASE WHEN status = $3 THEN $4 ELSE
+  40000 | 7919739 | 1673193 |    30.4 |      10.9 |       0 |        4349 |    329603 |     0.5 | SELECT id, target_url, event_topics, secret, status, consecutive_failures FROM autumn_webhook_subscriptions WH
+  41538 |   41538 |  878314 |    15.9 |      11.3 |       0 |        1595 |    124149 |     0.2 | SELECT id, target_url, event_topics, secret, status, consecutive_failures FROM autumn_webhook_subscriptions WH
+  81538 |   81538 |  612666 |    11.1 |      22.3 |    9427 |      213624 |  61630107 |    88.2 | INSERT INTO autumn_webhook_deliveries (id, subscription_id, topic, payload, request_headers, response_status, 
+ 122307 |   82307 |  449595 |     8.2 |      33.4 |       0 |        4402 |    289116 |     0.4 | SELECT id, subscription_id, topic, payload, request_headers, response_status, response_body, elapsed_ms, attem
+    769 |     768 |    9285 |     0.2 |       0.2 |       7 |        1051 |     81279 |     0.1 | UPDATE autumn_webhook_subscriptions SET consecutive_failures = consecutive_failures + $2, status = CASE WHEN c
+      1 |       1 |       1 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | SELECT sum(calls) AS calls, sum(shared_blks_hit + shared_blks_read) AS buffers, sum(shared_blks_dirtied) AS di
+     48 |       0 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | BEGIN
+     48 |       0 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | COMMIT
+      1 |       1 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | SELECT pg_current_wal_lsn()
+      1 |       1 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | SELECT pg_stat_force_next_flush()
+      1 |       1 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | SELECT pg_stat_reset()
+
+== top statements by calls
+== wait-event samples of the pgbench workers
+ wait_event_type |      wait_event      | samples | pct  
+-----------------+----------------------+---------+------
+ LWLock          | WALWrite             |     693 | 35.6
+ CPU             | -                    |     627 | 32.2
+ IO              | WALSync              |     305 | 15.7
+ Lock            | transactionid        |     188 |  9.7
+ Client          | ClientRead           |      81 |  4.2
+ Lock            | tuple                |      18 |  0.9
+ LWLock          | BufferContent        |      12 |  0.6
+ IO              | WALWrite             |      11 |  0.6
+ Timeout         | SpinDelay            |       6 |  0.3
+ LWLock          | LockManager          |       3 |  0.2
+ IO              | DataFileExtend       |       2 |  0.1
+ IPC             | ProcArrayGroupUpdate |       1 |  0.1
+(12 rows)
+

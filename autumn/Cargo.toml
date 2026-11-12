@@ -15,10 +15,10 @@ autotests = false
 exclude = ["tests/fixtures/axe-core/"]
 
 [features]
-# The last 19 names are the compile gates (#2795, ADR 0027, ADR 0045). Default-on; the
-# no-DB daemon starter drops them. Keep this on one line: the panic gate
+# The last 20 names are the compile gates (#2795, ADR 0027, ADR 0045, ADR 0046). Default-on. The
+# no-DB daemon starter drops all but `error-reporting`. Keep the list on one line: the panic gate
 # (scripts/check-panic-gate.sh) reads it with grep.
-default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push", "cluster"]
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push", "cluster", "error-reporting"]
 # Compile gates (#2795, ADR 0027). Each gates one module. See the default list.
 ledger = ["version-history"]
 experiments = ["feature-flags"]
@@ -264,7 +264,11 @@ variants = ["storage", "dep:image"]
 # panics + 5xx responses to configured `ErrorReporter`s. Ships a `tracing`-based
 # `LogReporter` as the default. On by default; disable to drop the panic-catch
 # layer and the reporting machinery.
-reporting = []
+error-reporting = []
+# `error-reporting` plus failure capture: the `capsule` module, its effect
+# hooks and `autumn replay` (#1598). On by default. The no-DB daemon starter
+# names `error-reporting` only (#2795).
+reporting = ["error-reporting"]
 mail = ["dep:lettre", "dep:css-inline", "maud"]
 # First-class inbound email handling with provider webhooks and routing DSL.
 # Adds `autumn_web::inbound_mail` with the generic RFC 5322 adapter.
@@ -494,7 +498,6 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
-tokio-cron-scheduler.workspace = true
 validator.workspace = true
 # `serde` is library-side, not test-only: `db::sqlite_types::SqliteUuid` is
 # `#[serde(transparent)]` over `uuid::Uuid`, so the lib does not compile under

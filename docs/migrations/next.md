@@ -708,6 +708,40 @@ autumn-web = { version = "{(X+1).0}", default-features = false, features = ["mau
 **Automation:** `manual` — a codemod cannot know if the app uses the
 cluster. Add the feature only if it does.
 
+---
+
+### Features: failure capture needs `reporting`
+
+**Why:** the `reporting` feature had two parts: the panic-catch layer and
+failure capture (issue #2795, ADR 0046). The panic-catch layer now has its
+own feature, `error-reporting`. `reporting` turns it on and adds failure
+capture, so a manifest that names `reporting` builds the same code as
+before. Both are in `default`.
+
+**You are affected only if your app sets `default-features = false`, does not
+name `reporting`, and sets `[failure_capture] enabled = true`.** Before,
+that build did not know the section and wrote no capsule. Now the section
+parses, and boot fails with a validation error that names the feature.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):** add `"reporting"`, or set
+`failure_capture.enabled = false`.
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "reporting"] }
+```
+
+An app that wants the panic-catch layer and no failure capture names
+`"error-reporting"`.
+
+**Automation:** `manual` — a codemod cannot know if the app wants failure
+capture.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
