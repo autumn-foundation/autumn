@@ -4,7 +4,7 @@
 # 25% a running-window unique job, 15% a pending-window unique job, 10% a
 # 1-hour TTL unique job (eviction UPDATE, then INSERT), keys zipf-drawn,
 # seeded. Prints the pg_stat_statements profile, WAL and table counters.
-# Usage: [JOB_RS=<file>] run.sh [N] [hist]. Needs PG* env pointing at a
+# Usage: [JOB_RS=<file>] [SCHEMA=<file>] run.sh [N] [hist]. Needs PG* env pointing at a
 # Postgres 16 server that preloads pg_stat_statements.
 set -euo pipefail
 # A seq scan of a table past shared_buffers/4 starts where the last one
@@ -21,8 +21,7 @@ python3 "$HERE/gen_pgbench.py" "$WORK"
 dropdb --if-exists "$DB"; createdb "$DB"
 export PGDATABASE="$DB"
 psql -qX -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements' >/dev/null
-(cd "$HERE" && psql -qX -v ON_ERROR_STOP=1 -f schema.sql >/dev/null)
-if [ -n "${EXTRA_SCHEMA:-}" ]; then psql -qX -v ON_ERROR_STOP=1 -f "$EXTRA_SCHEMA" >/dev/null; fi
+(cd "$HERE" && psql -qX -v ON_ERROR_STOP=1 -f "${SCHEMA:-schema.sql}" >/dev/null)
 psql -qX -v ON_ERROR_STOP=1 -v hist="$HIST" -f "$HERE/fixture.sql" >/dev/null
 echo "=== fixture: hist=$HIST, N=$N"
 psql -X -c "SELECT name, unique_window, status, count(*) FROM autumn_jobs
@@ -45,4 +44,7 @@ psql -XAt -c "SELECT 'rows: ' || count(*) FROM autumn_jobs" \
        FROM autumn_jobs WHERE id LIKE 'e%' GROUP BY name, unique_window, status) s" \
   -c "SELECT 'evicted ttl holds (fixture rows): ' || count(*) FROM autumn_jobs
       WHERE id LIKE 'ur%' AND unique_key IS NULL"
+psql -XAt -c "SELECT 'end-state md5 (id, name, queue, status, keys): ' || md5(string_agg(
+      concat_ws('|', id, name, queue, status, unique_key, unique_window, pending_unique_key),
+      E'\\n' ORDER BY id)) FROM autumn_jobs"
 rm -rf "$WORK"

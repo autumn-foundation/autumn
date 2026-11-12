@@ -6,3 +6,4 @@ DROP TABLE IF EXISTS autumn_jobs;
 \ir ../../../autumn/migrations/20260611000000_add_pending_unique_key_to_jobs/up.sql
 \ir ../../../autumn/migrations/20260628000000_add_queue_to_jobs/up.sql
 \ir ../../../autumn/migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql
+\ir ../../../autumn/migrations/20261112170000_add_jobs_unique_key_enqueued_index/up.sql
