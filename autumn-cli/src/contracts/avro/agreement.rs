@@ -631,9 +631,29 @@ fn tests_in(source: &str) -> Vec<(&str, &str)> {
             .and_then(|r| r.split('(').next())
             .unwrap_or_else(|| panic!("a `#[test]` with no `fn` after it: `{rest}`"));
         // The body ends at the first closing brace at the indent of `fn`.
-        out.push((name, chunk.split("\n    }\n").next().unwrap_or_default()));
+        // A Windows checkout can have CRLF line ends.
+        let end = ["\n    }\n", "\n    }\r\n"]
+            .iter()
+            .filter_map(|close| chunk.find(close))
+            .min()
+            .unwrap_or(chunk.len());
+        out.push((name, chunk[..end].trim_end_matches('\r')));
     }
     out
+}
+
+/// A checkout with CRLF line ends gives the same tests and bodies.
+#[test]
+fn the_test_parser_reads_crlf_as_lf() {
+    let lf = include_str!("../compat.rs").replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    let normalize = |tests: Vec<(&str, &str)>| -> Vec<(String, String)> {
+        tests
+            .into_iter()
+            .map(|(name, body)| (name.to_owned(), body.replace("\r\n", "\n")))
+            .collect()
+    };
+    assert_eq!(normalize(tests_in(&crlf)), normalize(tests_in(&lf)));
 }
 
 /// Each event test in `compat.rs` has a case here, and each case that
