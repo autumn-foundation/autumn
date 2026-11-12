@@ -732,7 +732,12 @@ impl<'a> Walk<'a> {
         if !self.path.insert(key.clone()) {
             return Vec::new();
         }
-        let mut found = request_issues(&sender.shape, &receiver.shape, key.2.as_deref(), self);
+        let mut found = request_issues(
+            &sender.shape,
+            &receiver.shape,
+            Level::Nested(key.2.as_deref()),
+            self,
+        );
         found.truncate(MAX_NESTED_ISSUES);
         self.path.remove(&key);
         self.encoded.insert(key, found.clone());
@@ -886,7 +891,8 @@ enum Decode {
 /// `produced` holds, and the code reads the fields in `reads`.
 ///
 /// A nested type of a matched field is compared in the same way, one level
-/// down, with the reads under that field.
+/// down, with the reads under that field. A read is missing only when the
+/// reader's own release produces the field and `produced` does not.
 fn decode_issues(
     reader: &WireTypeDescriptor,
     produced: &[WireFieldDescriptor],
@@ -900,7 +906,9 @@ fn decode_issues(
         let Some(field) = decoded.iter().find(|f| f.rust_name == read) else {
             continue;
         };
-        if produced_for(produced, field).is_none() {
+        // A field the reader's own release never produces is not a change.
+        let own_release_produces = produced_for(&reader.serialized, field).is_some();
+        if own_release_produces && produced_for(produced, field).is_none() {
             named.insert(field.wire_name.clone());
             out.push(Decode::Missing(field.wire_name.clone()));
         }
@@ -983,21 +991,42 @@ fn request_breaks(
         report(BreakKind::RequestUnitChanged);
         return;
     }
-    for kind in request_issues(&view.request, &serve.request, call.writes.as_deref(), walk) {
+    for kind in request_issues(
+        &view.request,
+        &serve.request,
+        Level::Top(call.writes.as_deref()),
+        walk,
+    ) {
         report(kind);
     }
 }
 
+/// The write-set of one request level.
+#[derive(Clone, Copy)]
+enum Level<'w> {
+    /// The body. `None` when the write-set is unknown.
+    Top(Option<&'w [String]>),
+    /// A nested type. `None` when the call site sets no field under it.
+    Nested(Option<&'w [String]>),
+}
+
 /// The request rules for one level: `sender` is the caller's type, and
-/// `receiver` the callee's. `writes` is the call site's write-set at this
-/// level, `None` when it is unknown. A nested level has a known write-set
-/// only when the call site sets it with an inline literal.
+/// `receiver` the callee's. `level` holds the call site's write-set there.
+///
+/// One build checks the body against the caller's own release, but not a
+/// nested type. So a nested level reports only what changed from the
+/// caller's own release: a field that release required counts as sent, and
+/// a set field counts as dropped only when that release accepted it.
 fn request_issues(
     sender: &WireTypeDescriptor,
     receiver: &WireTypeDescriptor,
-    writes: Option<&[String]>,
+    level: Level<'_>,
     walk: &mut Walk<'_>,
 ) -> Vec<BreakKind> {
+    let (writes, nested) = match level {
+        Level::Top(writes) => (writes, false),
+        Level::Nested(writes) => (writes, true),
+    };
     let mut out = Vec::new();
     let mut report = |kind| out.push(kind);
     let sent = &sender.serialized;
@@ -1016,7 +1045,7 @@ fn request_issues(
     let always_sent = |f: &WireFieldDescriptor| {
         f.required
             || written.contains(f.rust_name.as_str())
-            || (writes.is_none() && own_release_requires(f))
+            || ((writes.is_none() || nested) && own_release_requires(f))
     };
     for need in accepted {
         if key_hits(sent, need) > 1 {
@@ -1033,7 +1062,8 @@ fn request_issues(
         let Some(field) = sent.iter().find(|f| f.rust_name == *write) else {
             continue;
         };
-        if accepting(accepted, field).is_none() && !receiver.closed {
+        let own_release_accepts = accepting(&sender.deserialized, field).is_some();
+        if accepting(accepted, field).is_none() && !receiver.closed && own_release_accepts {
             report(BreakKind::RequestFieldDropped(field.wire_name.clone()));
         }
     }
@@ -1069,10 +1099,10 @@ fn request_issues(
                     }
                     // A nested write-set is known when the call site sets
                     // a field under this one.
-                    let nested = writes
+                    let under = writes
                         .map(|w| below(w, &field.rust_name))
                         .filter(|w| !w.is_empty());
-                    for kind in walk.encode(theirs, ours, nested) {
+                    for kind in walk.encode(theirs, ours, under) {
                         report(kind.under(&field.wire_name));
                     }
                 }
@@ -2622,32 +2652,103 @@ mod tests {
         );
     }
 
+    /// [`nested_sets`] where `Details.code` may be left off the wire. The
+    /// callee needs it when `required`. Only the request holds `details`.
+    fn optional_code(required: bool, writes: &[&str]) -> Bundle {
+        let mut bundle = nested_sets(true, &["id"], Some(writes));
+        let shape = &mut bundle.types[0].shape;
+        shape.serialized.push(plain("code", false));
+        shape.deserialized.push(plain("code", required));
+        let item = &mut ep(&mut bundle, "get_item").response;
+        for fields in [&mut item.serialized, &mut item.deserialized] {
+            fields.retain(|f| f.rust_name != "details");
+        }
+        bundle
+    }
+
     #[test]
     fn a_nested_write_set_counts_a_field_the_type_may_omit_only_when_set() {
-        // `Details.code` may be left off the wire, and the callee needs it.
-        let release = |writes: &[&str]| {
-            let mut bundle = nested_sets(true, &["id"], Some(writes));
-            let shape = &mut bundle.types[0].shape;
-            shape.serialized.push(plain("code", false));
-            shape.deserialized.push(plain("code", true));
-            // The request only: a response decode would need `code` too.
-            let item = &mut ep(&mut bundle, "get_item").response;
-            for fields in [&mut item.serialized, &mut item.deserialized] {
-                fields.retain(|f| f.rust_name != "details");
+        // The new callee starts to need `details.code`.
+        let set = &["details", "details.code", "name"];
+        let report = compare(&optional_code(false, set), &optional_code(true, set));
+        assert!(report.callee_first.is_empty(), "{report:?}");
+        let unset = &["details", "details.size", "name"];
+        let report = compare(&optional_code(false, unset), &optional_code(true, unset));
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::RequestFieldNotSent("details.code".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_release_with_nested_sets_is_compatible() {
+        // One build passes each of these. Only a change between releases is
+        // a break.
+        // A required field the type may omit, not named in the literal.
+        let omitted = optional_code(true, &["details", "details.size", "name"]);
+        assert_eq!(compare(&omitted, &omitted), Report::default());
+        // A field the type does not decode (`skip_deserializing`), set in a
+        // literal.
+        let mut skipped = nested_sets(true, &["id"], Some(&["details", "details.stamp"]));
+        skipped.types[0].shape.serialized.push(plain("stamp", true));
+        assert_eq!(compare(&skipped, &skipped), Report::default());
+        // A field the type does not encode (`skip_serializing`), read.
+        let mut secret = nested_sets(true, &["details", "details.secret"], Some(&["name"]));
+        secret.types[0]
+            .shape
+            .deserialized
+            .push(plain("secret", false));
+        assert_eq!(compare(&secret, &secret), Report::default());
+    }
+
+    #[test]
+    fn a_recursive_type_with_a_deep_read_ends_and_reports_the_path() {
+        let node = |with_x: bool| {
+            let mut child = field("child", "child", "Option<Node>", true);
+            child.nested = vec!["mesh-catalog::Node".to_owned()];
+            let mut decoded = vec![field("child", "child", "Option<Node>", false)];
+            decoded[0].nested.clone_from(&child.nested);
+            let mut sent = vec![child];
+            if with_x {
+                sent.push(field("x", "x", "Option<String>", true));
+                decoded.push(field("x", "x", "Option<String>", false));
             }
+            crate::contracts::bundle::BundleType {
+                id: "mesh-catalog::Node".to_owned(),
+                shape: shape("Node", sent, decoded),
+            }
+        };
+        let release = |with_x: bool, reads: &[&str]| {
+            let mut bundle = typed_release();
+            let mut root = field("root", "root", "Node", true);
+            root.nested = vec!["mesh-catalog::Node".to_owned()];
+            let item = ep(&mut bundle, "get_item");
+            item.response.serialized.push(root.clone());
+            item.response.deserialized.push(root);
+            bundle.types = vec![node(with_x)];
+            bundle.callers.retain(|c| c.endpoint != "get_item");
+            bundle
+                .callers
+                .push(call("show_item", "get_item", reads, None));
             bundle
         };
-        let set = release(&["details", "details.code", "name"]);
-        assert_eq!(compare(&set, &set).verdict(), Verdict::Compatible);
-        let unset = release(&["details", "details.size", "name"]);
-        assert!(
-            kinds(&compare(&unset, &unset).callee_first)
-                .contains(&BreakKind::RequestFieldNotSent("details.code".to_owned())),
+        let deep = &[
+            "root",
+            "root.child",
+            "root.child.child",
+            "root.child.child.x",
+        ];
+        let report = compare(&release(true, deep), &release(false, &["root"]));
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::ResponseFieldMissing(
+                "root.child.child.x".to_owned()
+            )]
         );
-        // `details: value` (not a literal): the nested write-set is unknown,
-        // and the caller's own release already needed `code`.
-        let unknown = release(&["details", "name"]);
-        assert_eq!(compare(&unknown, &unknown).verdict(), Verdict::Compatible);
+        assert_eq!(
+            compare(&release(true, deep), &release(true, deep)),
+            Report::default()
+        );
     }
 
     #[test]

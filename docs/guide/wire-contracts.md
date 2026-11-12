@@ -283,7 +283,10 @@ serves with the types of its release. The rules:
   `details.color`. The read and write rules also apply one level down. The
   callee must produce each nested field that the caller reads. The callee
   must accept each nested field that an inline literal sets. This is also
-  true for an optional nested field.
+  true for an optional nested field. One build does not check a nested
+  field against the caller's own release. So a nested rule reports only a
+  change from that release: a field it did not produce or accept is not a
+  break.
 * **Field types.** A field's Rust type must not change. Path prefixes do not
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.
@@ -1002,9 +1005,9 @@ on some changes:
   crate, because the name can also be a local function. Write
   `routes![mesh_catalog::get_item]` to have the check judge it.
 * The check sees a nested read through field access, a struct pattern, a
-  `let`, `if let` or `match` binding, a macro body, `unwrap`, `clone`,
-  `as_ref`, and the `Option` and `Result` callbacks
-  (`item.details.as_ref().map(|d| d.color)`).
+  `let`, `if let` or `match` binding, a macro body, a maud `@let` or
+  `@if let`, `unwrap`, `clone`, `as_ref`, and the `Option` and `Result`
+  callbacks (`item.details.as_ref().map(|d| d.color)`).
 * A loop, an index or another method call stops the path.
   `item.details.lines[0].price` reads `details.lines` only.
 * The check knows a nested write-set only when the call site sets a named
