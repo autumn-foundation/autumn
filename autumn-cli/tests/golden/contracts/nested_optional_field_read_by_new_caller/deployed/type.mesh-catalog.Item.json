@@ -1,0 +1,33 @@
+{
+  "krate": "mesh-catalog",
+  "name": "Item",
+  "serialized": [
+    {
+      "rust_name": "id",
+      "wire_name": "id",
+      "ty": "String",
+      "required": true
+    },
+    {
+      "rust_name": "details",
+      "wire_name": "details",
+      "ty": "Details",
+      "required": true
+    }
+  ],
+  "deserialized": [
+    {
+      "rust_name": "id",
+      "wire_name": "id",
+      "ty": "String",
+      "required": true
+    },
+    {
+      "rust_name": "details",
+      "wire_name": "details",
+      "ty": "Details",
+      "required": true
+    }
+  ],
+  "closed": false
+}

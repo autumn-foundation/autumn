@@ -158,6 +158,69 @@ fn a_required_field_removed_from_a_nested_type_is_a_break() {
 }
 
 #[test]
+fn an_optional_nested_field_a_caller_reads_removed_is_a_break() {
+    // The deployed caller reads `item.details.color`.
+    let report = golden_descriptors("nested_optional_read_field_removed", 3);
+    let (old_callers, new_callers) = report
+        .split_once("If the callers ship first")
+        .expect("both windows");
+    assert!(
+        old_callers.contains("reads response field `details.color`"),
+        "{report}"
+    );
+    assert!(new_callers.contains("ok"), "{report}");
+    assert!(
+        report.contains("safe only if the callers ship first"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_new_optional_nested_field_a_new_caller_reads_names_the_deploy_order() {
+    let report = golden_descriptors("nested_optional_field_read_by_new_caller", 3);
+    let (_, new_callers) = report
+        .split_once("If the callers ship first")
+        .expect("both windows");
+    assert!(
+        new_callers.contains("reads response field `details.color`"),
+        "{report}"
+    );
+    assert!(
+        report.contains("safe only if the callees ship first"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_nested_field_the_call_site_sets_and_the_callee_drops_is_a_break() {
+    // The deployed caller sets `details: Details { color: Some(..), .. }`.
+    let report = golden_descriptors("nested_request_field_dropped", 3);
+    let (old_callers, _) = report
+        .split_once("If the callers ship first")
+        .expect("both windows");
+    assert!(
+        old_callers.contains("sets request field `details.color`"),
+        "{report}"
+    );
+    assert!(
+        report.contains("safe only if the callers ship first"),
+        "{report}"
+    );
+}
+
+#[test]
+fn an_optional_nested_event_field_a_consumer_reads_removed_is_a_break() {
+    let report = golden_descriptors("nested_event_field_removed", 3);
+    let (old_callers, _) = report
+        .split_once("If the callers ship first")
+        .expect("both windows");
+    assert!(
+        old_callers.contains("reads field `details.color`"),
+        "{report}"
+    );
+}
+
+#[test]
 fn a_unit_struct_that_becomes_an_empty_object_breaks_both_windows() {
     let report = golden_descriptors("unit_to_empty_object", 1);
     assert!(

@@ -105,7 +105,8 @@ pub struct BundleListener {
     pub function: String,
     /// The topic of the event it consumes.
     pub topic: String,
-    /// Payload fields the consumer reads, by Rust name.
+    /// Payload fields the consumer reads, by Rust name. A nested field is a
+    /// dotted path: `details.color`.
     pub reads: Vec<String>,
 }
 
@@ -175,9 +176,11 @@ pub struct BundleCall {
     pub service: String,
     /// The endpoint called.
     pub endpoint: String,
-    /// Response fields the caller reads, by Rust name.
+    /// Response fields the caller reads, by Rust name. A nested field is a
+    /// dotted path: `details.color`.
     pub reads: Vec<String>,
-    /// Request fields the call site sets, by Rust name. `None` when unknown.
+    /// Request fields the call site sets, by Rust name, with nested fields
+    /// as dotted paths. `None` when unknown.
     pub writes: Option<Vec<String>>,
 }
 
