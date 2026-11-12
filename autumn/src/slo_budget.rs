@@ -184,11 +184,13 @@ impl BudgetTracker {
         })
     }
 
-    /// Good and bad counts in the buckets of `(now - window, now]`.
+    /// Good and bad counts in the buckets that overlap `(now - window, now]`.
+    /// The bucket that holds the start of the window counts whole, so an
+    /// event still inside the window is never dropped; at most one bucket
+    /// width of older events counts with it.
     fn counts(&self, now: Duration, window: Duration) -> Option<(u64, u64)> {
         let last = now.as_secs() / BUCKET_SECS;
-        let span = window.as_secs().div_ceil(BUCKET_SECS);
-        let first = (last + 1).saturating_sub(span);
+        let first = now.saturating_sub(window).as_secs() / BUCKET_SECS;
         let (good, bad) = self
             .buckets
             .iter()
@@ -216,17 +218,27 @@ pub fn parse_window(span: &str) -> Option<Duration> {
     count.checked_mul(unit).map(Duration::from_secs)
 }
 
-/// Whether `outcome` is a good event for `slo`. `None` when the outcome is
-/// on a route the SLO does not cover.
+/// The route label of a request that matched no route.
+pub const UNMATCHED_ROUTE: &str = "_unmatched";
+
+/// Whether `outcome` is a good event for `slo`.
+///
+/// `None` when the SLI does not count the outcome, as in the rules
+/// `autumn slo generate` writes: a route
+/// the SLO does not cover, a `5xx` for a latency SLI, or an unmatched request
+/// for a latency SLI with no route.
 #[must_use]
 pub fn classify(slo: &Slo, outcome: &Outcome<'_>) -> Option<bool> {
     if slo.route().is_some_and(|route| route != outcome.route) {
         return None;
     }
-    Some(match slo.sli {
-        Sli::Availability { .. } => outcome.status < 500,
-        Sli::Latency { threshold_ms, .. } => outcome.latency_ms <= threshold_ms,
-    })
+    let server_error = outcome.status >= 500;
+    match slo.sli {
+        Sli::Availability { .. } => Some(!server_error),
+        Sli::Latency { .. } if server_error => None,
+        Sli::Latency { route: None, .. } if outcome.route == UNMATCHED_ROUTE => None,
+        Sli::Latency { threshold_ms, .. } => Some(outcome.latency_ms <= threshold_ms),
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +351,52 @@ mod tests {
         assert_eq!(classify(&slo, &fast), Some(true));
         assert_eq!(classify(&slo, &slow), Some(false));
         assert_eq!(classify(&slo, &other), None);
+    }
+
+    #[test]
+    fn latency_ignores_server_errors_and_unscoped_unmatched_requests() {
+        let scoped = latency();
+        let fast_error = Outcome {
+            route: "/api/orders",
+            status: 503,
+            latency_ms: 1,
+        };
+        let slow_error = Outcome {
+            route: "/api/orders",
+            status: 500,
+            latency_ms: 9_999,
+        };
+        assert_eq!(classify(&scoped, &fast_error), None);
+        assert_eq!(classify(&scoped, &slow_error), None);
+
+        let unscoped = Slo {
+            sli: Sli::Latency {
+                route: None,
+                threshold_ms: 250,
+            },
+            ..latency()
+        };
+        let scanner = Outcome {
+            route: UNMATCHED_ROUTE,
+            status: 404,
+            latency_ms: 9_999,
+        };
+        assert_eq!(classify(&unscoped, &scanner), None);
+        // Availability still counts an unmatched 5xx.
+        let unmatched_error = Outcome {
+            route: UNMATCHED_ROUTE,
+            status: 500,
+            latency_ms: 1,
+        };
+        assert_eq!(classify(&availability(None), &unmatched_error), Some(false));
+    }
+
+    #[test]
+    fn the_bucket_holding_the_window_start_still_counts() {
+        let mut tracker = BudgetTracker::new(availability(None));
+        // 241 seconds old at query time: inside a five-minute window.
+        tracker.record(Duration::from_secs(59), fail("/"));
+        assert_eq!(tracker.burn_tenths(5 * MIN, 5 * MIN), Some(10_000));
     }
 
     #[test]
