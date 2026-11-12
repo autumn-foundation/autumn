@@ -1292,7 +1292,16 @@ fn macro_bindings(
                 i += 1;
             }
             proc_macro2::TokenTree::Punct(p) if p.as_char() == '@' => {
-                if let Some(binding) = maud_binding(tts, i, lookup) {
+                // An initializer sees the bindings before it, then the outer
+                // scope.
+                let earlier = |name: &str| {
+                    out.iter()
+                        .rev()
+                        .filter(|b: &&MacroBinding| (b.from..b.to).contains(&i))
+                        .find_map(|b| b.names.iter().find(|(n, _)| n == name))
+                        .map_or_else(|| lookup(name), |(_, held)| held.clone())
+                };
+                if let Some(binding) = maud_binding(tts, i, &earlier) {
                     out.push(binding);
                 }
                 i += 1;
@@ -1900,6 +1909,24 @@ mod tests {
         assert_eq!(
             nested_reads("html! { @let d = &item.details; p { (d.color) } }"),
             ["details", "details.color"]
+        );
+    }
+
+    #[test]
+    fn a_maud_binding_sees_the_bindings_before_it() {
+        assert_eq!(
+            nested_reads("html! { @let d = &item.details; @let e = d; (e.color) }"),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads(
+                "html! { @let d = &item.details; @if let Some(s) = &d.shade { (s.hex) } }"
+            ),
+            ["details", "details.shade", "details.shade.hex"]
+        );
+        assert_eq!(
+            nested_reads("html! { @let d = other; @let e = d; (e.color) }"),
+            [] as [&str; 0]
         );
     }
 
