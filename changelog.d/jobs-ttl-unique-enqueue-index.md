@@ -1,6 +1,6 @@
 ### Changed
 
-- **jobs:** a unique job with a TTL window (`#[job(unique, ttl = …)]`) no
+- **jobs:** [no-plugin] a unique job with a TTL window (`#[job(unique, ttl = …)]`) no
   longer reads the whole `autumn_jobs` table, finished history included, on
   every Postgres enqueue. The new migration
   `20261112170000_add_jobs_unique_key_enqueued_index` adds a partial index on
