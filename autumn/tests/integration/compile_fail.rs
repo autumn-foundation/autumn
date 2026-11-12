@@ -619,6 +619,7 @@ fn compile_fail_wire_contract_tests() {
     t.compile_fail("tests/compile-fail/wire_shape_rejects_container_rewrites.rs");
     t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
     t.compile_fail("tests/compile-fail/wire_shape_unknown_wire_type.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_tag_clash.rs");
 }
 
 /// Event contracts: a consumer that reads a field the event does not send
