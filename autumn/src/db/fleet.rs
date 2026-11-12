@@ -3982,7 +3982,12 @@ mod tests {
         use crate::config::FleetMaxOpenPolicy::{Refuse, Wait};
         for policy in [Refuse, Wait] {
             let tmp = tempfile::tempdir().unwrap();
-            let fleet = capped(tmp.path(), 3, policy, Duration::from_millis(40), 30);
+            // A slow runner opens and closes SQLite files slowly, and `wait`
+            // does not serve its waiters in order. This test checks the cap,
+            // not the wait time, so `wait` gets a deadline no runner reaches.
+            // The deadline test is `the_wait_policy_answers_503_when_no_room_comes_in_time`.
+            let wait_secs = if policy == Wait { 600 } else { 30 };
+            let fleet = capped(tmp.path(), 3, policy, Duration::from_millis(40), wait_secs);
             let tasks: Vec<_> = (1..=24)
                 .map(|n| {
                     let fleet = fleet.clone();
