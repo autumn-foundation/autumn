@@ -363,17 +363,10 @@ of database and user. So each boundary gets its own server pool.
 * The retention sweep of a repository uses the primary pool. A job runs
   its SQL through `BoundaryDb` or `pool_for`.
 * One table name cannot be in two schemas. The schema tools key a table by
-  name, and refuse the second one. Use one name for each table.
+  name, and refuse the second one. Use one name for each table. See
+  [ADR 0047](../adr/0047-schema-tools-key-tables-by-name.md).
 * `schema diff` does not move a table to another schema. It refuses the
   change. Write `ALTER TABLE ... SET SCHEMA` by hand.
-* `schema diff` does not match a foreign key to a table of another named
-  schema. Write that constraint in a migration.
-* `schema diff` refuses a type change of a column that a foreign key points
-  at, when an FK of the same table name in another schema exists. This is a
-  false refusal. Write the change by hand.
-* `schema diff` refuses the rename of a table when an index of the new
-  convention name exists in another schema. This is a false refusal. Write the
-  rename by hand.
 * A model with `schema` stops `schema diff` on SQLite.
 * `autumn migrate` does not run an embedded `migrations_in_schema` set. Run it
   at boot, or set `AUTUMN_MIGRATE=1`.

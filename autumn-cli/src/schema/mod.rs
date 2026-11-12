@@ -19,6 +19,7 @@ pub mod rename;
 pub mod schema_rs;
 pub mod shadow;
 pub mod snapshot;
+pub mod table_ref;
 pub mod width;
 
 use std::collections::BTreeMap;
@@ -1459,10 +1460,11 @@ fn bare_fk_targets(columns: &mut [Column], schemas: &BTreeMap<String, String>) {
 /// only when `table` is in `schema`. A target the model wrote with another
 /// schema (`auth.users`) stays as written.
 fn unqualify_fk(fk: &mut autumn_schema_core::ForeignKey, schemas: &BTreeMap<String, String>) {
-    if let Some((schema, bare)) = fk.table.split_once('.')
-        && schemas.get(bare).is_some_and(|s| s == schema)
+    let target = table_ref::TableRef::parse(&fk.table);
+    if let Some(schema) = target.schema()
+        && schemas.get(target.name()).is_some_and(|s| s == schema)
     {
-        fk.table = bare.to_owned();
+        fk.table = target.name().to_owned();
     }
 }
 
@@ -2900,6 +2902,24 @@ mod tests {
             .filter_map(|c| c.references.as_ref().map(|f| f.table.as_str()))
             .collect();
         assert_eq!(targets, ["auth.users", "authors"]);
+    }
+
+    #[test]
+    fn a_projected_qualified_fk_target_diffs_clean_against_its_model() {
+        use autumn_schema_core::{Column, ColumnType, ForeignKey};
+        let mut authors = Table::new("authors", Backend::Postgres);
+        authors.schema = Some("blog".to_owned());
+        let mut posts = Table::new("posts", Backend::Postgres);
+        let mut author = Column::new("author_id".to_string(), ColumnType::Int64);
+        author.references = Some(ForeignKey::new("blog.authors", "id"));
+        posts.columns = vec![author];
+        let desired = parse::ParsedSchema::from_tables(vec![authors, posts]);
+        let opts = diff::DiffOptions::default();
+        let plan = diff::diff_schema(&[], &desired, opts);
+        diff::guard_plan(&plan, opts).expect("create plan");
+        let snapshot = project_plan_target(&[], &plan);
+        let next = diff::diff_schema(&snapshot, &desired, opts);
+        assert!(next.is_empty(), "{:?}", next.changes);
     }
 
     #[test]
