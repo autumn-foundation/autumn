@@ -3481,6 +3481,13 @@ The files are Prometheus burn-rate rules and alerts (14.4x over 1h/5m, 6x over
 Rollouts `AnalysisTemplate`, Flagger `MetricTemplate`s and Helm values. Route
 and latency SLOs read the request-duration histogram (issue #3064).
 
+To read the budget inside the app, with no Prometheus, use
+`autumn_web::slo_budget::BudgetTracker::new(slo)` (a validated `Slo`). Call
+`record(at, Outcome { route, status, latency_ms })` after each request, then
+`burn_tenths(now, window)` (`144` = 14.4x), `remaining_ppm(now, window)` and
+`firing(now)` (the same three burn windows). It reads no clock: pass `at`/`now`
+as a `Duration` from an epoch you pick, such as the boot `Instant`.
+
 Bake each host after its cutover; roll it back on a 5xx or latency breach or a
 restart (off by default):
 
