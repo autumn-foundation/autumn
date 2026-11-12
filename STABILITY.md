@@ -332,6 +332,11 @@ The widget families (`widgets-search`, `widgets-social`, `widgets-workflow`,
 that `jsonwebtoken`, `rsa`, `crypto-bigint` 0.5 and `p256` are in the graph
 only when their feature is on, and runs the specs with both off.
 
+`error-reporting` has a lane as well: `reporting` turns it on, so the
+default build never has the panic-catch layer without failure capture. The
+`error-reporting` lane compiles the no-DB daemon starter's feature set and
+runs the reporter specs with `reporting` off.
+
 `db` alone selects no backend, so it stops at a `compile_error!`. The sweep
 skips it and the features that enable `db` but no backend (`seed`, `repl`,
 `offline-sync`, `ledger-profile`). The combinations above build them with a

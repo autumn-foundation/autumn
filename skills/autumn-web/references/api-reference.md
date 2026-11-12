@@ -1685,7 +1685,7 @@ See `docs/guide/system-tests.md`.
 
 ```toml
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "error-reporting"]
 ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]
@@ -1724,7 +1724,8 @@ storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
 seed = ["db"]
 system-info = []
-reporting = []
+error-reporting = []            # panic catch + ErrorReporter (in `default`)
+reporting = ["error-reporting"]  # adds failure capture and `autumn replay` (in `default`)
 webauthn = ["dep:webauthn-rs"]
 csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
@@ -1811,7 +1812,6 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["tra
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
-tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
 validator = { version = "0.21", features = ["derive"] }
 bcrypt = "0.19"
