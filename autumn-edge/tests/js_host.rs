@@ -803,8 +803,11 @@ fn the_js_gateway_suite_passes() {
     let Some(node) = node() else {
         return;
     };
+    // The default reporter depends on the Node version and the terminal. TAP
+    // gives the `# pass N` line that the check below reads.
     let output = Command::new(node)
         .arg("--test")
+        .arg("--test-reporter=tap")
         .arg(js_dir().join("test").join("gateway.test.mjs"))
         .output()
         .expect("run node --test");
