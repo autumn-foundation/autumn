@@ -1,0 +1,43 @@
+$ cargo test -p autumn-web --features "test-support,mcp" --test integration_tests agent_authority::a_call_the_route_guard_rejects_does_not_spend_the_rate_cap
+# (run locally through a one-module harness: the consolidated binary OOMs this 15 GB host at link time)
+
+running 22 tests
+test agent_authority::a_direct_call_has_no_via_key ... ok
+test agent_authority::a_call_over_the_grants_rate_cap_is_refused_and_audited ... ok
+test agent_authority::a_rate_cap_that_cannot_be_read_refuses_every_call ... ok
+test agent_authority::a_refusal_is_recorded_by_whichever_sinks_are_still_healthy ... ok
+test agent_authority::a_route_guarded_call_names_its_principal_in_the_outcome ... ok
+test agent_authority::a_sink_that_never_answers_refuses_an_irreversible_call_on_a_deadline ... ok
+test agent_authority::a_stream_cut_off_mid_flight_is_recorded_as_aborted ... ok
+test agent_authority::a_stream_that_fails_mid_flight_is_recorded_as_errored ... ok
+test agent_authority::a_streaming_tool_is_audited_without_disturbing_its_stream ... ok
+test agent_authority::call_tool_audits_the_inner_tool ... ok
+test agent_authority::call_tool_shares_the_grant_rate_cap ... ok
+test agent_authority::governed_tools_call_writes_an_attempt_and_an_outcome_event ... ok
+test agent_authority::handler_can_read_the_agent_invocation_extension ... ok
+test agent_authority::irreversible_tool_refuses_to_dispatch_when_the_attempt_cannot_be_audited ... ok
+test agent_authority::metadata_never_echoes_a_caller_chosen_argument_key ... ok
+test agent_authority::metadata_records_argument_names_but_never_values ... ok
+test agent_authority::reversible_tool_still_dispatches_when_the_attempt_cannot_be_audited ... ok
+test agent_authority::unauthenticated_call_is_attributed_to_the_anonymous_agent ... ok
+test agent_authority::ungoverned_tool_is_audited_with_unknown_reversibility ... ok
+test agent_authority::a_body_that_overflows_the_tool_result_cap_records_a_failure ... ok
+test agent_authority::a_failing_handler_records_a_failure_outcome_with_its_status ... ok
+test agent_authority::a_call_the_route_guard_rejects_does_not_spend_the_rate_cap ... FAILED
+
+failures:
+
+---- agent_authority::a_call_the_route_guard_rejects_does_not_spend_the_rate_cap stdout ----
+
+thread 'agent_authority::a_call_the_route_guard_rejects_does_not_spend_the_rate_cap' (10367) panicked at autumn/tests/integration/agent_authority.rs:809:5:
+rejected anonymous calls spent the grant's cap, so the admitted agent was refused: {"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"rate cap 2/min for grant GuardedRefundDrafter exceeded; retry in 30s","type":"text"}],"isError":true}}
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    agent_authority::a_call_the_route_guard_rejects_does_not_spend_the_rate_cap
+
+test result: FAILED. 21 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+error: test failed, to rerun pass `-p autumn-web --test warden_tmp`

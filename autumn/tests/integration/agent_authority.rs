@@ -750,6 +750,71 @@ async fn a_rate_cap_that_cannot_be_read_refuses_every_call() {
     assert_eq!(events[0].action, "agent.tool.draft_refund.refused");
 }
 
+// ── Rate cap × route guard: only an admitted call spends the cap ──────
+//
+// Attacker: an MCP client with no session. Defender: an app that guards a
+// governed tool with `#[secured]` and caps its grant at `2/min`, as the
+// agent-authority guide shows. Flag: the signed-in agent's call is refused
+// with "rate cap exceeded" although it is the only call the guard admitted.
+//
+// The grant's bucket is one per grant, shared by every caller. A call the
+// route's own guard rejects never ran the action, so it must not spend the
+// cap; otherwise anyone who can reach `/mcp` locks the action out for
+// everyone who may take it.
+
+static GUARDED_CAPPED_GRANT: Grant = Grant {
+    rate: Some("2/min"),
+    ..test_grant("GuardedRefundDrafter", Reversibility::Compensable)
+};
+static GUARDED_CAPPED_AUTHORITY: AgentAuthority =
+    test_authority("secured_capped_refund", &GUARDED_CAPPED_GRANT);
+
+static SECURED_CAPPED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[post("/api/secured-capped-refunds")]
+#[secured]
+#[api_doc(mcp, summary = "Draft a refund, signed in only")]
+async fn secured_capped_refund(Json(_body): Json<RefundRequest>) -> Json<NoteReceipt> {
+    SECURED_CAPPED_CALLS.fetch_add(1, Ordering::SeqCst);
+    Json(NoteReceipt { stored: true })
+}
+
+#[tokio::test]
+async fn a_call_the_route_guard_rejects_does_not_spend_the_rate_cap() {
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![secured_capped_refund], &GUARDED_CAPPED_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+    let args = serde_json::json!({ "body": { "memo": "r" } });
+    let before = SECURED_CAPPED_CALLS.load(Ordering::SeqCst);
+
+    // The attacker: no session. Every call is rejected by `#[secured]`.
+    for _ in 0..3 {
+        let out = call_tool(&client, "secured_capped_refund", args.clone()).await;
+        assert_eq!(out["result"]["isError"], true, "{out}");
+    }
+    assert_eq!(
+        SECURED_CAPPED_CALLS.load(Ordering::SeqCst),
+        before,
+        "the guard must keep an anonymous caller out of the handler"
+    );
+
+    // The agent the app meant to admit.
+    client.login_as("agent-1").await;
+    let out = call_tool(&client, "secured_capped_refund", args).await;
+    let text = out["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !text.contains("rate cap"),
+        "rejected anonymous calls spent the grant's cap, so the admitted \
+         agent was refused: {out}"
+    );
+    assert_ne!(out["result"]["isError"], true, "{out}");
+    assert_eq!(SECURED_CAPPED_CALLS.load(Ordering::SeqCst), before + 1);
+}
+
 // ── 6: fail-closed when the attempt record cannot be written ──────────
 
 #[tokio::test]
