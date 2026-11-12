@@ -233,6 +233,26 @@ fn an_export_without_endpoints_names_why_the_body_schemas_go() {
 
 #[cfg(unix)]
 #[test]
+fn avro_export_does_not_remove_schemas_through_a_linked_endpoints_directory() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let out = scratch.path().join("avro");
+    let elsewhere = scratch.path().join("elsewhere");
+    std::fs::create_dir_all(&out).expect("mkdir");
+    std::fs::create_dir_all(&elsewhere).expect("mkdir");
+    let theirs = elsewhere.join("catalog.old.request.avsc");
+    std::fs::write(
+        &theirs,
+        r#"{"type": "record", "name": "Old", "autumn.endpoint": "x", "fields": []}"#,
+    )
+    .expect("write");
+    std::os::unix::fs::symlink(&elsewhere, out.join("endpoints")).expect("link");
+    let (code, stderr) = export_avro(&release_1(), &out, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(theirs.exists(), "a schema behind a link stays: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
 fn avro_export_does_not_write_through_a_link() {
     let scratch = tempfile::tempdir().expect("tempdir");
     let out = scratch.path().join("avro");

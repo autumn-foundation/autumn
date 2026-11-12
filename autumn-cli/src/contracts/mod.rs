@@ -387,6 +387,11 @@ pub fn run_avro(bundle: &Bundle, out: &Path, args: &AvroArgs) -> Result<Vec<Stri
 fn stale_avro(out: &Path, files: &std::collections::BTreeMap<String, String>) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for dir in [out.to_path_buf(), out.join(avro::ENDPOINTS_DIR)] {
+        // A linked `endpoints` directory is not the export's: its files
+        // belong to the link target.
+        if dir != out && std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
