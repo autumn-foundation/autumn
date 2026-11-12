@@ -1,0 +1,90 @@
+pgbench: setting random seed to 3742
+transaction type: multiple scripts
+number of transactions actually processed: 20000/20000
+number of failed transactions: 0 (0.000%)
+SQL script 1: /tmp/tmp.OxlP4oNQar/deliver_ok.pgbench
+ - weight: 98 (targets 98.0% of total)
+ - number of failed transactions: 0 (0.000%)
+SQL script 2: /tmp/tmp.OxlP4oNQar/deliver_retry.pgbench
+ - weight: 2 (targets 2.0% of total)
+ - number of failed transactions: 0 (0.000%)
+== totals (pg_stat_statements, this database)
+ calls  | buffers | dirtied | temp_written | wal_records | wal_bytes | wal_fpi 
+--------+---------+---------+--------------+-------------+-----------+---------
+ 183432 | 1016804 |    4558 |            0 |      188975 |  36011546 |      24
+
+== top statements by buffers
+ calls |  rows   | buffers | pct_buf | pct_calls | dirtied | wal_records | wal_bytes | pct_wal |                                                     query                                                      
+-------+---------+---------+---------+-----------+---------+-------------+-----------+---------+----------------------------------------------------------------------------------------------------------------
+ 40854 |   40854 |  304214 |    29.9 |      22.3 |    4551 |      106502 |  30639810 |    85.1 | INSERT INTO autumn_webhook_deliveries (id, subscription_id, topic, payload, request_headers, response_status, 
+ 40000 |   40000 |  280028 |    27.5 |      21.8 |       6 |       59400 |   3935737 |    10.9 | UPDATE autumn_webhook_subscriptions SET consecutive_failures = $2, status = CASE WHEN status = $3 THEN $4 ELSE
+ 61281 |   41281 |  225296 |    22.2 |      33.4 |       0 |        2851 |    188453 |     0.5 | SELECT id, subscription_id, topic, payload, request_headers, response_status, response_body, elapsed_ms, attem
+ 20854 |   20854 |  104270 |    10.3 |      11.4 |       0 |         415 |     25297 |     0.1 | SELECT id, target_url, event_topics, secret, status, consecutive_failures FROM autumn_webhook_subscriptions WH
+ 20000 | 3959411 |  100003 |     9.8 |      10.9 |       0 |       19378 |   1183594 |     3.3 | SELECT id, target_url, event_topics, secret, status, consecutive_failures FROM autumn_webhook_subscriptions WH
+   427 |     427 |    2993 |     0.3 |       0.2 |       1 |         429 |     38655 |     0.1 | UPDATE autumn_webhook_subscriptions SET consecutive_failures = consecutive_failures + $2, status = CASE WHEN c
+     1 |       1 |       1 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | SELECT sum(calls) AS calls, sum(shared_blks_hit + shared_blks_read) AS buffers, sum(shared_blks_dirtied) AS di
+     6 |       0 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | BEGIN
+     6 |       0 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | COMMIT
+     1 |       1 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | SELECT pg_current_wal_lsn()
+     1 |       1 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | SELECT pg_stat_force_next_flush()
+     1 |       1 |       0 |     0.0 |       0.0 |       0 |           0 |         0 |     0.0 | SELECT pg_stat_reset()
+
+== top statements by calls
+ calls |  rows   | wal_bytes |                                                     query                                                      
+-------+---------+-----------+----------------------------------------------------------------------------------------------------------------
+ 61281 |   41281 |    188453 | SELECT id, subscription_id, topic, payload, request_headers, response_status, response_body, elapsed_ms, attem
+ 40854 |   40854 |  30639810 | INSERT INTO autumn_webhook_deliveries (id, subscription_id, topic, payload, request_headers, response_status, 
+ 40000 |   40000 |   3935737 | UPDATE autumn_webhook_subscriptions SET consecutive_failures = $2, status = CASE WHEN status = $3 THEN $4 ELSE
+ 20854 |   20854 |     25297 | SELECT id, target_url, event_topics, secret, status, consecutive_failures FROM autumn_webhook_subscriptions WH
+ 20000 | 3959411 |   1183594 | SELECT id, target_url, event_topics, secret, status, consecutive_failures FROM autumn_webhook_subscriptions WH
+   427 |     427 |     38655 | UPDATE autumn_webhook_subscriptions SET consecutive_failures = consecutive_failures + $2, status = CASE WHEN c
+     6 |       0 |         0 | BEGIN
+     6 |       0 |         0 | COMMIT
+     1 |      12 |         0 | SELECT calls, rows, shared_blks_hit + shared_blks_read AS buffers, round($1 * (shared_blks_hit + shared_blks_r
+     1 |       1 |         0 | SELECT pg_current_wal_lsn()
+     1 |       1 |         0 | SELECT pg_stat_force_next_flush()
+     1 |       1 |         0 | SELECT pg_stat_reset()
+
+== top statements by WAL bytes
+ calls | wal_records | wal_bytes | wal_fpi | pct_wal |                                                     query                                                      
+-------+-------------+-----------+---------+---------+----------------------------------------------------------------------------------------------------------------
+ 40854 |      106502 |  30639810 |      18 |    85.1 | INSERT INTO autumn_webhook_deliveries (id, subscription_id, topic, payload, request_headers, response_status, 
+ 40000 |       59400 |   3935737 |       5 |    10.9 | UPDATE autumn_webhook_subscriptions SET consecutive_failures = $2, status = CASE WHEN status = $3 THEN $4 ELSE
+ 20000 |       19378 |   1183594 |       0 |     3.3 | SELECT id, target_url, event_topics, secret, status, consecutive_failures FROM autumn_webhook_subscriptions WH
+ 61281 |        2851 |    188453 |       0 |     0.5 | SELECT id, subscription_id, topic, payload, request_headers, response_status, response_body, elapsed_ms, attem
+   427 |         429 |     38655 |       1 |     0.1 | UPDATE autumn_webhook_subscriptions SET consecutive_failures = consecutive_failures + $2, status = CASE WHEN c
+ 20854 |         415 |     25297 |       0 |     0.1 | SELECT id, target_url, event_topics, secret, status, consecutive_failures FROM autumn_webhook_subscriptions WH
+     6 |           0 |         0 |       0 |     0.0 | BEGIN
+     6 |           0 |         0 |       0 |     0.0 | COMMIT
+
+== WAL generated by the run (pg_current_wal_lsn delta, whole cluster)
+ wal_bytes_lsn_delta 
+---------------------
+            38985632
+
+== pg_stat_user_tables
+           relname            | seq_scan | seq_tup_read | idx_scan | n_tup_ins | n_tup_upd | n_tup_hot_upd | n_live_tup | n_dead_tup 
+------------------------------+----------+--------------+----------+-----------+-----------+---------------+------------+------------
+ autumn_webhook_deliveries    |        0 |            0 |   102135 |     20000 |     20854 |         18552 |      20000 |      12981
+ autumn_webhook_subscriptions |    81281 |     16256200 |        0 |         0 |     40427 |         40419 |          0 |         37
+
+== pg_statio_user_tables
+           relname            | heap_blks | idx_blks | toast_blks 
+------------------------------+-----------+----------+------------
+ autumn_webhook_deliveries    |    155873 |   373639 |          0
+ autumn_webhook_subscriptions |    487283 |        9 |          0
+
+== subscription table size
+ heap_bytes | heap_pages 
+------------+------------
+      40960 |          5
+
+== subscription state (equivalence: ordered md5 of every row)
+        subscriptions_md5         | failures_total | active 
+----------------------------------+----------------+--------
+ bbac99a2187a3c986ca64c4be1b90dc3 |              0 |    198
+
+          deliveries_md5          | deliveries 
+----------------------------------+------------
+ 12998edda82e80b049d5378294e5b1cd |    1020000
+
