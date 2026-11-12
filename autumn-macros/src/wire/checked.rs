@@ -1167,11 +1167,19 @@ fn held_value(
 }
 
 /// The names a maud `@if let` pattern binds, and what each holds. Only `x`,
-/// `Some(x)` and `Ok(x)` hold `value`. Any other pattern shadows its names.
+/// `Some(x)` and `Ok(x)` hold `value`, also with `ref` or `mut`. Any other
+/// pattern shadows its names.
 fn pattern_names(
     pat: &[proc_macro2::TokenTree],
     value: Option<Held>,
 ) -> Vec<(String, Option<Held>)> {
+    let mode = pat
+        .iter()
+        .take_while(
+            |tt| matches!(tt, proc_macro2::TokenTree::Ident(id) if id == "ref" || id == "mut"),
+        )
+        .count();
+    let pat = &pat[mode..];
     match pat {
         [proc_macro2::TokenTree::Ident(x)] => vec![(x.to_string(), value)],
         [
@@ -1927,6 +1935,18 @@ mod tests {
         assert_eq!(
             nested_reads("html! { @let d = other; @let e = d; (e.color) }"),
             [] as [&str; 0]
+        );
+    }
+
+    #[test]
+    fn a_maud_ref_or_mut_binding_keeps_the_nested_path() {
+        assert_eq!(
+            nested_reads("html! { @if let Some(ref d) = item.details { (d.color) } }"),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads("html! { @let ref mut d = item.details; (d.size) }"),
+            ["details", "details.size"]
         );
     }
 
