@@ -6,6 +6,7 @@
 //! with a deployed one, in both deploy windows, and names a safe deploy order
 //! when only one exists. See `docs/guide/wire-contracts.md`.
 
+pub mod avro;
 pub mod bundle;
 pub mod compat;
 pub mod proto;
@@ -58,6 +59,17 @@ pub struct ExportOptions {
     pub pass: PassOptions,
     /// Write protobuf files instead of the bundle.
     pub proto: Option<ProtoArgs>,
+    /// Write Avro schemas instead of the bundle.
+    pub avro: Option<AvroArgs>,
+}
+
+/// Options for `autumn contracts export --avro`.
+#[derive(Debug, Clone)]
+pub struct AvroArgs {
+    /// Write nothing. Fail when a file would change.
+    pub check: bool,
+    /// What the export writes in addition to the events.
+    pub options: avro::AvroOptions,
 }
 
 /// Options for `autumn contracts export --proto`.
@@ -132,6 +144,31 @@ pub fn run_export(opts: &ExportOptions) {
             },
         )
         .unwrap_or_else(|e| fail(&e));
+    if let Some(args) = &opts.avro {
+        let Some(out) = &opts.out else {
+            fail("`--avro` needs `--out <DIR>`");
+        };
+        match run_avro(&bundle, out, args) {
+            Ok(changes) if args.check && !changes.is_empty() => {
+                for change in &changes {
+                    eprintln!("\u{2717} {change}");
+                }
+                eprintln!(
+                    "The Avro export is not up to date. Run `autumn contracts export --avro \
+                     --out <DIR>` again. Then commit the files."
+                );
+                std::process::exit(EXIT_STALE);
+            }
+            Ok(_) if args.check => eprintln!("The Avro export is up to date."),
+            Ok(changes) => eprintln!(
+                "Wrote the Avro export to {} ({} change(s)).",
+                out.display(),
+                changes.len()
+            ),
+            Err(e) => fail(&e),
+        }
+        return;
+    }
     if let Some(args) = &opts.proto {
         let Some(out) = &opts.out else {
             fail("`--proto` needs `--out <DIR>`");
@@ -272,6 +309,104 @@ pub fn run_proto(bundle: &Bundle, out: &Path, args: &ProtoArgs) -> Result<Vec<St
     Ok(changes)
 }
 
+/// Export `bundle` as Avro schemas in `out`.
+///
+/// Returns each change: a file that is missing or differs, and a stale
+/// schema that the export wrote before. With `check`, it writes nothing.
+///
+/// # Errors
+/// The export refuses a form, a target is a link, or a file cannot be
+/// written.
+pub fn run_avro(bundle: &Bundle, out: &Path, args: &AvroArgs) -> Result<Vec<String>, String> {
+    let export = avro::export(bundle, args.options)?;
+    let mut changes = Vec::new();
+    for (path, text) in &export.files {
+        let file = out.join(path);
+        match read_lf(&file) {
+            Ok(have) if have == *text => {}
+            Ok(_) => changes.push(format!("{}: differs from the export", file.display())),
+            Err(_) => changes.push(format!("{}: is missing", file.display())),
+        }
+    }
+    let stale = stale_avro(out, &export.files);
+    let endpoint_files = stale
+        .iter()
+        .filter(|file| file.parent() == Some(out.join(avro::ENDPOINTS_DIR).as_path()))
+        .count();
+    for file in &stale {
+        changes.push(format!(
+            "{}: the export no longer writes it",
+            file.display()
+        ));
+    }
+    if endpoint_files > 0 && !args.options.endpoints {
+        eprintln!(
+            "note: {endpoint_files} body schema(s) under {} are stale because `--endpoints` \
+             is off. Pass `--endpoints` to keep them.",
+            out.join(avro::ENDPOINTS_DIR).display()
+        );
+    }
+    if args.check {
+        return Ok(changes);
+    }
+    for path in export.files.keys() {
+        let file = out.join(path);
+        let dir = file.parent().filter(|d| *d != out);
+        for target in std::iter::once(file.as_path()).chain(dir) {
+            if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!(
+                    "{} is a link. The Avro export does not write through a link",
+                    target.display()
+                ));
+            }
+        }
+    }
+    // Remove first: on a file system that ignores case, a topic renamed only
+    // in case is then written under its new name.
+    for file in &stale {
+        std::fs::remove_file(file).map_err(|e| format!("remove {}: {e}", file.display()))?;
+        eprintln!(
+            "Removed {}: the export no longer writes it.",
+            file.display()
+        );
+    }
+    for (path, text) in &export.files {
+        let file = out.join(path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&file, text).map_err(|e| format!("write {}: {e}", file.display()))?;
+    }
+    Ok(changes)
+}
+
+/// Each `.avsc` file in `out` and in `out/endpoints/` that the export wrote
+/// before and does not write now. A file has the export's marker. The walk
+/// does not go deeper, so a schema in another directory stays.
+fn stale_avro(out: &Path, files: &std::collections::BTreeMap<String, String>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in [out.to_path_buf(), out.join(avro::ENDPOINTS_DIR)] {
+        // A linked `endpoints` directory is not the export's: its files
+        // belong to the link target.
+        if dir != out && std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        found.extend(paths.into_iter().filter(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+                && path.extension().is_some_and(|e| e == "avsc")
+                && !files.contains_key(&relative(out, path))
+                && read_lf(path).is_ok_and(|text| avro::is_exported(&text))
+        }));
+    }
+    found
+}
+
 /// `proto.lock` beside the output directory: `contracts/proto/` has
 /// `contracts/proto.lock`.
 #[must_use]
@@ -302,14 +437,14 @@ fn relative(out: &Path, file: &Path) -> String {
 /// with the export's header. A file without it is left alone.
 fn written_protos(out: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    list_protos(&out.join("autumn"), &mut found);
+    list_files(&out.join("autumn"), "proto", &mut found);
     found.retain(|file| read_lf(file).is_ok_and(|text| text.starts_with(proto::HEADER)));
     found
 }
 
-/// Every `.proto` file under `dir`, sorted. A link is not followed, so the
-/// walk stays in `dir`.
-fn list_protos(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Every file under `dir` with the extension `ext`, sorted. A link is not
+/// followed, so the walk stays in `dir`.
+fn list_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -320,8 +455,8 @@ fn list_protos(dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         };
         if meta.is_dir() {
-            list_protos(&path, out);
-        } else if meta.is_file() && path.extension().is_some_and(|e| e == "proto") {
+            list_files(&path, ext, out);
+        } else if meta.is_file() && path.extension().is_some_and(|e| e == ext) {
             out.push(path);
         }
     }

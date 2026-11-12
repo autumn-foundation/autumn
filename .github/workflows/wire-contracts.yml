@@ -14,6 +14,9 @@ name: Wire contracts
 #   * Proto export: two real `--proto` exports must give the same bytes as
 #     the committed `examples/mesh-storefront/contracts/proto/`, and
 #     `--check` must pass on the committed lock.
+#   * Avro export: two real `--avro` exports must give the same bytes as the
+#     committed `examples/mesh-storefront/contracts/avro/`, and `--check`
+#     must pass on them.
 #   * buf: `buf lint` and `buf build` on each golden proto export, and
 #     `buf breaking` agrees with `autumn contracts check` on each golden
 #     release pair (`autumn-cli/tests/integration/contracts_proto.rs`).

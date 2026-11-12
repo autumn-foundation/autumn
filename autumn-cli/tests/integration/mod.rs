@@ -5,6 +5,7 @@ mod binary_lookup_build_target;
 mod build_script_target_dir;
 mod cloud_native_scaffold;
 mod console;
+mod contracts_avro;
 mod contracts_check;
 mod contracts_proto;
 mod db;

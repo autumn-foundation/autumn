@@ -207,6 +207,32 @@ impl Bundle {
             .map(|i| &self.types[i])
     }
 
+    /// The id of a nested type named `name`, in crate `krate` when given,
+    /// with the fields of `shape`. A body or an event payload that is also a
+    /// nested type then maps to one schema type.
+    #[must_use]
+    pub fn same_type(
+        &self,
+        name: &str,
+        krate: Option<&str>,
+        shape: &WireTypeDescriptor,
+    ) -> Option<&str> {
+        self.types
+            .iter()
+            .find(|t| {
+                t.id.rsplit("::").next() == Some(name)
+                    && krate.is_none_or(|k| {
+                        // A type id keeps the package name as written.
+                        t.id.split("::").next().map(|c| c.replace('-', "_"))
+                            == Some(k.replace('-', "_"))
+                    })
+                    && t.shape.serialized == shape.serialized
+                    && t.shape.deserialized == shape.deserialized
+                    && t.shape.unit == shape.unit
+            })
+            .map(|t| t.id.as_str())
+    }
+
     /// The event with this topic, if the bundle has it.
     #[must_use]
     pub fn event(&self, topic: &str) -> Option<&BundleEvent> {

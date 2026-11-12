@@ -177,6 +177,10 @@ rcgen = { workspace = true }
 # Parses the YAML that `autumn slo generate` writes, in its tests (#3069).
 # The lock file already has it through `autumn-web/openapi`.
 serde-saphyr = "2"
+# Parses each schema `autumn contracts export --avro` writes, and checks Avro
+# schema resolution against `autumn contracts check`. Test-only: the export
+# writes text and needs no Avro library.
+apache-avro = { version = "0.21", default-features = false }
 
 [lints]
 workspace = true
