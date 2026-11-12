@@ -38,7 +38,7 @@ fn node() -> Option<String> {
     }
     assert!(
         std::env::var_os("CI").is_none(),
-        "`{binary}` was not found: the JS host suite needs Node 18+ in CI"
+        "`{binary}` was not found: the JS host suite needs Node 18.15+ in CI"
     );
     eprintln!("skipping: `{binary}` is not on PATH (set NODE to run the JS host suite)");
     None
@@ -803,8 +803,11 @@ fn the_js_gateway_suite_passes() {
     let Some(node) = node() else {
         return;
     };
+    // Ask for TAP. Node 23 and later write the spec format by default, also
+    // to a pipe, and the pass count below reads the TAP summary.
     let output = Command::new(node)
         .arg("--test")
+        .arg("--test-reporter=tap")
         .arg(js_dir().join("test").join("gateway.test.mjs"))
         .output()
         .expect("run node --test");
