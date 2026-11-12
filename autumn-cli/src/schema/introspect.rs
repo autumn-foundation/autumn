@@ -313,7 +313,7 @@ fn check_unique_names(listed: &[(String, String)]) -> Result<Vec<String>, Intros
         if let Some(first) = seen.insert(name.as_str(), schema.as_str()) {
             return Err(IntrospectError::Query(format!(
                 "table `{name}` is in schemas `{first}` and `{schema}`; \
-                 the schema tools need one name per schema"
+                 a table name can be in only one schema"
             )));
         }
     }

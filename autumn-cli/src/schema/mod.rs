@@ -1190,10 +1190,12 @@ fn relation_clash(
             .rsplit_once('.')
             .map_or_else(|| key(name), |(schema, _)| key(&format!("{schema}.{name}")))
     };
-    let table_key = |t: &autumn_schema_core::Table| match t.schema.as_deref() {
-        Some(schema) if schema != "public" => key(&format!("{schema}.{}", t.name)),
-        _ => key(&t.name),
+    // `schema.table` for a table in a named schema; `table` for one in `public`.
+    let table_name = |t: &autumn_schema_core::Table| {
+        table_ref::named_schema(t)
+            .map_or_else(|| t.name.clone(), |schema| format!("{schema}.{}", t.name))
     };
+    let table_key = |t: &autumn_schema_core::Table| key(&table_name(t));
     let added: std::collections::BTreeSet<String> = plan
         .changes
         .iter()
@@ -1220,7 +1222,7 @@ fn relation_clash(
         .iter()
         .map(|n| key(n))
         .chain(baseline.iter().flat_map(|t| {
-            let prefix = t.qualified_name();
+            let prefix = table_name(t);
             std::iter::once(table_key(t)).chain(
                 t.indexes
                     .iter()
@@ -1236,7 +1238,7 @@ fn relation_clash(
         let names: Vec<(&String, String)> = match c {
             // A new table brings its own indexes.
             SchemaChange::CreateTable(t) => {
-                let prefix = t.qualified_name();
+                let prefix = table_name(t);
                 std::iter::once((&t.name, table_key(t)))
                     .chain(
                         t.indexes
@@ -1831,6 +1833,25 @@ mod tests {
         // A public table still clashes with a public view.
         let public = autumn_schema_core::Table::new("report", Backend::Postgres);
         assert!(relation_clash(&plan(public), &[], &public_view).is_some());
+    }
+
+    #[test]
+    fn an_index_of_a_table_stored_in_public_clashes_in_the_default_schema() {
+        use autumn_schema_core::{Index, Table};
+        let mut audit = Table::new("audit", Backend::Postgres);
+        audit.schema = Some("public".to_owned());
+        audit
+            .indexes
+            .push(Index::new("idx_taken", vec!["x".to_owned()], false));
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddIndex {
+                table: "reports".to_owned(),
+                index: Index::new("idx_taken", vec!["slug".to_owned()], false),
+            }],
+        };
+        let none = std::collections::BTreeSet::new();
+        assert!(relation_clash(&plan, &[audit], &none).is_some());
     }
 
     #[test]

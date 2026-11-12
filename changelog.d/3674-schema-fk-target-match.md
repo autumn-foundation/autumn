@@ -1,12 +1,15 @@
 ### Fixed
 
-- **schema:** `autumn schema diff` matches a foreign key target to a table in
-  one schema-aware way (`users`, `public.users` and `blog.users`). These false
-  refusals are gone:
-  - a type change of `users.id` when an FK points at `auth.users`;
-  - a rename when an index or table of the new name is in another schema;
-  - an FK that the model writes `blog.authors` and the snapshot writes
-    `authors`.
+- **schema:** `autumn schema diff` now uses one rule to match a foreign key
+  target to a table. The rule reads the schema of the target (`users`,
+  `public.users`, `blog.users`). These errors no longer occur:
+  - A type change of `users.id` was refused when an FK pointed at
+    `auth.users`.
+  - A table rename was refused when an index or table with the new name was
+    in another schema.
+  - The diff showed a foreign key change when the model wrote
+    `blog.authors` and the snapshot wrote `authors`.
+  - A table rename did not update a qualified FK (`blog.posts`) to the
+    renamed table.
 
-  A rename now also updates a qualified FK to the renamed table. See
-  [ADR 0047](docs/adr/0047-schema-tools-key-tables-by-name.md).
+  See [ADR 0047](docs/adr/0047-schema-tools-key-tables-by-name.md).

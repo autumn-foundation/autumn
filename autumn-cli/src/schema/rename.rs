@@ -233,10 +233,10 @@ fn index_renames(
             let Some(index) = renamed_index(idx, &new_name) else {
                 continue;
             };
-            // Index names are global in the schema, so check every table of
-            // the schema. A name another table owns is refused: an add would
-            // collide too. Names compare case-insensitively (SQLite resolves
-            // them that way).
+            // An index name is unique in its schema. Thus check every table in
+            // the schema of `base`. If another table uses the new name, refuse
+            // the rename: an added index with that name also fails. Names
+            // compare without case (SQLite resolves them that way).
             let mut schema_tables = work.iter().filter(|t| same_schema(t, base));
             let owner = schema_tables.clone().find(|t| {
                 t.indexes
@@ -1930,8 +1930,8 @@ mod tests {
         assert_eq!(fk_of_comments(&tables).table, "posts");
     }
 
-    /// Rename `public.posts` to `articles`, with `idx_posts_slug` following
-    /// it, and with `other` in the baseline too.
+    /// Rename `public.posts` to `articles`. The index `idx_posts_slug`
+    /// follows the table. The baseline also holds `other`.
     fn rename_posts_with(other: Table) -> Vec<SchemaChange> {
         let mut posts = table("posts", Backend::Postgres, &[("slug", ColumnType::Text)]);
         posts
@@ -1998,5 +1998,112 @@ mod tests {
         assert!(!has_conflict(&rename_posts_with(archive.clone())));
         archive.schema = Some("public".to_owned());
         assert!(has_conflict(&rename_posts_with(archive)));
+    }
+
+    #[test]
+    fn a_bare_rename_does_not_follow_an_fk_to_a_same_named_table_elsewhere() {
+        let mut tables = comments_to_blog_posts("auth.posts");
+        apply_rename(
+            &mut tables,
+            &SchemaChange::RenameTable {
+                from: "posts".to_owned(),
+                to: "articles".to_owned(),
+            },
+        );
+        assert_eq!(tables[0].name, "articles");
+        assert_eq!(fk_of_comments(&tables).table, "auth.posts");
+    }
+
+    #[test]
+    fn a_column_rename_does_not_follow_an_fk_to_a_same_named_table_elsewhere() {
+        let mut tables = comments_to_blog_posts("auth.posts");
+        apply_rename(
+            &mut tables,
+            &SchemaChange::RenameColumn {
+                table: "blog.posts".to_owned(),
+                from: "id".to_owned(),
+                to: "post_id".to_owned(),
+            },
+        );
+        assert_eq!(tables[0].columns[0].name, "post_id");
+        assert_eq!(fk_of_comments(&tables).column, "id");
+
+        // A table in another schema is not renamed.
+        apply_rename(
+            &mut tables,
+            &SchemaChange::RenameColumn {
+                table: "auth.posts".to_owned(),
+                from: "post_id".to_owned(),
+                to: "x".to_owned(),
+            },
+        );
+        assert_eq!(tables[0].columns[0].name, "post_id");
+    }
+
+    #[test]
+    fn an_index_rename_applies_only_in_the_named_schema() {
+        let mut tables = comments_to_blog_posts("blog.posts");
+        tables[0]
+            .indexes
+            .push(Index::new("idx_posts_old", vec!["id".to_owned()], false));
+        let rename = |table: &str| SchemaChange::RenameIndex {
+            table: table.to_owned(),
+            from: "idx_posts_old".to_owned(),
+            index: Index::new("idx_posts_new", vec!["id".to_owned()], false),
+        };
+        apply_rename(&mut tables, &rename("auth.posts"));
+        assert_eq!(tables[0].indexes[0].name, "idx_posts_old");
+        apply_rename(&mut tables, &rename("blog.posts"));
+        assert_eq!(tables[0].indexes[0].name, "idx_posts_new");
+    }
+
+    #[test]
+    fn a_rename_in_a_named_schema_checks_names_in_that_schema_only() {
+        // Rename `blog.posts` to `articles`. `idx_posts_slug` follows it.
+        let rename_in_blog = |other: Table| {
+            let mut posts = table("posts", Backend::Postgres, &[("slug", ColumnType::Text)]);
+            posts.schema = Some("blog".to_owned());
+            posts
+                .indexes
+                .push(Index::new("idx_posts_slug", vec!["slug".to_owned()], false));
+            let mut articles = table("articles", Backend::Postgres, &[("slug", ColumnType::Text)]);
+            articles.schema = Some("blog".to_owned());
+            articles.indexes.push(Index::new(
+                "idx_articles_slug",
+                vec!["slug".to_owned()],
+                false,
+            ));
+            let want = desired(
+                vec![articles, other.clone()],
+                vec![table_hint("articles", "posts")],
+            );
+            rename_changes(&[posts, other], &want)
+        };
+        let mut archive = table("archive", Backend::Postgres, &[("slug", ColumnType::Text)]);
+        archive.indexes.push(Index::new(
+            "idx_articles_slug",
+            vec!["slug".to_owned()],
+            false,
+        ));
+        archive
+            .indexes
+            .push(Index::new("articles", vec!["slug".to_owned()], false));
+        assert!(!has_conflict(&rename_in_blog(archive.clone())));
+        archive.schema = Some("blog".to_owned());
+        assert!(has_conflict(&rename_in_blog(archive)));
+    }
+
+    #[test]
+    fn a_sqlite_rename_still_refuses_an_index_of_the_new_name() {
+        let posts = table("posts", Backend::Sqlite, &[]);
+        let mut other = table("other", Backend::Sqlite, &[("x", ColumnType::Text)]);
+        other
+            .indexes
+            .push(Index::new("articles", vec!["x".to_owned()], false));
+        let want = desired(
+            vec![table("articles", Backend::Sqlite, &[]), other.clone()],
+            vec![table_hint("articles", "posts")],
+        );
+        assert!(has_conflict(&rename_changes(&[posts, other], &want)));
     }
 }

@@ -161,7 +161,7 @@ use autumn_schema_core::{
 };
 
 use crate::schema::parse::ParsedSchema;
-use crate::schema::table_ref::{fk_points_at, fk_target_in, named_schema, same_foreign_key};
+use crate::schema::table_ref::{FkTables, fk_points_at, fk_target_in, named_schema};
 
 /// The computed migration: an ordered list of structural changes plus the
 /// dialect they render against. Deterministic — same inputs ⇒ same plan ⇒ same
@@ -512,7 +512,8 @@ fn apply_table_schemas(
                 Some(seen) if *seen != named_schema(t) => conflicts.push((
                     t.name.clone(),
                     if side == "desired" {
-                        "the name is used in two schemas; use one name per schema".to_owned()
+                        "the name is used in two schemas; a table name can be in only one schema"
+                            .to_owned()
                     } else {
                         let from = named_schema(t).unwrap_or("the default schema");
                         let to = seen.unwrap_or("the default schema");
@@ -998,13 +999,17 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
         .iter()
         .map(|t| (t.name.as_str(), t))
         .collect();
-    // Every table by name, to find the schema of a bare foreign key target. A
-    // model table replaces a baseline table of the same name.
-    let known: BTreeMap<&str, &Table> = baseline_by_name
-        .iter()
-        .chain(&desired_by_name)
-        .map(|(name, t)| (*name, *t))
-        .collect();
+    // The tables of each side. They give the schema of a bare foreign key
+    // target on that side. On the model side, a model table replaces a
+    // baseline table with the same name.
+    let fk_tables = FkTables {
+        baseline: baseline_by_name.clone(),
+        desired: baseline_by_name
+            .iter()
+            .chain(&desired_by_name)
+            .map(|(name, t)| (*name, *t))
+            .collect(),
+    };
 
     // Iterate the union of table names in a stable (sorted) order.
     let mut names: Vec<&str> = baseline_by_name
@@ -1020,7 +1025,7 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
             // Present on both sides — diff only Autumn-managed tables.
             (Some(base), Some(want)) => {
                 if want.managed {
-                    diff_table(base, want, desired, &known, opts, backend, &mut changes);
+                    diff_table(base, want, desired, &fk_tables, opts, backend, &mut changes);
                 }
             }
             // Desired only — create it if Autumn owns it. But if the parser
@@ -1257,7 +1262,8 @@ fn column_participates_in_fk(
     }
 
     // Referenced side: any baseline table, or any managed desired table, whose FK
-    // targets `table.column`. A table that is not found is refused (safe side).
+    // targets `table.column`. If the table is not found, return true: the type
+    // change is then refused.
     let Some(target) = desired
         .tables
         .iter()
@@ -1289,7 +1295,7 @@ fn diff_table(
     base: &Table,
     want: &Table,
     desired: &ParsedSchema,
-    known: &BTreeMap<&str, &Table>,
+    fk_tables: &FkTables<'_>,
     opts: DiffOptions,
     backend: Backend,
     changes: &mut Vec<SchemaChange>,
@@ -1326,7 +1332,7 @@ fn diff_table(
             }),
             Some(base_col) => {
                 diff_column(
-                    &want.name, base_col, want_col, known, opts, backend, changes,
+                    &want.name, base_col, want_col, fk_tables, opts, backend, changes,
                 );
             }
         }
@@ -1414,7 +1420,7 @@ fn diff_column(
     table: &str,
     base: &Column,
     want: &Column,
-    known: &BTreeMap<&str, &Table>,
+    fk_tables: &FkTables<'_>,
     opts: DiffOptions,
     backend: Backend,
     changes: &mut Vec<SchemaChange>,
@@ -1479,7 +1485,7 @@ fn diff_column(
                 table: table.to_owned(),
                 column: want.name.clone(),
             }),
-            Some(existing) if same_foreign_key(existing, fk, known) => {}
+            Some(existing) if fk_tables.same_foreign_key(existing, fk) => {}
             Some(existing) => changes.push(SchemaChange::ForeignKeyChange {
                 table: table.to_owned(),
                 column: want.name.clone(),
@@ -3484,6 +3490,7 @@ fn topo_sort_creates(creates: &mut [&SchemaChange]) -> Result<(), EmitError> {
     for (&name, table) in &tables {
         let mut d = BTreeSet::new();
         for col in &table.columns {
+            // The batch map uses the bare table name as its key.
             if let Some(fk) = &col.references
                 && let Some(target) = fk_target_in(&fk.table, &tables)
                 && target.name != name
@@ -3552,6 +3559,7 @@ fn topo_sort_drops(drops: &mut [&SchemaChange]) -> Result<(), EmitError> {
         names.iter().map(|&n| (n, BTreeSet::new())).collect();
     for (&name, table) in &tables {
         for col in &table.columns {
+            // The batch map uses the bare table name as its key.
             if let Some(fk) = &col.references
                 && let Some(target) = fk_target_in(&fk.table, &tables)
                 && target.name != name
@@ -10446,5 +10454,105 @@ PRAGMA foreign_keys=ON;
             "{:?}",
             plan.changes
         );
+    }
+
+    /// `blog.authors`, and public `posts` with an FK to `fk_target`.
+    fn posts_to_blog_authors(fk_target: &str) -> (Table, Table) {
+        let mut authors = in_schema(posts_with(vec![]), "blog");
+        authors.name = "authors".to_owned();
+        let mut fk = col("author_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new(fk_target, "id"));
+        (authors, posts_with(vec![fk]))
+    }
+
+    #[test]
+    fn a_bare_baseline_fk_target_is_not_resolved_against_a_new_table() {
+        // The baseline FK points at an external `authors` that the snapshot does
+        // not hold. The model adds a new `blog.authors` and moves the FK to it.
+        let (authors, posts) = posts_to_blog_authors("blog.authors");
+        let (_, base_posts) = posts_to_blog_authors("authors");
+        let plan = diff_schema(&[base_posts], &parsed(vec![authors, posts], vec![]), ALLOW);
+        assert!(
+            plan.changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::ForeignKeyChange { .. })),
+            "{:?}",
+            plan.changes
+        );
+    }
+
+    #[test]
+    fn create_and_drop_order_follow_a_bare_fk_to_a_schema_table() {
+        for target in ["authors", "blog.authors"] {
+            let (authors, posts) = posts_to_blog_authors(target);
+            let plan = MigrationPlan {
+                backend: Backend::Postgres,
+                changes: vec![
+                    SchemaChange::CreateTable(posts.clone()),
+                    SchemaChange::CreateTable(authors.clone()),
+                ],
+            };
+            let up = emit_up_sql(&plan).expect("emit");
+            assert!(
+                pos(&up, "CREATE TABLE blog.authors") < pos(&up, "CREATE TABLE posts"),
+                "{target}: {up}"
+            );
+            let plan = MigrationPlan {
+                backend: Backend::Postgres,
+                changes: vec![
+                    SchemaChange::DropTable(authors),
+                    SchemaChange::DropTable(posts),
+                ],
+            };
+            let up = emit_up_sql(&plan).expect("emit");
+            assert!(
+                pos(&up, "DROP TABLE posts;") < pos(&up, "DROP TABLE blog.authors;"),
+                "{target}: {up}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_order_follows_a_public_qualified_fk() {
+        let mut users = posts_with(vec![]);
+        users.name = "users".to_owned();
+        let mut fk = col("user_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("public.users", "id"));
+        let mut accounts = posts_with(vec![fk]);
+        accounts.name = "accounts".to_owned();
+        let plan = diff_schema(&[], &parsed(vec![accounts, users], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            pos(&up, "CREATE TABLE users") < pos(&up, "CREATE TABLE accounts"),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_table_with_a_public_qualified_inbound_fk_is_refused() {
+        let (mut authors, posts) = posts_to_blog_authors("public.authors");
+        authors.schema = None;
+        let plan = diff_schema(
+            &[authors, posts.clone()],
+            &parsed(vec![posts], vec![]),
+            ALLOW,
+        );
+        assert!(guard_plan(&plan, ALLOW).is_err(), "{:?}", plan.changes);
+    }
+
+    #[test]
+    fn an_unknown_altered_table_counts_as_fk_bound() {
+        assert!(column_participates_in_fk(
+            "missing",
+            "id",
+            &[],
+            &parsed(vec![], vec![])
+        ));
+    }
+
+    fn pos(haystack: &str, needle: &str) -> usize {
+        haystack
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` not in:\n{haystack}"))
     }
 }

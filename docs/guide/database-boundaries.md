@@ -121,6 +121,8 @@ pub struct Campaign {
 * The sync writes a new model as `marketing.campaigns (id) { ... }` in
   `src/schema.rs`. A block that has a schema keeps it when the model names none.
 * A foreign key to a table of the same schema is written with the schema.
+* A foreign key to a table in another schema, such as `auth.users`, does
+  not match a managed table with the same name.
 * `autumn schema pull --schema marketing` reads the schema. Repeat the flag
   for more schemas. `public` is always read. A pull keeps the schemas of the
   existing snapshot. `schema doctor` and `schema diff --dev-url` read the
@@ -362,8 +364,8 @@ of database and user. So each boundary gets its own server pool.
   warns. Remove it once: `REVOKE CREATE ON SCHEMA public FROM PUBLIC;`.
 * The retention sweep of a repository uses the primary pool. A job runs
   its SQL through `BoundaryDb` or `pool_for`.
-* One table name cannot be in two schemas. The schema tools key a table by
-  name, and refuse the second one. Use one name for each table. See
+* A table name can be in only one schema. The schema tools identify a
+  table by its name only. They refuse a second table with the same name. See
   [ADR 0047](../adr/0047-schema-tools-key-tables-by-name.md).
 * `schema diff` does not move a table to another schema. It refuses the
   change. Write `ALTER TABLE ... SET SCHEMA` by hand.
