@@ -1,0 +1,59 @@
+{
+  "type": "record",
+  "name": "OrdersPlaced",
+  "namespace": "autumn.mesh_orders",
+  "doc": "topic: orders.placed, version 1",
+  "autumn.topic": "orders.placed",
+  "fields": [
+    {
+      "name": "ship_to",
+      "type": {
+        "type": "record",
+        "name": "Address",
+        "namespace": "autumn.mesh_orders.model",
+        "fields": [
+          { "name": "street", "type": "string" },
+          { "name": "zip", "type": ["null", "string"], "default": null }
+        ]
+      }
+    },
+    {
+      "name": "bill_to",
+      "type": ["null", "autumn.mesh_orders.model.Address"],
+      "default": null
+    },
+    {
+      "name": "tree",
+      "type": {
+        "type": "record",
+        "name": "Node",
+        "namespace": "autumn.mesh_orders.model",
+        "fields": [
+          { "name": "label", "type": "string" },
+          {
+            "name": "children",
+            "type": {
+              "type": "array",
+              "items": "autumn.mesh_orders.model.Node"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "legacy",
+      "type": {
+        "type": "record",
+        "name": "Address",
+        "namespace": "autumn.mesh_orders.legacy",
+        "fields": [
+          { "name": "line", "type": "string" }
+        ]
+      }
+    },
+    {
+      "name": "by_name",
+      "type": { "type": "map", "values": "autumn.mesh_orders.model.Address" }
+    }
+  ]
+}

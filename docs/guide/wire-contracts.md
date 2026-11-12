@@ -579,7 +579,8 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 
 The check protects callers in one Cargo workspace. A consumer in another
 repository, team or language cannot build against the Rust types. Give it a
-protobuf schema of the contract:
+protobuf schema of the contract, or an Avro schema of each event (see
+[Avro schemas for events](#avro-schemas-for-events)):
 
 ```bash
 autumn contracts export --proto --out contracts/proto/
@@ -767,10 +768,153 @@ approves. They differ by design on some changes that the check refuses:
 
 `autumn-cli/tests/integration/contracts_proto.rs` names each case.
 
+### Avro schemas for events
+
+Event data often goes to a broker, a data pipeline or a warehouse loader.
+Avro is the usual schema there. Export one Avro schema per event topic:
+
+```bash
+autumn contracts export --avro --out contracts/avro/
+```
+
+`--avro` takes the same `-p`, feature and `--from` flags as the bundle
+export. It writes text only. The CLI has no Avro dependency.
+
+The export writes one `.avsc` file per topic: `contact.updated.avsc`,
+`contact.updated.v2.avsc`. A new version is a new topic, so it is a new
+subject in a schema registry.
+
+```json
+{
+  "type": "record",
+  "name": "ContactUpdated",
+  "namespace": "autumn.core",
+  "doc": "topic: contact.updated, version 1",
+  "autumn.topic": "contact.updated",
+  "fields": [
+    { "name": "id", "type": { "type": "string", "logicalType": "uuid" } },
+    { "name": "email", "type": "string" },
+    { "name": "phone", "type": ["null", "string"], "default": null }
+  ]
+}
+```
+
+* The record name comes from the topic, and the namespace from the crate:
+  `autumn.<crate>` (`mesh-catalog` is `autumn.mesh_catalog`). A Rust rename
+  of the event type does not change it.
+* A field name is the serde wire name. A `#[serde(alias)]` is an Avro
+  `aliases` entry, so a rename with an alias resolves in Avro as it does in
+  Autumn.
+* A nested type is a record. Its name comes from its type id:
+  `shop::model::Address` is `autumn.shop.model.Address`. A file defines it
+  once, then names it.
+* A unit event (`struct Ping;`) is a record with no fields. Autumn sends JSON
+  `null` for it. The `doc` says so.
+* An opaque event (`#[event(opaque)]`) is `bytes`: the JSON text.
+* `autumn.topic` names the topic, and `autumn.endpoint` the endpoint. The
+  export removes a stale `.avsc` in `--out` or `--out/endpoints/` only when
+  it has one of these keys, and names each removal. It does not look in
+  other directories.
+* `--check` writes nothing. It exits 1 when a file is missing, would change
+  or would go away.
+* Two exports of the same source give the same bytes.
+
+`--endpoints` also writes the body of each routed endpoint:
+`endpoints/<service>.<endpoint>.request.avsc` and `.response.avsc`. A route
+with no body has no file. A list body is an Avro `array` of the record. It is
+off by default: `--proto` is the schema for endpoints. Use the same flags in
+each run: an export without `--endpoints` removes the body schemas.
+
+#### Avro type mapping
+
+| Wire type | Avro |
+|---|---|
+| `string` | `string`. `uuid` has `"logicalType": "uuid"`. Another format stays `string` with an `"autumn.format"` key, because Avro has no logical string type for it |
+| `integer`, `i8` to `i32`, `u8`, `u16` | `int` |
+| `integer`, `i64`, `isize`, `u32` | `long` |
+| `integer`, `u64`, `usize`, 128 bits | refused |
+| `number` | `double` |
+| `boolean` | `boolean` |
+| `array`, `map` | `array`, `map` |
+| `object` | a named `record` |
+| `nullable` | `["null", T]` with `"default": null` |
+| `any` | refused, unless the event is `#[event(opaque)]` |
+
+An integer format, such as `unix-seconds`, also goes in `"autumn.format"`.
+
+A field that the JSON can leave out gets a default, so an Avro reader can
+read data without it. This is a field with `#[serde(default)]` or
+`skip_serializing_if`, or a field on one serde side only. A list gets `[]`, a
+map gets `{}`, and another form becomes `["null", T]` with `null`. There,
+`null` means that the key is absent. In a body schema, a request field counts
+when serde reads it, and a response field when serde writes it.
+
+The export stops on a form that Avro cannot hold, and names each field and
+its fix:
+
+* `u64`, `usize` and 128-bit integers. Use a smaller type. Or send the value
+  as a string with a serde adapter, such as `serde_with::DisplayFromStr`, and
+  name that form with `#[wire(type = "string")]`. Use
+  `#[wire(type = "integer")]` only when a custom serializer writes an `i64`.
+  On a released field, each of these is a new JSON form, which the check
+  reports.
+* `any`: `serde_json::Value`, a custom serde function, a `#[wire(opaque)]`
+  field. Name the form with `#[wire(type = …)]`.
+* A nested type with no shape in the bundle.
+* A field whose serialized and deserialized forms differ.
+* A wire name that is not an Avro name, such as `price-cents`. An Avro name
+  has only ASCII letters, digits and `_`.
+* A topic or endpoint that is not a safe file name, such as `../x` or a
+  Windows device name like `aux`, and two files that differ only in case.
+* Two types that map to one Avro name.
+
+#### The data, not Avro's JSON encoding
+
+Autumn sends plain JSON. Avro's JSON encoding is different: it wraps a union
+value (`{"string": "x"}`). So the schema describes the data. A bridge that
+writes Avro binary to a broker reads Autumn's JSON and encodes it with the
+schema. Do not give Autumn's JSON to an Avro JSON decoder.
+
+#### Registry compatibility
+
+A schema registry checks each new schema of a subject against the last one.
+Use the mode that matches the deploy order you check with
+`autumn contracts check`:
+
+| `autumn contracts check` | Who ships first | Registry mode |
+|---|---|---|
+| no `--order` (safe in any order) | either | `FULL` |
+| `--order callee-first` | producers | `FORWARD`: old consumers read new data |
+| `--order caller-first` | consumers | `BACKWARD`: new consumers read old data |
+
+The check compares the new build with the deployed release only, so use the
+non-transitive modes.
+
+The registry is not the gate. `autumn contracts check` stays the gate. Avro
+resolution agrees with the check in each window, but they differ by design
+on some changes:
+
+* Read-sets. Avro checks only the fields in the schema, and fills a missing
+  nullable field with `null`. The check sees that a consumer reads it.
+* `deny_unknown_fields`. An Avro reader skips a field it does not know.
+* Topics. A new version is a new subject. A registry does not know which
+  topics a producer still sends.
+* Presence. Avro data holds each field, so a field that the JSON can leave
+  out gets a default. The check sees that a deployed consumer needs it.
+* Unit events. Fields on a unit event change its JSON from `null` to an
+  object. In Avro, nullable fields added to a record with no fields are
+  compatible.
+* Opaque events. The check does not compare them. Avro compares a record
+  with `bytes`.
+* Integer widths. Avro promotes `int` to `long`. The check compares Rust
+  types: `i32` is not `i64`, so it reports a break in both windows.
+
+`autumn-cli/src/contracts/avro/agreement.rs` names each case.
+
 ## Limits of the first slice
 
 * One workspace. Both ends must be present at build time. A consumer outside
-  the workspace gets a protobuf schema, not a build check. See
+  the workspace gets a protobuf or Avro schema, not a build check. See
   [Consumers outside the workspace](#consumers-outside-the-workspace).
 * Synchronous request/response and events, as JSON. No streaming or
   websockets.

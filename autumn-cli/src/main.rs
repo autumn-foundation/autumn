@@ -641,11 +641,12 @@ impl ContractsPassArgs {
     }
 }
 
-/// The protobuf options of `autumn contracts export`.
+/// The schema options of `autumn contracts export`: `--proto` or `--avro`.
 // Each bool is one CLI flag.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
-pub struct ContractsProtoArgs {
+#[command(group(clap::ArgGroup::new("schema").args(["proto", "avro"])))]
+pub struct ContractsSchemaArgs {
     /// Write protobuf schemas to `--out <DIR>` instead of the bundle.
     #[arg(long, requires = "out")]
     proto: bool,
@@ -653,8 +654,8 @@ pub struct ContractsProtoArgs {
     /// `proto.lock` beside the `--out` directory.
     #[arg(long, value_name = "PATH", requires = "proto")]
     lock: Option<PathBuf>,
-    /// Write nothing. Exit 1 when the lock or a `.proto` file would change.
-    #[arg(long, requires = "proto")]
+    /// Write nothing. Exit 1 when the lock or a schema file would change.
+    #[arg(long, requires = "schema")]
     check: bool,
     /// Add `google.api.http` options to each rpc.
     #[arg(long, requires = "proto")]
@@ -662,9 +663,20 @@ pub struct ContractsProtoArgs {
     /// Map a `date-time` string to `google.protobuf.Timestamp`.
     #[arg(long, requires = "proto")]
     well_known_types: bool,
+    /// Write Avro schemas (`.avsc`) to `--out <DIR>`: one per event topic.
+    #[arg(
+        long,
+        requires = "out",
+        conflicts_with_all = ["proto", "lock", "http_annotations", "well_known_types"]
+    )]
+    avro: bool,
+    /// With `--avro`, also write the request and response body of each
+    /// endpoint.
+    #[arg(long, requires = "avro")]
+    endpoints: bool,
 }
 
-impl ContractsProtoArgs {
+impl ContractsSchemaArgs {
     fn into_proto(self) -> Option<contracts::ProtoArgs> {
         self.proto.then_some(contracts::ProtoArgs {
             lock: self.lock,
@@ -672,6 +684,18 @@ impl ContractsProtoArgs {
             options: contracts::proto::ProtoOptions {
                 http_annotations: self.http_annotations,
                 well_known_types: self.well_known_types,
+            },
+        })
+    }
+
+    const fn to_avro(&self) -> Option<contracts::AvroArgs> {
+        if !self.avro {
+            return None;
+        }
+        Some(contracts::AvroArgs {
+            check: self.check,
+            options: contracts::avro::AvroOptions {
+                endpoints: self.endpoints,
             },
         })
     }
@@ -689,9 +713,12 @@ pub enum ContractsSubcommands {
     /// With `--proto`, write protobuf schemas for consumers outside the
     /// workspace instead: one file per service, one per crate for events,
     /// and a `buf.yaml`. The lock file keeps each field number.
+    ///
+    /// With `--avro`, write one Avro schema per event topic instead.
+    /// `--endpoints` adds the request and response bodies.
     Export {
         /// Write the bundle to this file. The default is stdout. With
-        /// `--proto`, write the `.proto` files to this directory.
+        /// `--proto` or `--avro`, write the schema files to this directory.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
         /// Use this bundle file, or join the descriptors in this directory.
@@ -699,7 +726,7 @@ pub enum ContractsSubcommands {
         #[arg(long, value_name = "BUNDLE|DIR")]
         from: Option<PathBuf>,
         #[command(flatten)]
-        proto: ContractsProtoArgs,
+        proto: ContractsSchemaArgs,
         #[command(flatten)]
         pass: ContractsPassArgs,
     },
@@ -6222,6 +6249,7 @@ fn run_command(command: Commands) {
                 out,
                 from,
                 pass: pass.into_pass(),
+                avro: proto.to_avro(),
                 proto: proto.into_proto(),
             });
         }
@@ -10731,6 +10759,45 @@ mod tests {
         );
         assert!(proto.check);
         assert!(proto.options.http_annotations && proto.options.well_known_types);
+    }
+
+    #[test]
+    fn parse_contracts_export_avro_with_its_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "export",
+            "--avro",
+            "--out",
+            "contracts/avro",
+            "--endpoints",
+            "--check",
+        ])
+        .expect("parses");
+        let Commands::Contracts(ContractsSubcommands::Export { proto, out, .. }) = cli.command
+        else {
+            panic!("expected contracts export");
+        };
+        assert_eq!(out, Some(PathBuf::from("contracts/avro")));
+        let avro = proto.to_avro().expect("avro");
+        assert!(avro.check && avro.options.endpoints);
+        assert!(proto.into_proto().is_none(), "avro is not proto");
+    }
+
+    #[test]
+    fn parse_contracts_export_avro_needs_out_and_refuses_proto_options() {
+        for args in [
+            &["--avro"][..],
+            &["--avro", "--proto", "--out", "x"],
+            &["--endpoints", "--out", "x"],
+            &["--avro", "--lock", "x.lock", "--out", "x"],
+            &["--avro", "--http-annotations", "--out", "x"],
+            &["--check", "--out", "x"],
+        ] {
+            let mut argv = vec!["autumn", "contracts", "export"];
+            argv.extend(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{args:?}");
+        }
     }
 
     #[test]

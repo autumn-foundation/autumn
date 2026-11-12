@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "CreateItemRequest",
+  "namespace": "autumn.catalog",
+  "doc": "endpoint: catalog.create_item, POST /items, request body",
+  "autumn.endpoint": "catalog.create_item",
+  "fields": [
+    { "name": "name", "type": "string" },
+    { "name": "note", "type": ["null", "string"], "default": null },
+    { "name": "price_cents", "type": "long" },
+    { "name": "request_id", "type": "string" }
+  ]
+}

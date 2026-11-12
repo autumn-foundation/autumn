@@ -1,0 +1,8 @@
+{
+  "type": "record",
+  "name": "PingResponse",
+  "namespace": "autumn.catalog",
+  "doc": "endpoint: catalog.ping, POST /ping, response body. Autumn sends JSON null, not an object",
+  "autumn.endpoint": "catalog.ping",
+  "fields": []
+}

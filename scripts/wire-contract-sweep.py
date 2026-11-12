@@ -13,7 +13,8 @@ unchanged tree twice and requires the same bytes as the committed bundle.
 
 Part 3 exports the unchanged tree with `--proto` twice and requires the same
 bytes as the committed `examples/mesh-storefront/contracts/proto/` and its
-lock. `--check` must pass on the committed files.
+lock. `--check` must pass on the committed files. It does the same with
+`--avro` and the committed `examples/mesh-storefront/contracts/avro/`.
 
 The script restores every file when it finishes.
 
@@ -36,6 +37,7 @@ MAIN = 'examples/mesh-storefront/src/main.rs'
 RELEASE_1 = 'examples/mesh-storefront/contracts/release-1.json'
 PROTO = 'examples/mesh-storefront/contracts/proto'
 PROTO_LOCK = 'examples/mesh-storefront/contracts/proto.lock'
+AVRO = 'examples/mesh-storefront/contracts/avro'
 BASE = open(LIB).read()
 BASE_MAIN = open(MAIN).read()
 PACKAGES = ['-p', 'mesh-catalog', '-p', 'mesh-storefront']
@@ -244,6 +246,18 @@ try:
     if not proto_ok:
         print(err)
 
+    avro_runs = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for n in (1, 2):
+            out = os.path.join(scratch, f'avro-{n}')
+            code, _, err = contracts(binary, 'export', '--avro', '--out', out)
+            assert code == 0, err
+            avro_runs.append(tree(out))
+    code, _, err = contracts(binary, 'export', '--avro', '--check', '--out', AVRO)
+    avro_ok = avro_runs[0] == avro_runs[1] == tree(AVRO) and code == 0
+    if not avro_ok:
+        print(err)
+
     cross = []
     for label, edits, want_code, want_text in CROSS_RELEASE:
         apply_release(edits)
@@ -273,7 +287,8 @@ for label, want, got, ok, text in cross:
 cross_wrong = [c for c in cross if not c[3]]
 print(f'bundle byte-stable across two exports and equal to {RELEASE_1}: {stable_ok}')
 print(f'proto export byte-stable across two exports and equal to {PROTO}: {proto_ok}')
+print(f'avro export byte-stable across two exports and equal to {AVRO}: {avro_ok}')
 
 # The acceptance criterion is a CALLER-NAMED error, not merely a red build, so
 # the exit code gates on `caught` rather than on `red`.
-sys.exit(1 if false_pos or len(caught) < len(breaking) or cross_wrong or not stable_ok or not proto_ok else 0)
+sys.exit(1 if false_pos or len(caught) < len(breaking) or cross_wrong or not stable_ok or not proto_ok or not avro_ok else 0)

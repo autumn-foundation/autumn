@@ -322,8 +322,8 @@ impl<'b> File<'b> {
         } else {
             &endpoint.request
         };
-        if let Some(id) = self.same_type(&shape.name, None, shape) {
-            return Origin::Type(id);
+        if let Some(id) = self.bundle.same_type(&shape.name, None, shape) {
+            return Origin::Type(id.to_owned());
         }
         let same = |s: &WireTypeDescriptor| {
             s.name == shape.name
@@ -359,32 +359,12 @@ impl<'b> File<'b> {
         if event.opaque {
             return Origin::Event(event.topic.clone());
         }
-        self.same_type(&event.type_name, Some(&event.krate), &event.shape)
-            .map_or_else(|| Origin::Event(event.topic.clone()), Origin::Type)
-    }
-
-    /// The id of a nested type named `name` with the fields of `shape`.
-    fn same_type(
-        &self,
-        name: &str,
-        krate: Option<&str>,
-        shape: &WireTypeDescriptor,
-    ) -> Option<String> {
         self.bundle
-            .types
-            .iter()
-            .find(|t| {
-                t.id.rsplit("::").next() == Some(name)
-                    && krate.is_none_or(|k| {
-                        // A type id keeps the package name as written.
-                        t.id.split("::").next().map(|c| c.replace('-', "_"))
-                            == Some(k.replace('-', "_"))
-                    })
-                    && t.shape.serialized == shape.serialized
-                    && t.shape.deserialized == shape.deserialized
-                    && t.shape.unit == shape.unit
-            })
-            .map(|t| t.id.clone())
+            .same_type(&event.type_name, Some(&event.krate), &event.shape)
+            .map_or_else(
+                || Origin::Event(event.topic.clone()),
+                |id| Origin::Type(id.to_owned()),
+            )
     }
 
     /// Give each origin in `roots`, and each type that they or `seeds`
@@ -1267,7 +1247,7 @@ fn quoted(text: &str) -> String {
 }
 
 /// A lower snake case identifier for a package part.
-fn package_part(text: &str) -> String {
+pub(super) fn package_part(text: &str) -> String {
     let snake = snake(text);
     if snake.starts_with(|c: char| c.is_ascii_lowercase()) {
         snake
@@ -1343,7 +1323,7 @@ fn message_ident(name: &str) -> String {
 ///
 /// A name that would start with a digit, or be empty, gets a `P` first, so
 /// it is a valid protobuf identifier: `3d` becomes `P3d`.
-fn pascal(text: &str) -> String {
+pub(super) fn pascal(text: &str) -> String {
     let name: String = text
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|part| !part.is_empty())

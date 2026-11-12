@@ -2484,6 +2484,15 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   Autumn's, so a consumer unwraps by hand. `--http-annotations` adds
   `google.api.http` options. `--well-known-types` maps `date-time` to
   `Timestamp`.
+- Events for data pipelines: `autumn contracts export --avro --out contracts/avro/`
+  writes one `.avsc` per topic (a new version is a new subject). Field names
+  are wire names; `#[serde(alias)]` is an Avro alias; nested types are named
+  records; an opaque event is `bytes`. It refuses `u64`/`usize`/128-bit
+  (use a smaller type, or a string adapter plus `#[wire(type = "string")]`)
+  and `any` fields (name the form with `#[wire(type = …)]`). The schema is for the data,
+  not Avro's JSON encoding. `--endpoints` adds bodies; `--check` exits 1 when
+  stale. Registry mode: `FULL` (any order), `FORWARD` (callee-first),
+  `BACKWARD` (caller-first).
 
 Limits: one workspace, sync request/response, JSON over HTTP. Guide:
 `docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +

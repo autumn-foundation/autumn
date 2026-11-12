@@ -618,3 +618,15 @@ a task with queues runs only where the role runs job workers and its pin
 admits one of the queues. The test
 `place_matches_the_model` in `autumn/src/background.rs` checks the runtime
 against the same rules.
+
+## Avro integer widths
+
+`avro_integer_width.rs` models how `autumn contracts export --avro` maps a
+Rust integer to an Avro `int` or `long`
+(`autumn-cli/src/contracts/avro/mod.rs`). It proves that the mapping never
+narrows, gives the smallest type, and refuses only when no Avro integer holds
+the range. Verify it with:
+
+```sh
+verus verification/avro_integer_width.rs
+```
