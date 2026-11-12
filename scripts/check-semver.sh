@@ -312,7 +312,7 @@ for crate in "${CRATES[@]}"; do
     #
     # NOTE: `telemetry-otlp` pulls prost/tonic, which need `protoc` at build
     # time. The SemVer job in .github/workflows/publish-gate.yml installs
-    # protobuf-compiler for this reason — keep them in sync.
+    # protoc for this reason — keep them in sync.
     #
     # TRIPWIRE (baseline-drift guard): the allowlist above is a static, hand-
     # computed intersection valid ONLY while cargo-semver-checks compares the

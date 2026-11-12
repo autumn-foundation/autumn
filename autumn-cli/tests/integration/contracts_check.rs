@@ -203,6 +203,13 @@ fn a_removed_response_field_that_no_caller_reads_passes() {
 }
 
 #[test]
+fn a_type_change_of_a_response_field_fails_even_when_no_caller_reads_it() {
+    // The deployed caller decodes every field, also one it does not read.
+    let report = golden("response_field_type_changed", 1);
+    assert!(report.contains("`subtitle` is `Option<i64>`"), "{report}");
+}
+
+#[test]
 fn a_new_required_request_field_fails() {
     let report = golden("new_required_request_field", 3);
     assert!(report.contains("requires request field `sku`"), "{report}");

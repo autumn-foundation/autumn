@@ -1894,8 +1894,16 @@ jobs:
           # end-to-end test (#1607) drives the real `autumn deploy` over ssh/scp
           # against a privileged systemd container, and ubuntu-latest does not
           # guarantee the ssh *client* on PATH.
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client openssh-client
+          # Use apt only for a missing tool: the runner's Ubuntu mirror can
+          # fail DNS, and the image usually has these tools.
+          has() { command -v "$1" >/dev/null 2>&1; }
+          missing=()
+          has pg_dump && has pg_restore || missing+=(postgresql-client)
+          has ssh && has scp || missing+=(openssh-client)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y "${missing[@]}"
+          fi
           pg_dump --version
           pg_restore --version
           ssh -V
@@ -2242,6 +2250,8 @@ jobs:
           # modules DOES need a line added here (and a step in
           # generator-conformance.yml) — that omission just makes it run
           # here too until skipped, never silently dark.
+          # The two `buf_` tests need the `buf` binary, not Docker. They run
+          # in wire-contracts.yml, which installs buf.
           # `scrubbed_database_migrates_clean_and_boots_the_app` additionally
           # compiles and boots a generated app and needs the diesel CLI, so it
           # runs in generator-conformance.yml's Postgres gate instead.
@@ -2291,7 +2301,9 @@ jobs:
             --skip serve_daemon_start_status_stop_over_unix_socket \
             --skip scaffolded_json_field_generates_compiles_inserts_and_selects \
             --skip scrubbed_database_migrates_clean_and_boots_the_app \
-            --skip documented_scaffold_example_builds_without_warnings
+            --skip documented_scaffold_example_builds_without_warnings \
+            --skip buf_lint_and_buf_build_pass_on_each_proto_export \
+            --skip buf_breaking_finds_no_break_that_contracts_check_approved
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
           # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)
@@ -2468,9 +2480,13 @@ jobs:
         continue-on-error: true
       - name: Install the ssh client
         # The test drives the real `ssh`/`scp`. The runner may lack them.
+        # Use apt only when ssh or scp is missing: the runner's Ubuntu
+        # mirror can fail DNS.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-client
+          if ! command -v ssh >/dev/null 2>&1 || ! command -v scp >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y openssh-client
+          fi
           ssh -V
       - name: Pull Docker Hub images through a mirror
         # The unauthenticated Docker Hub pull limit is often spent.
@@ -3034,13 +3050,14 @@ jobs:
             | tee "$RUNNER_TEMP/cli-boundaries-e2e-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-boundaries-e2e-cov.log"
           # Same gap for `contracts::` and `autumn contracts`. The `cli_tests`
-          # filter runs the real binary over the golden bundles. Check the
-          # count.
+          # filters run the real binary over the golden bundles, for `check`
+          # and for `export --proto`. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- contracts:: \
             tests::parse_contracts \
             | tee "$RUNNER_TEMP/cli-contracts-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-contracts-cov.log"
           cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- contracts_check \
+            contracts_proto \
             | tee "$RUNNER_TEMP/cli-contracts-e2e-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-contracts-e2e-cov.log"
           # No other coverage lane runs the grants and database-role tests.
@@ -3214,9 +3231,10 @@ jobs:
         run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
       - name: Install protoc (required for telemetry-otlp)
         # prost/tonic build scripts want it, and ubuntu-latest does not ship it.
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+        # GitHub Releases, not apt: the runner's Ubuntu mirror can fail DNS.
+        uses: taiki-e/install-action@v2.89.0
+        with:
+          tool: protoc
       - name: Clippy (autumn-web lib, sqlite + telemetry-otlp)
         # The durable SQLite job backend persists a W3C trace context, so its
         # `telemetry-otlp` arms only compile under this pair (#1907). Without
