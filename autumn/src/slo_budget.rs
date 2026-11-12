@@ -75,6 +75,7 @@ struct Bucket {
 pub struct BudgetTracker {
     slo: Slo,
     retain_buckets: u64,
+    max_window: Duration,
     buckets: VecDeque<Bucket>,
 }
 
@@ -90,8 +91,17 @@ impl BudgetTracker {
         Self {
             slo,
             retain_buckets: longest.as_secs().div_ceil(BUCKET_SECS),
+            max_window: longest,
             buckets: VecDeque::new(),
         }
+    }
+
+    /// The longest window the tracker keeps events for: the longest of the
+    /// [`BURN_WINDOWS`], three days. A longer query returns `None` rather
+    /// than an answer from part of the window.
+    #[must_use]
+    pub const fn max_window(&self) -> Duration {
+        self.max_window
     }
 
     /// The objective this tracker measures.
@@ -139,7 +149,8 @@ impl BudgetTracker {
 
     /// The burn rate over the `window` that ends at `now`, in tenths: `10`
     /// means the budget is spent exactly as fast as the objective allows.
-    /// `None` when the window holds no events.
+    /// `None` when the window holds no events, or is longer than
+    /// [`Self::max_window`].
     #[must_use]
     pub fn burn_tenths(&self, now: Duration, window: Duration) -> Option<u32> {
         let (good, bad) = self.counts(now, window)?;
@@ -151,7 +162,7 @@ impl BudgetTracker {
 
     /// The share of the error budget left over the `window` that ends at
     /// `now`, in ppm: `PPM` is untouched, `0` is spent. `None` when the
-    /// window holds no events.
+    /// window holds no events, or is longer than [`Self::max_window`].
     #[must_use]
     pub fn remaining_ppm(&self, now: Duration, window: Duration) -> Option<u32> {
         let (good, bad) = self.counts(now, window)?;
@@ -189,6 +200,9 @@ impl BudgetTracker {
     /// event still inside the window is never dropped; at most one bucket
     /// width of older events counts with it.
     fn counts(&self, now: Duration, window: Duration) -> Option<(u64, u64)> {
+        if window > self.max_window {
+            return None;
+        }
         let last = now.as_secs() / BUCKET_SECS;
         let first = now.saturating_sub(window).as_secs() / BUCKET_SECS;
         let (good, bad) = self
@@ -397,6 +411,18 @@ mod tests {
         // 241 seconds old at query time: inside a five-minute window.
         tracker.record(Duration::from_secs(59), fail("/"));
         assert_eq!(tracker.burn_tenths(5 * MIN, 5 * MIN), Some(10_000));
+    }
+
+    #[test]
+    fn a_window_longer_than_the_kept_history_is_refused() {
+        let mut tracker = BudgetTracker::new(availability(None));
+        tracker.record(Duration::ZERO, fail("/"));
+        tracker.record(4 * 24 * HOUR, ok("/"));
+        let month = 30 * 24 * HOUR;
+        assert_eq!(tracker.max_window(), 72 * HOUR);
+        assert_eq!(tracker.burn_tenths(4 * 24 * HOUR, month), None);
+        assert_eq!(tracker.remaining_ppm(4 * 24 * HOUR, month), None);
+        assert!(tracker.remaining_ppm(4 * 24 * HOUR, 72 * HOUR).is_some());
     }
 
     #[test]

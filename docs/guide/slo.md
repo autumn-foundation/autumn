@@ -290,7 +290,9 @@ let paging = tracker.firing(now).iter().any(|w| w.severity == "page");
 Use the answer to shed optional work, turn a feature flag off, or show the
 budget on an admin page. The tracker reads no clock: pass the time from an
 epoch you pick. A test can replay an exact timeline. Buckets older than three
-days are dropped, so each tracker holds at most 4,320 buckets.
+days are dropped, so each tracker holds at most 4,320 buckets. A query for a
+longer window, such as the 30-day budget on the dashboard, returns `None`.
+Read that from Prometheus.
 
 ---
 
