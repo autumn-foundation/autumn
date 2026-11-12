@@ -525,6 +525,10 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// on the last chip moves the focus to the input. The chip list is one tab stop. A status
 /// region tells a screen reader which chip was added or removed.
 ///
+/// A form reset (with `autumn-widgets.js`) brings back the server state: the
+/// chips, or the picked value. It clears the query and the popup. A reset
+/// that the page cancels changes nothing.
+///
 /// Use [`autocomplete_option`] and [`autocomplete_empty_state`] to render
 /// option partials returned by your handler. Use
 /// [`autocomplete_create_option`] for a "create new" entry.

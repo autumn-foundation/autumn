@@ -11,6 +11,10 @@ services into a release 2 and runs `autumn contracts check` against release 1.
 The exit code and the named deploy order must match. Part 2 also exports the
 unchanged tree twice and requires the same bytes as the committed bundle.
 
+Part 3 exports the unchanged tree with `--proto` twice and requires the same
+bytes as the committed `examples/mesh-storefront/contracts/proto/` and its
+lock. `--check` must pass on the committed files.
+
 The script restores every file when it finishes.
 
 Run from the workspace root:
@@ -22,6 +26,7 @@ Exits non-zero when any case does not give the expected result.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +34,8 @@ import tempfile
 LIB = 'examples/mesh-catalog/src/lib.rs'
 MAIN = 'examples/mesh-storefront/src/main.rs'
 RELEASE_1 = 'examples/mesh-storefront/contracts/release-1.json'
+PROTO = 'examples/mesh-storefront/contracts/proto'
+PROTO_LOCK = 'examples/mesh-storefront/contracts/proto.lock'
 BASE = open(LIB).read()
 BASE_MAIN = open(MAIN).read()
 PACKAGES = ['-p', 'mesh-catalog', '-p', 'mesh-storefront']
@@ -192,6 +199,14 @@ def autumn_bin():
     subprocess.run(['cargo', 'build', '-q', '-p', 'autumn-cli'], check=True)
     return os.path.join('target', 'debug', 'autumn')
 
+def tree(root):
+    out = {}
+    for base, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(base, name)
+            out[os.path.relpath(path, root).replace(os.sep, '/')] = open(path, 'rb').read()
+    return out
+
 def contracts(binary, *args):
     out = subprocess.run([binary, 'contracts', *args, *PACKAGES], capture_output=True, text=True)
     return out.returncode, out.stdout, out.stderr
@@ -213,6 +228,21 @@ try:
             assert code == 0, err
             stable.append(open(out, 'rb').read())
     stable_ok = stable[0] == stable[1] == open(RELEASE_1, 'rb').read()
+
+    proto_runs = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for n in (1, 2):
+            out = os.path.join(scratch, f'proto-{n}')
+            lock = os.path.join(scratch, f'proto-{n}.lock')
+            shutil.copyfile(PROTO_LOCK, lock)
+            code, _, err = contracts(binary, 'export', '--proto', '--out', out, '--lock', lock)
+            assert code == 0, err
+            proto_runs.append((tree(out), open(lock, 'rb').read()))
+    committed = (tree(PROTO), open(PROTO_LOCK, 'rb').read())
+    code, _, err = contracts(binary, 'export', '--proto', '--check', '--out', PROTO, '--lock', PROTO_LOCK)
+    proto_ok = proto_runs[0] == proto_runs[1] == committed and code == 0
+    if not proto_ok:
+        print(err)
 
     cross = []
     for label, edits, want_code, want_text in CROSS_RELEASE:
@@ -242,7 +272,8 @@ for label, want, got, ok, text in cross:
         print(text)
 cross_wrong = [c for c in cross if not c[3]]
 print(f'bundle byte-stable across two exports and equal to {RELEASE_1}: {stable_ok}')
+print(f'proto export byte-stable across two exports and equal to {PROTO}: {proto_ok}')
 
 # The acceptance criterion is a CALLER-NAMED error, not merely a red build, so
 # the exit code gates on `caught` rather than on `red`.
-sys.exit(1 if false_pos or len(caught) < len(breaking) or cross_wrong or not stable_ok else 0)
+sys.exit(1 if false_pos or len(caught) < len(breaking) or cross_wrong or not stable_ok or not proto_ok else 0)

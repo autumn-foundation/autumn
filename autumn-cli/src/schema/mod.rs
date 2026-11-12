@@ -19,6 +19,7 @@ pub mod rename;
 pub mod schema_rs;
 pub mod shadow;
 pub mod snapshot;
+pub mod table_ref;
 pub mod width;
 
 use std::collections::BTreeMap;
@@ -1189,10 +1190,12 @@ fn relation_clash(
             .rsplit_once('.')
             .map_or_else(|| key(name), |(schema, _)| key(&format!("{schema}.{name}")))
     };
-    let table_key = |t: &autumn_schema_core::Table| match t.schema.as_deref() {
-        Some(schema) if schema != "public" => key(&format!("{schema}.{}", t.name)),
-        _ => key(&t.name),
+    // `schema.table` for a table in a named schema; `table` for one in `public`.
+    let table_name = |t: &autumn_schema_core::Table| {
+        table_ref::named_schema(t)
+            .map_or_else(|| t.name.clone(), |schema| format!("{schema}.{}", t.name))
     };
+    let table_key = |t: &autumn_schema_core::Table| key(&table_name(t));
     let added: std::collections::BTreeSet<String> = plan
         .changes
         .iter()
@@ -1219,7 +1222,7 @@ fn relation_clash(
         .iter()
         .map(|n| key(n))
         .chain(baseline.iter().flat_map(|t| {
-            let prefix = t.qualified_name();
+            let prefix = table_name(t);
             std::iter::once(table_key(t)).chain(
                 t.indexes
                     .iter()
@@ -1235,7 +1238,7 @@ fn relation_clash(
         let names: Vec<(&String, String)> = match c {
             // A new table brings its own indexes.
             SchemaChange::CreateTable(t) => {
-                let prefix = t.qualified_name();
+                let prefix = table_name(t);
                 std::iter::once((&t.name, table_key(t)))
                     .chain(
                         t.indexes
@@ -1459,10 +1462,11 @@ fn bare_fk_targets(columns: &mut [Column], schemas: &BTreeMap<String, String>) {
 /// only when `table` is in `schema`. A target the model wrote with another
 /// schema (`auth.users`) stays as written.
 fn unqualify_fk(fk: &mut autumn_schema_core::ForeignKey, schemas: &BTreeMap<String, String>) {
-    if let Some((schema, bare)) = fk.table.split_once('.')
-        && schemas.get(bare).is_some_and(|s| s == schema)
+    let target = table_ref::TableRef::parse(&fk.table);
+    if let Some(schema) = target.schema()
+        && schemas.get(target.name()).is_some_and(|s| s == schema)
     {
-        fk.table = bare.to_owned();
+        fk.table = target.name().to_owned();
     }
 }
 
@@ -1829,6 +1833,25 @@ mod tests {
         // A public table still clashes with a public view.
         let public = autumn_schema_core::Table::new("report", Backend::Postgres);
         assert!(relation_clash(&plan(public), &[], &public_view).is_some());
+    }
+
+    #[test]
+    fn an_index_of_a_table_stored_in_public_clashes_in_the_default_schema() {
+        use autumn_schema_core::{Index, Table};
+        let mut audit = Table::new("audit", Backend::Postgres);
+        audit.schema = Some("public".to_owned());
+        audit
+            .indexes
+            .push(Index::new("idx_taken", vec!["x".to_owned()], false));
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddIndex {
+                table: "reports".to_owned(),
+                index: Index::new("idx_taken", vec!["slug".to_owned()], false),
+            }],
+        };
+        let none = std::collections::BTreeSet::new();
+        assert!(relation_clash(&plan, &[audit], &none).is_some());
     }
 
     #[test]
@@ -2900,6 +2923,24 @@ mod tests {
             .filter_map(|c| c.references.as_ref().map(|f| f.table.as_str()))
             .collect();
         assert_eq!(targets, ["auth.users", "authors"]);
+    }
+
+    #[test]
+    fn a_projected_qualified_fk_target_diffs_clean_against_its_model() {
+        use autumn_schema_core::{Column, ColumnType, ForeignKey};
+        let mut authors = Table::new("authors", Backend::Postgres);
+        authors.schema = Some("blog".to_owned());
+        let mut posts = Table::new("posts", Backend::Postgres);
+        let mut author = Column::new("author_id".to_string(), ColumnType::Int64);
+        author.references = Some(ForeignKey::new("blog.authors", "id"));
+        posts.columns = vec![author];
+        let desired = parse::ParsedSchema::from_tables(vec![authors, posts]);
+        let opts = diff::DiffOptions::default();
+        let plan = diff::diff_schema(&[], &desired, opts);
+        diff::guard_plan(&plan, opts).expect("create plan");
+        let snapshot = project_plan_target(&[], &plan);
+        let next = diff::diff_schema(&snapshot, &desired, opts);
+        assert!(next.is_empty(), "{:?}", next.changes);
     }
 
     #[test]

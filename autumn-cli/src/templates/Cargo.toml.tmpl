@@ -24,12 +24,16 @@ tokio = { version = "1", features = ["rt", "macros"] }
 
 [profile.dev]
 # Windows PDB files cap public symbols (LNK4319). Keep only file and line
-# info, for the app and for its dependencies. Set it here. The
-# CARGO_PROFILE_DEV_DEBUG variable did not work reliably.
-# For full debug info on Linux or macOS, set debug = true in both tables.
+# info for the app. Set it here. The CARGO_PROFILE_DEV_DEBUG variable did
+# not work reliably.
 debug = "line-tables-only"
 
+# Dependencies build with no debug info. The first build is faster and the
+# PDB is smaller. A backtrace frame in a dependency shows the function name
+# with no file and line. To get them back, set debug = "line-tables-only"
+# here. For full debug info on Linux or macOS, set debug = true in both
+# tables.
 [profile.dev.package."*"]
-debug = "line-tables-only"
+debug = false
 
 [workspace]

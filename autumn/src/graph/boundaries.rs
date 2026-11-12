@@ -774,9 +774,9 @@ fn unmatched_patterns(
         };
         if let Some(graph) = graph {
             for p in &b.owns {
-                let p_lower = p.to_ascii_lowercase();
+                let p_lower = table_pattern(p);
                 if !r.tables.iter().any(|t| glob(&p_lower, t)) {
-                    warn("owns", p, "table of a #[model] in the graph");
+                    warn("owns", p, "table of a model or repository in the graph");
                 }
             }
             for p in &b.modules {
@@ -807,7 +807,16 @@ fn unmatched_patterns(
         }
         for (list, entries) in [("may_read", &b.may_read), ("may_write", &b.may_write)] {
             for t in entries {
-                if r.exception_owners(t).is_empty() {
+                if !r.exception_owners(t).is_empty() {
+                    continue;
+                }
+                if graph.is_none() && is_wildcard(&table_pattern(t)) {
+                    warn(
+                        list,
+                        t,
+                        "table, because there is no graph. Write the table name, or check a graph",
+                    );
+                } else {
                     warn(list, t, "table that a boundary owns");
                 }
             }
@@ -1018,7 +1027,7 @@ pub fn ratchet(report: Report, baseline: Option<&Baseline>) -> Ratchet {
 /// Finds the boundary of a table, node or crate.
 struct Resolver<'a> {
     config: &'a BoundaryConfig,
-    /// The tables of the models in the graph, lowercase.
+    /// The tables of the models and repositories in the graph, lowercase.
     tables: BTreeSet<String>,
     /// Library name to its packages. A module path starts with the library
     /// name; the config can name the package.
@@ -1037,7 +1046,12 @@ impl<'a> Resolver<'a> {
         let tables = graph
             .iter()
             .flat_map(|g| &g.nodes)
-            .filter_map(|n| n.model.as_ref().map(|m| m.table.to_ascii_lowercase()))
+            .flat_map(|n| {
+                let model = n.model.as_ref().map(|m| &m.table);
+                let repository = n.repository.as_ref().map(|r| &r.table);
+                model.into_iter().chain(repository)
+            })
+            .map(|t| t.to_ascii_lowercase())
             .collect();
         let (lib_aliases, bin_aliases) = crates.map(aliases).unwrap_or_default();
         Self {
@@ -1136,16 +1150,20 @@ impl<'a> Resolver<'a> {
 
     /// The boundaries that own a table an exception pattern matches.
     ///
-    /// The pattern is matched against the tables in the graph, and read as a
-    /// table name too. A tie between two boundaries counts for neither.
+    /// The check reads the pattern without its schema. With no `*`, the
+    /// pattern is a table name, and it needs no graph. With a `*`, it matches
+    /// the tables in the graph only. A tie between two boundaries counts for
+    /// neither.
     fn exception_owners(&self, pattern: &str) -> BTreeSet<&'a str> {
         let lower = table_pattern(pattern);
+        let owner = |table: &str| self.owner(table).ok().flatten();
+        if !is_wildcard(&lower) {
+            return owner(&lower).into_iter().collect();
+        }
         self.tables
             .iter()
             .filter(|t| glob(&lower, t))
-            .map(String::as_str)
-            .chain(std::iter::once(lower.as_str()))
-            .filter_map(|t| self.owner(t).ok().flatten())
+            .filter_map(|t| owner(t))
             .collect()
     }
 
@@ -1198,6 +1216,11 @@ fn table_pattern(pattern: &str) -> String {
         Some((_, table)) => table.to_owned(),
         None => lower,
     }
+}
+
+/// Whether a table pattern from [`table_pattern`] has a `*`.
+fn is_wildcard(table: &str) -> bool {
+    table.contains('*')
 }
 
 /// How specific a pattern is: its count of characters that are not `*`.
@@ -1892,6 +1915,192 @@ crates = ["crm-core-ad*"]
             "{:?}",
             report.warnings
         );
+    }
+
+    /// `core` owns all tables that no other boundary owns.
+    const CATCH_ALL: &str = r#"
+[boundaries.core]
+owns = ["*"]
+crates = ["crm-core"]
+
+[boundaries.marketing]
+owns = ["campaigns"]
+crates = ["crm-marketing"]
+
+[boundaries.reporting]
+crates = ["crm-reporting"]
+may_read = ["campaign*"]
+"#;
+
+    fn catch_all() -> BoundaryConfig {
+        BoundaryConfig::parse(CATCH_ALL).expect("valid config")
+    }
+
+    /// One `contacts` model in `crm-core` and one `campaigns` model in
+    /// `crm-marketing`.
+    fn catch_all_graph() -> ArchitectureGraph {
+        build(&[], 0, &[], &MODELS[..2], &[], &[])
+    }
+
+    #[test]
+    fn a_wildcard_exception_resolves_against_graph_tables_only() {
+        let config = catch_all();
+        let graph = catch_all_graph();
+        let with_graph = Resolver::new(&config, Some(&graph), None);
+        assert_eq!(
+            with_graph.exception_owners("campaign*"),
+            BTreeSet::from(["marketing"])
+        );
+        assert_eq!(
+            with_graph.exception_owners("public.campaign*"),
+            BTreeSet::from(["marketing"])
+        );
+        let no_graph = Resolver::new(&config, None, None);
+        assert!(no_graph.exception_owners("campaign*").is_empty());
+        assert!(no_graph.exception_owners("public.campaign*").is_empty());
+        assert_eq!(
+            no_graph.exception_owners("contacts"),
+            BTreeSet::from(["core"])
+        );
+        assert_eq!(
+            with_graph.exception_owners("*"),
+            BTreeSet::from(["core", "marketing"])
+        );
+        assert!(no_graph.exception_owners("*").is_empty());
+        // With a `*` in the schema part only, the pattern is a table name.
+        assert_eq!(
+            no_graph.exception_owners("*.campaigns"),
+            BTreeSet::from(["marketing"])
+        );
+    }
+
+    #[test]
+    fn a_wildcard_exception_matches_a_table_that_only_a_repository_names() {
+        const ARCHIVE: &[RepositoryGraphDescriptor] = &[RepositoryGraphDescriptor {
+            repository: "CampaignArchiveRepository",
+            implementation: "PgCampaignArchiveRepository",
+            model: "Campaign",
+            table: "campaign_archive",
+            api: "",
+            module_path: "crm_marketing::repositories",
+            file: "src/repositories.rs",
+            line: 1,
+            crate_version: "0.1.0",
+        }];
+        let mut config = catch_all();
+        let marketing = config.boundaries.get_mut("marketing").expect("marketing");
+        marketing.owns = vec!["campaign*".into()];
+        marketing.schema_crates = vec!["crm-marketing".into()];
+        // No model has a `campaign*` table. Only the repository names one.
+        let graph = build(&[], 0, &[], &MODELS[..1], ARCHIVE, &[]);
+        let resolver = Resolver::new(&config, Some(&graph), None);
+        assert_eq!(
+            resolver.exception_owners("campaign*"),
+            BTreeSet::from(["marketing"])
+        );
+        let deps = crates(&[("crm-reporting", "crm-marketing")]);
+        let report = check(&config, Some(&graph), Some(&deps)).expect("runs");
+        assert!(
+            crate_violations(&report).is_empty(),
+            "{:?}",
+            report.violations
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("campaign*")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    /// The crate violations as (boundary, owner, schema crate).
+    fn crate_triples(report: &Report) -> Vec<(&str, &str, &str)> {
+        crate_violations(report)
+            .into_iter()
+            .map(|v| {
+                (
+                    v.boundary.as_str(),
+                    v.owner.as_str(),
+                    v.schema_crate.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    /// `config` with `crm-core` as core's schema crate and `crm-marketing` as
+    /// marketing's schema crate. With no graph, the check needs them.
+    fn with_schema_crates(mut config: BoundaryConfig) -> BoundaryConfig {
+        for (name, schema) in [("core", "crm-core"), ("marketing", "crm-marketing")] {
+            config
+                .boundaries
+                .get_mut(name)
+                .expect("boundary")
+                .schema_crates = vec![schema.into()];
+        }
+        config
+    }
+
+    #[test]
+    fn a_wildcard_exception_does_not_allow_the_schema_of_a_catch_all_owner() {
+        // `crm-reporting -> crm-marketing` is the control: `campaign*` allows it.
+        let deps = crates(&[
+            ("crm-reporting", "crm-core"),
+            ("crm-reporting", "crm-marketing"),
+        ]);
+        let report = check(&catch_all(), Some(&catch_all_graph()), Some(&deps)).expect("runs");
+        assert_eq!(crate_triples(&report), [("reporting", "core", "crm-core")]);
+    }
+
+    #[test]
+    fn a_literal_exception_allows_the_dependency_with_no_graph() {
+        let config = with_schema_crates(config("may_read = [\"contacts\"]\n"));
+        let deps = crates(&[("crm-marketing", "crm-core")]);
+        let report = check(&config, None, Some(&deps)).expect("runs");
+        assert!(
+            crate_violations(&report).is_empty(),
+            "{:?}",
+            report.violations
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("contacts")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn with_no_graph_a_wildcard_exception_allows_nothing_and_warns() {
+        let config = with_schema_crates(catch_all());
+        let deps = crates(&[
+            ("crm-reporting", "crm-core"),
+            ("crm-reporting", "crm-marketing"),
+        ]);
+        let report = check(&config, None, Some(&deps)).expect("runs");
+        assert_eq!(
+            crate_triples(&report),
+            [
+                ("reporting", "core", "crm-core"),
+                ("reporting", "marketing", "crm-marketing"),
+            ]
+        );
+        assert!(
+            report.warnings.iter().any(|w| {
+                w.contains("`may_read` pattern `campaign*`")
+                    && w.contains("because there is no graph")
+            }),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn an_owns_pattern_with_a_schema_matches_its_table_in_the_graph() {
+        let mut config = config("");
+        config.boundaries.get_mut("core").expect("core").owns =
+            vec!["public.contacts".into(), "public.contactz".into()];
+        let report = check(&config, Some(&graph()), None).expect("runs");
+        let warned = |p: &str| report.warnings.iter().any(|w| w.contains(p));
+        assert!(!warned("`public.contacts`"), "{:?}", report.warnings);
+        assert!(warned("`public.contactz`"), "{:?}", report.warnings);
     }
 
     #[test]

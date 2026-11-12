@@ -1,0 +1,2 @@
+lock held by A: relation|RowExclusiveLock|t
+B: row '1' is free while A is open
