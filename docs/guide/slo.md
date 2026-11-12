@@ -263,6 +263,37 @@ for the fleet behavior and the output.
 
 ---
 
+## Read the budget in the app
+
+Prometheus evaluates the alerts. The app can evaluate them too, with no
+scrape delay. `autumn_web::slo_budget::BudgetTracker` takes one checked
+`Slo` and counts each request outcome in one-minute buckets. It uses the same
+three burn windows as the generated rules:
+
+```rust
+use std::time::{Duration, Instant};
+use autumn_web::slo_budget::{BudgetTracker, Outcome};
+
+let boot = Instant::now();
+let mut tracker = BudgetTracker::new(slo);
+
+// After each request:
+tracker.record(boot.elapsed(), Outcome { route, status, latency_ms });
+
+// When you need the answer:
+let now = boot.elapsed();
+let burn = tracker.burn_tenths(now, Duration::from_hours(1)); // 144 = 14.4x
+let left = tracker.remaining_ppm(now, Duration::from_hours(72)); // PPM = all left
+let paging = tracker.firing(now).iter().any(|w| w.severity == "page");
+```
+
+Use the answer to shed optional work, turn a feature flag off, or show the
+budget on an admin page. The tracker reads no clock: pass the time from an
+epoch you pick. A test can replay an exact timeline. Buckets older than three
+days are dropped, so each tracker holds at most 4,320 buckets.
+
+---
+
 ## Validate the files yourself
 
 CI checks the golden files with the real tools. You can run the same checks:

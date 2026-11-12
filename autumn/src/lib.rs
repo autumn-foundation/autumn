@@ -806,6 +806,8 @@ pub mod runtime_config;
 pub mod seed;
 #[cfg(feature = "slo")]
 pub mod slo;
+#[cfg(feature = "slo")]
+pub mod slo_budget;
 
 // ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
 //
