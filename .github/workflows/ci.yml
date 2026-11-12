@@ -3020,6 +3020,11 @@ jobs:
             plugin_sandbox:: \
             | tee "$RUNNER_TEMP/cli-plugin-check-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-plugin-check-cov.log"
+          # Issue #2795: same gap for `dev_loop_bench::`, the budget and report
+          # half of the latency gates. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- dev_loop_bench:: \
+            | tee "$RUNNER_TEMP/cli-dev-loop-bench-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-dev-loop-bench-cov.log"
           # Issues #2468 and #2497: same gap for `posture::` and
           # `routes_audit::`. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: routes_audit:: \

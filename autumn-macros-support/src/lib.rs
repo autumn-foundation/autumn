@@ -54,6 +54,26 @@ pub mod analysers {
 
 #[cfg(test)]
 mod tests {
+    /// The entry points give the same tokens as the analysers they wrap.
+    #[test]
+    fn the_entry_points_run_the_analysers() {
+        let attr = || quote::quote!(2);
+        let item = || {
+            quote::quote!(
+                async fn list() {}
+            )
+        };
+        assert_eq!(
+            super::analysers::query_budget(attr(), item()).to_string(),
+            crate::query_budget::query_budget_macro(attr(), item()).to_string()
+        );
+        let attr = proc_macro2::TokenStream::new;
+        assert_eq!(
+            super::analysers::agent_operable(attr(), item()).to_string(),
+            crate::agent_authority::agent_operable_macro(attr(), item()).to_string()
+        );
+    }
+
     /// A large analyser in the proc-macro crate makes every cold build wait.
     #[test]
     fn the_large_analysers_are_not_in_the_proc_macro_crate() {
