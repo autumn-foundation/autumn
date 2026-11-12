@@ -280,6 +280,11 @@ app that bundles them), install the PostgreSQL client tools or point
 `AUTUMN_PG_BIN_DIR` at their `bin` directory. `autumn doctor` warns when they are
 missing.
 
+A `pg_restore` from PostgreSQL 17 or later turns off `transaction_timeout`. A
+server older than 17 does not know that setting and reports an error. When
+that is the only error, `autumn db restore` reports the restore as complete
+and prints a note. Any other error still fails the restore.
+
 > **Copying a backup to staging or a laptop?** Run it through
 > [`autumn db scrub`](data-scrubbing.md) first — it anonymizes every
 > PII-classified column and refuses (rather than silently passing data through)
