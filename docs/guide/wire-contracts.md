@@ -1010,6 +1010,8 @@ on some changes:
   callbacks (`item.details.as_ref().map(|d| d.color)`).
 * A loop, an index or another method call stops the path.
   `item.details.lines[0].price` reads `details.lines` only.
+* A field with more than one nested type, such as `Envelope<Payload>`, gives
+  the same nested reads and writes to each type.
 * The check knows a nested write-set only when the call site sets a named
   field in an inline literal, or in `Some(literal)`. For other values, the
   check uses the type, as for a request built elsewhere.
