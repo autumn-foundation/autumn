@@ -123,6 +123,7 @@ mod embed_assets_integration;
 mod encryption_columns;
 #[cfg(feature = "db")]
 mod encryption_repository;
+#[cfg(feature = "error-reporting")]
 mod error_reporting;
 mod error_validation_details;
 #[cfg(feature = "db")]

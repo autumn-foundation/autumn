@@ -177,7 +177,7 @@ impl ExceptionFilter for ProblemDetailsFilter {
         // A caught panic's identity must survive the rebuild: the capsule
         // replay driver reads it to compare panic against panic rather than
         // accepting any response with the same status.
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         if let Some(caught) = response
             .extensions()
             .get::<crate::reporting::CaughtPanic>()

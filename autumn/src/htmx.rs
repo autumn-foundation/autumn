@@ -866,9 +866,11 @@ mod tests {
     /// increased them from 70 KiB and 20 KiB.
     /// The direct upload hold for htmx requests increased the raw budget
     /// from 72 KiB. The gzip budget did not change.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 74 * 1024;
+    /// Issue #3618 added the form reset for the search widgets. It increased
+    /// them from 74 KiB and 21 KiB.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 76 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 21 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 22 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.

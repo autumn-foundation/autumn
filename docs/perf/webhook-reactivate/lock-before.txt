@@ -1,0 +1,2 @@
+lock held by A: relation|RowExclusiveLock|t
+B: ERROR:  could not obtain lock on row in relation "autumn_webhook_subscriptions"

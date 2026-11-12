@@ -8,7 +8,7 @@ failing a customer's request.
 Inside the workspace there is no IDL, no codegen step, and nothing to keep in
 sync by hand. For a consumer outside the workspace, an IDL is an export of the
 contract, not its source. See
-[ADR 0046](../adr/0046-wire-contracts-idl-at-the-edge.md).
+[ADR 0048](../adr/0048-wire-contracts-idl-at-the-edge.md).
 
 ## The shape of it
 
@@ -216,7 +216,7 @@ source file:
 
 `--from <dir>` joins a directory of descriptors that a build already wrote.
 No build runs, and there is no dependency graph, so a bare name can come
-from any crate in the directory.
+from any crate in the directory. `--from <file>` reads a bundle file.
 
 Use `-p` to export some packages only. The default is the whole workspace. The
 pass checks libraries and binaries. Callers in tests and examples are not part
@@ -578,11 +578,205 @@ const _: () = assert!(
 See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 [Events across releases](#events-across-releases) for the deploy rules.
 
+## Consumers outside the workspace
+
+The check protects callers in one Cargo workspace. A consumer in another
+repository, team or language cannot build against the Rust types. Give it a
+protobuf schema of the contract:
+
+```bash
+autumn contracts export --proto --out contracts/proto/
+```
+
+`--proto` takes the same `-p`, feature and `--from` flags as the bundle
+export. It writes text only. The CLI does not need `protoc`. The Rust types
+stay the source of truth, and JSON stays the wire format.
+
+The export writes:
+
+| File | Holds |
+|---|---|
+| `autumn/<service>/<service>.proto` | one `<Service>Service`, its rpcs and their messages |
+| `autumn/<crate>/events/events.proto` | one message per `#[event]` of the crate |
+| `buf.yaml` | the lint and breaking rules for these files |
+| `proto.lock`, beside `--out` | the field numbers (`--lock <path>` moves it) |
+
+```proto
+// Rust type `Item`.
+message Item {
+  string id = 1 [json_name = "id"]; // required
+  string name = 2 [json_name = "name"]; // required
+  optional string sku = 3 [json_name = "sku"];
+}
+
+service CatalogService {
+  // GET /items/{id}
+  rpc GetItem(GetItemRequest) returns (Item);
+}
+```
+
+* `json_name` is always the serde wire name. A protobuf JSON parser reads the
+  JSON that Autumn sends. A wrapper is the exception. See below.
+* The path parameters and the body of an endpoint go into one
+  `<Rpc>Request` message. When a body field has the name of a path
+  parameter, the body is one field, `body`, so it stays whole.
+* The HTTP method and path go in a comment. `--http-annotations` also writes
+  `google.api.http` options, with each path parameter named by its proto
+  field. The export adds the googleapis dependency to `buf.yaml`. Run
+  `buf dep update` to fetch it. A GET or DELETE rule has no `body`.
+* An event message has the name of the event type. A comment gives its
+  topic.
+* Each file holds every message it needs, so a consumer can use one file.
+* An endpoint that no router serves is not in the files.
+* A response with no body, or a unit struct, is `google.protobuf.Empty`. A
+  comment says what Autumn sends: no body, or JSON `null`.
+* A Rust type with the name of a generated message (`<Rpc>Request`, a
+  wrapper, `<Service>Service`) stops the export. Rename the type.
+
+### Type mapping
+
+| Wire type | Proto |
+|---|---|
+| `string` (any format) | `string`. With `--well-known-types`, `date-time` is `google.protobuf.Timestamp` |
+| `integer` | `int32`, `int64`, `uint32` or `uint64` by width and sign. 128 bits is `google.protobuf.Value`, read as a double |
+| `number` | `double`. serde_json writes NaN and infinity as `null`, which reads as 0 |
+| `boolean` | `bool` |
+| `array` | `repeated T` |
+| `map` | `map<string, T>` |
+| `object` | a message |
+| `nullable` | `optional T`. A message field and `google.protobuf.Value` hold null already, so they stay plain fields |
+| `any` | `google.protobuf.Value` |
+
+A format, such as `uuid`, goes in the field comment. When one side of a
+field is `any`, for example with a custom serde function on that side only,
+the field is `google.protobuf.Value`. So is a field whose two sides have
+different forms, for example a `#[wire(type = …)]` on the serializer only.
+
+Protobuf cannot write some shapes in place. The export writes a wrapper
+message for each. Its name ends in `Wrapper`, so it is easy to find:
+
+| Shape | Proto |
+|---|---|
+| `Vec<Vec<T>>` | `repeated TListWrapper` |
+| `Vec<Option<T>>` | `repeated NullableTWrapper` |
+| `HashMap<String, Option<T>>` | `map<string, NullableTWrapper>` |
+| a map of lists or maps | `map<string, TListWrapper>`, `map<string, TMapWrapper>` |
+| a list of maps | `repeated TMapWrapper` |
+| a list response (`Json<Vec<Item>>`) | `ItemListWrapper` |
+| a list request body | a `repeated` field `items` in `<Rpc>Request` |
+
+A wrapper is not the JSON that Autumn sends. Autumn sends the bare value: an
+array, a map, or a value or `null`. A protobuf JSON parser expects an object
+with a `values` or `value` field, so it refuses Autumn's JSON for a wrapper
+field. Wrap the value yourself before you parse it: `[1, 2]` becomes
+`{"values": [1, 2]}`. A comment on each wrapper says so. With
+`--http-annotations`, a list response has `response_body: "values"`, so a
+transcoder uses the bare array.
+
+A `nullable` list or map is a plain `repeated` or `map` field. Protobuf JSON
+reads `null` as empty.
+
+### Requests from a protobuf consumer
+
+The schema is made to read Autumn's JSON. A consumer that writes a request
+with a protobuf JSON writer must do two things:
+
+* Write fields with default values. By default a writer leaves out `0`,
+  `""` and `false`, and serde then refuses a required field. Turn on the
+  writer's option to emit unpopulated fields.
+* Not send a 64-bit integer field. Protobuf JSON writes `int64` and `uint64`
+  as strings, and serde reads an integer only as a JSON number.
+
+### Field numbers
+
+JSON has no field numbers, so the export gives them. A number must never move
+after you publish it.
+
+* The lock keeps each number, by message and wire name. It is
+  sorted TOML. Commit it.
+* A new field gets the next free number. The numbers 19000 to 19999 are not
+  used.
+* A removed field moves to `reserved`, with its number and its name. No other
+  field gets that number. When the field comes back with the same wire name,
+  it gets its old number again.
+* `#[wire(tag = N)]` on a field sets its number. It wins over the lock, and
+  the number it replaces stays reserved. Two
+  equal tags on one type, or a tag outside protobuf's range, is a compile
+  error. A tag on the number of another field, or on a reserved number,
+  stops the export.
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    #[wire(tag = 1)]
+    pub id: String,
+}
+```
+
+* The lock is `proto.lock` beside `--out`: `--out contracts/proto/` uses
+  `contracts/proto.lock`.
+* `--check` writes nothing. It exits 1 when the lock is missing or would
+  change, or when a file would change or go away. It reads CRLF as LF. Run
+  it in CI, so a lock that is not committed fails the build:
+
+```bash
+autumn contracts export --proto --out contracts/proto/ --check
+```
+
+The export removes a `.proto` file under `<out>/autumn/` that it wrote
+before and does not write now, and names it. A file without the export's
+first line stays.
+
+Two exports of the same source give the same bytes. `--from` takes a
+published bundle file, so you can export the schema of any release with no
+build. This updates the lock. Pass `--lock` with a scratch path to keep the
+committed lock as it is:
+
+```bash
+autumn contracts export --from release-1.json --proto \
+  --out target/proto-1/ --lock target/proto-1.lock
+```
+
+A lock key is the full message name. A message that gets a new name, for
+example because a second Rust type with the same name is now in the file,
+gets new numbers.
+
+### Required fields
+
+proto3 has no `required`. A field that serde requires stays a plain field,
+with `// required` in its comment. The `.proto` files are a schema for
+consumers. They are not the gate: `autumn contracts check` stays the gate for
+a field that a deployed caller reads.
+
+### buf
+
+The `buf.yaml` uses the `STANDARD` lint rules, with three exceptions:
+
+* `RPC_RESPONSE_STANDARD_NAME`: an rpc returns the message that Autumn sends.
+* `RPC_REQUEST_RESPONSE_UNIQUE`: two rpcs can return one message.
+* `PACKAGE_VERSION_SUFFIX`: the package is the service name.
+
+Breaking changes use `WIRE_JSON`, because JSON is the wire format.
+
+`buf breaking` finds no break in a change that `autumn contracts check`
+approves. They differ by design on some changes that the check refuses:
+
+* A new required request field, or a removed required nested field. proto3
+  has no required fields.
+* A removed response field that a caller reads, and a new field that a new
+  caller reads. buf cannot see read-sets.
+* A changed path or method, and an endpoint removed from its router. buf
+  does not compare comments, and `WIRE_JSON` does not check removed rpcs.
+
+`autumn-cli/tests/integration/contracts_proto.rs` names each case.
+
 ## Limits of the first slice
 
-* One workspace. Both ends must be present at build time.
+* One workspace. Both ends must be present at build time. A consumer outside
+  the workspace gets a protobuf schema, not a build check. See
+  [Consumers outside the workspace](#consumers-outside-the-workspace).
 * Contracts come from Rust types only. Autumn does not import `.proto` or
-  Avro files. [ADR 0046](../adr/0046-wire-contracts-idl-at-the-edge.md) gives
+  Avro files. [ADR 0048](../adr/0048-wire-contracts-idl-at-the-edge.md) gives
   the reasons. It also says which new limits reopen the decision.
 * Synchronous request/response and events, as JSON. No streaming or
   websockets.
@@ -616,7 +810,9 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * The cross-release check compares two releases: the deployed one and the
   current one. More than two live releases need one check per pair.
 * The cross-release check knows only the callers in the bundle. It cannot see
-  a client outside the workspace, so it keeps every deployed route.
+  a client outside the workspace, so it keeps every deployed route. Give such
+  a client a protobuf schema. See
+  [Consumers outside the workspace](#consumers-outside-the-workspace).
 * A field with `#[wire(opaque)]` is compared by its type name only. A change
   inside its type does not show.
 * A nested type pair reports at most 100 issues. The verdict does not

@@ -1,4 +1,4 @@
-# ADR 0046: Rust Types Are the Wire Contract; an IDL Is an Export at the Edge
+# ADR 0048: Rust Types Are the Wire Contract; an IDL Is an Export at the Edge
 
 - Status: Accepted
 - Date: 2026-11-11
@@ -12,7 +12,8 @@ of epic [#3548](https://github.com/autumn-foundation/autumn/issues/3548). It
 records the decision behind
 [#3665](https://github.com/autumn-foundation/autumn/issues/3665) (protobuf
 export) and [#3666](https://github.com/autumn-foundation/autumn/issues/3666)
-(Avro export).
+(Avro export). [ADR 0046](0046-proto-export-from-wire-contracts.md) records
+how the protobuf export works.
 
 Wire contracts come from Rust types. `#[derive(WireShape)]`, `#[endpoint]`
 and `#[event]` record the shapes. `autumn contracts check` compares the
@@ -64,8 +65,9 @@ Option 3.
   `WireShape`, `#[endpoint]`, `#[event]`, and `autumn contracts check`.
 - At the workspace edge, Autumn exports a standard IDL from the bundle:
   - `autumn contracts export --proto`: protobuf for endpoints. It also
-    writes a message for each event.
+    writes a message for each event. This export is available.
   - `autumn contracts export --avro`: Avro for events and outbox messages.
+    This export is planned.
 - The Rust types stay the source of truth. An exported file is an output.
   Do not edit it.
 - Autumn does not import IDL files. It does not generate Rust types from
@@ -109,11 +111,13 @@ flowchart LR
   only. They cannot see what an outside consumer reads.
 - An export states only what the bundle holds. A gap in the bundle is also a
   gap in the export: path parameter types, enum variants, query parameters,
-  and fields with the wire type `any`.
+  and fields with the wire type `any`. For example, the protobuf export
+  writes each path parameter as `string`, and an `any` field as
+  `google.protobuf.Value`.
 - A team that writes `.proto` or Avro files first cannot give them to
   Autumn. The team publishes the exported files instead.
-- Until the two exports ship, a consumer outside the workspace has only the
-  JSON bundle.
+- Until the Avro export ships, an event consumer outside the workspace has
+  the protobuf event messages or the JSON bundle.
 
 ## When to revisit
 

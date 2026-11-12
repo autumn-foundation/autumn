@@ -6,6 +6,7 @@ mod build_script_target_dir;
 mod cloud_native_scaffold;
 mod console;
 mod contracts_check;
+mod contracts_proto;
 mod db;
 mod db_backup_sqlite;
 mod db_pull;
