@@ -1882,6 +1882,31 @@ fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
         })
 }
 
+/// Give back the rate-cap call a dispatch took when the route refused it.
+///
+/// The bucket is shared by every caller of the grant. `401`, `403` and `429`
+/// are refusals of the caller by the route (its auth guard, CSRF, a throttle),
+/// so the action did not run. Charging them would let anyone who can reach
+/// the endpoint use up the cap for the callers the route admits.
+fn refund_refused_call(server: &McpServer, tool: &McpTool, status: StatusCode) {
+    if !matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    ) {
+        return;
+    }
+    let Some(grant) = tool.agent_authority.map(|a| a.grant) else {
+        return;
+    };
+    let Some(cap) = grant
+        .rate
+        .and_then(crate::agent_authority::rate::parse_rate)
+    else {
+        return;
+    };
+    server.rate_limiter.refund(grant.name, grant.location, cap);
+}
+
 /// Longest actor id an audit row keeps.
 const MAX_ACTOR_LEN: usize = 128;
 
@@ -2777,6 +2802,7 @@ async fn serve_tools_call(
         replayed,
         actor,
     } = Dispatched::inspect(&response);
+    refund_refused_call(server, tool, status);
     audit.adopt_actor(actor.as_deref());
     let client_accepts_sse = ctx
         .headers
@@ -3021,6 +3047,7 @@ async fn run_task(
         actor,
         ..
     } = Dispatched::inspect(&response);
+    refund_refused_call(server, tool, status);
     outcome.audit.adopt_actor(actor.as_deref());
     // A task has no HTTP response to carry `Set-Cookie` or `Server-Timing`.
     outcome.status = Some(status);

@@ -1,7 +1,8 @@
 //! Runtime enforcement of a grant's `rate` cap.
 //!
 //! The MCP dispatcher asks [`RateLimiter::check`] before each governed tool
-//! call. Each grant has one token bucket. State is per MCP mount and per
+//! call, and gives the call back with [`RateLimiter::refund`] when the route
+//! refused it (`401`, `403`, `429`). Each grant has one token bucket. State is per MCP mount and per
 //! process. N instances allow up to N times the declared cap.
 
 use std::collections::HashMap;
@@ -92,6 +93,20 @@ impl RateLimiter {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let wait = ((1.0 - bucket.tokens) / per_sec).ceil().max(1.0) as u64;
             Err(wait)
+        }
+    }
+
+    /// Give back the call [`check`](Self::check) took from the bucket of the
+    /// grant declared at `location` under `name`, for a call that never ran
+    /// the action. The bucket never holds more than the burst.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn refund(&self, name: &str, location: &str, cap: RateCap) {
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(bucket) = buckets.get_mut(&format!("{name}\0{location}")) {
+            bucket.tokens = (bucket.tokens + 1.0).min(cap.count);
         }
     }
 }
@@ -210,6 +225,33 @@ mod tests {
         }
         assert!(limiter.check("g", "a.rs:1", TWO_PER_MIN, at(0)).is_err());
         assert_eq!(limiter.check("g", "b.rs:9", TWO_PER_MIN, at(0)), Ok(()));
+    }
+
+    #[test]
+    fn a_refund_gives_one_call_back() {
+        let limiter = RateLimiter::default();
+        for _ in 0..2 {
+            limiter
+                .check("g", "here", TWO_PER_MIN, at(0))
+                .expect("burst");
+        }
+        limiter.refund("g", "here", TWO_PER_MIN);
+        assert_eq!(limiter.check("g", "here", TWO_PER_MIN, at(0)), Ok(()));
+        assert!(limiter.check("g", "here", TWO_PER_MIN, at(0)).is_err());
+    }
+
+    #[test]
+    fn a_refund_never_fills_past_the_burst() {
+        let limiter = RateLimiter::default();
+        limiter
+            .check("g", "here", TWO_PER_MIN, at(0))
+            .expect("first");
+        limiter.refund("g", "here", TWO_PER_MIN);
+        limiter.refund("g", "here", TWO_PER_MIN);
+        limiter.refund("other", "here", TWO_PER_MIN);
+        assert_eq!(limiter.check("g", "here", TWO_PER_MIN, at(0)), Ok(()));
+        assert_eq!(limiter.check("g", "here", TWO_PER_MIN, at(0)), Ok(()));
+        assert!(limiter.check("g", "here", TWO_PER_MIN, at(0)).is_err());
     }
 
     #[test]

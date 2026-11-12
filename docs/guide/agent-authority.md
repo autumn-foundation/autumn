@@ -175,7 +175,7 @@ Keys may appear in any order. Every key except `reversibility` is optional.
 | `outbound` | absolute URL prefixes, and `"alias:<name>"` for a named client | `[]` | prefix match that must end at a path boundary (`/`, `?`, `#`, end), so `…/v1/refunds` never authorises `…/v1/refunds-evil` |
 | `webhooks` | topic strings | `[]` | exact match on the topic — a fan-out delivers to subscriber-supplied URLs, so it can only be granted by topic |
 | `jobs` | job type idents or `"job_name"` strings | `[]` | exact match |
-| `rate` | `"<n>/<s\|sec\|min\|hour\|day>"` | none | **grammar** validated at compile time. The MCP dispatcher enforces it. One bucket serves the whole grant. The count is per process. A call over the cap is refused and audited |
+| `rate` | `"<n>/<s\|sec\|min\|hour\|day>"` | none | **grammar** validated at compile time. The MCP dispatcher enforces it. One bucket serves the whole grant. The count is per process. A call over the cap is refused and audited. A call the route itself refuses (`401`, `403`, `429`) gives its token back, so a caller the route keeps out cannot use up the cap |
 | `spend` | `"<decimal> <ISO 4217>"`, e.g. `"500.00 USD"` | none | **grammar** validated at compile time; **declared only** |
 | `reversibility` | `reversible` \| `compensable` \| `irreversible` | **required** | must sit at or above the floor the proved effects impose (below) |
 
