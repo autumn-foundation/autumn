@@ -1899,8 +1899,14 @@ mod tests {
         let exit = run("examples/hello", 3, Some(&path), false, false, false);
         assert_eq!(exit, 0);
         let content = std::fs::read_to_string(&path).expect("report file");
-        serde_json::from_str::<serde_json::Value>(&content)
+        let json = serde_json::from_str::<serde_json::Value>(&content)
             .expect("output file must contain valid JSON");
+        // The latency report names the CPU, as the cold-start report does.
+        assert_eq!(json["cpu_count"], cpu_count());
+        assert_eq!(
+            json.get("cpu_model").and_then(serde_json::Value::as_str),
+            cpu_model().as_deref()
+        );
     }
 
     #[test]

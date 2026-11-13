@@ -337,7 +337,7 @@ fn axum_ws_is_owned_by_its_feature() {
 }
 
 /// The CLI builds `autumn-web` with default features off, and
-/// `autumn plugin check` uses the conformance module.
+/// `autumn plugin-check` uses the conformance module.
 #[test]
 fn the_cli_names_the_plugin_conformance_feature() {
     let cli: toml::Table = repo_file("autumn-cli/Cargo.toml")
@@ -354,55 +354,75 @@ fn the_cli_names_the_plugin_conformance_feature() {
     assert!(names(&autumn_web["features"]).contains("plugin-conformance"));
 }
 
-/// The docs builds turn default features off and name their own lists. A
-/// gate that a list does not name removes its module from the docs, and the
-/// links to that module break.
-#[test]
-fn the_docs_feature_lists_name_the_new_gates() {
-    let m = manifest();
-    let docs_rs = names(&m["package"]["metadata"]["docs"]["rs"]["features"]);
-    let script = repo_file("scripts/check-docs.sh");
-    let line = script
+/// The features that `list` turns on: its names, and each feature that one
+/// of them enables.
+fn closure<'a>(m: &toml::Table, list: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
+    let mut on = BTreeSet::new();
+    let mut todo: Vec<String> = list.into_iter().map(str::to_owned).collect();
+    while let Some(feature) = todo.pop() {
+        if let Some(enables) = features(m).get(&feature) {
+            todo.extend(names(enables).into_iter().filter(|f| !on.contains(f)));
+        }
+        on.insert(feature);
+    }
+    on
+}
+
+/// The value of `<name>="a,b,c"` in a script, as a list.
+fn script_list<'a>(script: &'a str, name: &str) -> Vec<&'a str> {
+    let prefix = format!("{name}=");
+    script
         .lines()
-        .find(|l| l.starts_with("AUTUMN_WEB_DOCS_FEATURES="))
-        .expect("the docs feature list in scripts/check-docs.sh");
-    let in_script: BTreeSet<&str> = line
-        .trim_start_matches("AUTUMN_WEB_DOCS_FEATURES=")
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no `{name}` list in the script"))
         .trim_matches('"')
         .split(',')
-        .collect();
-    for feature in ["plugin-conformance", "runtime-config", "axum-ws"] {
+        .collect()
+}
+
+/// `scripts/check-docs.sh` builds the docs with default features off and
+/// names its own feature list. A gate that the list does not turn on removes
+/// its module from that build, and the links to that module break. The
+/// docs.rs list names the gates too, for a docs.rs build with default
+/// features off.
+#[test]
+fn the_docs_feature_lists_turn_on_every_gate() {
+    let m = manifest();
+    let docs_rs = names(&m["package"]["metadata"]["docs"]["rs"]["features"]);
+    let docs_rs = closure(&m, docs_rs.iter().map(String::as_str));
+    let script = repo_file("scripts/check-docs.sh");
+    let in_script = closure(&m, script_list(&script, "AUTUMN_WEB_DOCS_FEATURES"));
+    for feature in ALL_FEATURES {
         assert!(
-            docs_rs.contains(feature),
-            "the docs.rs list must name `{feature}`"
+            docs_rs.contains(*feature),
+            "the docs.rs list must turn on `{feature}`"
         );
-        assert!(
-            in_script.contains(feature),
-            "scripts/check-docs.sh must name `{feature}`"
-        );
+        // The script builds the docs without `reporting`, and so without
+        // `error-reporting`.
+        if *feature != "error-reporting" {
+            assert!(
+                in_script.contains(*feature),
+                "scripts/check-docs.sh must turn on `{feature}`"
+            );
+        }
     }
 }
 
 /// The semver gate compares the public API with the last release. A module
 /// that the release had with no feature looks removed, unless the gate turns
-/// the new feature on for the current build.
+/// the feature on for the current build.
 #[test]
-fn the_semver_gate_names_the_new_module_gates() {
+fn the_semver_gate_turns_on_every_module_gate() {
+    let m = manifest();
     let script = repo_file("scripts/check-semver.sh");
-    let line = script
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("autumn_web_semver_current_only="))
-        .expect("the current-only feature list in scripts/check-semver.sh");
-    let listed: BTreeSet<&str> = line
-        .trim_start_matches("autumn_web_semver_current_only=")
-        .trim_matches('"')
-        .split(',')
-        .collect();
-    for feature in ["plugin-conformance", "runtime-config"] {
+    let mut list = script_list(&script, "autumn_web_semver_features");
+    list.extend(script_list(&script, "autumn_web_semver_current_only"));
+    let on = closure(&m, list);
+    for (feature, module) in GATES {
         assert!(
-            listed.contains(feature),
-            "scripts/check-semver.sh must name `{feature}`"
+            on.contains(*feature),
+            "scripts/check-semver.sh must turn on `{feature}` (module `{module}`)"
         );
     }
 }

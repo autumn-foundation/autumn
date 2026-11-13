@@ -241,7 +241,8 @@ fn record_fields(walk: &SchemaDeserializer, fields: &'static [&'static str]) {
         );
 }
 
-/// Read a value. Every type hint comes here, as in toml: the value decides.
+/// Read a value. The scalar, sequence and map hints come here, as in toml:
+/// the value decides. A struct hint does not: see `ConfigDe::struct_entries`.
 fn read_value<'de, V: Visitor<'de>>(value: toml::Value, visitor: V) -> Result<V::Value, Error> {
     match value {
         toml::Value::String(v) => visitor.visit_string(v),
@@ -1332,6 +1333,81 @@ sli = "availability"
         assert!(toml::from_str::<Keys>(text).is_err());
         let err = parse::<Keys>(text).unwrap_err().to_string();
         assert!(err.contains("tuple variant"), "{err}");
+    }
+
+    /// A newtype or struct variant has a payload, and a key has none.
+    #[test]
+    fn a_map_key_is_not_a_newtype_or_struct_variant() {
+        #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+        #[serde(rename_all = "lowercase")]
+        #[allow(dead_code, reason = "only the error is read")]
+        enum Payload {
+            Count(u8),
+            Window { size: u32 },
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only the error is read")]
+        struct Keys {
+            modes: BTreeMap<Payload, u8>,
+        }
+        for (text, expected) in [
+            ("[modes]\ncount = 1\n", "newtype variant"),
+            ("[modes]\nwindow = 1\n", "struct variant"),
+        ] {
+            assert!(toml::from_str::<Keys>(text).is_err(), "{text}");
+            let err = parse::<Keys>(text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+            assert!(err.contains("in `modes`"), "{err}");
+        }
+    }
+
+    /// A key reads through a newtype struct, as in toml.
+    #[test]
+    fn a_map_key_reads_through_a_newtype_struct() {
+        #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+        struct Port(u16);
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Keys {
+            ports: BTreeMap<Port, String>,
+        }
+        let text = "[ports]\n8080 = \"web\"\n";
+        let expected: Keys = toml::from_str(text).expect("toml reads the key");
+        let actual: Keys = parse(text).expect("the config path reads the key");
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.ports.get(&Port(8080)).map(String::as_str),
+            Some("web")
+        );
+    }
+
+    /// Each integer width reads a key from its text, as in toml.
+    #[test]
+    fn each_integer_width_reads_a_map_key() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Keys<K: Ord> {
+            keys: BTreeMap<K, u8>,
+        }
+        fn reads<K>(width: &str)
+        where
+            K: serde::de::DeserializeOwned + Ord + std::fmt::Debug + TryFrom<u8>,
+        {
+            let text = "[keys]\n7 = 1\n";
+            let expected: Keys<K> = toml::from_str(text).expect(width);
+            let actual: Keys<K> = parse(text).expect(width);
+            assert_eq!(actual, expected, "{width}");
+            let seven = K::try_from(7).ok().expect(width);
+            assert_eq!(actual.keys.get(&seven), Some(&1), "{width}");
+        }
+        reads::<i8>("i8");
+        reads::<i16>("i16");
+        reads::<i32>("i32");
+        reads::<i64>("i64");
+        reads::<i128>("i128");
+        reads::<u8>("u8");
+        reads::<u16>("u16");
+        reads::<u32>("u32");
+        reads::<u64>("u64");
+        reads::<u128>("u128");
     }
 
     /// The schema walk feeds placeholders for every shape and does not stop.
