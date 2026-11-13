@@ -1685,8 +1685,11 @@ See `docs/guide/system-tests.md`.
 
 ```toml
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "error-reporting"]
-ws = ["dep:tokio-stream"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "error-reporting", "plugin-conformance", "runtime-config", "axum-ws"]
+axum-ws = ["axum/ws"]            # axum's WebSocket extractor (in `default`)
+ws = ["axum-ws", "dep:tokio-stream"]
+plugin-conformance = []          # `plugin_conformance` harness (in `default`)
+runtime-config = []              # `runtime_config` store (in `default`)
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
@@ -1788,7 +1791,7 @@ Guide: `docs/guide/constela.md`.
 ## Workspace dependency versions
 
 ```toml
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
 tokio-util = "0.7"
 diesel = { version = "2", features = ["sqlite", "postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }

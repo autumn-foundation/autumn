@@ -104,7 +104,8 @@ starts. Each sample then:
    computes p50/p95/max.
 
 The cold-start report carries the **same environment metadata** as the warm
-report (`timestamp_utc`, `runner_os`, `rust_version`, `autumn_version`) and, like
+report (`timestamp_utc`, `runner_os`, `cpu_count`, `cpu_model`, `rust_version`,
+`autumn_version`) and, like
 it, never includes local absolute paths, usernames, or secrets.
 
 ### Running the cold-start benchmark
@@ -217,11 +218,29 @@ and 75.8-76.9 s on another. The last scheduled run before it measured
 101.2 s, 89.3 s and 90.0 s. The budget is now p95 100 s / max 120 s: p95 is
 30% above the slowest of the ten samples.
 
-The original 60 s / 90 s target is met on the faster runner and not on the
-slower one. To meet it on each runner, the build needs less code in
+ADR 0049 cut the cold `hello` build on the test box from 74.3 s to 71.6 s
+(medians of 6 interleaved pairs, in a later and slower session than the
+ADR 0046 samples):
+
+1. The config reader compiles less code for each config type. With step 2,
+   `autumn-web` has 13% less LLVM IR.
+2. Three more default-on features: `plugin-conformance`, `runtime-config`
+   and `axum-ws`. The daemon starter turns them off, and does not compile
+   the WebSocket stack.
+
+The report now has `cpu_count` and `cpu_model`, so a run shows which CPU
+made its samples. Manual CI runs of 5 samples on that tree measured
+58.0-60.9 s on an `AMD EPYC 9V74` runner and 76.2-78.0 s on an
+`AMD EPYC 7763` runner. Two runs on trunk, on the same base commit, measured
+62.0-65.0 s and 64.4-66.9 s. The trunk report has no CPU field. The
+50.4-52.8 s group of the ADR 0046 runs did not appear again, and its CPU is
+not known. The budget did not change.
+
+The original 60 s / 90 s target is 1 s away on the `AMD EPYC 9V74` runner
+(p95 60.9 s). The `AMD EPYC 7763` runner needs about 18 s more (p95 78.0 s). To meet it on each runner, the build needs less code in
 `autumn-web` and a shorter single-core phase: a split of `autumn-web` into
-crates that compile in parallel (issue #2795, ADR 0046 "Roadmap"). The work
-of today's build packs into about 48 s on four cores of the test box at
+crates that compile in parallel (issue #2795, ADR 0049 "Roadmap"). The work
+of today's build packs into about 45 s on four cores of the test box at
 best.
 
 ---
@@ -296,6 +315,8 @@ local paths or secrets:
 |---|---|
 | `timestamp_utc` | ISO 8601 UTC timestamp of the measurement run |
 | `runner_os` | Operating system identifier (`linux`, `macos`, `windows`) |
+| `cpu_count` | Logical CPU cores that the benchmark can use (latency and cold-start reports) |
+| `cpu_model` | CPU model name. Only Linux on x86 gives one. Two runners of one kind can have different CPUs |
 | `rust_version` | `rustc` version used for the compile steps |
 | `autumn_version` | `autumn-web` crate version |
 | `example_name` | Which example was benchmarked |
@@ -375,6 +396,8 @@ evidence. Example structure:
 {
   "timestamp_utc": "2026-05-26T12:00:00Z",
   "runner_os": "linux",
+  "cpu_count": 4,
+  "cpu_model": "AMD EPYC 7763 64-Core Processor",
   "rust_version": "rustc 1.88.0 (stable)",
   "autumn_version": "0.5.0",
   "example_name": "examples/hello",

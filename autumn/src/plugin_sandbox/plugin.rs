@@ -1821,6 +1821,7 @@ sha256 = "{digest}"
         assert_eq!(sandboxed[1].method, "HEAD");
     }
 
+    #[cfg(feature = "plugin-conformance")]
     #[test]
     fn a_mounted_sandboxed_plugin_passes_the_conformance_checks() {
         let builder = crate::app::app().plugin(hello_plugin());

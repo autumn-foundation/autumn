@@ -248,6 +248,8 @@ Use this to connect your own carbon or price feed.
 
 ### Set it without a redeploy
 
+This needs the `runtime-config` Cargo feature. It is in `default`.
+
 1. Declare the framework key in your runtime-config registry:
 
    ```rust

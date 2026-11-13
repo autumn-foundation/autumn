@@ -53,6 +53,14 @@ impl Error {
         self
     }
 
+    /// Add the key of a table entry. The schema walk has no key to add.
+    fn at_key(self, key: Option<String>) -> Self {
+        match key {
+            Some(key) => self.at(Segment::Key(key)),
+            None => self,
+        }
+    }
+
     fn path(&self) -> String {
         let mut out = String::new();
         for segment in self.path.iter().rev() {
@@ -112,24 +120,136 @@ pub(super) enum ConfigDe {
     Schema(SchemaDeserializer),
 }
 
-impl ConfigDe {
-    fn key(key: &str) -> Self {
-        Self::Value(toml::Value::String(key.to_owned()))
+/// A table key or a variant name.
+///
+/// As in toml: the key is a string, or a bool, integer or char parsed from
+/// its text. A key has its own small deserializer, so a field visitor does
+/// not compile the code that reads tables, arrays and numbers.
+struct KeyDe<'a>(&'a str);
+
+/// One `deserialize_*` method of [`KeyDe`]: parse the key text as `$ty`.
+macro_rules! parsed_key {
+    ($($method:ident => $visit:ident($ty:ty);)*) => {$(
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+            let key: $ty = self.0.parse().map_err(de::Error::custom)?;
+            visitor.$visit(key)
+        }
+    )*};
+}
+
+impl<'de> de::Deserializer<'de> for KeyDe<'_> {
+    type Error = Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        visitor.visit_str(self.0)
+    }
+
+    parsed_key! {
+        deserialize_bool => visit_bool(bool);
+        deserialize_i8 => visit_i8(i8);
+        deserialize_i16 => visit_i16(i16);
+        deserialize_i32 => visit_i32(i32);
+        deserialize_i64 => visit_i64(i64);
+        deserialize_i128 => visit_i128(i128);
+        deserialize_u8 => visit_u8(u8);
+        deserialize_u16 => visit_u16(u16);
+        deserialize_u32 => visit_u32(u32);
+        deserialize_u64 => visit_u64(u64);
+        deserialize_u128 => visit_u128(u128);
+        deserialize_char => visit_char(char);
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        visitor.visit_enum(self)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    serde::forward_to_deserialize_any! {
+        f32 f64 str string seq bytes byte_buf map option unit ignored_any
+        unit_struct tuple_struct tuple identifier struct
     }
 }
 
-/// Read a value. Every type hint comes here, as in toml: the value decides.
+/// A key names a unit variant. It has no payload.
+impl<'de> EnumAccess<'de> for KeyDe<'_> {
+    type Error = Error;
+    type Variant = UnitOnly;
+
+    fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, UnitOnly), Error> {
+        seed.deserialize(self).map(|name| (name, UnitOnly))
+    }
+}
+
+/// The payload of a variant that a key names: none.
+struct UnitOnly;
+
+impl<'de> VariantAccess<'de> for UnitOnly {
+    type Error = Error;
+
+    fn unit_variant(self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, _seed: T) -> Result<T::Value, Error> {
+        Err(de::Error::invalid_type(
+            de::Unexpected::UnitVariant,
+            &"newtype variant",
+        ))
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(self, _len: usize, _visitor: V) -> Result<V::Value, Error> {
+        Err(de::Error::invalid_type(
+            de::Unexpected::UnitVariant,
+            &"tuple variant",
+        ))
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Error> {
+        Err(de::Error::invalid_type(
+            de::Unexpected::UnitVariant,
+            &"struct variant",
+        ))
+    }
+}
+
+/// Record the fields of the struct at the walk's path.
+///
+/// Not generic: each `deserialize_struct` copy calls this one function.
+fn record_fields(walk: &SchemaDeserializer, fields: &'static [&'static str]) {
+    walk.schema
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            walk.path.join("."),
+            fields.iter().map(|&s| s.to_owned()).collect(),
+        );
+}
+
+/// Read a value. The scalar, sequence and map hints come here, as in toml:
+/// the value decides. A struct hint does not: see `ConfigDe::struct_entries`.
 fn read_value<'de, V: Visitor<'de>>(value: toml::Value, visitor: V) -> Result<V::Value, Error> {
     match value {
         toml::Value::String(v) => visitor.visit_string(v),
         toml::Value::Integer(v) => visitor.visit_i64(v),
         toml::Value::Float(v) => visitor.visit_f64(v),
         toml::Value::Boolean(v) => visitor.visit_bool(v),
-        toml::Value::Datetime(v) => {
-            let mut table = toml::Table::new();
-            table.insert(DATETIME_KEY.to_owned(), toml::Value::String(v.to_string()));
-            visitor.visit_map(&mut Entries::table(table))
-        }
+        toml::Value::Datetime(v) => visitor.visit_map(&mut Entries::datetime(&v)),
         // As in toml, a visitor can stop before the last item.
         toml::Value::Array(v) => visitor.visit_seq(&mut Items::Array {
             iter: v.into_iter(),
@@ -291,18 +411,9 @@ impl<'de> de::Deserializer<'de> for ConfigDe {
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        match self {
-            Self::Value(value) => read_value(value, visitor),
-            Self::Schema(walk) => {
-                walk.schema
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(
-                        walk.path.join("."),
-                        fields.iter().map(|&s| s.to_owned()).collect(),
-                    );
-                visitor.visit_map(&mut Entries::fields(fields, walk))
-            }
+        match self.struct_entries(fields) {
+            Ok(mut entries) => visitor.visit_map(&mut entries),
+            Err(value) => Err(de::Error::invalid_type(unexpected(&value), &visitor)),
         }
     }
 
@@ -312,15 +423,46 @@ impl<'de> de::Deserializer<'de> for ConfigDe {
         variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
+        visitor.visit_enum(self.variant(variants)?)
+    }
+
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        drop(self);
+        visitor.visit_unit()
+    }
+}
+
+impl ConfigDe {
+    /// The entries of a struct, or the value that is not a struct.
+    ///
+    /// A struct is a table. A datetime is a one-entry table, as for
+    /// `toml::value::Datetime`. An array or a scalar is not a struct: the
+    /// visitor then needs no code for them.
+    ///
+    /// Not generic: each `deserialize_struct` copy calls this one function.
+    fn struct_entries(self, fields: &'static [&'static str]) -> Result<Entries, toml::Value> {
         match self {
-            Self::Value(toml::Value::String(name)) => {
-                visitor.visit_enum(Variant::Value { name, value: None })
+            Self::Value(toml::Value::Table(table)) => Ok(Entries::table(table)),
+            Self::Value(toml::Value::Datetime(datetime)) => Ok(Entries::datetime(&datetime)),
+            Self::Value(value) => Err(value),
+            Self::Schema(walk) => {
+                record_fields(&walk, fields);
+                Ok(Entries::fields(fields, walk))
             }
+        }
+    }
+
+    /// The variant of an enum: a string, or a table with exactly one entry.
+    ///
+    /// Not generic: each `deserialize_enum` copy calls this one function.
+    fn variant(self, variants: &'static [&'static str]) -> Result<Variant, Error> {
+        match self {
+            Self::Value(toml::Value::String(name)) => Ok(Variant::Value { name, value: None }),
             Self::Value(toml::Value::Table(table)) => {
                 let len = table.len();
                 let mut entries = table.into_iter();
                 match (entries.next(), entries.next()) {
-                    (Some((name, value)), None) => visitor.visit_enum(Variant::Value {
+                    (Some((name, value)), None) => Ok(Variant::Value {
                         name,
                         value: Some(value),
                     }),
@@ -336,15 +478,10 @@ impl<'de> de::Deserializer<'de> for ConfigDe {
             // The first real variant name. An empty name is an unknown
             // variant, and that error stops the walk for every later
             // section. The walk does not go into the variant.
-            Self::Schema(_) => visitor.visit_enum(Variant::Schema(
+            Self::Schema(_) => Ok(Variant::Schema(
                 variants.first().copied().unwrap_or_default(),
             )),
         }
-    }
-
-    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        drop(self);
-        visitor.visit_unit()
     }
 }
 
@@ -370,11 +507,64 @@ impl Entries {
         }
     }
 
+    /// A datetime as the one-entry table that toml uses for it.
+    fn datetime(datetime: &toml::value::Datetime) -> Self {
+        let mut table = toml::Table::new();
+        table.insert(
+            DATETIME_KEY.to_owned(),
+            toml::Value::String(datetime.to_string()),
+        );
+        Self::table(table)
+    }
+
     fn fields(fields: &'static [&'static str], walk: SchemaDeserializer) -> Self {
         Self::Fields {
             fields: fields.iter(),
             current: None,
             walk,
+        }
+    }
+
+    /// Go to the next entry and give its key.
+    ///
+    /// Not generic, as `step_value`: each `MapAccess` copy calls these.
+    fn step_key(&mut self) -> Option<&str> {
+        match self {
+            Self::Table { iter, value } => {
+                *value = iter.next();
+                value.as_ref().map(|(key, _)| key.as_str())
+            }
+            Self::Fields {
+                fields, current, ..
+            } => {
+                *current = fields.next().copied();
+                *current
+            }
+        }
+    }
+
+    /// Take the value of the current entry. A table entry also gives its
+    /// key, for the path of an error.
+    fn step_value(&mut self) -> Result<(ConfigDe, Option<String>), Error> {
+        match self {
+            Self::Table { value, .. } => {
+                let Some((key, next)) = value.take() else {
+                    return Err(de::Error::custom("value is missing"));
+                };
+                Ok((ConfigDe::Value(next), Some(key)))
+            }
+            Self::Fields { current, walk, .. } => {
+                let Some(field) = current.take() else {
+                    return Err(de::Error::custom("value is missing"));
+                };
+                let mut path = walk.path.clone();
+                path.push(field.to_owned());
+                let walk = SchemaDeserializer {
+                    path,
+                    ..walk.clone()
+                };
+                Ok((ConfigDe::Schema(walk), None))
+            }
         }
     }
 }
@@ -386,50 +576,15 @@ impl<'de> MapAccess<'de> for Entries {
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, Error> {
-        match self {
-            Self::Table { iter, value } => {
-                let Some((key, next)) = iter.next() else {
-                    return Ok(None);
-                };
-                // A key error names the key itself, so the path stops at the
-                // table.
-                let out = seed.deserialize(ConfigDe::key(&key))?;
-                *value = Some((key, next));
-                Ok(Some(out))
-            }
-            Self::Fields {
-                fields, current, ..
-            } => {
-                let Some(&field) = fields.next() else {
-                    return Ok(None);
-                };
-                *current = Some(field);
-                seed.deserialize(ConfigDe::key(field)).map(Some)
-            }
-        }
+        // A key error names the key itself, so the path stops at the table.
+        self.step_key()
+            .map(|key| seed.deserialize(KeyDe(key)))
+            .transpose()
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
-        match self {
-            Self::Table { value, .. } => {
-                let Some((key, next)) = value.take() else {
-                    return Err(de::Error::custom("value is missing"));
-                };
-                seed.deserialize(ConfigDe::Value(next))
-                    .map_err(|e| e.at(Segment::Key(key)))
-            }
-            Self::Fields { current, walk, .. } => {
-                let Some(field) = current.take() else {
-                    return Err(de::Error::custom("value is missing"));
-                };
-                let mut path = walk.path.clone();
-                path.push(field.to_owned());
-                seed.deserialize(ConfigDe::Schema(SchemaDeserializer {
-                    path,
-                    ..walk.clone()
-                }))
-            }
-        }
+        let (value, key) = self.step_value()?;
+        seed.deserialize(value).map_err(|e| e.at_key(key))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -503,10 +658,7 @@ impl<'de> EnumAccess<'de> for Variant {
     type Variant = Self;
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self), Error> {
-        let name = match &self {
-            Self::Value { name, .. } => seed.deserialize(ConfigDe::key(name))?,
-            Self::Schema(name) => seed.deserialize(ConfigDe::key(name))?,
-        };
+        let name = seed.deserialize(KeyDe(self.name()))?;
         Ok((name, self))
     }
 }
@@ -532,20 +684,8 @@ impl<'de> VariantAccess<'de> for Variant {
     }
 
     fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
-        match self {
-            Self::Value {
-                name,
-                value: Some(value),
-            } => seed
-                .deserialize(ConfigDe::Value(value))
-                .map_err(|e| e.at(Segment::Key(name))),
-            Self::Value { value: None, .. } => Err(de::Error::invalid_type(
-                de::Unexpected::UnitVariant,
-                &"newtype variant",
-            )),
-            // A fresh walk: the payload's fields are not recorded.
-            Self::Schema(_) => seed.deserialize(ConfigDe::Schema(SchemaDeserializer::new())),
-        }
+        let (payload, name) = self.newtype_payload()?;
+        seed.deserialize(payload).map_err(|e| e.at_key(name))
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
@@ -562,6 +702,32 @@ impl<'de> VariantAccess<'de> for Variant {
 }
 
 impl Variant {
+    fn name(&self) -> &str {
+        match self {
+            Self::Value { name, .. } => name,
+            Self::Schema(name) => name,
+        }
+    }
+
+    /// The payload of a newtype variant. A real variant also gives its
+    /// name, for the path of an error.
+    ///
+    /// Not generic: each `newtype_variant_seed` copy calls this one function.
+    fn newtype_payload(self) -> Result<(ConfigDe, Option<String>), Error> {
+        match self {
+            Self::Value {
+                name,
+                value: Some(value),
+            } => Ok((ConfigDe::Value(value), Some(name))),
+            Self::Value { value: None, .. } => Err(de::Error::invalid_type(
+                de::Unexpected::UnitVariant,
+                &"newtype variant",
+            )),
+            // A fresh walk: the payload's fields are not recorded.
+            Self::Schema(_) => Ok((ConfigDe::Schema(SchemaDeserializer::new()), None)),
+        }
+    }
+
     /// Read a tuple or struct variant. A struct variant refuses a key that
     /// is not one of its `fields`, as toml does.
     fn compound_variant<'de, V: Visitor<'de>>(
@@ -1041,7 +1207,7 @@ sli = "availability"
         assert!(scalar.unwrap_err().to_string().contains("in `c.window`"));
     }
 
-    #[derive(Debug, Deserialize, PartialEq)]
+    #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
     #[serde(rename_all = "snake_case")]
     enum Shape {
         Pair(u8, u8),
@@ -1088,6 +1254,160 @@ sli = "availability"
         assert_eq!(s.pair, (1, 2));
         let marker = Marker::deserialize(super::ConfigDe::Value(toml::Value::Boolean(true)));
         assert!(marker.is_err());
+    }
+
+    /// A struct is a table. toml also reads a struct from an array, one item
+    /// for each field in order. No config file is written that way, and the
+    /// code for it is one function for each config struct. This path refuses
+    /// the array.
+    #[test]
+    fn a_struct_is_a_table_and_not_an_array() {
+        let text = "server = [8080, \"0.0.0.0\"]\n";
+        assert!(toml::from_str::<Root>(text).is_ok(), "toml reads the array");
+        let err = parse::<Root>(text).unwrap_err().to_string();
+        assert!(
+            err.contains("invalid type: sequence, expected struct Server"),
+            "{err}"
+        );
+        assert!(err.contains("in `server`"), "{err}");
+    }
+
+    /// A scalar where a table must be gives the same error as before.
+    #[test]
+    fn a_struct_from_a_scalar_names_both_types() {
+        let err = parse::<Root>("server = \"x\"\n").unwrap_err().to_string();
+        assert!(
+            err.contains("invalid type: string \"x\", expected struct Server"),
+            "{err}"
+        );
+        assert!(err.contains("in `server`"), "{err}");
+    }
+
+    /// toml parses a bool, integer or char map key from its text. So does this
+    /// path.
+    #[test]
+    fn map_keys_parse_as_in_toml() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Keys {
+            ports: BTreeMap<u16, String>,
+            flags: BTreeMap<bool, u8>,
+            marks: BTreeMap<char, u8>,
+            modes: BTreeMap<Shape, u8>,
+            signed: BTreeMap<i64, u8>,
+        }
+        let text = "[ports]\n8080 = \"web\"\n[flags]\ntrue = 1\n[marks]\nx = 2\n\
+                    [modes]\ndot = 3\n[signed]\n-4 = 5\n";
+        let expected: Keys = toml::from_str(text).expect("toml reads the keys");
+        let actual: Keys = parse(text).expect("the config path reads the keys");
+        assert_eq!(actual, expected);
+        assert_eq!(actual.ports.get(&8080).map(String::as_str), Some("web"));
+    }
+
+    /// A key that is not a value of the key type is an error in toml and here.
+    /// The error names the table, as for an unknown field.
+    #[test]
+    fn a_bad_map_key_is_an_error_that_names_its_table() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only the error is read")]
+        struct Keys {
+            ports: BTreeMap<u16, String>,
+        }
+        let text = "[ports]\nhttp = \"web\"\n";
+        assert!(toml::from_str::<Keys>(text).is_err());
+        let err = parse::<Keys>(text).unwrap_err().to_string();
+        assert!(err.contains("in `ports`"), "{err}");
+        let too_large = "[ports]\n70000 = \"web\"\n";
+        assert!(toml::from_str::<Keys>(too_large).is_err());
+        assert!(parse::<Keys>(too_large).is_err());
+    }
+
+    /// A map key is not a variant with a payload.
+    #[test]
+    fn a_map_key_is_a_unit_variant_only() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only the error is read")]
+        struct Keys {
+            modes: BTreeMap<Shape, u8>,
+        }
+        let text = "[modes]\npair = 1\n";
+        assert!(toml::from_str::<Keys>(text).is_err());
+        let err = parse::<Keys>(text).unwrap_err().to_string();
+        assert!(err.contains("tuple variant"), "{err}");
+    }
+
+    /// A newtype or struct variant has a payload, and a key has none.
+    #[test]
+    fn a_map_key_is_not_a_newtype_or_struct_variant() {
+        #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+        #[serde(rename_all = "lowercase")]
+        #[allow(dead_code, reason = "only the error is read")]
+        enum Payload {
+            Count(u8),
+            Window { size: u32 },
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only the error is read")]
+        struct Keys {
+            modes: BTreeMap<Payload, u8>,
+        }
+        for (text, expected) in [
+            ("[modes]\ncount = 1\n", "newtype variant"),
+            ("[modes]\nwindow = 1\n", "struct variant"),
+        ] {
+            assert!(toml::from_str::<Keys>(text).is_err(), "{text}");
+            let err = parse::<Keys>(text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+            assert!(err.contains("in `modes`"), "{err}");
+        }
+    }
+
+    /// A key reads through a newtype struct, as in toml.
+    #[test]
+    fn a_map_key_reads_through_a_newtype_struct() {
+        #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+        struct Port(u16);
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Keys {
+            ports: BTreeMap<Port, String>,
+        }
+        let text = "[ports]\n8080 = \"web\"\n";
+        let expected: Keys = toml::from_str(text).expect("toml reads the key");
+        let actual: Keys = parse(text).expect("the config path reads the key");
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.ports.get(&Port(8080)).map(String::as_str),
+            Some("web")
+        );
+    }
+
+    /// Each integer width reads a key from its text, as in toml.
+    #[test]
+    fn each_integer_width_reads_a_map_key() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Keys<K: Ord> {
+            keys: BTreeMap<K, u8>,
+        }
+        fn reads<K>(width: &str)
+        where
+            K: serde::de::DeserializeOwned + Ord + std::fmt::Debug + TryFrom<u8>,
+        {
+            let text = "[keys]\n7 = 1\n";
+            let expected: Keys<K> = toml::from_str(text).expect(width);
+            let actual: Keys<K> = parse(text).expect(width);
+            assert_eq!(actual, expected, "{width}");
+            let seven = K::try_from(7).ok().expect(width);
+            assert_eq!(actual.keys.get(&seven), Some(&1), "{width}");
+        }
+        reads::<i8>("i8");
+        reads::<i16>("i16");
+        reads::<i32>("i32");
+        reads::<i64>("i64");
+        reads::<i128>("i128");
+        reads::<u8>("u8");
+        reads::<u16>("u16");
+        reads::<u32>("u32");
+        reads::<u64>("u64");
+        reads::<u128>("u128");
     }
 
     /// The schema walk feeds placeholders for every shape and does not stop.
@@ -1162,32 +1482,35 @@ sli = "availability"
         }
     }
 
-    /// `toml::from_str` into a config struct brings back the copies this
-    /// module removes. Outside tests, config code parses text only into
-    /// `toml::Table` or `toml::Value`.
+    /// `toml::from_str` into a struct brings back the copies this module
+    /// removes. Outside tests, config and capacity code parses text only
+    /// into `toml::Table` or `toml::Value`.
     #[test]
     fn config_code_parses_text_only_into_raw_toml() {
-        // A Windows checkout can have CRLF line ends.
-        let src = include_str!("../config.rs").replace("\r\n", "\n");
-        let body = src
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("source");
-        assert!(
-            body.len() < src.len(),
-            "config.rs has no test module marker"
-        );
-        for (number, line) in body.lines().enumerate() {
-            let Some(at) = line.find("toml::from_str") else {
-                continue;
-            };
-            let rest = &line[at + "toml::from_str".len()..];
-            assert!(
-                rest.starts_with("::<toml::Table>(") || rest.starts_with("::<toml::Value>("),
-                "config.rs:{}: name the raw toml type: {}",
-                number + 1,
-                line.trim()
-            );
+        let sources = [
+            ("config.rs", include_str!("../config.rs")),
+            ("capacity.rs", include_str!("../capacity.rs")),
+        ];
+        for (file, src) in sources {
+            // A Windows checkout can have CRLF line ends.
+            let src = src.replace("\r\n", "\n");
+            let body = src
+                .split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .expect("source");
+            assert!(body.len() < src.len(), "{file} has no test module marker");
+            for (number, line) in body.lines().enumerate() {
+                let Some(at) = line.find("toml::from_str") else {
+                    continue;
+                };
+                let rest = &line[at + "toml::from_str".len()..];
+                assert!(
+                    rest.starts_with("::<toml::Table>(") || rest.starts_with("::<toml::Value>("),
+                    "{file}:{}: name the raw toml type: {}",
+                    number + 1,
+                    line.trim()
+                );
+            }
         }
     }
 }
