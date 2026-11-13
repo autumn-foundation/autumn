@@ -454,6 +454,30 @@ const CASES: &[(&str, i32, bool, &str)] = &[
         false,
         "required fields: the removed number is reserved, and proto3 has no required",
     ),
+    (
+        "nested_optional_read_field_removed",
+        3,
+        false,
+        "read-sets: the removed number is reserved, and buf cannot see that a caller reads it",
+    ),
+    (
+        "nested_optional_field_read_by_new_caller",
+        3,
+        false,
+        "read-sets: a new caller reads a field that the deployed callee does not send yet",
+    ),
+    (
+        "nested_request_field_dropped",
+        3,
+        false,
+        "write-sets: the removed number is reserved, and buf cannot see that a caller sets it",
+    ),
+    (
+        "nested_event_field_removed",
+        3,
+        false,
+        "read-sets: the removed number is reserved, and buf cannot see that a consumer reads it",
+    ),
     ("unit_to_empty_object", 1, true, ""),
     (
         "user_no_body_response",

@@ -1,10 +1,10 @@
 //! Event consumers: `#[listener]` and `#[event_consumer]`.
 //!
 //! A consumer reads fields off an event payload. Its *read-set* is every
-//! field it names. Each read becomes a const assertion against the event's own
-//! field table, [`Event::SHAPE`]. A read of a field the event does not send
-//! fails the build, and the message names the consumer, the event and the
-//! field.
+//! field it names. A nested field is a dotted path: `details.color`. Each
+//! top-level read becomes a const assertion against the event's own field
+//! table, [`Event::SHAPE`]. A read of a field the event does not send fails
+//! the build, and the message names the consumer, the event and the field.
 //!
 //! The read-set also goes into a `listener.*.json` descriptor, so the
 //! cross-release check knows what each deployed consumer reads.
@@ -38,24 +38,30 @@ pub fn with_checks(func: &ItemFn, event: &Path, reads: &PayloadReads) -> ItemFn 
 pub fn consumer_checks(func: &ItemFn, event: &Path, reads: &PayloadReads) -> TokenStream {
     let function = func.sig.ident.to_string();
     let event_text = path_text(event);
-    let assertions = reads.reads.iter().map(|(field, span)| {
-        let message = escape_for_assert(&format!(
-            "event contract broken in `{function}`: reads field `{field}` of event \
-             `{event_text}`, which the event does not send"
-        ));
-        let span = *span;
-        let field = LitStr::new(field, span);
-        let message = LitStr::new(&message, span);
-        quote_spanned! { span =>
-            const _: () = ::core::assert!(
-                ::autumn_web::wire::event_delivers(
-                    <#event as ::autumn_web::events::Event>::SHAPE,
-                    #field,
-                ),
-                #message
-            );
-        }
-    });
+    // A nested type is shared by producer and consumer in one build, so rustc
+    // checks a nested field. Only a top-level field needs an assertion.
+    let assertions = reads
+        .reads
+        .iter()
+        .filter(|(field, _)| !field.contains('.'))
+        .map(|(field, span)| {
+            let message = escape_for_assert(&format!(
+                "event contract broken in `{function}`: reads field `{field}` of event \
+                 `{event_text}`, which the event does not send"
+            ));
+            let span = *span;
+            let field = LitStr::new(field, span);
+            let message = LitStr::new(&message, span);
+            quote_spanned! { span =>
+                const _: () = ::core::assert!(
+                    ::autumn_web::wire::event_delivers(
+                        <#event as ::autumn_web::events::Event>::SHAPE,
+                        #field,
+                    ),
+                    #message
+                );
+            }
+        });
     let written = store::contract_dir().map_or_else(TokenStream::new, |dir| {
         let descriptor = ListenerDescriptor {
             krate: std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
@@ -178,6 +184,30 @@ mod tests {
             ),
             ["email"]
         );
+    }
+
+    #[test]
+    fn a_nested_payload_read_is_a_dotted_path() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 let _ = event.details.color; \
+                 tracing::info!(\"{}\", event.address.city); Ok(()) }"
+            ),
+            ["address", "address.city", "details", "details.color"]
+        );
+    }
+
+    #[test]
+    fn a_consumer_asserts_only_top_level_fields() {
+        let func: ItemFn = syn::parse_str(
+            "async fn on(s: AppState, event: ContactUpdated) -> R { let _ = event.details.color; Ok(()) }",
+        )
+        .expect("fixture parses");
+        let reads = listener_reads(&func, &path("ContactUpdated"));
+        let out = consumer_checks(&func, &path("ContactUpdated"), &reads).to_string();
+        assert!(out.contains("\"details\""), "{out}");
+        assert!(!out.contains("\"details.color\""), "{out}");
     }
 
     #[test]

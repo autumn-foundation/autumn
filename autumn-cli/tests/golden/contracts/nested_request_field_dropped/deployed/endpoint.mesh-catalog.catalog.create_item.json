@@ -1,0 +1,14 @@
+{
+  "service": "catalog",
+  "name": "create_item",
+  "endpoint_ident": "create_item_endpoint",
+  "krate": "mesh-catalog",
+  "method": "POST",
+  "path": "/items",
+  "request_type": "NewItem",
+  "response_type": "Item",
+  "has_body": true,
+  "request_list": false,
+  "response_list": false,
+  "handler": "create_item"
+}

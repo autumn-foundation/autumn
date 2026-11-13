@@ -8,6 +8,10 @@
 //!   itself (`…await?.name`);
 //! * the **write-set** — every request field an inline struct literal sets.
 //!
+//! A nested field is a dotted path, `details.color`, and each prefix is in
+//! the set too. The const assertions use the top-level fields only: one
+//! build shares the nested types, so rustc checks a nested field itself.
+//!
 //! Each set becomes a const assertion against the callee's own const field
 //! table, so the check is a cross-crate compile-time fact rather than a
 //! snapshot: rustc rebuilds the caller whenever the callee's table changes.
@@ -183,14 +187,14 @@ struct Call {
     method: Ident,
     /// Where the call is written.
     span: Span,
-    /// Response fields the caller names.
+    /// Response fields the caller names, as dotted paths.
     reads: Vec<String>,
     /// The span of the first read of each field.
     read_spans: BTreeMap<String, Span>,
     /// In payload mode: whether the walk bound the payload anywhere.
     payload_seen: bool,
-    /// Request fields the caller sets, or `None` when the request is not an
-    /// inline struct literal.
+    /// Request fields the caller sets, as dotted paths, or `None` when the
+    /// request is not an inline struct literal.
     writes: Option<Vec<String>>,
 }
 
@@ -199,12 +203,19 @@ struct Call {
 enum Bound {
     /// One of the declared clients.
     Client(usize),
-    /// The response of call `n`.
-    Response(usize),
+    /// The response of call `n`, or the value at a field path in it. The
+    /// path is an id in [`Analyzer::paths`]; [`ROOT`] is the response itself.
+    Response(usize, usize),
     /// Anything else. Recorded rather than omitted, so a rebinding shadows the
     /// name instead of leaving the old meaning in force.
     Other,
 }
+
+/// The path id of a whole response: no field path.
+const ROOT: usize = 0;
+
+/// The payload of a consumer: the one "response", at its root.
+const PAYLOAD: Bound = Bound::Response(0, ROOT);
 
 /// Methods the generated client owns that are not endpoints.
 const CLIENT_OWN_METHODS: [&str; 6] = ["new", "base_url", "clone", "to_owned", "eq", "fmt"];
@@ -243,7 +254,9 @@ struct Analyzer<'a> {
     scopes: Vec<BTreeMap<String, Bound>>,
     /// Calls in the order they were found.
     calls: Vec<Call>,
-    /// In payload mode, the event type whose bindings are `Response(0)`.
+    /// Field paths in a response, by id. Id [`ROOT`] is the empty path.
+    paths: std::cell::RefCell<Vec<String>>,
+    /// In payload mode, the event type whose bindings are [`PAYLOAD`].
     payload: Option<&'a Path>,
     /// Whether a name was bound to the payload.
     payload_found: std::cell::Cell<bool>,
@@ -314,16 +327,49 @@ impl<'a> Analyzer<'a> {
             clients,
             scopes: vec![BTreeMap::new()],
             calls: Vec::new(),
+            paths: std::cell::RefCell::new(vec![String::new()]),
             payload: None,
             payload_found: std::cell::Cell::new(false),
         }
     }
 
-    /// Record that call `index` has `field` read at `span`.
-    fn read(&mut self, index: usize, field: String, span: Span) {
+    /// Record that call `index` has the field path `path` read at `span`.
+    ///
+    /// Each prefix is a read too: `details.color` also reads `details`. A
+    /// reader that knows only top-level fields still sees `details`.
+    fn read(&mut self, index: usize, path: &str, span: Span) {
         let call = &mut self.calls[index];
-        call.read_spans.entry(field.clone()).or_insert(span);
-        call.reads.push(field);
+        let mut end = 0;
+        for segment in path.split('.') {
+            end += segment.len();
+            let prefix = &path[..end];
+            call.read_spans.entry(prefix.to_owned()).or_insert(span);
+            call.reads.push(prefix.to_owned());
+            end += 1;
+        }
+    }
+
+    /// The id of the path `parent.name`.
+    fn child(&self, parent: usize, name: &str) -> usize {
+        let mut paths = self.paths.borrow_mut();
+        let path = match paths[parent].as_str() {
+            "" => name.to_owned(),
+            prefix => format!("{prefix}.{name}"),
+        };
+        paths.iter().position(|p| *p == path).unwrap_or_else(|| {
+            paths.push(path);
+            paths.len() - 1
+        })
+    }
+
+    /// Record a read of field `name` under the value `bound`, if `bound` is
+    /// in a response.
+    fn read_under(&mut self, bound: Bound, name: &str, span: Span) {
+        if let Bound::Response(index, parent) = bound {
+            let id = self.child(parent, name);
+            let path = self.paths.borrow()[id].clone();
+            self.read(index, &path, span);
+        }
     }
 
     /// Whether `ty` names the payload's event type.
@@ -399,7 +445,7 @@ impl<'a> Analyzer<'a> {
         for (index, arg) in func.sig.inputs.iter().enumerate() {
             if let syn::FnArg::Typed(pat) = arg {
                 let bound = if payload_param == Some(index) || self.is_payload(&pat.ty) {
-                    Bound::Response(0)
+                    PAYLOAD
                 } else {
                     self.client_index(&pat.ty)
                         .map_or(Bound::Other, Bound::Client)
@@ -422,7 +468,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn bind(&mut self, name: String, bound: Bound) {
-        if self.payload.is_some() && bound == Bound::Response(0) {
+        if self.payload.is_some() && bound == PAYLOAD {
             self.payload_found.set(true);
         }
         if let Some(scope) = self.scopes.last_mut() {
@@ -442,7 +488,7 @@ impl<'a> Analyzer<'a> {
                 // `x @ Item { .. }`: the sub-pattern sees the same value.
                 if let Some((_, sub)) = &ident.subpat {
                     let sub_bound = match bound {
-                        Bound::Response(_) => bound,
+                        Bound::Response(..) => bound,
                         _ => Bound::Other,
                     };
                     self.bind_pattern(sub, sub_bound);
@@ -450,7 +496,7 @@ impl<'a> Analyzer<'a> {
             }
             syn::Pat::Type(p) => {
                 let bound = if self.is_payload(&p.ty) {
-                    Bound::Response(0)
+                    PAYLOAD
                 } else {
                     self.client_index(&p.ty).map_or(bound, Bound::Client)
                 };
@@ -461,24 +507,27 @@ impl<'a> Analyzer<'a> {
             syn::Pat::Struct(p) => {
                 // `Item { id, name, .. }` over a response names the fields
                 // it reads. A pattern that names the payload type is the
-                // payload, whatever its value comes from.
+                // payload, whatever its value comes from. Each field's own
+                // pattern holds the value at that field's path, so
+                // `details: Details { color, .. }` reads `details.color`.
                 let bound = if self.is_payload_path(&p.path) {
-                    Bound::Response(0)
+                    PAYLOAD
                 } else {
                     bound
                 };
-                if let Bound::Response(index) = bound {
-                    if self.payload.is_some() && index == 0 {
-                        self.payload_found.set(true);
-                    }
-                    for field in &p.fields {
-                        if let syn::Member::Named(ident) = &field.member {
-                            self.read(index, field_name(ident), ident.span());
-                        }
-                    }
+                if self.payload.is_some() && matches!(bound, Bound::Response(0, _)) {
+                    self.payload_found.set(true);
                 }
                 for field in &p.fields {
-                    self.bind_pattern(&field.pat, Bound::Other);
+                    let inner = match (&field.member, bound) {
+                        (syn::Member::Named(ident), Bound::Response(index, parent)) => {
+                            let name = field_name(ident);
+                            self.read_under(bound, &name, ident.span());
+                            Bound::Response(index, self.child(parent, &name))
+                        }
+                        _ => Bound::Other,
+                    };
+                    self.bind_pattern(&field.pat, inner);
                 }
             }
             syn::Pat::TupleStruct(p) => {
@@ -490,7 +539,7 @@ impl<'a> Analyzer<'a> {
                         .last()
                         .is_some_and(|s| s.ident == "Ok" || s.ident == "Some");
                 let inner = match bound {
-                    Bound::Response(_) if wraps => bound,
+                    Bound::Response(..) if wraps => bound,
                     _ => Bound::Other,
                 };
                 for elem in &p.elems {
@@ -580,7 +629,7 @@ impl<'a> Analyzer<'a> {
     /// What an expression evaluates to, when that is knowable.
     fn bound_of(&self, expr: &Expr) -> Option<Bound> {
         if self.is_payload_turbofish(expr) {
-            return Some(Bound::Response(0));
+            return Some(PAYLOAD);
         }
         let recorded = |call: &syn::ExprMethodCall| {
             let node = std::ptr::from_ref(call);
@@ -593,9 +642,16 @@ impl<'a> Analyzer<'a> {
                 self.calls
                     .iter()
                     .position(|c| c.node == node)
-                    .map(Bound::Response)
+                    .map(|index| Bound::Response(index, ROOT))
             }
-            Expr::Match(m) => self.match_passes_through(m).map(Bound::Response),
+            // `item.details` is the value at path `details` in the response.
+            Expr::Field(field) => match (&field.member, self.bound_of(&field.base)?) {
+                (syn::Member::Named(name), Bound::Response(index, parent)) => Some(
+                    Bound::Response(index, self.child(parent, &field_name(name))),
+                ),
+                _ => None,
+            },
+            Expr::Match(m) => self.match_passes_through(m),
             // `{ m.payload_as::<E>()? }`: a block that is only its tail. A
             // block with more statements can rebind a name the tail uses, so
             // it is not looked into.
@@ -613,8 +669,11 @@ impl<'a> Analyzer<'a> {
     /// the payload: each arm either gives back the value its pattern binds
     /// (`x`, `Ok(x)`, `Some(x)`), or does not finish (`return`, `break`,
     /// `continue`, `panic!`, `unreachable!`, `todo!`).
-    fn match_passes_through(&self, m: &syn::ExprMatch) -> Option<usize> {
-        let index = self.response_of(&m.expr)?;
+    fn match_passes_through(&self, m: &syn::ExprMatch) -> Option<Bound> {
+        let bound = self.response_bound(&m.expr);
+        if bound == Bound::Other {
+            return None;
+        }
         let mut passes = false;
         for arm in &m.arms {
             if diverges(&arm.body) {
@@ -629,15 +688,7 @@ impl<'a> Analyzer<'a> {
             }
             passes = true;
         }
-        passes.then_some(index)
-    }
-
-    /// The call index an expression's response came from.
-    fn response_of(&self, expr: &Expr) -> Option<usize> {
-        match self.bound_of(expr) {
-            Some(Bound::Response(index)) => Some(index),
-            _ => None,
-        }
+        passes.then_some(bound)
     }
 
     /// Record a method call on a client binding as an endpoint call.
@@ -719,14 +770,16 @@ impl<'a> Analyzer<'a> {
         scan_tokens(
             &mac.tokens,
             &|name| match self.lookup(name) {
-                Some(Bound::Response(index)) => Some(index),
+                Some(Bound::Response(index, parent)) => {
+                    Some((index, self.paths.borrow()[parent].clone()))
+                }
                 _ => None,
             },
-            &std::collections::BTreeSet::new(),
+            &MacroScope::new(),
             &mut reads,
         );
-        for (index, field, span) in reads {
-            self.read(index, field, span);
+        for (index, path, span) in reads {
+            self.read(index, &path, span);
         }
     }
 }
@@ -765,7 +818,7 @@ impl Visit<'_> for Analyzer<'_> {
                 let callback = VALUE_CALLBACKS
                     .contains(&call.method.to_string().as_str())
                     .then(|| self.response_bound(&call.receiver))
-                    .filter(|bound| matches!(bound, Bound::Response(_)));
+                    .filter(|bound| matches!(bound, Bound::Response(..)));
                 let last = call.args.len().saturating_sub(1);
                 for (i, arg) in call.args.iter().enumerate() {
                     match (callback, arg) {
@@ -784,10 +837,10 @@ impl Visit<'_> for Analyzer<'_> {
             }
             Expr::Field(field) => {
                 self.visit_expr(&field.base);
-                if let (Some(index), syn::Member::Named(name)) =
-                    (self.response_of(&field.base), &field.member)
+                if let (Some(bound), syn::Member::Named(name)) =
+                    (self.bound_of(&field.base), &field.member)
                 {
-                    self.read(index, field_name(name), name.span());
+                    self.read_under(bound, &field_name(name), name.span());
                 }
             }
             Expr::Closure(closure) => {
@@ -852,7 +905,10 @@ impl Analyzer<'_> {
     /// The bound a scrutinee passes to its pattern: a response stays a
     /// response, anything else is `Other`.
     fn response_bound(&self, expr: &Expr) -> Bound {
-        self.response_of(expr).map_or(Bound::Other, Bound::Response)
+        match self.bound_of(expr) {
+            Some(bound @ Bound::Response(..)) => bound,
+            _ => Bound::Other,
+        }
     }
 
     /// A match arm: the pattern binds `bound`, then the guard and the body run
@@ -997,40 +1053,213 @@ fn strip_refs(ty: &syn::Type) -> &syn::Type {
     }
 }
 
-/// The write-set of a request argument.
+/// The write-set of a request argument, sorted.
 ///
 /// `None` when the request is not an inline struct literal, because then the
-/// fields the call site sets are not visible here.
+/// fields the call site sets are not visible here. A field set to an inline
+/// literal, or to `Some(…)` of one, adds the nested fields as dotted paths:
+/// `details.color`.
 fn request_write_set(arg: Option<&Expr>) -> Option<Vec<String>> {
     let Some(Expr::Struct(lit)) = arg.map(peel) else {
         return None;
     };
-    Some(
-        lit.fields
-            .iter()
-            .filter_map(|f| match &f.member {
-                syn::Member::Named(ident) => Some(field_name(ident)),
-                syn::Member::Unnamed(_) => None,
-            })
-            .collect(),
-    )
+    let mut writes = Vec::new();
+    literal_writes(lit, "", &mut writes);
+    writes.sort();
+    writes.dedup();
+    Some(writes)
 }
+
+/// The struct literal a nested field is set to, through `Some(…)` and the
+/// [`peel`] wrappers.
+fn literal(expr: &Expr) -> Option<&syn::ExprStruct> {
+    match peel(expr) {
+        Expr::Struct(lit) => Some(lit),
+        Expr::Call(call)
+            if call.args.len() == 1
+                && matches!(call.func.as_ref(), Expr::Path(p)
+                    if p.path.segments.last().is_some_and(|s| s.ident == "Some")) =>
+        {
+            literal(&call.args[0])
+        }
+        _ => None,
+    }
+}
+
+/// Push each field `lit` sets, under `prefix`, and the fields of each nested
+/// literal.
+fn literal_writes(lit: &syn::ExprStruct, prefix: &str, out: &mut Vec<String>) {
+    for field in &lit.fields {
+        let syn::Member::Named(ident) = &field.member else {
+            continue;
+        };
+        let path = format!("{prefix}{}", field_name(ident));
+        if let Some(nested) = literal(&field.expr) {
+            literal_writes(nested, &format!("{path}."), out);
+        }
+        out.push(path);
+    }
+}
+
+/// A response value a name holds: the call index and the field path.
+type Held = (usize, String);
+
+/// What each name that a macro body binds holds. `None` shadows the name.
+type MacroScope = BTreeMap<String, Option<Held>>;
 
 /// A name a macro body binds for itself, and the token range it covers.
 ///
 /// A closure's parameters (`|item| …`) cover its body: the tokens up to the
 /// next `,` at the same level, or the end of the group. A `for item in … { }`
-/// binding covers its `{ }` block. Outside that range the name keeps its outer
-/// meaning, so a read of the payload there is still a read.
+/// binding covers its `{ }` block. A maud `@if let` covers its `{ }` block,
+/// and a maud `@let` covers the rest of its level. Outside that range the
+/// name keeps its outer meaning, so a read of the payload there is still a
+/// read.
 struct MacroBinding {
-    names: Vec<String>,
+    names: Vec<(String, Option<Held>)>,
     from: usize,
     to: usize,
 }
 
+/// Methods that give back the value they are called on, for a maud binding:
+/// `@if let Some(d) = item.details.as_ref()`.
+const SAME_VALUE_METHODS: [&str; 5] = ["as_ref", "as_deref", "clone", "unwrap", "to_owned"];
+
+/// The response value that `tts` gives, when it is `&base.a.b` with
+/// optional [`SAME_VALUE_METHODS`] calls.
+fn held_value(
+    tts: &[proc_macro2::TokenTree],
+    lookup: &dyn Fn(&str) -> Option<Held>,
+) -> Option<Held> {
+    let mut i = 0;
+    while matches!(tts.get(i), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '&') {
+        i += 1;
+    }
+    let proc_macro2::TokenTree::Ident(base) = tts.get(i)? else {
+        return None;
+    };
+    let (index, mut path) = lookup(&base.to_string())?;
+    i += 1;
+    while i < tts.len() {
+        let dot = matches!(&tts[i], proc_macro2::TokenTree::Punct(p) if p.as_char() == '.');
+        let proc_macro2::TokenTree::Ident(name) = tts.get(i + 1)? else {
+            return None;
+        };
+        if !dot {
+            return None;
+        }
+        let empty_call = matches!(tts.get(i + 2), Some(proc_macro2::TokenTree::Group(g))
+            if g.delimiter() == proc_macro2::Delimiter::Parenthesis && g.stream().is_empty());
+        if empty_call && SAME_VALUE_METHODS.contains(&name.to_string().as_str()) {
+            i += 3;
+            continue;
+        }
+        if calls_name(tts, i + 2) {
+            return None;
+        }
+        if !path.is_empty() {
+            path.push('.');
+        }
+        path.push_str(&field_name(name));
+        i += 2;
+    }
+    Some((index, path))
+}
+
+/// The names a maud `@if let` pattern binds, and what each holds. Only `x`,
+/// `Some(x)` and `Ok(x)` hold `value`, also with `ref` or `mut`. Any other
+/// pattern shadows its names.
+fn pattern_names(
+    pat: &[proc_macro2::TokenTree],
+    value: Option<Held>,
+) -> Vec<(String, Option<Held>)> {
+    let mode = pat
+        .iter()
+        .take_while(
+            |tt| matches!(tt, proc_macro2::TokenTree::Ident(id) if id == "ref" || id == "mut"),
+        )
+        .count();
+    let pat = &pat[mode..];
+    match pat {
+        [proc_macro2::TokenTree::Ident(x)] => vec![(x.to_string(), value)],
+        [
+            proc_macro2::TokenTree::Ident(wrap),
+            proc_macro2::TokenTree::Group(g),
+        ] if (wrap == "Some" || wrap == "Ok")
+            && g.delimiter() == proc_macro2::Delimiter::Parenthesis =>
+        {
+            let inner: Vec<proc_macro2::TokenTree> = g.stream().into_iter().collect();
+            pattern_names(&inner, value)
+        }
+        _ => {
+            let mut names = Vec::new();
+            for tt in pat {
+                match tt {
+                    proc_macro2::TokenTree::Ident(x) => names.push((x.to_string(), None)),
+                    proc_macro2::TokenTree::Group(g) => {
+                        let inner: Vec<proc_macro2::TokenTree> = g.stream().into_iter().collect();
+                        names.extend(pattern_names(&inner, None));
+                    }
+                    _ => {}
+                }
+            }
+            names
+        }
+    }
+}
+
+/// Whether `tt` is the punctuation `ch`.
+fn is_punct(tt: Option<&proc_macro2::TokenTree>, ch: char) -> bool {
+    matches!(tt, Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ch)
+}
+
+/// The binding of a maud `@let name = value;` or `@if let pat = value { }`
+/// that starts at the `@` at `at`.
+fn maud_binding(
+    tts: &[proc_macro2::TokenTree],
+    at: usize,
+    lookup: &dyn Fn(&str) -> Option<Held>,
+) -> Option<MacroBinding> {
+    let word = |k: usize, w: &str| matches!(tts.get(k), Some(proc_macro2::TokenTree::Ident(id)) if id == w);
+    let lone_eq = |k: usize| {
+        matches!(&tts[k], proc_macro2::TokenTree::Punct(p)
+            if p.as_char() == '=' && p.spacing() == proc_macro2::Spacing::Alone)
+            && !matches!(tts.get(k.wrapping_sub(1)), Some(proc_macro2::TokenTree::Punct(p))
+                if p.spacing() == proc_macro2::Spacing::Joint)
+    };
+    if word(at + 1, "let") {
+        let eq = (at + 2..tts.len()).find(|&k| lone_eq(k))?;
+        let end = (eq + 1..tts.len())
+            .find(|&k| is_punct(tts.get(k), ';'))
+            .unwrap_or(tts.len());
+        let value = held_value(&tts[eq + 1..end], lookup);
+        return Some(MacroBinding {
+            names: pattern_names(&tts[at + 2..eq], value),
+            from: end + 1,
+            to: tts.len(),
+        });
+    }
+    if word(at + 1, "if") && word(at + 2, "let") {
+        let eq = (at + 3..tts.len()).find(|&k| lone_eq(k))?;
+        let body = (eq + 1..tts.len()).find(|&k| {
+            matches!(&tts[k], proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Brace)
+        })?;
+        let value = held_value(&tts[eq + 1..body], lookup);
+        return Some(MacroBinding {
+            names: pattern_names(&tts[at + 3..eq], value),
+            from: body,
+            to: body + 1,
+        });
+    }
+    None
+}
+
 /// The bindings one level of a macro body makes. Nested groups are scanned
-/// on their own.
-fn macro_bindings(tts: &[proc_macro2::TokenTree]) -> Vec<MacroBinding> {
+/// on their own. `lookup` gives what a name outside the binding holds.
+fn macro_bindings(
+    tts: &[proc_macro2::TokenTree],
+    lookup: &dyn Fn(&str) -> Option<Held>,
+) -> Vec<MacroBinding> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < tts.len() {
@@ -1042,7 +1271,7 @@ fn macro_bindings(tts: &[proc_macro2::TokenTree]) -> Vec<MacroBinding> {
                     && !matches!(&tts[j], proc_macro2::TokenTree::Punct(p) if p.as_char() == '|')
                 {
                     if let proc_macro2::TokenTree::Ident(id) = &tts[j] {
-                        names.push(id.to_string());
+                        names.push((id.to_string(), None));
                     }
                     j += 1;
                 }
@@ -1063,10 +1292,25 @@ fn macro_bindings(tts: &[proc_macro2::TokenTree]) -> Vec<MacroBinding> {
                     })
                 {
                     out.push(MacroBinding {
-                        names: vec![name.to_string()],
+                        names: vec![(name.to_string(), None)],
                         from: body,
                         to: body + 1,
                     });
+                }
+                i += 1;
+            }
+            proc_macro2::TokenTree::Punct(p) if p.as_char() == '@' => {
+                // An initializer sees the bindings before it, then the outer
+                // scope.
+                let earlier = |name: &str| {
+                    out.iter()
+                        .rev()
+                        .filter(|b: &&MacroBinding| (b.from..b.to).contains(&i))
+                        .find_map(|b| b.names.iter().find(|(n, _)| n == name))
+                        .map_or_else(|| lookup(name), |(_, held)| held.clone())
+                };
+                if let Some(binding) = maud_binding(tts, i, &earlier) {
+                    out.push(binding);
                 }
                 i += 1;
             }
@@ -1101,24 +1345,55 @@ fn is_operand(token: Option<&proc_macro2::TokenTree>) -> bool {
     }
 }
 
+/// Whether the token after a field name makes it a call, not a field: `(…)`,
+/// `::<T>`, or `!`. The `!` of `!=` is joined to its `=`: that is a
+/// comparison, so the name is a field.
+fn calls_name(tts: &[proc_macro2::TokenTree], next: usize) -> bool {
+    let not_equal = matches!(tts.get(next), Some(proc_macro2::TokenTree::Punct(p))
+        if p.as_char() == '!' && p.spacing() == proc_macro2::Spacing::Joint)
+        && matches!(tts.get(next + 1), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '=');
+    !not_equal
+        && (matches!(
+            tts.get(next),
+            Some(proc_macro2::TokenTree::Group(g))
+                if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+        ) || matches!(tts.get(next), Some(proc_macro2::TokenTree::Punct(p)) if matches!(p.as_char(), ':' | '!')))
+}
+
+/// The field name at `at`, after a `.`, when it is a field and not a call.
+fn field_at(tts: &[proc_macro2::TokenTree], at: usize) -> Option<String> {
+    if !matches!(tts.get(at.checked_sub(1)?)?, proc_macro2::TokenTree::Punct(p) if p.as_char() == '.')
+    {
+        return None;
+    }
+    let proc_macro2::TokenTree::Ident(field) = tts.get(at)? else {
+        return None;
+    };
+    (field != "await" && !calls_name(tts, at + 1)).then(|| field_name(field))
+}
+
 /// Record every `binding.field` in a token stream, resolving the binding
-/// through `resolve`.
+/// through `resolve` to its call and its field path.
 ///
 /// Token-level, because a macro body is not parsed Rust. Four shapes that look
 /// the same are excluded: `binding.method(…)`, `binding.field::<T>()`,
 /// `binding.mac!(…)`, and `other.binding.field` — where `binding` is itself a
-/// field of something else.
+/// field of something else. A chain `binding.a.b` reads the path `a.b`, up to
+/// the first method call or tuple index.
 fn scan_tokens(
     tokens: &proc_macro2::TokenStream,
-    resolve: &dyn Fn(&str) -> Option<usize>,
-    shadowed: &std::collections::BTreeSet<String>,
+    resolve: &dyn Fn(&str) -> Option<Held>,
+    outer: &MacroScope,
     reads: &mut Vec<(usize, String, Span)>,
 ) {
     let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
-    let bindings = macro_bindings(&tts);
+    let lookup_in = |scope: &MacroScope, name: &str| {
+        scope.get(name).map_or_else(|| resolve(name), Clone::clone)
+    };
+    let bindings = macro_bindings(&tts, &|name| lookup_in(outer, name));
     for (i, tt) in tts.iter().enumerate() {
         // The names the macro binds over this token, on top of the outer ones.
-        let mut here = shadowed.clone();
+        let mut here = outer.clone();
         for b in bindings.iter().filter(|b| (b.from..b.to).contains(&i)) {
             here.extend(b.names.iter().cloned());
         }
@@ -1133,37 +1408,24 @@ fn scan_tokens(
         {
             continue;
         }
-        if here.contains(&base.to_string()) {
-            continue;
-        }
-        let Some(index) = resolve(&base.to_string()) else {
+        let Some((index, mut path)) = lookup_in(&here, &base.to_string()) else {
             continue;
         };
-        if !matches!(tts.get(i + 1), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '.') {
-            continue;
-        }
-        let Some(proc_macro2::TokenTree::Ident(field)) = tts.get(i + 2) else {
+        let Some(first) = field_at(&tts, i + 2) else {
             continue;
         };
-        if field == "await" {
-            continue;
+        let span = tts[i + 2].span();
+        let mut at = i + 2;
+        let mut field = Some(first);
+        while let Some(name) = field {
+            if !path.is_empty() {
+                path.push('.');
+            }
+            path.push_str(&name);
+            at += 2;
+            field = field_at(&tts, at);
         }
-        // A call, a turbofish, or a macro — none of them a field read. The
-        // `!` of `!=` is joined to its `=`: that is a comparison, so a read.
-        let next = tts.get(i + 3);
-        let not_equal = matches!(next, Some(proc_macro2::TokenTree::Punct(p))
-            if p.as_char() == '!' && p.spacing() == proc_macro2::Spacing::Joint)
-            && matches!(tts.get(i + 4), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '=');
-        if !not_equal
-            && (matches!(
-                next,
-                Some(proc_macro2::TokenTree::Group(g))
-                    if g.delimiter() == proc_macro2::Delimiter::Parenthesis
-            ) || matches!(next, Some(proc_macro2::TokenTree::Punct(p)) if matches!(p.as_char(), ':' | '!')))
-        {
-            continue;
-        }
-        reads.push((index, field_name(field), field.span()));
+        reads.push((index, path, span));
     }
 }
 
@@ -1213,7 +1475,7 @@ fn assertions_for(call: &Call, client: &Path, caller: &str) -> Vec<TokenStream> 
     };
 
     let mut out = Vec::new();
-    for read in &call.reads {
+    for read in &check::top_level(&call.reads) {
         let message = enriched(
             &ViolationKind::ResponseFieldMissing(read.clone()),
             format!(
@@ -1231,10 +1493,10 @@ fn assertions_for(call: &Call, client: &Path, caller: &str) -> Vec<TokenStream> 
         });
     }
 
-    let Some(writes) = &call.writes else {
+    let Some(writes) = call.writes.as_deref().map(check::top_level) else {
         return out;
     };
-    for write in writes {
+    for write in &writes {
         let message = enriched(
             &ViolationKind::RequestFieldUnknown(write.clone()),
             format!(
@@ -1513,7 +1775,265 @@ mod tests {
         assert_eq!(calls[0].reads, ["name"]);
     }
 
+    // ── Nested reads ─────────────────────────────────────────────────────
+
+    /// The read-set of the one call in `body`, after
+    /// `let item = catalog.get_item(…)`.
+    fn nested_reads(body: &str) -> Vec<String> {
+        let calls = calls_of(&format!(
+            "async fn page(catalog: CatalogClient) {{ \
+             let item = catalog.get_item(&id, NoBody).await.unwrap(); {body} }}"
+        ));
+        calls[0].reads.clone()
+    }
+
+    #[test]
+    fn a_field_of_a_field_is_read_as_a_dotted_path() {
+        assert_eq!(
+            nested_reads("let _ = item.details.color;"),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads("let _ = item.details.shade.hex;"),
+            ["details", "details.shade", "details.shade.hex"]
+        );
+    }
+
+    #[test]
+    fn a_nested_read_straight_off_the_call_is_a_dotted_path() {
+        let calls = calls_of(
+            "async fn page(catalog: CatalogClient) -> Result<()> { \
+             let _ = catalog.get_item(&id, NoBody).await?.details.color; Ok(()) }",
+        );
+        assert_eq!(calls[0].reads, ["details", "details.color"]);
+    }
+
+    #[test]
+    fn a_nested_value_bound_to_a_name_keeps_its_path() {
+        assert_eq!(
+            nested_reads("let d = &item.details; let _ = d.color;"),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads("let d = item.details.clone(); let _ = d.size;"),
+            ["details", "details.size"]
+        );
+    }
+
+    #[test]
+    fn an_optional_nested_value_keeps_its_path() {
+        assert_eq!(
+            nested_reads("if let Some(d) = &item.details { let _ = d.color; }"),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads("let _ = item.details.as_ref().map(|d| d.color.clone());"),
+            ["details", "details.color"]
+        );
+    }
+
+    #[test]
+    fn a_nested_struct_pattern_reads_the_nested_fields() {
+        assert_eq!(
+            nested_reads("let Item { id, details: Details { color, .. }, .. } = item;"),
+            ["details", "details.color", "id"]
+        );
+        assert_eq!(
+            nested_reads("let Item { details: Some(Details { size, .. }), .. } = item;"),
+            ["details", "details.size"]
+        );
+    }
+
+    #[test]
+    fn a_method_or_a_tuple_index_ends_the_path() {
+        assert_eq!(
+            nested_reads("let _ = (item.details.color.clone(), item.tags.len());"),
+            ["details", "details.color", "tags"]
+        );
+        assert_eq!(nested_reads("let _ = item.pair.0.x;"), ["pair"]);
+    }
+
+    #[test]
+    fn a_match_on_a_nested_value_keeps_its_path() {
+        assert_eq!(
+            nested_reads("match &item.details { Some(d) => d.color.len(), None => 0 };"),
+            ["details", "details.color"]
+        );
+    }
+
+    #[test]
+    fn a_loop_or_an_index_reads_the_top_field_only() {
+        assert_eq!(
+            nested_reads("for l in &item.lines { let _ = l.price; } let _ = item.rows[0].x;"),
+            ["lines", "rows"]
+        );
+    }
+
+    #[test]
+    fn a_nested_binding_read_inside_a_macro_body_keeps_its_path() {
+        assert_eq!(
+            nested_reads("let d = &item.details; html! { (d.color) (d.size.to_string()) }"),
+            ["details", "details.color", "details.size"]
+        );
+    }
+
+    #[test]
+    fn the_caller_descriptor_holds_nested_paths() {
+        let func: ItemFn = syn::parse_str(
+            "async fn page(catalog: CatalogClient) { \
+               let item = catalog.get_item(&id, NoBody).await.unwrap(); let _ = item.details.color; \
+               catalog.create_item(NewItem { details: Details { size: 1 }, name }).await.unwrap(); }",
+        )
+        .expect("fixture parses");
+        let clients: Vec<Path> = vec![syn::parse_str("CatalogClient").expect("client path")];
+        let calls = Analyzer::new(&clients).run(&func);
+        let got = caller_descriptor("storefront", "page", &calls, &clients);
+        assert_eq!(got.calls[0].reads, ["details", "details.color"]);
+        assert_eq!(
+            got.calls[1].writes.as_deref(),
+            Some(
+                [
+                    "details".to_owned(),
+                    "details.size".to_owned(),
+                    "name".to_owned()
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn a_maud_if_let_or_let_keeps_the_nested_path() {
+        assert_eq!(
+            nested_reads("html! { @if let Some(d) = &item.details { (d.color) } }"),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads(
+                "html! { @if let Some(d) = item.details.as_ref() { p { (d.size) } } (d.x) }"
+            ),
+            ["details", "details.size"]
+        );
+        assert_eq!(
+            nested_reads("html! { @let d = &item.details; p { (d.color) } }"),
+            ["details", "details.color"]
+        );
+    }
+
+    #[test]
+    fn a_maud_binding_sees_the_bindings_before_it() {
+        assert_eq!(
+            nested_reads("html! { @let d = &item.details; @let e = d; (e.color) }"),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads(
+                "html! { @let d = &item.details; @if let Some(s) = &d.shade { (s.hex) } }"
+            ),
+            ["details", "details.shade", "details.shade.hex"]
+        );
+        assert_eq!(
+            nested_reads("html! { @let d = other; @let e = d; (e.color) }"),
+            [] as [&str; 0]
+        );
+    }
+
+    #[test]
+    fn a_maud_ref_or_mut_binding_keeps_the_nested_path() {
+        assert_eq!(
+            nested_reads("html! { @if let Some(ref d) = item.details { (d.color) } }"),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads("html! { @let ref mut d = item.details; (d.size) }"),
+            ["details", "details.size"]
+        );
+    }
+
+    #[test]
+    fn a_maud_binding_of_another_value_shadows_the_response() {
+        assert_eq!(
+            nested_reads("html! { @let item = other; (item.name) }"),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            nested_reads(
+                "let d = &item.details; html! { @if let Some(d) = other { (d.color) } (d.size) }"
+            ),
+            ["details", "details.size"]
+        );
+    }
+
+    #[test]
+    fn a_shadowed_nested_binding_stops_its_path() {
+        assert_eq!(
+            nested_reads("let d = &item.details; let d = other; let _ = d.color;"),
+            ["details"]
+        );
+    }
+
+    #[test]
+    fn a_nested_field_inside_a_macro_body_is_read_as_a_dotted_path() {
+        assert_eq!(
+            nested_reads(
+                "html! { (item.details.color) (item.details.size.to_string()) \
+                 (item.tags.len()) (other.item.details.x) }"
+            ),
+            ["details", "details.color", "details.size", "tags"]
+        );
+    }
+
     // ── Requests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_nested_literal_gives_a_nested_write_set() {
+        let calls = calls_of(
+            "async fn page(catalog: CatalogClient) { \
+             let _ = catalog.create_item(NewItem { name, \
+               details: Details { color: Some(c), ..Default::default() } }); \
+             let _ = catalog.create_item(NewItem { details: Some(Details { size: 1 }) }); }",
+        );
+        assert_eq!(
+            calls[0].writes.as_deref(),
+            Some(
+                [
+                    "details".to_owned(),
+                    "details.color".to_owned(),
+                    "name".to_owned()
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            calls[1].writes.as_deref(),
+            Some(["details".to_owned(), "details.size".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn a_nested_value_that_is_not_a_literal_has_no_nested_writes() {
+        let calls = calls_of(
+            "async fn page(catalog: CatalogClient) { \
+             let _ = catalog.create_item(NewItem { details: d, name }); }",
+        );
+        assert_eq!(
+            calls[0].writes.as_deref(),
+            Some(["details".to_owned(), "name".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn the_expansion_asserts_only_top_level_fields() {
+        let out = expand_str(
+            "client = CatalogClient",
+            "async fn page(catalog: CatalogClient) { \
+             let item = catalog.get_item(&id, NoBody).await.unwrap(); let _ = item.details.color; \
+             let _ = catalog.create_item(NewItem { details: Details { size: 1 } }); }",
+        );
+        assert!(out.contains("\"details\""), "{out}");
+        assert!(!out.contains("\"details.color\""), "{out}");
+        assert!(!out.contains("\"details.size\""), "{out}");
+    }
 
     #[test]
     fn an_inline_request_literal_gives_the_write_set() {
