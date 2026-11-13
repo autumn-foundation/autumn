@@ -218,10 +218,23 @@ and 75.8-76.9 s on another. The last scheduled run before it measured
 101.2 s, 89.3 s and 90.0 s. The budget is now p95 100 s / max 120 s: p95 is
 30% above the slowest of the ten samples.
 
+ADR 0049 cut the same build from 74.3 s to 71.6 s (medians of 6 interleaved
+samples):
+
+1. The config reader compiles less code for each config type. With step 2,
+   `autumn-web` has 13% less LLVM IR.
+2. Three more default-on features: `plugin-conformance`, `runtime-config`
+   and `axum-ws`. The daemon starter turns them off, and does not compile
+   the WebSocket stack.
+
+The budget did not change: the measure job does not run on a pull request.
+The report now has `cpu_count` and `cpu_model`, so the next runs show which
+CPU made each sample.
+
 The original 60 s / 90 s target is met on the faster runner and not on the
 slower one. To meet it on each runner, the build needs less code in
 `autumn-web` and a shorter single-core phase: a split of `autumn-web` into
-crates that compile in parallel (issue #2795, ADR 0046 "Roadmap"). The work
+crates that compile in parallel (issue #2795, ADR 0049 "Roadmap"). The work
 of today's build packs into about 48 s on four cores of the test box at
 best.
 

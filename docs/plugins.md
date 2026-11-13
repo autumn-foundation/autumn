@@ -612,7 +612,7 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `db::fleet_engine` | experimental | `FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. `install_replication` and `ShipMode::Generations` need the `sqlite` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040). |
 | `fleet` | experimental | `resolve`, `resolve_key`, `FleetLease`, `fleet_of` and `ownership_store`: the request path an engine plugin's fleet extractor calls. Also `FleetDatabase::sidecar_replica` and `replication::ScopedDestination` for a sidecar engine (requires the `db` feature). Experimental while the fleet seams land (ADR 0040). |
 | `form::FieldRenderer` | stable | Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature). |
-| `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack. |
+| `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack (requires the `plugin-conformance` feature, on by default). |
 | `plugin_conformance::fleet` | experimental | `run_fleet_conformance` and `FleetFixture`: the conformance kit of a fleet engine (requires the `db` feature). Experimental: checks may change in any release with the engine trait. |
 | `plugin_contract` | stable | This module: `PluginContract`, `PLUGIN_SURFACES`, `SurfaceTier`, `evaluate`, `lockstep_range`, and the `PLUGIN_CONTRACT_MARKER` dump protocol. |
 | `route_listing::RouteInfo` | stable | The route manifest type the conformance harness and `autumn routes --format json` share. |
@@ -814,7 +814,8 @@ autumn plugin-check --plugin-name autumn-myplugin-plugin --prefix /my-prefix \
 
 For tighter integration, use `autumn_web::plugin_conformance` in your
 test suite to verify conformance at `cargo test` time without a separate
-binary step:
+binary step. The harness has the `plugin-conformance` feature. The feature
+is in `default`: name it if your manifest sets `default-features = false`.
 
 ```rust
 #[cfg(test)]
