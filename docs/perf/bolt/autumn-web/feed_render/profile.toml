@@ -2,8 +2,8 @@
 package = "autumn-web"
 bench = "feed_render"
 mode = "marginal"
-date = "2026-10-30"
-commit = "b77d54e34935"
+date = "2026-11-13"
+commit = "ec07c44cf206"
 rustc = "rustc 1.97.0 (2d8144b78 2026-07-07)"
 valgrind = "valgrind-3.22.0"
 source_sha256 = "0fd9e814098d93388da1d65c3d41ceb2d5934a8046287d7345314e130f405ccb"
@@ -13,14 +13,14 @@ dhat = "valgrind --tool=dhat --dhat-out-file=dhat-run.json \"$BIN\" --iterations
 
 [totals]
 unit = "per iteration (N-iteration run minus zero-iteration run, divided by N)"
-instructions = 164769
+instructions = 164466
 alloc_bytes = 61004
 alloc_blocks = 196
 peak_live_bytes = 38323
 callgrind_n = 2000
 dhat_n = 500
-instructions_base = 8706537
-instructions_run = 338243980
+instructions_base = 8703319
+instructions_run = 337634765
 alloc_bytes_base = 3054146
 alloc_bytes_run = 33556150
 top_function = "autumn_web::feed::skip_clean"

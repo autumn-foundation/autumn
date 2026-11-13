@@ -6,15 +6,15 @@
 
           33,704   20.5%  autumn_web::feed::skip_clean
           16,165    9.8%  chrono::format::formatting::write_rfc3339
-          12,758    7.7%  _int_malloc
+          12,758    7.8%  _int_malloc
           11,826    7.2%  autumn_web::feed::push_escaped
-          11,576    7.0%  __memcpy_avx_unaligned_erms
+          11,578    7.0%  __memcpy_avx_unaligned_erms
           11,556    7.0%  _int_free
            8,534    5.2%  malloc
            7,801    4.7%  core::fmt::write
            6,637    4.0%  <alloc::string::String as core::fmt::Write>::write_str
-           5,842    3.5%  <autumn_web::feed::Feed>::render
            5,797    3.5%  free
+           5,537    3.4%  <autumn_web::feed::Feed>::render
            4,145    2.5%  feed_render::sample_feed
            3,483    2.1%  malloc_consolidate
            3,111    1.9%  <chrono::datetime::DateTime>::to_rfc3339_opts
@@ -35,4 +35,4 @@
              596    0.4%  _int_realloc
              429    0.3%  <alloc::raw_vec::RawVecInner>::finish_grow
 
-         164,769  100.0%  TOTAL
+         164,466  100.0%  TOTAL
