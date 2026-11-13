@@ -630,7 +630,12 @@ mod webmcp_shim;
 mod widget_css_coverage;
 #[cfg(feature = "maud")]
 mod widget_features;
-#[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
+#[cfg(all(
+    feature = "system-tests",
+    feature = "maud",
+    feature = "htmx",
+    feature = "plugin-conformance"
+))]
 mod widget_pack_browser;
 #[cfg(feature = "maud")]
 mod widgets_accordion;

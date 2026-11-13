@@ -1158,6 +1158,9 @@ pub(crate) struct TunnelGuard {
 /// Extract `KeepTunnel` and keep it for the life of the socket.
 /// `autumn_web::ws::WebSocketUpgrade` does this for you.
 ///
+/// axum's own extractor needs the `axum-ws` feature. It is in `default`, and
+/// `ws` turns it on.
+///
 /// It never rejects. On HTTP/1, or for a request that is not `CONNECT`, it
 /// holds nothing.
 ///

@@ -13,7 +13,12 @@
 //!   --test integration_tests widget_pack_browser -- --include-ignored
 //! ```
 
-#![cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
+#![cfg(all(
+    feature = "system-tests",
+    feature = "maud",
+    feature = "htmx",
+    feature = "plugin-conformance"
+))]
 
 use std::time::Duration;
 

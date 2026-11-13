@@ -13,7 +13,7 @@ categories = ["web-programming", "wasm"]
 
 [dependencies]
 # axum is pinned DIRECTLY rather than with `workspace = true`. The workspace pin
-# (`axum = { version = "0.8", features = ["macros", "ws"] }`) leaves axum's
+# (`axum = { version = "0.8", features = ["macros", "http2"] }`) leaves axum's
 # default features on, which drags in hyper/tokio/http1 — none of which compile
 # for `wasm32-wasip1`. A `workspace = true` inherit is feature-ADDITIVE and
 # cannot turn a workspace dependency's default features back off, so the edge

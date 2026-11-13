@@ -54,7 +54,9 @@ repository = "https://github.com/autumn-foundation/autumn"
 # `h2` in the rustls ALPN list. Autumn's serve loop needs hyper-util's `http2`
 # feature (see the `hyper-util` entry below). `axum/http2` gives the axum side
 # (HTTP/2 WebSockets, `axum::serve` in tests) the same HTTP/2 support.
-axum = { version = "0.8", features = ["macros", "ws", "http2"] }
+# `ws` is not here: autumn-web turns it on with its `axum-ws` feature, so an
+# app without WebSockets does not compile the tungstenite stack (#2795).
+axum = { version = "0.8", features = ["macros", "http2"] }
 # Multipart boundary parsing for the submit-token replay guard. `multer` is the
 # exact parser axum's `Multipart` extractor uses downstream (via `mime`), so the
 # guard and the extractor can never disagree about the boundary. Already in the

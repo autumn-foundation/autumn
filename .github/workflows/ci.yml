@@ -1427,6 +1427,7 @@ jobs:
             widgets,
             jwt-push,
             error-reporting,
+            daemon-starter,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1496,6 +1497,14 @@ jobs:
         # failure capture. The no-DB daemon starter does. The script compiles
         # that feature set, then runs the reporter specs with `reporting` off.
         run: ./scripts/check-error-reporting-feature.sh
+      - name: Check what the daemon starter does not compile
+        if: matrix.lane == 'daemon-starter'
+        # `plugin-conformance`, `runtime-config` and `axum-ws` are default-on,
+        # so `cargo test --workspace` never builds autumn-web with one of them
+        # off. The no-DB daemon starter does. The script checks that its
+        # dependency tree has no WebSocket crate, compiles its feature set,
+        # then runs the specs with the three features off.
+        run: ./scripts/check-daemon-starter-features.sh
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'
         # `markdown` is not a default feature, so the `test` job's `cargo test

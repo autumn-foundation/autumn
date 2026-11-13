@@ -75,6 +75,8 @@ autumn-web = { version = "0.10.0", path = "../autumn", default-features = false,
     # `autumn generate pwa` names the `push_subscriptions` table from
     # `autumn_web::push`. The CLI verifies no JWT, so `jwt` stays off.
     "push",
+    # `autumn plugin check` runs the rules of `autumn_web::plugin_conformance`.
+    "plugin-conformance",
     # `autumn plugin package` / `autumn plugin inspect` read and write the
     # `.autumn-plugin` container and load the module into the same sandbox the
     # runtime uses, so the CLI's verdict is the runtime's verdict. Backend-neutral

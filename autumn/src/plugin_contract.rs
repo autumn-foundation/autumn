@@ -299,7 +299,7 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
     PluginSurface {
         name: "plugin_conformance",
         tier: SurfaceTier::Stable,
-        note: "The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack.",
+        note: "The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack (requires the `plugin-conformance` feature, on by default).",
     },
     PluginSurface {
         name: "plugin_conformance::fleet",
