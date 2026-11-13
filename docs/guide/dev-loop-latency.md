@@ -228,12 +228,16 @@ ADR 0046 samples):
    and `axum-ws`. The daemon starter turns them off, and does not compile
    the WebSocket stack.
 
-The budget did not change: the measure job does not run on a pull request.
-The report now has `cpu_count` and `cpu_model`, so the next runs show which
-CPU made each sample.
+The report now has `cpu_count` and `cpu_model`, so a run shows which CPU
+made its samples. Manual CI runs of 5 samples on that tree measured
+58.0-60.9 s on an `AMD EPYC 9V74` runner and 76.2-78.0 s on an
+`AMD EPYC 7763` runner. Two runs on trunk, on the same base commit, measured
+62.0-65.0 s and 64.4-66.9 s. The trunk report has no CPU field. The
+50.4-52.8 s group of the ADR 0046 runs did not appear again, and its CPU is
+not known. The budget did not change.
 
-The original 60 s / 90 s target is met on the faster runner and not on the
-slower one. To meet it on each runner, the build needs less code in
+The original 60 s / 90 s target is 1 s away on the `AMD EPYC 9V74` runner
+(p95 60.9 s). The `AMD EPYC 7763` runner needs about 18 s more (p95 78.0 s). To meet it on each runner, the build needs less code in
 `autumn-web` and a shorter single-core phase: a split of `autumn-web` into
 crates that compile in parallel (issue #2795, ADR 0049 "Roadmap"). The work
 of today's build packs into about 45 s on four cores of the test box at

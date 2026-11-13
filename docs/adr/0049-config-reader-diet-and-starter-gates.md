@@ -190,6 +190,13 @@ Measured, daemon feature set, same box:
   than the samples in Context, when the host was slower.
 - Decisions 1-4 alone, 5 pairs on a noisy host: `autumn-web` was 1.3 s
   faster (median of the pair differences). The totals did not show it.
+- CI gate, manual runs of 5 samples. This change: 58.0-60.9 s on an
+  `AMD EPYC 9V74` runner (p95 60.9 s), and 76.2-78.0 s on an `AMD EPYC 7763`
+  runner (p95 78.0 s). Trunk, two runs on the same base commit: 62.0-65.0 s
+  and 64.4-66.9 s. The trunk report has no CPU field. If those two runs were
+  on the faster kind, the gain there is about 4 s. No trunk run came from
+  the slower kind, so CI does not show the gain there: ADR 0046 measured
+  75.8-76.9 s in its slow group.
 - A default DB app gains only from decisions 1-4.
 
 Costs:
@@ -204,11 +211,13 @@ Costs:
 - The `test-features` CI job has one more lane.
 
 The cold-start budget does not change. The measure job does not run on a
-pull request, and the two runner kinds differ by 25 s.
+pull request, and the two runner kinds differ by about 17 s.
 
 ## Roadmap to 60 s / 90 s
 
-The slower runner still needs about 14 s. The work of the build is now about
+On the CI gate, the `AMD EPYC 9V74` runner is 1 s from the 60 s target, and
+the `AMD EPYC 7763` runner still needs about 18 s. The work of the build is
+now about
 179 unit-seconds on the test box (148 for the dependencies and 31.5 for
 `autumn-web`, medians of the 6 samples). On four cores that is about 45 s at
 best, and today's build takes 71.6 s, because `autumn-web` compiles mostly on
