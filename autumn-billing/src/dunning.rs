@@ -10,8 +10,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_web::background::{BackgroundTask, PluginCapability};
 use autumn_web::job::{JobClient, JobInfo};
-use autumn_web::{AppState, AutumnResult, job};
+use autumn_web::{AppState, AutumnResult, Capability, job};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -587,30 +588,43 @@ async fn undo_unpaid(
     Ok(())
 }
 
-/// Re-enqueue every open schedule row at its due time and prune the event
-/// ledger. Waits for the job runtime (the test harness starts it after
-/// startup hooks). Fire-and-forget wrapper around [`rearm_pending_now`] — the
-/// startup hook cannot await it without blocking every other plugin's
-/// `on_startup`, so it spawns instead.
-pub(crate) fn rearm_pending(state: AppState, service: Arc<BillingService>) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        tracing::warn!("🍂 Autumn Billing: no async runtime; dunning rows not re-armed");
-        return;
-    };
-    handle.spawn(async move {
-        rearm_pending_now(&state, &service).await;
-    });
+/// The job queue of the dunning retry job.
+pub const QUEUE: &str = "billing";
+
+/// The capability of the dunning re-arm. A role runs it when it runs job
+/// workers: `combined` and `worker`.
+pub const DUNNING: PluginCapability =
+    PluginCapability::new("billing.dunning", Capability::JobWorkers);
+
+/// The background task name of the dunning re-arm.
+pub const REARM_TASK: &str = "billing.dunning_rearm";
+
+/// The dunning re-arm as a background task.
+///
+/// It re-arms once, on a role that drains [`QUEUE`]. A `web` replica does not
+/// re-arm: it does not drain the queue. Two workers that re-arm one row queue
+/// one job, because the retry job is unique per invoice while it is pending.
+///
+/// After the re-arm, the task waits for shutdown. The framework logs a
+/// warning for a task that returns before shutdown.
+pub(crate) fn rearm_task() -> BackgroundTask {
+    BackgroundTask::new(REARM_TASK, DUNNING, |state, shutdown| async move {
+        let service = BillingService::require(&state)?;
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = rearm_pending_now(&state, &service) => {}
+        }
+        shutdown.cancelled().await;
+        Ok(())
+    })
+    .queues([QUEUE])
 }
 
-/// The re-arm body `rearm_pending` spawns.
+/// The body of the re-arm task ([`REARM_TASK`]).
 ///
 /// Waits for the job runtime, loads every open row, re-enqueues each one,
-/// then prunes the event ledger. Exposed (rather than kept file-private) so
-/// a Ledger profiling harness can await its completion deterministically
-/// instead of racing a spawned task — same shape as
-/// `autumn_web::test::drain_ready_repository_commit_hooks`'s exposure of the
-/// repository-commit-hooks drain loop for the same reason. Returns the
-/// number of rows successfully re-armed.
+/// then prunes the event ledger. Public so that a test can await it. Returns
+/// the number of rows re-armed.
 pub async fn rearm_pending_now(state: &AppState, service: &Arc<BillingService>) -> usize {
     if !wait_for_job_client(state).await {
         tracing::warn!(
@@ -715,5 +729,25 @@ async fn wait_for_job_client(state: &AppState) -> bool {
             return false;
         }
         tokio::time::sleep(REARM_POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DUNNING, QUEUE, REARM_TASK, job_infos, rearm_task};
+
+    #[test]
+    fn the_retry_job_runs_on_the_billing_queue() {
+        let infos = job_infos();
+        assert!(!infos.is_empty());
+        assert!(infos.iter().all(|info| info.queue == QUEUE));
+    }
+
+    #[test]
+    fn the_rearm_task_drains_the_billing_queue() {
+        let task = rearm_task();
+        assert_eq!(task.name(), REARM_TASK);
+        assert_eq!(task.capability(), DUNNING.into());
+        assert_eq!(task.queue_names(), [QUEUE]);
     }
 }

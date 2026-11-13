@@ -7,9 +7,10 @@ statement = "SELECT \"notifications\".\"id\", \"notifications\".\"recipient_id\"
 tables = [
   "notifications",
 ]
-indexes = []
+indexes = [
+  "idx_notifications_feed",
+]
 findings = [
-  "full-scan: notifications (no index serves it, even with enable_seqscan = off)",
   "sort: created_at, id (the plan sorts, even with enable_seqscan = off)",
 ]
 notes = ""
@@ -21,18 +22,18 @@ function = "autumn_web::notifications::DbNotificationStore::list"
 [plan]
 status = "ok"
 method = "EXPLAIN (GENERIC_PLAN, COSTS OFF)"
-planned_on = "schema mirror of a Postgres 11 test database"
+planned_on = "test database, Postgres 16"
 generic = [
   "Limit",
   "  ->  Sort",
   "        Sort Key: created_at, id",
-  "        ->  Seq Scan on notifications",
-  "              Filter: ((tenant_id = $1) AND (recipient_id = $2))",
+  "        ->  Index Scan using idx_notifications_feed on notifications",
+  "              Index Cond: ((tenant_id = $1) AND (recipient_id = $2))",
 ]
 index_forced = [
   "Limit",
   "  ->  Sort",
   "        Sort Key: created_at, id",
-  "        ->  Seq Scan on notifications",
-  "              Filter: ((tenant_id = $1) AND (recipient_id = $2))",
+  "        ->  Index Scan using idx_notifications_feed on notifications",
+  "              Index Cond: ((tenant_id = $1) AND (recipient_id = $2))",
 ]

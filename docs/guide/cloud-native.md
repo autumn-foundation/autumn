@@ -346,7 +346,8 @@ On Kubernetes this is two `Deployment`s off the same image — one with
 `AUTUMN_ROLE=web`, one with `AUTUMN_ROLE=worker` — each with its own replica
 count and autoscaler, both pointing the readiness probe at `/ready` so the
 [rolling-deploy drain](#rolling-deploy-lifecycle) supervises worker rollouts the
-same way it does web.
+same way it does web. `autumn release init --target kubernetes` writes these
+for you: see [One workload per role](kubernetes.md#one-workload-per-role).
 
 ### Gating app-owned background work
 
@@ -549,6 +550,26 @@ Example output:
 | `data-backfill` | Schema change is safe but requires a separate backfill job. |
 | `manual-review` | Autumn cannot auto-classify this statement; operator review required. |
 | `unsupported` | The backend has no syntax for this statement; it fails at apply time. SQLite only (#1906). |
+
+The check reads `'..'` text as Postgres does with
+`standard_conforming_strings = on`, the default. A statement that can change
+this setting is `manual-review` (#3528): `SET`, `RESET`, `RESET ALL`,
+`DISCARD ALL`, `set_config`, an `UPDATE` of `pg_settings`, also in a `DO`
+or function body. A `SET` to `on` and text data such as `DEFAULT 'SET ..'`
+are not flagged. With the setting off, `\'` does not end `'..'` text. The check then
+possibly misses a later risky statement. Use `E'..'` text for backslash
+escapes. The check does not find a name that dynamic SQL builds.
+
+A `DO` body runs at migrate time, so the check classifies each statement in
+it (#3637). `DO $$ BEGIN DROP TABLE users; END $$;` is `destructive`. A
+common block, such as a conditional `CREATE TYPE`, makes no finding. A `DO`
+block is `manual-review` when its body holds `EXECUTE`, or when the check
+cannot read the body. The check cannot read a body in a language other than
+PL/pgSQL, `E'..'` text with a `\` escape, a body in more than one part, or
+`DO` blocks nested more than 8 deep. To accept such a block, add
+`-- autumn-safety: reviewed` above the `DO` statement. The check ignores a
+marker in the body. A function body does not run at migrate time. The
+`CREATE FUNCTION` statement is `manual-review`.
 
 ### Adding `autumn migrate check` to CI
 

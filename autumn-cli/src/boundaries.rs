@@ -6,6 +6,7 @@
 //!
 //! See `docs/guide/table-ownership.md`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -70,10 +71,16 @@ pub fn parse_cargo_metadata(metadata: &Value) -> Result<CargoFacts, String> {
             _ => name.to_owned(),
         };
         facts.crates.deps.entry(key.clone()).or_default();
-        if let Some(lib) = library_name(package)
-            && lib != name.replace('-', "_")
-        {
+        // A target with the package name adds nothing: the package name
+        // matches already.
+        let own = name.replace('-', "_");
+        let (lib, mut bins) = target_names(package);
+        if let Some(lib) = lib.filter(|lib| *lib != own) {
             facts.crates.libs.insert(key.clone(), lib);
+        }
+        bins.remove(&own);
+        if !bins.is_empty() {
+            facts.crates.bins.insert(key.clone(), bins);
         }
         names.insert(id.to_owned(), key);
         let owns = package
@@ -123,24 +130,36 @@ pub fn parse_cargo_metadata(metadata: &Value) -> Result<CargoFacts, String> {
     Ok(facts)
 }
 
-/// The library target name of a package, if it has one.
-fn library_name(package: &Value) -> Option<String> {
-    package
-        .get("targets")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|t| {
-            t.get("kind")
-                .and_then(Value::as_array)
-                .is_some_and(|kinds| {
-                    kinds
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|k| k.ends_with("lib") || k == "proc-macro")
-                })
-        })
-        .and_then(|t| t.get("name").and_then(Value::as_str))
-        .map(|n| n.replace('-', "_"))
+/// The library name and the binary names of a package, with `-` as `_`.
+///
+/// A test, bench, example or build script does not ship, so it adds no name.
+fn target_names(package: &Value) -> (Option<String>, BTreeSet<String>) {
+    let mut lib = None;
+    let mut bins = BTreeSet::new();
+    let targets = package.get("targets").and_then(Value::as_array);
+    for target in targets.into_iter().flatten() {
+        let Some(name) = target.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = name.replace('-', "_");
+        let kinds: Vec<&str> = target
+            .get("kind")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if kinds.contains(&"bin") {
+            bins.insert(name);
+        } else if lib.is_none()
+            && kinds
+                .iter()
+                .any(|k| k.ends_with("lib") || *k == "proc-macro")
+        {
+            lib = Some(name);
+        }
+    }
+    (lib, bins)
 }
 
 /// Whether one `resolve` dependency is a normal one.
@@ -545,5 +564,113 @@ mod tests {
             Some("crm_core")
         );
         assert!(!facts.crates.libs.contains_key("crm-web"));
+    }
+
+    fn names(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_renamed_binary_target_is_recorded() {
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "m", "name": "crm-marketing", "targets": [
+                    {"kind": ["lib"], "name": "crm_marketing"},
+                    {"kind": ["bin"], "name": "marketing-server"},
+                    {"kind": ["bin"], "name": "crm-marketing"},
+                    {"kind": ["test"], "name": "it"},
+                    {"kind": ["bench"], "name": "speed"},
+                    {"kind": ["example"], "name": "demo"},
+                    {"kind": ["custom-build"], "name": "build-script-build"}
+                ]},
+                {"id": "w", "name": "crm-web", "targets": [
+                    {"kind": ["bin"], "name": "crm-web"}
+                ]}
+            ],
+            "resolve": {"nodes": []}
+        });
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        assert_eq!(
+            facts.crates.bins.get("crm-marketing"),
+            Some(&names(&["marketing_server"]))
+        );
+        assert!(!facts.crates.libs.contains_key("crm-marketing"));
+        // A binary with the package name adds no name.
+        assert!(!facts.crates.bins.contains_key("crm-web"));
+    }
+
+    #[test]
+    fn a_package_with_a_library_and_a_binary_maps_both() {
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "m", "name": "crm-marketing", "targets": [
+                    {"kind": ["cdylib", "rlib"], "name": "crm_mkt"},
+                    {"kind": ["bin"], "name": "marketing-server"},
+                    {"kind": ["bin"], "name": "marketing-worker"}
+                ]}
+            ],
+            "resolve": {"nodes": []}
+        });
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        assert_eq!(
+            facts.crates.libs.get("crm-marketing").map(String::as_str),
+            Some("crm_mkt")
+        );
+        assert_eq!(
+            facts.crates.bins.get("crm-marketing"),
+            Some(&names(&["marketing_server", "marketing_worker"]))
+        );
+    }
+
+    #[test]
+    fn a_route_in_a_renamed_binary_is_checked() {
+        use autumn_web::graph::manifest::build;
+        use autumn_web::graph::{ModelGraphDescriptor, RouteGraphDescriptor};
+        const MODELS: &[ModelGraphDescriptor] = &[ModelGraphDescriptor {
+            model: "Contact",
+            model_path: "crm_core::Contact",
+            table: "contacts",
+            relations: &[],
+            module_path: "crm_core::models",
+            file: "src/lib.rs",
+            line: 1,
+            crate_version: "0.1.0",
+        }];
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            handler: "report",
+            module_path: "marketing_server::routes",
+            method: "GET",
+            path: "/report",
+            static_route: false,
+            file: "src/main.rs",
+            line: 1,
+            crate_version: "0.1.0",
+            signature_symbols: &[],
+            body_symbols: &["contacts"],
+            sql_symbols: &[],
+        }];
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "m", "name": "crm-marketing", "targets": [
+                    {"kind": ["bin"], "name": "marketing-server"}
+                ]},
+                {"id": "c", "name": "crm-core", "targets": [
+                    {"kind": ["lib"], "name": "crm_core"}
+                ]}
+            ],
+            "resolve": {"nodes": []}
+        });
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let config = BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.marketing]\ncrates = [\"crm-marketing\"]\n",
+        )
+        .expect("valid");
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        let (result, _) = evaluate(config, Some(&graph), Some(&facts), None).expect("runs");
+        let text = result.render();
+        assert!(!result.passes(), "{text}");
+        assert!(text.contains("marketing -> core"), "{text}");
+        assert!(text.contains("marketing_server::routes"), "{text}");
     }
 }

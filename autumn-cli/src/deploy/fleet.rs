@@ -226,7 +226,8 @@ pub(crate) fn plan_fleet(
 /// `unit` and `slots` are that host's own. The driver builds one of these per host
 /// and hands it straight to [`host_ops`].
 pub(crate) struct HostOpsInput<'a, P: ProxyController> {
-    /// This host's resolved config (differs from its siblings only in `host`).
+    /// This host's resolved config (differs from its siblings only in `host` and
+    /// its group `role`).
     pub(crate) cfg: &'a ResolvedDeployConfig,
     /// The proxy controller (per-host kamal-proxy, not a fleet load balancer).
     pub(crate) proxy: &'a P,
@@ -322,6 +323,26 @@ pub(crate) fn fleet_plan_lines(hosts: &[String]) -> Vec<String> {
          every host, not a host named here."
             .to_owned(),
     );
+    lines
+}
+
+/// The `deploy plan` role section: each host and its `[[deploy.groups]]`
+/// role. Empty when no host has a group role.
+pub(crate) fn fleet_role_lines(hosts: &[super::ResolvedDeployConfig]) -> Vec<String> {
+    if hosts.iter().all(|h| h.role.is_none()) {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        "Roles (`[[deploy.groups]]`; each env file sets AUTUMN_ROLE):".to_owned(),
+    ];
+    for host in hosts {
+        lines.push(format!(
+            "  {}: {}",
+            host.host.as_deref().unwrap_or("?"),
+            host.role.as_deref().unwrap_or("the role in autumn.toml")
+        ));
+    }
     lines
 }
 

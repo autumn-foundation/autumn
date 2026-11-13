@@ -466,8 +466,23 @@ The form then carries only the keys. Your handler checks each key, calls
 `complete_direct_upload`, then saves the `Blob`. The key can change in the
 browser, so accept only keys that your app issued to this user (see the
 worked example). A failed upload adds no key, so check the field on the
-server. The file input loses its `name`, so the bytes go only to storage. A
-form with a running upload does not submit.
+server. The file input loses its `name`, so the bytes go only to storage.
+
+A running upload holds the form. The form does not submit. The script also
+cancels each htmx request that carries the form. It uses the htmx 2 rule: the
+requester form, the closest form for a request that is not `GET`, and each
+`hx-include` target.
+
+- A click or a submit shows "Wait for the upload to finish, then send the
+  form again." The file input gets the focus.
+- Other requests, for example live validation on `keyup`, stop with no
+  message. The script does not send them again.
+- An `hx-get` button in the form does not carry the form. It is not
+  cancelled, unless its `hx-include` names the form.
+- A request on `autumn:upload` is not cancelled. It carries the new key.
+
+For autosave, add `autumn:upload` to the trigger:
+`hx-trigger="change, autumn:upload"`.
 
 The user can drop files on the field. The script checks `accept` on a drop.
 Your server must also check the type. The size and name in the presign request

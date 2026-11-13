@@ -67,6 +67,7 @@ on:
       - "autumn-cli/tests/integration/scaffold_form_for.rs"
       - "autumn-cli/tests/integration/scaffold_rich_text.rs"
       - "autumn-cli/tests/integration/scaffold_search.rs"
+      - "autumn-cli/tests/integration/scaffold_teams.rs"
       - "autumn-cli/tests/integration/scaffold_trash.rs"
       - "autumn-cli/tests/integration/seed_model_linking.rs"
       - "autumn-cli/tests/integration/serve.rs"
@@ -149,6 +150,7 @@ on:
       - "autumn-cli/tests/integration/scaffold_form_for.rs"
       - "autumn-cli/tests/integration/scaffold_rich_text.rs"
       - "autumn-cli/tests/integration/scaffold_search.rs"
+      - "autumn-cli/tests/integration/scaffold_teams.rs"
       - "autumn-cli/tests/integration/scaffold_trash.rs"
       - "autumn-cli/tests/integration/seed_model_linking.rs"
       - "autumn-cli/tests/integration/serve.rs"
@@ -196,9 +198,9 @@ env:
   # kache S3 remote (.github/actions/kache). Unset variables keep the GitHub
   # Actions cache. The write token is mapped only on a protected ref, so only
   # pushes to trunk and trunk-dev (and scheduled runs) add to the store.
-  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET }}
-  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT }}
-  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION }}
+  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET || secrets.AUTUMN_KACHE_S3_BUCKET }}
+  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT || secrets.AUTUMN_KACHE_S3_ENDPOINT }}
+  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION || secrets.AUTUMN_KACHE_S3_REGION }}
   AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID: ${{ secrets.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
   AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY: ${{ secrets.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY }}
   AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || '' }}
@@ -951,6 +953,19 @@ jobs:
             | tee "$RUNNER_TEMP/conformance-richtext_scaffold_cargo_checks.log"
 
           assert_ran "$RUNNER_TEMP/conformance-richtext_scaffold_cargo_checks.log" richtext_scaffold_cargo_checks
+      - name: teams_scaffold_cargo_tests
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
+            integration::scaffold_teams::teams_scaffold_cargo_tests \
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-teams_scaffold_cargo_tests.log"
+
+          assert_ran "$RUNNER_TEMP/conformance-teams_scaffold_cargo_tests.log" teams_scaffold_cargo_tests
       - name: searchable_scaffold_cargo_checks
         run: |
           set -euo pipefail
@@ -1212,6 +1227,10 @@ jobs:
             sudo apt-get install -y postgresql-client
           fi
           pg_dump --version
+      - name: Use the PostgreSQL 16 client tools
+        # pg_restore 17+ cannot restore into the 11 and 16 test servers.
+        # See the script header.
+        run: ./scripts/ci-pg-client-16.sh
 
       - name: generated_scaffold_serves_posts_index_and_json_api
         run: |

@@ -14,6 +14,11 @@ The properties, stated plainly up front: this is an **opt-in** subsystem
 deliberate **2-node slice**: designed, tested, and documented for exactly two
 nodes and exactly one shared primitive.
 
+> **Cargo feature.** The `cluster` feature compiles this subsystem. It is in
+> `autumn-web`'s `default` set. An app with `default-features = false` must
+> add `"cluster"` to use it. Without the feature, `[cluster]` still parses, but
+> `enabled = true` fails boot.
+
 > **This is not database sharding.** [Horizontal Sharding](sharding.md) also
 > uses the word "cluster" — a Redis-Cluster-style 16384-slot map routing
 > tenants across `[[database.shards]]` Postgres databases. That is data

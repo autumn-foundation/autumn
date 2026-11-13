@@ -7724,7 +7724,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         use crate::config::{Capability, ProcessRole};
         for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
             let mut state = crate::AppState::for_test();
-            state.role = role.into();
+            state.fields_mut().role = role.into();
             let json = info_json_for(state).await;
             assert_eq!(json["role"]["name"], role.as_str(), "{json}");
             assert_eq!(json["role"]["base"], role.as_str(), "{json}");
@@ -7775,7 +7775,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
     #[tokio::test]
     async fn actuator_info_reports_a_named_role() {
         let mut state = crate::AppState::for_test();
-        state.role = critical_role_3543();
+        state.fields_mut().role = critical_role_3543();
         let json = info_json_for(state).await;
         assert_eq!(json["role"]["name"], "critical", "{json}");
         assert_eq!(json["role"]["base"], "worker", "{json}");
@@ -7792,7 +7792,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         )
         .expect("roles config");
         let mut state = crate::AppState::for_test();
-        state.role = config.resolve_role().expect("marketing resolves");
+        state.fields_mut().role = config.resolve_role().expect("marketing resolves");
         let json = info_json_for(state).await;
         assert_eq!(
             json["role"]["mount"],
@@ -7808,7 +7808,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
     #[tokio::test]
     async fn actuator_jobs_reports_the_role() {
         let mut state = crate::AppState::for_test();
-        state.role = critical_role_3543();
+        state.fields_mut().role = critical_role_3543();
         let body = get_body(state, "/actuator/jobs").await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["role"]["name"], "critical", "{json}");
@@ -7834,7 +7834,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
     #[tokio::test]
     async fn actuator_prometheus_labels_framework_metrics_with_a_named_role() {
         let mut state = crate::AppState::for_test();
-        state.role = critical_role_3543();
+        state.fields_mut().role = critical_role_3543();
         state.metrics().record("GET", "/x", 200, 10);
         let text = get_body(state, "/actuator/prometheus").await;
         assert!(

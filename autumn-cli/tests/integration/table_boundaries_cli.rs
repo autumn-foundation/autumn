@@ -148,6 +148,37 @@ fn a_cross_boundary_read_fails_and_names_both_boundaries() {
 }
 
 #[test]
+fn a_route_in_a_renamed_binary_is_checked() {
+    // `crm-marketing` has `[[bin]] name = "marketing-server"`. The module
+    // paths of that binary start with `marketing_server` (#3599).
+    const BIN_ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+        module_path: "marketing_server::routes",
+        file: "crm-marketing/src/main.rs",
+        body_symbols: &["contacts"],
+        ..route("served", "/served")
+    }];
+    let dir = fixture();
+    let root = dir.path();
+    write(
+        root,
+        "crm-marketing/Cargo.toml",
+        "[package]\nname = \"crm-marketing\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [[bin]]\nname = \"marketing-server\"\npath = \"src/main.rs\"\n\n\
+         [dependencies]\ncrm-core = { path = \"../crm-core\" }\n",
+    );
+    write(root, "crm-marketing/src/main.rs", "fn main() {}\n");
+    let graph = build(&[], 0, BIN_ROUTES, MODELS, &[], &[]);
+    write(root, "architecture-graph.json", &graph.to_json());
+    let output = check(root, &[]);
+    let text = stdout(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("marketing -> core: route GET /served reads table `contacts`"),
+        "{text}"
+    );
+}
+
+#[test]
 fn may_read_makes_the_check_pass() {
     let dir = fixture();
     write(dir.path(), "boundaries.toml", &boundaries("\"contacts\""));

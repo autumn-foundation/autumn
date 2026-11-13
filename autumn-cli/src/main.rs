@@ -23,6 +23,7 @@ mod check;
 mod cold_start_driver;
 mod config;
 mod console;
+mod contracts;
 mod credentials;
 mod data;
 mod data_capsule;
@@ -64,6 +65,7 @@ mod plugin_sandbox;
 mod posture;
 mod process;
 mod release;
+mod release_roles;
 mod replay;
 mod retention;
 mod routes;
@@ -607,6 +609,149 @@ pub struct OpenApiExportArgs {
 pub enum OpenApiSubcommands {
     /// Emit the app's `OpenAPI` 3.1 document without booting it.
     Export(OpenApiExportArgs),
+}
+
+/// The crates and features the wire-contract pass checks.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+pub struct ContractsPassArgs {
+    /// Check only this package (repeatable). The default is the workspace.
+    #[arg(long = "package", short = 'p', value_name = "PACKAGE")]
+    package: Vec<String>,
+    /// Extra Cargo features (comma- or space-separated; repeatable).
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build with `--all-features`.
+    #[arg(long)]
+    all_features: bool,
+    /// Build with `--no-default-features`.
+    #[arg(long)]
+    no_default_features: bool,
+}
+
+impl ContractsPassArgs {
+    fn into_pass(self) -> contracts::PassOptions {
+        contracts::PassOptions {
+            packages: self.package,
+            features: routes::CargoFeatures {
+                features: self.features,
+                all: self.all_features,
+                no_default: self.no_default_features,
+            },
+        }
+    }
+}
+
+/// The schema options of `autumn contracts export`: `--proto` or `--avro`.
+// Each bool is one CLI flag.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[command(group(clap::ArgGroup::new("schema").args(["proto", "avro"])))]
+pub struct ContractsSchemaArgs {
+    /// Write protobuf schemas to `--out <DIR>` instead of the bundle.
+    #[arg(long, requires = "out")]
+    proto: bool,
+    /// The lock file of protobuf field numbers. Commit it. The default is
+    /// `proto.lock` beside the `--out` directory.
+    #[arg(long, value_name = "PATH", requires = "proto")]
+    lock: Option<PathBuf>,
+    /// Write nothing. Exit 1 when the lock or a schema file would change.
+    #[arg(long, requires = "schema")]
+    check: bool,
+    /// Add `google.api.http` options to each rpc.
+    #[arg(long, requires = "proto")]
+    http_annotations: bool,
+    /// Map a `date-time` string to `google.protobuf.Timestamp`.
+    #[arg(long, requires = "proto")]
+    well_known_types: bool,
+    /// Write Avro schemas (`.avsc`) to `--out <DIR>`: one per event topic.
+    #[arg(
+        long,
+        requires = "out",
+        conflicts_with_all = ["proto", "lock", "http_annotations", "well_known_types"]
+    )]
+    avro: bool,
+    /// With `--avro`, also write the request and response body of each
+    /// endpoint.
+    #[arg(long, requires = "avro")]
+    endpoints: bool,
+}
+
+impl ContractsSchemaArgs {
+    fn into_proto(self) -> Option<contracts::ProtoArgs> {
+        self.proto.then_some(contracts::ProtoArgs {
+            lock: self.lock,
+            check: self.check,
+            options: contracts::proto::ProtoOptions {
+                http_annotations: self.http_annotations,
+                well_known_types: self.well_known_types,
+            },
+        })
+    }
+
+    const fn to_avro(&self) -> Option<contracts::AvroArgs> {
+        if !self.avro {
+            return None;
+        }
+        Some(contracts::AvroArgs {
+            check: self.check,
+            options: contracts::avro::AvroOptions {
+                endpoints: self.endpoints,
+            },
+        })
+    }
+}
+
+/// Subcommands for `autumn contracts`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum ContractsSubcommands {
+    /// Write the wire-contract bundle of the current build.
+    ///
+    /// Runs a dedicated `cargo check` pass, so a cached build cannot leave a
+    /// descriptor out. The bundle is sorted JSON. Two exports of the same
+    /// source give the same bytes. Store it with each release.
+    ///
+    /// With `--proto`, write protobuf schemas for consumers outside the
+    /// workspace instead: one file per service, one per crate for events,
+    /// and a `buf.yaml`. The lock file keeps each field number.
+    ///
+    /// With `--avro`, write one Avro schema per event topic instead.
+    /// `--endpoints` adds the request and response bodies.
+    Export {
+        /// Write the bundle to this file. The default is stdout. With
+        /// `--proto` or `--avro`, write the schema files to this directory.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Use this bundle file, or join the descriptors in this directory.
+        /// No build runs, and there is no dependency graph.
+        #[arg(long, value_name = "BUNDLE|DIR")]
+        from: Option<PathBuf>,
+        #[command(flatten)]
+        proto: ContractsSchemaArgs,
+        #[command(flatten)]
+        pass: ContractsPassArgs,
+    },
+    /// Compare the current build with a deployed release.
+    ///
+    /// Checks both deploy windows: new callees with deployed callers, and new
+    /// callers with deployed callees. Exit 0: safe in the declared order.
+    /// Exit 1: not safe. Exit 3: safe only in the order the report names.
+    /// Exit 4: the check could not run.
+    Check {
+        /// The deployed release: a bundle file, an http(s) URL, or a git ref.
+        #[arg(long, value_name = "BUNDLE|URL|GIT-REF")]
+        against: String,
+        /// Use this bundle for the current build. The default runs the pass.
+        #[arg(long, value_name = "PATH")]
+        current: Option<PathBuf>,
+        /// The deploy order you plan. `any` needs both windows to be safe.
+        #[arg(long, value_enum, default_value_t = contracts::compat::Order::Any)]
+        order: contracts::compat::Order,
+        /// Accept a plain `http://` URL for `--against`.
+        #[arg(long)]
+        allow_http: bool,
+        #[command(flatten)]
+        pass: ContractsPassArgs,
+    },
 }
 
 /// Subcommands for `autumn aeo`.
@@ -1692,6 +1837,7 @@ enum Commands {
     ///   autumn fleet backup tenant:acme /backups/acme.db
     ///   autumn fleet import tenant:acme /backups/acme.db
     ///   autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+    ///   autumn fleet restore tenant:acme --from /backups/acme.db --force
     ///   autumn fleet lake report.sql --out report.csv
     #[command(subcommand, verbatim_doc_comment)]
     Fleet(FleetCommands),
@@ -2511,6 +2657,20 @@ enum Commands {
     ///   autumn openapi export --check openapi.json --strict
     #[command(subcommand, verbatim_doc_comment)]
     Openapi(OpenApiSubcommands),
+    /// Publish and check wire contracts across releases.
+    ///
+    /// `export` writes the bundle of the current build. `check` compares the
+    /// current build with a deployed bundle, in both deploy windows, and names
+    /// the safe deploy order when only one exists.
+    ///
+    /// # Examples
+    ///
+    ///   autumn contracts export --out target/contracts.json
+    ///   autumn contracts check --against deployed.json
+    ///   autumn contracts check --against origin/main
+    ///   autumn contracts check --against deployed.json --order callee-first
+    #[command(subcommand, verbatim_doc_comment)]
+    Contracts(ContractsSubcommands),
     /// Emit the classified-data flow manifest (#1654).
     ///
     /// Compiles the app and reads back the manifest the framework assembles from
@@ -3155,6 +3315,32 @@ enum DbCommands {
     ///   autumn db replica status
     #[command(subcommand, verbatim_doc_comment)]
     Replica(ReplicaCommands),
+    /// Print or apply the database grants of each boundary role.
+    ///
+    /// Reads `boundaries.toml` and the live catalog. A boundary with a
+    /// `role` gets its own tables and its `may_read` / `may_write`
+    /// exceptions. Every other privilege of that role on a table, sequence
+    /// or schema is revoked. All statements run in one transaction.
+    ///
+    /// Examples:
+    ///   autumn db grants              # print the SQL
+    ///   autumn db grants --apply      # run it, after `autumn migrate`
+    ///   autumn db grants --json       # the plan, per role
+    #[command(verbatim_doc_comment)]
+    Grants {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The boundary config.
+        #[arg(long, value_name = "PATH", default_value = "boundaries.toml")]
+        config: std::path::PathBuf,
+        /// Run the statements against the database.
+        #[arg(long)]
+        apply: bool,
+        /// Print the plan as JSON instead of SQL.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands for `autumn db offsite` (issue #1619).
@@ -3258,10 +3444,11 @@ impl DbCommands {
             | Self::Scrub { .. }
             | Self::Retention { .. }
             | Self::Offsite(_)
-            | Self::Replica(_) => {
+            | Self::Replica(_)
+            | Self::Grants { .. } => {
                 unreachable!(
-                    "db pull/backup/restore/scrub/retention/offsite/replica are dispatched \
-                     before into_command"
+                    "db pull/backup/restore/scrub/retention/offsite/replica/grants are \
+                     dispatched before into_command"
                 )
             }
         }
@@ -3530,12 +3717,14 @@ enum FleetCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Apply pending migrations from `migrations/` to every database.
+    /// Apply pending migrations from `migrations/` and `migrations-shards/`
+    /// to every database.
     ///
     /// Each database also gets the framework tables a fleet database gets at
-    /// boot. Plugin migrations are not applied: run the app once with
-    /// `AUTUMN_MIGRATE=1` for them. A failure on one database does not stop the
-    /// others. The command exits non-zero when one or more fail.
+    /// boot. `migrations-control/` is for the control database only, so it
+    /// is not applied. Plugin migrations are not applied: run the app once
+    /// with `AUTUMN_MIGRATE=1` for them. A failure on one database does not
+    /// stop the others. The command exits non-zero when one or more fail.
     Migrate {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
@@ -3594,11 +3783,13 @@ enum FleetCommands {
         #[arg(long)]
         force: bool,
     },
-    /// Rebuild one database from its `[replication]` replica.
+    /// Rebuild one database from its `[replication]` replica, or replace it
+    /// with a local file.
     ///
-    /// Verifies the chain before it replaces the file, as
-    /// `autumn db replica restore` does. Refused when another process has the
-    /// file open.
+    /// From the replica, it verifies the chain before it replaces the file,
+    /// as `autumn db replica restore` does. With `--from`, it replaces the
+    /// file with a local backup, and replication is not needed. Refused when
+    /// another process has the file open.
     Restore {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
@@ -3607,8 +3798,21 @@ enum FleetCommands {
         #[arg(value_name = "KEY")]
         key: String,
         /// Restore to this RFC 3339 instant instead of the latest state.
-        #[arg(long, value_name = "RFC3339")]
+        #[arg(long, value_name = "RFC3339", conflicts_with = "from")]
         timestamp: Option<String>,
+        /// Restore from this local file (a `fleet backup`) instead of the
+        /// replica. Replication is not needed. The command applies pending
+        /// migrations to the copy.
+        #[arg(long, value_name = "FILE")]
+        from: Option<std::path::PathBuf>,
+        /// With `--from`: accept a backup of another key, and write this key
+        /// into its identity row.
+        #[arg(long, requires = "from")]
+        allow_rekey: bool,
+        /// With `--from`: restore a deleted key. This purges the replica of
+        /// the deleted database and drops its tombstone.
+        #[arg(long, requires = "from")]
+        clear_tombstone: bool,
         /// Confirm the replacement. Required on every profile.
         #[arg(long)]
         force: bool,
@@ -3711,11 +3915,17 @@ impl FleetCommands {
                 profile,
                 key,
                 timestamp,
+                from,
+                allow_rekey,
+                clear_tombstone,
                 force,
             } => fleet::FleetCommand::Restore {
                 profile,
                 key,
                 timestamp,
+                from,
+                allow_rekey,
+                clear_tombstone,
                 force,
             },
             Self::Lake {
@@ -4353,8 +4563,9 @@ enum ReleaseCommands {
     ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
     ///                                   connector, opt-in Memorystore Redis).
     /// --target kubernetes             : also emits a Helm chart (deploy/helm/) and a
-    ///                                   Kustomize base (deploy/kustomize/base/) with
-    ///                                   /startup, /live and /ready probes, a `preStop`
+    ///                                   Kustomize base (deploy/kustomize/base/). Each
+    ///                                   role gets its own workload (see --roles). Both
+    ///                                   have /startup, /live and /ready probes, a `preStop`
     ///                                   hook, a grace period longer than the drain
     ///                                   window, a `PodDisruptionBudget`, and opt-in
     ///                                   Argo Rollouts or Flagger canaries.
@@ -4366,13 +4577,19 @@ enum ReleaseCommands {
         /// aws-ecs | gcp-cloud-run | kubernetes (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
-        /// Scaffold a separate worker-role service in the generated
-        /// docker-compose.yml (opt-in split topology). The `app` service runs
-        /// the web role and a new `worker` service runs jobs+scheduler, both on
-        /// the shared `postgres` jobs backend. Only affects `--target
-        /// docker-compose`; the default output is a single combined service.
+        /// Scaffold a split topology. For `--target docker-compose`: the `app`
+        /// service runs the web role and a new `worker` service runs jobs and
+        /// the scheduler, both on the shared `postgres` jobs backend. For
+        /// `--target kubernetes` and `--target fly`: a `web` and a `worker`
+        /// workload. The default output is one combined service.
         #[arg(long)]
         split_workers: bool,
+        /// The roles that get a workload. Only for `--target kubernetes` and
+        /// `--target fly`. Each is a built-in role or a `[roles.<name>]`
+        /// preset in autumn.toml. Default: `combined`. With presets or
+        /// `--split-workers`: `web`, `worker`, then each preset.
+        #[arg(long, value_name = "ROLE", value_delimiter = ',')]
+        roles: Vec<String>,
     },
 }
 
@@ -5592,6 +5809,17 @@ fn run_command(command: Commands) {
                 db::backup::run_offsite_list(profile.as_deref());
             }
             DbCommands::Replica(cmd) => db::replica::run(&cmd.into_command()),
+            DbCommands::Grants {
+                profile,
+                config,
+                apply,
+                json,
+            } => db::grants::run(&db::grants::GrantsArgs {
+                profile,
+                config,
+                apply,
+                json,
+            }),
             other => {
                 let (command, profile) = other.into_command();
                 db::run(&command, profile.as_deref());
@@ -6011,6 +6239,35 @@ fn run_command(command: Commands) {
             });
         }
         Commands::Graph(command) => run_graph(command),
+        Commands::Contracts(ContractsSubcommands::Export {
+            out,
+            from,
+            proto,
+            pass,
+        }) => {
+            contracts::run_export(&contracts::ExportOptions {
+                out,
+                from,
+                pass: pass.into_pass(),
+                avro: proto.to_avro(),
+                proto: proto.into_proto(),
+            });
+        }
+        Commands::Contracts(ContractsSubcommands::Check {
+            against,
+            current,
+            order,
+            allow_http,
+            pass,
+        }) => {
+            contracts::run_check(&contracts::CheckOptions {
+                against,
+                current,
+                order,
+                allow_http,
+                pass: pass.into_pass(),
+            });
+        }
         Commands::DataFlow(args) => {
             let features = routes::CargoFeatures {
                 features: args.features,
@@ -6760,10 +7017,10 @@ fn run_plugin_check_command(
         std::process::exit(1);
     });
 
-    let mut sensitive_routes: Vec<plugin_check::SensitiveRouteDecl> = Vec::new();
+    let mut sensitive_routes: Vec<plugin_check::SensitiveRoute> = Vec::new();
     for arg in sensitive_route_args {
         if let Some((path, desc)) = arg.split_once(':') {
-            sensitive_routes.push(plugin_check::SensitiveRouteDecl {
+            sensitive_routes.push(plugin_check::SensitiveRoute {
                 path_pattern: path.to_owned(),
                 auth_mechanism: desc.to_owned(),
             });
@@ -6904,6 +7161,7 @@ fn run_release_command(cmd: ReleaseCommands) {
             force,
             target,
             split_workers,
+            roles,
         } => {
             let t = target.as_deref().map_or(release::Target::Default, |s| {
                 s.parse().unwrap_or_else(|e| {
@@ -6915,6 +7173,7 @@ fn run_release_command(cmd: ReleaseCommands) {
                 force,
                 target: t,
                 split_workers,
+                roles,
             });
         }
     }
@@ -7818,6 +8077,9 @@ mod tests {
                 profile: None,
                 key: "slot:00042".to_owned(),
                 timestamp: Some("2026-10-01T12:00:00Z".to_owned()),
+                from: None,
+                allow_rekey: false,
+                clear_tombstone: false,
                 force: false
             }
         );
@@ -7852,6 +8114,52 @@ mod tests {
             Cli::try_parse_from(["autumn", "fleet", "lake", "q.sql", "--concurrency", "0"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fleet_restore_from_a_file_parses() {
+        use fleet::FleetCommand;
+        assert_eq!(
+            fleet_command(&[
+                "restore",
+                "tenant:acme",
+                "--from",
+                "/backups/acme.db",
+                "--allow-rekey",
+                "--clear-tombstone",
+                "--force"
+            ]),
+            FleetCommand::Restore {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                timestamp: None,
+                from: Some(std::path::PathBuf::from("/backups/acme.db")),
+                allow_rekey: true,
+                clear_tombstone: true,
+                force: true
+            }
+        );
+        // A file restore has no point in time.
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                "a.db",
+                "--timestamp",
+                "2026-10-01T12:00:00Z"
+            ])
+            .is_err()
+        );
+        // The file options need a file.
+        for flag in ["--allow-rekey", "--clear-tombstone"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "fleet", "restore", "tenant:acme", flag]).is_err(),
+                "{flag}"
+            );
+        }
     }
 
     #[test]
@@ -9475,6 +9783,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_db_grants() {
+        let cli = Cli::try_parse_from(["autumn", "db", "grants"]).unwrap();
+        let Commands::Db(DbCommands::Grants {
+            profile,
+            config,
+            apply,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected db grants");
+        };
+        assert_eq!(profile, None);
+        assert_eq!(config, std::path::PathBuf::from("boundaries.toml"));
+        assert!(!apply && !json);
+
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "grants",
+            "--apply",
+            "--json",
+            "--profile",
+            "prod",
+            "--config",
+            "crm/boundaries.toml",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Grants {
+            profile,
+            config,
+            apply,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected db grants");
+        };
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(config, std::path::PathBuf::from("crm/boundaries.toml"));
+        assert!(apply && json);
+    }
+
+    #[test]
     fn parse_db_restore_offsite_flag() {
         let cli = Cli::try_parse_from([
             "autumn",
@@ -10363,6 +10713,147 @@ mod tests {
     }
 
     #[test]
+    fn parse_contracts_export_defaults_to_the_workspace_and_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "contracts", "export"]).expect("parses");
+        match cli.command {
+            Commands::Contracts(ContractsSubcommands::Export {
+                out,
+                from,
+                proto,
+                pass,
+            }) => {
+                assert!(out.is_none());
+                assert!(from.is_none(), "the default runs the pass");
+                assert!(pass.package.is_empty());
+                assert!(
+                    proto.into_proto().is_none(),
+                    "the default writes the bundle"
+                );
+            }
+            _ => panic!("expected contracts export"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_export_proto_with_its_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "export",
+            "--proto",
+            "--out",
+            "contracts/proto",
+            "--check",
+            "--http-annotations",
+            "--well-known-types",
+        ])
+        .expect("parses");
+        let Commands::Contracts(ContractsSubcommands::Export { proto, .. }) = cli.command else {
+            panic!("expected contracts export");
+        };
+        let proto = proto.into_proto().expect("proto");
+        assert_eq!(proto.lock, None, "the default is beside `--out`");
+        assert_eq!(
+            contracts::default_lock(std::path::Path::new("contracts/proto")),
+            PathBuf::from("contracts/proto.lock")
+        );
+        assert!(proto.check);
+        assert!(proto.options.http_annotations && proto.options.well_known_types);
+    }
+
+    #[test]
+    fn parse_contracts_export_avro_with_its_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "export",
+            "--avro",
+            "--out",
+            "contracts/avro",
+            "--endpoints",
+            "--check",
+        ])
+        .expect("parses");
+        let Commands::Contracts(ContractsSubcommands::Export { proto, out, .. }) = cli.command
+        else {
+            panic!("expected contracts export");
+        };
+        assert_eq!(out, Some(PathBuf::from("contracts/avro")));
+        let avro = proto.to_avro().expect("avro");
+        assert!(avro.check && avro.options.endpoints);
+        assert!(proto.into_proto().is_none(), "avro is not proto");
+    }
+
+    #[test]
+    fn parse_contracts_export_avro_needs_out_and_refuses_proto_options() {
+        for args in [
+            &["--avro"][..],
+            &["--avro", "--proto", "--out", "x"],
+            &["--endpoints", "--out", "x"],
+            &["--avro", "--lock", "x.lock", "--out", "x"],
+            &["--avro", "--http-annotations", "--out", "x"],
+            &["--check", "--out", "x"],
+        ] {
+            let mut argv = vec!["autumn", "contracts", "export"];
+            argv.extend(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn parse_contracts_export_proto_needs_out_and_its_options_need_proto() {
+        assert!(Cli::try_parse_from(["autumn", "contracts", "export", "--proto"]).is_err());
+        for flag in ["--check", "--http-annotations", "--well-known-types"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "contracts", "export", flag]).is_err(),
+                "{flag} without --proto"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "contracts", "export", "--lock", "x.lock"]).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_contracts_check_with_order_and_packages() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "check",
+            "--against",
+            "deployed.json",
+            "--order",
+            "caller-first",
+            "-p",
+            "mesh-catalog",
+            "-p",
+            "mesh-storefront",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Contracts(ContractsSubcommands::Check {
+                against,
+                current,
+                order,
+                allow_http,
+                pass,
+            }) => {
+                assert!(!allow_http, "https only by default");
+                assert_eq!(against, "deployed.json");
+                assert!(current.is_none());
+                assert_eq!(order, contracts::compat::Order::CallerFirst);
+                assert_eq!(pass.package, ["mesh-catalog", "mesh-storefront"]);
+            }
+            _ => panic!("expected contracts check"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_check_needs_against() {
+        assert!(Cli::try_parse_from(["autumn", "contracts", "check"]).is_err());
+    }
+
+    #[test]
     fn parse_openapi_export_out_and_strict() {
         let cli = Cli::try_parse_from([
             "autumn",
@@ -10867,6 +11358,35 @@ mod tests {
             panic!("expected release init");
         };
         assert!(!split_workers, "split_workers must default to false");
+    }
+
+    #[test]
+    fn parse_release_init_with_roles() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "release",
+            "init",
+            "--target",
+            "kubernetes",
+            "--roles",
+            "web,worker",
+            "--roles",
+            "critical",
+        ])
+        .unwrap();
+        let Commands::Release(ReleaseCommands::Init { roles, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(roles, ["web", "worker", "critical"]);
+    }
+
+    #[test]
+    fn parse_release_init_roles_default_empty() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { roles, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert!(roles.is_empty());
     }
 
     #[test]

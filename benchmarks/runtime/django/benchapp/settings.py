@@ -28,12 +28,18 @@ TEMPLATES = [
     }
 ]
 
+# Under ASGI every request runs on a fresh thread, so persistent connections
+# (CONN_MAX_AGE > 0) are never reused and pile up until Postgres refuses new
+# ones. Use psycopg's connection pool instead, which Django supports natively
+# and which requires CONN_MAX_AGE = 0. Five per worker process times the four
+# Gunicorn workers gives the same 20 connections every other app gets.
 DATABASES = {
     "default": dj_database_url.config(
         default=os.environ.get("DATABASE_URL", "postgres://benchmark:benchmark@localhost:5432/benchmark"),
-        conn_max_age=600,
+        conn_max_age=0,
     )
 }
+DATABASES["default"]["OPTIONS"] = {"pool": {"min_size": 5, "max_size": 5, "timeout": 10}}
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 USE_TZ = True

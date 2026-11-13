@@ -1,7 +1,7 @@
 //! Ledger profiling harness for `DbRoomStore::reap_stale`'s phase-2 loop
 //! (`autumn-media-plugin/src/rooms_db.rs`), driven through the real
 //! `RoomStore::reap_stale` entry point — the same call the background reaper
-//! (`spawn_room_reaper_loop`, `rooms.rs`) makes once per tick against every
+//! (`run_room_reaper`, `rooms.rs`) makes once per tick against every
 //! `DbRoomStore`-backed deployment.
 //!
 //! Phase 2 first loads every room whose `created_at` is older than the

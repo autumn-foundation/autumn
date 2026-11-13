@@ -7,10 +7,10 @@ statement = "SELECT COUNT(*) FROM \"notifications\" WHERE ((\"notifications\".\"
 tables = [
   "notifications",
 ]
-indexes = []
-findings = [
-  "full-scan: notifications (no index serves it, even with enable_seqscan = off)",
+indexes = [
+  "idx_notifications_feed",
 ]
+findings = []
 notes = ""
 
 [[site]]
@@ -20,14 +20,14 @@ function = "autumn_web::notifications::DbNotificationStore::list"
 [plan]
 status = "ok"
 method = "EXPLAIN (GENERIC_PLAN, COSTS OFF)"
-planned_on = "schema mirror of a Postgres 11 test database"
+planned_on = "test database, Postgres 16"
 generic = [
   "Aggregate",
-  "  ->  Seq Scan on notifications",
-  "        Filter: ((tenant_id = $1) AND (recipient_id = $2))",
+  "  ->  Index Only Scan using idx_notifications_feed on notifications",
+  "        Index Cond: ((tenant_id = $1) AND (recipient_id = $2))",
 ]
 index_forced = [
   "Aggregate",
-  "  ->  Seq Scan on notifications",
-  "        Filter: ((tenant_id = $1) AND (recipient_id = $2))",
+  "  ->  Index Only Scan using idx_notifications_feed on notifications",
+  "        Index Cond: ((tenant_id = $1) AND (recipient_id = $2))",
 ]

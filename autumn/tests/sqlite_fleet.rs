@@ -14,6 +14,11 @@
 
 use std::path::Path as FsPath;
 
+#[path = "sqlite_fleet/generations.rs"]
+mod generations;
+#[path = "sqlite_fleet/lake_sink.rs"]
+mod lake_sink;
+
 use autumn_web::config::{AutumnConfig, DatabaseConfig, DatabaseFleetConfig};
 use autumn_web::db::fleet::DatabaseFleet;
 use autumn_web::db::{RuntimeConnection, create_pool};
@@ -176,6 +181,7 @@ fn fleet(dir: &FsPath, mode: FleetMode, create_on_demand: bool) -> DatabaseFleet
         root: dir.join("fleet").display().to_string(),
         path: None,
         max_open: 4,
+        max_resident_bytes: 0,
         pool_size: 2,
         create_on_demand: Some(create_on_demand),
         idle_close_secs: 0,
@@ -185,6 +191,9 @@ fn fleet(dir: &FsPath, mode: FleetMode, create_on_demand: bool) -> DatabaseFleet
         restore_check_sample: 0,
         replication_workers: 4,
         min_residency: std::time::Duration::from_secs(2),
+        max_open_policy: autumn_web::config::FleetMaxOpenPolicy::Soft,
+        mmap_size: 0,
+        cache_size_kib: 0,
     })
     .migrations("app", MIGRATIONS)
     .migrations(

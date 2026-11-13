@@ -312,7 +312,7 @@ for crate in "${CRATES[@]}"; do
     #
     # NOTE: `telemetry-otlp` pulls prost/tonic, which need `protoc` at build
     # time. The SemVer job in .github/workflows/publish-gate.yml installs
-    # protobuf-compiler for this reason — keep them in sync.
+    # protoc for this reason — keep them in sync.
     #
     # TRIPWIRE (baseline-drift guard): the allowlist above is a static, hand-
     # computed intersection valid ONLY while cargo-semver-checks compares the
@@ -366,7 +366,7 @@ for crate in "${CRATES[@]}"; do
     # alone, and the module features (#2795), `jwt` and `push` gate items the
     # baseline compiled with no feature of its own. Without them here, those
     # items look removed.
-    autumn_web_semver_current_only="widgets-search,widgets-social,widgets-workflow,widgets-charts,alerts,custom-domains,data-retention,experiments,feature-flags,gdpr,graph,idempotency,job-tracking,ledger,money,nested-form,slo,upgrade,version-history,wizard,jwt,push"
+    autumn_web_semver_current_only="widgets-search,widgets-social,widgets-workflow,widgets-charts,alerts,custom-domains,data-retention,experiments,feature-flags,gdpr,graph,idempotency,job-tracking,ledger,money,nested-form,slo,upgrade,version-history,wizard,jwt,push,cluster"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
     pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \

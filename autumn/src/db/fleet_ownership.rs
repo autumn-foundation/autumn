@@ -38,21 +38,21 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
-use diesel::RunQueryDsl as _;
-use diesel::sql_types::{BigInt, Integer, Text};
-use diesel_async::pooled_connection::deadpool::Pool;
 use futures::future::BoxFuture;
 use tokio::sync::Notify;
 
 use crate::config::SLOT_COUNT;
-use crate::db::RuntimeConnection;
 use crate::lock::FencingToken;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::time::ClockSource;
 
 /// The ownership table on the control database.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 const OWNERS_TABLE: &str = "_autumn_fleet_slot_owners";
 
-/// The DDL, applied at install. Times are epoch milliseconds.
+/// The DDL, applied at install. Times are epoch milliseconds. The text is
+/// the same for `SQLite` and Postgres.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 const SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS _autumn_fleet_slot_owners (
     range_start      INTEGER NOT NULL,
@@ -480,6 +480,16 @@ fn lease_end(now_ms: i64, ttl: Duration) -> i64 {
 /// Where the ownership table lives. Every host that serves the fleet must use
 /// the same store. Each call is one atomic decision of [`OwnershipTable`].
 pub trait SlotOwnershipStore: Send + Sync + 'static {
+    /// Makes the tables when they do not exist. Boot calls this once, before
+    /// the first claim. Default: nothing to make.
+    ///
+    /// # Errors
+    ///
+    /// [`OwnershipError::Store`] when the store cannot make its tables.
+    fn ensure_schema(&self) -> BoxFuture<'_, Result<(), OwnershipError>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
     /// [`OwnershipTable::claim_above`] at the store's time.
     fn claim<'a>(
         &'a self,
@@ -510,209 +520,466 @@ pub trait SlotOwnershipStore: Send + Sync + 'static {
     fn rows(&self) -> BoxFuture<'_, Result<Vec<OwnershipRow>, OwnershipError>>;
 }
 
-/// The ownership table on a `SQLite` pool, normally the control database.
-///
-/// Each call runs in one `BEGIN IMMEDIATE` transaction: it loads the rows,
-/// applies one [`OwnershipTable`] decision and writes the changed rows. So two
-/// processes that race a claim are serialized, and one wins.
-#[derive(Clone)]
-pub struct SqlSlotOwnership {
-    pool: Pool<RuntimeConnection>,
-    clock: Arc<dyn ClockSource>,
-}
+/// The row code both SQL stores share.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod sql_rows {
+    use diesel::sql_types::{BigInt, Integer, Text};
 
-impl fmt::Debug for SqlSlotOwnership {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SqlSlotOwnership").finish_non_exhaustive()
+    use super::{
+        FencingToken, OWNERS_TABLE, OwnerId, OwnershipError, OwnershipRow, OwnershipTable,
+        SlotRange, fmt,
+    };
+
+    /// Every row of the ownership table.
+    pub(super) const SELECT_ROWS: &str = "SELECT range_start, range_end, owner_id, epoch, \
+         lease_expires_at FROM _autumn_fleet_slot_owners";
+
+    /// The epoch counter.
+    pub(super) const SELECT_LAST: &str =
+        "SELECT last FROM _autumn_fleet_epoch_counter WHERE id = 1";
+
+    pub(super) fn store_error(error: impl fmt::Display) -> OwnershipError {
+        OwnershipError::Store(crate::db_url::redact_targets_in_message(&error.to_string()))
+    }
+
+    #[derive(diesel::QueryableByName)]
+    pub(super) struct RowSql {
+        #[diesel(sql_type = Integer)]
+        range_start: i32,
+        #[diesel(sql_type = Integer)]
+        range_end: i32,
+        #[diesel(sql_type = Text)]
+        owner_id: String,
+        #[diesel(sql_type = BigInt)]
+        epoch: i64,
+        #[diesel(sql_type = BigInt)]
+        lease_expires_at: i64,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    pub(super) struct LastSql {
+        #[diesel(sql_type = BigInt)]
+        last: i64,
+    }
+
+    pub(super) fn corrupt(detail: impl fmt::Display) -> diesel::result::Error {
+        diesel::result::Error::DeserializationError(
+            format!("{OWNERS_TABLE}: invalid row: {detail}").into(),
+        )
+    }
+
+    /// The table from the stored rows and the stored counter.
+    pub(super) fn table_from(
+        rows: Vec<RowSql>,
+        last: &[LastSql],
+    ) -> diesel::QueryResult<OwnershipTable> {
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let bound = |n: i32| u16::try_from(n).map_err(corrupt);
+                Ok(OwnershipRow {
+                    range: SlotRange::new(bound(row.range_start)?, bound(row.range_end)?)
+                        .map_err(corrupt)?,
+                    owner: OwnerId::new(row.owner_id).map_err(corrupt)?,
+                    epoch: FencingToken::try_from(row.epoch).map_err(corrupt)?,
+                    lease_expires_ms: row.lease_expires_at,
+                })
+            })
+            .collect::<diesel::QueryResult<Vec<_>>>()?;
+        let last = last
+            .first()
+            .map_or(0, |row| u64::try_from(row.last).unwrap_or(0));
+        Ok(OwnershipTable::from_parts(rows, last))
+    }
+
+    /// The rows of `before` that `after` does not have.
+    pub(super) fn gone<'a>(
+        before: &'a OwnershipTable,
+        after: &'a OwnershipTable,
+    ) -> impl Iterator<Item = &'a OwnershipRow> {
+        before
+            .rows()
+            .iter()
+            .filter(|old| !after.rows().iter().any(|new| new.range == old.range))
+    }
+
+    /// The rows of `after` that are new or changed.
+    pub(super) fn changed<'a>(
+        before: &'a OwnershipTable,
+        after: &'a OwnershipTable,
+    ) -> impl Iterator<Item = &'a OwnershipRow> {
+        after
+            .rows()
+            .iter()
+            .filter(|new| !before.rows().contains(new))
     }
 }
 
-impl SqlSlotOwnership {
-    /// A store on `pool`. Lease times come from `clock`.
-    #[must_use]
-    pub fn new(pool: Pool<RuntimeConnection>, clock: Arc<dyn ClockSource>) -> Self {
-        Self { pool, clock }
+/// The SQL store. Its statements are `SQLite`: it runs on the control
+/// database of a `SQLite` app.
+#[cfg(feature = "sqlite")]
+mod sql_store {
+    use diesel::RunQueryDsl as _;
+    use diesel::sql_types::{BigInt, Integer, Text};
+    use diesel_async::pooled_connection::deadpool::Pool;
+
+    use super::sql_rows::{
+        LastSql, RowSql, SELECT_LAST, SELECT_ROWS, changed, corrupt, gone, store_error, table_from,
+    };
+    use super::{
+        Arc, BoxFuture, ClockSource, Duration, FencingToken, Grant, OWNERS_TABLE, OwnerId,
+        OwnershipError, OwnershipRow, OwnershipTable, SCHEMA_SQL, SlotOwnershipStore, SlotRange,
+        fmt,
+    };
+    use crate::db::RuntimeConnection;
+
+    /// The ownership table on a `SQLite` pool, normally the control database.
+    ///
+    /// Each call runs in one `BEGIN IMMEDIATE` transaction: it loads the rows,
+    /// applies one [`OwnershipTable`] decision and writes the changed rows. So two
+    /// processes that race a claim are serialized, and one wins.
+    #[derive(Clone)]
+    pub struct SqlSlotOwnership {
+        pool: Pool<RuntimeConnection>,
+        clock: Arc<dyn ClockSource>,
     }
 
-    /// Create the tables when they do not exist.
-    ///
-    /// # Errors
-    ///
-    /// [`OwnershipError::Store`] when the DDL fails.
-    pub async fn ensure_schema(&self) -> Result<(), OwnershipError> {
-        use diesel_async::SimpleAsyncConnection as _;
-        self.pool
-            .get()
+    impl fmt::Debug for SqlSlotOwnership {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("SqlSlotOwnership").finish_non_exhaustive()
+        }
+    }
+
+    impl SqlSlotOwnership {
+        /// A store on `pool`. Lease times come from `clock`.
+        #[must_use]
+        pub fn new(pool: Pool<RuntimeConnection>, clock: Arc<dyn ClockSource>) -> Self {
+            Self { pool, clock }
+        }
+
+        /// Create the tables when they do not exist.
+        ///
+        /// # Errors
+        ///
+        /// [`OwnershipError::Store`] when the DDL fails.
+        pub async fn ensure_schema(&self) -> Result<(), OwnershipError> {
+            use diesel_async::SimpleAsyncConnection as _;
+            self.pool
+                .get()
+                .await
+                .map_err(store_error)?
+                .batch_execute(SCHEMA_SQL)
+                .await
+                .map_err(store_error)
+        }
+
+        /// Load the table, apply `decide` at the store's time, and write what
+        /// changed, in one write transaction. A refused decision writes nothing.
+        async fn decide<T: Send + 'static>(
+            &self,
+            decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError> + Send + 'static,
+        ) -> Result<T, OwnershipError> {
+            let now_ms = self.clock.now().timestamp_millis();
+            let mut conn = self.pool.get().await.map_err(store_error)?;
+            conn.spawn_blocking(move |conn| {
+                conn.immediate_transaction(|conn| {
+                    let before = load_table(conn)?;
+                    let mut after = before.clone();
+                    let decided = decide(&mut after, now_ms);
+                    if decided.is_ok() {
+                        store_changes(conn, &before, &after)?;
+                    }
+                    Ok(decided)
+                })
+            })
             .await
             .map_err(store_error)?
-            .batch_execute(SCHEMA_SQL)
-            .await
-            .map_err(store_error)
+        }
     }
 
-    /// Load the table, apply `decide` at the store's time, and write what
-    /// changed, in one write transaction. A refused decision writes nothing.
-    async fn decide<T: Send + 'static>(
-        &self,
-        decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError> + Send + 'static,
-    ) -> Result<T, OwnershipError> {
-        let now_ms = self.clock.now().timestamp_millis();
-        let mut conn = self.pool.get().await.map_err(store_error)?;
-        conn.spawn_blocking(move |conn| {
-            conn.immediate_transaction(|conn| {
-                let before = load_table(conn)?;
+    fn load_table(conn: &mut diesel::SqliteConnection) -> diesel::QueryResult<OwnershipTable> {
+        let rows: Vec<RowSql> = diesel::sql_query(SELECT_ROWS).load(conn)?;
+        let last: Vec<LastSql> = diesel::sql_query(SELECT_LAST).load(conn)?;
+        table_from(rows, &last)
+    }
+
+    /// Write the rows of `after` that differ from `before`, and the counter.
+    fn store_changes(
+        conn: &mut diesel::SqliteConnection,
+        before: &OwnershipTable,
+        after: &OwnershipTable,
+    ) -> diesel::QueryResult<()> {
+        for gone in gone(before, after) {
+            diesel::sql_query(format!(
+                "DELETE FROM {OWNERS_TABLE} WHERE range_start = ? AND range_end = ?"
+            ))
+            .bind::<Integer, _>(i32::from(gone.range.start()))
+            .bind::<Integer, _>(i32::from(gone.range.end()))
+            .execute(conn)?;
+        }
+        for row in changed(before, after) {
+            diesel::sql_query(format!(
+                "INSERT OR REPLACE INTO {OWNERS_TABLE} \
+                 (range_start, range_end, owner_id, epoch, lease_expires_at) VALUES (?, ?, ?, ?, ?)"
+            ))
+            .bind::<Integer, _>(i32::from(row.range.start()))
+            .bind::<Integer, _>(i32::from(row.range.end()))
+            .bind::<Text, _>(row.owner.as_str())
+            .bind::<BigInt, _>(row.epoch.as_i64())
+            .bind::<BigInt, _>(row.lease_expires_ms)
+            .execute(conn)?;
+        }
+        if after.last_epoch() != before.last_epoch() {
+            diesel::sql_query(
+                "INSERT INTO _autumn_fleet_epoch_counter (id, last) VALUES (1, ?) \
+                 ON CONFLICT (id) DO UPDATE SET last = excluded.last",
+            )
+            .bind::<BigInt, _>(i64::try_from(after.last_epoch()).map_err(corrupt)?)
+            .execute(conn)?;
+        }
+        Ok(())
+    }
+
+    impl SlotOwnershipStore for SqlSlotOwnership {
+        fn ensure_schema(&self) -> BoxFuture<'_, Result<(), OwnershipError>> {
+            Box::pin(Self::ensure_schema(self))
+        }
+
+        fn claim<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            ttl: Duration,
+            floor: u64,
+        ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+            let owner = owner.clone();
+            Box::pin(
+                self.decide(move |table, now| table.claim_above(range, &owner, now, ttl, floor)),
+            )
+        }
+
+        fn renew<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            epoch: FencingToken,
+            ttl: Duration,
+        ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+            let owner = owner.clone();
+            Box::pin(self.decide(move |table, now| table.renew(range, &owner, epoch, now, ttl)))
+        }
+
+        fn release<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            epoch: FencingToken,
+        ) -> BoxFuture<'a, Result<bool, OwnershipError>> {
+            let owner = owner.clone();
+            Box::pin(self.decide(move |table, now| Ok(table.release(range, &owner, epoch, now))))
+        }
+
+        fn rows(&self) -> BoxFuture<'_, Result<Vec<OwnershipRow>, OwnershipError>> {
+            Box::pin(self.decide(|table, _| Ok(table.rows().to_vec())))
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+pub use sql_store::SqlSlotOwnership;
+
+/// The Postgres store, for a Postgres control database.
+#[cfg(feature = "postgres")]
+mod pg_store {
+    use diesel::sql_types::{BigInt, Integer, Text};
+    use diesel_async::pooled_connection::deadpool::Pool;
+    use diesel_async::{
+        AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _,
+    };
+
+    use super::sql_rows::{
+        LastSql, RowSql, SELECT_LAST, SELECT_ROWS, changed, corrupt, gone, store_error, table_from,
+    };
+    use super::{
+        Arc, BoxFuture, ClockSource, Duration, FencingToken, Grant, OwnerId, OwnershipError,
+        OwnershipRow, OwnershipTable, SCHEMA_SQL, SlotOwnershipStore, SlotRange, fmt,
+    };
+
+    /// Serializes the decisions. Readers that do not lock still read.
+    const LOCK: &str = "LOCK TABLE _autumn_fleet_slot_owners IN EXCLUSIVE MODE";
+
+    const DELETE_ROW: &str =
+        "DELETE FROM _autumn_fleet_slot_owners WHERE range_start = $1 AND range_end = $2";
+
+    const UPSERT_ROW: &str = "INSERT INTO _autumn_fleet_slot_owners \
+         (range_start, range_end, owner_id, epoch, lease_expires_at) VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (range_start, range_end) DO UPDATE SET owner_id = EXCLUDED.owner_id, \
+         epoch = EXCLUDED.epoch, lease_expires_at = EXCLUDED.lease_expires_at";
+
+    const UPSERT_LAST: &str = "INSERT INTO _autumn_fleet_epoch_counter (id, last) VALUES (1, $1) \
+         ON CONFLICT (id) DO UPDATE SET last = EXCLUDED.last";
+
+    /// The key of the transaction advisory lock around the DDL. Two
+    /// `CREATE TABLE IF NOT EXISTS` at once can fail on the catalog.
+    fn schema_lock_key() -> i64 {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(b"autumn:fleet-slot-owners:v1\0schema");
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        i64::from_be_bytes(bytes)
+    }
+
+    /// The ownership table on a Postgres pool, normally the control database.
+    ///
+    /// Each call is one transaction. It takes an `EXCLUSIVE` lock on the
+    /// table, loads the rows, applies one [`OwnershipTable`] decision and
+    /// writes the changed rows. So two hosts that race a claim are
+    /// serialized, and one wins. Lease times come from the store's clock, as
+    /// in `SqlSlotOwnership`.
+    #[derive(Clone)]
+    pub struct PgSlotOwnership {
+        pool: Pool<AsyncPgConnection>,
+        clock: Arc<dyn ClockSource>,
+    }
+
+    impl fmt::Debug for PgSlotOwnership {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("PgSlotOwnership").finish_non_exhaustive()
+        }
+    }
+
+    impl PgSlotOwnership {
+        /// A store on `pool`. Use a primary pool. Lease times come from
+        /// `clock`.
+        #[must_use]
+        pub fn new(pool: Pool<AsyncPgConnection>, clock: Arc<dyn ClockSource>) -> Self {
+            Self { pool, clock }
+        }
+
+        /// Makes the tables when they do not exist. Safe when many hosts
+        /// boot at once.
+        ///
+        /// # Errors
+        ///
+        /// [`OwnershipError::Store`] when the DDL fails.
+        pub async fn ensure_schema(&self) -> Result<(), OwnershipError> {
+            let mut conn = self.pool.get().await.map_err(store_error)?;
+            // One simple query with many statements is one implicit
+            // transaction, so the transaction lock covers the DDL.
+            conn.batch_execute(&format!(
+                "SELECT pg_advisory_xact_lock({}); {SCHEMA_SQL}",
+                schema_lock_key()
+            ))
+            .await
+            .map_err(store_error)
+        }
+
+        /// Loads the table, applies `decide` at the store's time, and writes
+        /// what changed, in one transaction. A refused decision writes
+        /// nothing.
+        async fn decide<T: Send + 'static>(
+            &self,
+            decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError> + Send + 'static,
+        ) -> Result<T, OwnershipError> {
+            let now_ms = self.clock.now().timestamp_millis();
+            let mut conn = self.pool.get().await.map_err(store_error)?;
+            conn.transaction::<_, diesel::result::Error, _>(async move |conn| {
+                diesel::sql_query(LOCK).execute(conn).await?;
+                let rows: Vec<RowSql> = diesel::sql_query(SELECT_ROWS).load(conn).await?;
+                let last: Vec<LastSql> = diesel::sql_query(SELECT_LAST).load(conn).await?;
+                let before = table_from(rows, &last)?;
                 let mut after = before.clone();
                 let decided = decide(&mut after, now_ms);
                 if decided.is_ok() {
-                    store_changes(conn, &before, &after)?;
+                    store_changes(conn, &before, &after).await?;
                 }
                 Ok(decided)
             })
-        })
-        .await
-        .map_err(store_error)?
+            .await
+            .map_err(store_error)?
+        }
+    }
+
+    /// Writes the rows of `after` that differ from `before`, and the counter.
+    /// The deletes go first: a new row can take the range of a removed one.
+    async fn store_changes(
+        conn: &mut AsyncPgConnection,
+        before: &OwnershipTable,
+        after: &OwnershipTable,
+    ) -> diesel::QueryResult<()> {
+        for row in gone(before, after) {
+            diesel::sql_query(DELETE_ROW)
+                .bind::<Integer, _>(i32::from(row.range.start()))
+                .bind::<Integer, _>(i32::from(row.range.end()))
+                .execute(conn)
+                .await?;
+        }
+        for row in changed(before, after) {
+            diesel::sql_query(UPSERT_ROW)
+                .bind::<Integer, _>(i32::from(row.range.start()))
+                .bind::<Integer, _>(i32::from(row.range.end()))
+                .bind::<Text, _>(row.owner.as_str())
+                .bind::<BigInt, _>(row.epoch.as_i64())
+                .bind::<BigInt, _>(row.lease_expires_ms)
+                .execute(conn)
+                .await?;
+        }
+        if after.last_epoch() != before.last_epoch() {
+            diesel::sql_query(UPSERT_LAST)
+                .bind::<BigInt, _>(i64::try_from(after.last_epoch()).map_err(corrupt)?)
+                .execute(conn)
+                .await?;
+        }
+        Ok(())
+    }
+
+    impl SlotOwnershipStore for PgSlotOwnership {
+        fn ensure_schema(&self) -> BoxFuture<'_, Result<(), OwnershipError>> {
+            Box::pin(Self::ensure_schema(self))
+        }
+
+        fn claim<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            ttl: Duration,
+            floor: u64,
+        ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+            let owner = owner.clone();
+            Box::pin(
+                self.decide(move |table, now| table.claim_above(range, &owner, now, ttl, floor)),
+            )
+        }
+
+        fn renew<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            epoch: FencingToken,
+            ttl: Duration,
+        ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+            let owner = owner.clone();
+            Box::pin(self.decide(move |table, now| table.renew(range, &owner, epoch, now, ttl)))
+        }
+
+        fn release<'a>(
+            &'a self,
+            range: SlotRange,
+            owner: &'a OwnerId,
+            epoch: FencingToken,
+        ) -> BoxFuture<'a, Result<bool, OwnershipError>> {
+            let owner = owner.clone();
+            Box::pin(self.decide(move |table, now| Ok(table.release(range, &owner, epoch, now))))
+        }
+
+        fn rows(&self) -> BoxFuture<'_, Result<Vec<OwnershipRow>, OwnershipError>> {
+            Box::pin(self.decide(|table, _| Ok(table.rows().to_vec())))
+        }
     }
 }
 
-fn store_error(error: impl fmt::Display) -> OwnershipError {
-    OwnershipError::Store(error.to_string())
-}
-
-#[derive(diesel::QueryableByName)]
-struct RowSql {
-    #[diesel(sql_type = Integer)]
-    range_start: i32,
-    #[diesel(sql_type = Integer)]
-    range_end: i32,
-    #[diesel(sql_type = Text)]
-    owner_id: String,
-    #[diesel(sql_type = BigInt)]
-    epoch: i64,
-    #[diesel(sql_type = BigInt)]
-    lease_expires_at: i64,
-}
-
-#[derive(diesel::QueryableByName)]
-struct LastSql {
-    #[diesel(sql_type = BigInt)]
-    last: i64,
-}
-
-fn corrupt(detail: impl fmt::Display) -> diesel::result::Error {
-    diesel::result::Error::DeserializationError(
-        format!("{OWNERS_TABLE}: invalid row: {detail}").into(),
-    )
-}
-
-fn load_table(conn: &mut diesel::SqliteConnection) -> diesel::QueryResult<OwnershipTable> {
-    let rows: Vec<RowSql> = diesel::sql_query(format!(
-        "SELECT range_start, range_end, owner_id, epoch, lease_expires_at FROM {OWNERS_TABLE}"
-    ))
-    .load(conn)?;
-    let last: Vec<LastSql> =
-        diesel::sql_query("SELECT last FROM _autumn_fleet_epoch_counter WHERE id = 1")
-            .load(conn)?;
-    let rows = rows
-        .into_iter()
-        .map(|row| {
-            let bound = |n: i32| u16::try_from(n).map_err(corrupt);
-            Ok(OwnershipRow {
-                range: SlotRange::new(bound(row.range_start)?, bound(row.range_end)?)
-                    .map_err(corrupt)?,
-                owner: OwnerId::new(row.owner_id).map_err(corrupt)?,
-                epoch: FencingToken::try_from(row.epoch).map_err(corrupt)?,
-                lease_expires_ms: row.lease_expires_at,
-            })
-        })
-        .collect::<diesel::QueryResult<Vec<_>>>()?;
-    let last = last
-        .first()
-        .map_or(0, |row| u64::try_from(row.last).unwrap_or(0));
-    Ok(OwnershipTable::from_parts(rows, last))
-}
-
-/// Write the rows of `after` that differ from `before`, and the counter.
-fn store_changes(
-    conn: &mut diesel::SqliteConnection,
-    before: &OwnershipTable,
-    after: &OwnershipTable,
-) -> diesel::QueryResult<()> {
-    for gone in before
-        .rows()
-        .iter()
-        .filter(|old| !after.rows().iter().any(|new| new.range == old.range))
-    {
-        diesel::sql_query(format!(
-            "DELETE FROM {OWNERS_TABLE} WHERE range_start = ? AND range_end = ?"
-        ))
-        .bind::<Integer, _>(i32::from(gone.range.start()))
-        .bind::<Integer, _>(i32::from(gone.range.end()))
-        .execute(conn)?;
-    }
-    for row in after
-        .rows()
-        .iter()
-        .filter(|new| !before.rows().contains(new))
-    {
-        diesel::sql_query(format!(
-            "INSERT OR REPLACE INTO {OWNERS_TABLE} \
-             (range_start, range_end, owner_id, epoch, lease_expires_at) VALUES (?, ?, ?, ?, ?)"
-        ))
-        .bind::<Integer, _>(i32::from(row.range.start()))
-        .bind::<Integer, _>(i32::from(row.range.end()))
-        .bind::<Text, _>(row.owner.as_str())
-        .bind::<BigInt, _>(row.epoch.as_i64())
-        .bind::<BigInt, _>(row.lease_expires_ms)
-        .execute(conn)?;
-    }
-    if after.last_epoch() != before.last_epoch() {
-        diesel::sql_query(
-            "INSERT INTO _autumn_fleet_epoch_counter (id, last) VALUES (1, ?) \
-             ON CONFLICT (id) DO UPDATE SET last = excluded.last",
-        )
-        .bind::<BigInt, _>(i64::try_from(after.last_epoch()).map_err(corrupt)?)
-        .execute(conn)?;
-    }
-    Ok(())
-}
-
-impl SlotOwnershipStore for SqlSlotOwnership {
-    fn claim<'a>(
-        &'a self,
-        range: SlotRange,
-        owner: &'a OwnerId,
-        ttl: Duration,
-        floor: u64,
-    ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
-        let owner = owner.clone();
-        Box::pin(self.decide(move |table, now| table.claim_above(range, &owner, now, ttl, floor)))
-    }
-
-    fn renew<'a>(
-        &'a self,
-        range: SlotRange,
-        owner: &'a OwnerId,
-        epoch: FencingToken,
-        ttl: Duration,
-    ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
-        let owner = owner.clone();
-        Box::pin(self.decide(move |table, now| table.renew(range, &owner, epoch, now, ttl)))
-    }
-
-    fn release<'a>(
-        &'a self,
-        range: SlotRange,
-        owner: &'a OwnerId,
-        epoch: FencingToken,
-    ) -> BoxFuture<'a, Result<bool, OwnershipError>> {
-        let owner = owner.clone();
-        Box::pin(self.decide(move |table, now| Ok(table.release(range, &owner, epoch, now))))
-    }
-
-    fn rows(&self) -> BoxFuture<'_, Result<Vec<OwnershipRow>, OwnershipError>> {
-        Box::pin(self.decide(|table, _| Ok(table.rows().to_vec())))
-    }
-}
+#[cfg(feature = "postgres")]
+pub use pg_store::PgSlotOwnership;
 
 // ── This host's ownership ───────────────────────────────────────────────────
 
@@ -1095,6 +1362,19 @@ impl FleetOwnership {
         held
     }
 
+    /// The newest epoch a replicator or a fence saw at the destination for
+    /// `slot`. `0` when none did.
+    #[must_use]
+    pub(crate) fn fence_floor(&self, slot: u16) -> u64 {
+        self.ranges
+            .iter()
+            .zip(&self.fence_floors)
+            .filter(|(range, _)| range.contains(slot))
+            .map(|(_, floor)| floor.load(std::sync::atomic::Ordering::Acquire))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Drop the range that holds `slot` when its epoch is older than
     /// `newer` (a replicator saw `newer` at the destination). Returns whether
     /// a range was dropped.
@@ -1266,9 +1546,87 @@ impl crate::actuator::HealthIndicator for OwnershipIndicator {
     }
 }
 
-#[cfg(test)]
+/// An ownership table in memory, for tests of one process and the fleet
+/// conformance kit. Each call is one [`OwnershipTable`] decision at the
+/// clock's time.
+#[cfg(any(test, feature = "sqlite"))]
+pub(crate) struct MemoryOwnership {
+    table: Mutex<OwnershipTable>,
+    clock: Arc<dyn crate::time::ClockSource>,
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl MemoryOwnership {
+    pub(crate) fn new(clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        Self {
+            table: Mutex::new(OwnershipTable::new()),
+            clock,
+        }
+    }
+
+    fn decide<T>(
+        &self,
+        decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError>,
+    ) -> Result<T, OwnershipError> {
+        let now = self.clock.now().timestamp_millis();
+        let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut after = table.clone();
+        let decided = decide(&mut after, now);
+        if decided.is_ok() {
+            *table = after;
+        }
+        drop(table);
+        decided
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl SlotOwnershipStore for MemoryOwnership {
+    fn claim<'a>(
+        &'a self,
+        range: SlotRange,
+        owner: &'a OwnerId,
+        ttl: Duration,
+        floor: u64,
+    ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+        let result = self.decide(|t, now| t.claim_above(range, owner, now, ttl, floor));
+        Box::pin(std::future::ready(result))
+    }
+
+    fn renew<'a>(
+        &'a self,
+        range: SlotRange,
+        owner: &'a OwnerId,
+        epoch: FencingToken,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<Grant, OwnershipError>> {
+        let result = self.decide(|t, now| t.renew(range, owner, epoch, now, ttl));
+        Box::pin(std::future::ready(result))
+    }
+
+    fn release<'a>(
+        &'a self,
+        range: SlotRange,
+        owner: &'a OwnerId,
+        epoch: FencingToken,
+    ) -> BoxFuture<'a, Result<bool, OwnershipError>> {
+        let result = self.decide(|t, now| Ok(t.release(range, owner, epoch, now)));
+        Box::pin(std::future::ready(result))
+    }
+
+    fn rows(&self) -> BoxFuture<'_, Result<Vec<OwnershipRow>, OwnershipError>> {
+        let result = self.decide(|t, _| Ok(t.rows().to_vec()));
+        Box::pin(std::future::ready(result))
+    }
+}
+
+// The tests use the SQL store, which is `SQLite`.
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
+    use crate::db::RuntimeConnection;
+    use diesel::sql_types::Text;
+    use diesel_async::pooled_connection::deadpool::Pool;
 
     const TTL: Duration = Duration::from_secs(30);
 
@@ -2372,6 +2730,7 @@ mod tests {
                 root: dir.join(volume).display().to_string(),
                 path: None,
                 max_open: 8,
+                max_resident_bytes: 0,
                 pool_size: 2,
                 create_on_demand: Some(true),
                 idle_close_secs: 0,
@@ -2381,6 +2740,9 @@ mod tests {
                 restore_check_sample: 0,
                 replication_workers: 4,
                 min_residency: std::time::Duration::from_secs(2),
+                max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
+                mmap_size: 0,
+                cache_size_kib: 0,
             })
             .build()
             .unwrap();
@@ -2567,6 +2929,33 @@ mod tests {
             assert_eq!(ownership.held(), vec![(SlotRange::ALL, token(1))]);
             let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
             assert!(b.ownership.held().is_empty(), "nobody else may claim it");
+        }
+
+        /// A file stamped by a newer owner is refused with `421`, and the
+        /// file stays as it is.
+        #[tokio::test]
+        async fn an_open_refuses_a_file_a_newer_owner_stamped() {
+            use diesel::Connection as _;
+            use diesel::connection::SimpleConnection as _;
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = a.fleet.key_for("acme").unwrap();
+            drop(a.fleet.open(&key).await.unwrap());
+            a.fleet.close(&key).await;
+            let path = a.fleet.path_of(&key);
+            diesel::SqliteConnection::establish(&path.display().to_string())
+                .unwrap()
+                .batch_execute("UPDATE _autumn_fleet_epoch SET epoch = 999 WHERE id = 1")
+                .unwrap();
+            let error = a.fleet.open(&key).await.unwrap_err();
+            assert!(
+                matches!(error, FleetError::NewerEpoch { found: 999, .. }),
+                "{error}"
+            );
+            assert_eq!(error.http_status(), http::StatusCode::MISDIRECTED_REQUEST);
+            assert!(a.fleet.exists(&key), "a refused open replaces nothing");
+            a.fleet.close_all().await;
         }
 
         #[tokio::test(start_paused = true)]
@@ -3040,6 +3429,91 @@ mod tests {
             assert_eq!(db_c.epoch(), Some(token(3)));
             assert_eq!(bodies(&db_c).await, vec!["a1", "b1"]);
             c.fleet.close_all().await;
+        }
+
+        /// Each write at or before the old owner's last bound is in the
+        /// new owner's copy. A fenced old owner claims nothing.
+        #[tokio::test]
+        async fn a_takeover_restore_has_every_write_the_old_owner_covered() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            let mut committed = Vec::new();
+            for (i, ship) in [true, false, true, true, false, false]
+                .into_iter()
+                .enumerate()
+            {
+                let body = format!("a{i}");
+                exec(&db_a, &format!("INSERT INTO notes VALUES ('{body}')"))
+                    .await
+                    .unwrap();
+                committed.push((body, a.clock.now()));
+                // The app reads the clock after the commit. Time moves on.
+                a.clock.advance(Duration::from_millis(10));
+                if ship {
+                    tick(&a.replication).await;
+                }
+            }
+            let through = a
+                .replication
+                .replicated_through(&key)
+                .expect("A shipped under its epoch");
+            assert!(
+                committed.iter().any(|(_, at)| *at > through),
+                "the last writes are not shipped yet"
+            );
+
+            // B takes over from the replica. A is partitioned from the store.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            let db_b = b.fleet.open(&key).await.unwrap();
+            let restored = bodies(&db_b).await;
+            for (body, at) in &committed {
+                if *at <= through {
+                    assert!(
+                        restored.contains(body),
+                        "{body} at {at} <= {through}: {restored:?}"
+                    );
+                }
+            }
+            tick(&b.replication).await;
+
+            assert_eq!(
+                a.replication.replicated_through(&key),
+                Some(through),
+                "A has not learned of B yet"
+            );
+            // A learns that it lost the range: its bound goes before any fence.
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(
+                a.replication.replicated_through(&key),
+                None,
+                "a host that does not serve the slot claims nothing"
+            );
+
+            // A's next fence check sees B's epoch: A claims nothing more.
+            a.clock.advance(Duration::from_mins(2));
+            tick(&a.replication).await;
+            assert_eq!(a.replication.replicated_through(&key), None);
+            let waited = a
+                .fleet
+                .wait_replicated(&key, through, Duration::from_secs(5))
+                .await;
+            assert!(
+                matches!(
+                    waited,
+                    Err(crate::db::fleet_replication::ReplicatedWaitError::Fenced { .. })
+                ),
+                "{waited:?}"
+            );
+            drop((db_a, db_b));
+            a.fleet.close_all().await;
+            b.fleet.close_all().await;
         }
     }
 

@@ -91,6 +91,8 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   connection acquired lazily — long after the database was resolved — never
   finds its pool closed. The sweeper re-checks `max_open` at least once per grace
   window, so a burst of opens does not stay over the cap.
+  `max_open_policy = "wait"` or `"refuse"` makes the cap hard for request
+  opens (#3538). An open at the cap waits for a close, or answers `503`.
 - A new database is built in a private staging file beside its path —
   identity row and every migration — and published with a hard link, which
   refuses an existing target. A database is therefore absent or complete,
@@ -326,15 +328,16 @@ and the replication path both check it.
   generations by (epoch, time). The sweep never removes a generation without
   `snapshot.json` that is newer than the floor (an upload in progress). A
   replicator with no epoch records the newest epoch at the destination, so
-  turning ownership off does not order new generations below old ones. The
-  replicator lists `<root>/epochs/` at each new generation and every 60 s. A
-  newer epoch stops it (`ReplicationError::Fenced`), and the host loses the
-  range. A replica with no markers is epoch 0, so old replicas restore as
+  turning ownership off does not order new generations below old ones. Core
+  lists `<root>/epochs/` before each put to the replica (ADR 0040, "Notes
+  from step 3"). A newer epoch refuses the put and stops the replicator
+  (`ReplicationError::Fenced`), and the host loses the range. A replica with no markers is epoch 0, so old replicas restore as
   before.
 - **One replicator per database (#3230).** The epoch is the election token
   across hosts: only the owner of the current epoch opens the database. An
-  old replicator can still ship for up to 60 s, into its old epoch's
-  generation; the restore order makes that harmless. The lock file still
+  old replicator can still land one put that was in flight when the newer
+  marker landed, into its old epoch's generation; the restore order makes
+  that harmless. The lock file still
   elects one process inside the host. A parked replicator that reopens under
   a new epoch starts a new generation.
 
@@ -428,8 +431,9 @@ proofs are in `verification/fleet_replica_tombstones.rs`.
   SQLite-fleet app share handlers and repositories.
 - Bounded resources: `max_open × pool_size` connections, about
   `max_open × (2 × pool_size + 1)` file descriptors, when the fleet is not
-  busy. A burst can open more than `max_open` databases: the limit is soft
-  (see `database.fleet.min_residency` and ADR 0031).
+  busy. With `max_open_policy = "soft"` (the default), a burst can open more
+  than `max_open` databases: the limit is soft (see
+  `database.fleet.min_residency` and ADR 0031).
 - Metrics stay bounded: a fleet database's metric and route label is
   `shard=fleet`; its name goes on spans and logs only.
 

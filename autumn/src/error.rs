@@ -266,10 +266,10 @@ where
         // a refused negative balance are state conflicts, so they take 409.
         // An overflow is a value the server built and could not hold, so it
         // stays a 500. Mapped by downcast for the reason on the Constela arm.
-        // A SQLite fleet (ADR 0019): an unusable tenant id is the client's
+        // A fleet (ADR 0019): an unusable tenant id is the client's
         // fault (400), an unknown tenant database is 404, a pending migration
         // is 503. Mapped by downcast for the reason on the Constela arm.
-        #[cfg(feature = "sqlite")]
+        #[cfg(feature = "db")]
         if let Some(fleet_err) = any_err.downcast_ref::<crate::db::fleet::FleetError>() {
             status = fleet_err.http_status();
         }
@@ -1601,6 +1601,11 @@ impl IntoResponse for AutumnError {
         let message = self.inner.to_string();
         let (status, problem_type) = self.rendered_problem();
 
+        #[cfg(feature = "db")]
+        let retry_after = self
+            .inner
+            .downcast_ref::<crate::db::fleet::FleetError>()
+            .and_then(crate::db::fleet::FleetError::retry_after_secs);
         let details = self.details.clone();
         #[cfg(feature = "idempotency")]
         let cache_idempotency_response = self.cache_idempotency_response;
@@ -1632,6 +1637,12 @@ impl IntoResponse for AutumnError {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),
         );
+        #[cfg(feature = "db")]
+        if let Some(secs) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
         if status == StatusCode::CONFLICT {
             response.headers_mut().insert(
                 "HX-Trigger",
@@ -1921,6 +1932,29 @@ mod tests {
         assert_eq!(
             err.source_chain(),
             vec!["database connection dropped".to_string()]
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_full_fleet_answers_503_with_retry_after() {
+        let err = AutumnError::from(crate::db::fleet::FleetError::AtCapacity {
+            name: "slot-1".into(),
+            max_open: 2,
+            retry_after_secs: 3,
+        });
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "3");
+
+        let other = AutumnError::from(crate::db::fleet::FleetError::NotFound {
+            name: "slot-1".into(),
+        });
+        assert!(
+            !other
+                .into_response()
+                .headers()
+                .contains_key(header::RETRY_AFTER)
         );
     }
 

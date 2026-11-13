@@ -92,6 +92,8 @@ autumn-web = { version = "0.10.0", path = "../autumn", default-features = false,
     "openapi"
 ] }
 autumn-schema-core = { version = "0.10.0", path = "../autumn-schema-core" }
+# The wire descriptor types the macros write. `autumn contracts` reads them.
+autumn-macros-support = { version = "0.10.0", path = "../autumn-macros-support" }
 # `autumn edge serve` / `autumn edge ttfb` (#1790). `node` is the native edge
 # node: the wasmi host, an HTTP server and the origin client.
 autumn-edge = { version = "0.10.0", path = "../autumn-edge", features = ["node"] }
@@ -175,6 +177,10 @@ rcgen = { workspace = true }
 # Parses the YAML that `autumn slo generate` writes, in its tests (#3069).
 # The lock file already has it through `autumn-web/openapi`.
 serde-saphyr = "2"
+# Parses each schema `autumn contracts export --avro` writes, and checks Avro
+# schema resolution against `autumn contracts check`. Test-only: the export
+# writes text and needs no Avro library.
+apache-avro = { version = "0.21", default-features = false }
 
 [lints]
 workspace = true

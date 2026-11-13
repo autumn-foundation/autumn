@@ -245,6 +245,123 @@ async fn submitted_multi(
     format!("color_ids={:?} words={:?}", multi.color_ids, multi.words)
 }
 
+/// An APG tree with nested groups: `src` (`lib.rs`, `bin` (`main.rs`)),
+/// `docs` (`guide.md`), `README.md`. All parents are closed.
+fn file_tree() -> Markup {
+    html! {
+        ul id="t" role="tree" aria-label="Files" data-autumn-roving
+            data-autumn-orientation="vertical" data-autumn-typeahead {
+            li id="t-src" role="treeitem" aria-expanded="false" {
+                span { "src" }
+                ul role="group" hidden {
+                    li id="t-lib" role="treeitem" { "lib.rs" }
+                    li id="t-bin" role="treeitem" aria-expanded="false" {
+                        span { "bin" }
+                        ul role="group" hidden {
+                            li id="t-main" role="treeitem" { "main.rs" }
+                        }
+                    }
+                }
+            }
+            li id="t-docs" role="treeitem" aria-expanded="false" {
+                span { "docs" }
+                ul role="group" hidden {
+                    li id="t-guide" role="treeitem" { "guide.md" }
+                }
+            }
+            li id="t-readme" role="treeitem" { "README.md" }
+        }
+    }
+}
+
+/// The same tree with row items: `li role="none"` holds the item and its
+/// group, and the item names the group in `aria-owns`.
+fn row_tree() -> Markup {
+    html! {
+        ul id="r" role="tree" aria-label="Files" data-autumn-roving
+            data-autumn-orientation="vertical" {
+            li role="none" {
+                div id="r-src" role="treeitem" aria-expanded="false" aria-owns="r-src-group" { "src" }
+                ul id="r-src-group" role="group" hidden {
+                    li role="none" { div id="r-lib" role="treeitem" { "lib.rs" } }
+                    li role="none" {
+                        div id="r-bin" role="treeitem" aria-expanded="false" aria-owns="r-bin-group" { "bin" }
+                        ul id="r-bin-group" role="group" hidden {
+                            li role="none" { div id="r-main" role="treeitem" { "main.rs" } }
+                        }
+                    }
+                }
+            }
+            li role="none" {
+                div id="r-docs" role="treeitem" aria-expanded="false" aria-owns="r-docs-group" { "docs" }
+                ul id="r-docs-group" role="group" hidden {
+                    li role="none" { div id="r-guide" role="treeitem" { "guide.md" } }
+                }
+            }
+        }
+    }
+}
+
+/// A tree with a disabled parent: `d` (`x`) is disabled, `e` is not.
+fn disabled_tree() -> Markup {
+    html! {
+        ul id="dt" role="tree" aria-label="Files" data-autumn-roving
+            data-autumn-orientation="vertical" {
+            li id="dt-d" role="treeitem" aria-expanded="false" aria-disabled="true" {
+                span { "d" }
+                ul role="group" hidden {
+                    li id="dt-x" role="treeitem" aria-disabled="true" { "x" }
+                    li id="dt-z" role="treeitem" { "z" }
+                }
+            }
+            li id="dt-e" role="treeitem" { "e" }
+        }
+    }
+}
+
+#[get("/tree-disabled")]
+async fn tree_disabled_page() -> Markup {
+    layout("ltr", &disabled_tree())
+}
+
+/// A tree whose owned group is far from its owner: after the other root
+/// item. The guide says to put the group just after its owner. `ArrowRight`
+/// and `ArrowLeft` still follow `aria-owns` here.
+fn far_owned_tree() -> Markup {
+    html! {
+        ul id="f" role="tree" aria-label="Files" data-autumn-roving
+            data-autumn-orientation="vertical" {
+            li role="none" {
+                div id="f-src" role="treeitem" aria-expanded="false" aria-owns="f-src-group" { "src" }
+            }
+            li role="none" { div id="f-readme" role="treeitem" { "README.md" } }
+            ul id="f-src-group" role="group" hidden {
+                li role="none" { div id="f-lib" role="treeitem" { "lib.rs" } }
+            }
+        }
+    }
+}
+
+#[get("/tree-far")]
+async fn tree_far_page() -> Markup {
+    layout("ltr", &far_owned_tree())
+}
+
+#[get("/tree-rows")]
+async fn tree_rows_page() -> Markup {
+    layout("ltr", &row_tree())
+}
+
+#[get("/tree")]
+async fn tree_page() -> Markup {
+    layout("ltr", &file_tree())
+}
+
+#[get("/tree-rtl")]
+async fn tree_rtl_page() -> Markup {
+    layout("rtl", &file_tree())
+}
+
 async fn runner() -> SystemTestRunner {
     Box::pin(
         SystemTest::new()
@@ -259,7 +376,12 @@ async fn runner() -> SystemTestRunner {
                 colors,
                 colors_create,
                 submitted,
-                submitted_multi
+                submitted_multi,
+                tree_page,
+                tree_rtl_page,
+                tree_rows_page,
+                tree_disabled_page,
+                tree_far_page
             ])
             .build(),
     )
@@ -1505,4 +1627,217 @@ async fn widgets_run_under_the_default_csp_with_no_inline_script() {
     page.expect_no_console_errors()
         .await
         .expect("no CSP errors");
+}
+
+// ── Tree view ───────────────────────────────────────────────────────────
+
+/// Record each `autumn:expand` and `autumn:collapse` in `window.treeEvents`.
+async fn count_tree_events(page: &Page) {
+    assert!(
+        eval_bool(
+            page,
+            "(() => { window.treeEvents = []; \
+             ['autumn:expand', 'autumn:collapse'].forEach(n => document.addEventListener(n, \
+             e => window.treeEvents.push(n + ' ' + e.target.id + ' ' + e.detail.item.id))); \
+             return true; })()"
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_down_and_up_skip_a_closed_branch() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree").await;
+    assert_eq!(attr(&page, "t-src", "tabindex").await, "0");
+    focus(&page, "t-src").await;
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_id(&page).await, "t-docs");
+    press(&page, "End").await;
+    assert_eq!(active_id(&page).await, "t-readme");
+    press(&page, "ArrowUp").await;
+    assert_eq!(active_id(&page).await, "t-docs");
+    // Typeahead skips `guide.md` in the closed `docs`.
+    press(&page, "g").await;
+    assert_eq!(active_id(&page).await, "t-docs");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_right_opens_a_branch_then_moves_to_its_first_child() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree").await;
+    count_tree_events(&page).await;
+    focus(&page, "t-src").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
+    assert_eq!(
+        active_id(&page).await,
+        "t-src",
+        "Right on a closed node keeps focus"
+    );
+    assert!(
+        eval_bool(
+            &page,
+            "!document.querySelector('#t-src > [role=group]').hidden"
+        )
+        .await
+    );
+    // A new visible item takes focus by script, and the tab stop stays.
+    assert_eq!(attr(&page, "t-lib", "tabindex").await, "-1");
+    assert_eq!(attr(&page, "t-src", "tabindex").await, "0");
+    focus(&page, "t-lib").await;
+    assert_eq!(
+        attr(&page, "t-lib", "tabindex").await,
+        "0",
+        "focus moves the tab stop"
+    );
+    focus(&page, "t-src").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "t-lib");
+    // Right on an end node does nothing.
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "t-lib");
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_id(&page).await, "t-bin");
+    assert_eq!(
+        eval_string(&page, "window.treeEvents.join(',')").await,
+        "autumn:expand t-src t-src"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_left_closes_a_branch_then_moves_to_its_parent() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree").await;
+    count_tree_events(&page).await;
+    focus(&page, "t-src").await;
+    press(&page, "ArrowRight").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "t-lib");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(
+        active_id(&page).await,
+        "t-src",
+        "Left on a child moves to the parent"
+    );
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "false");
+    assert_eq!(active_id(&page).await, "t-src");
+    // Left on a closed root node does nothing.
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "t-src");
+    assert_eq!(
+        eval_string(&page, "window.treeEvents.join(',')").await,
+        "autumn:expand t-src t-src,autumn:collapse t-src t-src"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_star_opens_all_siblings() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree").await;
+    focus(&page, "t-readme").await;
+    press(&page, "*").await;
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
+    assert_eq!(attr(&page, "t-docs", "aria-expanded").await, "true");
+    // Only the siblings: `bin` stays closed.
+    assert_eq!(attr(&page, "t-bin", "aria-expanded").await, "false");
+    assert_eq!(active_id(&page).await, "t-readme");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn rtl_tree_swaps_left_and_right() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree-rtl").await;
+    focus(&page, "t-src").await;
+    press(&page, "ArrowLeft").await;
+    assert_eq!(attr(&page, "t-src", "aria-expanded").await, "true");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "t-lib");
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "t-src");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_keys_follow_aria_owns_for_row_items() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree-rows").await;
+    focus(&page, "r-src").await;
+    press(&page, "ArrowDown").await;
+    assert_eq!(
+        active_id(&page).await,
+        "r-docs",
+        "the closed branch is skipped"
+    );
+    press(&page, "ArrowUp").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(attr(&page, "r-src", "aria-expanded").await, "true");
+    assert!(eval_bool(&page, "!document.getElementById('r-src-group').hidden").await);
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "r-lib");
+    press(&page, "ArrowDown").await;
+    // `*` opens each closed node at this level, the focused one too.
+    press(&page, "*").await;
+    assert_eq!(attr(&page, "r-bin", "aria-expanded").await, "true");
+    assert_eq!(active_id(&page).await, "r-bin");
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "r-main");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(
+        active_id(&page).await,
+        "r-bin",
+        "Left follows aria-owns to the parent"
+    );
+    press(&page, "ArrowLeft").await;
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "r-src");
+    press(&page, "*").await;
+    assert_eq!(attr(&page, "r-docs", "aria-expanded").await, "true");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_disabled_items_take_focus_so_their_children_stay_reachable() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree-disabled").await;
+    assert_eq!(attr(&page, "dt-d", "tabindex").await, "0");
+    focus(&page, "dt-d").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(attr(&page, "dt-d", "aria-expanded").await, "true");
+    // The first child is disabled. Right still moves to it.
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "dt-x");
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_id(&page).await, "dt-z");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "dt-d");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tree_right_finds_the_first_child_of_a_far_owned_group() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/tree-far").await;
+    focus(&page, "f-src").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(attr(&page, "f-src", "aria-expanded").await, "true");
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "f-lib");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(active_id(&page).await, "f-src");
 }

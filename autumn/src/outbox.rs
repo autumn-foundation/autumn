@@ -73,8 +73,16 @@ pub const TOPIC_MAIL: &str = "autumn.mail";
 #[cfg(feature = "http-client")]
 pub const TOPIC_WEBHOOK: &str = "autumn.webhook";
 
+/// Topic of a message that the inbox endpoint took for one `#[listener]`.
+/// See [`INBOX_PATH`].
+pub const TOPIC_INBOX: &str = "autumn.inbox";
+
+pub(crate) mod remote;
+pub(crate) use remote::inbox_router;
+pub use remote::{INBOX_PATH, MESSAGE_ID_HEADER, SIGNATURE_HEADER, TOPIC_HEADER, inbox_signature};
+
 /// Topics that start with this prefix belong to the framework.
-pub const RESERVED_TOPIC_PREFIX: &str = "autumn.";
+pub const RESERVED_TOPIC_PREFIX: &str = crate::config::OUTBOX_RESERVED_TOPIC_PREFIX;
 
 /// How often the relay worker deletes old rows.
 const PURGE_INTERVAL: Duration = Duration::from_secs(60);
@@ -816,6 +824,18 @@ async fn insert_message(
     payload: &Value,
 ) -> AutumnResult<String> {
     let id = entropy.uuid_v4().to_string();
+    insert_message_with_id(conn, id, clock, aggregate, topic, payload).await
+}
+
+/// [`insert_message`] with a given `id`.
+async fn insert_message_with_id(
+    conn: &mut RuntimeConnection,
+    id: String,
+    clock: &dyn ClockSource,
+    aggregate: Option<&str>,
+    topic: &str,
+    payload: &Value,
+) -> AutumnResult<String> {
     let now = to_millis(clock.now());
     diesel::sql_query(sql(INSERT_SQL))
         .bind::<Text, _>(&id)
@@ -902,10 +922,7 @@ impl std::fmt::Debug for OutboxHandlers {
 /// `true` when `topic` uses only `A-Z a-z 0-9 . _ : -`. The relay puts
 /// topics in its SQL text, so no other character is allowed.
 fn is_valid_topic(topic: &str) -> bool {
-    !topic.is_empty()
-        && topic
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    crate::config::is_valid_outbox_topic(topic)
 }
 
 impl OutboxHandlers {
@@ -984,6 +1001,7 @@ impl OutboxRelay {
         all.insert_unchecked(TOPIC_MAIL.to_owned(), run_mail_delivery);
         #[cfg(feature = "http-client")]
         all.insert_unchecked(TOPIC_WEBHOOK.to_owned(), run_webhook_dispatch);
+        all.insert_unchecked(TOPIC_INBOX.to_owned(), remote::run_inbox_listener);
 
         let mut topics: Vec<&String> = all.handlers.keys().collect();
         topics.sort();
@@ -1037,19 +1055,37 @@ impl OutboxRelay {
 /// Install the relay on `state` when `config.enabled`. With the `mail`
 /// feature, also send `deliver_later` through the outbox, unless the app
 /// set its own queue.
-pub(crate) fn install(state: &AppState, config: &OutboxConfig, handlers: OutboxHandlers) {
+///
+/// The relay also sends the topics of `outbox.destinations` to other
+/// services. With `outbox.inbox.enabled`, it installs the inbox verifier.
+///
+/// # Errors
+///
+/// Returns an error when a destination topic also has a handler or is not
+/// an `#[event(name = "...")]`, or a signing secret is not set.
+pub(crate) fn install(
+    state: &AppState,
+    config: &OutboxConfig,
+    handlers: OutboxHandlers,
+) -> AutumnResult<()> {
     if !config.enabled {
-        if !handlers.is_empty() {
+        if !handlers.is_empty() || !config.destinations.is_empty() || config.inbox.enabled {
             tracing::warn!(
-                "outbox handlers are registered but outbox.enabled = false; the relay does not run"
+                "outbox handlers, destinations or the inbox are configured but \
+                 outbox.enabled = false; the relay does not run"
             );
         }
-        return;
+        return Ok(());
     }
     let Some(pool) = mail_pool(state) else {
         tracing::warn!("outbox.enabled = true needs a database; the relay does not run");
-        return;
+        return Ok(());
     };
+    let mut handlers = handlers;
+    remote::add_destinations(&mut handlers, config)?;
+    if config.inbox.enabled {
+        state.insert_extension(remote::InboxVerifier::from_config(&config.inbox)?);
+    }
     state.insert_extension(OutboxRelay::new(config.clone(), handlers));
     #[cfg(feature = "mail")]
     if state
@@ -1064,6 +1100,7 @@ pub(crate) fn install(state: &AppState, config: &OutboxConfig, handlers: OutboxH
     }
     #[cfg(not(feature = "mail"))]
     drop(pool);
+    Ok(())
 }
 
 /// Whether [`install`] gives `deliver_later` an outbox queue.

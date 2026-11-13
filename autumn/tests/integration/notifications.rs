@@ -642,6 +642,13 @@ mod pg {
          read_at TIMESTAMPTZ, \
          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())";
 
+    /// The Postgres indexes `autumn generate notifications` emits. An
+    /// autumn-cli test fails when the two lists differ.
+    const CREATE_NOTIFICATIONS_INDEXES: [&str; 2] = [
+        "CREATE INDEX idx_notifications_feed ON notifications (tenant_id, recipient_id, id)",
+        "CREATE INDEX idx_notifications_unread ON notifications (tenant_id, recipient_id, id) WHERE read_at IS NULL",
+    ];
+
     async fn setup() -> (
         Notifications,
         Pool<AsyncPgConnection>,
@@ -662,6 +669,12 @@ mod pg {
             .execute(&mut conn)
             .await
             .expect("create notifications table");
+        for index in CREATE_NOTIFICATIONS_INDEXES {
+            diesel::sql_query(index)
+                .execute(&mut conn)
+                .await
+                .expect("create notifications index");
+        }
         drop(conn);
 
         (
@@ -835,6 +848,95 @@ mod pg {
             feed.content.iter().map(|n| n.id).collect::<Vec<_>>(),
             vec![a.id, b.id, c.id],
             "oldest first with id tiebreak"
+        );
+    }
+
+    /// The plan of one store statement, as text. Sorts and sequential scans
+    /// are off, so the plan shows which index can serve the statement.
+    async fn index_plan(pool: &Pool<AsyncPgConnection>, statement: &str) -> String {
+        #[derive(diesel::QueryableByName)]
+        struct PlanLine {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+            line: String,
+        }
+        let mut conn = pool.get().await.expect("conn");
+        for setting in ["enable_seqscan", "enable_bitmapscan", "enable_sort"] {
+            diesel::sql_query(format!("SET {setting} = off"))
+                .execute(&mut conn)
+                .await
+                .expect("set");
+        }
+        let lines: Vec<PlanLine> = diesel::sql_query(format!("EXPLAIN (COSTS OFF) {statement}"))
+            .load(&mut conn)
+            .await
+            .expect("explain");
+        lines
+            .into_iter()
+            .map(|l| l.line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The default feed page and the unread reads each have an index in
+    /// their order. A page reads its rows from the index and sorts nothing.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_feed_reads_use_the_generated_indexes() {
+        let (_notifications, pool, _container) = setup().await;
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO notifications (recipient_id, kind, payload, read_at) \
+             SELECT g % 50, 'k', '{}', CASE WHEN g % 7 = 0 THEN NULL ELSE NOW() END \
+             FROM generate_series(1, 5000) g",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed");
+        diesel::sql_query("ANALYZE notifications")
+            .execute(&mut conn)
+            .await
+            .expect("analyze");
+        drop(conn);
+
+        // A copy of the column list and filters of `DbNotificationStore::list`.
+        // Change these when the store changes its queries.
+        let columns = "id, recipient_id, kind, payload, read_at, created_at";
+        let feed = "FROM notifications WHERE tenant_id = '' AND recipient_id = 7";
+        let page = index_plan(
+            &pool,
+            &format!("SELECT {columns} {feed} ORDER BY id DESC LIMIT 20 OFFSET 0"),
+        )
+        .await;
+        assert!(
+            page.contains("Scan Backward using idx_notifications_feed"),
+            "{page}"
+        );
+        assert!(!page.contains("Sort"), "{page}");
+
+        let unread_page = index_plan(
+            &pool,
+            &format!(
+                "SELECT {columns} {feed} AND read_at IS NULL ORDER BY id DESC LIMIT 20 OFFSET 0"
+            ),
+        )
+        .await;
+        assert!(
+            unread_page.contains("Scan Backward using idx_notifications_unread"),
+            "{unread_page}"
+        );
+        assert!(!unread_page.contains("Sort"), "{unread_page}");
+
+        let total = index_plan(&pool, &format!("SELECT COUNT(*) {feed}")).await;
+        assert!(total.contains("using idx_notifications_feed"), "{total}");
+
+        let unread_count = index_plan(
+            &pool,
+            &format!("SELECT COUNT(*) {feed} AND read_at IS NULL"),
+        )
+        .await;
+        assert!(
+            unread_count.contains("using idx_notifications_unread"),
+            "{unread_count}"
         );
     }
 

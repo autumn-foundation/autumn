@@ -85,10 +85,14 @@
 //! | `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT` | `database.idle_in_transaction_timeout` | duration; empty clears |
 //! | `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` | `database.migration_lock_timeout` | duration; empty is ignored |
 //! | `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES` | `database.migration_lock_retries` | `u32` |
+//! | `AUTUMN_DATABASE__MMAP_SIZE` | `database.mmap_size` | `u64` (bytes; `0` = off) |
+//! | `AUTUMN_DATABASE__CACHE_SIZE_KIB` | `database.cache_size_kib` | `u64` (KiB; `0` = `SQLite` default) |
 //! | `AUTUMN_DATABASE__FLEET__MODE` | `database.fleet.mode` | `tenant` / `slot` |
 //! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_OPEN` | `database.fleet.max_open` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY` | `database.fleet.max_open_policy` | `soft` / `wait` / `refuse` |
+//! | `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES` | `database.fleet.max_resident_bytes` | `u64` |
 //! | `AUTUMN_DATABASE__FLEET__MIN_RESIDENCY` | `database.fleet.min_residency` | duration; empty is `2s` |
 //! | `AUTUMN_DATABASE__FLEET__POOL_SIZE` | `database.fleet.pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND` | `database.fleet.create_on_demand` | `Option<bool>` |
@@ -97,6 +101,8 @@
 //! | `AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE` | `database.fleet.replica_retention_after_delete` | duration; empty is `0` |
 //! | `AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE` | `database.fleet.restore_check_sample` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS` | `database.fleet.replication_workers` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MMAP_SIZE` | `database.fleet.mmap_size` | `u64` (bytes; `0` = off) |
+//! | `AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB` | `database.fleet.cache_size_kib` | `u64` (KiB; `0` = `SQLite` default) |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER` | `database.fleet.ownership.owner` | `String` (creates the section) |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS` | `database.fleet.ownership.slots` | comma-separated `N` / `A-B` |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS` | `database.fleet.ownership.lease_secs` | `u64` |
@@ -107,6 +113,7 @@
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_POOL_SIZE` | `database.shards[i].primary_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_POOL_SIZE` | `database.shards[i].replica_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_FALLBACK` | `database.shards[i].replica_fallback` | `fail_readiness` / `primary` |
+//! | `AUTUMN_DATABASE__ROLES` | `database.roles` | comma-separated boundary names; each has `__<NAME>__URL`, `__USER`, `__PASSWORD`, `__POOL_SIZE` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_TELEMETRY__ENABLED` | `telemetry.enabled` | `bool` |
@@ -262,6 +269,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
+
+mod value_de;
 
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
 use std::sync::OnceLock;
@@ -586,7 +595,7 @@ pub fn profile_shutdown_defaults(profile: &str) -> (u64, u64) {
 /// their profile TOML file and env overrides.
 fn profile_defaults_as_toml(profile: &str) -> toml::Value {
     match profile {
-        "dev" => toml::from_str(
+        "dev" => toml::from_str::<toml::Value>(
             r#"
 [log]
 level = "debug"
@@ -639,7 +648,7 @@ ranges = ["127.0.0.0/8", "::1/128"]
                 feature = "sqlite",
                 allow(unused_mut, reason = "only the Postgres build adds to it")
             )]
-            let mut prod: toml::Value = toml::from_str(
+            let mut prod = toml::from_str::<toml::Value>(
                 r#"
 [log]
 level = "info"
@@ -691,7 +700,7 @@ secure = true
             #[cfg(not(feature = "sqlite"))]
             deep_merge(
                 &mut prod,
-                toml::from_str(
+                toml::from_str::<toml::Value>(
                     r#"
 [database]
 statement_timeout = "30s"
@@ -1473,7 +1482,6 @@ pub struct AutumnConfig {
     /// unknown-key validation never descends into its children. The regression
     /// guard `failure_capture_child_keys_are_strictly_validated` fails if this
     /// ordering breaks.
-    #[cfg(feature = "reporting")]
     #[serde(default)]
     pub failure_capture: FailureCaptureConfig,
 
@@ -1485,8 +1493,8 @@ pub struct AutumnConfig {
     /// # Field ordering (load-bearing — do not move below `database`)
     ///
     /// Declared here, before [`database`](Self::database), for the same reason
-    /// [`deploy`](Self::deploy) and `failure_capture` (a field only present
-    /// with the `reporting` feature, hence not linked) are: `DatabaseConfig`'s
+    /// [`deploy`](Self::deploy) and [`failure_capture`](Self::failure_capture)
+    /// are: `DatabaseConfig`'s
     /// `deserialize_with` duration field aborts the
     /// `SchemaDeserializer` traversal, so a section declared after it is
     /// recorded only as an opaque root leaf and strict unknown-key validation
@@ -1741,9 +1749,9 @@ pub struct AutumnConfig {
     /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
     ///
     /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
-    /// to registered reporters. Honored only when the `reporting` cargo
+    /// to registered reporters. Honored only when the `error-reporting` cargo
     /// feature is enabled.
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[serde(default)]
     pub reporting: ReportingConfig,
 
@@ -2066,6 +2074,44 @@ pub struct DeployConfig {
     /// See [`DeployBakeConfig`].
     #[serde(default)]
     pub bake: DeployBakeConfig,
+
+    /// Host groups, each with one role (`[[deploy.groups]]`). The env file of
+    /// each host sets `AUTUMN_ROLE` to the role of its group. The rollout
+    /// order is the group order, then the host order. Not allowed together
+    /// with [`host`](Self::host) or [`hosts`](Self::hosts). Empty: every host
+    /// runs the role in `autumn.toml`. See [`DeployGroup`].
+    #[serde(default)]
+    pub groups: Vec<DeployGroup>,
+}
+
+/// One `[[deploy.groups]]` entry: a role and the hosts that run it.
+///
+/// ```toml
+/// [[deploy.groups]]
+/// role = "web"
+/// hosts = ["10.0.0.1", "10.0.0.2"]
+///
+/// [[deploy.groups]]
+/// role = "worker"
+/// hosts = ["10.0.0.3"]
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployGroup {
+    /// A built-in role or a `[roles.<name>]` preset.
+    pub role: String,
+    /// SSH-reachable addresses, in rollout order.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// One host of a `[[deploy.groups]]` fleet and the role it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployGroupHost {
+    /// The trimmed SSH address.
+    pub host: String,
+    /// The canonical role name. A built-in alias becomes its built-in name.
+    pub role: String,
 }
 
 /// Default for [`DeployConfig::install_proxy`]: prepare the host (issue #1607).
@@ -2091,11 +2137,70 @@ impl Default for DeployConfig {
             tls: DeployTlsConfig::default(),
             install_proxy: default_deploy_install_proxy(),
             bake: DeployBakeConfig::default(),
+            groups: Vec::new(),
         }
     }
 }
 
 impl DeployConfig {
+    /// The hosts of `[[deploy.groups]]` and their roles, in rollout order.
+    /// Empty when no group is set.
+    ///
+    /// This checks the shape only. The CLI checks that each role is declared.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when groups are set with `host` or `hosts`, when a
+    /// group has a blank or invalid role, no hosts or a blank host, or when a
+    /// host is in more than one group or twice in one group.
+    pub fn group_hosts(&self) -> Result<Vec<DeployGroupHost>, String> {
+        if self.groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let host_set = self.host.as_deref().is_some_and(|h| !h.trim().is_empty());
+        if host_set || !self.hosts.is_empty() {
+            return Err(
+                "[[deploy.groups]] is mutually exclusive with [deploy] host and [deploy] \
+                 hosts: put every host in a group"
+                    .to_owned(),
+            );
+        }
+        let mut out: Vec<DeployGroupHost> = Vec::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            if group.role.trim().is_empty() {
+                return Err(format!("[[deploy.groups]] entry {index}: role is blank"));
+            }
+            let role: RoleName = group
+                .role
+                .parse()
+                .map_err(|e| format!("[[deploy.groups]] entry {index}: invalid role: {e}"))?;
+            if group.hosts.is_empty() {
+                return Err(format!(
+                    "[[deploy.groups]] entry {index} (role {role}) lists no hosts"
+                ));
+            }
+            for (host_index, host) in group.hosts.iter().enumerate() {
+                let host = host.trim();
+                if host.is_empty() {
+                    return Err(format!(
+                        "[[deploy.groups]] entry {index}: host {host_index} is blank"
+                    ));
+                }
+                if out.iter().any(|seen| seen.host == host) {
+                    return Err(format!(
+                        "[[deploy.groups]] lists `{host}` more than once: a host runs one \
+                         role, so put it in one group"
+                    ));
+                }
+                out.push(DeployGroupHost {
+                    host: host.to_owned(),
+                    role: role.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Validate the `[deploy]` section for a context that actually runs a deploy.
     ///
     /// A bare `[deploy]` table is valid at rest, but a deploy needs a target:
@@ -2115,8 +2220,12 @@ impl DeployConfig {
     /// # Errors
     ///
     /// Returns a message when `host` and `hosts` are both set, when a `hosts`
-    /// entry is blank or duplicated, or when neither key provides a target.
+    /// entry is blank or duplicated, when neither key provides a target, or
+    /// when [`group_hosts`](Self::group_hosts) refuses the groups.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.groups.is_empty() {
+            return self.group_hosts().map(|_| ());
+        }
         let host = self
             .host
             .as_deref()
@@ -2380,7 +2489,7 @@ pub struct RobotsConfig {
 /// Note: `enabled = false` only suppresses *delivery* to reporters. Handler
 /// panics are still caught and converted to a clean 500 response regardless of
 /// this setting.
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReportingConfig {
     /// Whether error events are delivered to registered reporters.
@@ -2398,7 +2507,7 @@ pub struct ReportingConfig {
     pub sample_rate: f64,
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 impl Default for ReportingConfig {
     fn default() -> Self {
         Self {
@@ -2408,12 +2517,12 @@ impl Default for ReportingConfig {
     }
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 const fn default_reporting_enabled() -> bool {
     true
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 const fn default_reporting_sample_rate() -> f64 {
     1.0
 }
@@ -2437,7 +2546,9 @@ const fn default_reporting_sample_rate() -> f64 {
 /// through `[log] filter_parameters`, but unstructured bodies, URL paths and
 /// result rows are not. Read `docs/guide/failure-capsules.md` before enabling
 /// this outside development.
-#[cfg(feature = "reporting")]
+///
+/// The section parses in every build. `enabled = true` needs the `reporting`
+/// feature: without it, boot fails.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FailureCaptureConfig {
     /// Whether failing requests are recorded as capsules.
@@ -2473,7 +2584,6 @@ pub struct FailureCaptureConfig {
     pub max_capsules: usize,
 }
 
-#[cfg(feature = "reporting")]
 impl Default for FailureCaptureConfig {
     fn default() -> Self {
         Self {
@@ -2486,27 +2596,48 @@ impl Default for FailureCaptureConfig {
     }
 }
 
-#[cfg(feature = "reporting")]
+impl FailureCaptureConfig {
+    /// Refuse `enabled = true` in a build without the `reporting` feature.
+    ///
+    /// That build cannot write a capsule. An operator who turns capture on
+    /// expects one after a failure, so boot fails. Only boot calls this.
+    /// `validate` does not, because the CLI reads the config of an app that
+    /// it does not run.
+    pub(crate) fn check_build(&self) -> Result<(), ConfigError> {
+        Self::check_feature(self.enabled, cfg!(feature = "reporting"))
+    }
+
+    /// [`check_build`](Self::check_build) for a build with (`built`) or
+    /// without the feature.
+    pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        if enabled && !built {
+            return Err(ConfigError::Validation(
+                "failure_capture.enabled is true, but this build does not have the \
+                 `reporting` feature. Turn on the feature, or set \
+                 failure_capture.enabled = false"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 const fn default_failure_capture_enabled() -> bool {
     false
 }
 
-#[cfg(feature = "reporting")]
 fn default_failure_capture_dir() -> String {
     "tmp/autumn-capsules".to_owned()
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_body_bytes() -> usize {
     65_536
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_capsule_bytes() -> usize {
     1_048_576
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_capsules() -> usize {
     50
 }
@@ -3021,9 +3152,11 @@ fn default_channels_redis_prefix() -> String {
 ///
 /// Off by default. When enabled, the node binds a small authenticated gossip
 /// listener, discovers the peers named in `seed_peers`, and exposes a
-/// cluster-wide counter through
-/// [`ClusterHandle`](crate::cluster::ClusterHandle). No external coordination
-/// service is involved — see `docs/guide/clustering.md`.
+/// cluster-wide counter through `autumn_web::cluster::ClusterHandle`. No
+/// external coordination service is involved — see `docs/guide/clustering.md`.
+///
+/// `enabled = true` needs the `cluster` feature. The section parses without
+/// it, and boot fails.
 ///
 /// The transport is **authenticated (HMAC-SHA256), not encrypted**: run it on a
 /// trusted network.
@@ -3201,6 +3334,27 @@ impl Default for ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Refuse `enabled = true` in a build without the `cluster` feature.
+    ///
+    /// That build has no cluster runtime. A node that does not join is a
+    /// fault, so boot fails and does not continue alone. Only boot calls
+    /// this. `validate` does not, because the CLI reads the config of an
+    /// app that it does not run.
+    #[cfg_attr(
+        all(feature = "cluster", not(test)),
+        allow(dead_code, reason = "boot calls it only without the `cluster` feature")
+    )]
+    pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        if enabled && !built {
+            return Err(ConfigError::Validation(
+                "cluster.enabled is true, but this build does not have the `cluster` \
+                 feature. Turn on the feature, or set cluster.enabled = false"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Fail fast on a `[cluster]` section that would boot an insecure or
     /// flapping cluster.
     ///
@@ -5285,6 +5439,112 @@ pub struct OutboxConfig {
     /// Age after which the relay deletes sent messages and inbox entries.
     /// Default `604800000` (7 days).
     pub retention_ms: u64,
+    /// Other services that get the messages of some topics, by name. The
+    /// relay POSTs each message to the inbox of the service.
+    pub destinations: BTreeMap<String, OutboxDestinationConfig>,
+    /// The inbox endpoint that takes messages from other services.
+    pub inbox: OutboxInboxConfig,
+}
+
+/// One remote outbox destination: `[outbox.destinations.<name>]`.
+///
+/// The relay POSTs each message of `topics` to `url`, signed with
+/// `signing_secret`. See `docs/guide/outbox.md`.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct OutboxDestinationConfig {
+    /// The inbox URL of the other service, for example
+    /// `https://marketing.internal/_autumn/inbox`.
+    pub url: String,
+    /// The HMAC key. Write `"${NAME}"` to read it from the environment
+    /// variable `NAME`.
+    pub signing_secret: Option<String>,
+    /// The topics that go to this destination. Each one is the topic of an
+    /// `#[event(name = "...")]`.
+    pub topics: Vec<String>,
+}
+
+impl std::fmt::Debug for OutboxDestinationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboxDestinationConfig")
+            .field("url", &self.url)
+            .field("signing_secret", &redacted(self.signing_secret.as_ref()))
+            .field("topics", &self.topics)
+            .finish()
+    }
+}
+
+/// The inbox endpoint: `[outbox.inbox]`.
+///
+/// When `enabled`, the app serves `POST /_autumn/inbox`. It takes messages
+/// that the relay of another service sends. See `docs/guide/outbox.md`.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct OutboxInboxConfig {
+    /// Serve the endpoint. Default `false`. Needs `outbox.enabled = true`.
+    pub enabled: bool,
+    /// The HMAC key. Write `"${NAME}"` to read it from the environment.
+    pub signing_secret: Option<String>,
+    /// Old keys that still verify during a rotation.
+    pub previous_signing_secrets: Vec<String>,
+    /// Largest difference between the signature time and now, in seconds.
+    /// Default `300`.
+    pub timestamp_tolerance_secs: u64,
+    /// Largest request body. Default `1048576` (1 MiB).
+    pub max_body_bytes: usize,
+}
+
+impl Default for OutboxInboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            signing_secret: None,
+            previous_signing_secrets: Vec::new(),
+            timestamp_tolerance_secs: 300,
+            max_body_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl std::fmt::Debug for OutboxInboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboxInboxConfig")
+            .field("enabled", &self.enabled)
+            .field("signing_secret", &redacted(self.signing_secret.as_ref()))
+            .field(
+                "previous_signing_secrets",
+                &self.previous_signing_secrets.len(),
+            )
+            .field("timestamp_tolerance_secs", &self.timestamp_tolerance_secs)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .finish()
+    }
+}
+
+/// The `Debug` text of a secret: never its value.
+const fn redacted(secret: Option<&String>) -> &'static str {
+    match secret {
+        Some(_) => "<redacted>",
+        None => "<none>",
+    }
+}
+
+/// The variable name of a `"${NAME}"` reference, else `None`.
+fn secret_reference(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .filter(|name| !name.is_empty())
+}
+
+/// Replace a `"${NAME}"` reference with the value of `NAME`. An unset
+/// variable leaves the reference, so validation names it.
+fn resolve_secret_reference(env: &dyn Env, value: &mut String) {
+    if let Some(name) = secret_reference(value)
+        && let Ok(resolved) = env.var(name)
+    {
+        *value = resolved;
+    }
 }
 
 impl OutboxConfig {
@@ -5317,8 +5577,168 @@ impl OutboxConfig {
                     .to_owned(),
             ));
         }
+        self.validate_destinations()?;
+        self.validate_inbox()
+    }
+
+    /// Whether the app serves the inbox endpoint: `enabled` and
+    /// `inbox.enabled` are both `true`.
+    #[must_use]
+    pub const fn serves_inbox(&self) -> bool {
+        self.enabled && self.inbox.enabled
+    }
+
+    fn validate_destinations(&self) -> Result<(), ConfigError> {
+        let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, destination) in &self.destinations {
+            let key = format!("outbox.destinations.{name}");
+            let uri = destination.url.parse::<http::Uri>().ok();
+            let web_url = uri.as_ref().is_some_and(|uri| {
+                matches!(uri.scheme_str(), Some("http" | "https")) && uri.host().is_some()
+            });
+            if !web_url {
+                return Err(ConfigError::Validation(format!(
+                    "{key}.url must be an http:// or https:// URL"
+                )));
+            }
+            if destination.topics.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "{key}.topics must name at least one topic"
+                )));
+            }
+            for topic in &destination.topics {
+                if topic.starts_with(OUTBOX_RESERVED_TOPIC_PREFIX) {
+                    return Err(ConfigError::Validation(format!(
+                        "{key}: topic {topic:?} uses the reserved prefix \
+                         `{OUTBOX_RESERVED_TOPIC_PREFIX}`"
+                    )));
+                }
+                if !is_valid_outbox_topic(topic) {
+                    return Err(ConfigError::Validation(format!(
+                        "{key}: topic {topic:?} must use only A-Z a-z 0-9 . _ : -"
+                    )));
+                }
+                if let Some(other) = owners.insert(topic, name) {
+                    return Err(ConfigError::Validation(format!(
+                        "outbox topic {topic:?} is in more than one destination \
+                         ({other:?} and {name:?})"
+                    )));
+                }
+            }
+            check_secret(
+                &format!("{key}.signing_secret"),
+                destination.signing_secret.as_ref(),
+            )?;
+        }
         Ok(())
     }
+
+    fn validate_inbox(&self) -> Result<(), ConfigError> {
+        if !self.inbox.enabled {
+            return Ok(());
+        }
+        if !self.enabled {
+            return Err(ConfigError::Validation(
+                "outbox.inbox.enabled needs outbox.enabled = true: the inbox hands each \
+                 message to the relay"
+                    .to_owned(),
+            ));
+        }
+        // A copy is dropped only while its inbox row exists. The purge deletes
+        // rows after `retention_ms`, so a signature must expire before that. A
+        // time ahead of the receiver clock stays valid for up to two
+        // tolerances after the inbox takes it.
+        if self.inbox.timestamp_tolerance_secs.saturating_mul(2_000) >= self.retention_ms {
+            return Err(ConfigError::Validation(
+                "outbox.retention_ms must be longer than two times \
+                 outbox.inbox.timestamp_tolerance_secs: else a copy can arrive after the purge"
+                    .to_owned(),
+            ));
+        }
+        check_secret(
+            "outbox.inbox.signing_secret",
+            self.inbox.signing_secret.as_ref(),
+        )?;
+        for (index, previous) in self.inbox.previous_signing_secrets.iter().enumerate() {
+            check_secret(
+                &format!("outbox.inbox.previous_signing_secrets[{index}]"),
+                Some(previous),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Check the strength of each signing secret. In production a weak or
+    /// template secret is an error, as for signed webhooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] that names the weak secret.
+    pub fn validate_signing_secrets(&self, is_production: bool) -> Result<(), ConfigError> {
+        let mut secrets: Vec<(String, &String)> = Vec::new();
+        for (name, destination) in &self.destinations {
+            if let Some(secret) = &destination.signing_secret {
+                secrets.push((format!("outbox.destinations.{name}.signing_secret"), secret));
+            }
+        }
+        if self.inbox.enabled {
+            if let Some(secret) = &self.inbox.signing_secret {
+                secrets.push(("outbox.inbox.signing_secret".to_owned(), secret));
+            }
+            for (index, secret) in self.inbox.previous_signing_secrets.iter().enumerate() {
+                secrets.push((
+                    format!("outbox.inbox.previous_signing_secrets[{index}]"),
+                    secret,
+                ));
+            }
+        }
+        for (key, secret) in secrets {
+            crate::security::config::validate_signing_secret(Some(secret), is_production)
+                .map_err(|reason| ConfigError::Validation(format!("{key}: {reason}")))?;
+        }
+        Ok(())
+    }
+
+    /// Resolve each `"${NAME}"` secret reference from `env`.
+    fn resolve_secret_references(&mut self, env: &dyn Env) {
+        for destination in self.destinations.values_mut() {
+            if let Some(secret) = destination.signing_secret.as_mut() {
+                resolve_secret_reference(env, secret);
+            }
+        }
+        if let Some(secret) = self.inbox.signing_secret.as_mut() {
+            resolve_secret_reference(env, secret);
+        }
+        for secret in &mut self.inbox.previous_signing_secrets {
+            resolve_secret_reference(env, secret);
+        }
+    }
+}
+
+/// Outbox topics that start with this prefix belong to the framework.
+pub(crate) const OUTBOX_RESERVED_TOPIC_PREFIX: &str = "autumn.";
+
+/// `true` when `topic` uses only `A-Z a-z 0-9 . _ : -`. The relay puts
+/// topics in its SQL text, so no other character is allowed.
+pub(crate) fn is_valid_outbox_topic(topic: &str) -> bool {
+    !topic.is_empty()
+        && topic
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// A signing secret must be set, must not be empty, and must not be an
+/// unresolved `"${NAME}"` reference.
+fn check_secret(key: &str, secret: Option<&String>) -> Result<(), ConfigError> {
+    let Some(secret) = secret.filter(|secret| !secret.is_empty()) else {
+        return Err(ConfigError::Validation(format!("{key} is required")));
+    };
+    if let Some(name) = secret_reference(secret) {
+        return Err(ConfigError::Validation(format!(
+            "{key} reads the environment variable {name}, which is not set"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for OutboxConfig {
@@ -5332,6 +5752,8 @@ impl Default for OutboxConfig {
             max_backoff_ms: 300_000,
             lease_ms: 60_000,
             retention_ms: 604_800_000,
+            destinations: BTreeMap::new(),
+            inbox: OutboxInboxConfig::default(),
         }
     }
 }
@@ -6196,7 +6618,7 @@ impl AutumnConfig {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
-            let _ = Self::deserialize(de.clone());
+            let _ = Self::deserialize(value_de::ConfigDe::Schema(de.clone()));
             let mut rejected: Vec<String> = std::mem::take(
                 &mut de
                     .rejected
@@ -6746,10 +7168,8 @@ impl AutumnConfig {
             warn_profile_typo(&profile);
         }
 
-        // Deserialize the merged TOML table into AutumnConfig
-        let toml_str =
-            toml::to_string(&merged).expect("internal error: failed to serialize merged config");
-        let mut config: Self = toml::from_str(&toml_str)?;
+        // Read the merged table into AutumnConfig. An error names its key.
+        let mut config: Self = value_de::from_value(merged.clone())?;
         config.profile = Some(profile);
 
         // An `AUTUMN_ROLE` that is not a role name fails the load, as a bad
@@ -6773,6 +7193,8 @@ impl AutumnConfig {
                 || env
                     .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
                     .is_ok_and(|v| v == "true" || v == "1");
+            let toml_str = toml::to_string(&merged)
+                .expect("internal error: failed to serialize merged config");
             Self::run_strict_unknown_key_check(
                 &toml_str,
                 enforce_all,
@@ -7061,7 +7483,8 @@ impl AutumnConfig {
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let config: Self = toml::from_str(&contents)?;
+                let table = toml::from_str::<toml::Table>(&contents)?;
+                let config: Self = value_de::from_value(toml::Value::Table(table))?;
                 config.validate()?;
                 Ok(config)
             }
@@ -7088,6 +7511,10 @@ impl AutumnConfig {
         self.http.client.retry_budget.validate()?;
         self.scheduler.validate()?;
         self.outbox.validate()?;
+        self.outbox.validate_signing_secrets(matches!(
+            self.profile.as_deref(),
+            Some("prod" | "production")
+        ))?;
         // #1605: reject an unparseable or zero retention window at boot rather
         // than silently skipping the dataset it names — a policy an operator
         // believes is enforced but isn't is worse than no policy.
@@ -7299,6 +7726,8 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__STARTUP_WAIT_SECS` → `database.startup_wait_secs` (u64)
     /// - `AUTUMN_DATABASE__AUTO_MIGRATE` -> `database.auto_migrate` (`Option<bool>`)
     /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
+    /// - `AUTUMN_DATABASE__MMAP_SIZE` -> `database.mmap_size` (u64)
+    /// - `AUTUMN_DATABASE__CACHE_SIZE_KIB` -> `database.cache_size_kib` (u64)
     ///
     /// # Log
     /// - `AUTUMN_LOG__LEVEL` → `log.level` (String, tracing filter directive)
@@ -7428,9 +7857,8 @@ impl AutumnConfig {
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         self.apply_metrics_env_overrides_with_env(env);
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         self.apply_reporting_env_overrides_with_env(env);
-        #[cfg(feature = "reporting")]
         self.apply_failure_capture_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
@@ -7743,7 +8171,7 @@ impl AutumnConfig {
         );
     }
 
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     fn apply_reporting_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(
             env,
@@ -7757,7 +8185,6 @@ impl AutumnConfig {
         );
     }
 
-    #[cfg(feature = "reporting")]
     fn apply_failure_capture_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(
             env,
@@ -8088,6 +8515,20 @@ impl AutumnConfig {
         apply_deploy_env_overrides(&mut self.deploy, env);
     }
 
+    /// `database.mmap_size` and `database.cache_size_kib`.
+    fn apply_sqlite_tuning_env_overrides(&mut self, env: &dyn Env) {
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__MMAP_SIZE",
+            &mut self.database.mmap_size,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__CACHE_SIZE_KIB",
+            &mut self.database.cache_size_kib,
+        );
+    }
+
     /// `database.replica_max_lag_ms` and `database.warn_on_pooler` (issue #3065).
     fn apply_replica_lag_and_pooler_env_overrides(&mut self, env: &dyn Env) {
         parse_env_option(
@@ -8148,6 +8589,7 @@ impl AutumnConfig {
             &mut self.database.pin_after_write_secs,
         );
         self.apply_replica_lag_and_pooler_env_overrides(env);
+        self.apply_sqlite_tuning_env_overrides(env);
         parse_env(
             env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
@@ -8199,6 +8641,7 @@ impl AutumnConfig {
             &mut self.database.migration_lock_retries,
         );
         self.apply_shard_env_overrides(env);
+        crate::db_roles::apply_env_overrides(&mut self.database.roles, env);
         self.apply_fleet_env_overrides(env);
     }
 
@@ -8217,21 +8660,7 @@ impl AutumnConfig {
                 eprintln!("Warning: AUTUMN_DATABASE__FLEET__MODE={mode:?} is not valid, ignoring");
                 return;
             };
-            self.database.fleet = Some(DatabaseFleetConfig {
-                mode,
-                root,
-                path: None,
-                max_open: default_fleet_max_open(),
-                min_residency: default_fleet_min_residency(),
-                pool_size: default_fleet_pool_size(),
-                create_on_demand: None,
-                idle_close_secs: default_fleet_idle_close_secs(),
-                restore_missing: false,
-                ownership: None,
-                replica_retention_after_delete: std::time::Duration::ZERO,
-                restore_check_sample: default_fleet_restore_check_sample(),
-                replication_workers: default_fleet_replication_workers(),
-            });
+            self.database.fleet = Some(default_fleet_section(mode, root));
         }
         let Some(fleet) = self.database.fleet.as_mut() else {
             return;
@@ -8240,6 +8669,13 @@ impl AutumnConfig {
         parse_env(env, "AUTUMN_DATABASE__FLEET__ROOT", &mut fleet.root);
         parse_env_option_string(env, "AUTUMN_DATABASE__FLEET__PATH", &mut fleet.path);
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_OPEN", &mut fleet.max_open);
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY",
+            &mut fleet.max_open_policy,
+        );
+        let budget = &mut fleet.max_resident_bytes;
+        parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES", budget);
         let mut residency = Some(fleet.min_residency);
         parse_env_option_duration(env, "AUTUMN_DATABASE__FLEET__MIN_RESIDENCY", &mut residency);
         fleet.min_residency = residency.unwrap_or_else(default_fleet_min_residency);
@@ -8743,6 +9179,7 @@ impl AutumnConfig {
             "AUTUMN_OUTBOX__RETENTION_MS",
             &mut self.outbox.retention_ms,
         );
+        self.outbox.resolve_secret_references(env);
     }
 
     /// Set `role` from `AUTUMN_ROLE`. A blank value leaves it. A value that is
@@ -11768,6 +12205,26 @@ pub struct DatabaseConfig {
     #[serde(default = "default_max_connections_warn_threshold")]
     pub max_connections_warn_threshold: usize,
 
+    /// `SQLite` only: `PRAGMA mmap_size` for each pooled connection, in bytes.
+    /// Default: `0` (off).
+    ///
+    /// Memory-mapped reads can be about two times faster on a large database
+    /// that the app reads often. An I/O error on a mapped file stops the
+    /// process with `SIGBUS`. Read `docs/guide/sqlite-in-production.md`
+    /// before you set it. It does not apply to [`fleet`](Self::fleet).
+    ///
+    /// Override via `AUTUMN_DATABASE__MMAP_SIZE`.
+    #[serde(default)]
+    pub mmap_size: u64,
+
+    /// `SQLite` only: the page cache of each pooled connection, in KiB, set
+    /// as `PRAGMA cache_size = -N`. Default: `0` (the `SQLite` default, about
+    /// 2 MiB). It does not apply to [`fleet`](Self::fleet).
+    ///
+    /// Override via `AUTUMN_DATABASE__CACHE_SIZE_KIB`.
+    #[serde(default)]
+    pub cache_size_kib: u64,
+
     /// A fleet of `SQLite` databases: one file per tenant or one per routing
     /// slot (ADR 0019). `None` (the default) means no fleet.
     ///
@@ -11779,6 +12236,67 @@ pub struct DatabaseConfig {
     /// [`shards`](Self::shards). See [`DatabaseFleetConfig`].
     #[serde(default)]
     pub fleet: Option<DatabaseFleetConfig>,
+
+    /// One connection role per boundary, as `[database.roles.<boundary>]`.
+    /// Empty (the default) means one role for the whole app. See
+    /// [`DatabaseRoleConfig`](crate::db_roles::DatabaseRoleConfig).
+    #[serde(default)]
+    pub roles: std::collections::BTreeMap<String, crate::db_roles::DatabaseRoleConfig>,
+}
+
+/// What an open does when the fleet already holds `max_open` databases.
+///
+/// The fleet does not close a database that is in use or that was used within
+/// [`min_residency`](DatabaseFleetConfig::min_residency). The cap applies to
+/// opens for requests. A background open never passes it, with any policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetMaxOpenPolicy {
+    /// Open anyway. `max_open` is a soft limit that a burst can pass. The
+    /// sweeper closes the extra databases after the burst. This is the default.
+    #[default]
+    Soft,
+    /// Wait for a free slot, for at most `connect_timeout_secs`. Then answer
+    /// `503`. The count of open and closing databases never passes `max_open`.
+    Wait,
+    /// Answer `503` with `Retry-After` at once when no idle database can
+    /// close. If one can close, wait for that close, for at most
+    /// `connect_timeout_secs`. The count of open and closing databases never
+    /// passes `max_open`.
+    Refuse,
+}
+
+impl FleetMaxOpenPolicy {
+    /// The name used in `autumn.toml` and in the environment.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::Wait => "wait",
+            Self::Refuse => "refuse",
+        }
+    }
+}
+
+impl std::fmt::Display for FleetMaxOpenPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FleetMaxOpenPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "soft" => Ok(Self::Soft),
+            "wait" => Ok(Self::Wait),
+            "refuse" => Ok(Self::Refuse),
+            other => Err(format!(
+                "expected `soft`, `wait` or `refuse`, got {other:?}"
+            )),
+        }
+    }
 }
 
 /// `[database.fleet]`: one `SQLite` database per tenant or per routing slot.
@@ -11815,16 +12333,60 @@ pub struct DatabaseFleetConfig {
     ///
     /// Past this, the sweeper closes the least recently used idle database.
     /// It does not close a database that is in use or that was used within
-    /// [`min_residency`](Self::min_residency), and an open never waits for
-    /// room. Thus a burst across many keys can open more databases than this
-    /// value. The count decreases when the burst stops.
+    /// [`min_residency`](Self::min_residency). With `max_open_policy = "soft"`,
+    /// an open never waits for room. Thus a burst across many keys can open
+    /// more databases than this value. The count decreases when the burst
+    /// stops. See [`max_open_policy`](Self::max_open_policy) for a hard limit.
     ///
     /// Each open database holds up to [`pool_size`](Self::pool_size)
     /// connections, and about `2 × pool_size + 1` file descriptors (the
-    /// database and `-wal` per connection, one `-shm`). Set the open-file
-    /// limit (`ulimit -n`) for the peak count, not for this value.
+    /// database and `-wal` per connection, one `-shm`). With the `"soft"`
+    /// policy, set the open-file limit (`ulimit -n`) for the peak count, not
+    /// for this value.
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
+
+    /// What an open does when the fleet already holds
+    /// [`max_open`](Self::max_open) databases. Default: `"soft"`.
+    ///
+    /// - `"soft"`: open anyway (see `max_open`).
+    /// - `"wait"`: wait for a free slot, for at most `connect_timeout_secs`,
+    ///   then answer `503`.
+    /// - `"refuse"`: answer `503` with `Retry-After` at once when no idle
+    ///   database can close. If one can close, wait for that close, for at
+    ///   most `connect_timeout_secs`.
+    ///
+    /// With `"wait"` or `"refuse"`, the count of open and closing databases
+    /// never passes `max_open`. The fleet databases then hold at most
+    /// `max_open × (2 × pool_size + 1)` file descriptors. Replicas, the
+    /// control database and sockets use more.
+    ///
+    /// The fleet keeps a database open while it is in use or was used within
+    /// [`min_residency`](Self::min_residency). A burst of new keys gets `503`
+    /// until that time ends. `Retry-After` is `min_residency` rounded up to
+    /// whole seconds (from 1 to 30).
+    ///
+    /// The cap counts a request for any key, also one that does not exist.
+    /// Check the tenant id before you open its database. With `"wait"`, set a
+    /// request limit too: a parked request holds its task for the timeout.
+    ///
+    /// This policy does not apply to
+    /// [`max_resident_bytes`](Self::max_resident_bytes). With `"wait"` and
+    /// `"refuse"`, a database that is too large stays open.
+    #[serde(default)]
+    pub max_open_policy: FleetMaxOpenPolicy,
+
+    /// A soft limit, in bytes, on the memory of the open databases. Default:
+    /// `0` (no limit).
+    ///
+    /// Each engine reports the memory of one open database. The `SQLite`
+    /// engine counts about 2 MB of page cache for each connection. Above the
+    /// limit, the fleet closes the least recently used idle database. The
+    /// rules are the same as for [`max_open`](Self::max_open) with the
+    /// `"soft"` policy. The fleet keeps one database open, also when it alone is above the limit.
+    /// While the budget is full, a background open gets no room.
+    #[serde(default)]
+    pub max_resident_bytes: u64,
 
     /// How long a database stays open after its last use before the
     /// [`max_open`](Self::max_open) sweep can close it. Default: `"2s"`.
@@ -11902,6 +12464,20 @@ pub struct DatabaseFleetConfig {
     /// interval.
     #[serde(default = "default_fleet_replication_workers")]
     pub replication_workers: usize,
+
+    /// `PRAGMA mmap_size` for each fleet database connection, in bytes.
+    /// Default: `0` (off). Separate from `database.mmap_size`.
+    ///
+    /// A fleet file is usually small, and mmap gives it no gain. Each open
+    /// database maps its file once per connection, so the worst case is
+    /// `mmap_size × max_open × pool_size`.
+    #[serde(default)]
+    pub mmap_size: u64,
+
+    /// The page cache of each fleet database connection, in KiB. Default:
+    /// `0` (the `SQLite` default). Separate from `database.cache_size_kib`.
+    #[serde(default)]
+    pub cache_size_kib: u64,
 }
 
 /// `[database.fleet.ownership]`: the slot ranges this host claims on the
@@ -12019,6 +12595,20 @@ impl DatabaseFleetConfig {
             .unwrap_or_else(|| self.mode.default_path())
     }
 
+    /// The read tuning of each fleet database connection.
+    pub(crate) const fn sqlite_tuning(&self) -> SqliteTuning {
+        SqliteTuning {
+            mmap_size: self.mmap_size,
+            cache_size_kib: self.cache_size_kib,
+        }
+    }
+
+    /// The most fleet connections that can have a map at the same time, at
+    /// `max_open`: `max_open × pool_size`. A burst can open more.
+    pub(crate) const fn sqlite_mmap_connections(&self) -> usize {
+        self.max_open.saturating_mul(self.pool_size)
+    }
+
     /// Whether a missing database is created on first use.
     #[must_use]
     pub fn effective_create_on_demand(&self) -> bool {
@@ -12061,6 +12651,11 @@ impl DatabaseFleetConfig {
                 "database.fleet.replication_workers must be 1 to 64".to_owned(),
             ));
         }
+        check_sqlite_tuning(
+            "database.fleet",
+            self.sqlite_tuning(),
+            self.sqlite_mmap_connections(),
+        )?;
         if let Some(ownership) = &self.ownership {
             ownership.validate()?;
         }
@@ -12076,8 +12671,119 @@ impl DatabaseFleetConfig {
     }
 }
 
+/// A `[database.fleet]` section with every default, made from the env when
+/// TOML has none.
+const fn default_fleet_section(
+    mode: crate::fleet_layout::FleetMode,
+    root: String,
+) -> DatabaseFleetConfig {
+    DatabaseFleetConfig {
+        mode,
+        root,
+        path: None,
+        max_open: default_fleet_max_open(),
+        max_resident_bytes: 0,
+        min_residency: default_fleet_min_residency(),
+        max_open_policy: FleetMaxOpenPolicy::Soft,
+        pool_size: default_fleet_pool_size(),
+        create_on_demand: None,
+        idle_close_secs: default_fleet_idle_close_secs(),
+        restore_missing: false,
+        ownership: None,
+        replica_retention_after_delete: std::time::Duration::ZERO,
+        restore_check_sample: default_fleet_restore_check_sample(),
+        replication_workers: default_fleet_replication_workers(),
+        mmap_size: 0,
+        cache_size_kib: 0,
+    }
+}
+
 const fn default_fleet_max_open() -> usize {
     256
+}
+
+/// Optional `SQLite` read tuning for each pooled connection. `0` turns a
+/// setting off. See `docs/guide/sqlite-in-production.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SqliteTuning {
+    /// `PRAGMA mmap_size`, in bytes.
+    pub mmap_size: u64,
+    /// `PRAGMA cache_size = -N`, in KiB.
+    pub cache_size_kib: u64,
+}
+
+impl SqliteTuning {
+    /// No tuning: `SQLite`'s own defaults.
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) const OFF: Self = Self {
+        mmap_size: 0,
+        cache_size_kib: 0,
+    };
+}
+
+/// The largest `mmap_size` the bundled `SQLite` uses (`SQLITE_MAX_MMAP_SIZE`).
+/// `SQLite` uses this value in place of a larger value. It does not return an
+/// error.
+const SQLITE_MAX_MMAP_SIZE: u64 = 0x7fff_0000;
+
+/// The address space that `SQLite` memory maps can use on a 32-bit target.
+const MMAP_ADDRESS_BUDGET_32_BIT: u64 = 1 << 30;
+
+/// Check `<prefix>.mmap_size` and `<prefix>.cache_size_kib`. `connections` is
+/// the most connections that can map the file at once.
+fn check_sqlite_tuning(
+    prefix: &str,
+    tuning: SqliteTuning,
+    connections: usize,
+) -> Result<(), ConfigError> {
+    // SQLite reads `mmap_size` as a signed 64-bit integer.
+    if tuning.mmap_size > i64::MAX.unsigned_abs() {
+        return Err(ConfigError::Validation(format!(
+            "{prefix}.mmap_size is {}; the maximum is {}",
+            tuning.mmap_size,
+            i64::MAX
+        )));
+    }
+    // SQLite reads `cache_size` as a signed 32-bit integer.
+    if tuning.cache_size_kib > u64::from(i32::MAX.unsigned_abs()) {
+        return Err(ConfigError::Validation(format!(
+            "{prefix}.cache_size_kib is {}; the maximum is {}",
+            tuning.cache_size_kib,
+            i32::MAX
+        )));
+    }
+    check_mmap_address_space(
+        &format!("{prefix}.mmap_size"),
+        mmap_reservation(tuning.mmap_size, connections),
+        usize::BITS,
+    )
+}
+
+/// The address space that `connections` maps of up to `mmap_size` bytes each
+/// can use. `SQLite` caps each map at [`SQLITE_MAX_MMAP_SIZE`].
+fn mmap_reservation(mmap_size: u64, connections: usize) -> u64 {
+    let connections = u64::try_from(connections).unwrap_or(u64::MAX);
+    mmap_size
+        .min(SQLITE_MAX_MMAP_SIZE)
+        .saturating_mul(connections)
+}
+
+/// On a target with `pointer_width` of 32 or less, refuse memory maps that
+/// can use more than [`MMAP_ADDRESS_BUDGET_32_BIT`] in total. A 64-bit target
+/// has address space for any value.
+fn check_mmap_address_space(
+    field: &str,
+    reserved: u64,
+    pointer_width: u32,
+) -> Result<(), ConfigError> {
+    if pointer_width > 32 || reserved <= MMAP_ADDRESS_BUDGET_32_BIT {
+        return Ok(());
+    }
+    Err(ConfigError::Validation(format!(
+        "{field} can map up to {reserved} bytes; on a 32-bit target the total must be \
+         at most {MMAP_ADDRESS_BUDGET_32_BIT} bytes (1 GiB). Decrease the mmap size or \
+         the pool sizes"
+    )))
 }
 
 const fn default_fleet_min_residency() -> std::time::Duration {
@@ -12169,9 +12875,11 @@ pub(crate) fn open_files_warning(
     Some(format!(
         "SQLite may keep about {files} files open at database.fleet.max_open, near \
          the open-file limit of {limit} (ulimit -n). The process also needs files \
-         for sockets and logs. database.fleet.max_open is a soft limit: a burst \
-         opens more. Increase ulimit -n. Or decrease database.fleet.max_open, \
-         database.fleet.pool_size or database.pool_size. Set \
+         for sockets and logs. With max_open_policy = \"soft\", \
+         database.fleet.max_open is a soft limit: a burst opens more. Use \
+         \"wait\" or \"refuse\" to bound the count. Increase ulimit -n. Or \
+         decrease database.fleet.max_open, database.fleet.pool_size or \
+         database.pool_size. Set \
          database.max_connections_warn_threshold = 0 to silence."
     ))
 }
@@ -12386,6 +13094,34 @@ pub fn database_backend_consistency(
 }
 
 impl DatabaseConfig {
+    /// The read tuning of each pooled `SQLite` connection. Not the fleet's.
+    pub(crate) const fn sqlite_tuning(&self) -> SqliteTuning {
+        SqliteTuning {
+            mmap_size: self.mmap_size,
+            cache_size_kib: self.cache_size_kib,
+        }
+    }
+
+    /// The address space that the `SQLite` maps of the control database and
+    /// the fleet can use together.
+    pub(crate) fn sqlite_mmap_reservation(&self) -> u64 {
+        let fleet = self.fleet.as_ref().map_or(0, |fleet| {
+            mmap_reservation(fleet.mmap_size, fleet.sqlite_mmap_connections())
+        });
+        mmap_reservation(self.mmap_size, self.sqlite_mmap_connections()).saturating_add(fleet)
+    }
+
+    /// The most pooled connections that can map the database at once: the
+    /// primary pool, and the replica pool when `replica_url` is set.
+    pub(crate) fn sqlite_mmap_connections(&self) -> usize {
+        let replica = if self.replica_url.is_some() {
+            self.effective_replica_pool_size()
+        } else {
+            0
+        };
+        self.effective_primary_pool_size().saturating_add(replica)
+    }
+
     /// Resolved primary/write database URL.
     #[must_use]
     pub fn effective_primary_url(&self) -> Option<&str> {
@@ -12625,6 +13361,9 @@ impl DatabaseConfig {
 
         self.validate_backend_consistency()?;
 
+        crate::db_roles::validate(&self.roles, self.effective_primary_url())
+            .map_err(ConfigError::Validation)?;
+
         let mut seen_names = std::collections::HashSet::new();
         for (idx, shard) in self.shards.iter().enumerate() {
             if shard.name.is_empty() {
@@ -12668,7 +13407,17 @@ impl DatabaseConfig {
             }
         }
         self.resolved_slot_map()?;
+        check_sqlite_tuning(
+            "database",
+            self.sqlite_tuning(),
+            self.sqlite_mmap_connections(),
+        )?;
         self.validate_fleet()?;
+        check_mmap_address_space(
+            "database.mmap_size with database.fleet.mmap_size",
+            self.sqlite_mmap_reservation(),
+            usize::BITS,
+        )?;
         Ok(())
     }
 
@@ -13547,6 +14296,11 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     } else if env_set_host && !env_set_hosts {
         deploy.hosts.clear();
     }
+    // An env target also wins over `[[deploy.groups]]`. Groups have no env
+    // override.
+    if env_set_host || env_set_hosts {
+        deploy.groups.clear();
+    }
     parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
     parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
     parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
@@ -13618,6 +14372,16 @@ fn apply_fleet_replica_env_overrides(fleet: &mut DatabaseFleetConfig, env: &dyn 
         env,
         "AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS",
         &mut fleet.replication_workers,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DATABASE__FLEET__MMAP_SIZE",
+        &mut fleet.mmap_size,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB",
+        &mut fleet.cache_size_kib,
     );
 }
 
@@ -14082,7 +14846,10 @@ impl Default for DatabaseConfig {
             shards: Vec::new(),
             directory_shard_router: false,
             max_connections_warn_threshold: default_max_connections_warn_threshold(),
+            mmap_size: 0,
+            cache_size_kib: 0,
             fleet: None,
+            roles: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -14587,7 +15354,7 @@ impl AutumnConfig {
     }
 }
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Visitor};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -14638,413 +15405,56 @@ impl SchemaDeserializer {
     }
 }
 
+/// Each method runs the schema walk of [`value_de::ConfigDe`]. The walk
+/// lives there, so the config types compile one walk, not two.
+macro_rules! schema_walk {
+    ($($method:ident($($arg:ident: $ty:ty),*);)*) => {$(
+        fn $method<V: Visitor<'de>>(
+            self,
+            $($arg: $ty,)*
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            de::Deserializer::$method(value_de::ConfigDe::Schema(self), $($arg,)* visitor)
+                .map_err(value_de::Error::into_value_error)
+        }
+    )*};
+}
+
 impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     type Error = serde::de::value::Error;
 
-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        // `deserialize_any` is inherently ambiguous for a placeholder walker:
-        // untagged SCALAR parsers (e.g. `deserialize_duration`) need a string,
-        // while a visitor that accepts only seq/map (e.g. `JobQueuesConfig` at
-        // `jobs.queues`) rejects a string and aborts the whole remaining walk
-        // (#1890). We can't know which shape a given visitor wants, and serde
-        // seeds can't be retried mid-walk, so we probe with a scalar by default
-        // and let `get_schema_keys` re-run the walk, escalating any REJECTED
-        // path to a map/seq probe on the next pass until none reject.
-        let path = self.path.join(".");
-        let probe = self
-            .any_probe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&path)
-            .copied()
-            .unwrap_or(AnyProbe::Str);
-        let result = match probe {
-            // "0" is a valid non-empty string that also parses as an int/duration,
-            // so untagged string- and number-shaped scalar parsers both accept it.
-            AnyProbe::Str => visitor.visit_str("0"),
-            // Empty map/seq: a seq/map-only visitor accepts it and yields an empty
-            // value, so the walk records the field as a leaf and CONTINUES past it
-            // (we intentionally do NOT descend — e.g. jobs.queues has dynamic keys).
-            AnyProbe::Map => visitor.visit_map(SchemaMapAccess {
-                fields: [].iter(),
-                current_field: None,
-                deserializer: self.clone(),
-            }),
-            AnyProbe::Seq => visitor.visit_seq(SchemaSeqAccess {
-                done: true,
-                deserializer: self.clone(),
-            }),
-        };
-        if result.is_err() {
-            self.rejected
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(path);
-        }
-        result
-    }
-
-    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_bool(false)
-    }
-
-    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i8(0)
-    }
-
-    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i16(0)
-    }
-
-    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i32(0)
-    }
-
-    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i64(0)
-    }
-
-    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u8(0)
-    }
-
-    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u16(0)
-    }
-
-    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u32(0)
-    }
-
-    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u64(0)
-    }
-
-    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_f32(0.0)
-    }
-
-    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_f64(0.0)
-    }
-
-    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_char('\0')
-    }
-
-    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_str("")
-    }
-
-    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_string(String::new())
-    }
-
-    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_bytes(&[])
-    }
-
-    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_byte_buf(Vec::new())
-    }
-
-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_some(self)
-    }
-
-    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn deserialize_unit_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn deserialize_newtype_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_newtype_struct(self)
-    }
-
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_seq(SchemaSeqAccess {
-            done: false,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_tuple_struct<V>(
-        self,
-        _name: &'static str,
-        _len: usize,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_map(SchemaMapAccess {
-            fields: [].iter(),
-            current_field: None,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_struct<V>(
-        self,
-        _name: &'static str,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let path_str = self.path.join(".");
-        {
-            let mut schema = self.schema.lock().unwrap();
-            schema.insert(path_str, fields.iter().map(|&s| s.to_string()).collect());
-        }
-
-        visitor.visit_map(SchemaMapAccess {
-            fields: fields.iter(),
-            current_field: None,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_enum<V>(
-        self,
-        _name: &'static str,
-        variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        // Feed the FIRST declared variant name (not `""`) so serde's derived
-        // variant-identifier visitor accepts it. An empty tag is an "unknown
-        // variant" error that aborts the ENTIRE remaining schema traversal, so a
-        // single enum field (e.g. `server.tls.acme.directory`) would drop every
-        // sibling/subsequent section (`database`, …) from the derived schema —
-        // silently disabling the strict unknown-key validator for them. The enum
-        // is still treated as an opaque leaf: every `SchemaEnumAccess` variant
-        // arm resolves to `visit_unit` without recursing.
-        visitor.visit_enum(SchemaEnumAccess {
-            variant: variants.first().copied().unwrap_or_default(),
-        })
-    }
-
-    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_str("")
-    }
-
-    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-}
-
-struct SchemaSeqAccess {
-    done: bool,
-    deserializer: SchemaDeserializer,
-}
-
-impl<'de> SeqAccess<'de> for SchemaSeqAccess {
-    type Error = serde::de::value::Error;
-
-    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
-    where
-        T: DeserializeSeed<'de>,
-    {
-        if self.done {
-            Ok(None)
-        } else {
-            self.done = true;
-            seed.deserialize(self.deserializer.clone()).map(Some)
-        }
-    }
-}
-
-struct SchemaMapAccess {
-    fields: std::slice::Iter<'static, &'static str>,
-    current_field: Option<&'static str>,
-    deserializer: SchemaDeserializer,
-}
-
-impl<'de> MapAccess<'de> for SchemaMapAccess {
-    type Error = serde::de::value::Error;
-
-    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
-    where
-        K: DeserializeSeed<'de>,
-    {
-        if let Some(&field) = self.fields.next() {
-            self.current_field = Some(field);
-            seed.deserialize(de::value::StrDeserializer::new(field))
-                .map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
-    where
-        V: DeserializeSeed<'de>,
-    {
-        let field = self.current_field.take().unwrap();
-        let mut new_path = self.deserializer.path.clone();
-        new_path.push(field.to_string());
-
-        let nested = SchemaDeserializer {
-            path: new_path,
-            schema: self.deserializer.schema.clone(),
-            any_probe: self.deserializer.any_probe.clone(),
-            rejected: self.deserializer.rejected.clone(),
-        };
-        seed.deserialize(nested)
-    }
-}
-
-struct SchemaEnumAccess {
-    /// The variant name to report to serde's derived variant-identifier visitor.
-    /// Must be a REAL variant name (the first declared one), never `""`, or
-    /// serde returns an "unknown variant" error that aborts schema traversal.
-    variant: &'static str,
-}
-
-impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
-    type Error = serde::de::value::Error;
-    type Variant = Self;
-
-    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
-    where
-        V: de::DeserializeSeed<'de>,
-    {
-        let val = seed.deserialize(de::value::StrDeserializer::new(self.variant))?;
-        Ok((val, self))
-    }
-}
-
-impl<'de> de::VariantAccess<'de> for SchemaEnumAccess {
-    type Error = serde::de::value::Error;
-
-    fn unit_variant(self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
-    where
-        T: de::DeserializeSeed<'de>,
-    {
-        seed.deserialize(SchemaDeserializer::new())
-    }
-
-    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn struct_variant<V>(
-        self,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
+    schema_walk! {
+        deserialize_any();
+        deserialize_bool();
+        deserialize_i8();
+        deserialize_i16();
+        deserialize_i32();
+        deserialize_i64();
+        deserialize_i128();
+        deserialize_u8();
+        deserialize_u16();
+        deserialize_u32();
+        deserialize_u64();
+        deserialize_u128();
+        deserialize_f32();
+        deserialize_f64();
+        deserialize_char();
+        deserialize_str();
+        deserialize_string();
+        deserialize_bytes();
+        deserialize_byte_buf();
+        deserialize_option();
+        deserialize_unit();
+        deserialize_unit_struct(name: &'static str);
+        deserialize_newtype_struct(name: &'static str);
+        deserialize_seq();
+        deserialize_tuple(len: usize);
+        deserialize_tuple_struct(name: &'static str, len: usize);
+        deserialize_map();
+        deserialize_struct(name: &'static str, fields: &'static [&'static str]);
+        deserialize_enum(name: &'static str, variants: &'static [&'static str]);
+        deserialize_identifier();
+        deserialize_ignored_any();
     }
 }
 
@@ -17326,7 +17736,7 @@ path = "/healthz"
         assert_eq!(config.database.pool_size, 25);
     }
 
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[test]
     fn env_override_reporting() {
         let env = MockEnv::new()
@@ -17340,7 +17750,6 @@ path = "/healthz"
         assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
     }
 
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_defaults_are_off() {
         let config = AutumnConfig::default();
@@ -17354,7 +17763,6 @@ path = "/healthz"
         assert_eq!(config.failure_capture.max_capsules, 50);
     }
 
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_env_overrides_apply() {
         let env = MockEnv::new()
@@ -17381,7 +17789,6 @@ path = "/healthz"
     /// `deserialize_with` duration field aborts the schema walk. If someone
     /// moves `failure_capture` below `database`, its child keys silently
     /// vanish from the schema and this fails.
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_child_keys_are_strictly_validated() {
         let leaves = AutumnConfig::schema_leaf_paths();
@@ -17412,6 +17819,46 @@ path = "/healthz"
     }
 
     // ── [cluster] (issue #1762) ──────────────────────────────────────────
+
+    #[test]
+    fn failure_capture_enabled_without_the_feature_fails() {
+        let err = FailureCaptureConfig::check_feature(true, false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`reporting` feature"), "{text}");
+        assert!(FailureCaptureConfig::check_feature(true, true).is_ok());
+        assert!(FailureCaptureConfig::check_feature(false, false).is_ok());
+    }
+
+    #[test]
+    fn boot_accepts_or_refuses_failure_capture_by_the_build() {
+        let on = FailureCaptureConfig {
+            enabled: true,
+            ..FailureCaptureConfig::default()
+        };
+        // A build with `reporting` can capture. A build without it cannot.
+        assert_eq!(on.check_build().is_ok(), cfg!(feature = "reporting"));
+        assert!(FailureCaptureConfig::default().check_build().is_ok());
+    }
+
+    #[cfg(not(feature = "reporting"))]
+    #[test]
+    fn boot_refuses_failure_capture_in_a_build_without_reporting() {
+        let on = FailureCaptureConfig {
+            enabled: true,
+            ..FailureCaptureConfig::default()
+        };
+        let text = on.check_build().unwrap_err().to_string();
+        assert!(text.contains("`reporting` feature"), "{text}");
+    }
+
+    #[test]
+    fn cluster_enabled_without_the_feature_fails() {
+        let err = ClusterConfig::check_feature(true, false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`cluster` feature"), "{text}");
+        assert!(ClusterConfig::check_feature(true, true).is_ok());
+        assert!(ClusterConfig::check_feature(false, false).is_ok());
+    }
 
     /// A cluster with no shared secret is an unauthenticated cluster: anyone
     /// who can reach the port can inject state. Boot must fail, not warn.
@@ -18788,8 +19235,227 @@ path = "/healthz"
                 max_backoff_ms: 200,
                 lease_ms: 900,
                 retention_ms: 1_000,
+                ..OutboxConfig::default()
             }
         );
+    }
+
+    const REMOTE_SECRET: &str = "marketing-inbox-secret-0123456789abcdef";
+
+    fn destination(url: &str, topics: &[&str]) -> OutboxDestinationConfig {
+        OutboxDestinationConfig {
+            url: url.to_owned(),
+            signing_secret: Some(REMOTE_SECRET.to_owned()),
+            topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+        }
+    }
+
+    fn with_destinations(destinations: &[(&str, OutboxDestinationConfig)]) -> OutboxConfig {
+        OutboxConfig {
+            enabled: true,
+            destinations: destinations
+                .iter()
+                .map(|(name, destination)| ((*name).to_owned(), destination.clone()))
+                .collect(),
+            ..OutboxConfig::default()
+        }
+    }
+
+    #[test]
+    fn outbox_destinations_and_inbox_parse_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [outbox]
+            enabled = true
+
+            [outbox.destinations.marketing]
+            url = "https://marketing.internal/_autumn/inbox"
+            signing_secret = "s3cret-value-0123456789abcdef0123"
+            topics = ["deal.won", "contact.updated.v2"]
+
+            [outbox.inbox]
+            enabled = true
+            signing_secret = "s3cret-value-0123456789abcdef0123"
+            previous_signing_secrets = ["old-value-0123456789abcdef012345"]
+            "#,
+        )
+        .expect("outbox remote config");
+        let marketing = &config.outbox.destinations["marketing"];
+        assert_eq!(marketing.url, "https://marketing.internal/_autumn/inbox");
+        assert_eq!(marketing.topics, ["deal.won", "contact.updated.v2"]);
+        assert!(config.outbox.inbox.enabled);
+        assert_eq!(config.outbox.inbox.previous_signing_secrets.len(), 1);
+        assert_eq!(config.outbox.inbox.timestamp_tolerance_secs, 300);
+        config.outbox.validate().expect("valid");
+    }
+
+    #[test]
+    fn outbox_remote_secrets_resolve_from_the_environment() {
+        let mut config = AutumnConfig {
+            outbox: with_destinations(&[(
+                "marketing",
+                OutboxDestinationConfig {
+                    signing_secret: Some("${MARKETING_INBOX_SECRET}".to_owned()),
+                    ..destination("https://m/_autumn/inbox", &["deal.won"])
+                },
+            )]),
+            ..AutumnConfig::default()
+        };
+        config.outbox.inbox.signing_secret = Some("${CORE_INBOX_SECRET}".to_owned());
+        config.outbox.inbox.previous_signing_secrets = vec!["${OLD_SECRET}".to_owned()];
+        let env = MockEnv::new()
+            .with("MARKETING_INBOX_SECRET", "from-env-1")
+            .with("CORE_INBOX_SECRET", "from-env-2")
+            .with("OLD_SECRET", "from-env-3");
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.outbox.destinations["marketing"]
+                .signing_secret
+                .as_deref(),
+            Some("from-env-1")
+        );
+        assert_eq!(
+            config.outbox.inbox.signing_secret.as_deref(),
+            Some("from-env-2")
+        );
+        assert_eq!(config.outbox.inbox.previous_signing_secrets, ["from-env-3"]);
+    }
+
+    #[test]
+    fn outbox_remote_unset_secret_reference_fails_validation() {
+        let mut config = AutumnConfig {
+            outbox: with_destinations(&[(
+                "marketing",
+                OutboxDestinationConfig {
+                    signing_secret: Some("${NOT_SET_ANYWHERE}".to_owned()),
+                    ..destination("https://m/_autumn/inbox", &["deal.won"])
+                },
+            )]),
+            ..AutumnConfig::default()
+        };
+        config.apply_env_overrides_with_env(&MockEnv::new());
+        let error = config.outbox.validate().unwrap_err().to_string();
+        assert!(error.contains("NOT_SET_ANYWHERE"), "{error}");
+    }
+
+    #[test]
+    fn outbox_destination_validation_refuses_bad_values() {
+        let cases: Vec<(OutboxConfig, &str)> = vec![
+            (
+                with_destinations(&[("m", destination("", &["deal.won"]))]),
+                "url",
+            ),
+            (
+                with_destinations(&[("m", destination("ftp://m/inbox", &["deal.won"]))]),
+                "url",
+            ),
+            (
+                with_destinations(&[("m", destination("https://m/_autumn/inbox", &[]))]),
+                "topics",
+            ),
+            (
+                with_destinations(&[("m", destination("https://m/i", &["autumn.event"]))]),
+                "reserved",
+            ),
+            (
+                with_destinations(&[("m", destination("https://m/i", &["deal won"]))]),
+                "topic",
+            ),
+            (
+                with_destinations(&[(
+                    "m",
+                    OutboxDestinationConfig {
+                        signing_secret: None,
+                        ..destination("https://m/i", &["deal.won"])
+                    },
+                )]),
+                "signing_secret",
+            ),
+            (
+                with_destinations(&[
+                    ("a", destination("https://a/i", &["deal.won"])),
+                    ("b", destination("https://b/i", &["deal.won"])),
+                ]),
+                "more than one destination",
+            ),
+            (
+                OutboxConfig {
+                    enabled: true,
+                    inbox: OutboxInboxConfig {
+                        enabled: true,
+                        ..OutboxInboxConfig::default()
+                    },
+                    ..OutboxConfig::default()
+                },
+                "signing_secret",
+            ),
+            (
+                OutboxConfig {
+                    inbox: OutboxInboxConfig {
+                        enabled: true,
+                        signing_secret: Some(REMOTE_SECRET.to_owned()),
+                        ..OutboxInboxConfig::default()
+                    },
+                    ..OutboxConfig::default()
+                },
+                "outbox.enabled",
+            ),
+            (
+                OutboxConfig {
+                    enabled: true,
+                    retention_ms: 600_000,
+                    inbox: OutboxInboxConfig {
+                        enabled: true,
+                        signing_secret: Some(REMOTE_SECRET.to_owned()),
+                        ..OutboxInboxConfig::default()
+                    },
+                    ..OutboxConfig::default()
+                },
+                "retention_ms",
+            ),
+        ];
+        for (config, needle) in cases {
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(needle), "{needle:?} not in {error:?}");
+        }
+        with_destinations(&[("m", destination("http://m/_autumn/inbox", &["deal.won"]))])
+            .validate()
+            .expect("plain http is allowed for an internal host");
+    }
+
+    #[test]
+    fn outbox_remote_weak_secret_is_refused_in_production() {
+        let outbox = with_destinations(&[(
+            "marketing",
+            OutboxDestinationConfig {
+                signing_secret: Some("short".to_owned()),
+                ..destination("https://m/_autumn/inbox", &["deal.won"])
+            },
+        )]);
+        let error = outbox
+            .validate_signing_secrets(true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("marketing"), "{error}");
+        outbox
+            .validate_signing_secrets(false)
+            .expect("dev accepts any secret");
+        let prod = AutumnConfig {
+            profile: Some("prod".to_owned()),
+            outbox,
+            ..AutumnConfig::default()
+        };
+        assert!(prod.validate().is_err(), "boot validation checks it");
+    }
+
+    #[test]
+    fn outbox_remote_debug_redacts_secrets() {
+        let mut config = with_destinations(&[("m", destination("https://m/i", &["deal.won"]))]);
+        config.inbox.signing_secret = Some(REMOTE_SECRET.to_owned());
+        config.inbox.previous_signing_secrets = vec![REMOTE_SECRET.to_owned()];
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(REMOTE_SECRET), "{debug}");
+        assert!(debug.contains("redacted"), "{debug}");
     }
 
     #[test]
@@ -20221,6 +20887,134 @@ path = "/healthz"
         );
     }
 
+    fn group(role: &str, hosts: &[&str]) -> DeployGroup {
+        DeployGroup {
+            role: role.to_owned(),
+            hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn deploy_groups_parse_from_toml() {
+        let cfg: DeployConfig = toml::from_str(
+            "[[groups]]\nrole = \"web\"\nhosts = [\"10.0.0.1\", \"10.0.0.2\"]\n\n\
+             [[groups]]\nrole = \"worker\"\nhosts = [\"10.0.0.3\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.groups,
+            [
+                group("web", &["10.0.0.1", "10.0.0.2"]),
+                group("worker", &["10.0.0.3"])
+            ]
+        );
+        assert!(
+            toml::from_str::<DeployConfig>("[[groups]]\nrole = \"web\"\nhost = \"x\"\n").is_err()
+        );
+    }
+
+    /// Strict config knows the `[[deploy.groups]]` keys and flags a typo.
+    #[test]
+    fn strict_config_accepts_deploy_groups() {
+        let schema = AutumnConfig::get_schema_keys();
+        let ok = "[[deploy.groups]]\nrole = \"web\"\nhosts = [\"10.0.0.1\"]\n";
+        let errors = AutumnConfig::validate_toml(ok, &schema);
+        assert!(errors.is_empty(), "{errors:?}");
+        let typo = "[[deploy.groups]]\nrole = \"web\"\nhostz = [\"10.0.0.1\"]\n";
+        let errors = AutumnConfig::validate_toml(typo, &schema);
+        assert!(!errors.is_empty(), "a typo in a group must be flagged");
+    }
+
+    #[test]
+    fn deploy_group_hosts_keep_group_then_host_order() {
+        let cfg = DeployConfig {
+            groups: vec![
+                group("web", &[" 10.0.0.1 ", "10.0.0.2"]),
+                group("JOBS", &["10.0.0.3"]),
+                group("critical", &["10.0.0.4"]),
+            ],
+            ..DeployConfig::default()
+        };
+        let hosts = cfg.group_hosts().unwrap();
+        let pairs: Vec<(&str, &str)> = hosts
+            .iter()
+            .map(|h| (h.host.as_str(), h.role.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("10.0.0.1", "web"),
+                ("10.0.0.2", "web"),
+                ("10.0.0.3", "worker"),
+                ("10.0.0.4", "critical"),
+            ]
+        );
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn deploy_group_hosts_refuse_a_bad_shape() {
+        let cases: [(DeployConfig, &str); 7] = [
+            (
+                DeployConfig {
+                    host: Some("10.0.0.9".to_owned()),
+                    groups: vec![group("web", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "mutually exclusive",
+            ),
+            (
+                DeployConfig {
+                    hosts: vec!["10.0.0.9".to_owned()],
+                    groups: vec![group("web", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "mutually exclusive",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group(" ", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "role is blank",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group("Bad Role!", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "invalid role",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group("web", &[])],
+                    ..DeployConfig::default()
+                },
+                "no hosts",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group("web", &["10.0.0.1", "  "])],
+                    ..DeployConfig::default()
+                },
+                "host 1 is blank",
+            ),
+            (
+                DeployConfig {
+                    groups: vec![group("web", &["10.0.0.1"]), group("worker", &["10.0.0.1"])],
+                    ..DeployConfig::default()
+                },
+                "more than once",
+            ),
+        ];
+        for (cfg, needle) in cases {
+            let err = cfg.group_hosts().expect_err(needle);
+            assert!(err.contains(needle), "want {needle:?}, got {err}");
+            let err = cfg.validate().expect_err(needle);
+            assert!(err.contains(needle), "validate: want {needle:?}, got {err}");
+        }
+    }
+
     #[test]
     fn deploy_validate_rejects_host_and_hosts_set_together() {
         // #1621 (AC-1): `host` and `hosts` are mutually exclusive — with both set
@@ -20410,6 +21204,31 @@ path = "/healthz"
                 deploy.validate()
             );
         }
+    }
+
+    #[test]
+    fn a_deploy_host_env_override_clears_the_toml_groups() {
+        for (key, value) in [
+            ("AUTUMN_DEPLOY__HOST", "staging-1"),
+            ("AUTUMN_DEPLOY__HOSTS", "a,b"),
+        ] {
+            let mut cfg: AutumnConfig =
+                toml::from_str("[[deploy.groups]]\nrole = \"web\"\nhosts = [\"10.0.0.1\"]\n")
+                    .expect("groups parse");
+            cfg.apply_env_overrides_with_env(&MockEnv::new().with(key, value));
+            let deploy = cfg.deploy.expect("deploy configured");
+            assert!(deploy.groups.is_empty(), "{key} must clear the groups");
+            assert!(deploy.validate().is_ok(), "{:?}", deploy.validate());
+        }
+        let mut kept: AutumnConfig =
+            toml::from_str("[[deploy.groups]]\nrole = \"web\"\nhosts = [\"10.0.0.1\"]\n")
+                .expect("groups parse");
+        kept.apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", " "));
+        assert_eq!(
+            kept.deploy.expect("deploy").groups.len(),
+            1,
+            "a blank value keeps them"
+        );
     }
 
     #[test]
@@ -22036,6 +22855,7 @@ path = "/healthz"
             root: "/var/lib/app/fleet".to_owned(),
             path: None,
             max_open: 16,
+            max_resident_bytes: 0,
             pool_size: 2,
             create_on_demand: None,
             idle_close_secs: 300,
@@ -22045,6 +22865,9 @@ path = "/healthz"
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: FleetMaxOpenPolicy::Soft,
+            mmap_size: 0,
+            cache_size_kib: 0,
         }
     }
 
@@ -22238,6 +23061,7 @@ path = "/healthz"
             .with("AUTUMN_DATABASE__FLEET__POOL_SIZE", "1")
             .with("AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND", "true")
             .with("AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS", "0")
+            .with("AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES", "1048576")
             .with("AUTUMN_DATABASE__FLEET__RESTORE_MISSING", "true");
         config.apply_env_overrides_with_env(&env);
         let fleet = config.database.fleet.expect("env creates the fleet");
@@ -22248,6 +23072,7 @@ path = "/healthz"
         assert_eq!(fleet.pool_size, 1);
         assert!(fleet.effective_create_on_demand());
         assert_eq!(fleet.idle_close_secs, 0);
+        assert_eq!(fleet.max_resident_bytes, 1_048_576);
         assert!(fleet.restore_missing);
         // Issue #3235: the defaults, then the overrides.
         assert_eq!(
@@ -22304,6 +23129,204 @@ path = "/healthz"
     }
 
     #[test]
+    fn database_sqlite_tuning_defaults_parse_and_env() {
+        let db = DatabaseConfig::default();
+        assert_eq!(db.mmap_size, 0, "mmap is off by default");
+        assert_eq!(db.cache_size_kib, 0, "SQLite's own cache by default");
+        assert_eq!(db.sqlite_tuning(), SqliteTuning::OFF);
+
+        let config: AutumnConfig = toml::from_str(
+            "[database]\nurl = \"sqlite:///var/lib/app/app.db\"\n\
+             mmap_size = 268435456\ncache_size_kib = 65536\n",
+        )
+        .unwrap();
+        assert_eq!(config.database.mmap_size, 268_435_456);
+        assert_eq!(config.database.cache_size_kib, 65_536);
+        assert_eq!(
+            config.database.sqlite_tuning(),
+            SqliteTuning {
+                mmap_size: 268_435_456,
+                cache_size_kib: 65_536,
+            }
+        );
+        assert!(config.database.validate().is_ok());
+
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__MMAP_SIZE", "1073741824")
+            .with("AUTUMN_DATABASE__CACHE_SIZE_KIB", "2048");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.mmap_size, 1_073_741_824);
+        assert_eq!(config.database.cache_size_kib, 2048);
+
+        // A negative or non-numeric value is ignored, so the value stays.
+        for bad in ["-1", "lots", "1.5"] {
+            let env = MockEnv::new()
+                .with("AUTUMN_DATABASE__MMAP_SIZE", bad)
+                .with("AUTUMN_DATABASE__CACHE_SIZE_KIB", bad);
+            let mut config = AutumnConfig::default();
+            config.apply_env_overrides_with_env(&env);
+            assert_eq!(config.database.mmap_size, 0, "{bad}");
+            assert_eq!(config.database.cache_size_kib, 0, "{bad}");
+        }
+        // A negative TOML value does not parse.
+        assert!(toml::from_str::<AutumnConfig>("[database]\nmmap_size = -1\n").is_err());
+    }
+
+    #[test]
+    fn fleet_sqlite_tuning_defaults_parse_and_env() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\nmmap_size = 1048576\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+            .unwrap()
+            .database
+            .fleet
+            .unwrap()
+        };
+        let fleet = parse("");
+        // The control value does not reach the fleet.
+        assert_eq!(fleet.mmap_size, 0);
+        assert_eq!(fleet.cache_size_kib, 0);
+        assert_eq!(fleet.sqlite_tuning(), SqliteTuning::OFF);
+        let fleet = parse("mmap_size = 4194304\ncache_size_kib = 512");
+        assert_eq!(
+            fleet.sqlite_tuning(),
+            SqliteTuning {
+                mmap_size: 4_194_304,
+                cache_size_kib: 512,
+            }
+        );
+        assert!(fleet.validate().is_ok());
+
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "slot")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MMAP_SIZE", "8388608")
+            .with("AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB", "256");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.mmap_size, 0, "the fleet key is separate");
+        let fleet = config.database.fleet.expect("env creates the fleet");
+        assert_eq!(fleet.mmap_size, 8_388_608);
+        assert_eq!(fleet.cache_size_kib, 256);
+    }
+
+    #[test]
+    fn sqlite_tuning_values_sqlite_cannot_read_are_refused() {
+        let db = |mmap_size: u64, cache_size_kib: u64| DatabaseConfig {
+            url: Some("sqlite:///var/lib/app/app.db".to_owned()),
+            mmap_size,
+            cache_size_kib,
+            ..Default::default()
+        };
+        // SQLite reads `mmap_size` as a signed 64-bit and `cache_size` as a
+        // signed 32-bit integer. A 32-bit target also caps the map size.
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            db(i64::MAX.unsigned_abs(), u64::from(i32::MAX.unsigned_abs()))
+                .validate()
+                .is_ok()
+        );
+        assert!(db(0, u64::from(i32::MAX.unsigned_abs())).validate().is_ok());
+        let error = db(i64::MAX.unsigned_abs() + 1, 0)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("database.mmap_size"), "{error}");
+        let error = db(0, u64::from(i32::MAX.unsigned_abs()) + 1)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("database.cache_size_kib"), "{error}");
+
+        let mut fleet = toml::from_str::<AutumnConfig>(
+            "[database.fleet]\nmode = \"slot\"\nroot = \"/data/fleet\"\n",
+        )
+        .unwrap()
+        .database
+        .fleet
+        .unwrap();
+        fleet.mmap_size = u64::MAX;
+        let error = fleet.validate().unwrap_err().to_string();
+        assert!(error.contains("database.fleet.mmap_size"), "{error}");
+        fleet.mmap_size = 0;
+        fleet.cache_size_kib = u64::MAX;
+        let error = fleet.validate().unwrap_err().to_string();
+        assert!(error.contains("database.fleet.cache_size_kib"), "{error}");
+    }
+
+    #[test]
+    fn mmap_address_space_is_capped_on_32_bit_targets_only() {
+        const MIB: u64 = 1024 * 1024;
+        // 64-bit: any value SQLite can read passes.
+        assert!(check_mmap_address_space("database.mmap_size", u64::MAX, 64).is_ok());
+        // 32-bit: the total must fit the budget.
+        assert!(check_mmap_address_space("database.mmap_size", 1024 * MIB, 32).is_ok());
+        let error = check_mmap_address_space("database.mmap_size", 1024 * MIB + 1, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("database.mmap_size"), "{error}");
+        assert!(error.contains("32-bit"), "{error}");
+    }
+
+    #[test]
+    fn mmap_reservation_caps_each_map_and_saturates() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(mmap_reservation(0, usize::MAX), 0);
+        assert_eq!(mmap_reservation(100 * MIB, 10), 1000 * MIB);
+        // SQLite maps at most `SQLITE_MAX_MMAP_SIZE` per connection.
+        assert_eq!(mmap_reservation(1 << 40, 2), 2 * SQLITE_MAX_MMAP_SIZE);
+        assert_eq!(mmap_reservation(u64::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn mmap_reservation_adds_the_control_database_and_the_fleet() {
+        const MIB: u64 = 1024 * 1024;
+        let mut config = toml::from_str::<AutumnConfig>(
+            "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\npool_size = 2\n\
+             mmap_size = 268435456\n\n\
+             [database.fleet]\nmode = \"slot\"\nroot = \"/data/fleet\"\n\
+             max_open = 8\npool_size = 2\nmmap_size = 16777216\n",
+        )
+        .unwrap()
+        .database;
+        // 2 × 256 MiB for the control pool, 8 × 2 × 16 MiB for the fleet.
+        assert_eq!(config.sqlite_mmap_reservation(), 512 * MIB + 256 * MIB);
+        assert!(config.validate().is_ok());
+        config.fleet = None;
+        assert_eq!(config.sqlite_mmap_reservation(), 512 * MIB);
+    }
+
+    #[test]
+    fn mmap_connections_count_every_pool_and_every_fleet_database() {
+        let db = DatabaseConfig {
+            url: Some("sqlite:///var/lib/app/app.db".to_owned()),
+            pool_size: 4,
+            ..Default::default()
+        };
+        assert_eq!(db.sqlite_mmap_connections(), 4);
+        let with_replica = DatabaseConfig {
+            replica_url: Some("sqlite:///var/lib/app/app.db".to_owned()),
+            replica_pool_size: Some(3),
+            ..db
+        };
+        assert_eq!(with_replica.sqlite_mmap_connections(), 7);
+
+        let mut fleet = toml::from_str::<AutumnConfig>(
+            "[database.fleet]\nmode = \"slot\"\nroot = \"/data/fleet\"\nmax_open = 64\npool_size = 2\n",
+        )
+        .unwrap()
+        .database
+        .fleet
+        .unwrap();
+        assert_eq!(fleet.sqlite_mmap_connections(), 128);
+        fleet.max_open = usize::MAX;
+        assert_eq!(fleet.sqlite_mmap_connections(), usize::MAX, "saturates");
+    }
+
+    #[test]
     fn fleet_min_residency_default_parse_and_env() {
         let parse = |extra: &str| {
             toml::from_str::<AutumnConfig>(&format!(
@@ -22345,6 +23368,75 @@ path = "/healthz"
             config.database.fleet.unwrap().min_residency,
             std::time::Duration::from_secs(2),
             "an empty value is the default"
+        );
+    }
+
+    #[test]
+    fn fleet_max_open_policy_default_parse_and_env() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+        };
+        let policy = |extra: &str| {
+            parse(extra)
+                .unwrap()
+                .database
+                .fleet
+                .unwrap()
+                .max_open_policy
+        };
+        assert_eq!(policy(""), FleetMaxOpenPolicy::Soft);
+        assert_eq!(
+            policy("max_open_policy = \"wait\""),
+            FleetMaxOpenPolicy::Wait
+        );
+        assert_eq!(
+            policy("max_open_policy = \"refuse\""),
+            FleetMaxOpenPolicy::Refuse
+        );
+        assert!(parse("max_open_policy = \"hard\"").is_err());
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY", "refuse");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().max_open_policy,
+            FleetMaxOpenPolicy::Refuse
+        );
+    }
+
+    #[test]
+    fn fleet_max_open_policy_names_round_trip() {
+        for policy in [
+            FleetMaxOpenPolicy::Soft,
+            FleetMaxOpenPolicy::Wait,
+            FleetMaxOpenPolicy::Refuse,
+        ] {
+            assert_eq!(policy.to_string(), policy.as_str());
+            assert_eq!(
+                format!(" {policy} ").parse::<FleetMaxOpenPolicy>(),
+                Ok(policy)
+            );
+        }
+        let error = "hard".parse::<FleetMaxOpenPolicy>().unwrap_err();
+        assert!(
+            error.contains("soft") && error.contains("refuse"),
+            "{error}"
+        );
+        // An invalid env value is ignored: the default stays.
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "slot")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY", "hard");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().max_open_policy,
+            FleetMaxOpenPolicy::Soft
         );
     }
 
@@ -22442,6 +23534,21 @@ path = "/healthz"
     }
 
     #[test]
+    fn fleet_memory_budget_deserializes_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [database.fleet]
+            mode = "slot"
+            root = "/var/lib/app/fleet"
+            max_resident_bytes = 536870912
+            "#,
+        )
+        .unwrap();
+        let fleet = config.database.fleet.as_ref().unwrap();
+        assert_eq!(fleet.max_resident_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
     fn fleet_section_deserializes_from_toml() {
         use crate::fleet_layout::FleetMode;
         let config: AutumnConfig = toml::from_str(
@@ -22460,6 +23567,7 @@ path = "/healthz"
         assert_eq!(fleet.max_open, 256);
         assert_eq!(fleet.pool_size, 2);
         assert_eq!(fleet.idle_close_secs, 300);
+        assert_eq!(fleet.max_resident_bytes, 0, "no memory budget by default");
         config.database.validate().unwrap();
     }
 

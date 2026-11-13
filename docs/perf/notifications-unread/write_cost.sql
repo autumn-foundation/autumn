@@ -1,18 +1,16 @@
--- usage: psql -v with_unread_index=true|false -f write_cost.sql  (run on the fixture database)
-\set QUIET on
-DROP TABLE IF EXISTS n_w; CREATE TABLE n_w (LIKE notifications INCLUDING DEFAULTS);
-ALTER TABLE n_w ADD PRIMARY KEY (id);
-CREATE INDEX ON n_w (tenant_id, recipient_id);
-\if :with_unread_index
-CREATE INDEX ON n_w (tenant_id, recipient_id) WHERE read_at IS NULL;
+-- WAL cost of the unread index on the ingest path. psql -v with_index=true|false -f write_cost.sql
+-- 100,000 inserts (all unread) then mark-all-read of them (one UPDATE), WAL bytes from LSN deltas.
+\set ON_ERROR_STOP on
+\i fixture.sql
+DROP INDEX IF EXISTS idx_notifications_unread;
+SELECT :'with_index' = 'true' AS wi \gset
+\if :wi
+CREATE INDEX idx_notifications_unread ON notifications (tenant_id, recipient_id, id) WHERE read_at IS NULL;
 \endif
-SELECT pg_current_wal_lsn() AS lsn0 \gset
-SELECT setseed(0.7);
-INSERT INTO n_w (id, tenant_id, recipient_id, kind, payload, read_at, created_at)
-SELECT g, '', 1 + floor(20000 * power(random(),4))::bigint, 'like', repeat('x',80), NULL, now() FROM generate_series(1,200000) g;
-SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), :'lsn0') AS wal_bytes_insert_200k_all_unread;
-SELECT pg_current_wal_lsn() AS lsn1 \gset
-UPDATE n_w SET read_at = now() WHERE id % 2 = 0;
-SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), :'lsn1') AS wal_bytes_mark_100k_read;
-SELECT pg_size_pretty(pg_indexes_size('n_w')) AS index_bytes;
-DROP TABLE n_w;
+CHECKPOINT;
+SELECT pg_current_wal_lsn() AS l0 \gset
+INSERT INTO notifications (recipient_id, kind, payload) SELECT 5000 + g % 2000, 'mention', repeat('x',120) FROM generate_series(1,100000) g;
+SELECT pg_current_wal_lsn() AS l1 \gset
+UPDATE notifications SET read_at = now() WHERE read_at IS NULL AND recipient_id >= 5000;
+SELECT pg_current_wal_lsn() AS l2 \gset
+SELECT :'with_index' AS with_index, pg_wal_lsn_diff(:'l1',:'l0') AS insert_wal_bytes, pg_wal_lsn_diff(:'l2',:'l1') AS mark_read_wal_bytes;

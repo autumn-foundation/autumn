@@ -102,6 +102,11 @@ fn humanize(name: &str) -> String {
 /// With the script, the form sends no file bytes. A failed upload adds no
 /// key, so check the field on the server.
 ///
+/// A running upload holds the form. The script stops a `submit` and cancels
+/// an htmx request that carries the form (an `hx-post` button, for example).
+/// A click or a submit shows a message and moves focus to the file input.
+/// A request on `autumn:upload` is not cancelled: it carries the new key.
+///
 /// The script fires `autumn:upload` (`detail.key`, `detail.file`) and
 /// `autumn:upload-error` (`detail.file`) on the widget.
 ///

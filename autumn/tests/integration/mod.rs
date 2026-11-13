@@ -65,6 +65,7 @@ mod chaos_session_loom;
 mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
+#[cfg(feature = "cluster")]
 mod cluster_two_node;
 #[cfg(all(feature = "db", feature = "collab"))]
 mod collab_model;
@@ -122,8 +123,11 @@ mod embed_assets_integration;
 mod encryption_columns;
 #[cfg(feature = "db")]
 mod encryption_repository;
+#[cfg(feature = "error-reporting")]
 mod error_reporting;
 mod error_validation_details;
+#[cfg(feature = "db")]
+mod event_wire_contract;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
@@ -166,6 +170,8 @@ mod fault_injection;
 mod feature_flags_integration;
 mod feed;
 mod fleet_failover_guide;
+#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+mod fleet_ownership_pg;
 mod fleet_slot_guide;
 #[cfg(feature = "maud")]
 mod form_field_options;
@@ -373,6 +379,9 @@ mod raw_router_escape_hatch;
 mod read_your_writes_routing;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod ready_db_ping;
+// A Postgres schema and a role per boundary. Docker.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod boundary_roles_pg;
 mod route_groups;
 // `test-support` exposes the monitor-step hook the test drives; the Docker
 // sweep enables it, so the test still runs there.
@@ -549,6 +558,8 @@ mod sim_testapp_jobs;
 mod sla_obligation_macro;
 mod sqlite_ci_coverage;
 mod sqlite_postgres_free;
+#[cfg(feature = "db")]
+mod sqlite_replicated_through;
 #[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]

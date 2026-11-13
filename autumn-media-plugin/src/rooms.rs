@@ -39,7 +39,7 @@
 //!
 //! [`InMemoryRoomStore`] holds at most [`MAX_ROOMS`] rooms. Past that, create
 //! returns [`RoomError::RegistryFull`] (`503`). The reaper
-//! ([`spawn_room_reaper_loop`]) also removes idle rooms. These are backstops
+//! ([`run_room_reaper`]) also removes idle rooms. These are backstops
 //! only. Use authentication and a rate limit.
 //!
 //! # Operator requirements
@@ -65,7 +65,7 @@
 //! # Known limitations
 //!
 //! - **Client-driven participant reaping**: the reaper
-//!   ([`spawn_room_reaper_loop`] → [`RoomStore::reap_stale`]) evicts a
+//!   ([`run_room_reaper`] → [`RoomStore::reap_stale`]) evicts a
 //!   participant whose `last_seen_at` is older than the idle TTL, so a crashed
 //!   client no longer holds a seat until process restart. Two signals refresh
 //!   `last_seen_at`: an explicit [`heartbeat`](RoomStore::heartbeat), and a
@@ -106,6 +106,7 @@ use autumn_web::reexports::axum::{
 };
 use autumn_web::reexports::http::HeaderMap;
 use autumn_web::reexports::http::request::Parts;
+use autumn_web::reexports::tokio_util::sync::CancellationToken;
 use autumn_web::route_listing::RouteInfo;
 use autumn_web::security::{__check_throttle, KeyStrategy, RateLimitExempt, ThrottleSpec};
 use autumn_web::{AppState, AutumnError, AutumnResult};
@@ -963,44 +964,73 @@ fn clamp_reaper_ttl(idle_ttl_secs: u64) -> Duration {
     )
 }
 
-/// Spawn the background idle-room / stale-participant reaper for `store`.
+/// Reap the idle rooms and stale participants of `store` until `shutdown` is
+/// cancelled.
 ///
-/// Ticks every `AUTUMN_MEDIA__ROOM_REAPER_INTERVAL_SECONDS` (default
-/// [`ROOM_REAPER_INTERVAL_SECONDS`], 60s) and reclaims participants/rooms idle
-/// past `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` (default [`ROOM_IDLE_TTL_SECONDS`],
-/// 900s). Both env overrides fall back to their default on an unset / blank /
-/// unparseable / zero value. Mirrors
-/// [`spawn_retention_sweep_loop`](crate::retention::spawn_retention_sweep_loop):
-/// `tokio::spawn` + `tokio::time::interval` with `MissedTickBehavior::Skip`, one
-/// independent tick each period, never panics. The clock is read per tick and
-/// handed to the deterministically-testable [`RoomStore::reap_stale`].
+/// The first sweep runs at once. Then one sweep runs each
+/// `AUTUMN_MEDIA__ROOM_REAPER_INTERVAL_SECONDS` (default 60s). A sweep
+/// removes participants and rooms idle for more than
+/// `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` (default 900s). An unset, blank, bad
+/// or zero value gives the default. A missed tick is skipped. The loop does
+/// not panic.
 ///
-/// Promoting the interval / idle-TTL knobs to `MediaConfig` is a documented
-/// follow-up; they live as env-overridable constants here to keep this hardening
-/// slice out of the config-load surface.
-pub fn spawn_room_reaper_loop(store: Arc<dyn RoomStore>) {
+/// The two knobs are environment variables, not `[media]` keys. Moving them
+/// to `MediaConfig` is a follow-up.
+///
+/// [`MediaPlugin::with_rooms`](crate::MediaPlugin::with_rooms) registers this
+/// loop as the background task [`ROOM_REAPER_TASK`](crate::ROOM_REAPER_TASK).
+pub async fn run_room_reaper(store: Arc<dyn RoomStore>, shutdown: CancellationToken) {
     let interval_secs = env_positive_u64(
         "AUTUMN_MEDIA__ROOM_REAPER_INTERVAL_SECONDS",
         ROOM_REAPER_INTERVAL_SECONDS,
     );
     let idle_ttl_secs =
         env_positive_u64("AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS", ROOM_IDLE_TTL_SECONDS);
-    let idle_ttl = clamp_reaper_ttl(idle_ttl_secs);
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            let stats = store.reap_stale(Utc::now(), idle_ttl).await;
-            if stats.rooms_reaped > 0 || stats.participants_reaped > 0 {
-                tracing::info!(
-                    rooms_reaped = stats.rooms_reaped,
-                    participants_reaped = stats.participants_reaped,
-                    "media rooms: reaped stale participants / idle rooms"
-                );
-            }
+    run_room_reaper_every(
+        store,
+        std::time::Duration::from_secs(interval_secs),
+        clamp_reaper_ttl(idle_ttl_secs),
+        shutdown,
+    )
+    .await;
+}
+
+/// [`run_room_reaper`] with a set interval and idle TTL.
+pub(crate) async fn run_room_reaper_every(
+    store: Arc<dyn RoomStore>,
+    interval: std::time::Duration,
+    idle_ttl: Duration,
+    shutdown: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
         }
-    });
+        let stats = tokio::select! {
+            () = shutdown.cancelled() => return,
+            stats = store.reap_stale(Utc::now(), idle_ttl) => stats,
+        };
+        if stats.rooms_reaped > 0 || stats.participants_reaped > 0 {
+            tracing::info!(
+                rooms_reaped = stats.rooms_reaped,
+                participants_reaped = stats.participants_reaped,
+                "media rooms: reaped stale participants / idle rooms"
+            );
+        }
+    }
+}
+
+/// Spawn [`run_room_reaper`] on the current runtime. It runs until the
+/// process exits.
+#[deprecated(
+    note = "It starts on every role. `MediaPlugin::with_rooms` registers the reaper as a \
+            background task. Call `run_room_reaper` from your own task."
+)]
+pub fn spawn_room_reaper_loop(store: Arc<dyn RoomStore>) {
+    tokio::spawn(run_room_reaper(store, CancellationToken::new()));
 }
 
 // ── Service (URL composition + AppState extension) ────────────────────────────
@@ -1118,6 +1148,12 @@ impl RoomService {
             max_participants,
             rate_limit_per_minute: 0,
         }
+    }
+
+    /// The room store of this service.
+    #[must_use]
+    pub const fn store(&self) -> &Arc<dyn RoomStore> {
+        &self.store
     }
 
     /// Limit each client IP to `per_minute` requests on each room route.
@@ -1627,7 +1663,7 @@ mod tests {
         MAX_REAPER_TTL_SECONDS, ReapStats, Room, RoomError, RoomParticipant, RoomRateGate,
         RoomService, RoomStore, SessionToken, bearer_token, clamp_reaper_ttl, renewed_expiry,
         room_participant_path, room_route_infos, room_router, room_service, rooms_heartbeat,
-        rooms_roster, validate_room_segment,
+        rooms_roster, run_room_reaper_every, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
@@ -3287,6 +3323,34 @@ mod tests {
             denied.status(),
             autumn_web::reexports::http::StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn run_room_reaper_reaps_and_stops_on_shutdown() {
+        let store = Arc::new(InMemoryRoomStore::new(6));
+        let now = Utc::now();
+        seed_room(&store, "", "idle", now - Duration::hours(2), &[]);
+        let shutdown = autumn_web::reexports::tokio_util::sync::CancellationToken::new();
+        let reaper = tokio::spawn(run_room_reaper_every(
+            Arc::clone(&store) as Arc<dyn RoomStore>,
+            std::time::Duration::from_secs(3600),
+            Duration::minutes(30),
+            shutdown.clone(),
+        ));
+        // The first tick runs at once.
+        for _ in 0..200 {
+            if seat_count(&store, "", "idle").is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(seat_count(&store, "", "idle"), None, "the idle room stays");
+
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), reaper)
+            .await
+            .expect("the reaper stops on shutdown")
+            .expect("the reaper does not panic");
     }
 
     #[test]

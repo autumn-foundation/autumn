@@ -2197,15 +2197,9 @@ mod tests {
         // it. That pre-check is gone in favour of `window.find('>')`, which need prove
         // nothing about the rest of the window once it finds a match.
         let candidate = format!("<div data-x='{}'>", "A".repeat(5000));
-        let html = candidate.repeat(2_000);
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| candidate.repeat(k);
+        let nodes = crate::pdf::linear::assert_linear("parse", 2_000, make, |html| parse(html));
         assert_eq!(nodes.len(), 1, "expected one nested chain of <div>s");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -2424,18 +2418,14 @@ mod tests {
         // was, making a long run of unterminated `&` (no nearby `;`) O(n^2).
         // 200k chars comfortably reproduced multi-second blowups before the
         // fix; this should now complete near-instantly.
-        let html = "&".repeat(200_000);
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| "&".repeat(k);
+        let nodes =
+            crate::pdf::linear::assert_linear("decode_entities", 200_000, make, |html| parse(html));
+        let html = make(200_000);
         assert_eq!(
             text(&nodes),
             html,
             "unterminated `&` passes through unchanged"
-        );
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "decode_entities took {:?} — looks quadratic again",
-            start.elapsed()
         );
     }
 
@@ -2448,18 +2438,14 @@ mod tests {
         // that same unbounded scan again, for every `<` in a long run of
         // unterminated fragments (e.g. `"<a".repeat(n)`, with no `>`
         // anywhere) — O(n^2) overall.
-        let html = "<a".repeat(100_000);
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| "<a".repeat(k);
+        let nodes =
+            crate::pdf::linear::assert_linear("parse_open_tag", 100_000, make, |html| parse(html));
+        let html = make(100_000);
         assert_eq!(
             text(&nodes),
             html,
             "unterminated `<a` fragments pass through unchanged as literal text"
-        );
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse_open_tag took {:?} — looks quadratic again",
-            start.elapsed()
         );
     }
 
@@ -2472,17 +2458,11 @@ mod tests {
         // stack (e.g. `"<a>".repeat(n) + "</x>".repeat(n)` — "x" never
         // appears, so no close ever pops the stack), each of the n closes
         // pays the full O(n) scan for O(n^2) overall.
-        let html = format!("{}{}", "<a>".repeat(50_000), "</x>".repeat(50_000));
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| format!("{}{}", "<a>".repeat(k), "</x>".repeat(k));
+        let nodes = crate::pdf::linear::assert_linear("parse", 50_000, make, |html| parse(html));
         // None of the "</x>" closes match anything, so they're all ignored
         // — the tree is just 50,000 nested (empty) <a> elements.
         assert_eq!(nodes.len(), 1);
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -2493,15 +2473,9 @@ mod tests {
         // regardless of stack depth — this is the cheap case; see
         // `long_run_of_never_closing_phrasing_wrappers_is_linear_not_quadratic`
         // just below for the bounded-but-not-free phrasing-wrapper case.
-        let html = "<span>".repeat(100_000);
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| "<span>".repeat(k);
+        let nodes = crate::pdf::linear::assert_linear("parse", 100_000, make, |html| parse(html));
         assert_eq!(nodes.len(), 1, "expected one deeply nested <span> tree");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -2517,15 +2491,9 @@ mod tests {
         // the full stack depth on every one of the n tag opens without this
         // bounded the same way `MAX_CLOSE_SCAN` bounds the closing-tag
         // matcher, for the same O(n^2) reason.
-        let html = "<strong>".repeat(100_000);
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| "<strong>".repeat(k);
+        let nodes = crate::pdf::linear::assert_linear("parse", 100_000, make, |html| parse(html));
         assert_eq!(nodes.len(), 1, "expected one deeply nested <strong> tree");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -2538,16 +2506,10 @@ mod tests {
         // until the bound where a `>` should be) pays that full scan once
         // per candidate — O(n^2) overall, the same shape of bug
         // `MAX_TAG_SCAN`/`MAX_CLOSE_SCAN` were fixed for.
-        let html = format!("<script>{}", "</script ".repeat(50_000));
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| format!("<script>{}", "</script ".repeat(k));
+        let nodes = crate::pdf::linear::assert_linear("parse", 50_000, make, |html| parse(html));
         assert_eq!(nodes.len(), 1);
         assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -2668,16 +2630,10 @@ mod tests {
         // each followed by a long run of whitespace but never a `>`)
         // still parses in linear, not quadratic, time.
         let candidate = format!("</script{}", " ".repeat(200));
-        let html = format!("<script>{}", candidate.repeat(2_000));
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| format!("<script>{}", candidate.repeat(k));
+        let nodes = crate::pdf::linear::assert_linear("parse", 2_000, make, |html| parse(html));
         assert_eq!(nodes.len(), 1);
         assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -2697,16 +2653,10 @@ mod tests {
         // the next literal `<` instead keeps each candidate's cost to its
         // own gap.
         let candidate = format!("</script data-x=\"{}", "y".repeat(300));
-        let html = format!("<script>{}", candidate.repeat(2_000));
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| format!("<script>{}", candidate.repeat(k));
+        let nodes = crate::pdf::linear::assert_linear("parse", 2_000, make, |html| parse(html));
         assert_eq!(nodes.len(), 1);
         assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -2983,9 +2933,13 @@ mod tests {
         // literal text" tolerance already established for the seven
         // special tags (and for real browsers, whose tokenizer stays in
         // attribute-value state until EOF too).
-        let html = "<a title=\"x".repeat(50_000);
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| "<a title=\"x".repeat(k);
+        let nodes = crate::pdf::linear::assert_linear(
+            "find_tag_end's quoted-attribute path",
+            50_000,
+            make,
+            |html| parse(html),
+        );
         assert_eq!(
             nodes,
             vec![Node::Element {
@@ -2994,11 +2948,6 @@ mod tests {
             }],
             "the whole unterminated attribute must be swallowed into one auto-closed <a>, \
              not leaked as visible text"
-        );
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "find_tag_end's quoted-attribute path took {:?} — looks quadratic",
-            start.elapsed()
         );
     }
 
@@ -3010,9 +2959,9 @@ mod tests {
         // so none pair up) still resolves in linear, not quadratic, time
         // — each skip only costs the gap to the *next* quote character,
         // not a rescan of the whole remaining span.
-        let html = format!("<div title={}>Visible</div>", "it's ".repeat(50_000));
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| format!("<div title={}>Visible</div>", "it's ".repeat(k));
+        let nodes =
+            crate::pdf::linear::assert_linear("find_tag_end", 50_000, make, |html| parse(html));
         assert_eq!(
             nodes.len(),
             1,
@@ -3022,11 +2971,6 @@ mod tests {
             panic!("expected an element")
         };
         assert_eq!(text(children), "Visible");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "find_tag_end took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -3040,9 +2984,9 @@ mod tests {
         // not quadratic, time — each backward walk only re-covers the
         // same gap the forward scan already paid for to reach that quote,
         // not a rescan of the whole prior span.
-        let html = format!("<div title={}>Visible</div>", "x     '".repeat(50_000));
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| format!("<div title={}>Visible</div>", "x     '".repeat(k));
+        let nodes =
+            crate::pdf::linear::assert_linear("find_tag_end", 50_000, make, |html| parse(html));
         assert_eq!(
             nodes.len(),
             1,
@@ -3052,11 +2996,6 @@ mod tests {
             panic!("expected an element")
         };
         assert_eq!(text(children), "Visible");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "find_tag_end took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -3067,16 +3006,10 @@ mod tests {
         // quoted `<` (but no real close) still resolve in linear, not
         // quadratic, time.
         let candidate = "</script data-x=\"<\" ";
-        let html = format!("<script>{}", candidate.repeat(2_000));
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| format!("<script>{}", candidate.repeat(k));
+        let nodes = crate::pdf::linear::assert_linear("parse", 2_000, make, |html| parse(html));
         assert_eq!(nodes.len(), 1);
         assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "script"));
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -3111,12 +3044,13 @@ mod tests {
         //    *other* style's absence cost a full scan of the remaining
         //    span on every single iteration too, the same shape again.
         let pairs = 20_000;
-        let html = format!(
-            r"<script data-x={}>Secret</script><p>Visible</p>",
-            r#""a""#.repeat(pairs)
-        );
-        let start = std::time::Instant::now();
-        let nodes = parse(&html);
+        let make = |k: usize| {
+            format!(
+                r"<script data-x={}>Secret</script><p>Visible</p>",
+                r#""a""#.repeat(k)
+            )
+        };
+        let nodes = crate::pdf::linear::assert_linear("parse", pairs, make, |html| parse(html));
         // Matches the established oversized-script behavior: no node at
         // all for the (unparseable) opening tag, its source discarded —
         // just confirms parsing correctly landed right after the real
@@ -3125,11 +3059,6 @@ mod tests {
         assert_eq!(nodes.len(), 1, "got {nodes:?}");
         assert!(matches!(&nodes[0], Node::Element { tag, .. } if tag == "p"));
         assert_eq!(text(&nodes), "Visible");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "parse took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]

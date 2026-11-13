@@ -7,10 +7,10 @@ statement = "UPDATE \"notifications\" SET \"read_at\" = $? WHERE (((\"notificati
 tables = [
   "notifications",
 ]
-indexes = []
-findings = [
-  "full-scan: notifications (no index serves it, even with enable_seqscan = off)",
+indexes = [
+  "idx_notifications_unread",
 ]
+findings = []
 notes = ""
 
 [[site]]
@@ -20,14 +20,16 @@ function = "autumn_web::notifications::DbNotificationStore::mark_all_read"
 [plan]
 status = "ok"
 method = "EXPLAIN (GENERIC_PLAN, COSTS OFF)"
-planned_on = "schema mirror of a Postgres 11 test database"
+planned_on = "test database, Postgres 16"
 generic = [
   "Update on notifications",
-  "  ->  Seq Scan on notifications",
-  "        Filter: ((read_at IS NULL) AND (tenant_id = $2) AND (recipient_id = $3))",
+  "  ->  Index Scan using idx_notifications_unread on notifications",
+  "        Index Cond: ((tenant_id = $2) AND (recipient_id = $3))",
+  "        Filter: (read_at IS NULL)",
 ]
 index_forced = [
   "Update on notifications",
-  "  ->  Seq Scan on notifications",
-  "        Filter: ((read_at IS NULL) AND (tenant_id = $2) AND (recipient_id = $3))",
+  "  ->  Index Scan using idx_notifications_unread on notifications",
+  "        Index Cond: ((tenant_id = $2) AND (recipient_id = $3))",
+  "        Filter: (read_at IS NULL)",
 ]

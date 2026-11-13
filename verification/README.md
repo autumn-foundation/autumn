@@ -33,6 +33,19 @@ scripts/verify-verus.sh                          # uses `verus` on PATH
 VERUS_BIN=/path/to/verus scripts/verify-verus.sh
 ```
 
+## Protobuf field numbers
+
+`proto_field_numbers.rs` models how `autumn contracts export --proto` gives
+field numbers (`autumn-cli/src/contracts/proto/lock.rs`). Verify it with:
+
+```sh
+verus verification/proto_field_numbers.rs
+```
+
+It proves three rules. Each new number is a valid field number. New numbers
+are distinct and above every used number. A new name does not change the
+number of another name.
+
 ## Lease-lock fencing
 
 `lease_fencing.rs` models the `autumn_lease_locks` statements in
@@ -111,11 +124,73 @@ It proves these properties:
   epoch it held.
 - A restore never selects a generation of an older epoch, and a fenced
   replicator stops.
+- Shipping is its own step. When `may_put` admits a put, `may_ship` admits
+  it too. After a newer epoch marker, or a newer epoch this host saw, each
+  put of the old owner is refused. After a new grant, the new owner can put.
+- An open refuses a file stamped by a newer owner. After the new owner opens
+  the file, the old owner cannot open it. The owner can open it again, and a
+  new grant can open any file the table stamped (`may_open`).
 
 It does not prove that two hosts never serve at once. That depends on the
 clock bound in the guide. The epoch makes a late write of the old owner
 harmless to the replicas. The proptest `the_table_keeps_its_invariants`
 checks the same rules on the runtime table.
+
+## Fleet sidecar scope
+
+`fleet_sidecar_scope.rs` models the replica scope of a fleet sidecar engine
+(`ScopedDestination` in `autumn/src/replication/destination.rs` and
+`sidecar_root` in `autumn/src/db/fleet.rs`). Verify it with:
+
+```sh
+verus verification/fleet_sidecar_scope.rs
+```
+
+It proves these properties:
+
+- A key the scope admits is under the database's replica prefix, so a purge
+  of the database also removes it.
+- A key the scope of engine `e` admits is not under `<prefix>/<r>/` and is
+  not `<prefix>/<r>`, for any other name `r` with no `/`. So a sidecar
+  cannot write the primary's `generations`, `epochs` or `tombstone`.
+- A sidecar key of one tenant is not under the prefix of another tenant.
+
+The unit tests in `destination.rs` and `db/fleet/engine_tests.rs` check the
+same rules on the runtime.
+
+## Fleet generations
+
+`fleet_generations.rs` models generation shipping (`ShipMode::Generations`
+in `autumn/src/db/fleet_engine.rs`, the shipper in
+`autumn/src/db/fleet/generations.rs`, and the fence in
+`autumn/src/replication/fence.rs`). Verify it with:
+
+```sh
+verus verification/fleet_generations.rs
+```
+
+It proves these properties:
+
+- The fence does not depend on the ship mode. A newer epoch at the
+  destination, a newer epoch this host saw, or a retired database refuses
+  each put. The current owner can put. `Rebuild` puts nothing.
+- A file whose hash the previous generation holds is not shipped again.
+  Each file of a new generation is shipped now or held already.
+- A holder is the new generation or a holder of the previous one, and it is
+  never newer than the generation that names it.
+- A prune keeps the newest generations and each holder that their
+  manifests name. So a restore of a kept generation finds every file.
+- A restore takes the greatest (epoch, time). The tombstone rules are the
+  rules of `fleet_replica_tombstones.rs`: after a delete, a restore is
+  refused. A purge at or after the newest generation removes every holder,
+  and keeps a newer database of the same key.
+
+The unit tests in `generations.rs` and `db/fleet/generations_tests.rs`, the
+kit checks `fleet-fenced-ship` and `fleet-unchanged-files`, and the takeover
+test in `tests/sqlite_fleet/generations.rs` check the runtime. The TLA+ spec
+needs no change. A list and a put are still two steps. So the witness
+`StaleGenerationLandsLate` still holds. The (epoch, time) order is still
+necessary.
 
 ## Fleet replica tombstones
 
@@ -151,6 +226,33 @@ It proves these properties:
 
 The proptest `the_rules_keep_the_model_properties` checks the same rules on
 the runtime functions.
+
+## Replica bound
+
+`replicated_through.rs` models the bound `replicated_through` of one
+replicator (`Replicator::tick_inner` and `settled_tail` in
+`autumn/src/replication/engine.rs`, and `ReplicationStatus` in
+`autumn/src/replication/status.rs`). Verify it with:
+
+```sh
+verus verification/replicated_through.rs
+```
+
+It proves these properties:
+
+- Each commit at or before the bound is in the replica. This holds at the
+  start and after every step: a commit, an upload, a tick, a new
+  generation, a new epoch and a fence.
+- A tick reads the clock before it measures the tail. It stamps one step
+  below that reading. It drops a bound at or above the reading.
+- In one generation, a tick never moves the bound back. A tick with an
+  unshipped commit does not advance it.
+- A fenced replica claims nothing. Only a new epoch ends the fence.
+- The old order (measure, then read the clock) can cover a commit that is
+  not shipped, even one step below the reading.
+
+The property test `a_restore_holds_every_write_at_or_before_the_bound` in
+`autumn/tests/integration/sqlite_replicated_through.rs` checks the runtime.
 
 ## Billing plan gate
 
@@ -438,6 +540,11 @@ It proves these properties:
 - The total does not depend on the order in which tenants are loaded.
 - A file in a fresh scratch directory is never under the fleet root when the
   scratch parent is not under it.
+- A `LakeSink` that keeps its lake between loads holds the same rows as a
+  new lake, when it holds the right rows for each state and no member
+  fails. The model assumes that core asks `has` only for an included
+  member, and that the sink drops each member it did not get. Then a
+  deleted member adds no rows.
 
 It does not model the restore, the schema union or the query. Tests cover
 them.
@@ -476,6 +583,23 @@ route is served on every HTTP role, and that a group another fleet role mounts
 is not drift. The test `mount_matches_the_model` in `autumn/src/config.rs`
 checks the runtime against the same rules.
 
+## Role manifests
+
+`role_manifests.rs` models the role set of `autumn release init` and the
+`[[deploy.groups]]` checks (issue #3547, ADR 0043). A role name is an
+integer. Verify it with:
+
+```sh
+verus verification/role_manifests.rs
+```
+
+It proves that each role in the default set is declared and has a unique
+name, that every role gets a workload and only an HTTP role gets a Service,
+that a fleet host never gets two roles, and that a fleet that passes
+preflight on a local jobs backend runs only `combined`. The test
+`manifest_roles_match_the_model` in `autumn-cli/src/release_roles.rs` checks
+the runtime against the same rules.
+
 ## Background tasks
 
 `background_tasks.rs` models `background::place` in
@@ -494,3 +618,15 @@ a task with queues runs only where the role runs job workers and its pin
 admits one of the queues. The test
 `place_matches_the_model` in `autumn/src/background.rs` checks the runtime
 against the same rules.
+
+## Avro integer widths
+
+`avro_integer_width.rs` models how `autumn contracts export --avro` maps a
+Rust integer to an Avro `int` or `long`
+(`autumn-cli/src/contracts/avro/mod.rs`). It proves that the mapping never
+narrows, gives the smallest type, and refuses only when no Avro integer holds
+the range. Verify it with:
+
+```sh
+verus verification/avro_integer_width.rs
+```

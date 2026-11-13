@@ -78,10 +78,239 @@ impl MigrationScope {
     pub const fn reaches_shards(self) -> bool {
         matches!(self, Self::Everywhere | Self::Shards)
     }
+
+    /// The directory that the CLI reads as a set of this scope, relative to
+    /// the app directory. `autumn migrate` and `autumn fleet migrate` read
+    /// it. Embed the same directory with the same scope, so the CLI and
+    /// boot apply the same sets:
+    ///
+    /// ```rust,ignore
+    /// const CONTROL: EmbeddedMigrations = embed_migrations!("migrations-control");
+    /// app().migrations_for(MigrationScope::Control, CONTROL)
+    /// ```
+    #[must_use]
+    pub const fn directory(self) -> &'static str {
+        match self {
+            Self::Everywhere => "migrations",
+            Self::Control => "migrations-control",
+            Self::Shards => "migrations-shards",
+        }
+    }
 }
 
-/// One registered migration set: its label, the set, and its scope.
-pub(crate) type RegisteredMigrations = (&'static str, EmbeddedMigrations, MigrationScope);
+/// One registered migration set: its label, the set, its scope, and the
+/// Postgres schema it goes into (`None`: the default `search_path`).
+pub(crate) type RegisteredMigrations = (
+    &'static str,
+    EmbeddedMigrations,
+    MigrationScope,
+    Option<&'static str>,
+);
+
+/// The SQL that runs before a migration of a set in `schema`.
+///
+/// It makes the schema and puts it first on the `search_path`, so an
+/// unqualified `CREATE TABLE campaigns` makes `<schema>.campaigns`. The rest
+/// of the path stays, so `__diesel_schema_migrations` resolves as before.
+///
+/// A transactional migration uses a local setting, which ends at commit. A
+/// non-transactional one uses a session setting; [`SCHEMA_EXIT_SQL`] resets it.
+///
+/// The batch starts with DDL, so the Ledger capture does not gate it. The
+/// migration role needs `CREATE` on the database: Postgres checks it before
+/// `IF NOT EXISTS`.
+fn schema_enter_sql(schema: &str, run_in_transaction: bool) -> String {
+    let ident = format!("\"{}\"", schema.replace('"', "\"\""));
+    let literal = format!("'{}'", ident.replace('\'', "''"));
+    // `concat_ws` drops an empty path, so `search_path = ''` gives a valid list.
+    format!(
+        "CREATE SCHEMA IF NOT EXISTS {ident}; \
+         SELECT set_config('search_path', \
+         concat_ws(', ', {literal}, NULLIF(current_setting('search_path'), '')), \
+         {run_in_transaction})"
+    )
+}
+
+/// The first migration that is registered both in a schema and without one,
+/// as an error message.
+///
+/// A plugin that registers its own migrations, and the same set again with
+/// [`AppBuilder::plugin_migrations_in_schema`](crate::app::AppBuilder::plugin_migrations_in_schema),
+/// has one migration name twice. The first copy runs, so the tables land in
+/// the wrong schema with no error. Boot refuses that.
+pub(crate) fn schema_registration_conflict(sets: &[RegisteredMigrations]) -> Option<String> {
+    let mut seen: HashMap<String, Option<&'static str>> = HashMap::new();
+    for (label, set, _, schema) in sets {
+        let Ok(migrations) = MigrationSource::<crate::db::RuntimeBackend>::migrations(set) else {
+            continue;
+        };
+        for m in migrations {
+            let name = m.name().to_string();
+            match seen.get(&name) {
+                Some(other) if other != schema => {
+                    let show = |s: Option<&str>| {
+                        s.map_or_else(|| "no schema".to_owned(), |s| format!("schema `{s}`"))
+                    };
+                    return Some(format!(
+                        "migration `{name}` (set `{label}`) is registered with {} and with {}; \
+                         register the set once",
+                        show(*other),
+                        show(*schema)
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(name, *schema);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The SQL that runs after a non-transactional migration in a schema.
+const SCHEMA_EXIT_SQL: &str = "RESET search_path";
+
+/// A [`MigrationSource`] whose migrations run in one Postgres schema.
+/// With no schema, it gives the inner migrations unchanged.
+///
+/// [`AppBuilder::migrations_in_schema`](crate::app::AppBuilder::migrations_in_schema)
+/// uses it at boot. Use it with [`run_pending`] to migrate a schema yourself:
+///
+/// ```rust,no_run
+/// use autumn_web::migrate::{EmbeddedMigrations, SchemaMigrations, embed_migrations, run_pending};
+/// # use autumn_web::reexports::diesel_migrations;
+///
+/// const MARKETING: EmbeddedMigrations = embed_migrations!("migrations");
+///
+/// run_pending("postgres://localhost/app", SchemaMigrations::new(MARKETING, Some("marketing")))
+///     .expect("migrations ran");
+/// ```
+pub struct SchemaMigrations<S> {
+    inner: S,
+    schema: Option<&'static str>,
+}
+
+impl<S> SchemaMigrations<S> {
+    /// Run the migrations of `inner` in `schema`, or as they are with `None`.
+    pub const fn new(inner: S, schema: Option<&'static str>) -> Self {
+        Self { inner, schema }
+    }
+}
+
+impl<DB, S> MigrationSource<DB> for SchemaMigrations<S>
+where
+    DB: diesel::backend::Backend + 'static,
+    S: MigrationSource<DB>,
+{
+    fn migrations(&self) -> diesel::migration::Result<Vec<Box<dyn Migration<DB>>>> {
+        let migrations = self.inner.migrations()?;
+        let Some(schema) = self.schema else {
+            return Ok(migrations);
+        };
+        Ok(migrations
+            .into_iter()
+            .map(|inner| Box::new(SchemaMigration { inner, schema }) as Box<dyn Migration<DB>>)
+            .collect())
+    }
+}
+
+/// A migration that runs in one Postgres schema. See [`schema_enter_sql`].
+struct SchemaMigration<DB> {
+    inner: Box<dyn Migration<DB>>,
+    schema: &'static str,
+}
+
+impl<DB: diesel::backend::Backend> SchemaMigration<DB> {
+    fn in_schema(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+        step: impl FnOnce(
+            &mut dyn diesel::connection::BoxableConnection<DB>,
+        ) -> diesel::migration::Result<()>,
+    ) -> diesel::migration::Result<()> {
+        let in_transaction = self.inner.metadata().run_in_transaction();
+        conn.batch_execute(&schema_enter_sql(self.schema, in_transaction))?;
+        let result = step(conn);
+        if in_transaction {
+            return result;
+        }
+        // Reset also after a failure; report the failure of the step first.
+        let reset = conn.batch_execute(SCHEMA_EXIT_SQL);
+        result?;
+        reset.map_err(Into::into)
+    }
+}
+
+impl<DB: diesel::backend::Backend> Migration<DB> for SchemaMigration<DB> {
+    fn run(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.in_schema(conn, |conn| self.inner.run(conn))
+    }
+
+    fn revert(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.in_schema(conn, |conn| self.inner.revert(conn))
+    }
+
+    fn metadata(&self) -> &dyn diesel::migration::MigrationMetadata {
+        self.inner.metadata()
+    }
+
+    fn name(&self) -> &dyn diesel::migration::MigrationName {
+        self.inner.name()
+    }
+}
+
+/// The scope a registered set has on the shards. The control-plane
+/// [`FRAMEWORK_MIGRATIONS`] set gives [`MigrationScope::Control`] in every
+/// registered scope: a shard never gets the control-plane tables. Each other
+/// set keeps its registered scope.
+///
+/// The shard loops, the fleet and the framework-set fold use this. The
+/// control database reads the registered scope. A collision map also reads
+/// the registered scope, so a substitute version that a shard already
+/// records does not change.
+#[cfg(feature = "db")]
+pub(crate) fn applied_scope(
+    set: &EmbeddedMigrations,
+    registered: MigrationScope,
+) -> MigrationScope {
+    if is_control_framework_set(set) {
+        MigrationScope::Control
+    } else {
+        registered
+    }
+}
+
+/// Whether `set` is the control-plane [`FRAMEWORK_MIGRATIONS`] set.
+///
+/// The test is a migration that is in [`FRAMEWORK_MIGRATIONS`] and in no
+/// shard-required set. [`FRAMEWORK_MIGRATIONS`] also holds the migrations of
+/// the shard-required sets, so a plain name match would also match those
+/// sets and keep them off the shards.
+#[cfg(feature = "db")]
+pub(crate) fn is_control_framework_set(set: &EmbeddedMigrations) -> bool {
+    use crate::db::RuntimeBackend;
+
+    fn names(set: &EmbeddedMigrations) -> std::collections::HashSet<String> {
+        let migrations: Vec<Box<dyn Migration<RuntimeBackend>>> =
+            set.migrations().unwrap_or_default();
+        migrations.iter().map(|m| m.name().to_string()).collect()
+    }
+
+    let mut control_only = names(&FRAMEWORK_MIGRATIONS);
+    for shard_required in shard_framework_migration_sets() {
+        for name in names(shard_required) {
+            control_only.remove(&name);
+        }
+    }
+    names(set).iter().any(|name| control_only.contains(name))
+}
 
 /// Embedded Autumn framework migrations.
 ///
@@ -3742,10 +3971,35 @@ pub fn run_pending_sqlite_with_framework_migrations<S>(
 where
     S: diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
 {
+    run_pending_sqlite_sets_with_framework_migrations(
+        database_url,
+        std::slice::from_ref(app_migrations),
+    )
+}
+
+/// [`run_pending_sqlite_with_framework_migrations`] for more than one app set.
+///
+/// For example, `migrations/` and `migrations-control/`. Each set counts as
+/// its own set in the collision map, as each registered set does at boot.
+/// The sets apply in the given order, then the framework sets.
+///
+/// # Errors
+///
+/// The same errors as [`run_pending_sqlite_with_framework_migrations`].
+#[cfg(feature = "sqlite")]
+pub fn run_pending_sqlite_sets_with_framework_migrations<S>(
+    database_url: &str,
+    app_sets: &[S],
+) -> Result<MigrationResult, MigrationError>
+where
+    S: diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+{
     use diesel::sqlite::Sqlite;
 
-    let mut sets: Vec<Vec<(String, String)>> =
-        vec![migration_versions_and_names::<Sqlite, S>(app_migrations)?];
+    let mut sets: Vec<Vec<(String, String)>> = Vec::with_capacity(app_sets.len() + 4);
+    for app_set in app_sets {
+        sets.push(migration_versions_and_names::<Sqlite, S>(app_set)?);
+    }
     sets.push(migration_versions_and_names::<Sqlite, _>(
         &FRAMEWORK_MIGRATIONS,
     )?);
@@ -3754,11 +4008,16 @@ where
     }
     let disambiguated = compute_migration_disambiguation_from_names(sets.clone());
     adopt_sqlite_collision_history(database_url, &sets, &disambiguated)?;
-    let mut applied = run_pending_sqlite(
-        database_url,
-        DisambiguatedMigrations::new(app_migrations, &disambiguated),
-    )?
-    .applied;
+    let mut applied = Vec::new();
+    for app_set in app_sets {
+        applied.extend(
+            run_pending_sqlite(
+                database_url,
+                DisambiguatedMigrations::new(app_set, &disambiguated),
+            )?
+            .applied,
+        );
+    }
     let framework_result = run_pending_sqlite(
         database_url,
         DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &disambiguated),
@@ -4465,6 +4724,15 @@ pub(crate) fn auto_migrate_sqlite(
 mod tests {
     use super::*;
 
+    /// Each scope has its own CLI directory. `Everywhere` keeps the
+    /// directory that `embed_migrations!()` reads by default.
+    #[test]
+    fn each_scope_names_its_cli_directory() {
+        assert_eq!(MigrationScope::Everywhere.directory(), "migrations");
+        assert_eq!(MigrationScope::Control.directory(), "migrations-control");
+        assert_eq!(MigrationScope::Shards.directory(), "migrations-shards");
+    }
+
     /// A shard holds tenant rows, so it needs every framework table the
     /// repositories that write those rows touch. Missing one leaves
     /// `autumn migrate --shard` reporting a clean shard that a boot then fails
@@ -4652,6 +4920,69 @@ mod tests {
             "nothing is applied twice: {:?}",
             second.applied
         );
+    }
+
+    /// Two app sets apply with one collision map, as two registered sets do
+    /// at boot. A version both sets use applies twice: one migration keeps
+    /// it, the other gets a substitute. A second run applies nothing.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_sets_apply_each_app_set_with_one_collision_map() {
+        use diesel::{Connection as _, RunQueryDsl as _};
+
+        #[derive(diesel::QueryableByName)]
+        struct Name {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+
+        let (migrations_dir, url) = sqlite_scratch("sets");
+        let control_dir = migrations_dir.with_file_name("migrations-control");
+        for (dir, name, table) in [
+            (&migrations_dir, "20990101000000_create_notes", "notes"),
+            (&control_dir, "20990101000000_create_tenants", "tenants"),
+        ] {
+            let migration = dir.join(name);
+            std::fs::create_dir_all(&migration).expect("migration dir");
+            std::fs::write(
+                migration.join("up.sql"),
+                format!("CREATE TABLE {table} (id INTEGER);"),
+            )
+            .expect("up.sql");
+            std::fs::write(migration.join("down.sql"), format!("DROP TABLE {table};"))
+                .expect("down.sql");
+        }
+        let sets = [
+            FileBasedMigrations::from_path(&migrations_dir).expect("app set"),
+            FileBasedMigrations::from_path(&control_dir).expect("control set"),
+        ];
+
+        let first =
+            run_pending_sqlite_sets_with_framework_migrations(&url, &sets).expect("first apply");
+        let shared: Vec<&String> = first
+            .applied
+            .iter()
+            .filter(|version| version.starts_with("20990101000000"))
+            .collect();
+        assert_eq!(shared.len(), 2, "both sets apply: {:?}", first.applied);
+        assert_ne!(shared[0], shared[1], "one gets a substitute version");
+
+        let path = url.trim_start_matches("sqlite://");
+        let mut conn = diesel::SqliteConnection::establish(path).expect("open");
+        let tables: Vec<String> =
+            diesel::sql_query("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .load::<Name>(&mut conn)
+                .expect("tables")
+                .into_iter()
+                .map(|row| row.name)
+                .collect();
+        for table in ["notes", "tenants"] {
+            assert!(tables.contains(&table.to_owned()), "{table}: {tables:?}");
+        }
+
+        let second =
+            run_pending_sqlite_sets_with_framework_migrations(&url, &sets).expect("second apply");
+        assert!(second.applied.is_empty(), "{:?}", second.applied);
     }
 
     /// A history table the guarded path cannot read stops the run before
@@ -5606,6 +5937,87 @@ mod tests {
                 retries: 2,
             }
         );
+    }
+
+    #[test]
+    fn schema_enter_sql_creates_the_schema_and_prepends_it() {
+        assert_eq!(
+            schema_enter_sql("marketing", true),
+            "CREATE SCHEMA IF NOT EXISTS \"marketing\"; \
+             SELECT set_config('search_path', \
+             concat_ws(', ', '\"marketing\"', NULLIF(current_setting('search_path'), '')), true)"
+        );
+        assert!(schema_enter_sql("marketing", false).ends_with(", false)"));
+    }
+
+    #[test]
+    fn schema_enter_sql_quotes_the_name() {
+        let sql = schema_enter_sql("we\"ird'name", true);
+        assert!(sql.contains("\"we\"\"ird'name\";"), "{sql}");
+        assert!(sql.contains("'\"we\"\"ird''name\"'"), "{sql}");
+    }
+
+    #[test]
+    fn a_set_in_a_schema_and_without_one_is_a_conflict() {
+        let set = |schema| {
+            (
+                "p",
+                FRAMEWORK_MIGRATIONS,
+                MigrationScope::Everywhere,
+                schema,
+            )
+        };
+        assert_eq!(schema_registration_conflict(&[set(None), set(None)]), None);
+        assert_eq!(
+            schema_registration_conflict(&[set(Some("a")), set(Some("a"))]),
+            None
+        );
+        let err = schema_registration_conflict(&[set(None), set(Some("billing"))]).unwrap();
+        assert!(
+            err.contains("no schema") && err.contains("schema `billing`"),
+            "{err}"
+        );
+    }
+
+    /// Boot wraps a set as `SchemaMigrations(DisambiguatedMigrations(set))`.
+    /// The substitute version of a collision must survive the wrapper.
+    #[test]
+    fn a_schema_set_keeps_its_substitute_versions() {
+        let first = MigrationSource::<diesel::pg::Pg>::migrations(&FRAMEWORK_MIGRATIONS)
+            .unwrap()
+            .remove(0)
+            .name()
+            .to_string();
+        let renamed = HashMap::from([(first, "99990101000000".to_owned())]);
+        let set = SchemaMigrations::new(
+            DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &renamed),
+            Some("marketing"),
+        );
+        let migrations = MigrationSource::<diesel::pg::Pg>::migrations(&set).unwrap();
+        assert_eq!(migrations[0].name().version().to_string(), "99990101000000");
+    }
+
+    #[test]
+    fn schema_migrations_with_no_schema_pass_through() {
+        let none = HashMap::new();
+        let set = SchemaMigrations::new(
+            DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &none),
+            None,
+        );
+        let wrapped = MigrationSource::<diesel::pg::Pg>::migrations(&set).unwrap();
+        let plain = MigrationSource::<diesel::pg::Pg>::migrations(&FRAMEWORK_MIGRATIONS).unwrap();
+        assert_eq!(wrapped.len(), plain.len());
+        let in_schema = SchemaMigrations::new(
+            DisambiguatedMigrations::new(&FRAMEWORK_MIGRATIONS, &none),
+            Some("marketing"),
+        );
+        let names: Vec<String> = MigrationSource::<diesel::pg::Pg>::migrations(&in_schema)
+            .unwrap()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
+        let plain_names: Vec<String> = plain.iter().map(|m| m.name().to_string()).collect();
+        assert_eq!(names, plain_names);
     }
 
     #[test]

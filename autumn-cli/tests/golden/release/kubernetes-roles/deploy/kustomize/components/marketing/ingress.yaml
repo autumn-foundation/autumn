@@ -1,0 +1,20 @@
+# Set the host and the ingress class in your overlay. The host is also in
+# AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS in deployment.yaml.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-app-marketing
+  labels:
+    app.kubernetes.io/component: marketing
+spec:
+  rules:
+    - host: marketing.demo-app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-app-marketing
+                port:
+                  name: http

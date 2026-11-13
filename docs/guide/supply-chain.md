@@ -436,7 +436,7 @@ When there is no fix — or the vulnerable code path is unreachable from your ap
 [advisories]
 ignore = [
     # Why this is acceptable *here*, and when you will look again.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path (autumn-web `jwt` feature, default-on); reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    { id = "RUSTSEC-2023-0071", reason = "verify-only; reaches this app only through jsonwebtoken's RSA-family JWT verification path (autumn-web `jwt` feature, default-on), never signing; rsa 0.10.0 final now exists but jsonwebtoken (^0.9) and webauthn-rs/crypto-glue (rc pin vs. final's mandatory sha2 feature) both block taking it; reconfirmed unreachable 2026-11-09; review-by 2026-12-05" },
 ]
 ```
 
@@ -445,14 +445,22 @@ one in the same crate — still fails, and the gate itself stays on. The id and
 the rationale are committed to your repository, so the decision is reviewable
 in a pull request rather than living in someone's memory.
 
-Your generated `deny.toml` has two waivers: `RUSTSEC-2023-0071` (`rsa`) and
-`RUSTSEC-2026-0387` (`crypto-bigint` 0.5). Both reach an Autumn app through
+Your generated `deny.toml` has three waivers. Two are `RUSTSEC-2023-0071`
+(`rsa`) and `RUSTSEC-2026-0387` (`crypto-bigint` 0.5). Both reach an Autumn app through
 `jsonwebtoken`, which `autumn-web` compiles behind its default-on `jwt`
-feature. No fix an app can take exists for either. An app that needs neither
+feature. A fix exists upstream for `rsa` (0.10.0 final, 2026-11) but nothing
+in either dependency chain can consume it yet, and no fix an app can take
+exists for `crypto-bigint`. An app that needs neither
 JWT tenancy nor OIDC can set `default-features = false`, leave out `jwt` (and
 `oauth2`, which turns it on), and delete both waivers. A passkey app still
 reaches `rsa` through `webauthn-rs`. cargo-deny's "this waiver is unused"
 warning tells you when one of *your* waivers has gone stale.
+
+A third waiver, `RUSTSEC-2026-0441`, is for `pin-utils`, which is
+unmaintained: no one fixes a new bug in it. It reaches the graph through
+`loom`, which `autumn-web` names only for its own `cfg(loom_models)` model
+checks. A normal build never compiles it, but cargo-deny audits every target.
+No `loom` release drops it yet.
 
 Those waivers are why a freshly scaffolded app's CI is green on day one instead
 of red on the first push. Autumn's CI generates each app flavor and audits it with

@@ -254,6 +254,8 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_managed_with_args.rs");
     #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_schema_bad_name.rs");
+    #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_unique_with_args.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
@@ -616,6 +618,24 @@ fn compile_fail_wire_contract_tests() {
     t.compile_fail("tests/compile-fail/wire_shape_rejects_transparent.rs");
     t.compile_fail("tests/compile-fail/wire_shape_rejects_container_rewrites.rs");
     t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_unknown_wire_type.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_tag_clash.rs");
+}
+
+/// Event contracts: a consumer that reads a field the event does not send
+/// fails the build at the read, and names the event and the field.
+#[test]
+fn compile_fail_event_contract_tests() {
+    let t = trybuild::TestCases::new();
+
+    t.compile_fail("tests/compile-fail/event_listener_reads_missing_field.rs");
+    t.compile_fail("tests/compile-fail/event_listener_reads_unsent_field.rs");
+    // `OutboxMessage` is behind `db`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/event_consumer_reads_unsent_field.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/event_consumer_payload_not_found.rs");
+    t.compile_fail("tests/compile-fail/event_rejects_flatten.rs");
 }
 
 // Split into `_a` / `_b` halves so CI can run them as two parallel trybuild
@@ -705,6 +725,10 @@ fn compile_pass_tests_a() {
     // stripped — the model still generates its normal write types.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_schema_markers.rs");
+
+    // `#[model(schema = "...")]` is accepted and changes no codegen.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_schema_arg.rs");
 
     // Model field enum (requires db feature)
     #[cfg(feature = "db")]

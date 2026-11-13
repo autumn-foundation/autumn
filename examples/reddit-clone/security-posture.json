@@ -388,7 +388,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:928",
+          "location": "examples/reddit-clone/src/routes/posts.rs:885",
           "provenance": "provable"
         },
         {
@@ -484,7 +484,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:415",
+          "location": "examples/reddit-clone/src/routes/posts.rs:372",
           "provenance": "provable"
         },
         {
@@ -508,7 +508,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:1655",
+          "location": "examples/reddit-clone/src/routes/posts.rs:1616",
           "provenance": "provable"
         },
         {
@@ -520,7 +520,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:961",
+          "location": "examples/reddit-clone/src/routes/posts.rs:918",
           "provenance": "provable"
         },
         {
@@ -532,7 +532,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:1352",
+          "location": "examples/reddit-clone/src/routes/posts.rs:1313",
           "provenance": "provable"
         },
         {
@@ -544,7 +544,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:1250",
+          "location": "examples/reddit-clone/src/routes/posts.rs:1211",
           "provenance": "provable"
         },
         {
@@ -556,7 +556,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:1625",
+          "location": "examples/reddit-clone/src/routes/posts.rs:1586",
           "provenance": "provable"
         },
         {
@@ -674,7 +674,7 @@
           "provenance": "provable"
         },
         {
-          "path": "/static/js/autumn-widgets.f53ee2c8.js",
+          "path": "/static/js/autumn-widgets.10b35e74.js",
           "method": "GET",
           "name": "autumn_widgets",
           "classification": "framework",
@@ -781,7 +781,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:376",
+          "location": "examples/reddit-clone/src/routes/posts.rs:333",
           "provenance": "provable"
         },
         {
@@ -793,7 +793,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/reddit-clone/src/routes/posts.rs:726",
+          "location": "examples/reddit-clone/src/routes/posts.rs:683",
           "provenance": "provable"
         },
         {
@@ -1290,7 +1290,7 @@
           "mtls_required": false
         },
         {
-          "path": "/static/js/autumn-widgets.f53ee2c8.js",
+          "path": "/static/js/autumn-widgets.10b35e74.js",
           "method": "GET",
           "mtls_required": false
         },

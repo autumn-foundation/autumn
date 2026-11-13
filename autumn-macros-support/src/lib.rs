@@ -7,11 +7,82 @@
 //! but the per-dylib compile cost stays proportional to the macros that
 //! dylib actually registers.
 //!
+//! One exception: the `analysers` module (feature `analysers`) holds the
+//! bodies of `#[query_budget]` and `#[agent_operable]`, which only
+//! `autumn-macros` registers. They are here because `autumn-web` waits for
+//! the proc-macro crate, and Cargo builds a library in parallel with other
+//! crates (#2795).
+//!
 //! Users should not depend on this crate directly — use `autumn-web`
 //! instead, which re-exports everything.
 
+#[cfg(any(test, feature = "analysers"))]
+mod agent_authority;
 pub mod cascade;
 pub mod crate_path;
 pub mod graph;
 pub mod naming;
+#[doc(hidden)]
+pub mod parse;
+#[cfg(any(test, feature = "analysers"))]
+mod query_budget;
 pub mod schema;
+pub mod wire;
+
+/// The two largest macro analysers. `autumn-macros` registers them.
+///
+/// They live in this library, not in the proc-macro crate. Cargo builds a
+/// library in parallel with other crates. It builds a proc-macro crate late,
+/// and `autumn-web` waits for that crate (#2795).
+#[cfg(any(test, feature = "analysers"))]
+#[doc(hidden)]
+pub mod analysers {
+    use proc_macro2::TokenStream;
+
+    /// The body of `#[query_budget]`.
+    #[must_use]
+    pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
+        crate::query_budget::query_budget_macro(attr, item)
+    }
+
+    /// The body of `#[agent_operable]`.
+    #[must_use]
+    pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
+        crate::agent_authority::agent_operable_macro(attr, item)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The entry points give the same tokens as the analysers they wrap.
+    #[test]
+    fn the_entry_points_run_the_analysers() {
+        let attr = || quote::quote!(2);
+        let item = || {
+            quote::quote!(
+                async fn list() {}
+            )
+        };
+        assert_eq!(
+            super::analysers::query_budget(attr(), item()).to_string(),
+            crate::query_budget::query_budget_macro(attr(), item()).to_string()
+        );
+        let attr = proc_macro2::TokenStream::new;
+        assert_eq!(
+            super::analysers::agent_operable(attr(), item()).to_string(),
+            crate::agent_authority::agent_operable_macro(attr(), item()).to_string()
+        );
+    }
+
+    /// A large analyser in the proc-macro crate makes every cold build wait.
+    #[test]
+    fn the_large_analysers_are_not_in_the_proc_macro_crate() {
+        let macros =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../autumn-macros/src"));
+        for file in ["query_budget.rs", "agent_authority.rs"] {
+            assert!(!macros.join(file).exists(), "{file} is in autumn-macros");
+            let here = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).join(file);
+            assert!(here.exists(), "{file} is not in autumn-macros-support");
+        }
+    }
+}

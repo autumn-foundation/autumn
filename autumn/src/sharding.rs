@@ -2612,12 +2612,20 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedReadDb {
     }
 }
 
-/// Resolve the routing key for [`ShardedDb`]; see its docs for the
-/// resolution order.
-async fn resolve_shard_key(
+/// Why a request has no routing key.
+pub(crate) enum RoutingKeyError {
+    /// The app state has no config.
+    NoConfig,
+    /// The tenancy extraction failed.
+    Tenant(AutumnError),
+}
+
+/// The routing key of a request: a [`ShardKeyOverride`], then the tenant of
+/// the tenancy middleware, then the tenant from the request.
+pub(crate) async fn request_routing_key(
     parts: &mut axum::http::request::Parts,
     state: &crate::AppState,
-) -> Result<String, AutumnError> {
+) -> Result<String, RoutingKeyError> {
     if let Some(overridden) = parts.extensions.get::<ShardKeyOverride>() {
         return Ok(overridden.0.clone());
     }
@@ -2626,15 +2634,29 @@ async fn resolve_shard_key(
     }
     let config = state
         .extension::<crate::config::AutumnConfig>()
-        .ok_or_else(|| AutumnError::service_unavailable_msg("Config is not available"))?;
+        .ok_or(RoutingKeyError::NoConfig)?;
     crate::tenancy::extract_tenant_from_parts(parts, &config)
         .await
-        .map_err(|error| {
-            AutumnError::bad_request_msg(format!(
+        .map_err(RoutingKeyError::Tenant)
+}
+
+/// Resolve the routing key for [`ShardedDb`]; see its docs for the
+/// resolution order.
+async fn resolve_shard_key(
+    parts: &mut axum::http::request::Parts,
+    state: &crate::AppState,
+) -> Result<String, AutumnError> {
+    request_routing_key(parts, state)
+        .await
+        .map_err(|error| match error {
+            RoutingKeyError::NoConfig => {
+                AutumnError::service_unavailable_msg("Config is not available")
+            }
+            RoutingKeyError::Tenant(error) => AutumnError::bad_request_msg(format!(
                 "ShardedDb could not resolve a shard key: {error}. Enable [tenancy] so \
                  the tenant id can route the request, or insert a ShardKeyOverride \
                  request extension from middleware (see docs/guide/sharding.md)"
-            ))
+            )),
         })
 }
 
@@ -3593,6 +3615,7 @@ mod tests {
             root: tmp.path().display().to_string(),
             path: None,
             max_open: 64,
+            max_resident_bytes: 0,
             pool_size: 2,
             create_on_demand: None,
             idle_close_secs: 0,
@@ -3602,6 +3625,9 @@ mod tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
         .build()
         .expect("fleet builds");

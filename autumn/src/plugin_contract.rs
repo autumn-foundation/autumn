@@ -152,6 +152,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Replace the rendered error pages — a tier-1 subsystem seam (requires the `maud` feature). The plugin crate needs its own `maud` dependency: `html!` expands to absolute `::maud::` paths, which no re-export can satisfy.",
     },
     PluginSurface {
+        name: "AppBuilder::fleet_ownership_store",
+        tier: SurfaceTier::Experimental,
+        note: "Keep fleet slot ownership in a plugin's `SlotOwnershipStore` (requires the `db` feature). Experimental while the fleet seams land (ADR 0040).",
+    },
+    PluginSurface {
         name: "AppBuilder::merge",
         tier: SurfaceTier::Stable,
         note: "Merge a raw axum router at the root. Pair it with `declare_plugin_routes` so the routes stay attributable.",
@@ -277,6 +282,16 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature).",
     },
     PluginSurface {
+        name: "db::fleet_engine",
+        tier: SurfaceTier::Experimental,
+        note: "`FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. `install_replication` and `ShipMode::Generations` need the `sqlite` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040).",
+    },
+    PluginSurface {
+        name: "fleet",
+        tier: SurfaceTier::Experimental,
+        note: "`resolve`, `resolve_key`, `FleetLease`, `fleet_of` and `ownership_store`: the request path an engine plugin's fleet extractor calls. Also `FleetDatabase::sidecar_replica` and `replication::ScopedDestination` for a sidecar engine (requires the `db` feature). Experimental while the fleet seams land (ADR 0040).",
+    },
+    PluginSurface {
         name: "form::FieldRenderer",
         tier: SurfaceTier::Stable,
         note: "Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature).",
@@ -285,6 +300,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "plugin_conformance",
         tier: SurfaceTier::Stable,
         note: "The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack.",
+    },
+    PluginSurface {
+        name: "plugin_conformance::fleet",
+        tier: SurfaceTier::Experimental,
+        note: "`run_fleet_conformance` and `FleetFixture`: the conformance kit of a fleet engine (requires the `db` feature). Experimental: checks may change in any release with the engine trait.",
     },
     PluginSurface {
         name: "plugin_contract",

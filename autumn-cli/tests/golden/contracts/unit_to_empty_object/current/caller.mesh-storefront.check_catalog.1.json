@@ -1,0 +1,12 @@
+{
+  "krate": "mesh-storefront",
+  "function": "check_catalog",
+  "calls": [
+    {
+      "client": "CatalogClient",
+      "method": "ping",
+      "reads": [],
+      "writes": null
+    }
+  ]
+}

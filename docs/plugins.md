@@ -583,6 +583,7 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `AppBuilder::config_section` | stable | Declare a plugin-owned top-level config root so `server.strict_config` treats it as known-and-opaque. |
 | `AppBuilder::declare_plugin_routes` | stable | Make routes mounted through an opaque `nest`/`merge` router visible to `autumn routes` and the conformance harness. |
 | `AppBuilder::error_pages` | stable | Replace the rendered error pages — a tier-1 subsystem seam (requires the `maud` feature). The plugin crate needs its own `maud` dependency: `html!` expands to absolute `::maud::` paths, which no re-export can satisfy. |
+| `AppBuilder::fleet_ownership_store` | experimental | Keep fleet slot ownership in a plugin's `SlotOwnershipStore` (requires the `db` feature). Experimental while the fleet seams land (ADR 0040). |
 | `AppBuilder::merge` | stable | Merge a raw axum router at the root. Pair it with `declare_plugin_routes` so the routes stay attributable. |
 | `AppBuilder::nest` | stable | Mount a raw axum router under a prefix. Pair it with `declare_plugin_routes` so the routes stay attributable. |
 | `AppBuilder::on_shutdown` | stable | Register an async shutdown hook that runs during graceful drain. |
@@ -608,8 +609,11 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `autumn_edge::host` | experimental | Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790). |
 | `background` | stable | `BackgroundTask`, `PluginCapability`, `BackgroundCapability` and `Role::runs_plugin`: role-aware background work. |
 | `db::Pool` | stable | The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature). |
+| `db::fleet_engine` | experimental | `FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. `install_replication` and `ShipMode::Generations` need the `sqlite` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040). |
+| `fleet` | experimental | `resolve`, `resolve_key`, `FleetLease`, `fleet_of` and `ownership_store`: the request path an engine plugin's fleet extractor calls. Also `FleetDatabase::sidecar_replica` and `replication::ScopedDestination` for a sidecar engine (requires the `db` feature). Experimental while the fleet seams land (ADR 0040). |
 | `form::FieldRenderer` | stable | Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature). |
 | `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack. |
+| `plugin_conformance::fleet` | experimental | `run_fleet_conformance` and `FleetFixture`: the conformance kit of a fleet engine (requires the `db` feature). Experimental: checks may change in any release with the engine trait. |
 | `plugin_contract` | stable | This module: `PluginContract`, `PLUGIN_SURFACES`, `SurfaceTier`, `evaluate`, `lockstep_range`, and the `PLUGIN_CONTRACT_MARKER` dump protocol. |
 | `route_listing::RouteInfo` | stable | The route manifest type the conformance harness and `autumn routes --format json` share. |
 | `widget_pack` | stable | The widget contract and `WidgetPack`: render, passthrough, tokens, `autumn-<pack>-*` classes, keyboard core, CSP, stories (requires the `maud` feature). |
@@ -790,7 +794,7 @@ This checks:
 | Check | What it verifies |
 |-------|-----------------|
 | `installability` | Binary compiles and route manifest is produced |
-| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. When routes carry only the contract's registered name (the default `Plugin::name()`), the route checks use that name. With `--no-routes` (a plugin that mounts none, such as a cache), skips when no route carries either name, and fails if one does. Without it, no routes found fails. It also fails when the app mounts a raw `.merge()` or an undeclared `.nest()` router: its routes were never listed, so no check saw them |
+| `route-attribution` | Every plugin route carries `plugin:<your-name>` source. If no route carries `--plugin-name` and a route carries the contract's registered name (the default `Plugin::name()`), the route checks use the registered name. Routes under more than one name of the plugin fail. With `--no-routes` (a plugin that mounts no routes, such as a cache), the check uses the library `no_routes` rule: it skips when no route carries a name of the plugin (`--plugin-name`, the contract's crate name or its registered name), and fails when a route carries one. The CLI skips only when the contract gives the registered name. In all other cases, no routes found fails. It also fails when the app mounts a raw `.merge()` or an undeclared `.nest()` router: its routes were never listed, so no check saw them |
 | `route-prefix` | Every plugin route lives under the declared prefix, or is declared as an intentional root route via `--intentional-root PATH` (repeatable; exact path match) |
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |
@@ -864,6 +868,13 @@ fails the check.
 Unlike the CLI, the library check does not need a contract to skip. Do not set
 a `prefix` with `no_routes`; the two contradict each other, and `route-prefix`
 fails.
+
+With a contract, if no route carries the config's plugin name and a route
+carries `registered_as`, the route checks use `registered_as`. Routes under
+more than one name of the plugin fail `route-attribution`.
+`autumn plugin-check` calls `run_route_checks` too. For the same routes, the
+CLI and your test give the same route-check results. The one exception is
+the `no_routes` difference above.
 
 ### 3. Publishing checklist
 

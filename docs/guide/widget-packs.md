@@ -134,7 +134,10 @@ Use the control in two ways:
 
 For a group of inputs (for example radios), make `FieldRenderer::grouped`
 return `true`. Then the wrapper is a `<fieldset>` with a `<legend>`. Write
-each input with `FieldContext::group_item`. For a control that sends a
+each input with `FieldContext::group_item`. A required field gets
+`required` on each radio, but not on a checkbox: `required` on a box means
+"check this box". A checkbox group shows the marker in the legend. Check
+the value on the server. For a control that sends a
 file, make `FieldRenderer::multipart` return `true`. Then `form_for` sets
 `enctype="multipart/form-data"`.
 

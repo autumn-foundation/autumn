@@ -55,9 +55,19 @@ Cargo file, and about half changed autumn-web or autumn-macros source.
     protected branch, or nothing is ever written.
   - Every other run, PRs included, gets a read-only token and passes
     `save-cache: false`, which sets `KACHE_REMOTE_READONLY` for the daemon.
+  - kache does not download the whole store. It downloads an artifact when a
+    compile asks for it, and it prefetches the expensive artifacts that the
+    last protected run of the same build recorded in a manifest. The manifest
+    key is the workflow, the job scope, the host triple and the exact rustc.
+    The host is in the key because the Linux, macOS and Windows legs of one
+    `shared-key` would otherwise write one manifest, and each leg would
+    prefetch artifacts built for another OS. A job on a small runner passes
+    `warm: false` to stop the prefetch; the macOS test archive does.
   - A composite action cannot read `secrets` or `vars`, so each workflow maps
     them into its env as `AUTUMN_KACHE_S3_*`. The bucket, endpoint and region
-    are repository variables. The two tokens are repository secrets.
+    are repository variables or secrets; a variable wins when both are set.
+    The two tokens are repository secrets. A run with the keys but no bucket
+    falls back to the GitHub cache with a warning annotation.
   - `publish-gate.yml` does not map them and stays on the GitHub cache. Its
     jobs prepare releases, which should not depend on a store other runs
     write to.
@@ -111,6 +121,16 @@ flowchart LR
   PRs means moving the write token into a GitHub environment whose
   deployment branches are limited to protected branches, and naming that
   environment on the jobs that write.
+- macOS runners use `Swatinem/rust-cache`, not kache (amended 2026-11-08).
+  The macOS test archive is bound by the runner's memory and disk, and kache
+  adds a daemon and a second copy of every artifact in its store beside
+  `target/`. The composite action picks rust-cache on macOS, so every macOS
+  job, and the callers' `shared-key`, `key` and `save` inputs, carry over
+  unchanged. On macOS the `s3` and `warm` inputs have no effect, and the cache
+  is the GitHub Actions cache, keyed by workflow, job (or `shared-key`),
+  `key`, OS, arch, rustc and the Cargo manifests. The same macOS change
+  removed the two-job compile cap from the `test-archive` macOS leg, which
+  now builds on a 4-core, 14 GB runner.
 - Scaffolded apps (`autumn-cli/src/templates/.github/workflows/*.tmpl`) still
   use rust-cache. What a generated app's CI uses is a separate decision for
   its users.

@@ -176,6 +176,7 @@ fn fleet_with(dir: &FsPath, max_open: usize, migrations: EmbeddedMigrations) -> 
         root: dir.join("fleet").display().to_string(),
         path: None,
         max_open,
+        max_resident_bytes: 0,
         pool_size: 2,
         create_on_demand: Some(true),
         idle_close_secs: 0,
@@ -185,6 +186,9 @@ fn fleet_with(dir: &FsPath, max_open: usize, migrations: EmbeddedMigrations) -> 
         restore_check_sample: 0,
         replication_workers: 4,
         min_residency: std::time::Duration::from_secs(2),
+        max_open_policy: autumn_web::config::FleetMaxOpenPolicy::Soft,
+        mmap_size: 0,
+        cache_size_kib: 0,
     })
     .min_residency(Duration::ZERO)
     .migrations("app", migrations)

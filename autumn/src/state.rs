@@ -50,11 +50,9 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Some extensions are published *after* the router is built: the
 /// custom-domain registry (#1635) appears at bind time, when the TLS listener
-/// creates it. A layer built before that cannot capture the value, and it must
-/// not capture an `AppState` either — `Route::call` deep-clones the service
-/// beneath it once per request (#2193), and the state is a wide struct. This
-/// handle is one `Arc`, so the clone costs one atomic increment, and the
-/// lookup happens only on the path that needs it.
+/// creates it. A layer built before that cannot capture the value. This
+/// handle holds only the extension map, so the layer reads the value later,
+/// on the path that needs it.
 ///
 /// Get one from [`AppState::late_extensions`].
 #[cfg_attr(not(feature = "custom-domains"), allow(dead_code))]
@@ -111,9 +109,24 @@ impl std::fmt::Debug for LateExtensions {
 /// // State without a database (e.g., for testing)
 /// let state = AppState::for_test().with_profile("dev");
 /// ```
+///
+/// A clone is one reference count. All clones share one set of fields. A
+/// builder call such as [`with_profile`](Self::with_profile) on a shared state
+/// copies the fields first, so it changes only that clone.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AppState {
+    inner: Arc<AppStateInner>,
+}
+
+/// The fields of one [`AppState`].
+///
+/// `AppState` holds these behind one [`Arc`]. Field reads go through
+/// [`Deref`](std::ops::Deref). A change goes through
+/// [`AppState::fields_mut`], which copies the fields when they are shared.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct AppStateInner {
     /// Runtime-managed typed extensions installed by integrations after the app
     /// state has been constructed.
     pub(crate) extensions: Arc<std::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
@@ -144,10 +157,8 @@ pub struct AppState {
 
     /// Active profile name (e.g., "dev", "prod", "staging").
     ///
-    /// `Arc<str>` rather than `String`: `AppState` is cloned once per tower
-    /// ingress traversal (`Route::call` deep-clones the boxed service beneath
-    /// it, per #2193/#2198), so an owned `String` here would be deep-copied
-    /// on every one of those clones rather than once per request.
+    /// `Arc<str>` rather than `String`, so a copy of the fields (see
+    /// [`AppState::fields_mut`]) does not copy the text.
     pub(crate) profile: Option<Arc<str>>,
 
     /// Resolved process role for this replica, after config parsing and the
@@ -235,8 +246,7 @@ pub struct AppState {
     /// [`PolicyContext`](crate::authorization::PolicyContext).
     /// Mirrors `[auth] session_key` (default: `"user_id"`).
     ///
-    /// `Arc<str>` for the same reason as [`Self::profile`]: shared across the
-    /// per-traversal clones instead of deep-copied by each one.
+    /// `Arc<str>` for the same reason as [`Self::profile`].
     pub(crate) auth_session_key: Arc<str>,
 
     /// Shared application cache backend. `None` means no global cache has been
@@ -288,6 +298,14 @@ fn default_config() -> &'static Arc<crate::config::AutumnConfig> {
     DEFAULT_CONFIG.get_or_init(|| Arc::new(crate::config::AutumnConfig::default()))
 }
 
+impl std::ops::Deref for AppState {
+    type Target = AppStateInner;
+
+    fn deref(&self) -> &AppStateInner {
+        &self.inner
+    }
+}
+
 impl crate::authorization::ProvideAuthorizationState for AppState {
     fn policy_registry(&self) -> &crate::authorization::PolicyRegistry {
         &self.policy_registry
@@ -310,7 +328,55 @@ impl crate::authorization::ProvideAuthorizationState for AppState {
     }
 }
 
+#[cfg(feature = "ws")]
 impl AppState {
+    /// Route channel publications through `interceptors`.
+    ///
+    /// Wraps the channel backend. The presence tracker and the collaboration
+    /// hub hold the old channels, so this builds them again on the new ones.
+    pub(crate) fn intercept_channels(
+        &mut self,
+        interceptors: Vec<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    ) {
+        let backend = Arc::new(crate::channels::InterceptedChannelsBackend::new(
+            self.channels.backend().clone(),
+            interceptors,
+        ));
+        self.fields_mut().channels = Channels::with_shared_backend(backend);
+        #[cfg(feature = "presence")]
+        {
+            self.fields_mut().presence = Presence::new(self.channels.clone());
+            #[cfg(feature = "collab")]
+            {
+                self.fields_mut().collab =
+                    CollabHub::new(self.channels.clone(), self.presence.clone());
+            }
+        }
+    }
+}
+
+impl AppState {
+    /// A state that owns these fields.
+    pub(crate) fn from_inner(inner: AppStateInner) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Mutable access to the fields.
+    ///
+    /// Copies the fields first when another clone shares them, so the change
+    /// stays in this clone. Use it only while the app is built, not per request.
+    pub(crate) fn fields_mut(&mut self) -> &mut AppStateInner {
+        Arc::make_mut(&mut self.inner)
+    }
+
+    /// Whether two states share one set of fields.
+    #[cfg(test)]
+    pub(crate) fn shares_fields(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.inner, &b.inner)
+    }
+
     /// Install or replace a typed runtime extension.
     ///
     /// Integrations use this to publish typed runtime resources, such as
@@ -464,7 +530,7 @@ impl AppState {
     /// Returns an empty `Vec` when none are registered; the
     /// [`ReportingLayer`](crate::reporting::ReportingLayer) then falls back to
     /// the built-in [`LogReporter`](crate::reporting::LogReporter).
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[must_use]
     pub(crate) fn error_reporters(
         &self,
@@ -477,17 +543,45 @@ impl AppState {
     /// Returns the database connection pool.
     #[cfg(feature = "db")]
     #[must_use]
-    pub const fn pool(
+    pub fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         self.pool.as_ref()
     }
 
+    /// Returns the pool of the database role of boundary `B`.
+    ///
+    /// * No `[database.roles]` in the config: the primary pool. The app has
+    ///   one role.
+    /// * `[database.roles.<B::NAME>]` is set: the pool of that role.
+    /// * Other roles are set, but not this one: `None`, with one warning. The
+    ///   boundary does not fall back to the owner role.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn pool_for<B: crate::db_roles::Boundary>(
+        &self,
+    ) -> Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>> {
+        self.pool_for_name(B::NAME)
+    }
+
+    /// [`Self::pool_for`], by boundary name.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn pool_for_name(
+        &self,
+        name: &str,
+    ) -> Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>> {
+        match self.extension::<crate::db_roles::RolePools>() {
+            Some(pools) if !pools.is_empty() => pools.get(name),
+            _ => self.pool.clone(),
+        }
+    }
+
     /// Returns the read-replica database connection pool, if configured.
     #[cfg(feature = "db")]
     #[must_use]
-    pub const fn replica_pool(
+    pub fn replica_pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
@@ -501,7 +595,7 @@ impl AppState {
     /// are unaffected by sharding; framework state lives there.
     #[cfg(feature = "db")]
     #[must_use]
-    pub const fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+    pub fn shards(&self) -> Option<&crate::sharding::ShardSet> {
         self.shards.as_ref()
     }
 
@@ -525,43 +619,43 @@ impl AppState {
 
     /// Returns the metrics collector.
     #[must_use]
-    pub const fn metrics(&self) -> &middleware::MetricsCollector {
+    pub fn metrics(&self) -> &middleware::MetricsCollector {
         &self.metrics
     }
 
     /// Returns the log levels configuration.
     #[must_use]
-    pub const fn log_levels(&self) -> &actuator::LogLevels {
+    pub fn log_levels(&self) -> &actuator::LogLevels {
         &self.log_levels
     }
 
     /// Returns the task registry.
     #[must_use]
-    pub const fn task_registry(&self) -> &actuator::TaskRegistry {
+    pub fn task_registry(&self) -> &actuator::TaskRegistry {
         &self.task_registry
     }
 
     /// Returns the job registry.
     #[must_use]
-    pub const fn job_registry(&self) -> &actuator::JobRegistry {
+    pub fn job_registry(&self) -> &actuator::JobRegistry {
         &self.job_registry
     }
 
     /// Returns the config properties.
     #[must_use]
-    pub const fn config_props(&self) -> &actuator::ConfigProperties {
+    pub fn config_props(&self) -> &actuator::ConfigProperties {
         &self.config_props
     }
 
     /// Returns the registry of plugin-contributed metrics sources.
     #[must_use]
-    pub const fn metrics_source_registry(&self) -> &actuator::MetricsSourceRegistry {
+    pub fn metrics_source_registry(&self) -> &actuator::MetricsSourceRegistry {
         &self.metrics_source_registry
     }
 
     /// Returns the registry of custom health indicators.
     #[must_use]
-    pub const fn health_indicator_registry(&self) -> &actuator::HealthIndicatorRegistry {
+    pub fn health_indicator_registry(&self) -> &actuator::HealthIndicatorRegistry {
         &self.health_indicator_registry
     }
 
@@ -622,13 +716,13 @@ impl AppState {
     /// Used to scope per-route `#[throttle]` limiters so two independently
     /// built apps with identical config never share a token bucket.
     #[must_use]
-    pub(crate) const fn app_id(&self) -> u64 {
+    pub(crate) fn app_id(&self) -> u64 {
         self.app_id
     }
 
     /// Returns the shared probe lifecycle state.
     #[must_use]
-    pub const fn probes(&self) -> &probe::ProbeState {
+    pub fn probes(&self) -> &probe::ProbeState {
         &self.probes
     }
 
@@ -663,7 +757,7 @@ impl AppState {
         mut self,
         pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     ) -> Self {
-        self.pool = Some(pool);
+        self.fields_mut().pool = Some(pool);
         self
     }
 
@@ -674,7 +768,7 @@ impl AppState {
         mut self,
         pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     ) -> Self {
-        self.replica_pool = Some(pool);
+        self.fields_mut().replica_pool = Some(pool);
         self
     }
 
@@ -682,7 +776,7 @@ impl AppState {
     #[cfg(feature = "db")]
     #[must_use]
     pub fn with_shards(mut self, shards: crate::sharding::ShardSet) -> Self {
-        self.shards = Some(shards);
+        self.fields_mut().shards = Some(shards);
         self
     }
 
@@ -721,7 +815,7 @@ impl AppState {
     /// Register a global cache backend (builder / test helper, build-time).
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
-        self.shared_cache = Some(crate::cache::with_capsule_seam(cache));
+        self.fields_mut().shared_cache = Some(crate::cache::with_capsule_seam(cache));
         self
     }
 
@@ -782,7 +876,7 @@ impl AppState {
                  starting the job runtime."
             );
         }
-        self.started_at = clock.monotonic();
+        self.fields_mut().started_at = clock.monotonic();
         // A registry's queue gauges compare ready-at marks against a clock, and
         // the marks come from the job runtime started off *this* state — so the
         // registry has to be the one this state's clock governs, and only that
@@ -797,8 +891,9 @@ impl AppState {
         // whichever order states are cloned and re-clocked in. Before a runtime
         // starts — the only point at which this builder is meaningful, checked
         // above — the registry is empty, so nothing is dropped.
-        self.job_registry = actuator::JobRegistry::new().with_clock(Arc::clone(&clock));
-        self.clock = clock;
+        self.fields_mut().job_registry =
+            actuator::JobRegistry::new().with_clock(Arc::clone(&clock));
+        self.fields_mut().clock = clock;
         self
     }
 
@@ -849,7 +944,7 @@ impl AppState {
     /// [`Self::with_clock`].
     #[must_use]
     pub fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
-        self.entropy = entropy;
+        self.fields_mut().entropy = entropy;
         self
     }
 
@@ -867,13 +962,13 @@ impl AppState {
     /// Sets the active profile.
     #[must_use]
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
-        self.profile = Some(Arc::from(profile.into()));
+        self.fields_mut().profile = Some(Arc::from(profile.into()));
         self
     }
 
     /// Returns a reference to the [`PolicyRegistry`].
     #[must_use]
-    pub const fn policy_registry(&self) -> &PolicyRegistry {
+    pub fn policy_registry(&self) -> &PolicyRegistry {
         &self.policy_registry
     }
 
@@ -893,7 +988,7 @@ impl AppState {
     /// [`ForbiddenResponse`] for the trade-off between `403` and
     /// `404` defaults.
     #[must_use]
-    pub const fn forbidden_response(&self) -> ForbiddenResponse {
+    pub fn forbidden_response(&self) -> ForbiddenResponse {
         self.forbidden_response
     }
 
@@ -907,8 +1002,8 @@ impl AppState {
     /// Override the configured deny response (test helper).
     #[doc(hidden)]
     #[must_use]
-    pub const fn with_forbidden_response(mut self, value: ForbiddenResponse) -> Self {
-        self.forbidden_response = value;
+    pub fn with_forbidden_response(mut self, value: ForbiddenResponse) -> Self {
+        self.fields_mut().forbidden_response = value;
         self
     }
 
@@ -916,7 +1011,7 @@ impl AppState {
     #[doc(hidden)]
     #[must_use]
     pub fn with_auth_session_key(mut self, value: impl Into<String>) -> Self {
-        self.auth_session_key = Arc::from(value.into());
+        self.fields_mut().auth_session_key = Arc::from(value.into());
         self
     }
 
@@ -969,7 +1064,7 @@ impl AppState {
     /// name. [`base`](crate::config::Role::base) is the built-in role. To gate
     /// one subsystem, use [`capabilities`](Self::capabilities).
     #[must_use]
-    pub const fn role(&self) -> &crate::config::Role {
+    pub fn role(&self) -> &crate::config::Role {
         &self.role
     }
 
@@ -992,7 +1087,7 @@ impl AppState {
     /// # }
     /// ```
     #[must_use]
-    pub const fn capabilities(&self) -> crate::config::RoleCapabilities {
+    pub fn capabilities(&self) -> crate::config::RoleCapabilities {
         self.role.capabilities()
     }
 
@@ -1027,14 +1122,14 @@ impl AppState {
     /// Shorthand for accessing `self.channels` directly.
     #[cfg(feature = "ws")]
     #[must_use]
-    pub const fn channels(&self) -> &Channels {
+    pub fn channels(&self) -> &Channels {
         &self.channels
     }
 
     /// Returns a reference to the distributed presence tracker.
     #[cfg(feature = "presence")]
     #[must_use]
-    pub const fn presence(&self) -> &Presence {
+    pub fn presence(&self) -> &Presence {
         &self.presence
     }
 
@@ -1043,7 +1138,7 @@ impl AppState {
     /// Shorthand for the [`CollabHub`] extractor.
     #[cfg(all(feature = "collab", feature = "presence"))]
     #[must_use]
-    pub const fn collab(&self) -> &CollabHub {
+    pub fn collab(&self) -> &CollabHub {
         &self.collab
     }
 
@@ -1102,7 +1197,7 @@ impl AppState {
         // one would disagree with the other.
         #[cfg(feature = "presence")]
         let presence = Presence::new(channels.clone());
-        Self {
+        Self::from_inner(AppStateInner {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
@@ -1137,7 +1232,7 @@ impl AppState {
             clock: Arc::new(SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: Self::next_app_id(),
-        }
+        })
     }
 
     /// Create an `AppState` suitable for testing, with sensible defaults
@@ -1187,6 +1282,18 @@ impl DbState for AppState {
 
     fn shards(&self) -> Option<&crate::sharding::ShardSet> {
         self.shards.as_ref()
+    }
+
+    fn boundary_pool(
+        &self,
+        name: &str,
+    ) -> Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>> {
+        self.pool_for_name(name)
+    }
+
+    fn boundary_roles_configured(&self) -> bool {
+        self.extension::<crate::db_roles::RolePools>()
+            .is_some_and(|pools| !pools.is_empty())
     }
 
     fn db_interceptors(
@@ -1429,14 +1536,24 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     /// Build a default `AppState` for unit tests.
     ///
+    /// See [`AppStateInner::test_default_fields`].
+    pub(crate) fn test_default() -> Self {
+        Self::from_inner(AppStateInner::test_default_fields())
+    }
+}
+
+#[cfg(test)]
+impl AppStateInner {
+    /// The fields of a default `AppState` for unit tests.
+    ///
     /// Every field here is the value duplicated verbatim across the crate's
     /// test helpers (`app::tests::test_router`, `router::tests::test_state`,
     /// `session::tests::test_state`, `auth::tests::test_app_state`, and
     /// several inline call sites) before they were consolidated onto this
     /// function. Callers that need one or two fields to differ do so with
-    /// struct-update syntax (`AppState { field: ..., ..AppState::test_default() }`)
+    /// struct-update syntax (`AppStateInner { field: ..., ..AppStateInner::test_default_fields() }`)
     /// rather than repeating the other twenty-odd fields.
-    pub(crate) fn test_default() -> Self {
+    pub(crate) fn test_default_fields() -> Self {
         // One registry and one tracker across all three fields, for the
         // reason `detached()` gives: a hub wired to a different `Channels`
         // than `state.channels()` publishes where nobody is listening, and a
@@ -1481,13 +1598,88 @@ impl AppState {
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-            app_id: Self::next_app_id(),
+            app_id: AppState::next_app_id(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The state is one pointer wide. A request clones the state several
+    /// times. A wide struct would cost one reference count for each field.
+    #[test]
+    fn app_state_is_one_pointer_wide() {
+        assert_eq!(
+            std::mem::size_of::<super::AppState>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
+    /// A clone shares the fields. It does not copy them.
+    #[test]
+    fn a_clone_shares_the_fields_of_the_original() {
+        let state = super::AppState::for_test();
+        let clone = state.clone();
+        assert!(super::AppState::shares_fields(&state, &clone));
+    }
+
+    /// Counts the publications it sees.
+    #[cfg(feature = "ws")]
+    #[derive(Default)]
+    struct CountPublishes(std::sync::atomic::AtomicUsize);
+
+    #[cfg(feature = "ws")]
+    impl crate::interceptor::ChannelsInterceptor for CountPublishes {
+        fn intercept_publish(
+            &self,
+            topic: &str,
+            msg: &crate::channels::ChannelMessage,
+            next: &dyn Fn(
+                &str,
+                &crate::channels::ChannelMessage,
+            ) -> Result<usize, crate::channels::ChannelPublishError>,
+        ) -> Result<usize, crate::channels::ChannelPublishError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            next(topic, msg)
+        }
+    }
+
+    /// An intercepted state sends each publication through the interceptor.
+    /// The clone taken before keeps its own channels.
+    #[cfg(feature = "ws")]
+    #[test]
+    fn intercept_channels_routes_publications_through_the_interceptor() {
+        let counter = Arc::new(CountPublishes::default());
+        let mut state = super::AppState::for_test();
+        let before = state.clone();
+        state.intercept_channels(vec![counter.clone()]);
+
+        state.channels().publish("topic", "one").expect("publish");
+        before.channels().publish("topic", "two").expect("publish");
+
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!super::AppState::shares_fields(&state, &before));
+    }
+
+    /// A builder call on a clone changes only that clone.
+    #[test]
+    fn a_builder_call_on_a_clone_leaves_the_original() {
+        let state = super::AppState::for_test().with_profile("dev");
+        let clone = state.clone().with_profile("prod");
+        assert_eq!(state.profile(), "dev");
+        assert_eq!(clone.profile(), "prod");
+        assert!(!super::AppState::shares_fields(&state, &clone));
+    }
+
+    /// A builder call on a clone keeps the shared runtime parts shared.
+    #[test]
+    fn a_builder_call_on_a_clone_keeps_the_extensions_shared() {
+        let state = super::AppState::for_test();
+        let clone = state.clone().with_profile("prod");
+        clone.insert_extension(7_u32);
+        assert_eq!(state.extension::<u32>().as_deref(), Some(&7));
+    }
+
     #[test]
     fn test_states_run_every_capability_of_the_combined_role() {
         let combined = crate::config::ProcessRole::Combined.capabilities();
@@ -1499,7 +1691,7 @@ mod tests {
     fn provide_actuator_state_reports_the_role_and_capabilities() {
         use crate::actuator::ProvideActuatorState as _;
         let mut state = super::AppState::for_test();
-        state.role = crate::config::ProcessRole::Web.into();
+        state.fields_mut().role = crate::config::ProcessRole::Web.into();
         let role = state.process_role().expect("AppState reports its role");
         assert_eq!(role, crate::config::ProcessRole::Web);
         assert_eq!(

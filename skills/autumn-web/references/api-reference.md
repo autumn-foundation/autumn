@@ -423,7 +423,7 @@ Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `cursor_key_type =` attr keys), bulk `save_many` / `save_many_skip_invalid` /
 `update_many` / `delete_many` / `upsert_many` (compile error on hooked repos),
 `with_lock`, `on_primary()`. Attr keys: `api =`, `policy =`,
-`scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
+`scope =`, `primary_reads`, `boundary =`, `soft_delete`, `tenant_scoped`, `hooks =`,
 `mcp` / `mcp = "read"`.
 
 **(0.6.0)**: `preload(records, spec)` (declarative associations);
@@ -487,11 +487,17 @@ helpers). Import the trait as `_`, then:
 
 ```rust
 use crate::models::PostComments as _;
-use autumn_web::commentable::{Comment, CommentNode};
+use autumn_web::commentable::{Comment, CommentNode, ThreadPage};
 
 async fn add_comment(&self, parent_id: i64, author_id: i64, body: &str,
                      reply_to: Option<i64>) -> AutumnResult<Comment>;
 async fn comment_thread(&self, parent_id: i64) -> AutumnResult<Vec<CommentNode>>;
+// One page of top-level comments and all their replies (#3325).
+async fn comment_thread_page(&self, parent_id: i64, after: Option<i64>,
+                             page_size: usize) -> AutumnResult<ThreadPage>;
+// The page that shows `comment_id`.
+async fn comment_thread_page_containing(&self, parent_id: i64, comment_id: i64,
+                                        page_size: usize) -> AutumnResult<ThreadPage>;
 async fn delete_comment(&self, parent_id: i64, comment_id: i64) -> AutumnResult<usize>;
 async fn recompute_comment_count(&self, parent_id: i64) -> AutumnResult<i64>;
 
@@ -500,6 +506,9 @@ pub struct Comment { pub id: i64, pub parent_id: Option<i64>, pub author_id: i64
                      pub author_name: Option<String> }
 pub struct CommentNode { pub comment: Comment, pub depth: usize,
                          pub replies: Vec<CommentNode> }
+#[non_exhaustive]
+pub struct ThreadPage { pub nodes: Vec<CommentNode>, pub after: Option<i64>,
+                        pub next: Option<i64> }
 ```
 
 One `comments` table keyed on `(commentable_type, commentable_id)` serves every
@@ -509,7 +518,9 @@ be `i64` — both are compile-checked. `add_comment` row-locks the parent (the
 polymorphic column has no foreign key, so the probe is the referential check),
 enforces `max_depth` (default 5) and same-record `reply_to`, and moves
 `comment_count` with the #1325 counter-cache primitive in the same transaction.
-`comment_thread` is one query at any depth; `delete_comment` cascades to the
+`comment_thread` is one query at any depth, and reads the whole thread. On a
+request path use `comment_thread_page`: the page size sets its cost, and
+`next` is the cursor of the next page. `delete_comment` cascades to the
 descendant subtree and is idempotent, and takes `parent_id` so a comment id
 alone is never authority over a comment on another record. With
 `soft_delete = false` it refuses (`422`) a subtree that has a reply on another
@@ -519,7 +530,9 @@ be WRONG here — it keys on the fk column alone, which is shared across models)
 Like `react()`, all four take their own pooled connection — never hold a `Db`
 extractor across one. `autumn_web::commentable::router(cfg)` serves
 `GET`/`POST /{commentable_type}/{parent_id}` for every registered model from a
-single mount; it authorizes the **tenant**, never the record, so an app with
+single mount. Both read one page (`CommentsConfig::page_size`, default 50;
+`GET ?after=<id>` for a later page), and a `POST` shows the page that holds
+the new comment. It authorizes the **tenant**, never the record, so an app with
 private records must set `CommentsConfig::authorize(...)`. Build a host page's
 own thread with `commentable::thread_dom_id`/`thread_action` so the router's
 re-render lands on the same element. Pair the `nest` with
@@ -1020,7 +1033,9 @@ Per-primitive setters (in addition to the shared set):
   `422`), `.label(s)` / `.empty_text(s)` / `.submit_label(s)` /
   `.reply_label(s)` / `.placeholder(s)`, `.body_field(s)` / `.reply_field(s)`,
   `.hx_target(s)` (defaults `#{dom_id}`), and `.read_only(Option<String>)` for
-  a signed-out visitor (thread renders, every form disappears, prompt shown).
+  a signed-out visitor (thread renders, every form disappears, prompt shown),
+  and `.page(after, next)` (from a `ThreadPage`) for the "More comments" /
+  "Earlier comments" links, with `.more_label(s)` / `.earlier_label(s)`.
   Render with `comment_thread(&cfg, &CommentView::from_thread(&nodes)) ->
   Markup`; `CommentView` is a plain view struct so the widget compiles without
   `db` and can be built from any source. Nested `<ol>`s (depth is exposed to
@@ -1038,7 +1053,8 @@ Per-primitive setters (in addition to the shared set):
   `.autumn-comment-meta` / `.autumn-comment-author` / `.autumn-comment-time` /
   `.autumn-comment-body` / `.autumn-comment-reply` /
   `.autumn-comment-reply-toggle` / `.autumn-comment-form` /
-  `.autumn-comment-label` / `.autumn-comment-input` / `.autumn-comment-submit`.
+  `.autumn-comment-label` / `.autumn-comment-input` / `.autumn-comment-submit` /
+  `.autumn-comments-more` / `.autumn-comments-earlier`.
 - `autumn_web::widgets::{BulkActionsConfig, bulk_actions_form,
   bulk_select_checkbox, bulk_actions_toolbar}` (#1312) — the no-JavaScript
   bulk-select + delete-selected flow. `BulkActionsConfig::new(action_url)`
@@ -1188,13 +1204,16 @@ in **Typed accessible primitives** above.)
 | `StoryGallery::stylesheet(href)` / `.script(src)` / `.merge(other)` | Extra assets each gallery page links. |
 | `form::FieldRenderer` (`name`, `render`, `multipart`, `grouped`) | Plugin form control. `FieldControl::custom(r)`, `custom_input_with(&cs, field, label, &r, &opts)`. |
 | `form::FieldContext::control(tag, attrs, body)` | Writes the control with `id`/`name`/`value`/`required`/`aria-*` + passthrough; drops owned names, `on*`/`hx-on*`, `style`; never pre-fills password/file/checkbox/radio. |
-| `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required`, `aria-invalid`, passthrough. |
+| `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required` (not on a checkbox: check "one or more" on the server), `aria-invalid`, passthrough. |
 | `widget_pack::element(tag, attrs, &FieldOptions, body)` | Root of a non-input widget with the app `data-*`/`hx-*` passthrough. |
 | `plugin_conformance::run_conformance(&ConformanceConfig::new(name).contract(c).no_routes(), &routes)` | For a plugin that mounts no routes (cache, background runtime): no route under the config name or the contract's `plugin`/`registered_as` skips `route-attribution`; such a route fails it. Take the contract from `builder.plugin_contracts()` (it carries `registered_as`); without that, every plugin route fails. Do not set a `prefix` with it. Library counterpart of `autumn plugin-check --no-routes`. |
+| `plugin_conformance::run_route_checks(&config, &routes)` | The route checks of `run_conformance` (all but `experimental-surface`). With a contract, if no route carries the config name and a route carries `registered_as`, the checks use `registered_as`. `autumn plugin-check` calls it on its route dump, so the CLI and the library give the same results, except that `--no-routes` needs `registered_as` to skip (#2828). |
+| `RouteSource::from_wire("plugin:<name>")` | Reads the route-dump source string: `framework`, `plugin:<name>`, else `User`. |
 | `plugin_conformance::widgets::run_widget_conformance(&pack)` | Static: `widget-pack-name`, `widget-stories`, `widget-class-names`, `widget-markup-csp`, `widget-tokens`, `widget-scripts`. |
 | `plugin_conformance::widgets::browser::run_widget_browser_conformance(&pack, axe_src).await` | Feature `system-tests`: `widget-axe` (light + dark), `widget-console`, `widget-keyboard`. |
 | `Page::axe_violations(axe_src)` / `SystemTest::plugin_assets(&ASSETS)` | Shared axe check; serve a bundle in a system test. |
 | `autumn:init` event | Fires on `document` at `DOMContentLoaded` and on each htmx-swapped root, before roving init. |
+| Tree keys (`role="tree"` + `data-autumn-roving`) | The keyboard core gives the APG tree keys: ArrowRight opens or goes to the first child, ArrowLeft closes or goes to the parent, `*` opens the siblings; typeahead and arrows skip items in a `hidden` subtree; disabled tree items take focus. A parent `treeitem` has `aria-expanded` and holds its `role="group"` or names it in `aria-owns`. Fires `autumn:expand` / `autumn:collapse` on the item (load lazy children there). Pack JS adds no arrow-key code (`docs/guide/keyboard.md#tree-keys`). |
 
 ## Cache read-through (0.6.0)
 
@@ -1346,8 +1365,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 
 - `autumn_web::cluster` — zero-dependency two-node clustering: authenticated
   TCP gossip membership plus one shared primitive, an eventually consistent
-  cluster-wide grow-only counter. Always compiled (no cargo feature); inert
-  unless `[cluster] enabled = true`. Not leader election, not mutual
+  cluster-wide grow-only counter. Needs the `cluster` feature (in `default`;
+  #2795). Inert unless `[cluster] enabled = true`. Without the feature,
+  `[cluster]` parses and `enabled = true` fails boot. Not leader election, not mutual
   exclusion, not durable — for run-once work use `Lock` above.
 - Handle: `state.extension::<ClusterHandle>() -> Option<Arc<ClusterHandle>>`
   (`None` when disabled). `ClusterHandle::{node_id() -> &str, local_addr() ->
@@ -1486,7 +1506,8 @@ double-submits and replays.
   `HxResponseExt`, `Sse`, `Event`, `TaskArgs`, `SignedWebhook`. With CSRF off
   (the dev default), `CsrfToken` is empty; `Option<CsrfToken>` is `None`.
 - Database: `autumn_web::db::prelude::*` (Diesel's prelude with the async
-  `RunQueryDsl`), `AppBuilder::migrations_for(MigrationScope, set)`.
+  `RunQueryDsl`), `AppBuilder::migrations_for(MigrationScope, set)`,
+  `AppBuilder::plugin_migrations_for(name, MigrationScope, set)`.
 - Error and response: `AutumnError`, `AutumnResult`, `IntoResponse`,
   `StatusCode`, `Redirect`.
 - Data helpers: `Changeset`, `ChangesetForm`, `IntoChangeset`, mutation hook
@@ -1664,7 +1685,7 @@ See `docs/guide/system-tests.md`.
 
 ```toml
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "error-reporting"]
 ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]
@@ -1703,7 +1724,8 @@ storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
 seed = ["db"]
 system-info = []
-reporting = []
+error-reporting = []            # panic catch + ErrorReporter (in `default`)
+reporting = ["error-reporting"]  # adds failure capture and `autumn replay` (in `default`)
 webauthn = ["dep:webauthn-rs"]
 csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
@@ -1790,7 +1812,6 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["tra
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
-tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
 validator = { version = "0.21", features = ["derive"] }
 bcrypt = "0.19"
@@ -1994,6 +2015,10 @@ Frequently used env keys:
 | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` |
 | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` |
 | `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS` | `database.replica_max_lag_ms` |
+| `AUTUMN_DATABASE__MMAP_SIZE` | `database.mmap_size` (SQLite, bytes; `0` = off) |
+| `AUTUMN_DATABASE__CACHE_SIZE_KIB` | `database.cache_size_kib` (SQLite, KiB; `0` = default) |
+| `AUTUMN_DATABASE__FLEET__MMAP_SIZE` | `database.fleet.mmap_size` |
+| `AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB` | `database.fleet.cache_size_kib` |
 | `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS` | `server.http.header_read_timeout_ms` |
 | `AUTUMN_REALTIME__MAX_MESSAGE_BYTES` | `realtime.max_message_bytes` |
 | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` |

@@ -66,3 +66,34 @@ async fn with_transactional_db_sqlite_url_yields_a_live_pool() {
         .assert_status(200)
         .assert_body_eq("1");
 }
+
+/// A `Db` hold on a matched route shows in `/actuator/metrics` under
+/// `db_connection_holds["GET /ping"]`. The deprecated `"GET /ping SELECT"`
+/// query key stays for one release.
+#[tokio::test]
+async fn db_connection_hold_shows_in_actuator_metrics() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let url = format!("sqlite://{}", tmp.path().join("holds.db").display());
+
+    let client = TestApp::new()
+        .routes(routes![ping])
+        .with_transactional_db(url)
+        .build();
+
+    client.get("/ping").send().await.assert_status(200);
+    client
+        .get("/actuator/metrics")
+        .send()
+        .await
+        .assert_ok()
+        .assert_json::<serde_json::Value, _>(|metrics| {
+            assert_eq!(
+                metrics["db_connection_holds"]["GET /ping"]["count"], 1,
+                "{metrics}"
+            );
+            assert_eq!(
+                metrics["db_queries"]["GET /ping SELECT"]["count"], 1,
+                "{metrics}"
+            );
+        });
+}

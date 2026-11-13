@@ -22,6 +22,9 @@
   //   data-autumn-dismiss              Escape, outside click or focus-out closes
   //   data-autumn-dismiss="escape"     only Escape closes (a tooltip)
   //
+  // role="tree" adds the APG tree keys (Right, Left, `*`) and fires
+  // `autumn:expand` and `autumn:collapse` on the item.
+  //
   // The controller (or trigger) is the element whose aria-controls names the
   // list (or layer). A role="tooltip" layer's trigger names it in
   // aria-describedby or aria-labelledby. Events: `autumn:navigate`
@@ -46,12 +49,21 @@
     el.dispatchEvent(new CustomEvent(name, { bubbles: true, detail: { item: item } }));
   }
 
-  // The items of a list: not disabled, not hidden, not in a nested list.
+  function inHidden(el, list) {
+    for (var p = el.parentElement; p && p !== list; p = p.parentElement) {
+      if (p.hidden) return true;
+    }
+    return false;
+  }
+
+  // The items of a list: not disabled, not hidden (or in a hidden subtree),
+  // not in a nested list. A tree keeps disabled items: they take focus.
   function listItems(list) {
     var sel = list.getAttribute('data-autumn-roving') || ITEMS;
+    var tree = list.getAttribute('role') === 'tree';
     return Array.prototype.filter.call(list.querySelectorAll(sel), function (el) {
-      return !el.hidden && el.getAttribute('aria-disabled') !== 'true' &&
-        el.closest(LIST) === list;
+      return !el.hidden && (tree || el.getAttribute('aria-disabled') !== 'true') &&
+        el.closest(LIST) === list && !inHidden(el, list);
     });
   }
 
@@ -202,10 +214,86 @@
     }
   }
 
+  // ── Tree keys ──
+  // A parent treeitem holds its role="group", or names it in aria-owns.
+  function groupOf(item, list) {
+    var ids = (item.getAttribute('aria-owns') || '').split(/\s+/);
+    for (var i = 0; i < ids.length; i++) {
+      var owned = ids[i] && document.getElementById(ids[i]);
+      if (owned && owned.getAttribute('role') === 'group' && list.contains(owned)) return owned;
+    }
+    for (var j = 0; j < item.children.length; j++) {
+      if (item.children[j].getAttribute('role') === 'group') return item.children[j];
+    }
+    return null;
+  }
+
+  // The treeitem that holds or owns `group`. An owner is often a sibling.
+  function ownerOf(group, list) {
+    var parent = group.parentElement;
+    if (parent && parent.getAttribute('role') === 'treeitem') return parent;
+    if (!group.id) return null;
+    var sel = '[role="treeitem"][aria-owns~="' + CSS.escape(group.id) + '"]';
+    for (var i = 0; parent && i < parent.children.length; i++) {
+      if (parent.children[i].matches(sel)) return parent.children[i];
+    }
+    return list.querySelector(sel);
+  }
+
+  function parentItem(item, list) {
+    var group = item.parentElement && item.parentElement.closest('[role="group"]');
+    return group && list.contains(group) ? ownerOf(group, list) : null;
+  }
+
+  function setExpanded(item, list, open) {
+    var group = groupOf(item, list);
+    item.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (group) group.hidden = !open;
+    // New visible items take focus by click or script. The tab stop stays.
+    if (open) listItems(list).forEach(function (el) { if (!el.hasAttribute('tabindex')) el.tabIndex = -1; });
+    emit(item, open ? 'autumn:expand' : 'autumn:collapse', item);
+  }
+
+  // Return true when the tree takes the key.
+  function treeKey(e, list, all, item) {
+    var rtl = getComputedStyle(list).direction === 'rtl';
+    var open = item.getAttribute('aria-expanded');
+    if (e.key === (rtl ? 'ArrowLeft' : 'ArrowRight')) {
+      if (open === 'false') setExpanded(item, list, true);
+      else if (open === 'true') {
+        // The first visible item in the group. An owned group can be anywhere.
+        var group = groupOf(item, list);
+        var first = group && all.filter(function (el) { return group.contains(el); })[0];
+        if (first) focusItem(list, first);
+      }
+      return true;
+    }
+    if (e.key === (rtl ? 'ArrowRight' : 'ArrowLeft')) {
+      var up = parentItem(item, list);
+      if (open === 'true') setExpanded(item, list, false);
+      else if (up && all.indexOf(up) >= 0) focusItem(list, up);
+      return true;
+    }
+    if (e.key === '*') {
+      var parent = parentItem(item, list);
+      all.forEach(function (el) {
+        if (el.getAttribute('aria-expanded') === 'false' && parentItem(el, list) === parent) {
+          setExpanded(el, list, true);
+        }
+      });
+      return true;
+    }
+    return false;
+  }
+
   function rovingKey(e, list) {
     var all = listItems(list);
     var index = all.indexOf(e.target);
     if (index < 0) return;
+    if (list.getAttribute('role') === 'tree' && treeKey(e, list, all, e.target)) {
+      e.preventDefault();
+      return;
+    }
     var n = nextIndex(list, all.length, index, e.key);
     var item = n >= 0 ? all[n] : null;
     if (!item && e.key.length === 1 && e.key !== ' ' && list.hasAttribute('data-autumn-typeahead')) {
@@ -379,15 +467,9 @@
   });
 
   // ── nav_bar widget ──────────────────────────────────────────────────────
-  // Progressive enhancement for autumn_web::widgets::nav_bar: before this
-  // runs, the hamburger toggle is hidden. Once it runs, the hamburger is
-  // revealed. Dropdowns are popover menus (see below).
-
-  // initNav is guarded per-CONTROL (the toggle), not once per nav element:
-  // when htmx swaps a <nav data-autumn-nav>'s innerHTML (the nav itself stays
-  // in the DOM, only its children are replaced), the swapped-in hamburger is
-  // a brand-new node, so it needs wiring again even though the nav was
-  // already initialized once.
+  // This code shows the hamburger toggle. Dropdowns are popover menus.
+  // The guard is on the toggle, not on the nav: an htmx swap of the nav
+  // content brings a new toggle, which needs its listener.
   function initNav(nav) {
     nav.classList.add('autumn-nav--enhanced');
 
@@ -517,14 +599,9 @@
   });
 
   // ── modal / confirm_action ────────────────────────────────────────────────
-  // autumn_web::widgets::modal / confirm_action open and close their
-  // <dialog> via the native HTML Invoker Commands API (command="show-modal"
-  // / command="close" + commandfor) wherever it's supported — no JS needed
-  // there. This is the fallback for browsers that don't support it yet:
-  // one delegated click handler wired to the same data-modal-open /
-  // data-modal-close attributes the widget always emits. showModal()/close()
-  // give ESC-close, a focus trap, and focus-into/-return-from the dialog for
-  // free from the browser in both paths.
+  // The dialog opens and closes with command/commandfor. This is the
+  // fallback for a browser without them: it reads data-modal-open and
+  // data-modal-close. showModal() gives Escape and the focus trap.
   if (!('command' in HTMLButtonElement.prototype)) {
     document.addEventListener('click', function (e) {
       var pop = e.target.closest('[data-popover-toggle]');
@@ -549,17 +626,10 @@
     });
   }
 
-  // ── modal light-dismiss (closedby="any") backdrop-click polyfill ──────────
-  // `closedby="any"` (ModalConfig::light_dismiss) is a newer <dialog>
-  // feature with limited browser support — where it's unsupported, the
-  // native backdrop click silently does nothing. Always wired (not
-  // feature-detected): dialog.close() on an already-closed dialog is a
-  // spec'd no-op, so this never double-fires where closedby IS natively
-  // supported. e.target === the dialog itself only happens for a genuine
-  // backdrop click here: .autumn-modal has zero padding and its one child,
-  // .autumn-modal__content, fills the whole box, so any click landing
-  // inside the visible dialog always targets a descendant, never the
-  // <dialog> element directly.
+  // ── modal light-dismiss (closedby="any") polyfill ─────────────────────────
+  // A backdrop click closes the dialog. close() on a closed dialog does
+  // nothing, so a browser with closedby is safe. The content fills the
+  // dialog, so only a backdrop click has the dialog as its target.
   document.addEventListener('click', function (e) {
     var t = e.target;
     if (t.matches && t.matches('dialog[closedby="any"][open]')) t.close();
@@ -631,11 +701,9 @@
     }
   }, true);
 
-  // A cached page can carry a stale data-theme. Only a page with a
-  // cookie-backed toggle (one that posts to the framework route) follows the
-  // cookie: its layout renders the stored preference, and no cookie means
-  // System. Other pages keep the data-theme their app set, for example a
-  // light-only pin or a theme read from a user profile.
+  // A cached page can have a stale data-theme. Only a page with a toggle
+  // that posts to the framework route follows the cookie (no cookie means
+  // System). Other pages keep the data-theme that their app set.
   function syncTheme() {
     var cookieBacked = 'form[data-autumn-theme-toggle][action="' + THEME_PATH + '"]';
     if (!document.querySelector(cookieBacked)) return;
@@ -1233,14 +1301,30 @@
   }, true);
 
   // A key is missing until its upload ends, so hold the form. One listener
-  // for the page, so a swap leaves no stale listener on the form.
-  document.addEventListener('submit', function (e) {
-    var root = e.target.querySelector && e.target.querySelector(UPLOAD + '[aria-busy]');
-    if (!root) return;
+  // for each event on the page, so a swap leaves no stale listener.
+  var BUSY = UPLOAD + '[aria-busy]';
+  function hold(e, root, tell) {
     e.preventDefault();
     e.stopImmediatePropagation();
+    if (!tell) return;
     root.querySelector('[role="alert"]').textContent = 'Wait for the upload to finish, then send the form again.';
     root.querySelector('input[type="file"]').focus();
+  }
+  document.addEventListener('submit', function (e) {
+    var root = e.target.querySelector && e.target.querySelector(BUSY);
+    if (root) hold(e, root, true);
+  }, true);
+  // htmx sends a button request on `click`, not `submit`. Cancel a request
+  // that sends a busy upload, by the htmx 2 rule. Only a click or a submit
+  // moves focus. A request on `autumn:upload` sends the key, so it goes.
+  document.addEventListener('htmx:beforeRequest', function (e) {
+    var elt = e.detail.elt, cfg = e.detail.requestConfig || {}, ev = cfg.triggeringEvent, root;
+    if (!elt || !elt.closest || (ev && ev.type.indexOf('autumn:upload') === 0)) return;
+    var sent = (targetsOf(elt, 'hx-include') || []).concat(
+      elt.matches('form') ? elt : [],
+      cfg.verb !== 'get' ? elt.closest('form') || [] : []);
+    sent.some(function (n) { return (root = n.querySelector(BUSY) || n.closest(BUSY)); });
+    if (root) hold(e, root, ev && (ev.type === 'click' || ev.type === 'submit'));
   }, true);
 
   // Run `fn` on `root` (when it matches) and on each match inside it.
@@ -1296,24 +1380,62 @@
   // A history restore (hx-boost, Back) brings back nodes without listeners.
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
 
-  // Busy state (#3406). Mark this request's [data-autumn-busy] requester,
-  // submitter and indicators, and its target. Indicators resolve as htmx
-  // does: the inherited hx-indicator, else the requester.
+  // Busy state (#3406). Mark the [data-autumn-busy] requester, submitter
+  // and indicators of this request, and its target. The indicators are the
+  // inherited hx-indicator, else the requester.
   var busyCount = new WeakMap();
-  function indicatorsOf(elt) {
-    var host = elt.closest('[hx-indicator],[data-hx-indicator]');
-    if (!host) return [elt];
-    var sel = host.getAttribute('hx-indicator') || host.getAttribute('data-hx-indicator');
+  var REL = /^(?:(closest|find) |(next|previous)(?: |$))/;
+  // `next X` (pos 2) or `previous X` (pos 4) as htmx scans: the first match
+  // after `elt`, or the last before it. Not a descendant or an ancestor.
+  function scan(elt, sel, pos) {
+    var all = Array.from(document.querySelectorAll(sel));
+    if (pos === 4) all.reverse();
+    return all.filter(function (el) { return el.compareDocumentPosition(elt) === pos; })[0];
+  }
+  // As in htmx: `<sel/>` is `sel`, and a comma in it does not split.
+  function bare(s) { return /^<.*\/>$/.test(s) ? s.slice(1, -2) : s; }
+  function parts(sel) {
+    var out = [], depth = 0, from = 0;
+    for (var i = 0; i < sel.length; i++) {
+      var c = sel.charAt(i);
+      if (c === ',' && !depth) { out.push(sel.slice(from, i)); from = i + 1; }
+      else if (c === '<') depth++;
+      else if (c === '/' && sel.charAt(i + 1) === '>') depth--;
+    }
+    return out.concat(sel.slice(from));
+  }
+  // The elements that the inherited `attr` names, or null with no `attr`.
+  // As htmx: `this` is the whole value. A keyword part resolves from `elt`.
+  // The other parts join again into one query, so a comma in :is() stays.
+  function targetsOf(elt, attr) {
+    var host = elt.closest('[' + attr + '],[data-' + attr + ']');
+    if (!host) return null;
+    var sel = host.getAttribute(attr) || host.getAttribute('data-' + attr);
+    if (sel === 'this') return [host];
+    var out = [], css = [], top = elt.getRootNode(), html = document.documentElement;
+    // The htmx words for one node. A document is its root element here.
+    var word = { document: html, root: top.host ? null : html, body: document.body, host: top.host, window: null };
     try {
-      // A plain CSS list stays whole: a comma can sit inside :is() or [a="b, c"].
-      if (!/(^|,)\s*(this|closest |find )/.test(sel)) return Array.from(document.querySelectorAll(sel));
-      return sel.split(',').reduce(function (all, s) {
-        s = s.trim();
-        var one = s === 'this' ? host : s.indexOf('closest ') === 0 ? elt.closest(s.slice(8))
-          : s.indexOf('find ') === 0 ? elt.querySelector(s.slice(5)) : null;
-        return all.concat(one ? [one] : /^(closest|find) /.test(s) ? [] : Array.from(document.querySelectorAll(s)));
-      }, []);
-    } catch (err) { return []; }
+      parts(sel.replace(/^global /, '')).forEach(function (s) {
+        s = bare(s.trim()).replace(/ElementSibling$/, '');
+        if (word.hasOwnProperty(s)) return word[s] && out.push(word[s]);
+        var m = REL.exec(s), k = m && (m[1] || m[2]), r = m && bare(s.slice(m[0].length).trim());
+        // An empty part (after a last comma) adds nothing, as in htmx.
+        if (!m) return s && css.push(s);
+        var one = k === 'closest' ? elt.closest(r) : k === 'find' ? elt.querySelector(r)
+          : k === 'next' ? (r ? scan(elt, r, 2) : elt.nextElementSibling)
+          : r ? scan(elt, r, 4) : elt.previousElementSibling;
+        if (one) out.push(one);
+      });
+      return out.concat(css.length ? Array.from(document.querySelectorAll(css.join(','))) : []);
+    } catch (err) { return out; }
+  }
+  function indicatorsOf(elt) {
+    return targetsOf(elt, 'hx-indicator') || [elt];
+  }
+  function unbusy(el) {
+    el.removeAttribute('aria-busy');
+    el.removeAttribute('data-autumn-busied');
   }
   document.addEventListener('htmx:beforeSend', function (e) {
     var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
@@ -1321,20 +1443,30 @@
       return el && el.matches && el.matches('[data-autumn-busy]');
     }).concat(indicatorsOf(e.target).filter(function (el) { return el.matches('[data-autumn-busy]'); }));
     if (els.length && d.target) els.push(d.target);
+    // Skip an app aria-busy. A marked one is ours, also from a snapshot:
+    // htmx sends a restored load request first.
     els = els.filter(function (el, i) {
-      return els.indexOf(el) === i && (busyCount.has(el) || !el.hasAttribute('aria-busy'));
+      return els.indexOf(el) === i && (el.hasAttribute('data-autumn-busied') || !el.hasAttribute('aria-busy'));
     });
     els.forEach(function (el) {
       busyCount.set(el, (busyCount.get(el) || 0) + 1);
       el.setAttribute('aria-busy', 'true');
+      el.setAttribute('data-autumn-busied', '');
     });
     d.xhr.addEventListener('loadend', function () {
       els.forEach(function (el) {
         var n = busyCount.get(el) - 1;
         if (n > 0) return busyCount.set(el, n);
         busyCount.delete(el);
-        el.removeAttribute('aria-busy');
+        unbusy(el);
       });
+    });
+  });
+  // htmx saves the page for history before `loadend`. A restored node
+  // keeps the runtime `aria-busy`, but no request owns it. Remove it.
+  document.addEventListener('htmx:historyRestore', function () {
+    each(document, '[data-autumn-busied]', function (el) {
+      if (!busyCount.has(el)) unbusy(el);
     });
   });
 

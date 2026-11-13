@@ -1,0 +1,43 @@
+### Breaking Changes
+
+- **Breaking:** `[failure_capture] enabled = true` fails boot in a build
+  without the `reporting` feature (issue #2795, ADR 0046). Before, that
+  build did not know the section and did nothing. The section now parses in
+  every build. A default build does not change
+  ([migration guide](docs/migrations/next.md#features-failure-capture-needs-reporting)).
+
+### Added
+
+- **features:** `error-reporting` is the panic-catch layer and the
+  `ErrorReporter` pipeline on their own (issue #2795, ADR 0046). `reporting`
+  turns it on and adds failure capture and `autumn replay`, as before. Both
+  are in `default`. `autumn new --daemon` names `error-reporting`, so the
+  starter does not compile failure capture.
+- **dev-loop:** the cold-start report has `prepare_ms`: the time of the
+  toolchain install, the index update and the crate downloads. The driver
+  does this work once before the samples, so the samples measure the build.
+  The report also names the compiler that the scaffold selects, not the one
+  of the repository root.
+
+### Changed
+
+- **scaffold:** a new app builds its dependencies with no debug info
+  (`[profile.dev.package."*"] debug = false`, issue #2795). The first build
+  is faster. The app keeps file and line. A backtrace frame in a dependency
+  shows the function name only. The template comment says how to get file
+  and line back. An existing app does not change.
+
+- **dev-loop:** the gated cold-start budget (`ColdStartHello`) is now p95
+  100 s and max 120 s, from p95 125 s and max 150 s. Two CI runs of the gate
+  on the changed tree measured 50.4-52.8 s and 75.8-76.9 s.
+
+### Performance
+
+- **build:** the no-DB daemon starter builds 12% faster from cold: 81.5 s
+  to 71.4 s on one 4 vCPU box (issue #2795, ADR 0046). The code changes
+  give 6.8 s of that. The two largest macro analysers moved from
+  `autumn-macros` to the `autumn-macros-support` library, which Cargo builds
+  in parallel with other crates. The unused `tokio-cron-scheduler`
+  dependency is gone. The daemon starter does not compile the `capsule`
+  module. The scaffold profile (dependencies with no debug info) gives the
+  other 3.3 s.

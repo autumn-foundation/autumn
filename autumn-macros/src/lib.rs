@@ -33,7 +33,6 @@
 //! argument naming the extern-prelude identifier to use instead, e.g.
 //! `#[get("/x", crate = "autumn_web_05")]`.
 
-mod agent_authority;
 mod api_doc;
 mod authorize;
 mod cached;
@@ -65,7 +64,6 @@ mod param_helpers;
 mod parse;
 mod paths_macro;
 mod public;
-mod query_budget;
 mod request_gate;
 mod route;
 mod routes_macro;
@@ -607,10 +605,15 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Applies the serde + `Clone`/`Debug` derives the event bus needs and
 /// implements `autumn_web::events::Event` with a stable `NAME` (the struct
-/// name by default, or `#[event(name = "...")]`).
+/// name by default, or `#[event(name = "...")]`) and a `VERSION`
+/// (`#[event(version = N)]`, default 1; above 1 adds `.vN` to the name).
+///
+/// The payload also gets a wire shape, as `#[derive(WireShape)]` gives it, so
+/// a `#[listener]` read of a field the event does not send fails the build.
+/// `#[event(opaque)]` turns the shape off, for a payload `WireShape` refuses.
 ///
 /// ```ignore
-/// #[event]
+/// #[event(name = "user.signed_up")]
 /// struct UserSignedUp { user_id: i64 }
 /// ```
 #[proc_macro_attribute]
@@ -626,6 +629,9 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Runs **synchronously** (in-request) by default, or **durably** (enqueued on
 /// the `#[job]` queue, surviving restarts with retry + DLQ) with `durable`.
 ///
+/// Each payload field the listener reads must be one the event sends, or the
+/// build fails and names the event and the field.
+///
 /// ```ignore
 /// #[listener(UserSignedUp, durable, max_attempts = 5)]
 /// async fn send_welcome_email(state: AppState, event: UserSignedUp) -> AutumnResult<()> { Ok(()) }
@@ -634,6 +640,28 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn listener(attr: TokenStream, item: TokenStream) -> TokenStream {
     autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
         listener::listener_macro(attr, item)
+    })
+    .into()
+}
+
+/// Check a function that reads an `#[event]` payload, such as an outbox
+/// topic handler.
+///
+/// Each payload field the function reads must be one the event sends, or the
+/// build fails. The macro finds the payload by its type: a parameter, a typed
+/// `let`, or a turbofish. A function with no payload binding is an error.
+///
+/// ```ignore
+/// #[event_consumer(OrderPlaced)]
+/// async fn post_to_ledger(state: AppState, message: OutboxMessage) -> AutumnResult<()> {
+///     let order: OrderPlaced = message.payload_as()?;
+///     record(order.total_cents).await
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn event_consumer(attr: TokenStream, item: TokenStream) -> TokenStream {
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        wire::consumer::event_consumer_macro(attr, &item)
     })
     .into()
 }
@@ -1043,7 +1071,7 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
     autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
-        query_budget::query_budget_macro(attr, item)
+        autumn_macros_support::analysers::query_budget(attr, item)
     })
     .into()
 }
@@ -1129,7 +1157,7 @@ pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
     autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
-        agent_authority::agent_operable_macro(attr, item)
+        autumn_macros_support::analysers::agent_operable(attr, item)
     })
     .into()
 }
@@ -1324,7 +1352,17 @@ pub fn contract_checked(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Refused rather than guessed at: generics, enums, tuple structs,
 /// `#[serde(flatten)]`, and split `rename(serialize = …, deserialize = …)`.
-#[proc_macro_derive(WireShape)]
+///
+/// `#[wire(opaque)]` on a field tells `autumn contracts` to compare it by its
+/// type name only. Use it for a type that has no `WireShape`, such as an
+/// enum. Without it, the export stops on such a field.
+///
+/// Each field also records its wire type: the JSON form serde writes. A field
+/// with `#[serde(with)]` is `any`. `#[wire(type = "integer", format =
+/// "unix-seconds")]` names the wire type. `type` is `string`, `integer`,
+/// `number`, `boolean` or `any`. `nullable` marks an `Option` under another
+/// name. A field with `type` is not looked up as a `WireShape` type.
+#[proc_macro_derive(WireShape, attributes(wire))]
 pub fn derive_wire_shape(input: TokenStream) -> TokenStream {
     let _guard = autumn_macros_support::crate_path::set_target(None);
     let parsed = syn::parse_macro_input!(input as syn::DeriveInput);

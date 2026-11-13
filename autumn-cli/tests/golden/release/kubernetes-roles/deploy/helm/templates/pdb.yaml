@@ -1,0 +1,22 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- range $name, $role := .Values.roles }}
+{{- $ctx := dict "root" $ "name" $name "role" $role }}
+{{- if $role.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "app.roleName" $ctx }}
+  labels:
+    {{- include "app.roleLabels" $ctx | nindent 4 }}
+spec:
+  maxUnavailable: {{ $.Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      # No app.kubernetes.io/name and no app: Flagger changes them on its
+      # primary pods, so a match on them would miss those pods.
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $name }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -165,6 +165,11 @@ impl SecurityDump {
         if config.mail.should_mount_unsubscribe_endpoint() {
             exempt_paths.push(crate::mail::UNSUBSCRIBE_PATH.to_owned());
         }
+        // The outbox inbox endpoint is exempt at runtime too.
+        #[cfg(feature = "db")]
+        if config.outbox.serves_inbox() {
+            exempt_paths.push(crate::outbox::INBOX_PATH.to_owned());
+        }
         exempt_paths.sort();
         exempt_paths.dedup();
 
@@ -295,16 +300,25 @@ impl Serialize for RouteSource {
     }
 }
 
-impl<'de> Deserialize<'de> for RouteSource {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Ok(if s == "framework" {
+impl RouteSource {
+    /// Reads the dump form that [`Display`](std::fmt::Display) writes:
+    /// `framework` and `plugin:<name>`. Any other string is `User`.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Self {
+        if s == "framework" {
             Self::Framework
         } else if let Some(name) = s.strip_prefix("plugin:") {
             Self::Plugin(name.to_owned())
         } else {
             Self::User
-        })
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RouteSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&s))
     }
 }
 
@@ -899,6 +913,16 @@ pub(crate) fn append_framework_routes_with_env(
                 "unsubscribe",
             ));
         }
+    }
+
+    // The outbox inbox endpoint, under the same predicate as the mount.
+    #[cfg(feature = "db")]
+    if config.outbox.serves_inbox() {
+        infos.push(RouteInfo::framework_route(
+            "POST",
+            crate::outbox::INBOX_PATH.to_owned(),
+            "outbox_inbox",
+        ));
     }
 
     // Widget story gallery routes (#1526), listed iff the resolved config
@@ -1905,6 +1929,20 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    /// `from_wire` reads the dump form, the same as `Deserialize` (#2828).
+    #[test]
+    fn route_source_from_wire_reads_the_dump_form() {
+        for source in [
+            RouteSource::User,
+            RouteSource::Framework,
+            RouteSource::Plugin("admin".to_owned()),
+            RouteSource::Plugin(String::new()),
+        ] {
+            assert_eq!(RouteSource::from_wire(&source.to_string()), source);
+        }
+        assert_eq!(RouteSource::from_wire("something-else"), RouteSource::User);
+    }
+
     // ── append_framework_routes ────────────────────────────────────────────
 
     #[test]
@@ -2563,6 +2601,44 @@ mod tests {
                 .any(|p| p == crate::mail::UNSUBSCRIBE_PATH),
             "unmounted unsubscribe path must not be exempt: {:?}",
             plain_dump.csrf.exempt_paths
+        );
+    }
+
+    /// The outbox inbox endpoint is listed and CSRF-exempt only when the app
+    /// serves it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn outbox_inbox_route_is_listed_and_exempt_when_served() {
+        let mut config = AutumnConfig::default();
+        config.outbox.enabled = true;
+        config.outbox.inbox.enabled = true;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(
+            infos.iter().any(|i| i.method == "POST"
+                && i.path == crate::outbox::INBOX_PATH
+                && i.classification == RouteClassification::Framework),
+            "{infos:?}"
+        );
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            dump.csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::outbox::INBOX_PATH)
+        );
+
+        config.outbox.inbox.enabled = false;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(!infos.iter().any(|i| i.path == crate::outbox::INBOX_PATH));
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            !dump
+                .csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::outbox::INBOX_PATH)
         );
     }
 

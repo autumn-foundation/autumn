@@ -560,6 +560,14 @@ pub struct CommentThread {
     /// top-level one, `Some(id)` for the reply under that comment. A draft
     /// re-filled into every form would duplicate it down the page.
     draft_reply_to: Option<i64>,
+    /// Whether this is a later page. Renders the "earlier" link.
+    later_page: bool,
+    /// The cursor of the next page. Renders the "more" item.
+    next_page: Option<i64>,
+    /// Text of the link to the next page.
+    more_label: String,
+    /// Text of the link to the first page.
+    earlier_label: String,
 }
 
 impl CommentThread {
@@ -594,6 +602,10 @@ impl CommentThread {
             error: None,
             draft: None,
             draft_reply_to: None,
+            later_page: false,
+            next_page: None,
+            more_label: "More comments".to_owned(),
+            earlier_label: "Earlier comments".to_owned(),
         }
     }
 
@@ -742,6 +754,68 @@ impl CommentThread {
         self
     }
 
+    /// Render the page links of a paged thread.
+    ///
+    /// Pass the [`ThreadPage`](crate::commentable::ThreadPage) cursors.
+    /// `after` is the cursor that the page starts after. `next` is the cursor
+    /// of the next page.
+    ///
+    /// - `next`: the top-level list ends with a "more" item. With htmx, it
+    ///   loads `{action}?after={next}` and puts the new top-level comments in
+    ///   its place. Without htmx, it is a link to the host page
+    ///   ([`return_to`](Self::return_to)) with `?after={next}`. With no host
+    ///   page, the link goes to the router.
+    /// - `after`: a link back to the first page comes before the list. Focus
+    ///   goes to the first comment of the page.
+    ///
+    /// The host page must read `after` from its query string and pass it to
+    /// `comment_thread_page`. Use the page size of
+    /// [`CommentsConfig::page_size`](crate::commentable::CommentsConfig) on
+    /// the host page too.
+    #[must_use]
+    pub const fn page(mut self, after: Option<i64>, next: Option<i64>) -> Self {
+        self.later_page = after.is_some();
+        self.next_page = next;
+        self
+    }
+
+    /// Override the text of the link to the next page (default
+    /// `More comments`).
+    #[must_use]
+    pub fn more_label(mut self, label: impl Into<String>) -> Self {
+        self.more_label = label.into();
+        self
+    }
+
+    /// Override the text of the link to the first page (default
+    /// `Earlier comments`).
+    #[must_use]
+    pub fn earlier_label(mut self, label: impl Into<String>) -> Self {
+        self.earlier_label = label.into();
+        self
+    }
+
+    /// The no-JS address of the page after `after` (the first page when
+    /// `None`): the host page when there is one, else the router.
+    fn page_href(&self, after: Option<i64>) -> String {
+        super::with_page_cursor(self.return_to.as_deref().unwrap_or(&self.action), after)
+    }
+
+    /// The htmx address of the page after `after`: always the router. It
+    /// carries `return_to`, so the forms it renders keep it.
+    fn page_hx_get(&self, after: Option<i64>) -> String {
+        let mut url = super::with_page_cursor(&self.action, after);
+        if let Some(return_to) = &self.return_to {
+            let encoded = percent_encoding::utf8_percent_encode(
+                return_to,
+                percent_encoding::NON_ALPHANUMERIC,
+            )
+            .to_string();
+            url = with_query(&url, "return_to", &encoded);
+        }
+        url
+    }
+
     /// Where a submit **without** htmx should send the browser afterwards,
     /// carried as a hidden `return_to` input.
     ///
@@ -754,6 +828,13 @@ impl CommentThread {
         self.return_to = Some(path.into());
         self
     }
+}
+
+/// `path` with `key=value` added to its query string. `value` must already be
+/// URL-safe. `path` must have no fragment.
+fn with_query(path: &str, key: &str, value: &str) -> String {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}{key}={value}")
 }
 
 /// The default deepest level offering a reply form, matching
@@ -810,8 +891,20 @@ pub fn comment_thread(cfg: &CommentThread, comments: &[CommentView]) -> maud::Ma
             @if let Some(error) = &cfg.error {
                 p class="autumn-comments-error" role="alert" { (error) }
             }
+            @if cfg.later_page {
+                p class="autumn-comments-earlier" {
+                    a href=(cfg.page_href(None))
+                        hx-get=(cfg.page_hx_get(None))
+                        hx-target=(cfg.hx_target)
+                        hx-swap="outerHTML" { (cfg.earlier_label) }
+                }
+            }
             @if comments.is_empty() {
-                p class="autumn-comments-empty" { (cfg.empty_text) }
+                // A later page can be empty when its cursor is stale. The
+                // thread is not empty, so the empty text would be wrong.
+                @if !cfg.later_page {
+                    p class="autumn-comments-empty" { (cfg.empty_text) }
+                }
             } @else {
                 (comment_list(cfg, comments, 0))
             }
@@ -830,10 +923,24 @@ pub fn comment_thread(cfg: &CommentThread, comments: &[CommentView]) -> maud::Ma
 /// whole region without moving focus — is announced rather than silent.
 fn comment_list(cfg: &CommentThread, comments: &[CommentView], depth: usize) -> maud::Markup {
     let live = (depth == 0).then_some("polite");
+    let next = cfg.next_page.filter(|_| depth == 0);
     maud::html! {
         ol class="autumn-comment-list" aria-live=[live] {
-            @for comment in comments {
-                (comment_node(cfg, comment, depth))
+            @for (index, comment) in comments.iter().enumerate() {
+                // On a later page, focus moves to its first comment. The
+                // "more" link that had focus is gone after the htmx swap.
+                (comment_node(cfg, comment, depth, cfg.later_page && depth == 0 && index == 0))
+            }
+            @if let Some(next) = next {
+                // htmx puts the next page's top-level items in place of this
+                // one. `hx-select` takes them from the router's response.
+                li class="autumn-comments-more" {
+                    a href=(cfg.page_href(Some(next)))
+                        hx-get=(cfg.page_hx_get(Some(next)))
+                        hx-target="closest li"
+                        hx-swap="outerHTML"
+                        hx-select=(format!("[id=\"{}\"] > ol > li", cfg.dom_id)) { (cfg.more_label) }
+                }
             }
         }
     }
@@ -869,7 +976,12 @@ fn comment_paragraphs(body: &str) -> Vec<String> {
         .collect()
 }
 
-fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> maud::Markup {
+fn comment_node(
+    cfg: &CommentThread,
+    comment: &CommentView,
+    depth: usize,
+    focus: bool,
+) -> maud::Markup {
     let node_id = comment_dom_id(&cfg.dom_id, comment.id);
     // The write path refuses a reply deeper than `max_depth`, so offering the
     // form past it would be an invitation to a 422. `depth` is the parent's
@@ -880,7 +992,7 @@ fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> mau
     // reader user has no way to tell which one they are on.
     let reply_label = format!("{} to {}", cfg.reply_label, comment.author);
     maud::html! {
-        li id=(node_id) class="autumn-comment" {
+        li id=(node_id) class="autumn-comment" tabindex=[focus.then_some("-1")] autofocus[focus] {
             div class="autumn-comment-meta" {
                 span class="autumn-comment-author" { (comment.author) }
                 @if let Some(datetime) = &comment.datetime {
@@ -1622,6 +1734,151 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    // ── comment_thread paging (#3325) ──────────────────────────────────
+
+    /// A page with more after it ends its top-level list with a "More" item.
+    /// htmx loads the next page into that item. Without htmx, it is a link.
+    #[test]
+    fn comment_thread_links_the_next_page() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").page(None, Some(3));
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(
+            html.contains(r#"<li class="autumn-comments-more">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"href="/comments/Post/1?after=3""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"hx-get="/comments/Post/1?after=3""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-target="closest li""#), "{html}");
+        assert!(
+            html.contains(r#"hx-select="[id=&quot;c&quot;] &gt; ol &gt; li""#),
+            "{html}"
+        );
+        assert!(html.contains("More comments"), "{html}");
+        assert!(!html.contains("autumn-comments-earlier"), "{html}");
+        // The item is the last child of the top-level list.
+        let more = html.find("autumn-comments-more").expect("more");
+        let close = html.rfind("</ol>").expect("list end");
+        assert!(more < close, "{html}");
+    }
+
+    /// With `return_to`, the no-JS link goes to the host page. The htmx
+    /// request carries `return_to`, so the new forms keep it.
+    #[test]
+    fn comment_thread_page_links_use_the_host_page() {
+        let cfg = CommentThread::new("c", "/comments/Post/1")
+            .return_to("/r/rust/posts/hello?sort=new")
+            .page(Some(1), Some(3))
+            .more_label("Load more")
+            .earlier_label("Back to start");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(
+            html.contains(r#"href="/r/rust/posts/hello?sort=new&amp;after=3""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"hx-get="/comments/Post/1?after=3&amp;return_to=%2Fr%2Frust%2Fposts%2Fhello%3Fsort%3Dnew""#
+            ),
+            "{html}"
+        );
+        assert!(html.contains("Load more"), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-comments-earlier""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"href="/r/rust/posts/hello?sort=new">"#)
+                || html.contains(r#"href="/r/rust/posts/hello?sort=new" "#),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"hx-get="/comments/Post/1?return_to=%2Fr%2Frust%2Fposts%2Fhello%3Fsort%3Dnew""#
+            ),
+            "{html}"
+        );
+        assert!(html.contains(r##"hx-target="#c""##), "{html}");
+        assert!(html.contains("Back to start"), "{html}");
+    }
+
+    /// A page that is not the first offers a way back to the first page.
+    #[test]
+    fn comment_thread_links_back_to_the_first_page() {
+        let cfg = CommentThread::new("c", "/comments/Post/1")
+            .read_only()
+            .page(Some(9), None);
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(
+            html.contains(r#"class="autumn-comments-earlier""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"href="/comments/Post/1""#), "{html}");
+        assert!(html.contains("Earlier comments"), "{html}");
+        assert!(!html.contains("autumn-comments-more"), "{html}");
+    }
+
+    /// The cursor helper replaces an `after` the address already has, and
+    /// keeps a fragment last. A host page can pass its current address.
+    #[test]
+    fn with_page_cursor_replaces_the_cursor_and_keeps_the_fragment() {
+        for (url, after, expected) in [
+            ("/p", Some(3), "/p?after=3"),
+            ("/p?after=3", Some(7), "/p?after=7"),
+            ("/p?after=3&sort=new", None, "/p?sort=new"),
+            ("/p?after", None, "/p"),
+            ("/p?afterward=1", Some(2), "/p?afterward=1&after=2"),
+            ("/p#comments", Some(4), "/p?after=4#comments"),
+            ("/p?x=1&after=2#c", Some(5), "/p?x=1&after=5#c"),
+        ] {
+            assert_eq!(
+                super::super::with_page_cursor(url, after),
+                expected,
+                "{url}"
+            );
+        }
+    }
+
+    /// On a later page, focus goes to the first top-level comment, so a
+    /// keyboard user does not lose their place after "More".
+    #[test]
+    fn a_later_page_focuses_its_first_comment() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").page(Some(9), None);
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert_eq!(html.matches("autofocus").count(), 1, "{html}");
+        assert!(
+            html.contains(r#"id="c-c1" class="autumn-comment" tabindex="-1" autofocus"#),
+            "{html}"
+        );
+
+        let first = CommentThread::new("c", "/comments/Post/1").page(None, Some(3));
+        let html = comment_thread(&first, &comment_fixture()).into_string();
+        assert!(!html.contains("autofocus"), "{html}");
+    }
+
+    /// An empty later page does not say the thread is empty.
+    #[test]
+    fn an_empty_later_page_has_no_empty_text() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").page(Some(9), None);
+        let html = comment_thread(&cfg, &[]).into_string();
+        assert!(!html.contains("autumn-comments-empty"), "{html}");
+        assert!(html.contains("autumn-comments-earlier"), "{html}");
+    }
+
+    /// The default is one unpaged thread: no page links.
+    #[test]
+    fn comment_thread_renders_no_page_links_by_default() {
+        let cfg = CommentThread::new("c", "/comments/Post/1");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(!html.contains("autumn-comments-more"), "{html}");
+        assert!(!html.contains("autumn-comments-earlier"), "{html}");
     }
 
     // ── reaction_controls CSRF sugar ───────────────────────────────────
