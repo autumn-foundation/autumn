@@ -25,9 +25,11 @@ New data, daemon feature set, one 4 vCPU box, `CARGO_INCREMENTAL=0` as in CI:
 - A cold build takes 72.0-73.5 s. Dependencies end at about 36.6 s and use
   all four cores (about 143 unit-seconds). `autumn-web` takes 33.5 s, mostly
   on one core. The app takes 2.5 s.
-- The model of ADR 0046 holds: `T = D/4 + W + A`. The first phase is full:
-  the cores are idle for 3.7 core-seconds in 36 s. So one unit-second less in
-  a dependency saves 0.25 s, and one second less in `autumn-web` saves 1 s.
+- A short form of the ADR 0046 model fits: `T = D/4 + W + A`. `D` is the
+  unit-seconds of the dependencies, `W` is the time of `autumn-web`, and `A`
+  is the time of the app. The first phase is full: the cores are idle for
+  3.7 core-seconds in 36 s. So one unit-second less in a dependency saves
+  0.25 s, and one second less in `autumn-web` saves 1 s.
 - `autumn-web` has no hot function. Its LLVM IR is 2,733,293 lines in 79,170
   copies. The config module is 18.9% of the IR. The next module is 5.9%.
 - Inside the config share, the reader made these copies for each config
@@ -36,17 +38,17 @@ New data, daemon feature set, one 4 vCPU box, `CARGO_INCREMENTAL=0` as in CI:
   and from each scalar (108 struct visitors), and the code that records the
   fields for the schema.
 - axum's `ws` feature was on in the workspace entry, so each app compiled
-  `tungstenite` and 8 more crates (11 compile units): 3.2 unit-seconds. Each use in
-  `autumn-web` is behind the `ws` feature, which the daemon starter does not
-  name.
-- `plugin_conformance` (a test harness) and `runtime_config` (a key store
-  that only app code arms) compile in each app: 0.95% and 0.71% of the IR.
+  `tungstenite` and 8 more crates (11 compile units): 3.2 unit-seconds. Each
+  use in `autumn-web` is behind the `ws` feature, which the daemon starter
+  does not name.
+- `plugin_conformance` (the harness of plugin tests and of
+  `autumn plugin-check`) and `runtime_config` (a key store that only app
+  code arms) compile in each app: 0.95% and 0.71% of the IR.
 
 ## Planning
 
-Four readers measured the options first: a config crate, more module gates,
-the config reader, and dependency features. Three views then made a plan, and
-one reviewer tried to break it.
+Four groups of options were measured first: a config crate, more module
+gates, the config reader, and dependency features.
 
 ### Brainstorm
 
@@ -76,13 +78,13 @@ How would this step make the build, or the framework, worse?
   from `toml`, a migration section and a breaking entry.
 - A gate removes a module and a docs build loses its links. Two lists name
   the docs features (`docs.rs` metadata, `scripts/check-docs.sh`). A spec
-  now fails when a new gate is in neither.
+  now fails when one of the three gates is missing from one of the lists.
 - The CLI builds `autumn-web` with default features off and uses the
   conformance module. A workspace build hides a missing feature there. A
   spec reads the CLI manifest.
-- No CI build compiled the test targets with a default-on gate off, so a
-  missing `cfg` on a test was invisible. The new lane runs the specs with
-  the three features off.
+- No CI build compiled the test targets with one of these three gates off,
+  so a missing `cfg` on a test was invisible. The new lane runs the specs
+  with the three features off.
 - A feature goes away from a manifest and comes back unseen later. The lane
   fails when the starter's dependency tree has a WebSocket crate, and fails
   when the default tree has none (an empty check).
@@ -105,7 +107,8 @@ How would this step make the build, or the framework, worse?
 - **Green (ideas):** move each generic step of the reader into a function
   that is not generic. Read `capacity.lock` with the same reader.
 - **Blue (process):** red test, green change, one commit for each step, an
-  IR count in each commit, then 5 interleaved cold builds of trunk and head.
+  IR count in each reader commit, then interleaved cold builds of trunk and
+  head.
 
 ## Decision
 
@@ -135,8 +138,15 @@ How would this step make the build, or the framework, worse?
    `cpu_count` and `cpu_model`. Two CI runs on `ubuntu-latest` differed by
    25 s, and the reports gave no cause.
 
-This changes two sentences of ADR 0045. "Map keys are always strings" is no
-longer true. The known difference from `toml` is now: a struct is a table.
+Decision 5 reverses two options that ADR 0046 did not select: a
+`plugin_conformance` gate, and `axum/ws` as a default-on feature. ADR 0046
+judged each one alone as too small. Here they go in one change with one
+lane.
+
+This changes one sentence of
+[ADR 0045](0045-one-config-deserializer-and-cluster-gate.md). "Map keys are
+always strings" is no longer true. The known differences from `toml` are
+now: a struct is a table, and a tuple variant cannot be written as a table.
 
 ## Options not selected
 
@@ -157,9 +167,11 @@ longer true. The known difference from `toml` is now: a struct is a table.
 - **Pair array items with field names in the struct path.** It keeps the
   `toml` behavior at the same IR. Not selected: no guide shows the form, and
   an error with the key path is easier to read than a wrong field.
-- **A second boundary parser in place of `multer`, a gate for the test
-  harness, validator `derive` behind a feature.** Rejected in ADR 0046. The
-  reasons hold.
+- **A second boundary parser in place of `multer`.** Rejected in ADR 0046.
+  The reason holds.
+- **A gate for the test harness (`autumn_web::test`).** The first
+  `cargo test` of an app would build `autumn-web` again.
+- **validator `derive` behind a feature.** A new app validates a form early.
 
 ## Consequences
 
@@ -174,7 +186,8 @@ Measured, daemon feature set, same box:
   0.22, `rand` 0.9, `rand_chacha` 0.9, `rand_core` 0.9 and `getrandom` 0.3.
 - Cold build, 6 interleaved pairs of trunk and this change: the median fell
   from 74.3 s to 71.6 s (2.7 s less). Trunk: 73.1-76.0 s. This change:
-  69.7-76.6 s. `autumn-web` alone: 33.3 s to 31.5 s.
+  69.7-76.6 s. `autumn-web` alone: 33.3 s to 31.5 s. The pairs ran later
+  than the samples in Context, when the host was slower.
 - Decisions 1-4 alone, 5 pairs on a noisy host: `autumn-web` was 1.3 s
   faster (median of the pair differences). The totals did not show it.
 - A default DB app gains only from decisions 1-4.
@@ -185,6 +198,9 @@ Costs:
 - A build with default features off that uses one of the three gated items
   adds a feature name.
 - A type error in `capacity.lock` names the key and not the line.
+- A `capacity.lock` with an integer above `i64::MAX` does not load. Only an
+  explicit `--seed` can be that large. `autumn calibrate` now refuses such
+  a seed and does not write such a contract.
 - The `test-features` CI job has one more lane.
 
 The cold-start budget does not change. The measure job does not run on a
@@ -192,8 +208,11 @@ pull request, and the two runner kinds differ by 25 s.
 
 ## Roadmap to 60 s / 90 s
 
-The slower runner still needs about 14 s. In order of gain for each line
-changed:
+The slower runner still needs about 14 s. The work of the build is now about
+179 unit-seconds on the test box (148 for the dependencies and 31.5 for
+`autumn-web`, medians of the 6 samples). On four cores that is about 45 s at
+best, and today's build takes 71.6 s, because `autumn-web` compiles mostly on
+one core. In order of gain for each line changed:
 
 1. The next gates, as one design with a boot refusal: `shadow`,
    `fault-injection`, `web-bot-auth`, and brotli. About 2.5 s for the

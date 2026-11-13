@@ -33,3 +33,6 @@
 - **capacity:** a value of the wrong type in `capacity.lock` names the key,
   for example ``in `envelope.admission_limit` ``. Before, the error showed
   the line. A syntax error keeps its line.
+- **capacity:** `autumn calibrate --seed` accepts at most
+  9223372036854775807, the largest TOML integer. A `capacity.lock` with a
+  larger seed does not load: run `autumn calibrate` again.

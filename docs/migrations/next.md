@@ -758,10 +758,12 @@ and uses one of these:**
 |---------|----------------------|-----|
 | `autumn_web::plugin_conformance` | ``unresolved import `autumn_web::plugin_conformance` `` | `plugin-conformance` |
 | `autumn_web::runtime_config`, `CostSignal::sync_from` | ``could not find `runtime_config` in `autumn_web` `` | `runtime-config` |
-| `autumn_web::reexports::axum::extract::ws` | ``could not find `ws` in `extract` `` | `axum-ws` |
+| axum's `extract::ws` or `extract::WebSocketUpgrade`, through `autumn_web::reexports::axum` or your own `axum` dependency | ``could not find `ws` in `extract` ``, or ``no `WebSocketUpgrade` in `axum::extract` `` | `axum-ws` |
 
 `ws` turns `axum-ws` on, so an app that names `ws` does not change. An app
-that has its own `axum` dependency with the `ws` feature does not change.
+that turns `ws` on in its own `axum` dependency does not change. An app
+that has its own `axum` dependency without `ws` adds `axum-ws` here, or
+`ws` there: before, `autumn-web` turned `ws` on for it.
 Without `runtime-config`, the cost signal does not follow the runtime-config
 key. Set it from code with `CostSignal::set`.
 
@@ -792,8 +794,8 @@ compiles less code.
 **You are affected only if `autumn.toml` gives the fields of a section as an
 array.** Boot fails with
 ``invalid type: sequence, expected struct ServerConfig`` and the key,
-``in `server` ``. An array of tables (`[[jobs.queues]]`) and an array value
-(`origins = ["a", "b"]`) do not change.
+``in `server` ``. An array of tables (`[[database.shards]]`) and an array
+value (`allowed_origins = ["https://a.example"]`) do not change.
 
 **Before (`{X.Y}`):**
 
@@ -939,6 +941,12 @@ If nothing changed, delete this section.
 - **Capacity:** a value of the wrong type in `capacity.lock` now names the
   key, for example ``in `envelope.admission_limit` ``. Before, the error
   showed the line. A syntax error keeps its line.
+- **Capacity:** a `capacity.lock` with an integer above 9223372036854775807
+  does not load (`u64 value was too large`). That is the largest TOML
+  integer. Only `seed` can be that large, and only from an explicit
+  `autumn calibrate --seed`. Run `autumn calibrate` again with a smaller
+  seed. `--seed` now refuses a larger value, and `autumn calibrate` does not
+  write one.
 
 Changes that still compile but behave differently at runtime. Examples:
 

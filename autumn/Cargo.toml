@@ -49,7 +49,7 @@ jwt = ["dep:jsonwebtoken"]
 # payload encryption over `p256`.
 push = ["dep:p256"]
 # The plugin conformance harness (`autumn_web::plugin_conformance`). A plugin
-# runs it in its tests, and `autumn plugin check` uses its rules.
+# runs it in its tests, and `autumn plugin-check` uses its rules.
 plugin-conformance = []
 # Live-tunable keys (`autumn_web::runtime_config`), and the cost signal that
 # follows one of them.
