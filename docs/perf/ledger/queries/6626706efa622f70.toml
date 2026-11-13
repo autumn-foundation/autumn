@@ -11,7 +11,7 @@ indexes = []
 findings = [
   "full-scan: autumn_jobs (no index serves it, even with enable_seqscan = off)",
 ]
-notes = ""
+notes = "The generic plan above cannot fold the CASE on $8, so it shows a seq scan for every window. diesel-async prepares this raw sql_query anew on every call, so each call is a custom plan: the running and pending windows probe idx_autumn_jobs_unique_inflight, and the TTL window probes idx_autumn_jobs_unique_key_enqueued (migration 20261112170000). See docs/perf/job-unique-enqueue/."
 
 [[site]]
 file = "autumn/src/job.rs"

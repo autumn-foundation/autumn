@@ -13379,7 +13379,7 @@ fn start_postgres_runtime(
 /// A shard-local job table is made from these same files, so it cannot drift
 /// from the control table. Each file is idempotent (`IF NOT EXISTS`).
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
-const SHARD_JOB_SCHEMA: [(&str, &str); 6] = [
+const SHARD_JOB_SCHEMA: [(&str, &str); 7] = [
     (
         "20260513000000_create_job_queue",
         include_str!("../migrations/20260513000000_create_job_queue/up.sql"),
@@ -13403,6 +13403,10 @@ const SHARD_JOB_SCHEMA: [(&str, &str); 6] = [
     (
         "20261026170000_add_jobs_queue_name_ready_index",
         include_str!("../migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql"),
+    ),
+    (
+        "20261112170000_add_jobs_unique_key_enqueued_index",
+        include_str!("../migrations/20261112170000_add_jobs_unique_key_enqueued_index/up.sql"),
     ),
 ];
 
