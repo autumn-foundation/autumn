@@ -34,6 +34,8 @@
 //! end is comparable byte for byte across a code change.
 
 #![cfg(feature = "db")]
+// Counters are a few thousand at most, far inside f64's exact integer range.
+#![allow(clippy::cast_precision_loss)]
 
 use std::fmt::Write as _;
 
@@ -137,17 +139,17 @@ fn operation(i: usize, users: u64) -> Transaction {
         // 55% top-ups.
         0..=10 => (
             vec![
-                Posting::debit(wallet.clone(), usd(amount * 20)),
+                Posting::debit(wallet, usd(amount * 20)),
                 Posting::credit("house:cash", usd(amount * 20)),
             ],
             format!("top-up {i}"),
         ),
         // 25% purchases, a third of them with a fee line.
         11..=15 => {
-            if i % 3 == 0 {
+            if i.is_multiple_of(3) {
                 (
                     vec![
-                        Posting::credit(wallet.clone(), usd(amount)),
+                        Posting::credit(wallet, usd(amount)),
                         Posting::debit("house:revenue", usd(amount - 50)),
                         Posting::debit("house:fees", usd(50)),
                     ],
@@ -156,7 +158,7 @@ fn operation(i: usize, users: u64) -> Transaction {
             } else {
                 (
                     vec![
-                        Posting::credit(wallet.clone(), usd(amount)),
+                        Posting::credit(wallet, usd(amount)),
                         Posting::debit("house:revenue", usd(amount)),
                     ],
                     String::new(),
@@ -165,7 +167,7 @@ fn operation(i: usize, users: u64) -> Transaction {
         }
         // 10% marketplace splits: 7 lines.
         16 | 17 => {
-            let mut lines = vec![Posting::credit(wallet.clone(), usd(amount * 5 + 50))];
+            let mut lines = vec![Posting::credit(wallet, usd(amount * 5 + 50))];
             for s in 0..5 {
                 let seller = format!("seller:{:04}", 1 + (i * 7 + s * 101) % 500);
                 lines.push(Posting::debit(seller, usd(amount)));
@@ -425,7 +427,6 @@ async fn money_ledger_post_profile() {
         .map(|s| s.buffers)
         .sum();
     let total_wal: f64 = top.iter().map(|s| s.wal_bytes).sum();
-    #[allow(clippy::cast_precision_loss)]
     let per_op = |v: f64| v / WORKLOAD_OPS as f64;
     // `toplevel = false` rows ran inside another statement (the balance
     // trigger, the immediate accounts foreign key) and their buffers are
@@ -451,7 +452,6 @@ async fn money_ledger_post_profile() {
         per_op(total_wal),
         wal_after - wal_before
     );
-    #[allow(clippy::cast_precision_loss)]
     let pct = |a: i64, b: i64| {
         if b == 0 {
             0.0

@@ -996,6 +996,11 @@ fn check_no_nul(field: &'static str, value: &str) -> Result<(), LedgerError> {
 /// The columns [`AccountRow`] reads.
 const ACCOUNT_COLUMNS: &str = "id, currency, allow_negative, balance_minor";
 
+/// The columns of a [`TransactionRow`], for both the read by key and the
+/// `RETURNING` of the insert.
+const TRANSACTION_COLUMNS: &str = "id, idempotency_key, request_hash, currency, memo, \
+     CAST(posted_at AS TEXT) AS posted_at";
+
 #[derive(diesel::QueryableByName)]
 struct AccountRow {
     #[diesel(sql_type = Text)]
@@ -1027,6 +1032,19 @@ struct TransactionRow {
 
 #[derive(diesel::QueryableByName)]
 struct PostingRow {
+    #[diesel(sql_type = Text)]
+    account_id: String,
+    #[diesel(sql_type = BigInt)]
+    amount_minor: i64,
+    #[diesel(sql_type = Text)]
+    currency: String,
+}
+
+/// A posting from the `RETURNING` of the insert, with its `seq` to sort by.
+#[derive(diesel::QueryableByName)]
+struct WrittenPostingRow {
+    #[diesel(sql_type = BigInt)]
+    seq: i64,
     #[diesel(sql_type = Text)]
     account_id: String,
     #[diesel(sql_type = BigInt)]
@@ -1103,6 +1121,22 @@ struct StoredAccount {
     account: Account,
     /// `None` when the stored balance is not known.
     balance: Option<i64>,
+}
+
+impl TransactionRow {
+    fn into_transaction(self, postings: Vec<Posting>) -> Result<StoredTransaction, LedgerError> {
+        Ok(StoredTransaction {
+            transaction: PostedTransaction {
+                id: self.id,
+                key: IdempotencyKey(self.idempotency_key),
+                currency: parse_currency(&self.currency)?,
+                memo: self.memo,
+                postings,
+                posted_at: self.posted_at,
+            },
+            request_hash: self.request_hash,
+        })
+    }
 }
 
 impl PostingRow {
@@ -1348,7 +1382,7 @@ async fn lock_accounts(
 /// database refuses that COMMIT.
 ///
 /// What is **not** guaranteed is which of the two happened. A drop after the
-/// last write — while the read-back is in flight — leaves a complete
+/// last write reaches the database — while its reply is in flight — leaves a complete
 /// transaction that commits normally, so a caller that swallows the
 /// cancellation and returns `Ok` can commit a charge it never saw the result
 /// of.
@@ -1435,29 +1469,32 @@ pub async fn post(
     // transaction row with no postings, and the tables being append-only would
     // make that unbalance permanent.
     let id = uuid::Uuid::new_v4().to_string();
-    write_postings(conn, &id, transfer).await?;
+    let postings = write_postings(conn, &id, transfer).await?;
 
+    // `RETURNING` hands back the stored row, so the call does not read it again
+    // with a second round trip.
     let insert_sql = format!(
         "INSERT INTO {TRANSACTIONS_TABLE} \
            (id, idempotency_key, request_hash, currency, memo, posted_at) \
          VALUES ({}, {}, {}, {}, {}, {NOW}) \
-         ON CONFLICT (idempotency_key) DO NOTHING",
+         ON CONFLICT (idempotency_key) DO NOTHING \
+         RETURNING {TRANSACTION_COLUMNS}",
         ph(1),
         ph(2),
         ph(3),
         ph(4),
         ph(5)
     );
-    let inserted = diesel::sql_query(insert_sql)
+    let inserted: Vec<TransactionRow> = diesel::sql_query(insert_sql)
         .bind::<Text, _>(id.clone())
         .bind::<Text, _>(transfer.key().as_str())
         .bind::<Text, _>(checked.request_hash().to_owned())
         .bind::<Text, _>(checked.currency.code())
         .bind::<Text, _>(transfer.memo_text())
-        .execute(conn)
+        .load(conn)
         .await?;
 
-    if inserted == 0 {
+    let Some(row) = inserted.into_iter().next() else {
         // Someone took the key between the read above and here. The account
         // locks serialize every poster over these accounts, so this is a
         // poster that shares the key but not the accounts — or a snapshot
@@ -1475,14 +1512,13 @@ pub async fn post(
         return Err(LedgerError::Conflict {
             key: transfer.key().as_str().to_owned(),
         });
-    }
+    };
 
-    // Read the row back, so the caller gets what the ledger stored: the
-    // database's own timestamp and the postings as written.
-    let stored = load_transaction(conn, transfer.key().as_str())
-        .await?
-        .ok_or(LedgerError::Database(diesel::result::Error::NotFound))?;
-    Ok(PostOutcome::Posted(stored.transaction))
+    // What the ledger stored: the database's own timestamp, and the postings
+    // as the INSERT wrote them.
+    Ok(PostOutcome::Posted(
+        row.into_transaction(postings)?.transaction,
+    ))
 }
 
 /// How deep the connection is in a transaction. Zero means autocommit.
@@ -1501,11 +1537,13 @@ fn transaction_depth(conn: &mut RuntimeConnection) -> Result<u32, LedgerError> {
 /// carry dozens of legs — a payroll run, a marketplace revenue split — that
 /// all belong to the same `INSERT`; the loop was paying that round-trip cost
 /// once per leg instead of once per transaction.
+///
+/// Returns the postings as stored, in `seq` order, from `RETURNING`.
 async fn write_postings(
     conn: &mut RuntimeConnection,
     transaction_id: &str,
     transfer: &Transaction,
-) -> Result<(), LedgerError> {
+) -> Result<Vec<Posting>, LedgerError> {
     let postings = transfer.postings();
     // Bounded by `MAX_POSTINGS`, already enforced by `Transaction::validate`
     // (which `post` calls before this), so the string this builds is bounded
@@ -1529,7 +1567,8 @@ async fn write_postings(
     let sql = format!(
         "INSERT INTO {POSTINGS_TABLE} \
            (transaction_id, seq, account_id, amount_minor, currency, posted_at) \
-         VALUES {values}"
+         VALUES {values} \
+         RETURNING seq, account_id, amount_minor, currency"
     );
     let mut query = diesel::sql_query(sql).into_boxed();
     for (index, posting) in postings.iter().enumerate() {
@@ -1543,8 +1582,19 @@ async fn write_postings(
             .bind::<BigInt, _>(posting.signed_minor()?)
             .bind::<Text, _>(posting.amount().currency().code());
     }
-    query.execute(conn).await?;
-    Ok(())
+    // Neither backend promises the order of `RETURNING` rows, so sort by `seq`.
+    let mut rows: Vec<WrittenPostingRow> = query.load(conn).await?;
+    rows.sort_by_key(|row| row.seq);
+    rows.into_iter()
+        .map(|row| {
+            PostingRow {
+                account_id: row.account_id,
+                amount_minor: row.amount_minor,
+                currency: row.currency,
+            }
+            .into_posting()
+        })
+        .collect()
 }
 
 /// Check what this transaction would leave in every account it touches.
@@ -1753,9 +1803,7 @@ async fn load_transaction(
     key: &str,
 ) -> Result<Option<StoredTransaction>, LedgerError> {
     let sql = format!(
-        "SELECT id, idempotency_key, request_hash, currency, memo, \
-           CAST(posted_at AS TEXT) AS posted_at \
-         FROM {TRANSACTIONS_TABLE} WHERE idempotency_key = {}",
+        "SELECT {TRANSACTION_COLUMNS} FROM {TRANSACTIONS_TABLE} WHERE idempotency_key = {}",
         ph(1)
     );
     let rows: Vec<TransactionRow> = diesel::sql_query(sql)
@@ -1783,17 +1831,7 @@ async fn load_transaction(
         .map(PostingRow::into_posting)
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Some(StoredTransaction {
-        transaction: PostedTransaction {
-            id: row.id,
-            key: IdempotencyKey(row.idempotency_key),
-            currency: parse_currency(&row.currency)?,
-            memo: row.memo,
-            postings,
-            posted_at: row.posted_at,
-        },
-        request_hash: row.request_hash,
-    }))
+    row.into_transaction(postings).map(Some)
 }
 
 /// Every currency's total across the whole ledger.

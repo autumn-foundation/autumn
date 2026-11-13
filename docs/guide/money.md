@@ -376,8 +376,9 @@ which refuses the commit. The alternative order could commit a transaction row
 with no postings, and append-only tables could never repair that.
 
 The ledger therefore ends up with either nothing or one complete balanced
-transaction. It does **not** tell you which: a drop after the last write, while
-the read-back is in flight, leaves a complete transaction that commits normally.
+transaction. It does **not** tell you which: a drop after the last write reaches
+the database, while its reply is in flight, leaves a complete transaction that
+commits normally.
 If you race `post` against a timeout, treat a cancellation as indeterminate and
 settle it by posting the same idempotency key again — that replays if the money
 moved and posts if it did not. Not racing it is simpler.
