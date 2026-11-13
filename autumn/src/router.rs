@@ -13431,7 +13431,7 @@ enabled = true
     /// code cannot satisfy at all, and `/notes.txt` is what no derivation from
     /// the route or the file name could ever produce.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // seven routes x (handler + build + serve assertions)
+    #[allow(clippy::too_many_lines)] // five routes x (handler + build + serve assertions)
     async fn ssg_generated_manifest_round_trips_content_types_end_to_end() {
         async fn robots() -> impl axum::response::IntoResponse {
             (
@@ -14374,7 +14374,7 @@ mod trusted_host_tests {
     #[tokio::test]
     async fn apply_upload_middleware_rejects_oversized_json_body() {
         let mut config = AutumnConfig::default();
-        config.security.upload.max_request_size_bytes = 100;
+        config.security.upload.max_request_size_bytes = 100; // 100-byte limit
 
         let base: axum::Router<AppState> = axum::Router::new().route(
             "/data",
@@ -14923,7 +14923,7 @@ mod trusted_host_tests {
     #[tokio::test(start_paused = true)]
     async fn request_timeout_per_route_override_extends_deadline() {
         let mut config = AutumnConfig::default();
-        config.server.timeouts.request_timeout_ms = Some(100);
+        config.server.timeouts.request_timeout_ms = Some(100); // tight global
 
         let state = crate::state::AppState::for_test();
         let router: axum::Router<AppState> = axum::Router::new().route(

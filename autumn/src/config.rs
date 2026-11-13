@@ -707,7 +707,7 @@ idle_in_transaction_timeout = "60s"
             );
             prod
         }
-        _ => toml::Value::Table(toml::map::Map::new()),
+        _ => toml::Value::Table(toml::map::Map::new()), // Custom profiles get no smart defaults
     }
 }
 
@@ -22277,11 +22277,11 @@ path = "/healthz"
     #[test]
     fn detect_backend_sqlite_schemes() {
         for url in [
-            "sqlite:///var/lib/app.db",
+            "sqlite:///var/lib/app.db", // canonical sqlite:// (absolute path)
             "sqlite://./relative.db",
             "sqlite::memory:",
-            "sqlite:app.db",
-            "file:app.db",
+            "sqlite:app.db", // shorter sqlite: form
+            "file:app.db",   // file: form
         ] {
             assert_eq!(
                 DatabaseBackend::detect(url),
@@ -23455,7 +23455,7 @@ path = "/healthz"
     #[test]
     fn levenshtein_basic() {
         assert_eq!(levenshtein("dev", "dev"), 0);
-        assert_eq!(levenshtein("dev", "dve"), 2); // a swap is 2 edits: no transposition
+        assert_eq!(levenshtein("dev", "dve"), 2); // swap = 2 edits (del + ins)
         assert_eq!(levenshtein("prod", "prodd"), 1);
         assert_eq!(levenshtein("prod", "prd"), 1);
         assert_eq!(levenshtein("staging", "dev"), 7);
@@ -23898,7 +23898,7 @@ path = "/healthz"
     fn env_override_health_detailed_false() {
         let env = MockEnv::new().with("AUTUMN_HEALTH__DETAILED", "false");
         let mut config = AutumnConfig::default();
-        config.health.detailed = true;
+        config.health.detailed = true; // start true, override to false
         config.apply_env_overrides_with_env(&env);
         assert!(!config.health.detailed);
     }
@@ -23921,7 +23921,7 @@ path = "/healthz"
     fn env_override_health_enabled_false() {
         let env = MockEnv::new().with("AUTUMN_HEALTH__ENABLED", "false");
         let mut config = AutumnConfig::default();
-        assert!(config.health.enabled);
+        assert!(config.health.enabled); // starts true (default)
         config.apply_env_overrides_with_env(&env);
         assert!(!config.health.enabled);
     }
@@ -24369,7 +24369,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
         let tmp = TempDir::new().unwrap();
         // The master key has the right length but is not hex.
-        let bogus_key = "zz".repeat(32);
+        let bogus_key = "zz".repeat(32); // 64 chars but not valid hex
         let ct = encrypt(&crate::credentials::MasterKey::generate(), b"x = \"y\"\n");
         std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
         std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
@@ -25145,7 +25145,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     #[test]
     fn red_detect_from_toml_present_emits_finding() {
         let merged = merged_with_abc(toml::Value::Integer(1));
-        let env = MockEnv::new();
+        let env = MockEnv::new(); // AUTUMN_A__B__C not set
         let findings = detect_deprecated_keys(&merged, &env, TEST_REGISTRY);
         assert_eq!(findings.len(), 1);
         let f = &findings[0];
@@ -25158,7 +25158,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     #[test]
     fn red_detect_from_env_present_emits_finding() {
-        let merged = toml::Table::new();
+        let merged = toml::Table::new(); // no TOML key
         let env = MockEnv::new().with("AUTUMN_A__B__C", "val");
         let findings = detect_deprecated_keys(&merged, &env, TEST_REGISTRY);
         assert_eq!(findings.len(), 1);
@@ -25179,7 +25179,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         // Only the replacement key `a.b.d` is set.
         let mut merged = toml::Table::new();
         let mut b = toml::Table::new();
-        b.insert("d".to_owned(), toml::Value::Integer(1));
+        b.insert("d".to_owned(), toml::Value::Integer(1)); // new key, not deprecated
         let mut a = toml::Table::new();
         a.insert("b".to_owned(), toml::Value::Table(b));
         merged.insert("a".to_owned(), toml::Value::Table(a));
@@ -25212,7 +25212,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     #[test]
     fn red_toml_path_non_table_mid_segment_not_present() {
         let mut root = toml::Table::new();
-        root.insert("a".to_owned(), toml::Value::Integer(42));
+        root.insert("a".to_owned(), toml::Value::Integer(42)); // "a" is a leaf, not a table
         assert!(!toml_path_present(&root, "a.b.c"));
     }
 

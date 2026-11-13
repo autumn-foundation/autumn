@@ -2575,7 +2575,7 @@ mod tests {
 
         let mut data = HashMap::new();
         data.insert("custom_user_id".to_owned(), "user:123".to_owned());
-        data.insert("user_id".to_owned(), "user:999".to_owned()); // the default key: must be ignored
+        data.insert("user_id".to_owned(), "user:999".to_owned()); // distracter
         let session = crate::session::Session::new_for_test("session_id".to_owned(), data);
 
         let mut req = axum::http::Request::builder().body(()).unwrap();

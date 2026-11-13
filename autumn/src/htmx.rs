@@ -1150,7 +1150,7 @@ mod tests {
             .hx_location(invalid_header_value)
             .hx_push_url(invalid_header_value)
             .hx_redirect(invalid_header_value)
-            .hx_refresh()
+            .hx_refresh() // valid by default
             .hx_replace_url(invalid_header_value)
             .hx_reswap(invalid_header_value)
             .hx_retarget(invalid_header_value)

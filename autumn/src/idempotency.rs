@@ -666,7 +666,7 @@ impl MemoryIdempotencyStore {
         if let Some(lock) = in_flight.get(key)
             && lock.expires_at > now
         {
-            return false;
+            return false; // still in flight
         }
         // Held until the handler unlocks, or until the TTL expires after a cancellation.
         let ttl = if lock_ttl.is_zero() {

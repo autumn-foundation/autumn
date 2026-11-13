@@ -353,7 +353,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::Extension;
     use axum::routing::get;
-    use tower::ServiceExt;
+    use tower::ServiceExt; // for oneshot
 
     #[tokio::test]
     async fn response_has_request_id_header() {

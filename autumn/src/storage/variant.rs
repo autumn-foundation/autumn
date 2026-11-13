@@ -122,7 +122,7 @@ pub struct VariantBudget {
 impl Default for VariantBudget {
     fn default() -> Self {
         Self {
-            max_source_bytes: 20 * 1024 * 1024,
+            max_source_bytes: 20 * 1024 * 1024, // 20 MiB
             max_source_width: 10_000,
             max_source_height: 10_000,
         }
@@ -732,9 +732,9 @@ mod tests {
             .await
             .unwrap();
         let budget = VariantBudget {
-            max_source_width: 3,
+            max_source_width: 3, // less than 4
             max_source_height: 3,
-            max_source_bytes: jpeg.len() as u64 * 10,
+            max_source_bytes: jpeg.len() as u64 * 10, // byte budget is fine
         };
         let blob = Blob::new("test", "big.jpg", "image/jpeg", jpeg.len() as u64);
         let err = blob

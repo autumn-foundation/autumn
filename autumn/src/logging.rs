@@ -78,10 +78,10 @@ mod tests {
                 format: LogFormat::Pretty,
                 ..LogConfig::default()
             };
-            init(&config);
+            init(&config); // Sets it successfully
 
             let result = std::panic::catch_unwind(|| {
-                init(&config);
+                init(&config); // Should definitely panic
             });
 
             assert!(result.is_err(), "init did not panic on second call");
@@ -192,7 +192,7 @@ mod tests {
         };
         let telemetry_config = TelemetryConfig {
             enabled: true,
-            strict: true,
+            strict: true, // strict mode to ensure we get an error
             service_name: "test".to_owned(),
             service_namespace: None,
             service_version: "1.0.0".to_owned(),

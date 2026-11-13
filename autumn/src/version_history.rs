@@ -1820,7 +1820,7 @@ mod tests {
             changes: vec![],
             recorded_at: Utc::now(),
         };
-        entry.actor = "reassigned-in-test".to_owned();
+        entry.actor = "reassigned-in-test".to_owned(); // allowed for test setup
         assert_eq!(entry.actor, "reassigned-in-test");
     }
 }

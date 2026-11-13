@@ -2085,7 +2085,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(extracted.page(), 1);
-        assert_eq!(extracted.size(), 20);
+        assert_eq!(extracted.size(), 20); // Default is 20
     }
 
     #[tokio::test]
@@ -2099,7 +2099,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(extracted.size(), 20);
+        assert_eq!(extracted.size(), 20); // Default is 20
         assert!(extracted.cursor.is_none());
     }
 

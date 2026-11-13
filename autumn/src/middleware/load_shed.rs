@@ -601,7 +601,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize as StdAtomicUsize;
     use std::time::Duration;
     use tokio::sync::Notify;
-    use tower::ServiceExt;
+    use tower::ServiceExt; // for oneshot
 
     fn make_app(layer: LoadShedLayer) -> Router {
         Router::new()

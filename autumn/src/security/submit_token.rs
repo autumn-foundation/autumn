@@ -83,11 +83,11 @@ const SUBMIT_TOKEN_REPLAYED: &str = "x-submit-token-replayed";
 /// Maximum response body size cached for replay. Scaffold create/update
 /// handlers redirect (303) with tiny bodies; larger responses stream through
 /// without caching.
-const MAX_CACHEABLE_RESPONSE_BODY: usize = 10 * 1024 * 1024;
+const MAX_CACHEABLE_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 
 #[cfg(feature = "idempotency")]
 /// Hard cap on the request body bytes buffered while scanning for the token.
-const MAX_SCAN_BYTES_CAP: usize = 2 * 1024 * 1024;
+const MAX_SCAN_BYTES_CAP: usize = 2 * 1024 * 1024; // 2 MiB
 
 /// The configured submit-token form field name.
 ///

@@ -615,7 +615,7 @@ mod tests {
 
         let handle = presence.track("room:1", "alice", serde_json::json!({}));
         std::thread::sleep(Duration::from_millis(100));
-        handle.refresh();
+        handle.refresh(); // reset heartbeat
         std::thread::sleep(Duration::from_millis(100));
 
         presence.sweep_expired();

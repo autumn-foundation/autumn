@@ -547,7 +547,7 @@ mod tests {
             "status",
             "draft",
             sample_transitions(),
-            |to| to == "published",
+            |to| to == "published", // guard passes for the draft -> published edge
             None,
             None,
         )
@@ -566,7 +566,7 @@ mod tests {
             "status",
             "draft",
             sample_transitions(),
-            |_to| false,
+            |_to| false, // guard fails: legal edge, but currently blocked
             None,
             None,
         )

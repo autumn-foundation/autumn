@@ -3081,7 +3081,7 @@ mod tests {
             0,
             "concluded experiment must not emit exposure events"
         );
-        let _ = records;
+        let _ = records; // silence unused-variable warning for the other sink
         let _ = svc;
     }
 
@@ -3101,7 +3101,7 @@ mod tests {
         let svc = make_svc();
         running(&svc, "exp");
         let v1 = svc.assign("exp", "user:42").unwrap();
-        let v2 = svc.assign("exp", "exp").unwrap();
+        let v2 = svc.assign("exp", "exp").unwrap(); // different key — just to exercise more
         // A fresh service has no sticky assignment, so this checks the hash alone.
         let svc2 = make_svc();
         running(&svc2, "exp");
@@ -3284,6 +3284,59 @@ mod tests {
         );
         assert!(store.get_assignment("exp:user", "1").unwrap().is_none());
         assert!(store.get_assignment("exp", "user:2").unwrap().is_none());
+    }
+
+    #[test]
+    fn in_memory_store_refuses_a_sibling_assignment_in_the_same_group() {
+        // The service checks the group before writing; this is the store's own
+        // refusal, which catches two concurrent first assignments.
+        let store = InMemoryExperimentStore::new();
+        for name in ["exp_a", "exp_b"] {
+            store
+                .upsert(
+                    ExperimentConfig::new(name, vec![VariantConfig::new("v1", 1)])
+                        .exclusion_group("group"),
+                )
+                .unwrap();
+        }
+        store
+            .upsert(ExperimentConfig::new(
+                "solo",
+                vec![VariantConfig::new("v1", 1)],
+            ))
+            .unwrap();
+        store
+            .record_assignment(Assignment::new("exp_a", "user:1", "v1", false))
+            .unwrap();
+
+        let refused = store.record_assignment(Assignment::new("exp_b", "user:1", "v1", false));
+        assert!(
+            matches!(&refused, Err(ExperimentStoreError::Backend(msg)) if msg == "ExcludedByGroup:group"),
+            "got {refused:?}"
+        );
+        assert!(store.get_assignment("exp_b", "user:1").unwrap().is_none());
+
+        assert_eq!(
+            store
+                .record_assignment(Assignment::new("exp_b", "user:2", "v1", false))
+                .unwrap(),
+            "v1",
+            "another actor is not excluded"
+        );
+        assert_eq!(
+            store
+                .record_assignment(Assignment::new("exp_b", "user:1", "v1", true))
+                .unwrap(),
+            "v1",
+            "an override bypasses the group"
+        );
+        assert_eq!(
+            store
+                .record_assignment(Assignment::new("solo", "user:1", "v1", false))
+                .unwrap(),
+            "v1",
+            "an experiment outside the group is unaffected"
+        );
     }
 
     #[test]

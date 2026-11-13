@@ -1671,7 +1671,7 @@ mod tests {
         let err = LocalBlobStore::new(
             "test",
             dir.path().to_path_buf(),
-            "_blobs",
+            "_blobs", // missing leading slash
             Duration::from_secs(60),
             SigningKey::new(b"k".to_vec()),
             vec![],
@@ -1772,7 +1772,7 @@ mod tests {
 
     #[test]
     fn signature_rejects_expired() {
-        let exp = 1;
+        let exp = 1; // long ago
         let sig = sign(b"k", "blob/1.png", exp);
         let err = verify(b"k", "blob/1.png", exp, &sig).unwrap_err();
         assert!(matches!(err, BlobStoreError::Signature(_)));
@@ -1904,7 +1904,7 @@ mod tests {
     #[tokio::test]
     async fn atomic_replace_propagates_io_errors() {
         let dir = temp_root();
-        let tmp = dir.path().join("missing.tmp");
+        let tmp = dir.path().join("missing.tmp"); // never created
         let dst = dir.path().join("target.bin");
         let err = atomic_replace(&tmp, &dst).await.unwrap_err();
         assert!(
@@ -2169,7 +2169,7 @@ mod tests {
         tokio::fs::create_dir(&sidecar).await.unwrap();
 
         drop_stale_sidecar(&blob).await;
-        assert!(sidecar.exists());
+        assert!(sidecar.exists()); // Because it couldn't remove a dir
     }
 
     #[tokio::test]
@@ -2316,7 +2316,7 @@ mod tests {
     fn blob_url_expired_with_previous_key_still_rejects() {
         let old_key = SigningKey::new(b"old-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
         let new_key = SigningKey::new(b"new-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
-        let expired_exp = 1u64;
+        let expired_exp = 1u64; // Unix epoch + 1s — already expired
         let old_sig = sign(old_key.as_bytes(), "a/b.txt", expired_exp);
         let result = verify_with_rotation(&new_key, &[old_key], "a/b.txt", expired_exp, &old_sig);
         assert!(
@@ -2386,7 +2386,7 @@ mod tests {
     #[test]
     fn verify_upload_rejects_expired_token() {
         let key = b"secret";
-        let exp = 1u64;
+        let exp = 1u64; // ancient past
         let sig = sign_upload(key, "k.png", "image/png", exp);
         let err = verify_upload(key, "k.png", "image/png", exp, &sig).unwrap_err();
         assert!(matches!(err, BlobStoreError::Signature(_)));
@@ -2397,7 +2397,7 @@ mod tests {
         let key = b"secret";
         let blob_key = "img/photo.jpg";
         let exp = u64::MAX / 2;
-        let download_sig = sign(key, blob_key, exp);
+        let download_sig = sign(key, blob_key, exp); // download-style token
         let err = verify_upload(key, blob_key, "image/jpeg", exp, &download_sig).unwrap_err();
         assert!(
             matches!(err, BlobStoreError::Signature(_)),

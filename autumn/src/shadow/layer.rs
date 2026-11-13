@@ -1952,7 +1952,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
         let response = service.oneshot(request).await.expect("response");
-        drop(response);
+        drop(response); // never read the body
 
         settle("the abandoned primary to be counted", || {
             registry.stats().primary_incomplete == 1

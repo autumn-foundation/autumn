@@ -3177,7 +3177,7 @@ mod tests {
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
-            burst: 5,
+            burst: 5, // global: 5
             trust_forwarded_headers: true,
             ..Default::default()
         };
@@ -3185,7 +3185,7 @@ mod tests {
         let layer = RateLimitLayer::from_config(&config).with_path_override(
             "/strict",
             RateLimitOverride {
-                burst: Some(1),
+                burst: Some(1), // override: 1
                 requests_per_second: None,
             },
         );

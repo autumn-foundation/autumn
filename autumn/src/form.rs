@@ -7618,7 +7618,7 @@ mod tests {
             name: String,
         }
         let form = ChangesetForm::blank(F { name: "ok".into() }, "tok");
-        assert!(form.is_valid());
+        assert!(form.is_valid()); // via Deref
         assert_eq!(form.csrf_token(), Some("tok"));
     }
 

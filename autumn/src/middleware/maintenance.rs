@@ -418,7 +418,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
-    use tower::ServiceExt;
+    use tower::ServiceExt; // for oneshot
 
     fn make_app(state: MaintenanceState) -> Router {
         Router::new()

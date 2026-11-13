@@ -795,7 +795,7 @@ pub fn duplicate_commentable_storage() -> Option<&'static str> {
 ///   `max_depth`.
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
 /// - Any database error.
-#[allow(clippy::too_many_arguments)] // A struct would hide the key and scope at each call site.
+#[allow(clippy::too_many_arguments)] // The polymorphic key is two values.
 pub async fn add_comment(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -1237,7 +1237,7 @@ pub struct ThreadPage {
 ///
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
 /// - Any database error.
-#[allow(clippy::too_many_arguments)] // The thread read's arguments, plus cursor and page size.
+#[allow(clippy::too_many_arguments)] // The thread read's arguments, plus the
 pub async fn comment_thread_page(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -1275,7 +1275,7 @@ pub async fn comment_thread_page(
 ///
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
 /// - Any database error.
-#[allow(clippy::too_many_arguments)] // The page read's arguments, target instead of cursor.
+#[allow(clippy::too_many_arguments)] // The page read's arguments, with the
 pub async fn thread_page_containing(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -3242,7 +3242,7 @@ struct ThreadQuery {
 
 /// Post a comment (or a reply), then render the page that shows it.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
-#[allow(clippy::too_many_arguments)] // Each argument is a distinct axum extractor.
+#[allow(clippy::too_many_arguments)] // Every argument is a distinct axum
 async fn post_comment(
     axum::Extension(config): axum::Extension<std::sync::Arc<CommentsConfig>>,
     axum::extract::Path((commentable_type, parent_id)): axum::extract::Path<(String, i64)>,
@@ -3389,7 +3389,7 @@ async fn post_comment(
 /// The page the `POST` response shows: the page that holds `focus`, else
 /// the first page. For a no-JS redirect it reads only the cursor.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
-#[allow(clippy::too_many_arguments)] // The handler's request state, passed through.
+#[allow(clippy::too_many_arguments)] // The post's own request state, passed
 async fn page_after_post(
     db: &mut RuntimeConnection,
     config: &CommentsConfig,
@@ -3507,7 +3507,7 @@ async fn session_author(session: &crate::session::Session, config: &CommentsConf
 
 /// Build the widget markup for one thread.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
-#[allow(clippy::too_many_arguments)] // Each argument is a distinct piece of request state.
+#[allow(clippy::too_many_arguments)] // Straight-line assembly of the widget's
 fn render(
     config: &CommentsConfig,
     spec: &CommentableSpec,

@@ -1806,7 +1806,7 @@ pub(crate) fn compute_migration_disambiguation_from_names(
         by_version.keys().cloned().collect();
     for (version, mut entries) in by_version {
         if entries.len() <= 1 {
-            continue;
+            continue; // 0 or 1 distinct migration claims this version -- no collision.
         }
         // Order by full name, not registration order: reordering the
         // `.migrations()`/`.plugin_migrations()` calls or adding a plugin must not

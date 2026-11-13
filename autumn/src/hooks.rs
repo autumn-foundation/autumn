@@ -1103,7 +1103,7 @@ mod tests {
         hooks.after_delete_commit(&mut ctx, &model).await.unwrap();
 
         assert_eq!(CALLS.load(Ordering::SeqCst), 3);
-        let _ = Arc::new(CountingHooks);
+        let _ = Arc::new(CountingHooks); // ensure Arc usage works (Clone check)
     }
 
     // ── Patch serde tests ──────────────────────────────────────────

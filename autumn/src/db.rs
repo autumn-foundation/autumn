@@ -1128,13 +1128,13 @@ fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
             None => break,
             Some('\'') => {
                 if chars.peek() == Some(&'\'') {
-                    chars.next();
+                    chars.next(); // consume the doubled quote
                 } else {
                     break;
                 }
             }
             Some('\\') => {
-                chars.next();
+                chars.next(); // skip the character after the backslash
             }
             Some(_) => {}
         }
@@ -1153,7 +1153,7 @@ fn consume_dollar_quoted_body(chars: &mut std::iter::Peekable<std::str::Chars<'_
         if sc == closing[match_count] {
             match_count += 1;
             if match_count == clen {
-                break;
+                break; // Found the closing delimiter.
             }
         } else {
             match_count = 0;
@@ -1184,7 +1184,7 @@ pub fn scrub_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     // A digit only starts a literal after a separator, so identifiers like
     // `table1` keep their digits. Start of input counts as a separator.
-    let mut prev_is_sep = true;
+    let mut prev_is_sep = true; // treat start-of-input as a separator boundary
 
     let mut chars = sql.chars().peekable();
 
@@ -1192,7 +1192,7 @@ pub fn scrub_sql(sql: &str) -> String {
         // ── E-string literal  E'...' / e'...'  (backslash-escape aware) ──
         // Checked before the single-quote handler so the `E` prefix is consumed.
         if (c == 'E' || c == 'e') && chars.peek() == Some(&'\'') {
-            chars.next();
+            chars.next(); // consume the opening '
             out.push_str("'?'");
             prev_is_sep = false;
             consume_estring_body(&mut chars);
@@ -1246,7 +1246,7 @@ pub fn scrub_sql(sql: &str) -> String {
             } else if next_ch.is_some_and(|nc| nc.is_alphabetic() || nc == '_') {
                 while let Some(&tc) = chars.peek() {
                     if tc == '$' {
-                        chars.next();
+                        chars.next(); // consume the closing `$` of the opening tag
                         found_closing_dollar = true;
                         break;
                     } else if tc.is_alphanumeric() || tc == '_' {
@@ -1276,7 +1276,7 @@ pub fn scrub_sql(sql: &str) -> String {
         if (c.is_ascii_digit() && prev_is_sep) || is_leading_dot {
             out.push('?');
             if is_leading_dot {
-                chars.next();
+                chars.next(); // consume the leading dot
             }
             while chars
                 .peek()
@@ -1286,9 +1286,9 @@ pub fn scrub_sql(sql: &str) -> String {
             }
             // Optional exponent: e/E [+/-] <digits>.
             if chars.peek().is_some_and(|e| *e == 'e' || *e == 'E') {
-                chars.next();
+                chars.next(); // consume 'e'/'E'
                 if chars.peek().is_some_and(|s| *s == '+' || *s == '-') {
-                    chars.next();
+                    chars.next(); // consume optional sign
                 }
                 while chars.peek().is_some_and(char::is_ascii_digit) {
                     chars.next();

@@ -868,7 +868,7 @@ pub struct EtagLayer;
 impl EtagLayer {
     /// Maximum body size (bytes) that will be buffered for `ETag` computation.
     /// Responses larger than this are passed through unchanged (no `ETag`).
-    pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+    pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
     /// Create a new `EtagLayer`.
     #[must_use]

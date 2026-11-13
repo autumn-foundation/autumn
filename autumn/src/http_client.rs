@@ -5189,7 +5189,7 @@ mod tests {
 
     #[test]
     fn retry_override_per_request() {
-        let client = Client::new();
+        let client = Client::new(); // default: 3 retries
         let builder = client.get("https://example.com").retries(0);
         assert_eq!(builder.retry_policy.max_retries, 0);
 

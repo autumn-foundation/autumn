@@ -499,7 +499,7 @@ impl StaticFileLayer {
                     url,
                     coordinator.backend()
                 );
-                return;
+                return; // _guard drops here, resetting in_flight
             }
 
             let result =

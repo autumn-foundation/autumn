@@ -237,7 +237,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         if self.pos < self.bytes.len() {
-            self.pos += 1;
+            self.pos += 1; // consume '>'
         }
 
         // Close the matching open element and any unclosed elements above it.
@@ -292,7 +292,7 @@ impl<'a> Parser<'a> {
             let name = name.to_ascii_lowercase();
             self.skip_whitespace();
             let value = if self.bytes.get(self.pos) == Some(&b'=') {
-                self.pos += 1;
+                self.pos += 1; // consume '='
                 self.skip_whitespace();
                 self.read_attr_value()
             } else {
@@ -306,14 +306,14 @@ impl<'a> Parser<'a> {
 
     fn read_attr_value(&mut self) -> String {
         if let Some(&q @ (b'"' | b'\'')) = self.bytes.get(self.pos) {
-            self.pos += 1;
+            self.pos += 1; // opening quote
             let start = self.pos;
             while self.pos < self.bytes.len() && self.bytes[self.pos] != q {
                 self.pos += 1;
             }
             let value = self.input[start..self.pos].to_string();
             if self.pos < self.bytes.len() {
-                self.pos += 1;
+                self.pos += 1; // closing quote
             }
             value
         } else {
@@ -867,7 +867,7 @@ fn read_attr_value(chars: &[char], i: &mut usize, full: &str) -> Result<String, 
             return Err(format!("unterminated quoted value in selector `{full}`"));
         }
         let value: String = chars[start..*i].iter().collect();
-        *i += 1;
+        *i += 1; // closing quote
         Ok(value)
     } else {
         let start = *i;

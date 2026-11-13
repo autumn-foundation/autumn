@@ -5754,7 +5754,7 @@ mod tests {
     fn assert_no_n_plus_one_with_threshold_overrides_default() {
         // Two identical queries: the configured threshold (10) does not fire, an explicit 2 does.
         let resp = resp_with_queries(&["SELECT 1", "SELECT 1"], 10);
-        resp.assert_no_n_plus_one();
+        resp.assert_no_n_plus_one(); // default threshold 10 -> passes
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             resp.assert_no_n_plus_one_with_threshold(2);
         }))

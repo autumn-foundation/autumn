@@ -1195,11 +1195,11 @@ impl MailBuilder {
         // may pass an html_layout, and vice versa.
         let html = match (self.html, self.html_layout) {
             (Some(body), Some(layout)) => Some(compose_layout(&layout, &body)),
-            (html, _) => html,
+            (html, _) => html, // layout without a body: silently unused (by design)
         };
         let text = match (self.text, self.text_layout) {
             (Some(body), Some(layout)) => Some(compose_layout(&layout, &body)),
-            (text, _) => text,
+            (text, _) => text, // layout without a body: silently unused (by design)
         };
         Ok(Mail {
             from: self.from,
@@ -8082,7 +8082,7 @@ mod tests {
         // Nothing listens on this port, so every send fails.
         let config = SmtpConfig {
             host: Some("127.0.0.1".to_string()),
-            port: Some(9999),
+            port: Some(9999), // Bogus port
             tls: TlsMode::Disabled,
             username: None,
             password_env: None,

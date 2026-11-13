@@ -398,7 +398,7 @@ mod tests {
         buf.push(make_entry("INFO", "first"));
         buf.push(make_entry("INFO", "second"));
         buf.push(make_entry("INFO", "third"));
-        buf.push(make_entry("INFO", "fourth"));
+        buf.push(make_entry("INFO", "fourth")); // should evict "first"
 
         let snap = buf.snapshot(None, None);
         assert_eq!(snap.len(), 3);

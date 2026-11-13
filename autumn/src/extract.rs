@@ -1236,7 +1236,7 @@ mod tests {
         assert_eq!(tighter.max_file_size_bytes, 50);
 
         let not_tighter = tighter.with_max_bytes(200);
-        assert_eq!(not_tighter.max_file_size_bytes, 50); // never relaxes the cap
+        assert_eq!(not_tighter.max_file_size_bytes, 50); // should not relax
     }
 
     #[test]
