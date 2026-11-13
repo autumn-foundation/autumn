@@ -1041,7 +1041,7 @@ sli = "availability"
         assert!(scalar.unwrap_err().to_string().contains("in `c.window`"));
     }
 
-    #[derive(Debug, Deserialize, PartialEq)]
+    #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
     #[serde(rename_all = "snake_case")]
     enum Shape {
         Pair(u8, u8),
@@ -1088,6 +1088,85 @@ sli = "availability"
         assert_eq!(s.pair, (1, 2));
         let marker = Marker::deserialize(super::ConfigDe::Value(toml::Value::Boolean(true)));
         assert!(marker.is_err());
+    }
+
+    /// A struct is a table. toml also reads a struct from an array, one item
+    /// for each field in order. No config file is written that way, and the
+    /// code for it is one function for each config struct. This path refuses
+    /// the array.
+    #[test]
+    fn a_struct_is_a_table_and_not_an_array() {
+        let text = "server = [8080, \"0.0.0.0\"]\n";
+        assert!(toml::from_str::<Root>(text).is_ok(), "toml reads the array");
+        let err = parse::<Root>(text).unwrap_err().to_string();
+        assert!(
+            err.contains("invalid type: sequence, expected struct Server"),
+            "{err}"
+        );
+        assert!(err.contains("in `server`"), "{err}");
+    }
+
+    /// A scalar where a table must be gives the same error as before.
+    #[test]
+    fn a_struct_from_a_scalar_names_both_types() {
+        let err = parse::<Root>("server = \"x\"\n").unwrap_err().to_string();
+        assert!(
+            err.contains("invalid type: string \"x\", expected struct Server"),
+            "{err}"
+        );
+        assert!(err.contains("in `server`"), "{err}");
+    }
+
+    /// toml parses a bool, integer or char map key from its text. So does this
+    /// path.
+    #[test]
+    fn map_keys_parse_as_in_toml() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Keys {
+            ports: BTreeMap<u16, String>,
+            flags: BTreeMap<bool, u8>,
+            marks: BTreeMap<char, u8>,
+            modes: BTreeMap<Shape, u8>,
+            signed: BTreeMap<i64, u8>,
+        }
+        let text = "[ports]\n8080 = \"web\"\n[flags]\ntrue = 1\n[marks]\nx = 2\n\
+                    [modes]\ndot = 3\n[signed]\n-4 = 5\n";
+        let expected: Keys = toml::from_str(text).expect("toml reads the keys");
+        let actual: Keys = parse(text).expect("the config path reads the keys");
+        assert_eq!(actual, expected);
+        assert_eq!(actual.ports.get(&8080).map(String::as_str), Some("web"));
+    }
+
+    /// A key that is not a value of the key type is an error in toml and here.
+    /// The error names the table, as for an unknown field.
+    #[test]
+    fn a_bad_map_key_is_an_error_that_names_its_table() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only the error is read")]
+        struct Keys {
+            ports: BTreeMap<u16, String>,
+        }
+        let text = "[ports]\nhttp = \"web\"\n";
+        assert!(toml::from_str::<Keys>(text).is_err());
+        let err = parse::<Keys>(text).unwrap_err().to_string();
+        assert!(err.contains("in `ports`"), "{err}");
+        let too_large = "[ports]\n70000 = \"web\"\n";
+        assert!(toml::from_str::<Keys>(too_large).is_err());
+        assert!(parse::<Keys>(too_large).is_err());
+    }
+
+    /// A map key is not a variant with a payload.
+    #[test]
+    fn a_map_key_is_a_unit_variant_only() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only the error is read")]
+        struct Keys {
+            modes: BTreeMap<Shape, u8>,
+        }
+        let text = "[modes]\npair = 1\n";
+        assert!(toml::from_str::<Keys>(text).is_err());
+        let err = parse::<Keys>(text).unwrap_err().to_string();
+        assert!(err.contains("tuple variant"), "{err}");
     }
 
     /// The schema walk feeds placeholders for every shape and does not stop.
@@ -1162,32 +1241,35 @@ sli = "availability"
         }
     }
 
-    /// `toml::from_str` into a config struct brings back the copies this
-    /// module removes. Outside tests, config code parses text only into
-    /// `toml::Table` or `toml::Value`.
+    /// `toml::from_str` into a struct brings back the copies this module
+    /// removes. Outside tests, config and capacity code parses text only
+    /// into `toml::Table` or `toml::Value`.
     #[test]
     fn config_code_parses_text_only_into_raw_toml() {
-        // A Windows checkout can have CRLF line ends.
-        let src = include_str!("../config.rs").replace("\r\n", "\n");
-        let body = src
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("source");
-        assert!(
-            body.len() < src.len(),
-            "config.rs has no test module marker"
-        );
-        for (number, line) in body.lines().enumerate() {
-            let Some(at) = line.find("toml::from_str") else {
-                continue;
-            };
-            let rest = &line[at + "toml::from_str".len()..];
-            assert!(
-                rest.starts_with("::<toml::Table>(") || rest.starts_with("::<toml::Value>("),
-                "config.rs:{}: name the raw toml type: {}",
-                number + 1,
-                line.trim()
-            );
+        let sources = [
+            ("config.rs", include_str!("../config.rs")),
+            ("capacity.rs", include_str!("../capacity.rs")),
+        ];
+        for (file, src) in sources {
+            // A Windows checkout can have CRLF line ends.
+            let src = src.replace("\r\n", "\n");
+            let body = src
+                .split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .expect("source");
+            assert!(body.len() < src.len(), "{file} has no test module marker");
+            for (number, line) in body.lines().enumerate() {
+                let Some(at) = line.find("toml::from_str") else {
+                    continue;
+                };
+                let rest = &line[at + "toml::from_str".len()..];
+                assert!(
+                    rest.starts_with("::<toml::Table>(") || rest.starts_with("::<toml::Value>("),
+                    "{file}:{}: name the raw toml type: {}",
+                    number + 1,
+                    line.trim()
+                );
+            }
         }
     }
 }

@@ -918,6 +918,37 @@ mod tests {
     fn parse_reports_malformed_toml() {
         let err = CapacityContract::parse("this is not = = toml").expect_err("must reject garbage");
         assert!(matches!(err, CapacityError::Parse(_)), "got {err}");
+        assert!(err.to_string().contains("line 1"), "got {err}");
+    }
+
+    #[test]
+    fn parse_names_the_key_of_a_bad_value() {
+        let mut contract = toml::Table::try_from(sample_contract()).expect("raw serialize");
+        let envelope = contract["envelope"].as_table_mut().expect("a table");
+        envelope.insert("admission_limit".to_owned(), "many".into());
+        let rendered = toml::to_string_pretty(&contract).expect("raw serialize");
+
+        let err = CapacityContract::parse(&rendered).expect_err("a string is not a limit");
+        assert!(matches!(err, CapacityError::Parse(_)), "got {err}");
+        let message = err.to_string();
+        assert!(message.contains("invalid type: string"), "got {message}");
+        assert!(
+            message.contains("in `envelope.admission_limit`"),
+            "got {message}"
+        );
+    }
+
+    #[test]
+    fn parse_needs_a_version() {
+        let mut contract = toml::Table::try_from(sample_contract()).expect("raw serialize");
+        contract.remove("version");
+        let rendered = toml::to_string_pretty(&contract).expect("raw serialize");
+
+        let err = CapacityContract::parse(&rendered).expect_err("no version");
+        assert!(
+            err.to_string().contains("missing field `version`"),
+            "got {err}"
+        );
     }
 
     #[test]
