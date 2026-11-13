@@ -210,12 +210,12 @@ pub struct OsEntropy;
 impl Entropy for OsEntropy {
     fn next_u64(&self) -> u64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).expect("OS RNG must not fail on supported platforms");
+        getrandom::fill(&mut buf).expect("OS RNG must not fail on supported platforms");
         u64::from_le_bytes(buf)
     }
 
     fn fill_bytes(&self, dest: &mut [u8]) {
-        getrandom::getrandom(dest).expect("OS RNG must not fail on supported platforms");
+        getrandom::fill(dest).expect("OS RNG must not fail on supported platforms");
     }
 }
 

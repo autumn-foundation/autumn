@@ -29,7 +29,7 @@
 use std::sync::{Arc, RwLock};
 
 use futures::future::BoxFuture;
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::{Digest as _, Sha256};
 
 use super::http::{HttpRequest, HttpResponse, HttpTransport};
@@ -568,8 +568,11 @@ fn txt_rrset_for(xml: &str, fqdn: &str) -> TxtRrset {
         .unwrap_or_default()
 }
 
-/// Zone-name candidates for `fqdn`, most specific first (see the Cloudflare
-/// provider for the same rule).
+/// Zone-name candidates for `fqdn`, most specific first.
+///
+/// Byte-for-byte shared with [`cloudflare`](super::cloudflare)'s copy of the
+/// same ACME DNS-01 zone-discovery rule (issue #1620) —
+/// `zone_candidates_match_cloudflare` below fails the build if the two drift.
 fn zone_candidates(fqdn: &str) -> Vec<String> {
     // The `_acme-challenge` label is NOT stripped: delegating
     // `_acme-challenge.example.com` to a zone of its own (so an ACME client
@@ -825,6 +828,79 @@ fn sign_request_for_service(
 mod tests {
     use super::super::http::RecordingTransport;
     use super::*;
+
+    /// Extracts the balanced `open`..`close` span starting at the first
+    /// occurrence of `needle` (which must itself end with `open`), e.g.
+    /// `"fn zone_candidates(fqdn: &str) -> Vec<String> {"` with `('{', '}')`
+    /// returns the whole function including its signature and closing brace.
+    fn extract_balanced(src: &str, needle: &str, open: char, close: char) -> String {
+        assert!(
+            needle.ends_with(open),
+            "needle {needle:?} must end at the opening delimiter"
+        );
+        let start = src
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not found in source"));
+        let open_pos = start + needle.len() - open.len_utf8();
+        let mut depth = 0i32;
+        let mut end = open_pos;
+        for (i, c) in src[open_pos..].char_indices() {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    end = open_pos + i + c.len_utf8();
+                    break;
+                }
+            }
+        }
+        assert_ne!(
+            end, open_pos,
+            "unbalanced {open:?}/{close:?} after {needle:?}"
+        );
+        src[start..end].to_string()
+    }
+
+    /// Drops every whole-line `//` comment, so two copies that carry
+    /// different (per-file, correctly-adapted) prose over identical code
+    /// still compare equal.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `zone_candidates` is a deliberate byte-for-byte copy of
+    /// `cloudflare.rs`'s function of the same name (see the doc comment
+    /// above it in both files): the ACME DNS-01 zone-discovery rule from
+    /// issue #1620 is one decision, implemented once per provider because
+    /// each `DnsProvider` is otherwise self-contained. This test fails the
+    /// build the moment either copy's code drifts, instead of relying on a
+    /// maintainer noticing during review.
+    #[test]
+    fn zone_candidates_match_cloudflare() {
+        let this = include_str!("route53.rs");
+        let sibling = include_str!("cloudflare.rs");
+
+        let a = strip_line_comments(&extract_balanced(
+            this,
+            "fn zone_candidates(fqdn: &str) -> Vec<String> {",
+            '{',
+            '}',
+        ));
+        let b = strip_line_comments(&extract_balanced(
+            sibling,
+            "fn zone_candidates(fqdn: &str) -> Vec<String> {",
+            '{',
+            '}',
+        ));
+        assert_eq!(
+            a, b,
+            "zone_candidates has drifted between route53.rs and cloudflare.rs"
+        );
+    }
 
     const ZONE_LOOKUP: &str = "GET /2013-04-01/hostedzonesbyname";
     const RRSET_LIST: &str = "GET /2013-04-01/hostedzone/ZPUBLIC/rrset";

@@ -1360,6 +1360,88 @@ async fn verify_request(
     })
 }
 
+/// Verifies an `Autumn-Signature: t=<unix>,v1=<hex>` header: the HMAC-SHA256
+/// of `{t}.{body}`, the scheme outbound webhooks send.
+///
+/// It checks the signature and the timestamp tolerance only. It keeps no
+/// replay record: the caller drops copies itself (the outbox inbox does).
+#[cfg(feature = "db")]
+pub(crate) struct AutumnSignatureVerifier {
+    endpoint: ResolvedWebhookEndpoint,
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for AutumnSignatureVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutumnSignatureVerifier")
+            .field("name", &self.endpoint.config.name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "db")]
+impl AutumnSignatureVerifier {
+    /// A verifier for `secret` and the `previous` secrets of a rotation.
+    pub(crate) fn new(
+        name: &str,
+        path: &str,
+        secret: &str,
+        previous: &[String],
+        tolerance_secs: u64,
+    ) -> Self {
+        let mut config = WebhookEndpointConfig::stripe(name, path, secret)
+            .with_timestamp_tolerance_secs(tolerance_secs)
+            .without_replay_protection();
+        config.signature_header = Some("Autumn-Signature".to_owned());
+        config.previous_secrets = previous.to_vec();
+        let keys = crate::security::config::ResolvedSigningKeys::new(
+            secret.as_bytes().to_vec(),
+            previous.iter().map(|key| key.as_bytes().to_vec()).collect(),
+        );
+        Self {
+            endpoint: ResolvedWebhookEndpoint { config, keys },
+        }
+    }
+
+    /// Check the header shape and the timestamp before the body is read.
+    ///
+    /// # Errors
+    ///
+    /// `400` for a missing or malformed header, `401` for a stale timestamp.
+    pub(crate) fn precheck(
+        &self,
+        headers: &HeaderMap,
+        received_at: SystemTime,
+    ) -> Result<(), crate::AutumnError> {
+        let check = || {
+            let header = required_header(headers, signature_header(&self.endpoint))?;
+            let (timestamp, _) = parse_stripe_signature(header)?;
+            verify_timestamp(
+                timestamp,
+                received_at,
+                self.endpoint.config.timestamp_tolerance_secs,
+            )
+        };
+        check().map_err(WebhookVerifyError::into_autumn_error)
+    }
+
+    /// Check the signature of `body`.
+    ///
+    /// # Errors
+    ///
+    /// `400` for a missing or malformed header, `401` for a stale timestamp
+    /// or a signature that does not match.
+    pub(crate) fn verify(
+        &self,
+        headers: &HeaderMap,
+        body: &[u8],
+        received_at: SystemTime,
+    ) -> Result<(), crate::AutumnError> {
+        verify_stripe(&self.endpoint, headers, body, received_at)
+            .map_err(WebhookVerifyError::into_autumn_error)
+    }
+}
+
 fn verify_stripe(
     endpoint: &ResolvedWebhookEndpoint,
     headers: &HeaderMap,
@@ -1380,10 +1462,9 @@ fn verify_stripe(
     signed_payload.push(b'.');
     signed_payload.extend_from_slice(body);
 
-    if signatures
-        .iter()
-        .any(|signature| endpoint.keys.verify(&signed_payload, signature))
-    {
+    // One MAC per key, not one per candidate: a header with many `v1=`
+    // entries must not multiply the hash work over the body.
+    if endpoint.keys.verify_any(&signed_payload, &signatures) {
         Ok(())
     } else {
         Err(WebhookVerifyError::SignatureMismatch)
@@ -1499,11 +1580,15 @@ fn parse_stripe_signature(header: &str) -> Result<(i64, Vec<&str>), WebhookVerif
     }
 
     let timestamp = timestamp.ok_or(WebhookVerifyError::MalformedTimestamp)?;
-    if signatures.is_empty() {
+    if signatures.is_empty() || signatures.len() > MAX_SIGNATURE_CANDIDATES {
         return Err(WebhookVerifyError::MalformedSignature);
     }
     Ok((timestamp, signatures))
 }
+
+/// Most `v1=` entries one `t=…,v1=…` header may hold. A sender lists one per
+/// active secret, so a rotation needs two or three.
+const MAX_SIGNATURE_CANDIDATES: usize = 8;
 
 fn verify_timestamp(
     timestamp: i64,
@@ -1716,6 +1801,10 @@ mod tests {
 
     #[test]
     fn test_verify_timestamp_valid() {
+        #[allow(
+            clippy::duration_suboptimal_units,
+            reason = "a Unix timestamp reads in seconds"
+        )]
         let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
         assert!(verify_timestamp(1_614_556_800, received_at, 300).is_ok());
         assert!(verify_timestamp(1_614_556_800 + 300, received_at, 300).is_ok());
@@ -1724,6 +1813,10 @@ mod tests {
 
     #[test]
     fn test_verify_timestamp_stale() {
+        #[allow(
+            clippy::duration_suboptimal_units,
+            reason = "a Unix timestamp reads in seconds"
+        )]
         let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
         let err = verify_timestamp(1_614_556_800 + 301, received_at, 300).unwrap_err();
         assert!(matches!(err, WebhookVerifyError::StaleTimestamp));

@@ -481,11 +481,8 @@ const MAX_LAG_RESENDS: u32 = 3;
 /// Available from a handler as `state.collab()`, or as the [`CollabHub`]
 /// extractor. Cloning is cheap and shares the same documents.
 ///
-/// One pointer wide on purpose. [`AppState`](crate::state::AppState) holds a
-/// hub by value and lives inside large futures, so four inline fields here
-/// cost 72 bytes in every one of them — enough to push
-/// `SystemTest::build()` past `clippy::large_futures`. The seams beside it
-/// (`Channels`, `Presence`) are handles for the same reason.
+/// One pointer wide on purpose: a clone is one reference count. The seams
+/// beside it (`Channels`, `Presence`) are handles for the same reason.
 #[derive(Clone)]
 pub struct CollabHub {
     inner: Arc<HubInner>,

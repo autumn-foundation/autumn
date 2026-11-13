@@ -631,6 +631,39 @@ impl ColumnType {
     }
 }
 
+/// The `SQLite` expression that builds a random version-4 UUID (see
+/// [`SQLITE_UUID_V4_SQL`]). A macro, so `concat!` can embed it in a literal.
+macro_rules! sqlite_uuid_v4_sql {
+    () => {
+        "lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || \
+         substr(lower(hex(randomblob(2))), 2) || '-' || \
+         substr('89ab', 1 + (random() & 3), 1) || substr(lower(hex(randomblob(2))), 2) || \
+         '-' || lower(hex(randomblob(6)))"
+    };
+}
+
+macro_rules! sqlite_uuid_pk_sql {
+    () => {
+        concat!(
+            "TEXT PRIMARY KEY NOT NULL DEFAULT (",
+            sqlite_uuid_v4_sql!(),
+            ")"
+        )
+    };
+}
+
+/// A `SQLite` expression that yields a random version-4 UUID as canonical
+/// lowercase hyphenated text.
+///
+/// `SQLite` has no `gen_random_uuid()`. This builds the same value from
+/// `randomblob`. It sets the version nibble to `4` and the variant nibble to one
+/// of `8`, `9`, `a`, `b`. Put it in parentheses to use it as a column `DEFAULT`.
+/// It uses `random() & 3`. `abs(random())` can overflow for the smallest `i64`.
+pub const SQLITE_UUID_V4_SQL: &str = sqlite_uuid_v4_sql!();
+
+/// The Rust type of a `SQLite` UUID key: `autumn-web`'s `TEXT`-backed newtype.
+pub const SQLITE_UUID_RUST_TYPE: &str = "autumn_web::db::sqlite_types::SqliteUuid";
+
 /// The primary-key strategy for a generated table.
 ///
 /// Mirrors `dsl::IdType`. Defaults conceptually to [`BigSerial`](Self::BigSerial)
@@ -648,8 +681,9 @@ pub enum IdKind {
     /// by `schema pull` recreates as `SERIAL` (auto-increment) rather than a plain
     /// `INTEGER PRIMARY KEY` that silently loses the sequence.
     Serial,
-    /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` (PG) / `TEXT PRIMARY KEY`
-    /// (`SQLite`) — a non-enumerable UUID.
+    /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` (PG) / `TEXT PRIMARY KEY NOT
+    /// NULL DEFAULT (<v4 expression>)` (`SQLite`) — a non-enumerable UUID that
+    /// the database generates on both backends.
     Uuid,
 }
 
@@ -687,7 +721,19 @@ impl IdKind {
                 "INTEGER PRIMARY KEY AUTOINCREMENT"
             }
             (Self::Uuid, Backend::Postgres) => "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
-            (Self::Uuid, Backend::Sqlite) => "TEXT PRIMARY KEY",
+            (Self::Uuid, Backend::Sqlite) => sqlite_uuid_pk_sql!(),
+        }
+    }
+
+    /// The Rust type for the `#[id]` struct field on `backend`.
+    ///
+    /// `SQLite` has no `uuid` column type. Its UUID key is the `TEXT`-backed
+    /// `SqliteUuid` newtype. Every other key has the same type on both backends.
+    #[must_use]
+    pub const fn rust_type_for(self, backend: Backend) -> &'static str {
+        match (self, backend) {
+            (Self::Uuid, Backend::Sqlite) => SQLITE_UUID_RUST_TYPE,
+            _ => self.rust_type(),
         }
     }
 }
@@ -1047,6 +1093,109 @@ pub struct Table {
     /// existing database can be represented as `managed = false` so tooling
     /// records its shape without claiming authority to migrate it.
     pub managed: bool,
+    /// The Postgres schema of the table. `None` is the default schema
+    /// (`public`, or the first on the `search_path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+}
+
+/// Words that Postgres reserves. A schema cannot have one of these names
+/// without quotes.
+const RESERVED_SCHEMA_WORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "column",
+    "constraint",
+    "create",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "from",
+    "grant",
+    "group",
+    "having",
+    "in",
+    "initially",
+    "intersect",
+    "into",
+    "lateral",
+    "leading",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "select",
+    "session_user",
+    "some",
+    "symmetric",
+    "system_user",
+    "table",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "variadic",
+    "when",
+    "where",
+    "window",
+    "with",
+];
+
+/// True when `name` is a schema name the DDL can write without quotes.
+///
+/// The name is `[a-z_][a-z0-9_]*`, at most 63 bytes, not a reserved Postgres
+/// word, and without the `pg_` prefix that Postgres keeps for system schemas.
+#[must_use]
+pub fn is_valid_schema_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && name.len() <= 63
+        && !name.starts_with("pg_")
+        && !RESERVED_SCHEMA_WORDS.contains(&name)
 }
 
 impl Table {
@@ -1060,7 +1209,16 @@ impl Table {
             checks: Vec::new(),
             backend,
             managed: true,
+            schema: None,
         }
+    }
+
+    /// `schema.name`, or `name` when the table has no schema.
+    #[must_use]
+    pub fn qualified_name(&self) -> String {
+        self.schema
+            .as_deref()
+            .map_or_else(|| self.name.clone(), |s| format!("{s}.{}", self.name))
     }
 }
 
@@ -1088,6 +1246,44 @@ impl Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_names_are_plain_and_not_reserved() {
+        for ok in ["marketing", "_x", "a1", "billing_2"] {
+            assert!(is_valid_schema_name(ok), "{ok}");
+        }
+        for bad in [
+            "", "Order", "order", "user", "a.b", "1a", "a b", "a\"b", "select",
+        ] {
+            assert!(!is_valid_schema_name(bad), "{bad}");
+        }
+        assert!(!is_valid_schema_name(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn table_schema_defaults_to_none_and_qualifies() {
+        let mut t = Table::new("campaigns", Backend::Postgres);
+        assert_eq!(t.schema, None);
+        assert_eq!(t.qualified_name(), "campaigns");
+        t.schema = Some("marketing".to_owned());
+        assert_eq!(t.qualified_name(), "marketing.campaigns");
+    }
+
+    #[test]
+    fn a_snapshot_table_without_a_schema_key_loads() {
+        let json = r#"{"name":"t","columns":[],"primary_key":[],"indexes":[],"checks":[],"backend":"Postgres","managed":true}"#;
+        let t: Table = serde_json::from_str(json).expect("old snapshot loads");
+        assert_eq!(t.schema, None);
+    }
+
+    #[test]
+    fn table_without_schema_serializes_as_before() {
+        let t = Table::new("campaigns", Backend::Postgres);
+        let json = serde_json::to_string(&t).expect("json");
+        assert!(!json.contains("schema"), "{json}");
+        let back: Table = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back, t);
+    }
 
     /// Every logical column type, for exhaustive table-driven assertions. Kept
     /// in one place so a newly added [`ColumnType`] variant that is not listed
@@ -1697,7 +1893,30 @@ mod tests {
             IdKind::Uuid.pk_sql(Backend::Postgres),
             "UUID PRIMARY KEY DEFAULT gen_random_uuid()"
         );
-        assert_eq!(IdKind::Uuid.pk_sql(Backend::Sqlite), "TEXT PRIMARY KEY");
+        assert_eq!(
+            IdKind::Uuid.pk_sql(Backend::Sqlite),
+            format!("TEXT PRIMARY KEY NOT NULL DEFAULT ({SQLITE_UUID_V4_SQL})")
+        );
+    }
+
+    #[test]
+    fn id_kind_uuid_rust_type_follows_the_backend() {
+        assert_eq!(IdKind::Uuid.rust_type_for(Backend::Postgres), "uuid::Uuid");
+        assert_eq!(
+            IdKind::Uuid.rust_type_for(Backend::Sqlite),
+            "autumn_web::db::sqlite_types::SqliteUuid"
+        );
+        assert_eq!(IdKind::BigSerial.rust_type_for(Backend::Sqlite), "i64");
+    }
+
+    #[test]
+    fn sqlite_uuid_default_names_no_postgres_function() {
+        assert!(!SQLITE_UUID_V4_SQL.contains("gen_random_uuid"));
+        assert!(SQLITE_UUID_V4_SQL.contains("randomblob"));
+        assert!(
+            !SQLITE_UUID_V4_SQL.contains("abs("),
+            "abs(i64::MIN) overflows"
+        );
     }
 
     #[test]

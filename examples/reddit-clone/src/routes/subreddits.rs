@@ -25,6 +25,7 @@ use super::layout::{field_errors, form_error_summary, layout, layout_with_seo, t
 ///
 /// Every meta value is fixed text, so the `seo(...)` argument carries all of
 /// them and the handler only adds the canonical URL. See `docs/guide/seo.md`.
+#[public]
 #[get(
     "/r",
     seo(
@@ -312,6 +313,7 @@ pub async fn create(
 /// front page's live feed. `PageRequest` clamps `?page=` and `?size=` rather
 /// than rejecting them, so a hand-edited or stale URL renders the list instead
 /// of a 400.
+#[public]
 #[get("/r/{slug}", seo(og_type = "website"))]
 // Every argument is a distinct extractor: path, SEO defaults, session, CSRF
 // token, CSRF field name, page request, repository, connection, flash.
@@ -325,6 +327,8 @@ pub async fn show(
     // whatever `security.csrf.form_field` configured, or the first submit 403s.
     csrf_field: CsrfFormField,
     page_req: PageRequest,
+    // The comment page (#3325). `?after=` comes from the widget's link.
+    autumn_web::extract::Query(comment_page): autumn_web::extract::Query<super::CommentPageQuery>,
     repo: PgSubredditRepository,
     mut db: Db,
     flash: Flash,
@@ -396,7 +400,11 @@ pub async fn show(
     // table of its own, no route, no threading query: the framework router
     // `main.rs` already mounts for `Post` serves this too, keyed on
     // `Subreddit::COMMENTABLE_TYPE`.
-    let thread = repo.comment_thread(sub.id).await?;
+    //
+    // One page of top-level comments at a time (#3325).
+    let comment_page = repo
+        .comment_thread_page(sub.id, comment_page.after, super::COMMENTS_PER_PAGE)
+        .await?;
     let comments_config = autumn_web::commentable::CommentsConfig::default();
     let mut comment_config = CommentThread::from_spec(
         autumn_web::commentable::thread_dom_id(Subreddit::COMMENTABLE_TYPE, sub.id),
@@ -409,7 +417,8 @@ pub async fn show(
     )
     .label("Community discussion")
     .empty_text("No community discussion yet.")
-    .return_to(__autumn_path_show(&sub.slug));
+    .return_to(__autumn_path_show(&sub.slug))
+    .page(comment_page.after, comment_page.next);
     if current_user.is_some() {
         comment_config = comment_config
             .csrf_token(csrf.token())
@@ -565,7 +574,7 @@ pub async fn show(
                 // rendered outside it would go stale the moment someone
                 // replies.
                 h2 class="font-semibold text-gray-700 mb-2" { "Community discussion" }
-                (comment_thread(&comment_config, &CommentView::from_thread(&thread)))
+                (comment_thread(&comment_config, &CommentView::from_thread(&comment_page.nodes)))
             }
         },
     ))

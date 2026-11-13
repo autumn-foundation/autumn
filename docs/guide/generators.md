@@ -81,6 +81,10 @@ set.
 | `token:Uuid`      | `uuid::Uuid`                    | `Uuid`             | `UUID`              |
 | `at:NaiveDateTime`| `chrono::NaiveDateTime`         | `Timestamp`        | `TIMESTAMP`         |
 | `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
+| `opens:time` *(or `NaiveTime`)* | `chrono::NaiveTime` | `Time`         | `TIME`              |
+| `mobile:phone` *(or `tel`)* | `String`              | `Text`             | `TEXT`              |
+| `accent:color`    | `String` (`#rrggbb`)            | `Text`             | `TEXT`              |
+| `price:money`     | `rust_decimal::Decimal`         | `Numeric`          | `NUMERIC(12,2)`     |
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
 | `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 | `slug:slug{from:title}` | `String`                  | `Text`              | `TEXT`              |
@@ -91,6 +95,24 @@ set.
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
+
+### `time`, `phone`, `color` and `money` — native form controls
+
+These kinds pick a native form control (issue #3405):
+
+| Kind | Form control | Notes |
+|---|---|---|
+| `time` | `<input type="time">` (`FieldControl::Time`) | The browser posts `HH:MM`. On `SQLite` the column is `TEXT`. |
+| `phone` (alias `tel`) | `<input type="tel">` (`FieldControl::Tel`) | A `String` column. The browser does not check the format. |
+| `color` | `<input type="color">` (`FieldControl::Color`) | A `String` column. The browser posts a lowercase `#rrggbb`. A color input always posts a value, so `Option<color>` is an error: use `Option<String>`. |
+| `money` | `<input type="number" step="0.01">` | The same column as a bare `decimal`: `NUMERIC(12,2)`. |
+
+`phone` and `color` take no `{…}` modifier. Use `String{…}` for a constrained
+text column, and `decimal{p,s}` for another precision or scale.
+
+```bash
+autumn generate scaffold Shop name:String opens:time mobile:phone accent:color price:money
+```
 
 ### `json`/`jsonb` — flexible structured data
 
@@ -1144,10 +1166,11 @@ Everything `model` produces, plus:
   `autumn_web::test::{TestApp, TestClient, TestDb}`: it boots a throwaway
   Postgres database, fires a request at a stand-in for the scaffolded index
   route, and asserts a real response — no running server, no env var, no
-  silent skip. `cargo test` reports it as `ignored` with an explicit reason
-  (Docker isn't assumed to be available); run `cargo test -- --ignored` to
-  execute it for real. `--api` scaffolds get the JSON equivalent, asserting
-  against `GET /api/<plural>`.
+  silent skip. On Postgres, `cargo test` reports it as `ignored` with an
+  explicit reason (Docker isn't assumed to be available); run
+  `cargo test -- --ignored` to execute it for real. On a SQLite app it uses a
+  temp-file database, so a plain `cargo test` runs it. `--api` scaffolds get the
+  JSON equivalent, asserting against `GET /api/<plural>`.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op. By default, the scaffold registers only
@@ -1219,10 +1242,11 @@ Contract of the generated handler:
 | Situation | Behaviour |
 | --------- | --------- |
 | Checked rows | Deleted through the repository's `delete_many`, then a `Deleted N <plural>` flash and a 303 back to the index. |
-| Field name | `name="ids"` (matching `autumn-admin-plugin`); the parser also accepts the `ids[]` spelling some clients send. |
+| Field name | `name="ids"` (matching `autumn-admin-plugin`). The ids decode into `BulkSelection { ids: Vec<i64> }` through `autumn_web::form::from_urlencoded`. The `ids[]` spelling also works. |
 | Empty selection | Info flash + 303 redirect. **Never** a 400 — a list-write endpoint doesn't fail on missing params. |
-| Malformed id (`ids=abc`) | Silently dropped, same as above. Duplicates are collapsed through a `HashSet`, so parsing a crafted body full of distinct ids stays linear rather than quadratic. |
-| Oversized selection | Capped at `MAX_BULK_IDS` (5000). A real selection is page-sized, so this only bites on a hand-crafted body — the default 32 MiB request limit otherwise leaves room for over a million ids. The parser stops one past the cap, and the handler refuses the batch with an error flash rather than truncating it: a silently partial destructive batch is worse than a refused one. |
+| Malformed body (`ids=abc`, or `ids` mixed with `ids[]`) | Error flash + 303 redirect. Never a 400. Nothing is deleted. |
+| Duplicate ids | Collapsed through a `HashSet`. A crafted body full of distinct ids stays linear, not quadratic. |
+| Oversized selection | Capped at `MAX_BULK_IDS` (5000). A real selection is page-sized, so this only bites on a hand-crafted body — the default 32 MiB request limit otherwise leaves room for over a million ids. The handler counts the submitted ids before it decodes them and stops one past the cap. It refuses the batch with an error flash rather than truncating it: a silently partial destructive batch is worse than a refused one. |
 | Large selection | The pre-flight `SELECT` is chunked at 1000 ids. `eq_any` binds one parameter per id, and `autumn_web::repository::MAX_BIND_PARAMS` is 32766 on SQLite, so one unbounded `eq_any` would fail with "too many SQL variables" before reaching the already-chunked `delete_many`. |
 | `--soft-delete` | The pre-flight `SELECT` filters `deleted_at IS NULL`, and `delete_many` applies the soft-delete update — no hand-rolled `deleted_at` write. |
 | Record policy wiring on (an owner column, the default) | Each selected row is authorized with the same `"delete"` action `destroy` uses. A row the actor may not delete is dropped from the batch rather than 403'ing the request, so the endpoint is not an existence oracle. |
@@ -1266,7 +1290,7 @@ JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
 `'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
 by the browser — the form would submit with no prompt, which is worse
 than not promising one. The framework's server-rendered replacement for
-`window.confirm()`, [`confirm_action`](../../autumn/src/widgets.rs), submits
+`window.confirm()`, [`confirm_action`](../../autumn/src/widgets/feedback.rs), submits
 its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
@@ -1396,7 +1420,10 @@ autumn generate scaffold Post title:String comments:commentable
   created_at, deleted_at)` table, with an index covering the thread read and
   another for the delete cascade. It is emitted **once per project**: run the
   same token on a second model and the generator reuses the existing table and
-  says so.
+  says so. A `comments` table that does not have all of these columns (from a
+  `Comment` scaffold, for example) stops generation. The error tells you how
+  to correct it
+  ([details](commentable.md#a-comments-table-that-is-not-the-shared-one-2283)).
 - The **model** gets `#[commentable(by = User, counter_cache = comment_count)]`
   — `by` only when the project actually has a `User` model, since naming a
   missing one would be a compile error in a file you did not write. That
@@ -1411,14 +1438,11 @@ autumn generate scaffold Post title:String comments:commentable
 
   ```rust
   .nest("/comments", autumn_web::commentable::router(Default::default()))
+  .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
   ```
 
   and render a thread with `autumn_web::widgets::comment_thread`. Adding a
   third commentable model needs no change there.
-
-If the project already has a `comments` table that is not the shared one,
-generation stops and writes no file. Rename that resource, or add every
-missing column of the shared table (`id`, `commentable_type`, `commentable_id`, `parent_id`, `author_id`, `body`, `created_at` and `deleted_at`), then run the command again.
 
 At most one `commentable` field per model, and it takes no `{…}` modifiers —
 everything else is configured on the model's `#[commentable(...)]` attribute.
@@ -1646,7 +1670,7 @@ Contract of the generated handler:
 | CSRF and double submit | The POST is `#[secured]` and the form renders the shipped CSRF and one-time submit-token hidden inputs as its **first** fields, so both land inside `security.csrf.token_scan_bytes` on a multipart body. Keep them first if you rearrange the form. |
 | Rate limiting | No `#[throttle]` (unlike the export): the route is `#[secured]`, and its work is bounded by `MAX_IMPORT_BYTES` and `MAX_IMPORT_ROWS` rather than by the size of the table. It also does not fit: the handler declares 9 extractors on a policy-enabled scaffold (10 under `--i18n`), `#[secured]` injects 3 more and `#[throttle]` 8, and axum's `Handler` tops out at 16. To add one, drop extractors to make room — the submit-token pair is the cheapest, at the cost of double-submit protection. `--no-policy` (7 params) does leave room. |
 | Record policy wiring on (an owner column, the default) | The handler is `#[secured]` and calls `authorize_create::<Model>` once, exactly like `create`: an import has no loaded row to authorize per record, any more than a create does. A per-row rule therefore does not apply here either; add the check inside the row closure if your policy needs one. |
-| Line numbers | 1-based lines of the uploaded file, header included — and the **same numbers for CRLF and LF** files. (The underlying CSV parser's own counter runs one behind on CRLF, the dialect Excel writes; `import_csv` calibrates against the header and corrects for it, and strips the parser's own uncalibrated line number out of the message so a reader never sees two.) A quoted field containing a newline moves the rows after it down, and the reported numbers move with them. A header that itself spans a quoted newline is accounted for, so it does not shift the rows under it. The shift is measured once, so only a file that *mixes* terminators drifts. |
+| Line numbers | 1-based lines of the uploaded file, header included — and the **same numbers for CRLF and LF** files. (The underlying CSV parser's own counter runs one behind on CRLF, the dialect Excel writes; `import_csv` calibrates against the header and corrects for it, and strips the parser's own uncalibrated line number out of the message so a reader never sees two.) A quoted field containing a newline moves the rows after it down, and the reported numbers move with them. A header that itself spans a quoted newline is accounted for, so it does not shift the rows under it. Blank lines are skipped but still count, so a row after them is reported on its own line. The shift is measured once, so only a file that *mixes* terminators drifts. |
 | Existing records | **Never matched or updated.** Every row is inserted as a new record and an `id` column in the file is ignored, so re-uploading an exported file *duplicates* it rather than updating it in place. `ImportMode::Upsert { by }` exists in the framework for update-in-place; wiring it up means matching on the `by` columns in the row closure and calling the repository's update path, which is deliberately left to you rather than guessed at. |
 | Columns the import cannot set | Named on the upload page, from an emitted `CSV_IGNORED_COLUMNS`: `id` and `created_at` (the database assigns both), an `Attachment` (a storage key in a cell is not a file), and anything dropped from the form — a `--default`ed column, for instance. They are in the file the export writes, so without that line an operator could edit one, re-upload, and watch nothing happen. |
 | An `#[encrypted]` column | **Refuses the whole surface.** The export omits an at-rest encrypted column (#1340 — the model holds plaintext), but the generated form requires it, so a file headed by `csv_columns()` could never satisfy it and every row would fail with "missing field". `--import` generates nothing there and warns, naming the column. |
@@ -1699,7 +1723,7 @@ methods were waiting for (issue #1332) — zero lines of user code:
 - Per row: a **Restore** submit posting to
   `POST /<plural>/{id}/restore`, and a **Purge** control posting to
   `POST /<plural>/{id}/purge` behind
-  [`confirm_action`](../../autumn/src/widgets.rs)'s server-rendered dialog
+  [`confirm_action`](../../autumn/src/widgets/feedback.rs)'s server-rendered dialog
   (titled per row, so the person confirming an irreversible delete can see
   which record it is). Both carry the CSRF hidden field.
 - A `Deleted At` column showing each row's `deleted_at` stamp, so the page
@@ -2058,17 +2082,11 @@ The live HTTP test requires Docker access for the Postgres testcontainer and
 the `diesel` CLI on `PATH`, because `autumn migrate` delegates to
 `diesel migration run`.
 
-### WebAuthn native dependency note
+### WebAuthn dependency note
 
 `autumn generate auth --passkeys` enables the `webauthn` feature and adds
-`webauthn-rs`. That dependency currently builds through OpenSSL. On Ubuntu CI
-the system OpenSSL toolchain is already available, but Windows developers need
-to install the OpenSSL libraries through `vcpkg` and set `VCPKG_ROOT` so
-`openssl-sys` can find them.
-
-The release SemVer gate checks `autumn-web` optional public feature APIs, so this
-native dependency must be present on machines that run `scripts/check-semver.sh`
-locally.
+`webauthn-rs`. Since 0.6, `webauthn-rs` uses pure-Rust crypto. It needs no
+OpenSSL and no native libraries on any platform.
 
 ## `autumn generate policy`
 
@@ -2210,6 +2228,19 @@ quietly do nothing. It also keeps one command from claiming another's files:
 `autumn new --starter` writes through the same machinery, and no generator
 owns what it wrote.
 
+`generate` records each edit it makes to a shared file (`Cargo.toml`,
+`src/main.rs`, `i18n/en.ftl`) under `[[runs.<id>]]`. `destroy` refuses when
+a recorded edit is in a file that still exists, and the new plan reverts that
+kind of edit at a different place. This happens when a project setting that
+the arguments do not show (for example `[i18n] dir`) changes after `generate`.
+Without the check, `destroy` deletes the owned files and leaves the edit in
+the shared file. The message names each edit. Undo the setting change and run
+`destroy` again. Or check the files by hand and pass `--force`. `--dry-run`
+lists the edits and changes nothing. A plan that reverts more than `generate`
+edited is fine. An edit in a file that no longer exists is also fine. A
+manifest from an older CLI has no record, so `destroy` keeps the old behaviour.
+`destroy` checks only edits that have a revert.
+
 Commit `.autumn/generated.toml`. It is the baseline a later checkout compares
 against. Without it, `destroy` can only compare against the current templates —
 so a CLI upgrade that changed a template makes every untouched file that
@@ -2232,6 +2263,32 @@ A file that several resources share (a mailer's `_layout.html`, say) is
 never a hard error and is never force-deleted. `destroy` removes it only
 when it is provably this generator's own output and no sibling resource is
 left in its directory; otherwise it warns and leaves it in place.
+
+A newer CLI can rename or drop a file that an older template made. The current
+plan does not name the old file, but the manifest does. `destroy` sweeps it:
+
+- It deletes the file when the digest still matches and the current templates
+  create a file in the same directory. It prints
+  `Removed <path> (no longer generated)`.
+- It keeps the file and names it in a warning when you edited the file, when
+  other resources can share it, when other Rust code still names it, when the
+  templates create nothing in its directory, or when the manifest entry is from
+  Autumn 0.8.0 (that entry does not say which resource owns the file).
+  `--force` does not change this.
+- It never sweeps a migration, a project file such as `Cargo.toml` or
+  `src/main.rs`, a path with a dot segment (`.env`, `.git/`), a file under
+  `target/`, or a path through a symlink.
+
+On a case-insensitive file system (macOS, Windows), a template can change
+only the case of a name (`Foo.rs` to `foo.rs`, or `src/widgets` to
+`src/Widgets`). The two spellings name one file. `destroy` uses the manifest
+entry of the old spelling. On a case-sensitive file system, the two spellings
+are two files.
+
+The manifest decides what the sweep can delete, so review changes to
+`.autumn/generated.toml` as you review code.
+
+`--dry-run` lists the files the sweep would delete.
 
 `destroy` also removes each entry it acted on from the manifest, and deletes
 the manifest once it holds nothing. Deleting or hand-editing the manifest

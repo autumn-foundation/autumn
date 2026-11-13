@@ -10,7 +10,7 @@ autumn-web = { path = "../autumn", features = ["system-tests", "test-support"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 thiserror = { workspace = true }
 futures = { workspace = true }
 

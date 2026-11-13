@@ -28,6 +28,10 @@
 //! data) start with every row selected and are never descended from;
 //! `never_include` tables (audit logs) are emptied.
 //!
+//! Each pass joins only the frontier: the keys that the previous pass and this
+//! pass added. The walk joined older keys before. Thus a pass reads the new
+//! rows, not every row found so far (#2599).
+//!
 //! # Fail-closed
 //!
 //! Anything the walk cannot prove is refused before a row is deleted: a table no
@@ -1509,6 +1513,30 @@ fn join_on(edge: &ForeignKeyConstraint, child: &str, parent: &str) -> String {
         .join(" AND ")
 }
 
+/// The frontier of `set`: the keys a pass walks from.
+///
+/// It holds the keys that the previous pass and this pass added. The walk
+/// joined each older key through every edge before, so a join against it
+/// finds nothing new (#2599).
+fn frontier_of(set: &str) -> String {
+    format!("{set}_front")
+}
+
+/// The keys the current pass added to `set`. They become the next frontier.
+fn next_of(set: &str) -> String {
+    format!("{set}_next")
+}
+
+/// Whether a pass ascends into `parent`. A full-copy parent holds every row.
+fn ascends_into(parent: &SampleTable) -> bool {
+    parent.role != SampleRole::AlwaysInclude
+}
+
+/// Whether a pass descends from `parent` into `child`.
+const fn descends_between(parent: &SampleTable, child: &SampleTable) -> bool {
+    parent.role.descends() && child.role.descends()
+}
+
 impl SamplePlan {
     /// The table entry for `name`.
     fn table(&self, name: &str) -> &SampleTable {
@@ -1530,7 +1558,89 @@ impl SamplePlan {
             .filter(|t| t.role != SampleRole::NeverInclude)
     }
 
-    /// `CREATE TEMP TABLE` for every keep- and descend-set.
+    /// The tables whose descend set can hold a row: the roots, and every
+    /// table a walked edge descends into from one of them.
+    ///
+    /// Any other descend set stays empty, so a statement that reads it can
+    /// select nothing. The walk does not emit that statement.
+    fn descend_reachable(&self) -> BTreeSet<&str> {
+        let mut reached: BTreeSet<&str> = self
+            .tables
+            .iter()
+            .filter(|t| t.role.descends_from_seed())
+            .map(|t| t.table.as_str())
+            .collect();
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for edge in &self.walk_edges {
+                let child = self.table(&edge.child_table);
+                let parent = self.table(&edge.parent_table);
+                if reached.contains(parent.table.as_str()) && descends_between(parent, child) {
+                    grew |= reached.insert(child.table.as_str());
+                }
+            }
+        }
+        reached
+    }
+
+    /// The sets the walk reads and the sets it writes.
+    fn walk_sets(&self) -> (BTreeSet<String>, BTreeSet<String>) {
+        let reachable = self.descend_reachable();
+        let (mut read, mut written) = (BTreeSet::new(), BTreeSet::new());
+        for edge in &self.walk_edges {
+            let child = self.table(&edge.child_table);
+            let parent = self.table(&edge.parent_table);
+            if ascends_into(parent) {
+                read.insert(child.keep.clone());
+                written.insert(parent.keep.clone());
+            }
+            if reachable.contains(parent.table.as_str()) && descends_between(parent, child) {
+                read.insert(parent.descend.clone());
+                written.insert(child.keep.clone());
+                written.insert(child.descend.clone());
+            }
+        }
+        (read, written)
+    }
+
+    /// The sets a walk statement reads, sorted. Only these get a frontier.
+    ///
+    /// Each set is a relation that holds a lock until the commit, so a
+    /// frontier that no statement reads only uses lock slots.
+    fn frontier_sets(&self) -> Vec<String> {
+        self.walk_sets().0.into_iter().collect()
+    }
+
+    /// The frontier sets a walk statement also writes, sorted. Only these get
+    /// a next set. A set that only the seed fills adds nothing after pass 1.
+    fn next_sets(&self) -> Vec<String> {
+        let (read, written) = self.walk_sets();
+        read.intersection(&written).cloned().collect()
+    }
+
+    /// `INSERT INTO set` from `select`, which yields only keys not in `set`.
+    ///
+    /// When `set` is in `next_sets`, the same statement also writes the new
+    /// keys to its frontier and its next set. One statement writes all three,
+    /// so the walk reads each new key.
+    fn insert_into(next_sets: &[String], tag: &str, set: &str, select: &str) -> String {
+        if next_sets.iter().any(|f| f == set) {
+            format!(
+                "{tag}WITH added AS (INSERT INTO {set_ident} (k) {select} RETURNING k), \
+                 frontier AS (INSERT INTO {frontier} (k) SELECT k FROM added) \
+                 INSERT INTO {next} (k) SELECT k FROM added",
+                set_ident = quote_ident(set),
+                frontier = quote_ident(&frontier_of(set)),
+                next = quote_ident(&next_of(set)),
+            )
+        } else {
+            format!("{tag}INSERT INTO {} (k) {select}", quote_ident(set))
+        }
+    }
+
+    /// `CREATE TEMP TABLE` for every keep- and descend-set, and for the
+    /// frontier and next set of each set a pass reads.
     ///
     /// `AS SELECT … WITH NO DATA` copies the key's own type rather than casting
     /// everything to text, so the join back to the source table can use its
@@ -1550,6 +1660,20 @@ impl SamplePlan {
                     )
                 })
             })
+            .chain(
+                self.frontier_sets()
+                    .into_iter()
+                    .map(|set| (frontier_of(&set), set))
+                    .chain(self.next_sets().into_iter().map(|set| (next_of(&set), set)))
+                    .map(|(name, set)| {
+                        format!(
+                            "CREATE TEMPORARY TABLE {} ON COMMIT DROP AS \
+                             SELECT k FROM {} WITH NO DATA",
+                            quote_ident(&name),
+                            quote_ident(&set),
+                        )
+                    }),
+            )
             .collect()
     }
 
@@ -1568,6 +1692,9 @@ impl SamplePlan {
                 out.push(format!("ANALYZE {}", quote_ident(set)));
             }
         }
+        for set in self.frontier_sets() {
+            out.push(format!("ANALYZE {}", quote_ident(&frontier_of(&set))));
+        }
         out
     }
 
@@ -1576,10 +1703,44 @@ impl SamplePlan {
     #[must_use]
     pub fn analyze_statements(&self) -> Vec<String> {
         self.keyed_tables()
-            .flat_map(|table| {
-                [&table.keep, &table.descend].map(|set| format!("ANALYZE {}", quote_ident(set)))
-            })
+            .flat_map(|table| [table.keep.clone(), table.descend.clone()])
+            .chain(self.frontier_sets().iter().map(|set| frontier_of(set)))
+            .map(|set| format!("ANALYZE {}", quote_ident(&set)))
             .collect()
+    }
+
+    /// Make the keys this pass added the next frontier. Run after each pass,
+    /// before [`Self::analyze_statements`].
+    ///
+    /// Without this step the result does not change, but each pass joins
+    /// every key found so far again.
+    ///
+    /// `TRUNCATE`, not `DELETE`: autovacuum never touches a temporary table,
+    /// so deleted rows stay in it and every later scan reads them again.
+    #[must_use]
+    pub fn rotate_statements(&self) -> Vec<String> {
+        let next_sets = self.next_sets();
+        let mut out = Vec::new();
+        for set in self.frontier_sets() {
+            let frontier = quote_ident(&frontier_of(&set));
+            out.push(format!("TRUNCATE {frontier}"));
+            if next_sets.contains(&set) {
+                let next = quote_ident(&next_of(&set));
+                out.push(format!("INSERT INTO {frontier} (k) SELECT k FROM {next}"));
+                out.push(format!("TRUNCATE {next}"));
+            }
+        }
+        out
+    }
+
+    /// What runs after each pass, in order: [`Self::rotate_statements`],
+    /// then [`Self::analyze_statements`]. `apply` and the printed loop both
+    /// use this list, so the two cannot drift apart.
+    #[must_use]
+    pub fn end_of_pass_statements(&self) -> Vec<String> {
+        let mut out = self.rotate_statements();
+        out.extend(self.analyze_statements());
+        out
     }
 
     /// Seed the roots (deterministically) and the always-include tables.
@@ -1619,13 +1780,29 @@ impl SamplePlan {
                 SampleRole::NeverInclude | SampleRole::Related => {}
             }
         }
+        // The first pass walks from every seeded key.
+        for set in self.frontier_sets() {
+            out.push(format!(
+                "INSERT INTO {} (k) SELECT k FROM {}",
+                quote_ident(&frontier_of(&set)),
+                quote_ident(&set),
+            ));
+        }
         out
     }
 
     /// One closure pass: ascend then descend over every walked edge. Run
-    /// repeatedly until a pass selects nothing new.
+    /// repeatedly until a pass selects nothing new, with
+    /// [`Self::end_of_pass_statements`] after each pass.
+    ///
+    /// Each join reads the frontier, not the full set, so a pass reads the new
+    /// rows, not every row found so far. The `NOT EXISTS` still reads the full
+    /// set. A statement inserts the same rows as a join against the full set,
+    /// so the pass count does not change.
     #[must_use]
     pub fn walk_statements(&self) -> Vec<String> {
+        let next_sets = self.next_sets();
+        let reachable = self.descend_reachable();
         let mut out = Vec::new();
         for edge in &self.walk_edges {
             let child = self.table(&edge.child_table);
@@ -1636,40 +1813,43 @@ impl SamplePlan {
             let tag = format!("/* {} */ ", comment_safe(&edge.name));
 
             // Ascend: keep the parent of every kept child, so the reference
-            // resolves. A full-copy parent already holds every row.
-            if parent.role != SampleRole::AlwaysInclude {
-                out.push(format!(
-                    "{tag}INSERT INTO {keep} (k) SELECT DISTINCT {parent_key} \
+            // resolves.
+            if ascends_into(parent) {
+                let select = format!(
+                    "SELECT DISTINCT {parent_key} \
                      FROM {parent_table} AS p \
                      JOIN {child_table} AS c ON {on} \
-                     JOIN {child_keep} AS ck ON ck.k = {child_key} \
+                     JOIN {child_frontier} AS ck ON ck.k = {child_key} \
                      WHERE NOT EXISTS (SELECT 1 FROM {keep} AS existing \
                      WHERE existing.k = {parent_key})",
                     keep = quote_ident(&parent.keep),
                     parent_table = qualified(&parent.table),
                     child_table = qualified(&child.table),
-                    child_keep = quote_ident(&child.keep),
-                ));
+                    child_frontier = quote_ident(&frontier_of(&child.keep)),
+                );
+                out.push(Self::insert_into(&next_sets, &tag, &parent.keep, &select));
             }
 
             // Descend: keep every child of a descend-eligible parent, and make
             // those children descend-eligible in turn. A full-copy child already
             // holds every row, and nothing ever descends out of it, so neither
-            // of its sets is worth filling.
-            if parent.role.descends() && child.role.descends() {
+            // of its sets is worth filling. A parent no root reaches has an
+            // empty descend set, so there is nothing to descend from.
+            if reachable.contains(parent.table.as_str()) && descends_between(parent, child) {
                 for set in [&child.keep, &child.descend] {
-                    out.push(format!(
-                        "{tag}INSERT INTO {set} (k) SELECT DISTINCT {child_key} \
+                    let select = format!(
+                        "SELECT DISTINCT {child_key} \
                          FROM {child_table} AS c \
                          JOIN {parent_table} AS p ON {on} \
-                         JOIN {parent_descend} AS pd ON pd.k = {parent_key} \
-                         WHERE NOT EXISTS (SELECT 1 FROM {set} AS existing \
+                         JOIN {parent_frontier} AS pd ON pd.k = {parent_key} \
+                         WHERE NOT EXISTS (SELECT 1 FROM {set_ident} AS existing \
                          WHERE existing.k = {child_key})",
-                        set = quote_ident(set),
+                        set_ident = quote_ident(set),
                         child_table = qualified(&child.table),
                         parent_table = qualified(&parent.table),
-                        parent_descend = quote_ident(&parent.descend),
-                    ));
+                        parent_frontier = quote_ident(&frontier_of(&parent.descend)),
+                    );
+                    out.push(Self::insert_into(&next_sets, &tag, set, &select));
                 }
             }
         }
@@ -1688,8 +1868,8 @@ impl SamplePlan {
     /// key and every integrity assertion still passes.
     ///
     /// So the dry run emits this instead of the bare statements: the same
-    /// walk, the same per-pass `ANALYZE`, and the same `MAX_PASSES` ceiling,
-    /// wrapped in the loop that makes them a fixpoint.
+    /// walk, the same [`Self::end_of_pass_statements`], and the same
+    /// `MAX_PASSES` ceiling, wrapped in the loop that makes them a fixpoint.
     #[must_use]
     pub fn walk_loop_statement(&self) -> String {
         let mut body = vec![
@@ -1702,12 +1882,17 @@ impl SamplePlan {
             "    total := 0;".to_owned(),
         ];
         for statement in self.walk_statements() {
-            body.push(format!("    {statement};"));
+            // `EXECUTE` plans the statement again on each pass. PL/pgSQL keeps
+            // one plan per static statement and replans only when a table it
+            // reads changes. A frontier keeps about the same size, so its
+            // `ANALYZE` does not cause a replan, and a plan made for the
+            // first pass stays for all of them.
+            body.push(format!("    EXECUTE {};", quote_literal(&statement)));
             // Immediately, before the next statement overwrites it.
             body.push("    GET DIAGNOSTICS moved = ROW_COUNT;".to_owned());
             body.push("    total := total + moved;".to_owned());
         }
-        for statement in self.analyze_statements() {
+        for statement in self.end_of_pass_statements() {
             body.push(format!("    {statement};"));
         }
         body.push("    passes := passes + 1;".to_owned());
@@ -2061,14 +2246,14 @@ pub fn apply(
     }
 
     let walk = plan.walk_statements();
-    let analyze = plan.analyze_statements();
+    let end_of_pass = plan.end_of_pass_statements();
     let mut passes = 0;
     loop {
         let mut selected = 0;
         for statement in &walk {
             selected += sql_query(statement).execute(conn)?;
         }
-        for statement in &analyze {
+        for statement in &end_of_pass {
             sql_query(statement).execute(conn)?;
         }
         passes += 1;
@@ -3415,8 +3600,8 @@ mod tests {
         );
         for statement in &walk {
             assert!(
-                loop_sql.contains(statement),
-                "the loop must carry {statement}:\n{loop_sql}"
+                loop_sql.contains(&format!("    EXECUTE {};", quote_literal(statement))),
+                "the loop must run {statement} through EXECUTE:\n{loop_sql}"
             );
         }
         for statement in &analyze {
@@ -3491,7 +3676,7 @@ mod tests {
             walk.iter().any(|s| s.starts_with(&format!(
                 "/* comments_user_fk */ INSERT INTO {}",
                 quote_ident(&users_keep)
-            )) && s.contains(&quote_ident(&comments_keep))),
+            )) && s.contains(&quote_ident(&frontier_of(&comments_keep)))),
             "the ascend must fill users' keep set from comments': {walk:?}"
         );
         // Descend fills the CHILD's keep AND descend sets, from the parent's
@@ -3499,10 +3684,12 @@ mod tests {
         // pull its whole subtree in.
         for target in [&comments_keep, &comments_descend] {
             assert!(
-                walk.iter().any(|s| s.starts_with(&format!(
-                    "/* comments_user_fk */ INSERT INTO {}",
-                    quote_ident(target)
-                )) && s.contains(&quote_ident(&users_descend))),
+                walk.iter().any(|s| s.starts_with("/* comments_user_fk */ ")
+                    && s.contains(&format!(
+                        "INSERT INTO {} (k) SELECT DISTINCT",
+                        quote_ident(target)
+                    ))
+                    && s.contains(&quote_ident(&frontier_of(&users_descend)))),
                 "the descend must fill {target} from users' descend set: {walk:?}"
             );
         }
@@ -4138,9 +4325,431 @@ mod tests {
             .count();
         assert_eq!(
             sql.matches("CREATE TEMPORARY TABLE").count(),
-            keyed * 2,
+            keyed * 2 + plan.frontier_sets().len() + plan.next_sets().len(),
             "{sql}"
         );
         assert!(sql.contains("ON COMMIT DROP"), "{sql}");
+    }
+
+    // ── Frontier walk (#2599) ───────────────────────────────────────────────
+
+    /// The fixture plus `users.manager_id -> users`, so `users` both ascends
+    /// and descends into itself.
+    fn self_referential_plan() -> SamplePlan {
+        let (tables, mut keys) = schema();
+        keys.push(fk("users_manager_fk", "users", "manager_id", "users", "id"));
+        plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap()
+    }
+
+    fn sets_of(plan: &SamplePlan, table: &str) -> (String, String) {
+        let t = plan.tables.iter().find(|t| t.table == table).unwrap();
+        (t.keep.clone(), t.descend.clone())
+    }
+
+    #[test]
+    fn the_walk_joins_the_frontier_not_the_full_set() {
+        // A join against the full set reads every row the walk ever reached,
+        // on every pass. A join against the frontier reads each row once.
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (comments_keep, _) = sets_of(&plan, "comments");
+        let (_, users_descend) = sets_of(&plan, "users");
+        let sql = joined(&plan.walk_statements());
+        assert!(
+            sql.contains(&format!(
+                "JOIN {} AS ck",
+                quote_ident(&frontier_of(&comments_keep))
+            )),
+            "the ascend must read the child's keep frontier: {sql}"
+        );
+        assert!(
+            sql.contains(&format!(
+                "JOIN {} AS pd",
+                quote_ident(&frontier_of(&users_descend))
+            )),
+            "the descend must read the parent's descend frontier: {sql}"
+        );
+        for full in [&comments_keep, &users_descend] {
+            assert!(
+                !sql.contains(&format!("JOIN {} AS", quote_ident(full))),
+                "no pass may join the full set {full}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_sets_a_pass_reads_get_a_frontier() {
+        // Each set is a relation, and every relation holds a lock until the
+        // commit. A frontier that no statement reads only uses lock slots.
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (comments_keep, _) = sets_of(&plan, "comments");
+        let (_, users_descend) = sets_of(&plan, "users");
+        let mut expected = vec![comments_keep.clone(), users_descend.clone()];
+        expected.sort();
+        assert_eq!(plan.frontier_sets(), expected);
+        // Only the seed fills users' descend set, so it needs no next set.
+        assert_eq!(plan.next_sets(), vec![comments_keep.clone()]);
+
+        let setup = joined(&plan.setup_statements());
+        let keyed = plan
+            .tables
+            .iter()
+            .filter(|t| t.role != SampleRole::NeverInclude)
+            .count();
+        assert_eq!(
+            setup.matches("CREATE TEMPORARY TABLE").count(),
+            keyed * 2 + 3,
+            "a keep and descend set per table, two frontiers, one next set: {setup}"
+        );
+        let created = |name: &str| {
+            setup.contains(&format!(
+                "CREATE TEMPORARY TABLE {} ON COMMIT DROP",
+                quote_ident(name)
+            ))
+        };
+        assert!(created(&frontier_of(&comments_keep)), "{setup}");
+        assert!(created(&next_of(&comments_keep)), "{setup}");
+        assert!(created(&frontier_of(&users_descend)), "{setup}");
+        assert!(!created(&next_of(&users_descend)), "{setup}");
+    }
+
+    #[test]
+    fn every_insert_into_a_read_set_also_fills_its_frontier_and_next() {
+        // A key that reaches the set but not the frontier is never walked
+        // from. Its rows are then deleted, and no foreign key check sees it.
+        let plan = self_referential_plan();
+        let walk = plan.walk_statements();
+        let frontiers = plan.frontier_sets();
+        assert_eq!(frontiers.len(), 3, "users' two sets and comments' keep set");
+        for set in &frontiers {
+            let into = format!("INSERT INTO {} (k)", quote_ident(set));
+            let writers: Vec<&String> = walk.iter().filter(|s| s.contains(&into)).collect();
+            assert!(!writers.is_empty(), "the fixture must write {set}");
+            for statement in writers {
+                for name in [frontier_of(set), next_of(set)] {
+                    assert!(
+                        statement.contains(&format!(
+                            "INSERT INTO {} (k) SELECT k FROM added",
+                            quote_ident(&name)
+                        )),
+                        "an insert into {set} must also fill {name}: {statement}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_insert_into_an_unread_set_writes_only_that_set() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (users_keep, _) = sets_of(&plan, "users");
+        let walk = plan.walk_statements();
+        let ascend = walk
+            .iter()
+            .find(|s| s.contains(&format!("INSERT INTO {} (k)", quote_ident(&users_keep))))
+            .expect("the fixture ascends into users");
+        assert!(
+            !ascend.contains("WITH added AS"),
+            "users' keep set has no frontier, so nothing else is written: {ascend}"
+        );
+    }
+
+    #[test]
+    fn the_frontier_starts_as_the_seeded_set() {
+        // The first pass walks from the roots and the full-copy tables, so
+        // their seeded keys must be the first frontier.
+        let plan = self_referential_plan();
+        let seed = plan.seed_statements(&BTreeMap::new());
+        let frontier_names: Vec<String> = plan
+            .frontier_sets()
+            .iter()
+            .map(|set| quote_ident(&frontier_of(set)))
+            .collect();
+        let last_root_seed = seed
+            .iter()
+            .rposition(|s| !frontier_names.iter().any(|f| s.contains(f.as_str())))
+            .expect("roots are seeded");
+        for set in plan.frontier_sets() {
+            let copy = format!(
+                "INSERT INTO {} (k) SELECT k FROM {}",
+                quote_ident(&frontier_of(&set)),
+                quote_ident(&set)
+            );
+            let at = seed
+                .iter()
+                .position(|s| *s == copy)
+                .unwrap_or_else(|| panic!("{copy} is missing: {seed:?}"));
+            assert!(at > last_root_seed, "copy only after the seeds: {seed:?}");
+        }
+        let index = joined(&plan.index_statements());
+        for set in plan.frontier_sets() {
+            assert!(
+                index.contains(&format!("ANALYZE {}", quote_ident(&frontier_of(&set)))),
+                "the first pass must plan against the seeded frontier: {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_pass_moves_what_it_added_into_the_frontier() {
+        let plan = self_referential_plan();
+        let rotate = plan.rotate_statements();
+        assert_eq!(
+            plan.next_sets(),
+            plan.frontier_sets(),
+            "every frontier of the fixture also grows during the walk"
+        );
+        let mut expected = Vec::new();
+        for set in plan.frontier_sets() {
+            let frontier = quote_ident(&frontier_of(&set));
+            let next = quote_ident(&next_of(&set));
+            expected.push(format!("TRUNCATE {frontier}"));
+            expected.push(format!("INSERT INTO {frontier} (k) SELECT k FROM {next}"));
+            expected.push(format!("TRUNCATE {next}"));
+        }
+        assert!(!expected.is_empty(), "the fixture must have a frontier");
+        assert_eq!(rotate, expected);
+
+        let analyze = plan.analyze_statements();
+        for set in plan.frontier_sets() {
+            assert!(
+                analyze.contains(&format!("ANALYZE {}", quote_ident(&frontier_of(&set)))),
+                "each pass must plan against the new frontier: {analyze:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_printed_loop_moves_the_frontier_between_the_walk_and_the_analyze() {
+        let plan = self_referential_plan();
+        let loop_sql = plan.walk_loop_statement();
+        let walk = plan.walk_statements();
+        let rotate = plan.rotate_statements();
+        let last_walk = walk
+            .iter()
+            .map(|s| loop_sql.find(s.as_str()).expect("walk is in the loop"))
+            .max()
+            .unwrap();
+        let first_analyze = plan
+            .analyze_statements()
+            .iter()
+            .map(|s| {
+                loop_sql
+                    .rfind(&format!("    {s};"))
+                    .expect("analyze is in the loop")
+            })
+            .min()
+            .unwrap();
+        assert!(!rotate.is_empty());
+        for statement in &rotate {
+            let at = loop_sql
+                .find(&format!("    {statement};"))
+                .unwrap_or_else(|| panic!("the loop must carry {statement}:\n{loop_sql}"));
+            assert!(
+                at > last_walk && at < first_analyze,
+                "{statement} must run after the walk and before the analyze:\n{loop_sql}"
+            );
+        }
+        // Only the walk selects rows; the move is not new work.
+        assert_eq!(
+            loop_sql
+                .matches("GET DIAGNOSTICS moved = ROW_COUNT;")
+                .count(),
+            walk.len(),
+            "{loop_sql}"
+        );
+    }
+
+    #[test]
+    fn apply_and_the_printed_loop_share_one_end_of_pass_list() {
+        // Without the rotate the result does not change, but each pass joins
+        // every key found so far again. No result check can see that.
+        let plan = self_referential_plan();
+        let mut expected = plan.rotate_statements();
+        expected.extend(plan.analyze_statements());
+        assert_eq!(plan.end_of_pass_statements(), expected);
+        let loop_sql = plan.walk_loop_statement();
+        let body: String = expected
+            .iter()
+            .fold(String::new(), |body, s| body + "    " + s + ";\n");
+        assert!(
+            loop_sql.contains(&body),
+            "the loop must run the end-of-pass list in order:\n{loop_sql}"
+        );
+    }
+
+    #[test]
+    fn a_full_copy_child_seeds_its_whole_keep_set_into_the_frontier() {
+        // `user_flags` is copied whole and references `users`, so the first
+        // pass ascends from every flag. Its keep set holds every row after
+        // the seed, so the frontier must start with every row too.
+        let (mut tables, mut keys) = schema();
+        tables.push(table("user_flags", &["id"]));
+        keys.push(fk(
+            "user_flags_user_fk",
+            "user_flags",
+            "user_id",
+            "users",
+            "id",
+        ));
+        let rules = SampleRules {
+            always_include: vec!["countries".to_owned(), "user_flags".to_owned()],
+            never_include: vec!["audit_logs".to_owned()],
+        };
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &rules,
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (flags_keep, flags_descend) = sets_of(&plan, "user_flags");
+        assert!(plan.frontier_sets().contains(&flags_keep));
+        assert!(
+            !plan.frontier_sets().contains(&flags_descend),
+            "nothing descends out of a full-copy table"
+        );
+        let seed = plan.seed_statements(&BTreeMap::new());
+        let fill = seed
+            .iter()
+            .position(|s| {
+                s.starts_with(&format!(
+                    "INSERT INTO {} (k) SELECT",
+                    quote_ident(&flags_keep)
+                ))
+            })
+            .expect("the full copy is seeded");
+        let copy = seed
+            .iter()
+            .position(|s| {
+                *s == format!(
+                    "INSERT INTO {} (k) SELECT k FROM {}",
+                    quote_ident(&frontier_of(&flags_keep)),
+                    quote_ident(&flags_keep)
+                )
+            })
+            .expect("the frontier copies the full keep set");
+        assert!(copy > fill, "{seed:?}");
+        assert!(
+            joined(&plan.walk_statements()).contains(&format!(
+                "JOIN {} AS ck",
+                quote_ident(&frontier_of(&flags_keep))
+            )),
+            "the ascend out of the full copy reads its frontier"
+        );
+    }
+
+    #[test]
+    fn a_frontier_only_the_seed_fills_is_emptied_after_the_first_pass() {
+        // users' descend set gets its rows from the seed alone. After pass 1
+        // its frontier must be empty, or each pass descends from it again.
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (_, users_descend) = sets_of(&plan, "users");
+        let frontier = quote_ident(&frontier_of(&users_descend));
+        let rotate = plan.rotate_statements();
+        assert!(
+            rotate.contains(&format!("TRUNCATE {frontier}")),
+            "{rotate:?}"
+        );
+        assert!(
+            !rotate
+                .iter()
+                .any(|s| s.starts_with(&format!("INSERT INTO {frontier}"))),
+            "nothing refills it: {rotate:?}"
+        );
+    }
+
+    #[test]
+    fn the_walk_does_not_descend_from_a_parent_no_root_reaches() {
+        // `orgs` is only ascended into, so its descend set stays empty. A
+        // descend from it selects nothing, and its sets only use lock slots.
+        let (mut tables, mut keys) = schema();
+        tables.push(table("orgs", &["id"]));
+        keys.push(fk("users_org_fk", "users", "org_id", "orgs", "id"));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (orgs_keep, orgs_descend) = sets_of(&plan, "orgs");
+        let walk = plan.walk_statements();
+        assert!(
+            walk.iter()
+                .any(|s| s.contains(&format!("INSERT INTO {} (k)", quote_ident(&orgs_keep)))),
+            "users still ascend into orgs: {walk:?}"
+        );
+        assert!(
+            !walk
+                .iter()
+                .any(|s| s.contains(&quote_ident(&frontier_of(&orgs_descend)))),
+            "no statement descends from orgs: {walk:?}"
+        );
+        assert!(!plan.frontier_sets().contains(&orgs_descend));
+    }
+
+    #[test]
+    fn a_descend_set_reached_through_a_related_table_still_walks() {
+        // users -> comments -> replies: comments' descend set is filled by
+        // the walk, not the seed, and replies are reached through it.
+        let (mut tables, mut keys) = schema();
+        tables.push(table("replies", &["id"]));
+        keys.push(fk(
+            "replies_comment_fk",
+            "replies",
+            "comment_id",
+            "comments",
+            "id",
+        ));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (_, comments_descend) = sets_of(&plan, "comments");
+        assert!(plan.next_sets().contains(&comments_descend));
+        assert!(
+            joined(&plan.walk_statements()).contains(&format!(
+                "JOIN {} AS pd",
+                quote_ident(&frontier_of(&comments_descend))
+            )),
+            "replies descend from comments' frontier"
+        );
     }
 }

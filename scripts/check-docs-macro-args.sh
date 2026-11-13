@@ -4,13 +4,13 @@
 #
 # WHY THIS EXISTS: the corpus already gates six of the seven things a reader
 # copies off a page.
-# `scripts/check-docs-links.sh` gates its *links* (a 404 on GitHub),
+# `xtask/src/docs/links.rs` gates its *links* (a 404 on GitHub),
 # `scripts/check-docs-cli.sh` its *commands* (`unrecognized subcommand`),
 # `scripts/check-docs-config.sh` the `AUTUMN_*` variables they SET (a silent
 # no-op), `scripts/check-docs-toml.sh` the `autumn.toml` keys they WRITE
 # (dropped silently), `scripts/check-docs-symbols.sh` the `autumn_web::…` paths
 # they IMPORT (E0432 against their own file), and
-# `scripts/check-docs-routes.sh` the `/actuator/…` URLs they REQUEST (a 404
+# `xtask/src/docs/routes.rs` the `/actuator/…` URLs they REQUEST (a 404
 # that reads like a feature they failed to enable). `check-docs-orphans.sh`
 # asserts the page can be reached at all.
 #
@@ -258,8 +258,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # Kept in Python for the same reason as its sibling gates: fence tracking
 # across two comment syntaxes and per-macro key extraction are both work that
 # bash renders unreadable, and python3 is already a dependency of
-# scripts/check-docs-cli.sh, scripts/check-docs-config.sh,
-# scripts/check-docs-toml.sh and scripts/check-docs-routes.sh.
+# scripts/check-docs-cli.sh, scripts/check-docs-config.sh and
+# scripts/check-docs-toml.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
 import collections
@@ -273,12 +273,18 @@ ROOT = pathlib.Path(sys.argv[2])
 # ── Truth set ────────────────────────────────────────────────────────────────
 
 # The macro crate split (#2809) moved `model.rs`, `repository.rs` and
-# `service.rs` into sibling proc-macro crates. File names stay unique across
-# the roots, so `OWNERS` below still names a bare file.
+# `service.rs` into sibling proc-macro crates. `OWNERS` below still names a
+# bare file, and `macro_src` resolves it to the first root that holds it.
+#
+# Order matters: the support library has its own `parse.rs`, `graph.rs` and
+# `wire/` files, so its root stays last. Listed earlier, it would hand the
+# route verbs its `parse.rs` in place of the route argument parser.
 MACRO_SRCS = (
     ROOT / "autumn-macros" / "src",
     ROOT / "autumn-macros-model" / "src",
     ROOT / "autumn-macros-repository" / "src",
+    # `query_budget.rs` and `agent_authority.rs` live in the support library.
+    ROOT / "autumn-macros-support" / "src",
 )
 
 
@@ -318,6 +324,8 @@ OWNERS = {
     "edge": "edge.rs",
     "endpoint": "wire/endpoint.rs",
     "event": "event.rs",
+    # One positional argument, the event type. No keys.
+    "event_consumer": "wire/consumer.rs",
     "feature_flag": "feature_flag.rs",
     "get": ("route.rs", "parse.rs"),
     "inbound_mail": "inbound_mail.rs",

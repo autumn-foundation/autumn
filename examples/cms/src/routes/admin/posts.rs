@@ -15,9 +15,7 @@ use crate::content;
 use crate::content_types::{self, PostType};
 use crate::models::{Attachment, NewPost, Post, Term, User};
 use crate::plugins::{Action, do_action};
-use crate::repositories::{
-    AttachmentRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
-};
+use crate::repositories::{AttachmentRepository as _, PostRepository as _, TermRepository as _};
 use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
@@ -2175,14 +2173,13 @@ pub async fn revisions(
     // post's owner, so on a collaborative site it was quietly wrong — and
     // nothing rendered it, which is why nobody could notice. It records the
     // acting editor now, and the history says so.
-    let mut names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-    for author_id in history.iter().filter_map(|revision| revision.author_id) {
-        if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(author_id)
-            && let Some(account) = repos.users.find_by_id(author_id).await?
-        {
-            slot.insert(account.public_name().to_owned());
-        }
-    }
+    let author_ids: Vec<i64> = history
+        .iter()
+        .filter_map(|revision| revision.author_id)
+        .collect();
+    let names = repos
+        .with_conn(async |conn| content::public_names(conn, &author_ids).await)
+        .await?;
 
     let body = html! {
         p class="text-sm text-gray-500 mb-4" {

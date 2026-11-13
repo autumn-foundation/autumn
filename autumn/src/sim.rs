@@ -181,7 +181,7 @@ pub use dblink::{DbFaultEvent, DbFaultKind, DbLink};
 // The sim runtime and its blocking-work gate (issue #3067).
 pub(crate) mod gate;
 
-pub use gate::runtime;
+pub use gate::{SimRuntime, runtime};
 
 // Same-seed trace capture and diff (issue #3067).
 pub mod trace;

@@ -14,6 +14,10 @@
 //!                                checkpoint run, with nothing unshipped
 //! missing ─► restore_missing = true: rebuild the file from its replica
 //!            before the open, so a fresh volume serves the database
+//! delete  ─► purge the replica, or keep it for the retention; a tombstone
+//!            blocks restore_missing until then (see `fleet_tombstones`)
+//! check   ─► every verify interval: restore a random sample into scratch
+//!            files, check integrity and the identity row
 //! ```
 //!
 //! The databases run with `wal_autocheckpoint = 0`; the replicator is the only
@@ -35,7 +39,7 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -43,14 +47,21 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::actuator::{HealthCheckOutput, HealthIndicator};
+use crate::entropy::Entropy;
 use crate::fleet_layout::FleetDbKey;
 use crate::replication::destination::ReplicaDestination;
 use crate::replication::engine::{ReplicationSettings, Replicator};
+use crate::replication::fence::{FencedDestination, ShipFence};
 use crate::replication::restore::{RestoreError, RestoreOutcome};
+use crate::replication::segment;
 use crate::replication::status::ReplicationStatus;
 use crate::time::ClockSource;
 
+use super::fleet::generations::GenerationSlot;
 use super::fleet::{FleetDatabase, FleetLifecycle};
+use super::fleet_tombstones::{
+    FleetTombstones, MARKER_OBJECT, Marker, PurgeReport, Tombstone, purge_deletes, restore_allowed,
+};
 
 /// Health indicator name of the fleet's replication.
 pub const FLEET_REPLICATION_INDICATOR: &str = "replication:fleet";
@@ -75,6 +86,61 @@ const CLAIM_POLL: Duration = Duration::from_millis(25);
 
 /// Pause between flush passes at shutdown.
 const FLUSH_RETRY: Duration = Duration::from_millis(100);
+
+/// The default number of threads that ship the databases of one pass.
+pub const DEFAULT_SHIP_WORKERS: usize = 4;
+
+/// The pause after a pass that took `took`, so that a pass starts once per
+/// `interval`. Zero when the pass took longer than `interval`.
+const fn pause_after(interval: Duration, took: Duration) -> Duration {
+    interval.saturating_sub(took)
+}
+
+/// The keys, the oldest time first. A pass ships in this order, so the
+/// database with the most lag ships first.
+fn oldest_first(mut entries: Vec<(FleetDbKey, DateTime<Utc>)>) -> Vec<FleetDbKey> {
+    entries.sort_by_key(|entry| entry.1);
+    entries.into_iter().map(|(key, _)| key).collect()
+}
+
+/// Run `work` once for each key, on at most `workers` threads. The calling
+/// thread is one of them. Blocking: it returns when all keys are done.
+fn for_each_on(workers: usize, keys: &[FleetDbKey], work: impl Fn(&FleetDbKey) + Sync) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let drain = || {
+        while let Some(key) = keys.get(next.fetch_add(1, Ordering::Relaxed)) {
+            work(key);
+        }
+    };
+    let helpers = workers.min(keys.len()).saturating_sub(1);
+    std::thread::scope(|scope| {
+        for _ in 0..helpers {
+            // If a thread does not start, the other threads do its keys.
+            let _ = std::thread::Builder::new()
+                .name("autumn-fleet-ship".to_owned())
+                .spawn_scoped(scope, drain);
+        }
+        drain();
+    });
+}
+
+/// Real time since `started`, in milliseconds.
+fn millis_since(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// No pass has run yet.
+const NO_PASS: u64 = u64::MAX;
+
+/// The sidecar scope `<root>/<name>` of `object`, when `object` is under the
+/// scope of a sidecar engine.
+fn sidecar_scope(root: &str, object: &str) -> Option<String> {
+    let (name, _) = object
+        .strip_prefix(root)?
+        .strip_prefix('/')?
+        .split_once('/')?;
+    (!super::fleet::RESERVED_SIDECAR_NAMES.contains(&name)).then(|| format!("{root}/{name}"))
+}
 
 /// The destination key prefix of one fleet database, under the control
 /// database's replication root.
@@ -103,6 +169,9 @@ struct ActiveReplica {
     /// Set when a newer ownership epoch writes to the replica (issue #3233).
     /// Such a replica ships nothing more, not even at close.
     fenced: AtomicBool,
+    /// Set when a delete or a restore lets the parked replica go. A tick
+    /// that still holds it ships nothing more.
+    released: AtomicBool,
     /// The replicator's epoch, 0 for none. Written under the replicator
     /// lock; read without it, so a reopen under the same epoch does not wait
     /// for a tick in destination I/O.
@@ -190,6 +259,64 @@ impl ReplicaLock {
     }
 }
 
+/// What a retry of an [`UnshippedGeneration`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GenerationRetry {
+    /// The generation shipped, or the destination has the same files.
+    Shipped,
+    /// A fence or a retire refused it. Nothing ships for it.
+    Retired,
+    /// The key is open or draining. The retry waits.
+    Busy,
+    /// The ship failed. The next pass tries again.
+    Failed(String),
+}
+
+/// Ships an [`UnshippedGeneration`] once. Blocking: call it only on a
+/// blocking thread, never in an async task.
+pub(crate) type RetryShip = Box<dyn Fn() -> GenerationRetry + Send + Sync>;
+
+/// A closed database in `generations` mode whose last generation did not
+/// ship. Its files stay at `path`.
+pub(crate) struct UnshippedGeneration {
+    path: PathBuf,
+    epoch: Option<u64>,
+    /// Set by a delete, a restore or a fence. The ship then refuses each put.
+    retired: Arc<AtomicBool>,
+    /// The slot whose upload lock a ship of `retry` holds. A purge waits
+    /// for it.
+    upload: Option<Arc<GenerationSlot>>,
+    /// Held for one retry. A second pass skips a busy record.
+    busy: Mutex<()>,
+    /// The order in which records were kept. See
+    /// [`FleetReplication::generation_mark`].
+    seq: u64,
+    retry: RetryShip,
+}
+
+impl UnshippedGeneration {
+    /// The record of the database at `path`, closed under `epoch`. The
+    /// ship of `retry` must stop when `retired` is set, and hold the upload
+    /// lock of `upload` for its puts.
+    pub(crate) fn new(
+        path: PathBuf,
+        epoch: Option<u64>,
+        retired: Arc<AtomicBool>,
+        upload: Option<Arc<GenerationSlot>>,
+        retry: RetryShip,
+    ) -> Self {
+        Self {
+            path,
+            epoch,
+            retired,
+            upload,
+            busy: Mutex::new(()),
+            seq: 0,
+            retry,
+        }
+    }
+}
+
 /// Replicates the open databases of one fleet. Installed by
 /// [`DatabaseFleet::install_replication`](super::fleet::DatabaseFleet::install_replication).
 pub struct FleetReplication {
@@ -214,12 +341,189 @@ pub struct FleetReplication {
     unshipped: Mutex<Vec<String>>,
     /// When shutdown must be done. Close-time shipping stops at it.
     shutdown_cutoff: Mutex<Option<std::time::Instant>>,
-    /// Told when a replicator sees a newer epoch (issue #3233).
-    fence_hook: Mutex<Option<FenceHook>>,
+    /// Told when a replicator sees a newer epoch. Shared with the fence of
+    /// each replica.
+    fence_hook: Arc<Mutex<Option<FenceHook>>>,
+    /// The newest epoch this host saw for a database. Shared with the fence
+    /// of each replica.
+    known_hook: Arc<Mutex<Option<KnownHook>>>,
+    /// The ship mode of the fleet, and its RPO. Set at install.
+    ship: std::sync::OnceLock<ShipInfo>,
+    /// The ship slot of each open database in `generations` mode.
+    generation_slots: Mutex<HashMap<FleetDbKey, Arc<GenerationSlot>>>,
+    /// Closed databases in `generations` mode whose last generation did not
+    /// ship. The loop and the shutdown flush ship them again.
+    unshipped_generations: Mutex<HashMap<FleetDbKey, Arc<UnshippedGeneration>>>,
+    /// Kept generations that a delete or a restore released. They do not
+    /// ship. A delete or a restore that fails puts them back.
+    released_generations: Mutex<HashMap<FleetDbKey, Arc<UnshippedGeneration>>>,
+    /// The `seq` of the next kept generation.
+    next_kept_seq: AtomicU64,
+    /// The tombstone rows of deleted databases (issue #3235). `None`: a
+    /// failed purge is not retried.
+    tombstones: Option<Arc<FleetTombstones>>,
+    /// How long a deleted database's replica stays before its purge.
+    retention_after_delete: Duration,
+    /// How often the restore check runs, and how many databases it takes.
+    restore_check: Option<(Duration, usize)>,
+    /// Picks the restore-check sample and names its scratch files.
+    entropy: Arc<dyn Entropy>,
+    /// One purge at a time in this process: a re-create waits for the retry
+    /// task, and the other way round.
+    purge_turn: tokio::sync::Mutex<()>,
+    /// Parked replicas a delete or a restore let go. A purge waits for a
+    /// tick that still holds one.
+    released: Mutex<HashMap<FleetDbKey, std::sync::Weak<ActiveReplica>>>,
+    /// The last purge pass, for health.
+    last_purge: Mutex<Option<PurgeReport>>,
+    /// The last restore check, for health.
+    last_restore_check: Mutex<Option<RestoreCheckReport>>,
+    /// The threads that ship the databases of one pass.
+    ship_workers: usize,
+    /// The time of the last loop pass in milliseconds, [`NO_PASS`] before
+    /// it. A shutdown flush does not change it.
+    last_pass_ms: AtomicU64,
+    /// Woken after each pass, ship, close and release, for
+    /// `wait_replicated`.
+    progress: tokio::sync::Notify,
+    /// The longest `wait_replicated` sleeps with no wake-up.
+    wait_poll: Duration,
+    /// The last bound of each closed database, and when it closed. Cleared
+    /// at the next open, a delete, a restore, or after [`CLOSED_BOUND_TTL`].
+    closed: Mutex<HashMap<FleetDbKey, (ClosedBound, DateTime<Utc>)>>,
+    /// The epoch at which this host serves a key now. `None`: its lease
+    /// lapsed. The fleet installs it with its ownership.
+    serving_hook: Mutex<Option<ServingHook>>,
+}
+
+/// The bound of one database, for [`FleetReplication::replicated_through`].
+enum Bound {
+    /// Every commit at or before it is in the replica.
+    At(DateTime<Utc>),
+    /// Replicated here, but no bound is proved now.
+    Unknown,
+    /// A newer owner fenced the replica.
+    Fenced,
+    /// Not open in this process.
+    NotReplicating,
+}
+
+/// The last bound of a closed database.
+#[derive(Clone)]
+pub(crate) enum ClosedBound {
+    /// Its replicator still ships the backlog: read its status.
+    Live {
+        status: Arc<ReplicationStatus>,
+        epoch: u64,
+    },
+    /// Its replica caught up, or its last generation shipped.
+    At {
+        at: Option<DateTime<Utc>>,
+        epoch: u64,
+    },
+    /// Its last generation ships from this slot, also in a retry after the
+    /// close: read the slot.
+    Slot(Arc<GenerationSlot>),
+    /// A newer owner fenced it.
+    Fenced,
+}
+
+/// Wakes each `wait_replicated` when dropped, on every return path.
+struct Wake<'a>(&'a tokio::sync::Notify);
+
+impl Drop for Wake<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
+}
+
+/// How long a closed database keeps its last bound. A waiter needs it
+/// only around the close.
+const CLOSED_BOUND_TTL: Duration = Duration::from_hours(1);
+
+/// Longest `wait_replicated` sleeps between two checks with no wake-up.
+const WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// A deadline past any real wait, for a timeout too large to add.
+fn far_future() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_hours(24 * 365 * 30)
+}
+
+/// Why [`FleetReplication::wait_replicated`] gave up.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReplicatedWaitError {
+    /// This process does not ship the database: it is not open here, or the
+    /// fleet does not replicate.
+    #[error("fleet database {name} has no replicator in this process")]
+    NotReplicating {
+        /// The database name.
+        name: String,
+    },
+    /// A newer owner fenced the replica. This process ships nothing more.
+    #[error("fleet database {name}: a newer owner fenced the replica")]
+    Fenced {
+        /// The database name.
+        name: String,
+    },
+    /// The replica did not reach the instant in time.
+    #[error(
+        "fleet database {name}: the replica did not reach {committed_at} in {timeout:?} \
+         (replicated through {through:?})"
+    )]
+    TimedOut {
+        /// The database name.
+        name: String,
+        /// The instant the caller waited for.
+        committed_at: DateTime<Utc>,
+        /// How long the caller waited.
+        timeout: Duration,
+        /// The bound when the wait ended.
+        through: Option<DateTime<Utc>>,
+    },
+}
+
+/// The result of one restore check (issue #3235). See
+/// [`DatabaseFleet::check_replica_sample`](super::fleet::DatabaseFleet::check_replica_sample).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreCheckReport {
+    /// When the check ran (app clock).
+    pub checked_at: Option<DateTime<Utc>>,
+    /// Databases whose replica restored, passed `PRAGMA integrity_check`
+    /// and carries the right identity row.
+    pub passed: Vec<String>,
+    /// Databases with no replica yet (never opened while replicated).
+    pub unreplicated: Vec<String>,
+    /// Databases whose restore failed, with the reason.
+    pub failed: Vec<(String, String)>,
+}
+
+/// The result of one restore check of one database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestoreCheck {
+    Passed,
+    NoReplica,
+    Failed(String),
 }
 
 /// Called with the database and the newer epoch a replicator saw.
 pub(crate) type FenceHook = Arc<dyn Fn(&FleetDbKey, u64) + Send + Sync>;
+
+/// Returns the epoch at which this host serves the database now. `None`
+/// when its lease lapsed.
+pub(crate) type ServingHook = Arc<dyn Fn(&FleetDbKey) -> Option<u64> + Send + Sync>;
+
+/// Returns the newest epoch this host saw for the database.
+pub(crate) type KnownHook = Arc<dyn Fn(&FleetDbKey) -> u64 + Send + Sync>;
+
+/// The ship mode of a fleet, for health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShipInfo {
+    /// [`ShipMode::name`](super::fleet_engine::ShipMode::name).
+    pub(crate) mode: &'static str,
+    /// The interval of `Generations`. `None` in other modes.
+    pub(crate) every: Option<Duration>,
+}
 
 impl FleetReplication {
     /// Replicate fleet databases next to the control database.
@@ -248,8 +552,111 @@ impl FleetReplication {
             final_flush_ms: AtomicU64::new(5_000),
             unshipped: Mutex::new(Vec::new()),
             shutdown_cutoff: Mutex::new(None),
-            fence_hook: Mutex::new(None),
+            fence_hook: Arc::new(Mutex::new(None)),
+            known_hook: Arc::new(Mutex::new(None)),
+            ship: std::sync::OnceLock::new(),
+            generation_slots: Mutex::new(HashMap::new()),
+            unshipped_generations: Mutex::new(HashMap::new()),
+            released_generations: Mutex::new(HashMap::new()),
+            next_kept_seq: AtomicU64::new(0),
+            tombstones: None,
+            retention_after_delete: Duration::ZERO,
+            restore_check: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
+            purge_turn: tokio::sync::Mutex::new(()),
+            released: Mutex::new(HashMap::new()),
+            last_purge: Mutex::new(None),
+            last_restore_check: Mutex::new(None),
+            ship_workers: DEFAULT_SHIP_WORKERS,
+            last_pass_ms: AtomicU64::new(NO_PASS),
+            progress: tokio::sync::Notify::new(),
+            wait_poll: WAIT_POLL,
+            closed: Mutex::new(HashMap::new()),
+            serving_hook: Mutex::new(None),
         }
+    }
+
+    /// Ship the databases of a pass on `workers` threads. The default is
+    /// [`DEFAULT_SHIP_WORKERS`]. `0` means `1`.
+    #[must_use]
+    pub const fn with_ship_workers(mut self, workers: usize) -> Self {
+        self.ship_workers = if workers == 0 { 1 } else { workers };
+        self
+    }
+
+    /// The threads that ship the databases of a pass.
+    #[must_use]
+    pub const fn ship_workers(&self) -> usize {
+        self.ship_workers
+    }
+
+    /// Keep a tombstone row on the control database for each deleted
+    /// database until its replica is purged (issue #3235). Without it, a
+    /// failed purge is logged and not retried.
+    #[must_use]
+    pub fn with_tombstones(mut self, tombstones: Arc<FleetTombstones>) -> Self {
+        self.tombstones = Some(tombstones);
+        self
+    }
+
+    /// Keep a deleted database's replica for `retention`, then purge it.
+    /// The default, zero, purges at once.
+    #[must_use]
+    pub const fn with_retention_after_delete(mut self, retention: Duration) -> Self {
+        self.retention_after_delete = retention;
+        self
+    }
+
+    /// Restore `sample` random databases every `every` (issue #3235).
+    /// `None` or a sample of 0 turns the check off. The default is off.
+    #[must_use]
+    pub fn with_restore_check(mut self, every: Option<Duration>, sample: usize) -> Self {
+        self.restore_check = every.filter(|_| sample > 0).map(|every| (every, sample));
+        self
+    }
+
+    /// The entropy that picks the restore-check sample. Default: the OS.
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn Entropy>) -> Self {
+        self.entropy = entropy;
+        self
+    }
+
+    /// The tombstone store, if any.
+    #[must_use]
+    pub const fn tombstones(&self) -> Option<&Arc<FleetTombstones>> {
+        self.tombstones.as_ref()
+    }
+
+    /// How long a deleted database's replica stays.
+    #[must_use]
+    pub const fn retention_after_delete(&self) -> Duration {
+        self.retention_after_delete
+    }
+
+    /// How often the restore check runs, and its sample size.
+    #[must_use]
+    pub const fn restore_check(&self) -> Option<(Duration, usize)> {
+        self.restore_check
+    }
+
+    /// Whether a missing database is restored from its replica.
+    #[must_use]
+    pub const fn restores_missing(&self) -> bool {
+        self.restore_missing
+    }
+
+    pub(crate) fn entropy(&self) -> &dyn Entropy {
+        self.entropy.as_ref()
+    }
+
+    pub(crate) const fn purge_turn(&self) -> &tokio::sync::Mutex<()> {
+        &self.purge_turn
+    }
+
+    /// The app clock.
+    pub(crate) fn now(&self) -> DateTime<Utc> {
+        self.clock.now()
     }
 
     /// Tell `hook` when a replicator sees a newer epoch. The fleet installs
@@ -259,6 +666,121 @@ impl FleetReplication {
             .fence_hook
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Tell the fence of each replica the newest epoch this host saw. The
+    /// fleet installs it with its ownership.
+    pub(crate) fn set_known_hook(&self, hook: KnownHook) {
+        *self
+            .known_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Tell `replicated_through` the epoch at which this host serves a key.
+    /// The fleet installs it with its ownership.
+    pub(crate) fn set_serving_hook(&self, hook: ServingHook) {
+        *self
+            .serving_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// The fence of the replica of `key`, for a writer of `epoch`. Core
+    /// writes through it in every ship mode.
+    pub(crate) fn ship_fence(&self, key: &FleetDbKey, epoch: Option<u64>) -> ShipFence {
+        let (known, fenced) = (Arc::clone(&self.known_hook), Arc::clone(&self.fence_hook));
+        let (known_key, fenced_key) = (key.clone(), key.clone());
+        ShipFence::new(Arc::clone(&self.destination), self.root_for(key), epoch)
+            .known_epoch(Arc::new(move || {
+                let hook = known.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                hook.map_or(0, |hook| hook(&known_key))
+            }))
+            .on_fenced(Arc::new(move |newest| {
+                let hook = fenced
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(hook) = hook {
+                    hook(&fenced_key, newest);
+                }
+            }))
+    }
+
+    /// The destination of `key` for a writer of `epoch`, with its fence.
+    pub(crate) fn fenced_destination(
+        &self,
+        key: &FleetDbKey,
+        epoch: Option<u64>,
+    ) -> Arc<dyn ReplicaDestination> {
+        Arc::new(FencedDestination::new(
+            Arc::clone(&self.destination),
+            self.ship_fence(key, epoch),
+        ))
+    }
+
+    /// Record the ship mode of the fleet. The first call wins.
+    pub(crate) fn set_ship_info(&self, info: ShipInfo) {
+        let _ = self.ship.set(info);
+    }
+
+    /// The ship mode of the fleet. `continuous` before an install.
+    pub(crate) fn ship_info(&self) -> ShipInfo {
+        self.ship.get().copied().unwrap_or(ShipInfo {
+            mode: "continuous",
+            every: None,
+        })
+    }
+
+    /// The RPO of the fleet: the sync interval of `continuous`, the
+    /// interval of `generations`, none for `rebuild`.
+    #[must_use]
+    pub(crate) fn rpo(&self) -> Option<Duration> {
+        let info = self.ship_info();
+        match info.mode {
+            "continuous" => Some(self.settings.sync_interval),
+            _ => info.every,
+        }
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<GenerationSlot>>> {
+        self.generation_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The ship slot of the open database of `key`, if it ships
+    /// generations in this process.
+    pub(crate) fn current_generation_slot(&self, key: &FleetDbKey) -> Option<Arc<GenerationSlot>> {
+        self.slots().get(key).cloned()
+    }
+
+    /// A new ship slot for `key`, at an open. It replaces the slot of an
+    /// earlier open.
+    pub(crate) fn open_generation_slot(&self, key: &FleetDbKey, epoch: u64) -> Arc<GenerationSlot> {
+        let slot = Arc::new(GenerationSlot::new(self.clock.now(), epoch));
+        self.slots().insert(key.clone(), Arc::clone(&slot));
+        // After the insert: a waiter never sees the key in neither map.
+        self.forget_closed(key);
+        slot
+    }
+
+    /// Drop `slot` of `key` when it is still the current one.
+    pub(crate) fn forget_generation_slot(&self, key: &FleetDbKey, slot: &Arc<GenerationSlot>) {
+        let mut slots = self.slots();
+        if slots
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+        {
+            slots.remove(key);
+        }
+    }
+
+    fn generation_slots(&self) -> Vec<(FleetDbKey, Arc<GenerationSlot>)> {
+        self.slots()
+            .iter()
+            .map(|(key, slot)| (key.clone(), Arc::clone(slot)))
+            .collect()
     }
 
     /// Stop `replica` for good: a newer epoch owns its database.
@@ -338,10 +860,10 @@ impl FleetReplication {
         Duration::from_millis(self.final_flush_ms.load(Ordering::Acquire))
     }
 
-    /// Tick until no replicator is parked, or until `deadline` passes.
-    /// This call blocks. It returns the names still unshipped. Each one is
-    /// logged with `error!`. The call replaces the `unshipped` list in the
-    /// health details.
+    /// Tick until no replicator is parked and no kept generation is left,
+    /// or until `deadline` passes. This call blocks. It returns the names
+    /// still unshipped. Each one is logged with `error!`. The call replaces
+    /// the `unshipped` list in the health details.
     ///
     /// The deadline uses real elapsed time, ticks included. A pinned or
     /// virtual clock cannot make the loop run forever. No tick starts after
@@ -361,19 +883,28 @@ impl FleetReplication {
                 break;
             }
             self.tick_pass(&|| cutoff);
-            if self.closing() == 0 {
+            // A released generation waits for its delete or restore.
+            if self.closing() == 0 && self.records().is_empty() {
                 break;
             }
             std::thread::sleep(FLUSH_RETRY.min(deadline.saturating_sub(started.elapsed())));
         }
         let mut unshipped: Vec<String> = self.parked().keys().map(FleetDbKey::name).collect();
-        unshipped.sort();
         for name in &unshipped {
             tracing::error!(
                 database = %name,
                 "fleet shutdown: committed WAL is not shipped and stays on this volume"
             );
         }
+        for name in self.unshipped_generation_names() {
+            tracing::error!(
+                database = %name,
+                "fleet shutdown: the last generation is not shipped and stays on this volume"
+            );
+            unshipped.push(name);
+        }
+        unshipped.sort();
+        unshipped.dedup();
         self.unshipped
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -381,7 +912,13 @@ impl FleetReplication {
         unshipped
     }
 
-    fn root_for(&self, key: &FleetDbKey) -> String {
+    /// Where the replicas go.
+    pub(crate) const fn destination(&self) -> &Arc<dyn ReplicaDestination> {
+        &self.destination
+    }
+
+    /// The key prefix of the replica of `key`.
+    pub(crate) fn root_for(&self, key: &FleetDbKey) -> String {
         replica_root(&self.settings.root, key)
     }
 
@@ -399,6 +936,207 @@ impl FleetReplication {
             .max())
     }
 
+    fn marker_key(&self, key: &FleetDbKey) -> String {
+        format!("{}/{MARKER_OBJECT}", self.root_for(key))
+    }
+
+    /// Write the tombstone marker of `key`. Hosts that do not share the
+    /// control database read it. Blocking.
+    pub(crate) fn write_marker(
+        &self,
+        key: &FleetDbKey,
+        tombstone: &Tombstone,
+    ) -> Result<(), String> {
+        let body = serde_json::to_vec(&Marker::of(tombstone)).map_err(|e| e.to_string())?;
+        self.destination
+            .put(&self.marker_key(key), &body)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The tombstone marker of `key`, if any. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// The destination failed, or the marker cannot be read. An unreadable
+    /// marker refuses the restore: it is not ignored.
+    pub fn marker(&self, key: &FleetDbKey) -> Result<Option<Marker>, String> {
+        match self.destination.get(&self.marker_key(key)) {
+            Ok(body) => serde_json::from_slice(&body)
+                .map(Some)
+                .map_err(|e| format!("unreadable tombstone marker: {e}")),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// When the newest generation of the replica of `key` was created.
+    /// `None` when there is none. Blocking: one list at the destination.
+    ///
+    /// # Errors
+    ///
+    /// The destination failed.
+    pub(crate) fn newest_generation(
+        &self,
+        key: &FleetDbKey,
+    ) -> Result<Option<DateTime<Utc>>, String> {
+        let root = self.root_for(key);
+        Ok(self
+            .destination
+            .list(&segment::generations_prefix(&root))
+            .map_err(|e| e.to_string())?
+            .iter()
+            .filter_map(|object| segment::generation_of_key(&root, object))
+            .filter_map(|generation| segment::parse_generation_id(&generation))
+            .filter_map(|info| DateTime::from_timestamp_millis(info.created_ms))
+            .max())
+    }
+
+    /// Remove the tombstone marker of `key`. Blocking.
+    pub(crate) fn delete_marker(&self, key: &FleetDbKey) -> Result<(), String> {
+        self.destination
+            .delete(&self.marker_key(key))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Wait until no tick holds a replica that a delete or a restore of
+    /// `key` let go. Blocking.
+    pub(crate) fn quiesce_released(&self, key: &FleetDbKey) {
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
+        if let Some(replica) = released.and_then(|weak| weak.upgrade()) {
+            drop(lock_replicator(&replica, &|| None));
+        }
+        // A generation ship in flight holds the upload lock. Its database
+        // is retired, so a later put is refused. The slot stays: only the
+        // worker of its open drops it.
+        let slot = self.current_generation_slot(key);
+        if let Some(slot) = slot {
+            slot.wait_upload();
+        }
+        // So does the retry of a kept generation that was released.
+        let kept = self
+            .released_records()
+            .get(key)
+            .and_then(|record| record.upload.clone());
+        if let Some(slot) = kept {
+            slot.wait_upload();
+        }
+    }
+
+    /// Delete the replica of `key` up to `cutoff` (issue #3235). Blocking.
+    ///
+    /// Deletes each object of a generation created at or before `cutoff`.
+    /// When no newer generation exists, it also deletes the rest (epoch
+    /// markers, the tombstone marker last). A newer generation is a new
+    /// database with the same key: it keeps its objects. Returns the number
+    /// of objects deleted.
+    ///
+    /// # Errors
+    ///
+    /// The destination failed. Some objects can be gone: call again.
+    pub fn purge_replica(&self, key: &FleetDbKey, cutoff: DateTime<Utc>) -> Result<usize, String> {
+        self.quiesce_released(key);
+        let root = self.root_for(key);
+        // The slash: `tenant/acme` is not a prefix of `tenant/acme2`.
+        let objects = self
+            .destination
+            .list(&format!("{root}/"))
+            .map_err(|e| e.to_string())?;
+        let dated = |scope: &str, object: &str| {
+            segment::generation_of_key(scope, object)
+                .and_then(|generation| segment::parse_generation_id(&generation))
+                .and_then(|info| DateTime::from_timestamp_millis(info.created_ms))
+        };
+        // A sidecar object is dated by its own `generations/<id>/`. An
+        // object with no date can be of the deleted database: it goes.
+        let created = |object: &str| {
+            dated(&root, object).or_else(|| {
+                sidecar_scope(&root, object).map(|scope| dated(&scope, object).unwrap_or(cutoff))
+            })
+        };
+        let newer = objects
+            .iter()
+            .filter_map(|object| created(object))
+            .any(|at| at > cutoff);
+        let marker = self.marker_key(key);
+        let mut deleted = 0;
+        let mut marker_goes = false;
+        for object in &objects {
+            if !purge_deletes(created(object), cutoff, newer) {
+                continue;
+            }
+            if *object == marker {
+                marker_goes = true;
+                continue;
+            }
+            self.destination
+                .delete(object)
+                .map_err(|e| format!("could not delete {object}: {e}"))?;
+            deleted += 1;
+        }
+        // Last: a purge that stops part way stays tombstoned.
+        if marker_goes {
+            self.delete_marker(key)?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
+    /// Restore the replica of `key` into a scratch file under `scratch`,
+    /// check its identity row, and remove the file. The restore itself runs
+    /// `PRAGMA integrity_check`. A failure is tried once more: a live
+    /// replicator can ship between the list and the head read. Blocking.
+    pub(crate) fn check_restore(&self, key: &FleetDbKey, scratch: &Path) -> RestoreCheck {
+        match self.check_restore_once(key, scratch) {
+            RestoreCheck::Failed(_) => self.check_restore_once(key, scratch),
+            outcome => outcome,
+        }
+    }
+
+    fn check_restore_once(&self, key: &FleetDbKey, scratch: &Path) -> RestoreCheck {
+        if let Err(error) = std::fs::create_dir_all(scratch) {
+            return RestoreCheck::Failed(format!(
+                "could not create the scratch directory: {error}"
+            ));
+        }
+        let output = scratch.join(format!("{:016x}.db", self.entropy.next_u64()));
+        let name = key.name();
+        let result = match self.restore_to(key, None, &output) {
+            Ok(_) => match super::fleet::read_identity(&output, &name) {
+                Ok(Some(found)) if found == name => RestoreCheck::Passed,
+                Ok(Some(found)) => {
+                    RestoreCheck::Failed(format!("the identity row names {found}, not {name}"))
+                }
+                Ok(None) => RestoreCheck::Failed("the identity row is missing".to_owned()),
+                Err(error) => RestoreCheck::Failed(error.to_string()),
+            },
+            Err(RestoreError::NoReplica { .. }) => RestoreCheck::NoReplica,
+            Err(error) => RestoreCheck::Failed(error.to_string()),
+        };
+        let _ = std::fs::remove_file(&output);
+        for sidecar in crate::fleet_layout::sidecar_paths(&output) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        result
+    }
+
+    pub(crate) fn record_purge_report(&self, report: PurgeReport) {
+        *self
+            .last_purge
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(report);
+    }
+
+    pub(crate) fn record_restore_check(&self, report: RestoreCheckReport) {
+        *self
+            .last_restore_check
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(report);
+    }
+
     fn active(&self) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<ActiveReplica>>> {
         self.active.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -408,14 +1146,23 @@ impl FleetReplication {
     }
 
     /// Drop a parked replicator that is still the one parked for `key`.
-    fn retire_parked(&self, key: &FleetDbKey, replica: &Arc<ActiveReplica>) -> bool {
+    /// Keep `closed` as its last bound. It is kept under the parked lock:
+    /// a `release` that takes the lock after it clears it.
+    fn retire_parked(
+        &self,
+        key: &FleetDbKey,
+        replica: &Arc<ActiveReplica>,
+        closed: ClosedBound,
+    ) -> bool {
         let mut parked = self.parked();
         let current = parked
             .get(key)
             .is_some_and(|current| Arc::ptr_eq(current, replica));
         if current {
             parked.remove(key);
+            self.remember_closed(key, closed);
         }
+        drop(parked);
         current
     }
 
@@ -423,6 +1170,152 @@ impl FleetReplication {
     #[must_use]
     pub fn closing(&self) -> usize {
         self.parked().len()
+    }
+
+    /// Closed databases whose last generation did not ship. Each one makes
+    /// `release_ownership` let the ranges lapse.
+    #[must_use]
+    pub fn unshipped_generations(&self) -> usize {
+        self.unshipped_generation_names().len()
+    }
+
+    fn released_records(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<UnshippedGeneration>>> {
+        self.released_generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn records(&self) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<UnshippedGeneration>>> {
+        self.unshipped_generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep `record` of `key` until a ship or a retire drops it. It
+    /// replaces an older record: the files at the path hold its writes.
+    pub(crate) fn keep_unshipped_generation(
+        &self,
+        key: &FleetDbKey,
+        mut record: UnshippedGeneration,
+    ) {
+        tracing::warn!(
+            database = %key,
+            path = %record.path.display(),
+            epoch = ?record.epoch,
+            "fleet generation: the last generation of the close did not ship; it is kept and ships later"
+        );
+        record.seq = self.next_kept_seq.fetch_add(1, Ordering::AcqRel);
+        self.records().insert(key.clone(), Arc::new(record));
+    }
+
+    /// A mark to take before a ship starts. A record kept after it can hold
+    /// writes the ship does not.
+    pub(crate) fn generation_mark(&self) -> u64 {
+        self.next_kept_seq.load(Ordering::Acquire)
+    }
+
+    /// A ship of `key` that started at `mark` worked: its files hold the
+    /// writes of a record kept before `mark`. A later record stays.
+    pub(crate) fn drop_unshipped_generation(&self, key: &FleetDbKey, mark: u64) {
+        let mut records = self.records();
+        if records.get(key).is_some_and(|record| record.seq < mark) {
+            records.remove(key);
+            drop(records);
+            tracing::info!(database = %key, "fleet generation: the kept generation shipped");
+        }
+    }
+
+    /// A delete or a restore of `key` starts: its kept generation stops
+    /// shipping. It still counts as unshipped until
+    /// [`settle_released_generation`](Self::settle_released_generation).
+    pub(crate) fn release_unshipped_generation(&self, key: &FleetDbKey) {
+        let removed = self.records().remove(key);
+        if let Some(record) = removed {
+            record.retired.store(true, Ordering::Release);
+            self.released_records().insert(key.clone(), record);
+        }
+    }
+
+    /// A delete or a restore of `key` ended. `replaced`: the files are gone
+    /// or replaced, so the kept generation goes and nothing ships for it.
+    /// Otherwise the files stay, and it ships again.
+    pub(crate) fn settle_released_generation(&self, key: &FleetDbKey, replaced: bool) {
+        let Some(record) = self.released_records().remove(key) else {
+            return;
+        };
+        if replaced {
+            tracing::info!(database = %key, "fleet generation: a delete or a restore replaced the kept generation; it does not ship");
+            return;
+        }
+        record.retired.store(false, Ordering::Release);
+        self.records().entry(key.clone()).or_insert(record);
+        tracing::warn!(database = %key, "fleet generation: the delete or the restore failed; the kept generation ships again");
+    }
+
+    /// The names of the kept generations, released ones too, sorted.
+    fn unshipped_generation_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.records().keys().map(FleetDbKey::name).collect();
+        names.extend(self.released_records().keys().map(FleetDbKey::name));
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Ship the kept generation of `key` once. A pass that finds it busy
+    /// skips it.
+    fn retry_unshipped(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
+        if expired(cutoff()) {
+            return;
+        }
+        let Some(record) = self.records().get(key).cloned() else {
+            return;
+        };
+        let _busy = match record.busy.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        // A ship or a retire dropped it, or a new close replaced it.
+        let current = self
+            .records()
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, &record));
+        if !current {
+            return;
+        }
+        if record.retired.load(Ordering::Acquire) {
+            // Nothing ships for it any more.
+            self.forget_record(key, &record);
+            return;
+        }
+        // A panic in a retry must not stop the loop thread.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (record.retry)()))
+            .unwrap_or_else(|_| GenerationRetry::Failed("the retry panicked".to_owned()));
+        match outcome {
+            GenerationRetry::Shipped => self.forget_record(key, &record),
+            GenerationRetry::Retired => {
+                record.retired.store(true, Ordering::Release);
+                self.forget_record(key, &record);
+                tracing::info!(database = %key, "fleet generation: a fence retired the kept generation; it does not ship");
+            }
+            GenerationRetry::Busy => {}
+            GenerationRetry::Failed(error) => {
+                tracing::warn!(database = %key, %error, "fleet generation: the kept generation did not ship; the next pass tries again");
+            }
+        }
+    }
+
+    /// Drop `record` of `key` when it is still the current one.
+    fn forget_record(&self, key: &FleetDbKey, record: &Arc<UnshippedGeneration>) {
+        let mut records = self.records();
+        if records
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, record))
+        {
+            records.remove(key);
+        }
     }
 
     fn all_replicas(&self) -> Vec<(FleetDbKey, Arc<ActiveReplica>)> {
@@ -439,7 +1332,9 @@ impl FleetReplication {
         replicas
     }
 
-    /// Open databases that another process replicates.
+    /// Open databases whose replicator lock this process does not hold.
+    /// Usually another process on the same root holds it. A pass claims
+    /// the lock again when that process lets it go.
     #[must_use]
     pub fn unowned(&self) -> usize {
         self.active().values().filter(|r| !r.owned()).count()
@@ -458,73 +1353,177 @@ impl FleetReplication {
     /// After the shutdown cutoff (see
     /// [`set_shutdown_cutoff`](Self::set_shutdown_cutoff)), it starts no work.
     pub fn tick_all(&self) {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the pass time measures blocking I/O"
+        )]
+        let started = std::time::Instant::now();
         self.tick_pass(&|| self.shutdown_cutoff());
+        self.last_pass_ms
+            .store(millis_since(started), Ordering::Release);
     }
 
     /// One tick pass. `cutoff` is read again for each replica, each lock
     /// attempt and each ship step, so a cutoff installed mid-pass takes
     /// effect. After it, no replica starts, and a replica that another thread
     /// holds is given up on.
-    fn tick_pass(&self, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
-        let active: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
+    ///
+    /// [`ship_workers`](Self::ship_workers) threads tick the replicas, the
+    /// one that shipped longest ago first. A pass looks up each replica when
+    /// it gets to it. It does not keep a closed database's replica, so that
+    /// replica's lock is free when the database opens again.
+    fn tick_pass(&self, cutoff: &(dyn Fn() -> Option<std::time::Instant> + Sync)) {
+        let active = self.ship_order();
+        for_each_on(self.ship_workers, &active, |key| {
+            self.tick_active(key, cutoff);
+        });
+        // One wake-up per phase, not per database: each wake-up makes every
+        // waiter look again.
+        self.notify_progress();
+        let parked: Vec<FleetDbKey> = self.parked().keys().cloned().collect();
+        for_each_on(self.ship_workers, &parked, |key| {
+            self.tick_parked(key, cutoff);
+        });
+        self.notify_progress();
+        let kept: Vec<FleetDbKey> = self.records().keys().cloned().collect();
+        for_each_on(self.ship_workers, &kept, |key| {
+            self.retry_unshipped(key, cutoff);
+        });
+        // A retry moves the bound of its slot.
+        self.notify_progress();
+        self.prune_closed();
+    }
+
+    /// The open databases, the oldest last ship first. A database that never
+    /// shipped counts from its registration, as its lag does.
+    fn ship_order(&self) -> Vec<FleetDbKey> {
+        let entries = self
             .active()
             .iter()
-            .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
+            .map(|(key, replica)| {
+                let shipped = replica.status.snapshot().last_success_at;
+                (key.clone(), shipped.unwrap_or(replica.registered_at))
+            })
             .collect();
-        for (key, replica) in active {
-            let now_cutoff = cutoff();
-            if expired(now_cutoff) {
-                return;
-            }
-            // A database that another process replicates is retried each tick.
-            if replica.fenced.load(Ordering::Acquire) || !replica.claim(&key) {
-                continue;
-            }
-            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
-                continue;
-            };
-            if let Err(error) = replicator.tick() {
-                tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
-            }
-            // Under the replicator lock: an `on_open` that reuses this
-            // replica then sees the flag.
-            if let Some(newest) = replicator.fenced_by() {
-                self.fence(&key, &replica, newest);
-            }
-            drop(replicator);
+        oldest_first(entries)
+    }
+
+    /// Tick the open database `key` once.
+    fn tick_active(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
+        if expired(cutoff()) {
+            return;
         }
-        let parked: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
-            .parked()
-            .iter()
-            .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
-            .collect();
-        for (key, replica) in parked {
-            let now_cutoff = cutoff();
-            if expired(now_cutoff) {
-                return;
+        let Some(replica) = self.active().get(key).cloned() else {
+            return;
+        };
+        // A database that another process replicates is retried each tick.
+        if replica.fenced.load(Ordering::Acquire) || !replica.claim(key) {
+            return;
+        }
+        let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+            return;
+        };
+        // Closed since the lookup: its close shipped the last frames, or it
+        // is parked. A reopen puts a replica back in `active`.
+        let current = self
+            .active()
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, &replica));
+        if !current {
+            return;
+        }
+        if let Err(error) = replicator.tick() {
+            let failures = replica.status.snapshot().consecutive_failures;
+            if crate::replication::engine::tick_failure_level(&error, failures)
+                == tracing::Level::WARN
+            {
+                tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
+            } else {
+                tracing::debug!(database = %key, error = %error, "fleet replication tick failed");
             }
-            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
-                continue;
-            };
-            let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
-            let fenced_by = replicator.fenced_by();
-            if let Some(newest) = fenced_by {
-                self.fence(&key, &replica, newest);
-            }
-            drop(replicator);
-            if fenced_by.is_some() {
-                // Nothing more ships: let the file go.
-                self.retire_parked(&key, &replica);
-                continue;
-            }
-            if caught_up && self.retire_parked(&key, &replica) {
-                tracing::info!(database = %key, "fleet replication: closed database caught up");
-            }
+        }
+        // Under the replicator lock: an `on_open` that reuses this replica
+        // then sees the flag.
+        if let Some(newest) = replicator.fenced_by() {
+            self.fence(key, &replica, newest);
         }
     }
 
-    /// Run the loop on a dedicated thread until [`stop`](Self::stop). The
-    /// final ship of each database happens when it closes, not here.
+    /// Tick the open database `key` once, now. Blocking. `Ok(None)` when
+    /// this process does not replicate it: another process holds its lock.
+    ///
+    /// # Errors
+    ///
+    /// The tick failed. [`ReplicationError::Fenced`] when a newer epoch owns
+    /// the replica.
+    pub(crate) fn ship_one(
+        &self,
+        key: &FleetDbKey,
+    ) -> Result<Option<crate::replication::TickReport>, crate::replication::ReplicationError> {
+        let _wake = Wake(&self.progress);
+        let Some(replica) = self.active().get(key).cloned() else {
+            return Ok(None);
+        };
+        if !replica.claim(key) {
+            return Ok(None);
+        }
+        let Some(mut replicator) = lock_replicator(&replica, &|| self.shutdown_cutoff()) else {
+            return Ok(None);
+        };
+        if let Some(newest) = replicator.fenced_by() {
+            return Err(crate::replication::ReplicationError::Fenced {
+                epoch: replica.epoch.load(Ordering::Acquire),
+                newest,
+            });
+        }
+        let result = replicator.tick();
+        if let Some(newest) = replicator.fenced_by() {
+            self.fence(key, &replica, newest);
+        }
+        result.map(Some)
+    }
+
+    /// Ship the backlog of the closed database `key`, and retire its
+    /// replicator when it caught up.
+    fn tick_parked(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
+        if expired(cutoff()) {
+            return;
+        }
+        let Some(replica) = self.parked().get(key).cloned() else {
+            return;
+        };
+        let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+            return;
+        };
+        // A delete or a restore let it go: its files are being removed. Or
+        // another pass retired it, or a reopen took it back.
+        let parked = self
+            .parked()
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, &replica));
+        if replica.released.load(Ordering::Acquire) || !parked {
+            return;
+        }
+        let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
+        let fenced_by = replicator.fenced_by();
+        if let Some(newest) = fenced_by {
+            self.fence(key, &replica, newest);
+        }
+        drop(replicator);
+        if fenced_by.is_some() {
+            // Nothing more ships: let the file go.
+            self.retire_parked(key, &replica, ClosedBound::Fenced);
+            return;
+        }
+        if caught_up && self.retire_parked(key, &replica, closed_at(&replica)) {
+            tracing::info!(database = %key, "fleet replication: closed database caught up");
+        }
+    }
+
+    /// Run the loop on a dedicated thread until [`stop`](Self::stop). A pass
+    /// starts every `sync_interval`, or at once when the last pass took
+    /// longer. The final ship of each database happens when it closes, not
+    /// here. A final generation that did not ship ships again here.
     ///
     /// # Errors
     ///
@@ -535,12 +1534,18 @@ impl FleetReplication {
             .name("autumn-fleet-replication".to_owned())
             .spawn(move || {
                 while !this.stopped.load(Ordering::Acquire) {
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "real time: the loop paces blocking I/O"
+                    )]
+                    let started = std::time::Instant::now();
                     this.tick_all();
+                    // A pass starts once per interval. A long pass does not
+                    // add a full interval to the lag.
+                    let pause = pause_after(this.settings.sync_interval, started.elapsed());
                     let mut slept = Duration::ZERO;
-                    while slept < this.settings.sync_interval
-                        && !this.stopped.load(Ordering::Acquire)
-                    {
-                        let step = STOP_POLL.min(this.settings.sync_interval.saturating_sub(slept));
+                    while slept < pause && !this.stopped.load(Ordering::Acquire) {
+                        let step = STOP_POLL.min(pause.saturating_sub(slept));
                         std::thread::sleep(step);
                         slept += step;
                     }
@@ -551,6 +1556,206 @@ impl FleetReplication {
     /// Stop the loop after its current tick.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Every transaction committed to `key` at or before the returned
+    /// instant is in the replica.
+    ///
+    /// Read the commit time from the app clock after the commit returns. The
+    /// fleet uses the same clock. The bound assumes a clock that does not step
+    /// back. If the clock steps back, the bound follows it back.
+    ///
+    /// `None` when:
+    /// - no tick proved the replica caught up since the current generation
+    ///   or epoch started;
+    /// - another process replicates the database;
+    /// - this host's lease on the slot lapsed, or a newer owner fenced it;
+    /// - the database never opened in this process, or a delete or a
+    ///   restore replaced it.
+    ///
+    /// A closed database keeps its last bound for an hour, or until it opens
+    /// again, a delete or a restore in this process.
+    #[must_use]
+    pub fn replicated_through(&self, key: &FleetDbKey) -> Option<DateTime<Utc>> {
+        match self.bound(key) {
+            Bound::At(at) => Some(at),
+            Bound::Unknown | Bound::Fenced | Bound::NotReplicating => None,
+        }
+    }
+
+    /// Wait until the replica of `key` holds every commit at or before
+    /// `committed_at`. A tick pass wakes the wait. Use it to acknowledge only
+    /// a write that survives a takeover.
+    ///
+    /// Give a finite `timeout` under paused Tokio time: each poll then ends
+    /// at once.
+    ///
+    /// # Errors
+    ///
+    /// - [`ReplicatedWaitError::NotReplicating`]: no replicator for the
+    ///   database ran in this process.
+    /// - [`ReplicatedWaitError::Fenced`]: a newer owner fenced the replica.
+    /// - [`ReplicatedWaitError::TimedOut`]: `timeout` passed first. This does
+    ///   not mean the write is lost.
+    pub async fn wait_replicated(
+        &self,
+        key: &FleetDbKey,
+        committed_at: DateTime<Utc>,
+        timeout: Duration,
+    ) -> Result<(), ReplicatedWaitError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(far_future);
+        loop {
+            // Registered before the check: a wake-up between the two counts.
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let through = match self.bound(key) {
+                Bound::At(at) if at >= committed_at => return Ok(()),
+                Bound::At(at) => Some(at),
+                Bound::Unknown => None,
+                Bound::Fenced => return Err(ReplicatedWaitError::Fenced { name: key.name() }),
+                Bound::NotReplicating => {
+                    return Err(ReplicatedWaitError::NotReplicating { name: key.name() });
+                }
+            };
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(ReplicatedWaitError::TimedOut {
+                    name: key.name(),
+                    committed_at,
+                    timeout,
+                    through,
+                });
+            }
+            // A missed wake-up costs at most one poll.
+            let poll = now
+                .checked_add(self.wait_poll)
+                .map_or(deadline, |poll| poll.min(deadline));
+            let _ = tokio::time::timeout_at(poll, notified).await;
+        }
+    }
+
+    /// Wake each `wait_replicated`.
+    pub(crate) fn notify_progress(&self) {
+        self.progress.notify_waiters();
+    }
+
+    /// Keep the last bound of the closed database `key`.
+    pub(crate) fn remember_closed(&self, key: &FleetDbKey, bound: ClosedBound) {
+        let now = self.clock.now();
+        let mut closed = self.closed.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(bound, ClosedBound::At { at: None, .. }) {
+            closed.remove(key);
+        } else {
+            closed.insert(key.clone(), (bound, now));
+        }
+    }
+
+    /// Drop the closed bounds that no waiter can use: older than
+    /// [`CLOSED_BOUND_TTL`], or under an epoch this host no longer serves.
+    /// A bound that is still shipping (`Live`) stays.
+    fn prune_closed(&self) {
+        let now = self.clock.now();
+        // Lock order: `closed`, then the serving hook. Nothing takes them
+        // the other way round.
+        self.closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|key, (bound, at)| {
+                let old = now
+                    .signed_duration_since(*at)
+                    .to_std()
+                    .is_ok_and(|age| age >= CLOSED_BOUND_TTL);
+                let epoch = match bound {
+                    ClosedBound::Live { .. } => return true,
+                    ClosedBound::At { epoch, .. } => Some(*epoch),
+                    ClosedBound::Slot(slot) => Some(slot.epoch()),
+                    ClosedBound::Fenced => None,
+                };
+                !old && epoch.is_none_or(|epoch| self.serves(key, epoch))
+            });
+    }
+
+    /// Forget the last bound of `key`: it opens again, or a delete or a
+    /// restore replaces it.
+    pub(crate) fn forget_closed(&self, key: &FleetDbKey) {
+        self.closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
+    }
+
+    /// Whether this host serves `key` at `epoch` now. Always `true` without
+    /// ownership (no hook).
+    fn serves(&self, key: &FleetDbKey, epoch: u64) -> bool {
+        let hook = self
+            .serving_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        // With ownership, a replica with no epoch opened before it: no claim.
+        hook.is_none_or(|hook| epoch != 0 && hook(key) == Some(epoch))
+    }
+
+    /// `at` under `epoch`, or `Unknown` when:
+    /// - this host does not serve the key at that epoch now: a new owner may
+    ///   restore before an old ship lands;
+    /// - `at` is not below the clock now: the clock stepped back.
+    fn bound_at(&self, key: &FleetDbKey, at: Option<DateTime<Utc>>, epoch: u64) -> Bound {
+        match at {
+            Some(at) if at < self.clock.now() && self.serves(key, epoch) => Bound::At(at),
+            _ => Bound::Unknown,
+        }
+    }
+
+    /// The bound of a generations-mode slot.
+    fn slot_bound(&self, key: &FleetDbKey, slot: &GenerationSlot) -> Bound {
+        let (at, fenced) = {
+            let track = slot.track();
+            (track.replicated_through, track.fenced)
+        };
+        if fenced {
+            Bound::Fenced
+        } else {
+            self.bound_at(key, at, slot.epoch())
+        }
+    }
+
+    /// The bound of `key` and why it is missing. The lookups do not nest
+    /// locks.
+    fn bound(&self, key: &FleetDbKey) -> Bound {
+        let active = self.active().get(key).cloned();
+        let replica = active.or_else(|| self.parked().get(key).cloned());
+        if let Some(replica) = replica {
+            if replica.fenced.load(Ordering::Acquire) {
+                return Bound::Fenced;
+            }
+            if !replica.owned() {
+                return Bound::Unknown;
+            }
+            let epoch = replica.epoch.load(Ordering::Acquire);
+            return self.bound_at(key, replica.status.replicated_through(), epoch);
+        }
+        if let Some(slot) = self.current_generation_slot(key) {
+            return self.slot_bound(key, &slot);
+        }
+        let closed = self
+            .closed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .map(|(bound, _)| bound.clone());
+        match closed {
+            Some(ClosedBound::Live { status, epoch }) => {
+                self.bound_at(key, status.replicated_through(), epoch)
+            }
+            Some(ClosedBound::At { at, epoch }) => self.bound_at(key, at, epoch),
+            Some(ClosedBound::Slot(slot)) => self.slot_bound(key, &slot),
+            Some(ClosedBound::Fenced) => Bound::Fenced,
+            None => Bound::NotReplicating,
+        }
     }
 
     /// Rebuild the replica of `key`, as of `target` (latest when `None`),
@@ -573,6 +1778,21 @@ impl FleetReplication {
             target,
             output,
         )
+    }
+
+    /// A lake over these replicas (issue #3236). It carries the tombstones
+    /// and the entropy of this replication.
+    #[must_use]
+    pub fn lake(&self) -> super::fleet_lake::FleetLake {
+        let lake = super::fleet_lake::FleetLake::new(
+            Arc::clone(&self.destination),
+            self.settings.root.clone(),
+        )
+        .with_entropy(Arc::clone(&self.entropy));
+        match &self.tombstones {
+            Some(tombstones) => lake.with_tombstones(Arc::clone(tombstones)),
+            None => lake,
+        }
     }
 
     /// The health indicator for every replicating database.
@@ -627,20 +1847,27 @@ impl FleetReplication {
             .collect();
         details.insert("lock_failures".to_owned(), lock_failures.len().into());
         details.insert("failing".to_owned(), failing.into());
-        details.insert(
-            "unshipped".to_owned(),
-            self.unshipped
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-                .into(),
-        );
+        // The last flush, and each generation kept now.
+        let mut unshipped = self
+            .unshipped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        unshipped.extend(self.unshipped_generation_names());
+        unshipped.sort();
+        unshipped.dedup();
+        details.insert("unshipped".to_owned(), unshipped.into());
         details.insert("pending_bytes".to_owned(), pending_bytes.into());
         details.insert(
             "lag_alert_after_seconds".to_owned(),
             self.lag_alert_after.as_secs().into(),
         );
         details.insert("destination".to_owned(), self.destination.describe().into());
+        details.insert("ship_workers".to_owned(), self.ship_workers.into());
+        let last_pass_ms = self.last_pass_ms.load(Ordering::Acquire);
+        if last_pass_ms != NO_PASS {
+            details.insert("last_pass_ms".to_owned(), last_pass_ms.into());
+        }
         let lag_ok = if let Some((lag, name)) = worst {
             details.insert("worst_lag_seconds".to_owned(), lag.as_secs().into());
             details.insert("worst_database".to_owned(), name.into());
@@ -648,74 +1875,125 @@ impl FleetReplication {
         } else {
             true
         };
-        // A database whose lock cannot be taken is never replicated.
-        let healthy = lag_ok && lock_failures.is_empty();
+        let restore_ok = self.lifecycle_details(&mut details);
+        let generations_ok = self.ship_details(&mut details, now);
+        // A database whose lock cannot be taken is never replicated. A
+        // replica that does not restore is not a backup.
+        let healthy = lag_ok && lock_failures.is_empty() && restore_ok && generations_ok;
         if healthy {
             HealthCheckOutput::up().with_details(details)
         } else {
             HealthCheckOutput::down().with_details(details)
         }
     }
+
+    /// The ship mode, the RPO and, in `generations` mode, the lag of each
+    /// database. `false` when a database did not ship for longer than the
+    /// interval plus the lag alert.
+    fn ship_details(
+        &self,
+        details: &mut HashMap<String, serde_json::Value>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let ship = self.ship_info();
+        details.insert("ship_mode".to_owned(), ship.mode.into());
+        details.insert(
+            "rpo_seconds".to_owned(),
+            self.rpo().map(|rpo| rpo.as_secs()).into(),
+        );
+        let Some(every) = ship.every else {
+            return true;
+        };
+        let mut worst: Option<(Duration, String)> = None;
+        let (mut databases, mut failing) = (0_u64, 0_u64);
+        let mut last_error = None;
+        for (key, slot) in self.generation_slots() {
+            let (failures, error, since) = {
+                let track = slot.track();
+                (
+                    track.failures,
+                    track.last_error.clone(),
+                    track.last_ok.unwrap_or(track.registered_at),
+                )
+            };
+            databases += 1;
+            if failures > 0 {
+                failing += 1;
+                last_error = error;
+            }
+            let lag = now
+                .signed_duration_since(since)
+                .to_std()
+                .unwrap_or(Duration::ZERO);
+            if worst.as_ref().is_none_or(|(w, _)| lag > *w) {
+                worst = Some((lag, key.name()));
+            }
+        }
+        let limit = every.saturating_add(self.lag_alert_after);
+        let mut generations = serde_json::json!({
+            "databases": databases,
+            "failing": failing,
+            "last_error": last_error,
+        });
+        let ok = worst.as_ref().is_none_or(|(lag, _)| *lag <= limit);
+        if let Some((lag, name)) = worst {
+            generations["worst_lag_seconds"] = lag.as_secs().into();
+            generations["worst_database"] = name.into();
+        }
+        details.insert("generations".to_owned(), generations);
+        ok
+    }
+
+    /// The tombstone and restore-check details (issue #3235). `false` when
+    /// the last restore check failed.
+    fn lifecycle_details(&self, details: &mut HashMap<String, serde_json::Value>) -> bool {
+        if let Some(purge) = self
+            .last_purge
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            details.insert(
+                "tombstones".to_owned(),
+                serde_json::json!({
+                    "purged": purge.purged,
+                    "failed": purge.failed,
+                    "waiting": purge.waiting,
+                    "failing": purge.failing,
+                    "last_error": purge.last_error,
+                }),
+            );
+        }
+        let mut restore_ok = true;
+        if let Some(check) = self
+            .last_restore_check
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            restore_ok = check.failed.is_empty();
+            let failed: Vec<serde_json::Value> = check
+                .failed
+                .iter()
+                .map(|(database, error)| serde_json::json!({"database": database, "error": error}))
+                .collect();
+            details.insert(
+                "restore_check".to_owned(),
+                serde_json::json!({
+                    "checked_at": check.checked_at.map(|at| at.to_rfc3339()),
+                    "passed": check.passed.len(),
+                    "unreplicated": check.unreplicated.len(),
+                    "failed": failed,
+                }),
+            );
+        }
+        restore_ok
+    }
 }
 
 impl FleetReplication {
-    /// Claim at close. An owner that closes at the same time still holds the
-    /// lock while it ships, so wait for it, within `CLAIM_WAIT` and the
-    /// shutdown cutoff.
-    fn claim_for_close(&self, replica: &ActiveReplica, key: &FleetDbKey) -> bool {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "real time: the wait bounds blocking I/O"
-        )]
-        let limit = std::time::Instant::now() + CLAIM_WAIT;
-        loop {
-            if replica.claim(key) {
-                return true;
-            }
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "real time: the wait bounds blocking I/O"
-            )]
-            let now = std::time::Instant::now();
-            if now >= limit || expired(self.shutdown_cutoff()) {
-                return false;
-            }
-            std::thread::sleep(CLAIM_POLL);
-        }
-    }
-}
-
-impl FleetLifecycle for FleetReplication {
-    fn restore_missing(&self, key: &FleetDbKey, path: &Path) -> Result<bool, String> {
-        if !self.restore_missing {
-            return Ok(false);
-        }
-        // Restore privately, then publish with a link that refuses an
-        // existing target: when two processes restore the same database at
-        // once, the first to publish wins and the other opens its file,
-        // rather than replacing it under a process already serving it.
-        let staging = super::fleet::staging_path(path, "restoring").map_err(|e| e.to_string())?;
-        let result = match self.restore_to(key, None, &staging) {
-            Ok(outcome) => match std::fs::hard_link(&staging, path) {
-                Ok(()) => {
-                    tracing::info!(
-                        database = %key,
-                        bytes = outcome.bytes,
-                        "fleet database restored from its replica"
-                    );
-                    Ok(true)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
-                Err(e) => Err(format!("could not publish the restored database: {e}")),
-            },
-            Err(RestoreError::NoReplica { .. }) => Ok(false),
-            Err(error) => Err(format!("restore from replica failed: {error}")),
-        };
-        super::fleet::discard_staging(&staging);
-        result
-    }
-
-    fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
+    /// Register the replicator of `db`, or take back its parked one.
+    fn open_replica(&self, db: &FleetDatabase) -> Result<(), String> {
         // A closed database still shipping its backlog keeps its replicator:
         // two replicators on one file would both checkpoint it.
         let epoch = db.epoch().map(crate::lock::FencingToken::get);
@@ -748,6 +2026,7 @@ impl FleetLifecycle for FleetReplication {
             };
             if !parked.fenced.load(Ordering::Acquire) {
                 replicator.set_epoch(epoch);
+                replicator.set_destination(self.fenced_destination(db.key(), epoch));
                 parked.epoch.store(epoch.unwrap_or(0), Ordering::Release);
                 drop(replicator);
                 self.active().insert(db.key().clone(), Arc::clone(&parked));
@@ -763,16 +2042,20 @@ impl FleetLifecycle for FleetReplication {
             ..self.settings.clone()
         };
         let status = Arc::new(ReplicationStatus::new(self.destination.describe()));
-        let replicator =
-            Replicator::new(settings, Arc::clone(&self.destination), Arc::clone(&status))
-                .with_clock(Arc::clone(&self.clock))
-                .with_epoch(epoch);
+        let replicator = Replicator::new(
+            settings,
+            self.fenced_destination(db.key(), epoch),
+            Arc::clone(&status),
+        )
+        .with_clock(Arc::clone(&self.clock))
+        .with_epoch(epoch);
         let replica = Arc::new(ActiveReplica {
             replicator: Mutex::new(replicator),
             lock: Mutex::new(None),
             lock_error: Mutex::new(None),
             retired: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             epoch: AtomicU64::new(epoch.unwrap_or(0)),
             path: db.path().to_path_buf(),
             status,
@@ -784,8 +2067,105 @@ impl FleetLifecycle for FleetReplication {
         Ok(())
     }
 
+    /// Claim at close. An owner that closes at the same time still holds the
+    /// lock while it ships, so wait for it, within `CLAIM_WAIT` and the
+    /// shutdown cutoff.
+    fn claim_for_close(&self, replica: &ActiveReplica, key: &FleetDbKey) -> bool {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the wait bounds blocking I/O"
+        )]
+        let limit = std::time::Instant::now() + CLAIM_WAIT;
+        loop {
+            if replica.claim(key) {
+                return true;
+            }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real time: the wait bounds blocking I/O"
+            )]
+            let now = std::time::Instant::now();
+            if now >= limit || expired(self.shutdown_cutoff()) {
+                return false;
+            }
+            std::thread::sleep(CLAIM_POLL);
+        }
+    }
+}
+
+impl FleetLifecycle for FleetReplication {
+    fn restore_missing(&self, key: &FleetDbKey, path: &Path) -> Result<bool, String> {
+        if !self.restore_missing {
+            return Ok(false);
+        }
+        let root = self.root_for(key);
+        let plan = match crate::replication::restore::plan(self.destination.as_ref(), &root, None) {
+            Ok(plan) => plan,
+            Err(RestoreError::NoReplica { .. }) => return Ok(false),
+            Err(error) => return Err(format!("restore from replica failed: {error}")),
+        };
+        // A delete on another host leaves a marker. A generation that is
+        // not newer than it is the deleted database (issue #3235).
+        let marker = self.marker(key)?;
+        if !restore_allowed(
+            false,
+            marker.map(|marker| marker.deleted_at()),
+            plan.generation_started_at,
+        ) {
+            tracing::info!(database = %key, "fleet database was deleted: its replica is not restored");
+            return Ok(false);
+        }
+        // Restore privately, then publish with a link that refuses an
+        // existing target: when two processes restore the same database at
+        // once, the first to publish wins and the other opens its file,
+        // rather than replacing it under a process already serving it.
+        let staging = super::fleet::staging_path(path, "restoring").map_err(|e| e.to_string())?;
+        let result =
+            match crate::replication::restore::apply(self.destination.as_ref(), &plan, &staging) {
+                Ok(outcome) => match std::fs::hard_link(&staging, path) {
+                    Ok(()) => {
+                        tracing::info!(
+                            database = %key,
+                            bytes = outcome.bytes,
+                            "fleet database restored from its replica"
+                        );
+                        Ok(true)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
+                    Err(e) => Err(format!("could not publish the restored database: {e}")),
+                },
+                Err(RestoreError::NoReplica { .. }) => Ok(false),
+                Err(error) => Err(format!("restore from replica failed: {error}")),
+            };
+        super::fleet::discard_staging(&staging);
+        result
+    }
+
+    fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
+        let opened = self.open_replica(db);
+        // After the insert: the open replica answers for the bound from now
+        // on, and a waiter never sees the key in neither map.
+        if opened.is_ok() {
+            self.forget_closed(db.key());
+        }
+        opened
+    }
+
     fn on_close(&self, db: &FleetDatabase) {
+        let _wake = Wake(&self.progress);
+        // Kept before the remove: a waiter never sees the key in neither.
+        let current = self.active().get(db.key()).cloned();
+        if let Some(replica) = current {
+            self.remember_closed(
+                db.key(),
+                ClosedBound::Live {
+                    status: Arc::clone(&replica.status),
+                    epoch: replica.epoch.load(Ordering::Acquire),
+                },
+            );
+        }
         let Some(replica) = self.active().remove(db.key()) else {
+            self.forget_closed(db.key());
             return;
         };
         // The owner may have left since the last tick. Try once, so commits
@@ -793,11 +2173,14 @@ impl FleetLifecycle for FleetReplication {
         // A fenced replica ships nothing: a newer epoch owns the replica.
         if replica.fenced.load(Ordering::Acquire) {
             replica.retired.store(true, Ordering::Release);
+            self.remember_closed(db.key(), ClosedBound::Fenced);
             return;
         }
         let owner = self.claim_for_close(&replica, db.key());
         replica.retired.store(true, Ordering::Release);
         if !owner {
+            // Another process ships it: this process has no bound.
+            self.forget_closed(db.key());
             return;
         }
         // Every pooled connection is gone. Ship everything they committed
@@ -820,6 +2203,7 @@ impl FleetLifecycle for FleetReplication {
         let shipped = match shipped {
             Err((_, Some(newest))) => {
                 self.fence(db.key(), &replica, newest);
+                self.remember_closed(db.key(), ClosedBound::Fenced);
                 return;
             }
             other => other.map_err(|(error, _)| error),
@@ -832,13 +2216,36 @@ impl FleetLifecycle for FleetReplication {
                  stays open and keeps shipping until it does"
             );
             self.parked().insert(db.key().clone(), replica);
+            return;
         }
+        // Caught up: the replicator closes. Keep its last bound.
+        self.remember_closed(db.key(), closed_at(&replica));
     }
 
     fn release(&self, key: &FleetDbKey) {
+        let _wake = Wake(&self.progress);
         // The files are about to be removed or replaced: a parked replicator
-        // must not hold them open.
-        self.parked().remove(key);
+        // must not hold them open, and must ship nothing more.
+        let parked = self.parked().remove(key);
+        // After the parked lock: a pass that retired the replica kept its
+        // bound under that lock. A delete or a restore voids it.
+        self.forget_closed(key);
+        let Some(replica) = parked else {
+            return;
+        };
+        replica.released.store(true, Ordering::Release);
+        self.released
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.clone(), Arc::downgrade(&replica));
+    }
+}
+
+/// The final bound of a replica that closes.
+fn closed_at(replica: &ActiveReplica) -> ClosedBound {
+    ClosedBound::At {
+        at: replica.status.replicated_through(),
+        epoch: replica.epoch.load(Ordering::Acquire),
     }
 }
 
@@ -870,6 +2277,11 @@ fn ship_until_caught_up(
         }
     }
     Err(format!("still behind after {FINAL_SHIP_MAX_TICKS} ticks"))
+}
+
+/// Whether the shutdown `cutoff` has passed.
+pub(crate) fn cutoff_passed(cutoff: std::time::Instant) -> bool {
+    expired(Some(cutoff))
 }
 
 /// Whether `cutoff` has passed. Real time on purpose: the flush bounds
@@ -951,31 +2363,204 @@ mod tests {
         replicas: &Path,
         restore_missing: bool,
     ) -> (DatabaseFleet, Arc<FleetReplication>) {
+        replicated_fleet_with_mmap(root, replicas, restore_missing, 0)
+    }
+
+    fn replicated_fleet_with_mmap(
+        root: &Path,
+        replicas: &Path,
+        restore_missing: bool,
+        mmap_size: u64,
+    ) -> (DatabaseFleet, Arc<FleetReplication>) {
+        replicated_fleet_on(
+            root,
+            replicas,
+            restore_missing,
+            mmap_size,
+            Arc::new(crate::time::SystemClock),
+            |replication| replication,
+        )
+    }
+
+    fn replicated_fleet_on(
+        root: &Path,
+        replicas: &Path,
+        restore_missing: bool,
+        mmap_size: u64,
+        clock: Arc<dyn ClockSource>,
+        tune: impl FnOnce(FleetReplication) -> FleetReplication,
+    ) -> (DatabaseFleet, Arc<FleetReplication>) {
         let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
             mode: FleetMode::Tenant,
             root: root.display().to_string(),
             path: None,
             max_open: 8,
+            max_resident_bytes: 0,
             pool_size: 2,
             create_on_demand: Some(true),
             idle_close_secs: 0,
             restore_missing,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
+            mmap_size,
+            cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let destination: Arc<dyn ReplicaDestination> =
             Arc::new(FileDestination::new(replicas).unwrap());
-        let replication = Arc::new(FleetReplication::new(
+        let replication = Arc::new(tune(FleetReplication::new(
             destination,
             settings(),
             Duration::from_secs(30),
             restore_missing,
-            Arc::new(crate::time::SystemClock),
-        ));
+            clock,
+        )));
         assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
         assert!(fleet.install_replication(Arc::clone(&replication)).is_err());
         (fleet, replication)
+    }
+
+    /// A sidecar gets the keys under `<key prefix>/<engine>/`, no other key,
+    /// and its objects go with a delete of the database.
+    #[tokio::test]
+    async fn a_sidecar_ships_next_to_the_primary_and_goes_with_a_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        let side = db
+            .sidecar_replica("duckdb")
+            .unwrap()
+            .expect("the fleet replicates");
+        assert_eq!(side.root(), "app/test/fleet/tenant/acme/duckdb");
+        let object = side.key("generations/g1/acme.duckdb").unwrap();
+        side.put(&object, b"rows").unwrap();
+        for outside in [
+            "app/test/fleet/tenant/acme/epochs/00000000000000000009",
+            "app/test/fleet/tenant/acme/tombstone",
+            "app/test/fleet/tenant/globex/duckdb/x",
+        ] {
+            assert!(
+                matches!(
+                    side.put(outside, b"x"),
+                    Err(crate::replication::DestinationError::Rejected { .. })
+                ),
+                "{outside}"
+            );
+        }
+        let destination = Arc::clone(replication.destination());
+        assert_eq!(destination.get(&object).unwrap(), b"rows");
+        // A clone kept past the close writes nothing more.
+        let kept = side.clone();
+        drop((side, db));
+        fleet.close(&key).await;
+        assert!(kept.is_stopped());
+        assert!(matches!(
+            kept.put(&object, b"late"),
+            Err(crate::replication::DestinationError::Rejected { .. })
+        ));
+        assert_eq!(kept.get(&object).unwrap(), b"rows", "reads still work");
+        let reopened = fleet.open(&key).await.unwrap();
+        let side = reopened.sidecar_replica("duckdb").unwrap().unwrap();
+        assert!(!side.is_stopped(), "a new open gives a new scope");
+        drop((side, reopened));
+        assert!(fleet.delete(&key).await.unwrap());
+        let left = destination.list("app/test/fleet/tenant/acme/").unwrap();
+        assert!(
+            !left.contains(&object),
+            "the purge takes the sidecar: {left:?}"
+        );
+    }
+
+    /// A sidecar write checks the epoch: it is refused as soon as this host
+    /// loses the slot, before any fence reaches the database.
+    #[tokio::test]
+    async fn a_sidecar_write_is_refused_once_the_slot_is_lost() {
+        use crate::db::fleet_ownership::{FleetOwnership, MemoryOwnership, OwnerId, SlotRange};
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, _replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let clock = crate::time::TickingClock::starting_at(
+            DateTime::from_timestamp_millis(1_000_000).unwrap(),
+        );
+        let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
+        let host = |owner: &str| {
+            Arc::new(
+                FleetOwnership::new(
+                    Arc::clone(&store) as _,
+                    OwnerId::new(owner).unwrap(),
+                    vec![SlotRange::ALL],
+                    Duration::from_secs(30),
+                )
+                .unwrap(),
+            )
+        };
+        let a = host("host-a");
+        assert_eq!(
+            fleet
+                .start_ownership(Arc::clone(&a))
+                .await
+                .unwrap()
+                .claimed
+                .len(),
+            1
+        );
+        let db = fleet.open_for("acme").await.unwrap();
+        let side = db.sidecar_replica("duckdb").unwrap().unwrap();
+        let object = side.key("state.json").unwrap();
+        side.put(&object, b"one").unwrap();
+
+        clock.advance(Duration::from_secs(31));
+        assert_eq!(host("host-b").refresh().await.claimed.len(), 1);
+        assert_eq!(a.refresh().await.lost, [SlotRange::ALL]);
+        // No fence ran: the database is still open here.
+        assert!(fleet.open_keys().contains(db.key()));
+        assert!(side.is_stopped());
+        assert!(matches!(
+            side.put(&object, b"two"),
+            Err(crate::replication::DestinationError::Rejected { .. })
+        ));
+        assert_eq!(side.get(&object).unwrap(), b"one");
+    }
+
+    /// A purge after the key got a new database keeps the sidecar files of
+    /// the new database and removes the files of the deleted one.
+    #[tokio::test]
+    async fn a_purge_dates_sidecar_files_by_their_generation() {
+        use crate::replication::segment::generation_id;
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
+        let key = fleet.key_for("acme").unwrap();
+        let root = "app/test/fleet/tenant/acme";
+        let cutoff = DateTime::from_timestamp_millis(2_000_000).unwrap();
+        let (old, new) = (generation_id(1_000_000, 1), generation_id(3_000_000, 2));
+        let destination = Arc::clone(replication.destination());
+        let objects = [
+            (format!("{root}/generations/{new}/snapshot"), true),
+            (format!("{root}/duckdb/generations/{new}/acme.duckdb"), true),
+            (
+                format!("{root}/duckdb/generations/{old}/acme.duckdb"),
+                false,
+            ),
+            (format!("{root}/duckdb/state.json"), false),
+        ];
+        for (object, _) in &objects {
+            destination.put(object, b"x").unwrap();
+        }
+        replication.purge_replica(&key, cutoff).unwrap();
+        let left = destination.list(&format!("{root}/")).unwrap();
+        for (object, kept) in &objects {
+            assert_eq!(left.contains(object), *kept, "{object}: {left:?}");
+        }
     }
 
     async fn exec(db: &FleetDatabase, sql: &str) {
@@ -1012,6 +2597,88 @@ mod tests {
             .await
             .unwrap()
             .wal_autocheckpoint
+    }
+
+    async fn mmap_size(db: &FleetDatabase) -> i64 {
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct Value {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        let mut conn = db.pool().get().await.unwrap();
+        diesel::sql_query("PRAGMA mmap_size")
+            .get_result::<Value>(&mut *conn)
+            .await
+            .unwrap()
+            .mmap_size
+    }
+
+    const MMAP: u64 = 64 * 1024 * 1024;
+
+    /// Ship, close, lose the file, restore: all with the file mapped.
+    #[tokio::test]
+    async fn a_mapped_database_ships_and_restores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) =
+            replicated_fleet_with_mmap(&tmp.path().join("a"), &replicas, false, MMAP);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&db).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(wal_autocheckpoint(&db).await, 0);
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        for n in 0..200 {
+            exec(
+                &db,
+                &format!("INSERT INTO notes VALUES ('note {n} {}')", "x".repeat(500)),
+            )
+            .await;
+        }
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+        exec(&db, "INSERT INTO notes VALUES ('shipped on close')").await;
+        assert_eq!(count(&db).await, 201);
+        drop(db);
+        fleet.close(&key).await;
+
+        let path = fleet.path_of(&key);
+        std::fs::remove_file(&path).unwrap();
+        for sidecar in crate::fleet_layout::sidecar_paths(&path) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        fleet.restore(&key, None).await.unwrap();
+        let restored = fleet.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&restored).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(count(&restored).await, 201);
+    }
+
+    /// `restore_missing` rebuilds the file before the mapped pool opens it.
+    #[tokio::test]
+    async fn restore_missing_serves_a_mapped_database_from_its_replica() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (old_host, _) =
+            replicated_fleet_with_mmap(&tmp.path().join("old"), &replicas, false, MMAP);
+        let key = old_host.key_for("acme").unwrap();
+        let db = old_host.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('moved with the slot')").await;
+        drop(db);
+        old_host.close_all().await;
+
+        let (new_host, replication) =
+            replicated_fleet_with_mmap(&tmp.path().join("new"), &replicas, true, MMAP);
+        assert!(!new_host.exists(&key));
+        let db = new_host.open(&key).await.unwrap();
+        assert_eq!(mmap_size(&db).await, i64::try_from(MMAP).unwrap());
+        assert_eq!(count(&db).await, 1);
+        assert_eq!(new_host.stats().created_total, 0, "restored, not created");
+        assert_eq!(replication.replicating(), 1);
     }
 
     #[test]
@@ -1105,12 +2772,22 @@ mod tests {
             root: tmp.path().join("plain").display().to_string(),
             path: None,
             max_open: 8,
+            max_resident_bytes: 0,
             pool_size: 2,
             create_on_demand: None,
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let key = FleetDbKey::Slot(1);
@@ -1416,12 +3093,22 @@ mod tests {
             root: tmp.path().join("a").display().to_string(),
             path: None,
             max_open: 8,
+            max_resident_bytes: 0,
             pool_size: 2,
             create_on_demand: Some(true),
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let flaky = Arc::new(Flaky {
@@ -1671,12 +3358,22 @@ mod tests {
             root: tmp.join("a").display().to_string(),
             path: None,
             max_open: 8,
+            max_resident_bytes: 0,
             pool_size: 2,
             create_on_demand: Some(true),
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
+            mmap_size: 0,
+            cache_size_kib: 0,
         })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
         .build()
         .unwrap();
         let flaky = Arc::new(Flaky {
@@ -1771,6 +3468,24 @@ mod tests {
             std::thread::sleep(delay);
             flaky.down.store(false, Ordering::SeqCst);
         });
+    }
+
+    #[tokio::test]
+    async fn a_reopened_parked_replicator_keeps_shipping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        assert_eq!(replication.closing(), 1);
+        // A request reopens it: the parked replicator goes back to work.
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(replication.closing(), 0);
+        flaky.down.store(false, Ordering::SeqCst);
+        tick(&replication).await;
+        let health = replication.health();
+        assert_eq!(health.details["failing"], 0, "{health:?}");
+        assert_eq!(health.details["pending_bytes"], 0, "{health:?}");
+        drop(db);
+        fleet.close_all().await;
     }
 
     #[tokio::test]
@@ -2064,5 +3779,894 @@ mod tests {
         );
         holder.join().unwrap();
         assert_eq!(replication.closing(), 1, "parked, not shipped");
+    }
+
+    // --- Many busy databases per process ---
+
+    /// A destination that counts the writes that run at once. Each write
+    /// takes `delay`. With `meet`, the first write waits (up to
+    /// [`NOT_STUCK`]) until a second write starts, so two workers always
+    /// overlap.
+    struct Slow {
+        inner: FileDestination,
+        delay: Duration,
+        meet: bool,
+        in_flight: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Slow {
+        fn new(dir: &Path, delay: Duration, meet: bool) -> Self {
+            Self {
+                inner: FileDestination::new(dir).unwrap(),
+                delay,
+                meet,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                most: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn write<T>(&self, op: impl FnOnce() -> T) -> T {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            let began = std::time::Instant::now();
+            while self.meet && self.most.load(Ordering::SeqCst) < 2 && began.elapsed() < NOT_STUCK {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(self.delay);
+            let out = op();
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            out
+        }
+    }
+
+    impl ReplicaDestination for Slow {
+        fn describe(&self) -> String {
+            "slow".to_owned()
+        }
+        fn put(&self, key: &str, body: &[u8]) -> Result<(), crate::replication::DestinationError> {
+            self.write(|| self.inner.put(key, body))
+        }
+        fn put_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), crate::replication::DestinationError> {
+            self.write(|| self.inner.put_file(key, path))
+        }
+        fn get(&self, key: &str) -> Result<Vec<u8>, crate::replication::DestinationError> {
+            self.inner.get(key)
+        }
+        fn get_to_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), crate::replication::DestinationError> {
+            self.inner.get_to_file(key, path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, crate::replication::DestinationError> {
+            self.inner.list(prefix)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::replication::DestinationError> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// A destination that stops the first write after `arm` until the
+    /// returned sender drops. It sends the key of that write.
+    struct Gate {
+        inner: FileDestination,
+        armed: AtomicBool,
+        reached: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl Gate {
+        fn new(dir: &Path) -> Self {
+            Self {
+                inner: FileDestination::new(dir).unwrap(),
+                armed: AtomicBool::new(false),
+                reached: Mutex::new(None),
+                release: Mutex::new(None),
+            }
+        }
+
+        fn arm(
+            &self,
+        ) -> (
+            std::sync::mpsc::Receiver<String>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *self.reached.lock().unwrap() = Some(reached_tx);
+            *self.release.lock().unwrap() = Some(release_rx);
+            self.armed.store(true, Ordering::SeqCst);
+            (reached_rx, release_tx)
+        }
+
+        fn stop(&self, key: &str) {
+            if !self.armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let reached = self.reached.lock().unwrap().take();
+            if let Some(reached) = reached {
+                let _ = reached.send(key.to_owned());
+            }
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    impl ReplicaDestination for Gate {
+        fn describe(&self) -> String {
+            "gate".to_owned()
+        }
+        fn put(&self, key: &str, body: &[u8]) -> Result<(), crate::replication::DestinationError> {
+            self.stop(key);
+            self.inner.put(key, body)
+        }
+        fn put_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), crate::replication::DestinationError> {
+            self.stop(key);
+            self.inner.put_file(key, path)
+        }
+        fn get(&self, key: &str) -> Result<Vec<u8>, crate::replication::DestinationError> {
+            self.inner.get(key)
+        }
+        fn get_to_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), crate::replication::DestinationError> {
+            self.inner.get_to_file(key, path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, crate::replication::DestinationError> {
+            self.inner.list(prefix)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::replication::DestinationError> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// A fleet that ships to `destination` with `workers` ship workers.
+    fn fleet_with(
+        tmp: &Path,
+        destination: Arc<dyn ReplicaDestination>,
+        workers: usize,
+    ) -> (DatabaseFleet, Arc<FleetReplication>) {
+        let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
+            mode: FleetMode::Tenant,
+            root: tmp.join("a").display().to_string(),
+            path: None,
+            max_open: 16,
+            max_resident_bytes: 0,
+            pool_size: 1,
+            create_on_demand: Some(true),
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
+            mmap_size: 0,
+            cache_size_kib: 0,
+        })
+        // A loaded CI runner can take more than 5 s to open a connection.
+        .connect_timeout_secs(60)
+        .build()
+        .unwrap();
+        let replication = Arc::new(
+            FleetReplication::new(
+                destination,
+                settings(),
+                Duration::from_secs(30),
+                false,
+                Arc::new(crate::time::SystemClock),
+            )
+            .with_ship_workers(workers),
+        );
+        assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
+        (fleet, replication)
+    }
+
+    const TENANTS: [&str; 8] = ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"];
+
+    /// Open each tenant and run `sql` on it.
+    async fn write_each(fleet: &DatabaseFleet, tenants: &[&str], sql: &str) {
+        for tenant in tenants {
+            let db = fleet.open_for(tenant).await.unwrap();
+            exec(&db, sql).await;
+        }
+    }
+
+    #[test]
+    fn a_fleet_ships_with_a_small_pool_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = FleetReplication::new(
+            Arc::new(FileDestination::new(tmp.path()).unwrap()),
+            settings(),
+            Duration::from_secs(30),
+            false,
+            Arc::new(crate::time::SystemClock),
+        );
+        assert_eq!(replication.ship_workers(), DEFAULT_SHIP_WORKERS);
+        assert_eq!(replication.with_ship_workers(0).ship_workers(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_ships_databases_in_parallel() {
+        for (workers, parallel) in [(1, false), (4, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let slow = Arc::new(Slow::new(
+                &tmp.path().join("replicas"),
+                Duration::from_millis(5),
+                parallel,
+            ));
+            let (fleet, replication) = fleet_with(
+                tmp.path(),
+                Arc::clone(&slow) as Arc<dyn ReplicaDestination>,
+                workers,
+            );
+            write_each(&fleet, &TENANTS, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+            tick(&replication).await;
+            let most = slow.most.load(Ordering::SeqCst);
+            if parallel {
+                assert!(most >= 2, "{workers} workers shipped one at a time");
+            } else {
+                assert_eq!(most, 1, "one worker ships one database at a time");
+            }
+            fleet.close_all().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_database_reopened_during_a_pass_is_replicated_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Gate::new(&tmp.path().join("replicas")));
+        let (fleet, replication) = fleet_with(
+            tmp.path(),
+            Arc::clone(&gate) as Arc<dyn ReplicaDestination>,
+            1,
+        );
+        let tenants = &TENANTS[..3];
+        write_each(&fleet, tenants, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&replication).await;
+        write_each(&fleet, tenants, "INSERT INTO notes VALUES ('next')").await;
+
+        // The pass stops in the first database it ships. The others wait.
+        let (reached, release) = gate.arm();
+        let pass = crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        });
+        let stopped = crate::time::spawn_blocking(move || reached.recv_timeout(NOT_STUCK))
+            .await
+            .unwrap()
+            .expect("the pass ships");
+        let waiting = tenants
+            .iter()
+            .find(|tenant| !stopped.contains(&format!("/tenant/{tenant}/")))
+            .unwrap();
+
+        // Close and reopen a database that the pass did not reach yet.
+        let key = fleet.key_for(waiting).unwrap();
+        fleet.close(&key).await;
+        let _db = fleet.open(&key).await.unwrap();
+        assert_eq!(
+            (replication.unowned(), replication.replicating()),
+            (0, 3),
+            "no other process has this volume: this process owns every database"
+        );
+
+        drop(release);
+        pass.await.unwrap();
+        fleet.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_pass_time_and_the_ship_workers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication) =
+            replicated_fleet(&tmp.path().join("a"), &tmp.path().join("replicas"), false);
+        fleet.open_for("acme").await.unwrap();
+        tick(&replication).await;
+        let output = replication.indicator().check().await;
+        assert_eq!(output.details["ship_workers"], DEFAULT_SHIP_WORKERS);
+        assert!(
+            output.details["last_pass_ms"].is_u64(),
+            "{:?}",
+            output.details
+        );
+        fleet.close_all().await;
+    }
+
+    #[test]
+    fn the_loop_starts_a_pass_once_per_interval() {
+        let interval = Duration::from_secs(1);
+        assert_eq!(pause_after(interval, Duration::ZERO), interval);
+        assert_eq!(
+            pause_after(interval, Duration::from_millis(300)),
+            Duration::from_millis(700)
+        );
+        // A pass that overran starts the next one at once.
+        assert_eq!(
+            pause_after(interval, Duration::from_secs(3)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_pass_takes_the_most_lagging_database_first() {
+        let at = |secs| DateTime::from_timestamp(secs, 0).unwrap();
+        let order = oldest_first(vec![
+            (FleetDbKey::Slot(1), at(30)),
+            (FleetDbKey::Slot(2), at(10)),
+            (FleetDbKey::Slot(3), at(20)),
+        ]);
+        assert_eq!(
+            order,
+            vec![
+                FleetDbKey::Slot(2),
+                FleetDbKey::Slot(3),
+                FleetDbKey::Slot(1)
+            ]
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_pass_order_is_every_database_once_oldest_first(
+            times in proptest::collection::vec(0_i64..1_000, 0..64)
+        ) {
+            let at = |secs| DateTime::from_timestamp(secs, 0).unwrap();
+            let entries: Vec<(FleetDbKey, DateTime<Utc>)> = times
+                .iter()
+                .enumerate()
+                .map(|(slot, secs)| (FleetDbKey::Slot(u16::try_from(slot).unwrap()), at(*secs)))
+                .collect();
+            let order = oldest_first(entries.clone());
+            let mut sorted = order.clone();
+            sorted.sort();
+            let mut keys: Vec<FleetDbKey> = entries.iter().map(|(key, _)| key.clone()).collect();
+            keys.sort();
+            proptest::prop_assert_eq!(sorted, keys, "every key once");
+            let when: HashMap<FleetDbKey, DateTime<Utc>> = entries.into_iter().collect();
+            for pair in order.windows(2) {
+                proptest::prop_assert!(when[&pair[0]] <= when[&pair[1]]);
+            }
+        }
+
+        #[test]
+        fn every_worker_count_visits_each_key_once(
+            keys in 0_usize..40,
+            workers in 1_usize..9,
+        ) {
+            let keys: Vec<FleetDbKey> = (0..keys)
+                .map(|slot| FleetDbKey::Slot(u16::try_from(slot).unwrap()))
+                .collect();
+            let seen = Mutex::new(Vec::new());
+            for_each_on(workers, &keys, |key| seen.lock().unwrap().push(key.clone()));
+            let mut seen = seen.into_inner().unwrap();
+            seen.sort();
+            let mut expected = keys;
+            expected.sort();
+            proptest::prop_assert_eq!(seen, expected);
+        }
+
+        #[test]
+        fn kept_generations_follow_their_model(
+            ops in proptest::collection::vec((0_u8..5, 0_u16..4, 0_u8..4), 0..48)
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let replication = kept_replication(tmp.path());
+            // The model: each kept key, and the next retry outcome of each.
+            let mut model: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+            let outcomes: HashMap<u16, Arc<Mutex<GenerationRetry>>> = (0..4)
+                .map(|slot| (slot, Arc::new(Mutex::new(GenerationRetry::Busy))))
+                .collect();
+            let mut flags: HashMap<u16, Arc<AtomicBool>> = HashMap::new();
+            // Retry calls of each slot: a dropped record is never retried.
+            let calls: HashMap<u16, Arc<AtomicU64>> =
+                (0..4).map(|slot| (slot, Arc::new(AtomicU64::new(0)))).collect();
+            for (op, slot, outcome) in ops {
+                let key = FleetDbKey::Slot(slot);
+                match op {
+                    // A failed close keeps it.
+                    0 => {
+                        let retired = Arc::new(AtomicBool::new(false));
+                        let next = Arc::clone(&outcomes[&slot]);
+                        let count = Arc::clone(&calls[&slot]);
+                        replication.keep_unshipped_generation(
+                            &key,
+                            UnshippedGeneration::new(
+                                PathBuf::from(format!("db-{slot}")),
+                                None,
+                                Arc::clone(&retired),
+                                None,
+                                Box::new(move || {
+                                    count.fetch_add(1, Ordering::SeqCst);
+                                    next.lock().unwrap().clone()
+                                }),
+                            ),
+                        );
+                        flags.insert(slot, retired);
+                        model.insert(slot);
+                    }
+                    // A ship of the open database.
+                    1 => {
+                        let mark = replication.generation_mark();
+                        replication.drop_unshipped_generation(&key, mark);
+                        model.remove(&slot);
+                    }
+                    // A delete or a restore.
+                    2 => {
+                        replication.release_unshipped_generation(&key);
+                        if model.contains(&slot) {
+                            proptest::prop_assert!(flags[&slot].load(Ordering::Acquire));
+                        }
+                        // A failed delete or restore puts it back.
+                        let replaced = outcome % 2 == 0;
+                        replication.settle_released_generation(&key, replaced);
+                        if replaced {
+                            model.remove(&slot);
+                        } else if model.contains(&slot) {
+                            proptest::prop_assert!(!flags[&slot].load(Ordering::Acquire));
+                        }
+                    }
+                    // Set the next retry outcome.
+                    3 => {
+                        *outcomes[&slot].lock().unwrap() = match outcome {
+                            0 => GenerationRetry::Shipped,
+                            1 => GenerationRetry::Retired,
+                            2 => GenerationRetry::Busy,
+                            _ => GenerationRetry::Failed("down".to_owned()),
+                        };
+                    }
+                    // One loop pass.
+                    _ => {
+                        let before: HashMap<u16, u64> = calls
+                            .iter()
+                            .map(|(slot, count)| (*slot, count.load(Ordering::SeqCst)))
+                            .collect();
+                        replication.tick_all();
+                        for (slot, count) in &calls {
+                            let made = count.load(Ordering::SeqCst) - before[slot];
+                            let expected = u64::from(model.contains(slot));
+                            proptest::prop_assert_eq!(made, expected, "one retry per kept key");
+                        }
+                        let gone: Vec<u16> = model
+                            .iter()
+                            .copied()
+                            .filter(|slot| matches!(
+                                *outcomes[slot].lock().unwrap(),
+                                GenerationRetry::Shipped | GenerationRetry::Retired
+                            ))
+                            .collect();
+                        for slot in gone {
+                            if matches!(*outcomes[&slot].lock().unwrap(), GenerationRetry::Retired) {
+                                proptest::prop_assert!(flags[&slot].load(Ordering::Acquire));
+                            }
+                            model.remove(&slot);
+                        }
+                    }
+                }
+                proptest::prop_assert_eq!(replication.unshipped_generations(), model.len());
+                let names: Vec<String> =
+                    model.iter().map(|slot| FleetDbKey::Slot(*slot).name()).collect();
+                proptest::prop_assert_eq!(replication.unshipped_generation_names(), names);
+            }
+        }
+    }
+
+    fn kept_replication(dir: &Path) -> FleetReplication {
+        FleetReplication::new(
+            Arc::new(FileDestination::new(dir.join("replicas")).unwrap()),
+            settings(),
+            Duration::from_secs(30),
+            false,
+            Arc::new(crate::time::SystemClock),
+        )
+    }
+
+    #[test]
+    fn a_busy_record_is_skipped_by_a_second_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = Arc::new(kept_replication(tmp.path()));
+        let key = FleetDbKey::Slot(1);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (go, leave) = std::sync::mpsc::channel::<()>();
+        let leave = Mutex::new(leave);
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&calls);
+        replication.keep_unshipped_generation(
+            &key,
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let _ = entered.send(());
+                    let _ = leave.lock().unwrap().recv_timeout(Duration::from_secs(30));
+                    GenerationRetry::Shipped
+                }),
+            ),
+        );
+        let first = {
+            let replication = Arc::clone(&replication);
+            std::thread::spawn(move || replication.tick_all())
+        };
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The first pass holds the record: this pass skips it.
+        replication.tick_all();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        go.send(()).unwrap();
+        first.join().unwrap();
+        assert_eq!(replication.unshipped_generations(), 0);
+    }
+
+    #[test]
+    fn a_ship_drops_only_a_record_kept_before_it_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = kept_replication(tmp.path());
+        let key = FleetDbKey::Slot(1);
+        let record = || {
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(|| GenerationRetry::Busy),
+            )
+        };
+        replication.keep_unshipped_generation(&key, record());
+        let mark = replication.generation_mark();
+        // A reopen and a second close during the ship keep a new record.
+        replication.keep_unshipped_generation(&key, record());
+        replication.drop_unshipped_generation(&key, mark);
+        assert_eq!(
+            replication.unshipped_generations(),
+            1,
+            "the ship does not hold the writes of the later close"
+        );
+        let later = replication.generation_mark();
+        replication.drop_unshipped_generation(&key, later);
+        assert_eq!(replication.unshipped_generations(), 0);
+    }
+
+    #[test]
+    fn a_panicking_retry_keeps_the_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = kept_replication(tmp.path());
+        replication.keep_unshipped_generation(
+            &FleetDbKey::Slot(1),
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(|| panic!("a broken retry")),
+            ),
+        );
+        replication.tick_all();
+        assert_eq!(replication.unshipped_generations(), 1);
+    }
+
+    #[test]
+    fn health_names_each_kept_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = kept_replication(tmp.path());
+        replication.keep_unshipped_generation(
+            &FleetDbKey::Slot(2),
+            UnshippedGeneration::new(
+                PathBuf::from("db"),
+                Some(3),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Box::new(|| GenerationRetry::Failed("down".to_owned())),
+            ),
+        );
+        let details = replication.health().details;
+        assert_eq!(
+            details["unshipped"],
+            serde_json::json!([FleetDbKey::Slot(2).name()])
+        );
+        assert_eq!(
+            details["closing"], 0,
+            "a kept generation is not a parked replicator"
+        );
+    }
+
+    // ── replicated_through ──────────────────────────────────────────────────
+
+    /// A clock a test sets, back as well as forward.
+    struct SetClock(Mutex<DateTime<Utc>>);
+
+    impl SetClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(
+                DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            )))
+        }
+
+        fn advance(&self, secs: i64) {
+            *self.0.lock().unwrap() += chrono::Duration::seconds(secs);
+        }
+    }
+
+    impl ClockSource for SetClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// A fleet on `clock`, with no poll: only a wake-up ends a wait early.
+    fn clocked_fleet(tmp: &Path, clock: &Arc<SetClock>) -> (DatabaseFleet, Arc<FleetReplication>) {
+        replicated_fleet_on(
+            &tmp.join("fleet"),
+            &tmp.join("replicas"),
+            false,
+            0,
+            Arc::clone(clock) as Arc<dyn ClockSource>,
+            |mut replication| {
+                replication.wait_poll = Duration::from_hours(1);
+                replication
+            },
+        )
+    }
+
+    /// The system clock after a commit, and a wait until it moves past that
+    /// reading. A coarse clock then cannot give the next tick the same value.
+    fn wall_after_commit() -> DateTime<Utc> {
+        let at = crate::time::ClockSource::now(&crate::time::SystemClock);
+        while crate::time::ClockSource::now(&crate::time::SystemClock) <= at {
+            std::thread::yield_now();
+        }
+        at
+    }
+
+    #[tokio::test]
+    async fn replicated_through_covers_a_commit_once_a_tick_ships_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(replication.replicated_through(&key), None, "no tick yet");
+
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('one')").await;
+        let committed_at = clock.now();
+        tick(&replication).await;
+        assert!(
+            replication
+                .replicated_through(&key)
+                .is_none_or(|through| through < committed_at),
+            "a reading equal to the commit time does not cover it"
+        );
+        clock.advance(1);
+        tick(&replication).await;
+        let through = replication.replicated_through(&key).expect("caught up");
+        assert!(through >= committed_at, "{through} < {committed_at}");
+        assert_eq!(fleet.replicated_through(&key), Some(through));
+        fleet
+            .wait_replicated(&key, committed_at, Duration::ZERO)
+            .await
+            .expect("already covered: no wait");
+        assert!(matches!(
+            fleet
+                .wait_replicated(&fleet.key_for("other").unwrap(), committed_at, NOT_STUCK)
+                .await,
+            Err(ReplicatedWaitError::NotReplicating { .. })
+        ));
+        drop(db);
+        fleet.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_closed_database_keeps_its_last_bound_until_it_opens_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('last')").await;
+        let committed_at = clock.now();
+        clock.advance(1);
+
+        // The close ships the last commit. A waiter learns it from the bound.
+        drop(db);
+        fleet.close(&key).await;
+        let through = replication
+            .replicated_through(&key)
+            .expect("closed, caught up");
+        assert!(through >= committed_at);
+        replication
+            .wait_replicated(&key, committed_at, Duration::ZERO)
+            .await
+            .expect("the close shipped it");
+
+        // A new open answers from its own replicator.
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(replication.replicated_through(&key), None);
+        clock.advance(1);
+        tick(&replication).await;
+        assert!(replication.replicated_through(&key) > Some(through));
+
+        // A delete voids the bound.
+        drop(db);
+        assert!(fleet.delete(&key).await.unwrap());
+        assert_eq!(replication.replicated_through(&key), None);
+        assert!(matches!(
+            replication
+                .wait_replicated(&key, committed_at, NOT_STUCK)
+                .await,
+            Err(ReplicatedWaitError::NotReplicating { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_pass_drops_a_closed_bound_after_an_hour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        clock.advance(1);
+        drop(db);
+        fleet.close(&key).await;
+        assert!(replication.replicated_through(&key).is_some());
+        clock.advance(3599);
+        tick(&replication).await;
+        assert!(replication.replicated_through(&key).is_some(), "not yet");
+        clock.advance(2);
+        tick(&replication).await;
+        assert_eq!(replication.replicated_through(&key), None, "pruned");
+    }
+
+    #[tokio::test]
+    async fn a_bound_above_the_clock_is_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&replication).await;
+        assert!(replication.replicated_through(&key).is_some());
+        // The clock steps back. A commit now would be read below the bound.
+        clock.advance(-10);
+        assert_eq!(replication.replicated_through(&key), None);
+        clock.advance(20);
+        assert!(replication.replicated_through(&key).is_some());
+        drop(db);
+        fleet.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_database_another_process_replicates_has_no_bound_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let db_a = a.open(&key).await.unwrap();
+        let _db_b = b.open(&key).await.unwrap();
+        exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&ra).await;
+        tick(&rb).await;
+        assert!(ra.replicated_through(&key).is_some(), "A owns it");
+        assert_eq!(rb.replicated_through(&key), None, "B does not");
+        let waited = rb
+            .wait_replicated(&key, wall_after_commit(), Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(
+                waited,
+                Err(ReplicatedWaitError::TimedOut { through: None, .. })
+            ),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_replica_answers_until_it_retires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        flaky.down.store(false, Ordering::SeqCst);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&replication).await;
+        let before = replication.replicated_through(&key).expect("caught up");
+
+        // The close cannot ship the last commit: the replicator parks.
+        flaky.down.store(true, Ordering::SeqCst);
+        exec(&db, "INSERT INTO notes VALUES ('late')").await;
+        let committed_at = wall_after_commit();
+        drop(db);
+        fleet.close(&key).await;
+        assert_eq!(replication.closing(), 1);
+        assert_eq!(
+            replication.replicated_through(&key),
+            Some(before),
+            "a parked replica still answers"
+        );
+
+        // The destination comes back. The pass ships the tail, retires the
+        // replicator, and keeps its last bound.
+        flaky.down.store(false, Ordering::SeqCst);
+        let waiter = {
+            let replication = Arc::clone(&replication);
+            let key = key.clone();
+            tokio::spawn(async move {
+                replication
+                    .wait_replicated(&key, committed_at, NOT_STUCK)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        tick(&replication).await;
+        assert_eq!(replication.closing(), 0);
+        waiter
+            .await
+            .unwrap()
+            .expect("the retired replica shipped the commit");
+        let through = replication.replicated_through(&key).expect("kept at close");
+        assert!(through >= committed_at, "{through} < {committed_at}");
+    }
+
+    #[tokio::test]
+    async fn a_tick_wakes_a_waiter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&replication).await;
+        exec(&db, "INSERT INTO notes VALUES ('one')").await;
+        let committed_at = clock.now();
+        clock.advance(1);
+
+        // No tick: the wait times out and names the bound it saw.
+        let waited = replication
+            .wait_replicated(&key, committed_at, Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(
+                &waited,
+                Err(ReplicatedWaitError::TimedOut { through: Some(through), .. })
+                    if *through < committed_at
+            ),
+            "{waited:?}"
+        );
+
+        // The poll is an hour: only the wake-up of the pass ends this wait.
+        let ticker = {
+            let replication = Arc::clone(&replication);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                replication.tick_all();
+            })
+        };
+        replication
+            .wait_replicated(&key, committed_at, NOT_STUCK)
+            .await
+            .expect("the pass covers the commit and wakes the wait");
+        ticker.join().unwrap();
+        drop(db);
+        fleet.close_all().await;
     }
 }

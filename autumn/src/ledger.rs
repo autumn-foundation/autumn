@@ -2366,6 +2366,7 @@ pub fn ensure_snapshot_recoverable(
 /// this, because the clock and the two instants come back as different SQL
 /// types on each tier.
 #[cfg(feature = "db")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ChainState {
     db_now: DateTime<Utc>,
     head_seq: Option<i64>,
@@ -2584,22 +2585,6 @@ async fn read_chain_state(
     }
 }
 
-/// Append one [`LedgerRevision`] inside the caller's already-open transaction,
-/// so the revision and the row it describes commit together or not at all.
-///
-/// The append is a read-then-write: [`read_chain_state`] reads the record's
-/// chain head, its high-water mark and the database's clock, then two
-/// statements insert the revision and raise the mark. All of them run under the
-/// write transaction's row lock on the record, and the migration's
-/// `(table_name, COALESCE(tenant_id, ''), record_id, seq)` unique index turns
-/// any race that slips past that lock into a hard error rather than a silently
-/// forked chain.
-///
-/// # Errors
-///
-/// Returns [`LedgerError::ChainUnreadable`] when the chain state cannot be read
-/// or disagrees with its high-water mark in a way that appending would erase
-/// (see the inline rules), and the database error when either write fails.
 /// The revision INSERT.
 ///
 /// `$8` is bound as TEXT, not cast to `jsonb`: `jsonb` parses each number into
@@ -2659,43 +2644,48 @@ type Instant = diesel::sql_types::Timestamptz;
 #[cfg(all(feature = "db", feature = "sqlite"))]
 type Instant = diesel::sql_types::TimestamptzSqlite;
 
+/// A revision that [`plan_revision`] has numbered, linked and hashed.
 #[cfg(feature = "db")]
-#[doc(hidden)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the #2323 high-water cross-checks, the sequence allocation and the \
-              transaction-time clamp are one indivisible decision: each rule's \
-              rationale is stated where it is enforced, and splitting them would \
-              scatter the argument for why an append is allowed to proceed"
-)]
-pub async fn append_revision(
-    conn: &mut crate::db::RuntimeConnection,
-    append: LedgerAppend<'_>,
-) -> crate::AutumnResult<()> {
-    use diesel::sql_types::{BigInt, Nullable, Text};
-    use diesel_async::RunQueryDsl;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedRevision {
+    seq: i64,
+    prev_hash: Option<String>,
+    recorded_at: DateTime<Utc>,
+    valid_from: DateTime<Utc>,
+    hash: String,
+    /// The canonical snapshot text that `hash` covers.
+    snapshot: String,
+}
 
-    let LedgerAppend {
-        table_name,
-        tenant_id,
-        record_id,
-        op,
-        actor,
-        request_id,
-        snapshot,
-        valid_from,
-    } = append;
+#[cfg(feature = "db")]
+impl ChainState {
+    /// The state the database holds after `planned` is written: the new
+    /// revision is the head, and the mark names it. The clock read stays.
+    fn after(&self, planned: &PlannedRevision) -> Self {
+        Self {
+            db_now: self.db_now,
+            head_seq: Some(planned.seq),
+            head_hash: Some(planned.hash.clone()),
+            head_recorded_at: Some(planned.recorded_at),
+            mark_seq: Some(planned.seq),
+            mark_hash: Some(planned.hash.clone()),
+            mark_recorded_at: Some(planned.recorded_at),
+        }
+    }
+}
 
-    let unreadable = |detail: String| {
-        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
-            table: table_name.to_string(),
-            record_id,
-            detail,
-        })
-    };
-
-    let state = read_chain_state(conn, table_name, record_id, tenant_id).await?;
-
+/// Decide the next revision of a record from its chain `state`. Pure.
+///
+/// This function holds every #2323 write-path guard, the sequence allocation,
+/// the clock clamp and the hash. [`append_revision`] and [`append_revisions`] both call
+/// it, so the two paths cannot drift.
+///
+/// # Errors
+///
+/// Returns why the append must not proceed. The caller wraps it in
+/// [`LedgerError::ChainUnreadable`].
+#[cfg(feature = "db")]
+fn plan_revision(state: &ChainState, append: &LedgerAppend<'_>) -> Result<PlannedRevision, String> {
     // #2323: the mark is cross-checked on the write path too, not only by
     // `ledger_verify`. Without this the append is a free repair — delete the newest
     // revision and the mark, wait for ordinary traffic, and the append would re-create
@@ -2718,13 +2708,13 @@ pub async fn append_revision(
     //     seq 1, which `verify` reports as a `MissingRevision` forever. Allow — bricking
     //     the record would buy no evidence that is not already permanent.
     if state.head_seq.is_some() && state.mark_seq.is_none() {
-        return Err(unreadable(
+        return Err(
             "the record has revisions but no high-water mark; the mark that makes a \
              deleted revision permanent evidence is itself missing. Appending here \
              would re-create it over whatever is left. Run `ledger_verify` and \
              re-apply the high-water migration's backfill once you know what happened"
                 .to_string(),
-        ));
+        );
     }
     // A mark names a real revision, so its sequence number starts at 1. Below
     // that it contributes nothing to the `max` below — the append would allocate
@@ -2735,13 +2725,13 @@ pub async fn append_revision(
     // this is the second lock on the same door, for a database whose constraint
     // was dropped.
     if state.mark_seq.is_some_and(|seq| seq < 1) {
-        return Err(unreadable(
+        return Err(
             "the record's high-water mark carries a sequence number below 1, which \
              names no revision. Appending would allocate as though the mark were \
              absent and then overwrite it — run `ledger_verify`, and check whether \
              the mark table's CHECK constraint is still in place"
                 .to_string(),
-        ));
+        );
     }
     // Deliberately the same condition `head_versus_mark` reports
     // `HighWaterMismatch` on, `recorded_at` included. Anything verify calls a
@@ -2753,13 +2743,13 @@ pub async fn append_revision(
         && (state.mark_hash.as_deref() != state.head_hash.as_deref()
             || state.mark_recorded_at != state.head_recorded_at)
     {
-        return Err(unreadable(
+        return Err(
             "the high-water mark and the chain head carry the same sequence number \
              but describe different revisions; one of the two was rewritten out of \
              band. Appending here would settle the disagreement in the writer's \
              favour and erase it — run `ledger_verify` instead"
                 .to_string(),
-        ));
+        );
     }
 
     // The sequence number is allocated from the greater of the surviving chain
@@ -2772,15 +2762,15 @@ pub async fn append_revision(
         // Saturating here would allocate `i64::MAX` a second time and fail on
         // the chain unique index with an opaque constraint error, once per
         // attempt, forever. Say what actually happened.
-        return Err(unreadable(
+        return Err(
             "the record's chain is at i64::MAX and cannot be continued; no further \
              revision can be numbered"
                 .to_string(),
-        ));
+        );
     }
     let seq: i64 = seq_base.saturating_add(1);
     // The chain still links to the revision that is actually there.
-    let prev_hash: Option<String> = state.head_hash;
+    let prev_hash: Option<String> = state.head_hash.clone();
 
     // Transaction time, sourced from the database rather than this host's clock
     // and clamped so it can never precede the revision it follows. Truncated to
@@ -2801,60 +2791,696 @@ pub async fn append_revision(
         state.head_recorded_at
     };
     let recorded_at = monotonic_recorded_at(state.db_now, floor).ok_or_else(|| {
-        unreadable(format!(
+        format!(
             "the record's transaction-time floor is more than {LEDGER_MAX_CLOCK_SKEW_SECS}s \
              ahead of the database's own clock; writing behind it would hash that instant \
              into the chain and make every as-of query miss the revision. Refusing rather \
              than ratcheting",
-        ))
+        )
     })?;
     // Valid time: the model's own instant when it declares one, else the
     // transaction time (the fact became true when the database learned it).
-    let valid_from = valid_from.map_or(recorded_at, truncate_to_micros);
+    let valid_from = append.valid_from.map_or(recorded_at, truncate_to_micros);
 
     let hash: String = revision_hash(&RevisionHashInput {
         prev_hash: prev_hash.as_deref(),
-        table_name,
-        tenant_id,
-        record_id,
+        table_name: append.table_name,
+        tenant_id: append.tenant_id,
+        record_id: append.record_id,
         seq,
-        op,
-        actor,
-        request_id,
-        snapshot: &snapshot,
+        op: append.op,
+        actor: append.actor,
+        request_id: append.request_id,
+        snapshot: &append.snapshot,
         valid_from,
         recorded_at,
     });
-    let snapshot_str: String = canonical_json(&snapshot);
+    Ok(PlannedRevision {
+        seq,
+        prev_hash,
+        recorded_at,
+        valid_from,
+        hash,
+        snapshot: canonical_json(&append.snapshot),
+    })
+}
+
+/// The chain of one record: its id and its tenant key, `COALESCE(tenant_id, '')`
+/// as the unique index has it.
+#[cfg(feature = "db")]
+type ChainKey = (i64, String);
+
+#[cfg(feature = "db")]
+fn chain_key(append: &LedgerAppend<'_>) -> ChainKey {
+    (append.record_id, append.tenant_id.unwrap_or("").to_owned())
+}
+
+/// Plan a batch in input order (#3345). Pure.
+///
+/// `states` holds the chain state that the database read for each key. A key
+/// that occurs again starts from the state its previous append leaves, so the
+/// batch makes the chain that one append after the other makes.
+///
+/// # Errors
+///
+/// The index of the first append that must not proceed, and why.
+#[cfg(feature = "db")]
+fn plan_revisions(
+    states: &std::collections::HashMap<ChainKey, ChainState>,
+    appends: &[LedgerAppend<'_>],
+) -> Result<Vec<PlannedRevision>, (usize, String)> {
+    let mut folded: std::collections::HashMap<ChainKey, ChainState> =
+        std::collections::HashMap::new();
+    let mut planned = Vec::with_capacity(appends.len());
+    for (index, append) in appends.iter().enumerate() {
+        let key = chain_key(append);
+        let state = folded
+            .get(&key)
+            .or_else(|| states.get(&key))
+            .ok_or_else(|| {
+                (
+                    index,
+                    "the chain state of the record was not read".to_string(),
+                )
+            })?;
+        let revision = plan_revision(state, append).map_err(|detail| (index, detail))?;
+        let next = state.after(&revision);
+        folded.insert(key, next);
+        planned.push(revision);
+    }
+    Ok(planned)
+}
+
+/// Append one [`LedgerRevision`] inside the caller's already-open transaction,
+/// so the revision and the row it describes commit together or not at all.
+///
+/// The append is a read-then-write: [`read_chain_state`] reads the record's
+/// chain head, its high-water mark and the database's clock, then two
+/// statements insert the revision and raise the mark. All of them run under the
+/// write transaction's row lock on the record, and the migration's
+/// `(table_name, COALESCE(tenant_id, ''), record_id, seq)` unique index turns
+/// any race that slips past that lock into a hard error rather than a silently
+/// forked chain.
+///
+/// [`plan_revision`] holds the guards. A bulk write uses [`append_revisions`].
+///
+/// # Errors
+///
+/// Returns [`LedgerError::ChainUnreadable`] when the chain state cannot be read
+/// or disagrees with its high-water mark in a way that appending would erase
+/// (see the inline rules), and the database error when either write fails.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn append_revision(
+    conn: &mut crate::db::RuntimeConnection,
+    append: LedgerAppend<'_>,
+) -> crate::AutumnResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    let state =
+        read_chain_state(conn, append.table_name, append.record_id, append.tenant_id).await?;
+    let planned = plan_revision(&state, &append).map_err(|detail| {
+        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: append.table_name.to_string(),
+            record_id: append.record_id,
+            detail,
+        })
+    })?;
 
     diesel::sql_query(REVISION_INSERT_SQL)
-        .bind::<Text, _>(table_name)
-        .bind::<Nullable<Text>, _>(tenant_id)
-        .bind::<BigInt, _>(record_id)
-        .bind::<BigInt, _>(seq)
-        .bind::<Text, _>(op.as_str())
-        .bind::<Text, _>(actor)
-        .bind::<Nullable<Text>, _>(request_id)
-        .bind::<Text, _>(snapshot_str)
-        .bind::<Instant, _>(valid_from)
-        .bind::<Instant, _>(recorded_at)
-        .bind::<Nullable<Text>, _>(prev_hash.as_deref())
-        .bind::<Text, _>(hash.as_str())
-        .execute(conn)
+        .bind::<Text, _>(append.table_name)
+        .bind::<Nullable<Text>, _>(append.tenant_id)
+        .bind::<BigInt, _>(append.record_id)
+        .bind::<BigInt, _>(planned.seq)
+        .bind::<Text, _>(append.op.as_str())
+        .bind::<Text, _>(append.actor)
+        .bind::<Nullable<Text>, _>(append.request_id)
+        .bind::<Text, _>(planned.snapshot.as_str())
+        .bind::<Instant, _>(planned.valid_from)
+        .bind::<Instant, _>(planned.recorded_at)
+        .bind::<Nullable<Text>, _>(planned.prev_hash.as_deref())
+        .bind::<Text, _>(planned.hash.as_str())
+        .execute(&mut *conn)
         .await
         .map_err(crate::AutumnError::from)?;
 
     diesel::sql_query(HIGH_WATER_UPSERT_SQL)
-        .bind::<Text, _>(table_name)
-        .bind::<Nullable<Text>, _>(tenant_id)
-        .bind::<BigInt, _>(record_id)
-        .bind::<BigInt, _>(seq)
-        .bind::<Text, _>(hash.as_str())
-        .bind::<Instant, _>(recorded_at)
+        .bind::<Text, _>(append.table_name)
+        .bind::<Nullable<Text>, _>(append.tenant_id)
+        .bind::<BigInt, _>(append.record_id)
+        .bind::<BigInt, _>(planned.seq)
+        .bind::<Text, _>(planned.hash.as_str())
+        .bind::<Instant, _>(planned.recorded_at)
         .execute(conn)
         .await
         .map_err(crate::AutumnError::from)?;
 
+    Ok(())
+}
+
+/// Ids for each reload query of a bulk write (#3345).
+#[doc(hidden)]
+pub const RELOAD_CHUNK: usize = 1000;
+
+/// What a bulk write collects for one ledger revision before it reloads the
+/// row (#3345). The generated code fills it.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct LedgerPending<'a> {
+    /// The record's tenant as the write path holds it.
+    pub tenant_id: Option<&'a str>,
+    /// For an update or restore: the tenant before the write. The append
+    /// refuses a change.
+    pub before_tenant_id: Option<Option<&'a str>>,
+    /// Refuse a non-finite float in the reloaded row.
+    pub check_non_finite: bool,
+    /// Take the valid time from the model. `false` for a delete or restore.
+    pub model_valid_time: bool,
+}
+
+/// [`read_chain_state`] for many records of one table (#3345).
+///
+/// Postgres sends one statement. `SQLite` sends one statement for each chunk
+/// of keys below [`crate::repository::MAX_BIND_PARAMS`].
+#[cfg(feature = "db")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one backend-forked statement, as `read_chain_state`"
+)]
+async fn read_chain_states(
+    conn: &mut crate::db::RuntimeConnection,
+    table_name: &str,
+    keys: &[(i64, Option<&str>)],
+) -> crate::AutumnResult<std::collections::HashMap<ChainKey, ChainState>> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    let unreadable = |record_id: i64, detail: String| {
+        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: table_name.to_string(),
+            record_id,
+            detail,
+        })
+    };
+    let mut states = std::collections::HashMap::with_capacity(keys.len());
+
+    #[cfg(not(feature = "sqlite"))]
+    {
+        use diesel::sql_types::{Array, Timestamptz};
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = BigInt)]
+            ord: i64,
+            #[diesel(sql_type = Timestamptz)]
+            db_now: DateTime<Utc>,
+            #[diesel(sql_type = Nullable<BigInt>)]
+            head_seq: Option<i64>,
+            #[diesel(sql_type = Nullable<Text>)]
+            head_hash: Option<String>,
+            #[diesel(sql_type = Nullable<Timestamptz>)]
+            head_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<BigInt>)]
+            mark_seq: Option<i64>,
+            #[diesel(sql_type = Nullable<Text>)]
+            mark_hash: Option<String>,
+            #[diesel(sql_type = Nullable<Timestamptz>)]
+            mark_recorded_at: Option<DateTime<Utc>>,
+        }
+
+        let rows: Vec<Row> = diesel::sql_query(CHAIN_STATES_SQL)
+            .bind::<Text, _>(table_name)
+            .bind::<Array<BigInt>, _>(keys.iter().map(|k| k.0).collect::<Vec<_>>())
+            .bind::<Array<Nullable<Text>>, _>(keys.iter().map(|k| k.1).collect::<Vec<_>>())
+            .load(conn)
+            .await
+            .map_err(crate::AutumnError::from)?;
+        for row in rows {
+            let key = usize::try_from(row.ord - 1)
+                .ok()
+                .and_then(|index| keys.get(index))
+                .ok_or_else(|| {
+                    unreadable(
+                        keys.first().map_or(0, |k| k.0),
+                        format!("the chain-state read returned an unknown key {}", row.ord),
+                    )
+                })?;
+            states.insert(
+                (key.0, key.1.unwrap_or("").to_owned()),
+                ChainState {
+                    db_now: row.db_now,
+                    head_seq: row.head_seq,
+                    head_hash: row.head_hash,
+                    head_recorded_at: row.head_recorded_at,
+                    mark_seq: row.mark_seq,
+                    mark_hash: row.mark_hash,
+                    mark_recorded_at: row.mark_recorded_at,
+                },
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    {
+        use diesel::sql_types::TimestamptzSqlite;
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = BigInt)]
+            ord: i64,
+            #[diesel(sql_type = Text)]
+            db_now: String,
+            #[diesel(sql_type = Nullable<BigInt>)]
+            head_seq: Option<i64>,
+            #[diesel(sql_type = Nullable<Text>)]
+            head_hash: Option<String>,
+            #[diesel(sql_type = Nullable<TimestamptzSqlite>)]
+            head_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<BigInt>)]
+            mark_seq: Option<i64>,
+            #[diesel(sql_type = Nullable<Text>)]
+            mark_hash: Option<String>,
+            #[diesel(sql_type = Nullable<TimestamptzSqlite>)]
+            mark_recorded_at: Option<DateTime<Utc>>,
+        }
+
+        // Three binds for each key, then three for the table name.
+        let per_chunk = (crate::repository::MAX_BIND_PARAMS - 3) / 3;
+        for (chunk_index, chunk) in keys.chunks(per_chunk).enumerate() {
+            let sql = format!(
+                "WITH __keys(ord, record_id, tenant_key) AS (VALUES {}) \
+                 SELECT __keys.ord AS ord, \
+                        strftime('%Y-%m-%d %H:%M:%f', 'now') AS db_now, \
+                        __head.seq AS head_seq, \
+                        __head.hash AS head_hash, \
+                        __head.recorded_at AS head_recorded_at, \
+                        __mark.high_seq AS mark_seq, \
+                        __mark.head_hash AS mark_hash, \
+                        __mark.recorded_at AS mark_recorded_at \
+                 FROM __keys \
+                 LEFT JOIN _autumn_ledger_revisions AS __head \
+                 ON __head.table_name = ? AND __head.record_id = __keys.record_id \
+                 AND COALESCE(__head.tenant_id, '') = __keys.tenant_key \
+                 AND __head.seq = ( \
+                     SELECT MAX(seq) FROM _autumn_ledger_revisions \
+                     WHERE table_name = ? AND record_id = __keys.record_id \
+                     AND COALESCE(tenant_id, '') = __keys.tenant_key \
+                 ) \
+                 LEFT JOIN _autumn_ledger_high_water AS __mark \
+                 ON __mark.table_name = ? AND __mark.record_id = __keys.record_id \
+                 AND __mark.tenant_key = __keys.tenant_key",
+                vec!["(?, ?, ?)"; chunk.len()].join(", ")
+            );
+            let base = chunk_index * per_chunk;
+            let mut query = diesel::sql_query(sql).into_boxed();
+            for (offset, key) in chunk.iter().enumerate() {
+                let ord = i64::try_from(base + offset)
+                    .map_err(|_| unreadable(key.0, "the batch has too many records".to_string()))?;
+                query = query
+                    .bind::<BigInt, _>(ord)
+                    .bind::<BigInt, _>(key.0)
+                    .bind::<Text, _>(key.1.unwrap_or(""));
+            }
+            for _ in 0..3 {
+                query = query.bind::<Text, _>(table_name);
+            }
+            let rows: Vec<Row> = query
+                .load(&mut *conn)
+                .await
+                .map_err(crate::AutumnError::from)?;
+            for row in rows {
+                let key = usize::try_from(row.ord)
+                    .ok()
+                    .and_then(|index| keys.get(index))
+                    .ok_or_else(|| {
+                        unreadable(
+                            keys.first().map_or(0, |k| k.0),
+                            format!("the chain-state read returned an unknown key {}", row.ord),
+                        )
+                    })?;
+                let db_now = parse_sqlite_instant(&row.db_now).ok_or_else(|| {
+                    unreadable(
+                        key.0,
+                        format!(
+                            "the database clock read back as {:?}, which is not the encoding \
+                             the ledger expects",
+                            row.db_now,
+                        ),
+                    )
+                })?;
+                states.insert(
+                    (key.0, key.1.unwrap_or("").to_owned()),
+                    ChainState {
+                        db_now,
+                        head_seq: row.head_seq,
+                        head_hash: row.head_hash,
+                        head_recorded_at: row.head_recorded_at,
+                        mark_seq: row.mark_seq,
+                        mark_hash: row.mark_hash,
+                        mark_recorded_at: row.mark_recorded_at,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(states)
+}
+
+/// Postgres form of the batched chain-state read (#3345).
+///
+/// One row for each key, numbered from 1 in input order. The `LATERAL` head
+/// lookup uses the chain unique index, as the single-record read does.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const CHAIN_STATES_SQL: &str = "SELECT __keys.ord AS ord, \
+            clock_timestamp() AS db_now, \
+            __head.seq AS head_seq, \
+            __head.hash AS head_hash, \
+            __head.recorded_at AS head_recorded_at, \
+            __mark.high_seq AS mark_seq, \
+            __mark.head_hash AS mark_hash, \
+            __mark.recorded_at AS mark_recorded_at \
+     FROM unnest($2::int8[], $3::text[]) WITH ORDINALITY AS __keys(record_id, tenant_id, ord) \
+     LEFT JOIN LATERAL ( \
+         SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions \
+         WHERE table_name = $1 AND record_id = __keys.record_id \
+         AND COALESCE(tenant_id, '') = COALESCE(__keys.tenant_id, '') \
+         ORDER BY seq DESC LIMIT 1 \
+     ) AS __head ON TRUE \
+     LEFT JOIN _autumn_ledger_high_water AS __mark \
+     ON __mark.table_name = $1 AND __mark.record_id = __keys.record_id \
+     AND __mark.tenant_key = COALESCE(__keys.tenant_id, '')";
+
+/// Postgres form of the batched revision INSERT (#3345).
+///
+/// The snapshot stays TEXT, as in [`REVISION_INSERT_SQL`]. `ORDER BY u.ord`
+/// gives the rows their ids in input order.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const REVISIONS_INSERT_SQL: &str = "INSERT INTO _autumn_ledger_revisions \
+     (table_name, tenant_id, record_id, seq, op, actor, request_id, \
+      snapshot, valid_from, recorded_at, prev_hash, hash) \
+     SELECT $1, u.tenant_id, u.record_id, u.seq, u.op, u.actor, u.request_id, \
+            u.snapshot, u.valid_from, u.recorded_at, u.prev_hash, u.hash \
+     FROM unnest($2::text[], $3::int8[], $4::int8[], $5::text[], $6::text[], $7::text[], \
+                 $8::text[], $9::timestamptz[], $10::timestamptz[], $11::text[], $12::text[]) \
+     WITH ORDINALITY AS u(tenant_id, record_id, seq, op, actor, request_id, snapshot, \
+          valid_from, recorded_at, prev_hash, hash, ord) \
+     ORDER BY u.ord";
+
+/// Postgres form of the batched high-water upsert (#3345).
+///
+/// Same monotonic guard as [`HIGH_WATER_UPSERT_SQL`]. Each key occurs one
+/// time: Postgres refuses to update one row two times in one statement.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const HIGH_WATER_UPSERT_MANY_SQL: &str = "INSERT INTO _autumn_ledger_high_water \
+     (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+     SELECT $1, COALESCE(u.tenant_id, ''), u.record_id, u.seq, u.hash, u.recorded_at \
+     FROM unnest($2::text[], $3::int8[], $4::int8[], $5::text[], $6::timestamptz[]) \
+     AS u(tenant_id, record_id, seq, hash, recorded_at) \
+     ON CONFLICT (table_name, tenant_key, record_id) DO UPDATE SET \
+     high_seq = EXCLUDED.high_seq, \
+     head_hash = EXCLUDED.head_hash, \
+     recorded_at = EXCLUDED.recorded_at \
+     WHERE _autumn_ledger_high_water.high_seq < EXCLUDED.high_seq";
+
+/// Append the revisions of one bulk write inside the caller's transaction
+/// (#3345).
+///
+/// One chain-state read, one revision INSERT and one high-water upsert for the
+/// batch on Postgres. `SQLite` sends one of each for each chunk of rows below
+/// [`crate::repository::MAX_BIND_PARAMS`]. Before, each row sent 3.
+///
+/// [`plan_revisions`] plans the batch in input order. A record that occurs
+/// two or more times gets one chain, as from one [`append_revision`] after
+/// the other. All appends must name one table.
+///
+/// # Errors
+///
+/// When one append fails a guard, no revision is written and the error is
+/// [`LedgerError::ChainUnreadable`] for the first such append, with the text
+/// of [`append_revision`]. Returns the database error when a statement fails.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn append_revisions(
+    conn: &mut crate::db::RuntimeConnection,
+    appends: Vec<LedgerAppend<'_>>,
+) -> crate::AutumnResult<()> {
+    let Some(first) = appends.first() else {
+        return Ok(());
+    };
+    let table_name = first.table_name;
+    let planned = plan_batch(conn, &appends).await?;
+
+    // The last revision of each chain raises its mark.
+    let mut last: std::collections::HashMap<ChainKey, usize> =
+        std::collections::HashMap::with_capacity(appends.len());
+    for (index, append) in appends.iter().enumerate() {
+        last.insert(chain_key(append), index);
+    }
+    let mut marks: Vec<usize> = last.into_values().collect();
+    marks.sort_unstable();
+
+    write_revisions(conn, table_name, &appends, &planned, &marks).await
+}
+
+/// Return the first error of a bulk write in input order (#3345). Writes
+/// nothing.
+///
+/// `error` is the model check that failed on the row after `appends`. When a
+/// chain guard refuses one of `appends`, that error comes first, as in the
+/// per-row path.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn first_batch_error(
+    conn: &mut crate::db::RuntimeConnection,
+    appends: Vec<LedgerAppend<'_>>,
+    error: crate::AutumnError,
+) -> crate::AutumnError {
+    if appends.is_empty() {
+        return error;
+    }
+    match plan_batch(conn, &appends).await {
+        Ok(_) => error,
+        Err(earlier) => earlier,
+    }
+}
+
+/// Read the chain state of each key in `appends`, then plan them in input
+/// order.
+#[cfg(feature = "db")]
+async fn plan_batch(
+    conn: &mut crate::db::RuntimeConnection,
+    appends: &[LedgerAppend<'_>],
+) -> crate::AutumnResult<Vec<PlannedRevision>> {
+    let Some(first) = appends.first() else {
+        return Ok(Vec::new());
+    };
+    let table_name = first.table_name;
+    let unreadable = |record_id: i64, detail: String| {
+        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: table_name.to_string(),
+            record_id,
+            detail,
+        })
+    };
+    if let Some(other) = appends.iter().find(|a| a.table_name != table_name) {
+        return Err(unreadable(
+            other.record_id,
+            format!(
+                "one batch names two tables: {table_name} and {}",
+                other.table_name
+            ),
+        ));
+    }
+
+    // Each chain one time, in first-seen order.
+    let mut seen = std::collections::HashSet::with_capacity(appends.len());
+    let keys: Vec<(i64, Option<&str>)> = appends
+        .iter()
+        .filter(|append| seen.insert(chain_key(append)))
+        .map(|append| (append.record_id, append.tenant_id))
+        .collect();
+    let states = read_chain_states(conn, table_name, &keys).await?;
+    plan_revisions(&states, appends)
+        .map_err(|(index, detail)| unreadable(appends[index].record_id, detail))
+}
+
+/// The two writes of [`append_revisions`]. `marks` indexes the revisions that
+/// raise a high-water mark.
+#[cfg(feature = "db")]
+async fn write_revisions(
+    conn: &mut crate::db::RuntimeConnection,
+    table_name: &'static str,
+    appends: &[LedgerAppend<'_>],
+    planned: &[PlannedRevision],
+    marks: &[usize],
+) -> crate::AutumnResult<()> {
+    #[cfg(not(feature = "sqlite"))]
+    {
+        use diesel::sql_types::{Array, BigInt, Nullable, Text, Timestamptz};
+        use diesel_async::RunQueryDsl;
+
+        diesel::sql_query(REVISIONS_INSERT_SQL)
+            .bind::<Text, _>(table_name)
+            .bind::<Array<Nullable<Text>>, _>(
+                appends.iter().map(|a| a.tenant_id).collect::<Vec<_>>(),
+            )
+            .bind::<Array<BigInt>, _>(appends.iter().map(|a| a.record_id).collect::<Vec<_>>())
+            .bind::<Array<BigInt>, _>(planned.iter().map(|p| p.seq).collect::<Vec<_>>())
+            .bind::<Array<Text>, _>(appends.iter().map(|a| a.op.as_str()).collect::<Vec<_>>())
+            .bind::<Array<Text>, _>(appends.iter().map(|a| a.actor).collect::<Vec<_>>())
+            .bind::<Array<Nullable<Text>>, _>(
+                appends.iter().map(|a| a.request_id).collect::<Vec<_>>(),
+            )
+            .bind::<Array<Text>, _>(
+                planned
+                    .iter()
+                    .map(|p| p.snapshot.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Timestamptz>, _>(planned.iter().map(|p| p.valid_from).collect::<Vec<_>>())
+            .bind::<Array<Timestamptz>, _>(
+                planned.iter().map(|p| p.recorded_at).collect::<Vec<_>>(),
+            )
+            .bind::<Array<Nullable<Text>>, _>(
+                planned
+                    .iter()
+                    .map(|p| p.prev_hash.as_deref())
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Text>, _>(planned.iter().map(|p| p.hash.as_str()).collect::<Vec<_>>())
+            .execute(&mut *conn)
+            .await
+            .map_err(crate::AutumnError::from)?;
+
+        diesel::sql_query(HIGH_WATER_UPSERT_MANY_SQL)
+            .bind::<Text, _>(table_name)
+            .bind::<Array<Nullable<Text>>, _>(
+                marks
+                    .iter()
+                    .map(|&i| appends[i].tenant_id)
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<BigInt>, _>(
+                marks
+                    .iter()
+                    .map(|&i| appends[i].record_id)
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<BigInt>, _>(marks.iter().map(|&i| planned[i].seq).collect::<Vec<_>>())
+            .bind::<Array<Text>, _>(
+                marks
+                    .iter()
+                    .map(|&i| planned[i].hash.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Timestamptz>, _>(
+                marks
+                    .iter()
+                    .map(|&i| planned[i].recorded_at)
+                    .collect::<Vec<_>>(),
+            )
+            .execute(conn)
+            .await
+            .map_err(crate::AutumnError::from)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    {
+        // The same binds, in the same SQL types, as the single-row statements.
+        insert_revisions_sqlite(conn, table_name, appends, planned).await?;
+        raise_marks_sqlite(conn, table_name, appends, planned, marks).await
+    }
+}
+
+/// The `SQLite` revision INSERT of [`write_revisions`], in bind-limit chunks.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn insert_revisions_sqlite(
+    conn: &mut crate::db::RuntimeConnection,
+    table_name: &'static str,
+    appends: &[LedgerAppend<'_>],
+    planned: &[PlannedRevision],
+) -> crate::AutumnResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    const REVISION_COLUMNS: usize = 12;
+    let rows: Vec<usize> = (0..appends.len()).collect();
+    for chunk in rows.chunks(crate::repository::MAX_BIND_PARAMS / REVISION_COLUMNS) {
+        let sql = format!(
+            "INSERT INTO _autumn_ledger_revisions \
+             (table_name, tenant_id, record_id, seq, op, actor, request_id, \
+              snapshot, valid_from, recorded_at, prev_hash, hash) VALUES {}",
+            vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ")
+        );
+        let mut query = diesel::sql_query(sql).into_boxed();
+        for &i in chunk {
+            let (append, plan) = (&appends[i], &planned[i]);
+            query = query
+                .bind::<Text, _>(table_name)
+                .bind::<Nullable<Text>, _>(append.tenant_id)
+                .bind::<BigInt, _>(append.record_id)
+                .bind::<BigInt, _>(plan.seq)
+                .bind::<Text, _>(append.op.as_str())
+                .bind::<Text, _>(append.actor)
+                .bind::<Nullable<Text>, _>(append.request_id)
+                .bind::<Text, _>(plan.snapshot.as_str())
+                .bind::<Instant, _>(plan.valid_from)
+                .bind::<Instant, _>(plan.recorded_at)
+                .bind::<Nullable<Text>, _>(plan.prev_hash.as_deref())
+                .bind::<Text, _>(plan.hash.as_str());
+        }
+        query
+            .execute(&mut *conn)
+            .await
+            .map_err(crate::AutumnError::from)?;
+    }
+    Ok(())
+}
+
+/// The `SQLite` high-water upsert of [`write_revisions`], in bind-limit chunks.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn raise_marks_sqlite(
+    conn: &mut crate::db::RuntimeConnection,
+    table_name: &'static str,
+    appends: &[LedgerAppend<'_>],
+    planned: &[PlannedRevision],
+    marks: &[usize],
+) -> crate::AutumnResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    const MARK_COLUMNS: usize = 6;
+    for chunk in marks.chunks(crate::repository::MAX_BIND_PARAMS / MARK_COLUMNS) {
+        let sql = format!(
+            "INSERT INTO _autumn_ledger_high_water \
+             (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+             VALUES {} \
+             ON CONFLICT (table_name, tenant_key, record_id) DO UPDATE SET \
+             high_seq = excluded.high_seq, \
+             head_hash = excluded.head_hash, \
+             recorded_at = excluded.recorded_at \
+             WHERE _autumn_ledger_high_water.high_seq < excluded.high_seq",
+            vec!["(?, COALESCE(?, ''), ?, ?, ?, ?)"; chunk.len()].join(", ")
+        );
+        let mut query = diesel::sql_query(sql).into_boxed();
+        for &i in chunk {
+            query = query
+                .bind::<Text, _>(table_name)
+                .bind::<Nullable<Text>, _>(appends[i].tenant_id)
+                .bind::<BigInt, _>(appends[i].record_id)
+                .bind::<BigInt, _>(planned[i].seq)
+                .bind::<Text, _>(planned[i].hash.as_str())
+                .bind::<Instant, _>(planned[i].recorded_at);
+        }
+        query
+            .execute(&mut *conn)
+            .await
+            .map_err(crate::AutumnError::from)?;
+    }
     Ok(())
 }
 
@@ -2949,6 +3575,38 @@ mod tests {
     }
     use chrono::TimeZone as _;
     use serde_json::json;
+
+    /// The Postgres batch statements keep the contract of the single-row ones
+    /// (#3345).
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[test]
+    fn the_batched_ledger_statements_keep_their_contract() {
+        assert!(
+            !REVISIONS_INSERT_SQL.contains("::jsonb"),
+            "{REVISIONS_INSERT_SQL}"
+        );
+        assert!(
+            REVISIONS_INSERT_SQL.contains(
+                "(table_name, tenant_id, record_id, seq, op, actor, request_id, \
+                 snapshot, valid_from, recorded_at, prev_hash, hash)"
+            ),
+            "{REVISIONS_INSERT_SQL}"
+        );
+        assert!(
+            HIGH_WATER_UPSERT_MANY_SQL
+                .to_ascii_lowercase()
+                .contains("where _autumn_ledger_high_water.high_seq < excluded.high_seq"),
+            "the mark must refuse to move backwards: {HIGH_WATER_UPSERT_MANY_SQL}"
+        );
+        assert!(
+            CHAIN_STATES_SQL.contains("clock_timestamp()"),
+            "the clock comes from the database, as in the single-record read"
+        );
+        assert!(
+            CHAIN_STATES_SQL.contains("ORDER BY seq DESC LIMIT 1"),
+            "{CHAIN_STATES_SQL}"
+        );
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_800_000_000 + secs, 0)
@@ -4795,5 +5453,247 @@ mod tests {
         assert_eq!((value, stored), (json!({ "title": "a" }), 2));
         let shown = schema_mismatch_at("t", 1, 1, stored, 1, "cannot decode").to_string();
         assert!(shown.contains("newer"), "{shown}");
+    }
+
+    // ── Batched appends (#3345) ──────────────────────────────────────
+
+    #[cfg(feature = "db")]
+    fn empty_state(db_now: DateTime<Utc>) -> ChainState {
+        ChainState {
+            db_now,
+            head_seq: None,
+            head_hash: None,
+            head_recorded_at: None,
+            mark_seq: None,
+            mark_hash: None,
+            mark_recorded_at: None,
+        }
+    }
+
+    #[cfg(feature = "db")]
+    fn append_for(
+        record_id: i64,
+        tenant_id: Option<&'static str>,
+        n: i64,
+    ) -> LedgerAppend<'static> {
+        LedgerAppend {
+            table_name: "widgets",
+            tenant_id,
+            record_id,
+            op: VersionOp::Update,
+            actor: "batch",
+            request_id: None,
+            snapshot: json!({ "id": record_id, "n": n }),
+            valid_from: None,
+        }
+    }
+
+    /// Plan each append alone, from the state the database holds after the
+    /// previous one. This is the per-row path the batch must match.
+    #[cfg(feature = "db")]
+    fn plan_one_by_one(
+        mut states: std::collections::HashMap<(i64, String), ChainState>,
+        appends: &[LedgerAppend<'_>],
+    ) -> Result<Vec<PlannedRevision>, (usize, String)> {
+        let mut out = Vec::new();
+        for (index, append) in appends.iter().enumerate() {
+            let key = (append.record_id, append.tenant_id.unwrap_or("").to_owned());
+            let state = states.get(&key).expect("a state for each key").clone();
+            let planned = plan_revision(&state, append).map_err(|detail| (index, detail))?;
+            states.insert(key, state.after(&planned));
+            out.push(planned);
+        }
+        Ok(out)
+    }
+
+    #[cfg(feature = "db")]
+    fn states_for(
+        appends: &[LedgerAppend<'_>],
+        state: &ChainState,
+    ) -> std::collections::HashMap<(i64, String), ChainState> {
+        appends
+            .iter()
+            .map(|a| {
+                (
+                    (a.record_id, a.tenant_id.unwrap_or("").to_owned()),
+                    state.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_repeated_record_chains_like_two_single_appends() {
+        let appends = [append_for(7, None, 1), append_for(7, None, 2)];
+        let states = states_for(&appends, &empty_state(at(0)));
+        let planned = plan_revisions(&states, &appends).expect("plan");
+        assert_eq!(planned, plan_one_by_one(states, &appends).expect("plan"));
+        assert_eq!((planned[0].seq, planned[1].seq), (1, 2));
+        assert_eq!(
+            planned[1].prev_hash.as_deref(),
+            Some(planned[0].hash.as_str())
+        );
+        assert_eq!(planned[1].recorded_at, planned[0].recorded_at);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_tenant_is_part_of_the_chain_key() {
+        let appends = [append_for(7, Some("a"), 1), append_for(7, Some("b"), 2)];
+        let states = states_for(&appends, &empty_state(at(0)));
+        let planned = plan_revisions(&states, &appends).expect("plan");
+        assert_eq!((planned[0].seq, planned[1].seq), (1, 1));
+        assert_eq!(planned[1].prev_hash, None);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_missing_chain_state_refuses_the_batch() {
+        let appends = [append_for(7, None, 1)];
+        let err = plan_revisions(&std::collections::HashMap::new(), &appends).unwrap_err();
+        assert_eq!(err.0, 0);
+    }
+
+    /// Each #2323 guard refuses the batch at the bad row, with the text of the
+    /// single-row path, also when a good row comes first.
+    #[cfg(feature = "db")]
+    #[test]
+    fn every_guard_refuses_the_batch_with_the_single_row_text() {
+        let head = |seq: i64, hash: &str, recorded_at: DateTime<Utc>| ChainState {
+            head_seq: Some(seq),
+            head_hash: Some(hash.to_owned()),
+            head_recorded_at: Some(recorded_at),
+            ..empty_state(at(100))
+        };
+        let bad_states = [
+            // A live chain with no mark.
+            head(3, "h", at(10)),
+            // A mark below 1.
+            ChainState {
+                mark_seq: Some(0),
+                ..empty_state(at(100))
+            },
+            // The mark and the head disagree on the hash.
+            ChainState {
+                mark_seq: Some(3),
+                mark_hash: Some("other".to_owned()),
+                mark_recorded_at: Some(at(10)),
+                ..head(3, "h", at(10))
+            },
+            // The mark and the head disagree on the instant.
+            ChainState {
+                mark_seq: Some(3),
+                mark_hash: Some("h".to_owned()),
+                mark_recorded_at: Some(at(11)),
+                ..head(3, "h", at(10))
+            },
+            // The chain is at i64::MAX.
+            ChainState {
+                mark_seq: Some(i64::MAX),
+                mark_hash: Some("h".to_owned()),
+                mark_recorded_at: Some(at(10)),
+                ..head(i64::MAX, "h", at(10))
+            },
+            // The clock floor is far ahead of the database clock.
+            ChainState {
+                mark_seq: Some(3),
+                mark_hash: Some("h".to_owned()),
+                mark_recorded_at: Some(at(1_000_000)),
+                ..head(3, "h", at(1_000_000))
+            },
+        ];
+        for bad in bad_states {
+            let appends = [append_for(1, None, 1), append_for(2, None, 1)];
+            let single = plan_revision(&bad, &appends[1]).expect_err("the guard refuses");
+            let mut states = states_for(&appends[..1], &empty_state(at(100)));
+            states.insert((2, String::new()), bad.clone());
+            assert_eq!(
+                plan_revisions(&states, &appends),
+                Err((1, single)),
+                "state: {bad:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "db")]
+    proptest::proptest! {
+        /// Any batch plans as the per-row path does, and each key gets one
+        /// intact chain.
+        #[test]
+        fn a_batch_plans_as_the_per_row_path_does(
+            keys in proptest::collection::vec((1_i64..4, proptest::bool::ANY), 1..24),
+            start in 0_u8..3,
+            ahead in 0_i64..5,
+        ) {
+            let appends: Vec<LedgerAppend<'static>> = keys
+                .iter()
+                .zip(0_i64..)
+                .map(|(&(id, tenant), n)| append_for(id, tenant.then_some("t"), n))
+                .collect();
+            // 0: no chain. 1: a head and its mark, ahead of the clock. 2: a mark
+            // past the head (a deleted tail).
+            let state = match start {
+                0 => empty_state(at(0)),
+                1 => ChainState {
+                    head_seq: Some(3),
+                    head_hash: Some("h".to_owned()),
+                    head_recorded_at: Some(at(ahead)),
+                    mark_seq: Some(3),
+                    mark_hash: Some("h".to_owned()),
+                    mark_recorded_at: Some(at(ahead)),
+                    ..empty_state(at(0))
+                },
+                _ => ChainState {
+                    head_seq: Some(2),
+                    head_hash: Some("h".to_owned()),
+                    head_recorded_at: Some(at(0)),
+                    mark_seq: Some(4),
+                    mark_hash: Some("m".to_owned()),
+                    mark_recorded_at: Some(at(ahead)),
+                    ..empty_state(at(0))
+                },
+            };
+            let states = states_for(&appends, &state);
+            let planned = plan_revisions(&states, &appends).expect("plan");
+            proptest::prop_assert_eq!(&planned, &plan_one_by_one(states, &appends).expect("plan"));
+            // The clock clamp: no revision precedes the floor of its chain.
+            let floor = if start == 0 { at(0) } else { at(ahead) };
+            for plan in &planned {
+                proptest::prop_assert!(plan.recorded_at >= floor);
+            }
+            if start != 0 {
+                return Ok(());
+            }
+
+            let mut chains: std::collections::HashMap<(i64, Option<&str>), Vec<LedgerRevision>> =
+                std::collections::HashMap::new();
+            for (append, plan) in appends.iter().zip(&planned) {
+                chains
+                    .entry((append.record_id, append.tenant_id))
+                    .or_default()
+                    .push(LedgerRevision {
+                        id: plan.seq,
+                        table_name: append.table_name.to_owned(),
+                        tenant_id: append.tenant_id.map(str::to_owned),
+                        record_id: append.record_id,
+                        seq: plan.seq,
+                        op: append.op,
+                        actor: append.actor.to_owned(),
+                        request_id: None,
+                        snapshot: append.snapshot.clone(),
+                        valid_from: plan.valid_from,
+                        recorded_at: plan.recorded_at,
+                        prev_hash: plan.prev_hash.clone(),
+                        hash: plan.hash.clone(),
+                    });
+            }
+            for ((record_id, _), chain) in &chains {
+                let seqs: Vec<i64> = chain.iter().map(|r| r.seq).collect();
+                let expected: Vec<i64> = (1..=i64::try_from(chain.len()).expect("small")).collect();
+                proptest::prop_assert_eq!(seqs, expected);
+                proptest::prop_assert!(verify_chain(*record_id, chain).is_intact());
+            }
+        }
     }
 }

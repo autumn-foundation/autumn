@@ -28,8 +28,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
-autumn-search = "0.8"
+autumn-web = "0.10"
+autumn-search = "0.10"
 ```
 
 ## What you write

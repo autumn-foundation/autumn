@@ -168,16 +168,22 @@ fn scaffolded_form_render_allocations_on_a_12_field_workload() {
     // **22,828** per render / **4,565,600** total (-0.85%) — exact-capacity
     // sizing trims the same over-reservation slack the pre-escaping follow-up
     // above added, though not by much against this workload's larger buffers.
+    //
+    // Field wrapper v2 (issue #3395): all helpers now use one direct writer
+    // (`render_field`) with one buffer sized from the field's content, not a
+    // `maud::html!` buffer sized from the macro's token length. **78** blocks
+    // per render, 15,600 total (-13.3%); **19,170** bytes per render,
+    // 3,834,000 total (-16.0%).
     assert!(
-        info.count_total <= 18_700,
+        info.count_total <= 16_200,
         "scaffolded form render allocated {} blocks over {RENDERS} renders, over the \
-         18,700-block ceiling (18,000 measured; 20,800 was the pre-fix baseline)",
+         16,200-block ceiling (15,600 measured; 18,000 before #3395)",
         info.count_total,
     );
     assert!(
-        info.bytes_total <= 4_660_000,
+        info.bytes_total <= 3_920_000,
         "scaffolded form render allocated {} bytes over {RENDERS} renders, over the \
-         4,660,000-byte ceiling (4,565,600 measured; 4,604,600 was the pre-fix baseline)",
+         3,920,000-byte ceiling (3,834,000 measured; 4,565,600 before #3395)",
         info.bytes_total,
     );
 }

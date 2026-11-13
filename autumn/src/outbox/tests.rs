@@ -124,7 +124,7 @@ fn replay_knows_when_install_gives_mail_a_queue() {
 #[test]
 fn install_without_enabled_installs_nothing() {
     let state = AppState::for_test();
-    install(&state, &OutboxConfig::default(), OutboxHandlers::default());
+    install(&state, &OutboxConfig::default(), OutboxHandlers::default()).expect("install");
     assert!(state.extension::<OutboxRelay>().is_none());
 }
 
@@ -171,7 +171,8 @@ mod sqlite {
                 ..config
             },
             handlers,
-        );
+        )
+        .expect("install");
         Fixture {
             _substrate: substrate,
             state,
@@ -231,7 +232,7 @@ mod sqlite {
             Box::pin(async move {
                 let n = message.payload["n"].as_str().unwrap_or_default().to_owned();
                 if fail_left
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                         left.checked_sub(1)
                     })
                     .is_ok()
@@ -544,6 +545,41 @@ mod sqlite {
         assert!(error.to_string().contains("outbox is off"), "{error}");
     }
 
+    /// Codex review on #3473: an outbox job keeps the schema version of its
+    /// job and the tenant that enqueued it, as an after-commit enqueue does.
+    #[tokio::test]
+    async fn enqueue_job_stores_the_version_envelope_and_the_tenant() {
+        #[derive(diesel::QueryableByName)]
+        struct Payload {
+            #[diesel(sql_type = Text)]
+            payload: String,
+        }
+        let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
+        fx.state
+            .insert_extension(crate::job::JobClient::versioned_for_test("welcome", 2));
+        let mut conn = fx.state.pool().unwrap().get().await.unwrap();
+        let outbox = Outbox::new(&fx.state);
+        crate::tenancy::CURRENT_TENANT
+            .scope(
+                Some("acme".to_owned()),
+                outbox.enqueue_job(&mut conn, "welcome", &serde_json::json!({ "user": 7 })),
+            )
+            .await
+            .unwrap();
+
+        let stored = diesel::sql_query("SELECT payload FROM autumn_outbox")
+            .get_result::<Payload>(&mut conn)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&stored.payload).unwrap();
+        assert_eq!(body["name"], "welcome");
+        assert_eq!(
+            body["args"],
+            crate::payload_version::wrap(2, serde_json::json!({ "user": 7 }))
+        );
+        assert_eq!(body["tenant"], "acme");
+    }
+
     #[tokio::test]
     async fn a_message_that_crashes_every_relay_goes_to_dead_letters() {
         let mut handlers = OutboxHandlers::default();
@@ -739,7 +775,8 @@ mod sqlite {
                 ..OutboxConfig::default()
             },
             handlers,
-        );
+        )
+        .expect("install");
         ensure_relay_schema(&state)
             .await
             .expect("schema on every pool");
@@ -821,7 +858,8 @@ mod sqlite {
                 ..OutboxConfig::default()
             },
             handlers,
-        );
+        )
+        .expect("install");
         let mut conn = main.pool().get().await.unwrap();
         Outbox::new(&state)
             .write(&mut conn, "a", "t", &serde_json::json!({}))
@@ -867,7 +905,8 @@ mod sqlite {
                 ..OutboxConfig::default()
             },
             handlers,
-        );
+        )
+        .expect("install");
         ensure_relay_schema(&state)
             .await
             .expect("schema on the shard");
@@ -930,7 +969,8 @@ mod sqlite {
                 ..OutboxConfig::default()
             },
             handlers,
-        );
+        )
+        .expect("install");
 
         ensure_relay_schema(&state)
             .await
@@ -964,5 +1004,237 @@ mod sqlite {
     async fn schema_is_idempotent() {
         let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
         ensure_schema(fx.state.pool().unwrap()).await.unwrap();
+    }
+
+    /// The claim reads pending rows through `idx_autumn_outbox_claim`. Without
+    /// it, the claim can read each sent row that the purge has not deleted yet
+    /// (#3203).
+    #[tokio::test]
+    async fn claim_reads_pending_rows_through_the_claim_index() {
+        #[derive(diesel::QueryableByName)]
+        struct Step {
+            #[diesel(sql_type = Text)]
+            detail: String,
+        }
+        let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
+        let mut conn = fx.state.pool().unwrap().get().await.unwrap();
+        let plan: Vec<String> =
+            diesel::sql_query(format!("EXPLAIN QUERY PLAN {}", claim_sql("'t'")))
+                .bind::<Text, _>("token")
+                .bind::<BigInt, _>(0)
+                .bind::<BigInt, _>(0)
+                .bind::<BigInt, _>(0)
+                .bind::<BigInt, _>(1)
+                .load::<Step>(&mut conn)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|step| step.detail)
+                .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("USING INDEX idx_autumn_outbox_claim")),
+            "{plan:#?}"
+        );
+    }
+
+    /// Tables made before `idx_autumn_outbox_claim` existed get the index from
+    /// `ensure_schema`.
+    #[tokio::test]
+    async fn ensure_schema_adds_the_claim_index_to_existing_tables() {
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
+        let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
+        let pool = fx.state.pool().unwrap();
+        let mut conn = pool.get().await.unwrap();
+        conn.batch_execute("DROP INDEX IF EXISTS idx_autumn_outbox_claim")
+            .await
+            .unwrap();
+        drop(conn);
+
+        ensure_schema(pool).await.unwrap();
+
+        let mut conn = pool.get().await.unwrap();
+        let index = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_autumn_outbox_claim'",
+        )
+        .get_result::<Count>(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(index.n, 1);
+    }
+
+    /// Edge rows for the claim. The `payload` of each row holds its expected
+    /// result.
+    const CLAIM_EDGES_SQL: &str = include_str!("../../tests/fixtures/outbox/claim_edges.sql");
+
+    /// The ids that one claim takes from [`CLAIM_EDGES_SQL`], and the ids it
+    /// must take. Both lists are in `seq` order.
+    async fn claim_edges(with_claim_index: bool) -> (Vec<String>, Vec<String>) {
+        #[derive(diesel::QueryableByName)]
+        struct Id {
+            #[diesel(sql_type = Text)]
+            id: String,
+        }
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert("t", |_, _| async { Ok(()) });
+        let fx = fixture(OutboxConfig::default(), handlers).await;
+        let pool = fx.state.pool().unwrap().clone();
+        let now = to_millis(fx.clock.now()).to_string();
+        let mut conn = pool.get().await.unwrap();
+        if !with_claim_index {
+            conn.batch_execute("DROP INDEX IF EXISTS idx_autumn_outbox_claim")
+                .await
+                .unwrap();
+        }
+        conn.batch_execute(&CLAIM_EDGES_SQL.replace("__NOW__", &now))
+            .await
+            .unwrap();
+        let expected = diesel::sql_query(
+            "SELECT id FROM autumn_outbox WHERE payload = '{\"claim\":true}' ORDER BY seq",
+        )
+        .load::<Id>(&mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+        drop(conn);
+
+        let relay = fx.state.extension::<OutboxRelay>().unwrap();
+        let mut rows = claim(&relay, &pool, &fx.state, "relay", 100).await.unwrap();
+        rows.sort_by_key(|row| row.seq);
+        (rows.into_iter().map(|row| row.id).collect(), expected)
+    }
+
+    /// With and without the claim index, the claim takes only the rows that the
+    /// fixture marks (#3203).
+    #[tokio::test]
+    async fn claim_takes_the_same_edge_rows_with_and_without_the_claim_index() {
+        for with_claim_index in [true, false] {
+            let (claimed, expected) = claim_edges(with_claim_index).await;
+            assert_eq!(expected.len(), 5, "the fixture marks 5 rows");
+            assert_eq!(claimed, expected, "with_claim_index = {with_claim_index}");
+        }
+    }
+}
+
+// ── Remote destinations and the inbox endpoint ──────────────────────────────
+
+#[cfg(feature = "http-client")]
+mod remote_delivery {
+    use super::*;
+    use crate::config::{OutboxDestinationConfig, OutboxInboxConfig};
+
+    /// A named event: it is in the event catalogue.
+    #[crate::event(name = "unit.remote.deal")]
+    struct UnitDeal {
+        id: i64,
+    }
+
+    fn lazy_pool() -> Pool<RuntimeConnection> {
+        crate::db::create_pool(&crate::config::DatabaseConfig {
+            primary_url: Some(crate::test_urls::primary("unused")),
+            ..crate::config::DatabaseConfig::default()
+        })
+        .expect("pool builds")
+        .expect("url present => Some(pool)")
+    }
+
+    fn remote(topics: &[&str]) -> OutboxConfig {
+        let mut config = OutboxConfig {
+            enabled: true,
+            ..OutboxConfig::default()
+        };
+        config.destinations.insert(
+            "marketing".to_owned(),
+            OutboxDestinationConfig {
+                url: "http://marketing/_autumn/inbox".to_owned(),
+                signing_secret: Some("unit-secret-0123456789abcdef0123".to_owned()),
+                topics: topics.iter().map(|topic| (*topic).to_owned()).collect(),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn inbox_signature_uses_the_autumn_signature_scheme() {
+        let header = inbox_signature("k", 1_700_000_000, "{\"a\":1}");
+        let expected = crate::security::config::hmac_sha256_hex(b"k", b"1700000000.{\"a\":1}");
+        assert_eq!(header, format!("t=1700000000,v1={expected}"));
+    }
+
+    #[test]
+    fn named_event_is_in_the_catalogue() {
+        let _ = UnitDeal { id: 1 }.id;
+        assert!(crate::events::event_contract("unit.remote.deal").is_some());
+        assert!(crate::events::event_contract("unit.remote.nothing").is_none());
+    }
+
+    #[test]
+    fn relay_routes_destination_topics_to_the_remote_handler() {
+        let state = AppState::for_test().with_pool(lazy_pool());
+        install(
+            &state,
+            &remote(&["unit.remote.deal"]),
+            OutboxHandlers::default(),
+        )
+        .expect("install");
+        let relay = state.extension::<OutboxRelay>().expect("relay");
+        assert!(relay.handles("unit.remote.deal"));
+        assert!(relay.topics_in_list.contains("'unit.remote.deal'"));
+    }
+
+    #[test]
+    fn destination_topic_must_be_a_named_event() {
+        let state = AppState::for_test().with_pool(lazy_pool());
+        let error = install(
+            &state,
+            &remote(&["unit.remote.typo"]),
+            OutboxHandlers::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unit.remote.typo"), "{error}");
+        assert!(error.contains("#[event(name"), "{error}");
+        assert!(state.extension::<OutboxRelay>().is_none());
+    }
+
+    #[test]
+    fn topic_cannot_be_local_and_remote() {
+        let state = AppState::for_test().with_pool(lazy_pool());
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert("unit.remote.deal", |_, _| async { Ok(()) });
+        let error = install(&state, &remote(&["unit.remote.deal"]), handlers)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outbox_handler"), "{error}");
+    }
+
+    #[test]
+    fn inbox_installs_its_verifier() {
+        let state = AppState::for_test().with_pool(lazy_pool());
+        let config = OutboxConfig {
+            enabled: true,
+            inbox: OutboxInboxConfig {
+                enabled: true,
+                signing_secret: Some("unit-secret-0123456789abcdef0123".to_owned()),
+                ..OutboxInboxConfig::default()
+            },
+            ..OutboxConfig::default()
+        };
+        install(&state, &config, OutboxHandlers::default()).expect("install");
+        assert!(state.extension::<remote::InboxVerifier>().is_some());
+        assert!(
+            state
+                .extension::<OutboxRelay>()
+                .expect("relay")
+                .handles(TOPIC_INBOX),
+            "the receiver relay runs the listeners"
+        );
     }
 }

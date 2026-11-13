@@ -961,7 +961,7 @@ impl ConfigStore for InMemoryConfigStore {
 /// `autumn_runtime_config_changes` tables managed by
 /// [`crate::migrate::FRAMEWORK_MIGRATIONS`]. This is the persistent store that
 /// shares state with the `autumn config` CLI.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub mod pg {
     use super::{ConfigChangeRecord, ConfigStore, ConfigStoreError, ConfigValue};
     use diesel::prelude::*;
@@ -1060,6 +1060,12 @@ pub mod pg {
     /// `PgExperimentStore`, no per-request extractor reads this store: the
     /// callers are admin routes and the cost-signal refresh task. Therefore it keeps
     /// the read-through cache. Do not read it on a hot request path.
+    ///
+    /// Clone class: `PgFlagStore` (`autumn/src/feature_flags.rs`) and
+    /// `PgExperimentStore` (`autumn/src/experiments.rs`) share this store's
+    /// read-through-cache ancestry but were moved to a background-refreshed
+    /// snapshot in #3155 and #3262/#3273; the paragraph above records why
+    /// that port was deliberately skipped here, not missed.
     #[derive(Debug)]
     pub struct PgConfigStore {
         database_url: String,

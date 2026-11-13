@@ -25,8 +25,8 @@ For a runnable end-to-end demo, see [`examples/media-room`](../../examples/media
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
-autumn-media-plugin = "0.8"
+autumn-web = "0.10"
+autumn-media-plugin = "0.10"
 ```
 
 ## Mounting the plugin
@@ -87,7 +87,9 @@ config is not valid, the plugin installs no storage, workflows, jobs or sweep.
 | `.ffmpeg_bin(impl Into<String>)` | Override the `FFmpeg` binary path. |
 | `.artifact_sink(Arc<dyn MediaArtifactSink>)` | App callback invoked when an encode completes. |
 | `.retention_days(u32)` | Recording-retention window (`0` disables the sweep). |
-| `.recordings_root(impl Into<PathBuf>)` | Filesystem root the retention sweep operates on (required to spawn it). |
+| `.recordings_root(impl Into<PathBuf>)` | Filesystem root the retention sweep operates on (required to start it). |
+| `.retention_on_every_role()` | Run the retention sweep on every role, `web` too. |
+| `.room_reaper_on_every_role()` | Run the `db` room reaper on every role, `web` too. |
 
 An out-of-range `room_max_participants` (0 or > 6) or an invalid
 `room_namespace` (a slash, a `.`/`..` segment, whitespace) is a **fail-fast**
@@ -268,8 +270,10 @@ Room state lives behind the `RoomStore` trait, selected by
   so the app still boots.
 
 Both backends enforce the absolute 6-seat mesh ceiling and cap the registry, and
-a background reaper (`spawn_room_reaper_loop`) reclaims stale participants and
-idle rooms by `last_seen_at` / `created_at`. The `DbRoomStore` reaper is a
+a background reaper (`run_room_reaper`) reclaims stale participants and
+idle rooms by `last_seen_at` / `created_at`. It is the background task
+`media.room_reaper`. The role decides where it runs: see
+[Background tasks and roles](#background-tasks-and-roles). The `DbRoomStore` reaper is a
 last-write-wins sweep, so concurrent reapers across processes converge with no
 corruption.
 
@@ -285,7 +289,7 @@ side effect — a member-gated roster poll. Do either on any interval well under
 the idle TTL (default 15 minutes, `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS`) and the
 seat is held. Send a heartbeat as:
 
-<!-- config-key-allow: AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS — read directly by the reaper as an env-overridable constant, not a `[media]` config key; promoting it is a documented follow-up on `spawn_room_reaper_loop` -->
+<!-- config-key-allow: AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS — read directly by the reaper as an env-overridable constant, not a `[media]` config key; promoting it to `MediaConfig` is a follow-up -->
 
 ```http
 POST /api/media/rooms/{room_id}/heartbeat
@@ -347,12 +351,45 @@ handler unset. This keeps the plugin out of your application tables.
 
 ## Recording retention
 
-When a `recordings_root` is configured, the plugin spawns a background sweep
-that deletes source recordings older than `retention_days` (0 disables it). Set
+When a `recordings_root` is configured, the plugin registers the background
+task `media.recording_retention`. It deletes source recordings older than
+`retention_days` (0 disables it). Set
 the root explicitly with `.recordings_root(...)` — without it, no sweep runs.
 `MediaConfig::from_arroyo_env()` wires the root automatically from
 `ARROYO_RECORDINGS_ROOT`. The sweep starts only if you enable a primitive and
 the storage config is valid.
+
+## Background tasks and roles
+
+The plugin registers its loops with `AppBuilder::background`. It starts no
+loop from `on_startup`. The role of the process decides where each loop runs
+(see [Jobs: background tasks](jobs.md#background-tasks-for-plugins-and-apps)):
+
+| Task | Capability | Default roles | Why |
+|---|---|---|---|
+| `media.room_reaper`, `db` store | `media.maintenance` (parent `maintenance`) | `combined`, `worker` | The rooms are in the shared database. The worker replicas reap it. |
+| `media.room_reaper`, `memory` store | `serves_http` | `combined`, `web` | The rooms are in the memory of the process that serves the room routes. Only that process can reap them. |
+| `media.recording_retention` | `media.retention` (parent `retention`), queue `media` | roles that drain the media queue | The recordings root is a local path. The encode jobs read it, so the sweep runs where they run. This is the same for the `local` and the `s3` storage backends. |
+
+To turn a task off on one named role, set its capability:
+
+```toml
+[roles.edge-worker]
+base = "worker"
+capabilities = { "media.maintenance" = false, "media.retention" = false }
+```
+
+The plugin declares both capabilities whenever it is installed, so these keys
+are valid with each room store.
+
+If each replica has its own recordings disk, call
+`.retention_on_every_role()`. Then the sweep runs on every role. The boot logs
+a warning on each role that does not run `media.retention` or does not drain
+the media queue. For a fleet of only `web` replicas on a `db` room store, call
+`.room_reaper_on_every_role()`. Both switches override the role keys above.
+
+`/actuator/tasks` (`background_tasks`) and `autumn graph` list each task and
+the roles that run it.
 
 ## See also
 

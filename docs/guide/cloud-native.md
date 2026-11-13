@@ -346,30 +346,85 @@ On Kubernetes this is two `Deployment`s off the same image — one with
 `AUTUMN_ROLE=web`, one with `AUTUMN_ROLE=worker` — each with its own replica
 count and autoscaler, both pointing the readiness probe at `/ready` so the
 [rolling-deploy drain](#rolling-deploy-lifecycle) supervises worker rollouts the
-same way it does web.
+same way it does web. `autumn release init --target kubernetes` writes these
+for you: see [One workload per role](kubernetes.md#one-workload-per-role).
 
 ### Gating app-owned background work
 
-`AUTUMN_ROLE` gates the **framework's** `#[job]`/`#[scheduled]` workers, but not
-a background loop your app spawns itself in an `on_startup` hook — that runs on
-every replica, including the web tier, unless you gate it. The resolved role is
-exposed on `AppState` as the same value the framework used to gate its own
-workers, so self-gate app-owned loops instead of re-reading `AUTUMN_ROLE`:
+`AUTUMN_ROLE` gates the **framework's** background work. A loop that your app
+or a plugin spawns itself in an `on_startup` hook runs on every replica,
+including the web tier. Declare it as a background task instead. The
+framework then starts it only where the role runs its capability, and stops
+it with the server:
 
 ```rust
-use autumn_web::{AppState, ProcessRole};
+use autumn_web::Capability;
 
-// on_startup hook: only start the embedded loop where workers run.
-if state.role().runs_workers() {
-    tokio::spawn(my_embedded_worker(state.clone()));
-}
+app.background_task("app.embedded_worker", Capability::JobWorkers, |state, shutdown| async move {
+    my_embedded_worker(state, shutdown).await
+})
 ```
 
-`state.role()` returns a `ProcessRole` with `serves_http()` / `runs_workers()`
-predicates; see
-[Self-gating app-owned background work](jobs.md#self-gating-app-owned-background-work).
-Custom/named roles are unsupported today — for finer placement use per-queue
-worker pinning (#1623) plus app-level `state.role()` gating.
+`/actuator/tasks` lists each task and the roles that run it. It needs
+`[actuator] sensitive = true`. See
+[Role capabilities](jobs.md#role-capabilities) and
+[Background tasks for plugins and apps](jobs.md#background-tasks-for-plugins-and-apps).
+
+### Named tiers
+
+For more than two tiers, declare each tier once as a `[roles.<name>]` preset in
+`autumn.toml`. Each Deployment then sets only `AUTUMN_ROLE=<name>`:
+
+```toml
+[jobs]
+backend = "postgres"
+
+[roles.critical]
+base = "worker"
+pin = ["critical"]
+scheduler = false
+
+[roles.bulk]
+base = "worker"
+pin = ["bulk", "default"]
+scheduler = false
+
+[roles.cron]
+base = "worker"
+pin = []          # no job workers
+scheduler = true
+```
+
+```yaml
+  worker-critical:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: critical
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+```
+
+- The base (`combined`, `web` or `worker`) is the safety contract. A preset can
+  only turn a capability off. The durable-backend check reads the base.
+  A `combined` preset with no job workers counts as `web`.
+- `state.role().name()` is `"critical"`. `state.role().base()` is
+  `ProcessRole::Worker`.
+- `/actuator/info`, `/actuator/jobs`, a `role` metric label and the default
+  scheduler `replica_id` show the name.
+- `autumn doctor --strict` derives the fleet coverage from the presets. You do
+  not declare the tiers a second time in `[jobs.fleet]`. The derived list has
+  only the presets. If a tier runs as a plain built-in role, declare it as a
+  preset or set `[jobs.fleet] tiers`.
+- An undeclared name stops the boot.
+
+See [Named roles](jobs.md#named-roles) for every key and rule.
+
+### Route groups on HTTP tiers
+
+A preset over `web` or `combined` can serve only some route groups. Set
+`mount = ["marketing"]`. One image then runs a `marketing` role and a
+`service` role. Probes and the actuator stay on every role. See
+[Route groups and per-role mounting](route-groups.md) for a worked example on
+Fly `[processes]` and on two Kubernetes Deployments.
 
 ## Migration Jobs
 
@@ -495,6 +550,26 @@ Example output:
 | `data-backfill` | Schema change is safe but requires a separate backfill job. |
 | `manual-review` | Autumn cannot auto-classify this statement; operator review required. |
 | `unsupported` | The backend has no syntax for this statement; it fails at apply time. SQLite only (#1906). |
+
+The check reads `'..'` text as Postgres does with
+`standard_conforming_strings = on`, the default. A statement that can change
+this setting is `manual-review` (#3528): `SET`, `RESET`, `RESET ALL`,
+`DISCARD ALL`, `set_config`, an `UPDATE` of `pg_settings`, also in a `DO`
+or function body. A `SET` to `on` and text data such as `DEFAULT 'SET ..'`
+are not flagged. With the setting off, `\'` does not end `'..'` text. The check then
+possibly misses a later risky statement. Use `E'..'` text for backslash
+escapes. The check does not find a name that dynamic SQL builds.
+
+A `DO` body runs at migrate time, so the check classifies each statement in
+it (#3637). `DO $$ BEGIN DROP TABLE users; END $$;` is `destructive`. A
+common block, such as a conditional `CREATE TYPE`, makes no finding. A `DO`
+block is `manual-review` when its body holds `EXECUTE`, or when the check
+cannot read the body. The check cannot read a body in a language other than
+PL/pgSQL, `E'..'` text with a `\` escape, a body in more than one part, or
+`DO` blocks nested more than 8 deep. To accept such a block, add
+`-- autumn-safety: reviewed` above the `DO` statement. The check ignores a
+marker in the body. A function body does not run at migrate time. The
+`CREATE FUNCTION` statement is `manual-review`.
 
 ### Adding `autumn migrate check` to CI
 
@@ -736,7 +811,7 @@ autumn_web::app()
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-cache-redis = "0.8"
+autumn-cache-redis = "0.10"
 ```
 
 `CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the

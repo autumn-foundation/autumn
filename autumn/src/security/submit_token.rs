@@ -41,31 +41,51 @@
 //! }
 //! ```
 
+use axum::extract::{FromRequestParts, OptionalFromRequestParts};
+use axum::http::StatusCode;
+
+// The layer half below needs the idempotency store, so it is built only with
+// the `idempotency` feature. The extractors above it work without.
+#[cfg(feature = "idempotency")]
 use std::future::Future;
+#[cfg(feature = "idempotency")]
 use std::pin::Pin;
+#[cfg(feature = "idempotency")]
 use std::sync::Arc;
+#[cfg(feature = "idempotency")]
 use std::task::{Context, Poll};
+#[cfg(feature = "idempotency")]
 use std::time::Duration;
 
+#[cfg(feature = "idempotency")]
 use axum::body::{Body, Bytes};
-use axum::extract::{FromRequestParts, OptionalFromRequestParts};
-use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
+#[cfg(feature = "idempotency")]
+use axum::http::{HeaderMap, Method, Request, Response};
+#[cfg(feature = "idempotency")]
 use futures::StreamExt as _;
+#[cfg(feature = "idempotency")]
 use sha2::Digest as _;
+#[cfg(feature = "idempotency")]
 use tower::{Layer, Service};
+#[cfg(feature = "idempotency")]
 use uuid::Uuid;
 
+#[cfg(feature = "idempotency")]
 use super::config::SubmitTokenConfig;
+#[cfg(feature = "idempotency")]
 use crate::idempotency::{IdempotencyRecord, IdempotencyStore};
 
+#[cfg(feature = "idempotency")]
 /// Response header set on a replayed submit-token response.
 const SUBMIT_TOKEN_REPLAYED: &str = "x-submit-token-replayed";
 
+#[cfg(feature = "idempotency")]
 /// Maximum response body size cached for replay. Scaffold create/update
 /// handlers redirect (303) with tiny bodies; larger responses stream through
 /// without caching.
 const MAX_CACHEABLE_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 
+#[cfg(feature = "idempotency")]
 /// Hard cap on the request body bytes buffered while scanning for the token.
 const MAX_SCAN_BYTES_CAP: usize = 2 * 1024 * 1024; // 2 MiB
 
@@ -167,6 +187,7 @@ where
     }
 }
 
+#[cfg(feature = "idempotency")]
 const fn is_mutating_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -174,17 +195,7 @@ const fn is_mutating_method(method: &Method) -> bool {
     )
 }
 
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
-}
-
+#[cfg(feature = "idempotency")]
 /// Release this attempt's in-flight lock for `key`. Each attempt has its own
 /// `owner`: an attempt that outlived its lock must not free the lock of a retry
 /// that took the token since. An error is logged; the lock then expires by its
@@ -195,6 +206,7 @@ async fn release_lock(store: &Arc<dyn IdempotencyStore>, key: &str, owner: &str)
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Derive the store key for a submitted token. The token is a per-render random
 /// UUID, so it is globally unique and needs no method/path/principal scoping —
 /// the token itself identifies the single logical submission.
@@ -202,28 +214,76 @@ fn storage_key(token: &str) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"autumn.submit_token:v1:");
     hasher.update(token.as_bytes());
-    format!("submit:{}", hex_lower(hasher.finalize()))
+    format!("submit:{}", hex::encode(hasher.finalize()))
 }
 
 // ── Multipart / body scanning helpers ─────────────────────────────────────────
 
-fn scan_for_token(
-    bytes: &[u8],
-    is_urlencoded: bool,
-    boundary: Option<&str>,
-    field: &str,
-) -> Option<String> {
-    if is_urlencoded {
-        url::form_urlencoded::parse(bytes)
-            .find(|(key, _)| key == field)
-            .map(|(_, value)| value.into_owned())
-    } else if let Some(boundary) = boundary {
-        super::multipart_scan::scan_multipart_field(bytes, boundary, field).map(str::to_owned)
-    } else {
-        None
+#[cfg(feature = "idempotency")]
+const MULTIPART_PREFIX: &str = "multipart/";
+
+#[cfg(feature = "idempotency")]
+/// A request body that can carry a submit token.
+enum TokenForm {
+    UrlEncoded,
+    Multipart { boundary: String },
+}
+
+#[cfg(feature = "idempotency")]
+impl TokenForm {
+    /// The token form of a request, or `None` for a body that is not a form.
+    ///
+    /// The layer and the body scan both use this one check. If they did not
+    /// agree, a form could reach the handler with its token not read, and the
+    /// request would stay replayable.
+    fn of(headers: &HeaderMap) -> Option<Self> {
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
+            return Some(Self::UrlEncoded);
+        }
+        // Parse the boundary with `multer::parse_boundary` — the exact parser
+        // `axum::extract::Multipart` uses downstream (via `mime`) — so the guard
+        // and the extractor can never disagree about the boundary. A hand-rolled
+        // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
+        // quoted parameter value, so `boundary="x;y"` parses to the boundary
+        // `x;y` in the real extractor while a split truncates it to `x`, leaving
+        // the form to be handled while its `_submit_token` is never
+        // scanned/consumed (the request stays REPLAYABLE). `parse_boundary` is
+        // case-insensitive on the media type / `boundary` param name and
+        // preserves the boundary VALUE's case; it returns `Err` for a
+        // non-multipart type.
+        //
+        // The parse allocates. Only a type that starts with `multipart/` can
+        // parse as multipart, so skip the parse for each other type.
+        let maybe_multipart = content_type
+            .trim_start()
+            .get(..MULTIPART_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MULTIPART_PREFIX));
+        if !maybe_multipart {
+            return None;
+        }
+        multer::parse_boundary(content_type)
+            .ok()
+            .map(|boundary| Self::Multipart { boundary })
     }
 }
 
+#[cfg(feature = "idempotency")]
+fn scan_for_token(bytes: &[u8], form: &TokenForm, field: &str) -> Option<String> {
+    match form {
+        TokenForm::UrlEncoded => url::form_urlencoded::parse(bytes)
+            .find(|(key, _)| key == field)
+            .map(|(_, value)| value.into_owned()),
+        TokenForm::Multipart { boundary } => {
+            super::multipart_scan::scan_multipart_field(bytes, boundary, field).map(str::to_owned)
+        }
+    }
+}
+
+#[cfg(feature = "idempotency")]
 /// Body collected up to a scan/cache limit.
 enum CollectedBody {
     /// The whole body fits within the limit and is fully buffered.
@@ -242,6 +302,7 @@ enum CollectedBody {
     Errored(axum::Error),
 }
 
+#[cfg(feature = "idempotency")]
 /// Buffer `body` up to `limit` bytes without corrupting oversized bodies.
 async fn collect_body(body: Body, limit: usize) -> CollectedBody {
     let mut buf = Vec::<u8>::new();
@@ -287,56 +348,35 @@ async fn collect_body(body: Body, limit: usize) -> CollectedBody {
     CollectedBody::Full(Bytes::from(buf))
 }
 
-/// Extract the submitted `_submit_token` from the request body, returning the
-/// token (if present) and a request whose body is preserved for the handler.
+#[cfg(feature = "idempotency")]
+/// Extract the submitted `_submit_token` from the form body of `req`,
+/// returning the token (if present) and a request whose body is preserved for
+/// the handler.
 ///
 /// Returns `Err` when the body stream errors mid-read while scanning: the caller
 /// must reject the request rather than forward a truncated form (see
 /// [`CollectedBody::Errored`]).
 async fn extract_submitted_token(
     req: Request<Body>,
+    form: &TokenForm,
     field: &str,
     max_scan_bytes: usize,
 ) -> Result<(Option<String>, Request<Body>), axum::Error> {
     let (parts, body) = req.into_parts();
-
-    let content_type = parts
-        .headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    let is_urlencoded =
-        crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
-    // Parse the boundary with `multer::parse_boundary` — the exact parser
-    // `axum::extract::Multipart` uses downstream (via `mime`) — so the guard and
-    // the extractor can never disagree about the boundary. A hand-rolled
-    // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
-    // quoted parameter value, so `boundary="x;y"` parses to the boundary `x;y`
-    // in the real extractor while a split truncates it to `x`, leaving the form
-    // to be handled while its `_submit_token` is never scanned/consumed (the
-    // request stays REPLAYABLE). `parse_boundary` is case-insensitive on the
-    // media type / `boundary` param name and preserves the boundary VALUE's
-    // case; it returns `Err` for a non-multipart type, so `.ok()` yields `None`.
-    let boundary = multer::parse_boundary(content_type).ok();
-    // content_type borrow ends here.
-
-    if !is_urlencoded && boundary.is_none() {
-        return Ok((None, Request::from_parts(parts, body)));
-    }
-
     match collect_body(body, max_scan_bytes).await {
         CollectedBody::Full(bytes) => {
-            let token = scan_for_token(&bytes, is_urlencoded, boundary.as_deref(), field);
+            let token = scan_for_token(&bytes, form, field);
             Ok((token, Request::from_parts(parts, Body::from(bytes))))
         }
         CollectedBody::Oversized { prefix, body } => {
-            let token = scan_for_token(&prefix, is_urlencoded, boundary.as_deref(), field);
+            let token = scan_for_token(&prefix, form, field);
             Ok((token, Request::from_parts(parts, body)))
         }
         CollectedBody::Errored(err) => Err(err),
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Headers to strip when caching a response for replay: hop-by-hop headers plus
 /// `set-cookie` (never resurrect a stale cookie on a replay) and our own marker.
 fn replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
@@ -359,6 +399,7 @@ fn replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+#[cfg(feature = "idempotency")]
 fn replay_response(record: &IdempotencyRecord) -> Response<Body> {
     let mut builder = Response::builder().status(record.status);
     for (name, value) in &record.headers {
@@ -375,6 +416,7 @@ fn replay_response(record: &IdempotencyRecord) -> Response<Body> {
         })
 }
 
+#[cfg(feature = "idempotency")]
 fn in_flight_conflict_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::CONFLICT)
@@ -385,6 +427,7 @@ fn in_flight_conflict_response() -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+#[cfg(feature = "idempotency")]
 /// `400` returned when the request body stream errors mid-read while scanning
 /// for the token. Failing here is safer than forwarding a truncated form to the
 /// handler (missing tail fields) after a leading token has already been consumed.
@@ -395,6 +438,7 @@ fn body_read_error_response() -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+#[cfg(feature = "idempotency")]
 /// `500` returned when the handler's response body stream errors while it is
 /// being buffered for replay caching. The token is not recorded, and the
 /// in-flight lock is intentionally kept held (it expires via `in_flight_ttl`)
@@ -409,6 +453,7 @@ fn response_read_error_response() -> Response<Body> {
 
 // ── Layer / Service ───────────────────────────────────────────────────────────
 
+#[cfg(feature = "idempotency")]
 struct SubmitTokenSettings {
     store: Arc<dyn IdempotencyStore>,
     field_name: String,
@@ -418,6 +463,7 @@ struct SubmitTokenSettings {
     max_scan_bytes: usize,
 }
 
+#[cfg(feature = "idempotency")]
 // `Arc::make_mut` in the builder methods requires `Clone` on the inner value.
 impl Clone for SubmitTokenSettings {
     fn clone(&self) -> Self {
@@ -432,6 +478,7 @@ impl Clone for SubmitTokenSettings {
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Tower [`Layer`] that enforces at-most-once form submissions via one-time
 /// submit tokens.
 ///
@@ -444,6 +491,7 @@ pub struct SubmitTokenLayer {
     settings: Arc<SubmitTokenSettings>,
 }
 
+#[cfg(feature = "idempotency")]
 impl std::fmt::Debug for SubmitTokenLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubmitTokenLayer")
@@ -453,6 +501,7 @@ impl std::fmt::Debug for SubmitTokenLayer {
     }
 }
 
+#[cfg(feature = "idempotency")]
 impl SubmitTokenLayer {
     /// Create a new submit-token layer backed by `store` and configured from
     /// `config`.
@@ -495,6 +544,7 @@ impl SubmitTokenLayer {
     }
 }
 
+#[cfg(feature = "idempotency")]
 impl<S> Layer<S> for SubmitTokenLayer {
     type Service = SubmitTokenService<S>;
 
@@ -506,6 +556,7 @@ impl<S> Layer<S> for SubmitTokenLayer {
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Tower [`Service`] produced by [`SubmitTokenLayer`].
 #[derive(Clone)]
 pub struct SubmitTokenService<S> {
@@ -513,6 +564,7 @@ pub struct SubmitTokenService<S> {
     settings: Arc<SubmitTokenSettings>,
 }
 
+#[cfg(feature = "idempotency")]
 impl<S> Service<Request<Body>> for SubmitTokenService<S>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
@@ -523,7 +575,12 @@ where
 {
     type Response = Response<Body>;
     type Error = std::convert::Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    /// The inner future for a request with no token to read. A box only for a
+    /// guarded form (issue #2830).
+    type Future = futures::future::Either<
+        S::Future,
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>,
+    >;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -547,39 +604,39 @@ where
                 !crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths)
             });
 
-        // Every GET (and every exempt/non-mutating request) takes this branch:
-        // nothing below needs `self.inner` cloned into an owned value, so
-        // `self.inner.call(req)` can be boxed directly rather than cloning
-        // `self.inner` (a `BoxCloneSyncService` at this point in the stack,
-        // whose `Clone` impl allocates a fresh box) just to move the clone
-        // into an `async move` block that would immediately `.await` it and
-        // do nothing else.
-        if !is_guarded {
-            return Box::pin(self.inner.call(req));
-        }
+        // A GET, an exempt request, and a body that is not a form have no token
+        // to read. Nothing runs before the inner call, so the inner future is
+        // the future of this service: no clone and no box.
+        let Some(form) = is_guarded.then(|| TokenForm::of(req.headers())).flatten() else {
+            return futures::future::Either::Left(self.inner.call(req));
+        };
 
         let settings = Arc::clone(&self.settings);
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        Box::pin(async move {
-            let (submitted, req) =
-                match extract_submitted_token(req, &settings.field_name, settings.max_scan_bytes)
-                    .await
-                {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        // A body-stream read error while scanning must reject the
-                        // request: forwarding the bytes read so far would hand the
-                        // handler a truncated form whose leading token we already
-                        // scanned, silently dropping tail fields.
-                        tracing::warn!(
-                            error = %error,
-                            "Submit-token body scan failed on a read error; rejecting the request"
-                        );
-                        return Ok(body_read_error_response());
-                    }
-                };
+        futures::future::Either::Right(Box::pin(async move {
+            let (submitted, req) = match extract_submitted_token(
+                req,
+                &form,
+                &settings.field_name,
+                settings.max_scan_bytes,
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(error) => {
+                    // A body-stream read error while scanning must reject the
+                    // request: forwarding the bytes read so far would hand the
+                    // handler a truncated form whose leading token we already
+                    // scanned, silently dropping tail fields.
+                    tracing::warn!(
+                        error = %error,
+                        "Submit-token body scan failed on a read error; rejecting the request"
+                    );
+                    return Ok(body_read_error_response());
+                }
+            };
 
             let Some(token) = submitted.filter(|t| !t.is_empty()) else {
                 // No submit token present — pass through unchanged.
@@ -662,10 +719,11 @@ where
 
             let response = inner.call(req).await?;
             Ok(cache_consumed_token_response(response, &settings, &key, &owner).await)
-        })
+        }))
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// The `409` for a submit whose lock lapsed before the handler ran, or `None`
 /// when the lock still covers the handler: renewed when the work since it was
 /// taken was slow (see `keep_lock_for_handler`). A renewal error fails closed.
@@ -698,6 +756,7 @@ async fn lapsed_lock_response(
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Run the handler's response through the consumed-token replay cache: buffer it
 /// (up to [`MAX_CACHEABLE_RESPONSE_BODY`]), record 2xx/3xx responses under `key`
 /// so a replay returns them verbatim, and release the in-flight lock. Kept out
@@ -781,6 +840,7 @@ async fn cache_consumed_token_response(
     }
 }
 
+#[cfg(feature = "idempotency")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,6 +849,48 @@ mod tests {
     };
     use axum::Router;
     use axum::routing::{get, post};
+
+    /// `TokenForm::of` must agree with the parsers of the extractors. A form
+    /// that it does not find skips the token scan and stays replayable.
+    #[test]
+    fn token_form_agrees_with_the_extractor_parsers() {
+        let cases = [
+            "application/json",
+            "application/json; charset=utf-8",
+            "text/plain",
+            "",
+            "application/x-www-form-urlencoded",
+            "Application/X-WWW-Form-Urlencoded; charset=utf-8",
+            "multipart/form-data; boundary=x",
+            "Multipart/Form-Data; Boundary=AbC",
+            "  multipart/form-data; boundary=x",
+            "multipart/form-data; boundary=\"x;y\"",
+            "multipart/form-data",
+            "multipart/mixed; boundary=x",
+            "multipart",
+            "multipart/",
+        ];
+        for content_type in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(content_type).unwrap(),
+            );
+            let urlencoded =
+                crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
+            let boundary = multer::parse_boundary(content_type).ok();
+            let expected = if urlencoded {
+                Some(None)
+            } else {
+                boundary.map(Some)
+            };
+            let actual = TokenForm::of(&headers).map(|form| match form {
+                TokenForm::UrlEncoded => None,
+                TokenForm::Multipart { boundary } => Some(boundary),
+            });
+            assert_eq!(actual, expected, "content type {content_type:?}");
+        }
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
@@ -2170,7 +2272,7 @@ mod tests {
             .expect("the guard must acquire an in-flight lock");
         assert_eq!(
             lock_ttl,
-            Duration::from_secs(86_400),
+            Duration::from_hours(24),
             "the in-flight lock TTL must come from in_flight_ttl_secs, not ttl_secs"
         );
         // ...while the consumed-record replay window still tracks ttl_secs.
@@ -2221,7 +2323,7 @@ mod tests {
         let key = storage_key(token);
         assert!(
             store
-                .try_lock(&key, "first-attempt", Duration::from_secs(86_400))
+                .try_lock(&key, "first-attempt", Duration::from_hours(24))
                 .await
                 .unwrap()
         );
@@ -2389,5 +2491,17 @@ mod tests {
             "the racing request's response is replayed, not a 409"
         );
         assert_eq!(count.load(Ordering::SeqCst), 0, "the handler did not run");
+    }
+
+    /// Characterization for the Echo clone class: `storage_key` renders its
+    /// digest through this file's own `hex_lower`, one of six byte-identical
+    /// copies across the crate. Pinned when `hex_lower` was replaced by the
+    /// `hex` crate (already a dependency) at its call site.
+    #[test]
+    fn storage_key_is_pinned_hex() {
+        assert_eq!(
+            storage_key("token-abc"),
+            "submit:2a8a128a33f0f4cec8eb049c91fc3242d32de4ca2384fa3e7a3770b7ab952d1b"
+        );
     }
 }

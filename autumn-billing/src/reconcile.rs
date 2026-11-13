@@ -20,7 +20,9 @@
 //! Sequence: claim the event id in the ledger → upsert snapshots (the store
 //! applies the ordering guard) → open or close dunning → notify → mark
 //! applied. A failure after the claim releases it, so the provider's
-//! redelivery is applied again; every step is idempotent. A redelivery of a
+//! redelivery is applied again. Every step is idempotent. A redelivery that
+//! meets an unfinished claim is not acknowledged
+//! ([`ReconcileOutcome::InFlight`]). A redelivery of a
 //! snapshot already in the mirror (`Write::Unchanged`) repeats the idempotent
 //! steps (dunning row, job) but not notifications or hooks.
 
@@ -60,6 +62,9 @@ pub enum ReconcileOutcome {
     },
     /// The event id was already applied. Nothing changed.
     Duplicate,
+    /// Another delivery of the event id is still being applied. Nothing
+    /// changed. Ask the provider to redeliver: that delivery can still fail.
+    InFlight,
     /// The provider event type is not mirrored. Recorded only.
     Ignored {
         /// Provider event type.
@@ -83,9 +88,16 @@ pub async fn apply(
     let claim = store
         .claim_event(&event.id, kind, now, EVENT_CLAIM_STALE_AFTER)
         .await?;
-    if claim == EventClaim::Duplicate {
-        tracing::debug!(event_id = %event.id, kind, "🍂 Autumn Billing: duplicate event");
-        return Ok(ReconcileOutcome::Duplicate);
+    match claim {
+        EventClaim::Claimed => {}
+        EventClaim::Applied => {
+            tracing::debug!(event_id = %event.id, kind, "🍂 Autumn Billing: duplicate event");
+            return Ok(ReconcileOutcome::Duplicate);
+        }
+        EventClaim::InFlight => {
+            tracing::debug!(event_id = %event.id, kind, "🍂 Autumn Billing: event in flight");
+            return Ok(ReconcileOutcome::InFlight);
+        }
     }
     let event_id = event.id.clone();
     let ctx = Ctx {
@@ -202,69 +214,14 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// Two events for one subscription at the same instant with different
-    /// statuses cannot be put in order: the provider's timestamps are coarse
-    /// (Stripe's are whole seconds) and its event ids are not ordered. Ranking
-    /// them would drop a legitimate reversal (`past_due -> active`, `active ->
-    /// paused`) and leave the mirror wrong until some later event arrived, so
-    /// ask the provider for the subscription's current state instead.
-    ///
-    /// Returns the live snapshot, to be written as authoritative at the tied
-    /// instant itself. No timestamp is invented: the stored instant stays the
-    /// provider's, so an event created after the tie compares against a real
-    /// provider time, and a later event at the same second with a different
-    /// status ties again and is settled by another lookup. `None`
-    /// keeps the event as it is: no tie, a terminal status on either side
-    /// (those are final and the store's own rule is exact), or a provider that
-    /// cannot look the subscription up.
-    ///
-    /// # Errors
-    ///
-    /// A failed lookup is returned, so the webhook is retried rather than
-    /// guessed at.
-    async fn resolve_tie(
+    /// The guarded write for one subscription state.
+    fn subscription_upsert(
         &self,
-        previous: Option<&Subscription>,
+        customer: &Customer,
         snapshot: &SubscriptionSnapshot,
         status: SubscriptionStatus,
         occurred_at: DateTime<Utc>,
-    ) -> Result<Option<SubscriptionSnapshot>, BillingError> {
-        let Some(previous) = previous else {
-            return Ok(None);
-        };
-        if previous.last_event_at != occurred_at
-            || previous.status == status
-            || previous.status.is_terminal()
-            || status.is_terminal()
-        {
-            return Ok(None);
-        }
-        let live = self
-            .service
-            .provider()
-            .fetch_subscription(&snapshot.provider_subscription_id)
-            .await?;
-        Ok(live)
-    }
-
-    async fn subscription(
-        &self,
-        snapshot: &SubscriptionSnapshot,
-        status: SubscriptionStatus,
-        occurred_at: DateTime<Utc>,
-    ) -> Result<(), BillingError> {
-        let store = self.service.store();
-        let customer = self.customer(&snapshot.provider_customer_id, None).await?;
-        let previous = store
-            .subscription_by_provider_id(&snapshot.provider_subscription_id)
-            .await?;
-        let live = self
-            .resolve_tie(previous.as_ref(), snapshot, status, occurred_at)
-            .await?;
-        let authoritative = live.is_some();
-        let (snapshot, status) = live
-            .as_ref()
-            .map_or((snapshot, status), |live| (live, live.status));
+    ) -> SubscriptionUpsert {
         let mut upsert = SubscriptionUpsert::new(
             self.new_id(),
             customer.id.clone(),
@@ -275,9 +232,6 @@ impl Ctx<'_> {
         )
         .with_quantity(snapshot.quantity)
         .with_cancel_at_period_end(snapshot.cancel_at_period_end);
-        if authoritative {
-            upsert = upsert.with_authoritative();
-        }
         if let Some(price_id) = &snapshot.provider_price_id {
             upsert = upsert.with_price(price_id.clone());
             if let Some(plan) = self.service.catalog().by_price_id(price_id) {
@@ -292,12 +246,73 @@ impl Ctx<'_> {
         if let Some(end) = snapshot.current_period_end {
             upsert = upsert.with_period_end(end);
         }
-        let written = store.upsert_subscription(upsert).await?;
+        upsert
+    }
+
+    /// Write one subscription event.
+    ///
+    /// Two events at the same instant with different statuses cannot be put
+    /// in order: the provider's timestamps are coarse (Stripe's are whole
+    /// seconds) and its event ids are not ordered. Ranking them would drop a
+    /// legitimate reversal (`past_due -> active`, `active -> paused`). The
+    /// store reports the tie inside the write. This also works for concurrent
+    /// webhooks. The caller then asks the provider for the current state and
+    /// writes it as authoritative at the tied instant. No timestamp is
+    /// invented, so a later event still compares against a real provider
+    /// time.
+    ///
+    /// A provider that cannot look the subscription up leaves the event to the
+    /// ranking. A failed lookup is returned, so the webhook is retried.
+    ///
+    /// Also returns the row that the tie found. It is the true previous state
+    /// for the hooks, because the caller read before the other webhook wrote.
+    async fn write_subscription(
+        &self,
+        customer: &Customer,
+        snapshot: &SubscriptionSnapshot,
+        status: SubscriptionStatus,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(StoreWrite<Subscription>, Option<Subscription>), BillingError> {
+        let store = self.service.store();
+        let upsert = self.subscription_upsert(customer, snapshot, status, occurred_at);
+        let written = store
+            .upsert_subscription(upsert.clone().with_tie_check())
+            .await?;
+        let StoreWrite::Tie(tied) = written else {
+            return Ok((written, None));
+        };
+        let live = self
+            .service
+            .provider()
+            .fetch_subscription(&snapshot.provider_subscription_id)
+            .await?;
+        let retry = match live {
+            Some(live) => self
+                .subscription_upsert(customer, &live, live.status, occurred_at)
+                .with_authoritative(),
+            None => upsert,
+        };
+        Ok((store.upsert_subscription(retry).await?, Some(tied)))
+    }
+
+    async fn subscription(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        status: SubscriptionStatus,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(), BillingError> {
+        let store = self.service.store();
+        let customer = self.customer(&snapshot.provider_customer_id, None).await?;
+        let previous = store
+            .subscription_by_provider_id(&snapshot.provider_subscription_id)
+            .await?;
+        let (written, tied) = self
+            .write_subscription(&customer, snapshot, status, occurred_at)
+            .await?;
+        let previous = tied.or(previous);
         // Every outcome has a stored row. This call is idempotent. A
         // redelivery therefore links what the first delivery missed.
-        let (StoreWrite::Applied(stored)
-        | StoreWrite::Unchanged(stored)
-        | StoreWrite::Stale(stored)) = &written;
+        let stored = written.as_inner();
         store
             .link_subscription(&snapshot.provider_subscription_id, &stored.id, self.now)
             .await?;
@@ -311,7 +326,7 @@ impl Ctx<'_> {
             // idempotent step only. Notifications and hooks ran, or never
             // will, with the first delivery.
             StoreWrite::Unchanged(_) => return Ok(()),
-            StoreWrite::Stale(_) => {
+            StoreWrite::Stale(_) | StoreWrite::Tie(_) => {
                 tracing::debug!(
                     provider_subscription_id = %snapshot.provider_subscription_id,
                     "🍂 Autumn Billing: stale subscription event; mirror unchanged"
@@ -433,7 +448,7 @@ impl Ctx<'_> {
         let (invoice, applied) = match write {
             StoreWrite::Applied(invoice) => (invoice, true),
             StoreWrite::Unchanged(invoice) => (invoice, false),
-            StoreWrite::Stale(_) => {
+            StoreWrite::Stale(_) | StoreWrite::Tie(_) => {
                 tracing::debug!(
                     provider_invoice_id = %snapshot.provider_invoice_id,
                     "🍂 Autumn Billing: stale payment_failed event; mirror unchanged"
@@ -558,10 +573,8 @@ impl Ctx<'_> {
         occurred_at: DateTime<Utc>,
     ) -> Result<(), BillingError> {
         let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
-        let (invoice, applied) = match write {
-            StoreWrite::Applied(invoice) => (invoice, true),
-            StoreWrite::Unchanged(invoice) => (invoice, false),
-            StoreWrite::Stale(_) => return Ok(()),
+        let (StoreWrite::Applied(invoice) | StoreWrite::Unchanged(invoice)) = write else {
+            return Ok(());
         };
         self.relink(&invoice).await?;
         let store = self.service.store();
@@ -577,7 +590,9 @@ impl Ctx<'_> {
         let written = store
             .settle_dunning(&row.invoice_id, row.attempt, OPEN_STATES, recovered)
             .await?;
-        if !written || !applied {
+        // The row settle is the once-only gate: the retry job may have
+        // recorded the paid invoice already, so the write can be unchanged.
+        if !written {
             return Ok(());
         }
         notify::send_to_customer(

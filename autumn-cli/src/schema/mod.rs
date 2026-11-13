@@ -19,6 +19,8 @@ pub mod rename;
 pub mod schema_rs;
 pub mod shadow;
 pub mod snapshot;
+pub mod table_ref;
+pub mod width;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -147,6 +149,10 @@ pub enum SchemaAction {
         /// Print what would change without writing the snapshot file.
         #[arg(long)]
         dry_run: bool,
+        /// Also read this Postgres schema. Repeat for more. `public` is
+        /// always read. A table name must be in one schema only.
+        #[arg(long = "schema", value_name = "SCHEMA")]
+        schemas: Vec<String>,
     },
     /// Apply pending migration files against the configured database.
     ///
@@ -172,6 +178,28 @@ pub enum SchemaAction {
         /// Emit the checks as JSON instead of the aligned text report.
         #[arg(long)]
         json: bool,
+    },
+    /// Report every Diesel declaration wider than Diesel's default 32-column
+    /// tuple cap, and exit non-zero when there is one.
+    ///
+    /// Reads every `diesel::table!` block and every `#[model]` struct under
+    /// PATH, replays the migration sets (each `up.sql` in version order), and
+    /// asks cargo whether diesel resolves with `64-column-tables` or
+    /// `128-column-tables`. The cap is per declaration: a migration table over
+    /// 32 columns counts only when no `table!` (by name or `#[sql_name]`) or
+    /// `#[model]` maps it. A wider cap makes every crate that depends on
+    /// diesel slower and hungrier to compile. `autumn build` prints the same
+    /// findings as a warning; this command is the CI gate.
+    Width {
+        /// Project root to scan (defaults to the current directory).
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: PathBuf,
+        /// The widest table allowed.
+        #[arg(long, default_value_t = width::DIESEL_DEFAULT_COLUMN_LIMIT)]
+        max: usize,
+        /// Print every table and its width, not only the wide ones.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -209,9 +237,17 @@ pub fn run(action: SchemaAction) {
             out,
             backend,
             dry_run,
-        } => run_pull(profile.as_deref(), out.as_deref(), backend, dry_run),
+            schemas,
+        } => run_pull(
+            profile.as_deref(),
+            out.as_deref(),
+            backend,
+            dry_run,
+            &schemas,
+        ),
         SchemaAction::Migrate { profile } => migrate::run_migrate(profile.as_deref()),
         SchemaAction::Doctor { profile, json } => doctor::run_doctor(profile.as_deref(), json),
+        SchemaAction::Width { path, max, all } => width::run_width(&path, max, all),
     };
     if let Err(message) = result {
         eprintln!("error: {message}");
@@ -418,10 +454,11 @@ fn run_pull(
     out: Option<&Path>,
     backend: Option<BackendArg>,
     dry_run: bool,
+    schemas: &[String],
 ) -> Result<(), String> {
     let project_root = std::env::current_dir()
         .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
-    pull_at(&project_root, profile, out, backend, dry_run)
+    pull_at(&project_root, profile, out, backend, dry_run, schemas)
 }
 
 /// The body of [`run_pull`], taking an explicit `project_root` so the wiring is
@@ -432,6 +469,7 @@ fn pull_at(
     out: Option<&Path>,
     backend: Option<BackendArg>,
     dry_run: bool,
+    schemas: &[String],
 ) -> Result<(), String> {
     crate::generate::ensure_project_root(project_root)
         .map_err(|_| crate::generate::GenerateError::NotInProject.to_string())?;
@@ -481,7 +519,15 @@ fn pull_at(
     // default (Postgres) build that somehow resolves a SQLite backend fails loudly
     // rather than silently mis-introspecting.
     let tables = match backend {
-        Backend::Postgres => introspect::introspect_postgres(&url).map_err(|e| e.to_string())?,
+        Backend::Postgres => {
+            // Keep the schemas the existing snapshot has, so a pull does not
+            // drop them.
+            let mut all = table_schemas(existing.iter().flat_map(|s| s.tables.iter()));
+            all.extend(schemas.iter().cloned());
+            all.sort();
+            all.dedup();
+            introspect::introspect_postgres_in(&url, &all).map_err(|e| e.to_string())?
+        }
         #[cfg(feature = "sqlite")]
         Backend::Sqlite => introspect::introspect_sqlite(&url).map_err(|e| e.to_string())?,
         #[cfg(not(feature = "sqlite"))]
@@ -813,15 +859,12 @@ fn diff_at_with(
         return Err(clash);
     }
 
-    // The SQLite table-recreate path needs each affected table's full desired (up)
-    // / baseline (down) shape, which the per-change deltas don't carry; thread them
-    // in via the context. Postgres ignores it (identical output).
-    // The baseline side is the renamed baseline: the plan's non-rename changes
-    // use the new names.
-    let ctx = diff::SchemaContext::from_tables(
-        &desired.tables,
-        &rename::renamed_baseline(&baseline_tables, &plan.changes),
-    );
+    // A SQLite table-recreate needs the full desired and baseline tables, and the
+    // skipped decimal columns. Postgres ignores the context. The baseline is the
+    // renamed baseline: the plan's non-rename changes use the new names.
+    let renamed = rename::renamed_baseline(&baseline_tables, &plan.changes);
+    let ctx =
+        diff::SchemaContext::from_tables(&desired.tables, &renamed).with_skipped_decimals(&desired);
     let up = diff::emit_up_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
     let down = diff::emit_down_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
 
@@ -1086,6 +1129,16 @@ fn load_diff_snapshot(
     }
 }
 
+/// The sorted, distinct schema names of `tables`. A table in the default
+/// schema adds none.
+pub fn table_schemas<'a>(tables: impl IntoIterator<Item = &'a Table>) -> Vec<String> {
+    let set: std::collections::BTreeSet<&str> = tables
+        .into_iter()
+        .filter_map(|t| t.schema.as_deref())
+        .collect();
+    set.into_iter().map(str::to_owned).collect()
+}
+
 /// The `--dev-url` baseline: the migrations replayed on the dev database, with
 /// a warning when they do not match the snapshot, and with managed flags from
 /// the snapshot and the models (see [`shadow::adopt_managed_flags`]).
@@ -1096,7 +1149,13 @@ fn replay_baseline(
     snapshot: Option<&SchemaSnapshot>,
     desired: &parse::ParsedSchema,
 ) -> Result<shadow::Replay, String> {
-    let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"))?;
+    let schemas = table_schemas(
+        desired
+            .tables
+            .iter()
+            .chain(snapshot.iter().flat_map(|s| s.tables.iter())),
+    );
+    let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"), &schemas)?;
     shadow::adopt_model_spelling(&mut replayed.tables, desired);
     if let Some(snapshot) = snapshot {
         warn_snapshot_drift(&snapshot.tables, &replayed.tables);
@@ -1124,11 +1183,24 @@ fn relation_clash(
     // Names compare case-insensitively: SQLite resolves them that way, and on
     // Postgres a false match only refuses (the safe side).
     let key = |name: &str| name.to_ascii_lowercase();
+    // A relation in a named schema is `schema.name`; one in `public` is bare.
+    // `table` is `table` or `schema.table`, and its indexes share the schema.
+    let in_schema_of = |table: &str, name: &str| {
+        table
+            .rsplit_once('.')
+            .map_or_else(|| key(name), |(schema, _)| key(&format!("{schema}.{name}")))
+    };
+    // `schema.table` for a table in a named schema; `table` for one in `public`.
+    let table_name = |t: &autumn_schema_core::Table| {
+        table_ref::named_schema(t)
+            .map_or_else(|| t.name.clone(), |schema| format!("{schema}.{}", t.name))
+    };
+    let table_key = |t: &autumn_schema_core::Table| key(&table_name(t));
     let added: std::collections::BTreeSet<String> = plan
         .changes
         .iter()
         .filter_map(|c| match c {
-            SchemaChange::AddIndex { index, .. } => Some(key(&index.name)),
+            SchemaChange::AddIndex { table, index } => Some(in_schema_of(table, &index.name)),
             _ => None,
         })
         .collect();
@@ -1136,11 +1208,12 @@ fn relation_clash(
         .changes
         .iter()
         .filter_map(|c| match c {
-            SchemaChange::RenameTable { from, .. } | SchemaChange::RenameIndex { from, .. } => {
-                Some(key(from))
-            }
-            SchemaChange::DropIndex { index, .. } if added.contains(&key(&index.name)) => {
-                Some(key(&index.name))
+            SchemaChange::RenameTable { from, .. } => Some(key(from)),
+            SchemaChange::RenameIndex { table, from, .. } => Some(in_schema_of(table, from)),
+            SchemaChange::DropIndex { table, index }
+                if added.contains(&in_schema_of(table, &index.name)) =>
+            {
+                Some(in_schema_of(table, &index.name))
             }
             _ => None,
         })
@@ -1149,30 +1222,41 @@ fn relation_clash(
         .iter()
         .map(|n| key(n))
         .chain(baseline.iter().flat_map(|t| {
-            std::iter::once(key(&t.name)).chain(t.indexes.iter().map(|i| key(&i.name)))
+            let prefix = table_name(t);
+            std::iter::once(table_key(t)).chain(
+                t.indexes
+                    .iter()
+                    .map(move |i| in_schema_of(&prefix, &i.name)),
+            )
         }))
         .collect();
-    let taken = |name: &str| {
-        let k = key(name);
-        !freed.contains(&k) && existing.contains(&k)
-    };
+    let taken = |k: &str| !freed.contains(k) && existing.contains(k);
     // A name that two targets of this plan share collides too.
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     plan.changes.iter().find_map(|c| {
-        let names: Vec<&String> = match c {
+        // `(name to show, key to compare)` for each relation the change makes.
+        let names: Vec<(&String, String)> = match c {
             // A new table brings its own indexes.
-            SchemaChange::CreateTable(t) => std::iter::once(&t.name)
-                .chain(t.indexes.iter().map(|i| &i.name))
-                .collect(),
-            SchemaChange::RenameTable { to, .. } => vec![to],
-            SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
-                vec![&index.name]
+            SchemaChange::CreateTable(t) => {
+                let prefix = table_name(t);
+                std::iter::once((&t.name, table_key(t)))
+                    .chain(
+                        t.indexes
+                            .iter()
+                            .map(|i| (&i.name, in_schema_of(&prefix, &i.name))),
+                    )
+                    .collect()
+            }
+            SchemaChange::RenameTable { from, to } => vec![(to, in_schema_of(from, to))],
+            SchemaChange::AddIndex { table, index }
+            | SchemaChange::RenameIndex { table, index, .. } => {
+                vec![(&index.name, in_schema_of(table, &index.name))]
             }
             _ => return None,
         };
-        let name = names
+        let (name, _) = names
             .into_iter()
-            .find(|n| taken(n) || !seen.insert(key(n)))?;
+            .find(|(_, k)| taken(k) || !seen.insert(k.clone()))?;
         Some(format!(
             "`{name}` is already a table, index, view, sequence, type or other relation \
              in the schema; choose another name"
@@ -1223,6 +1307,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
     // Renames come first in a plan and depend only on the baseline, so apply
     // them before the name-keyed working set is built.
     let baseline = rename::renamed_baseline(baseline, &plan.changes);
+    let schemas = plan_schemas(&baseline, plan);
     // Name-keyed working set cloned from the baseline.
     let mut tables: BTreeMap<String, Table> = baseline
         .iter()
@@ -1234,18 +1319,22 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
     for change in &plan.changes {
         match change {
             SchemaChange::CreateTable(table) => {
-                tables.insert(table.name.clone(), table.clone());
+                let mut table = table.clone();
+                bare_fk_targets(&mut table.columns, &schemas);
+                tables.insert(table.name.clone(), table);
             }
             SchemaChange::DropTable(table) => {
                 tables.remove(&table.name);
             }
             SchemaChange::AddColumn { table, column } => {
-                if let Some(t) = tables.get_mut(table) {
-                    t.columns.push(column.clone());
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
+                    let mut column = column.clone();
+                    bare_fk_targets(std::slice::from_mut(&mut column), &schemas);
+                    t.columns.push(column);
                 }
             }
             SchemaChange::DropColumn { table, column } => {
-                if let Some(t) = tables.get_mut(table) {
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     t.columns.retain(|c| c.name != column.name);
                     // Postgres `ALTER TABLE … DROP COLUMN` automatically drops any
                     // index (and the constraint it backs) that depends on the
@@ -1292,21 +1381,23 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
                 foreign_key,
             } => {
                 if let Some(c) = column_mut(&mut tables, table, column) {
-                    c.references = Some(foreign_key.clone());
+                    let mut fk = foreign_key.clone();
+                    unqualify_fk(&mut fk, &schemas);
+                    c.references = Some(fk);
                 }
             }
             SchemaChange::AddIndex { table, index } => {
-                if let Some(t) = tables.get_mut(table) {
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     t.indexes.push(index.clone());
                 }
             }
             SchemaChange::DropIndex { table, index } => {
-                if let Some(t) = tables.get_mut(table) {
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     t.indexes.retain(|i| i.name != index.name);
                 }
             }
             SchemaChange::AddCheck { table, check } => {
-                if let Some(t) = tables.get_mut(table) {
+                if let Some(t) = tables.get_mut(diff::bare_name(table)) {
                     t.checks.push(check.clone());
                 }
             }
@@ -1318,6 +1409,7 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
             | SchemaChange::RenameColumn { .. }
             | SchemaChange::RenameIndex { .. }
             | SchemaChange::RenameConflict { .. }
+            | SchemaChange::TableSchemaConflict { .. }
             | SchemaChange::PrimaryKeyChange { .. }
             | SchemaChange::ForeignKeyChange { .. }
             | SchemaChange::IdentityChange { .. }
@@ -1341,8 +1433,41 @@ fn column_mut<'a>(
     column: &str,
 ) -> Option<&'a mut Column> {
     tables
-        .get_mut(table)
+        .get_mut(diff::bare_name(table))
         .and_then(|t| t.columns.iter_mut().find(|c| c.name == column))
+}
+
+/// The named schema of each table that the baseline or the plan knows, by
+/// bare name.
+fn plan_schemas(baseline: &[Table], plan: &MigrationPlan) -> BTreeMap<String, String> {
+    baseline
+        .iter()
+        .chain(plan.changes.iter().filter_map(|c| match c {
+            SchemaChange::CreateTable(t) => Some(t),
+            _ => None,
+        }))
+        .filter_map(|t| Some((t.name.clone(), t.schema.clone()?)))
+        .collect()
+}
+
+/// The plan names a foreign key target as `schema.table`. A model and the
+/// baseline spell it bare, so the projected snapshot does too.
+fn bare_fk_targets(columns: &mut [Column], schemas: &BTreeMap<String, String>) {
+    for fk in columns.iter_mut().filter_map(|c| c.references.as_mut()) {
+        unqualify_fk(fk, schemas);
+    }
+}
+
+/// Undo the qualification that the plan added: `schema.table` becomes `table`
+/// only when `table` is in `schema`. A target the model wrote with another
+/// schema (`auth.users`) stays as written.
+fn unqualify_fk(fk: &mut autumn_schema_core::ForeignKey, schemas: &BTreeMap<String, String>) {
+    let target = table_ref::TableRef::parse(&fk.table);
+    if let Some(schema) = target.schema()
+        && schemas.get(target.name()).is_some_and(|s| s == schema)
+    {
+        fk.table = target.name().to_owned();
+    }
 }
 
 /// Write a `migrations/<ts>_<suffix>/{up,down}.sql` pair, creating the leaf
@@ -1689,6 +1814,44 @@ mod tests {
             to: "new".to_owned(),
         });
         assert_eq!(relation_clash(&fine, &[], &others), None);
+    }
+
+    #[test]
+    fn a_relation_in_another_schema_does_not_clash() {
+        let plan = |t: autumn_schema_core::Table| MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::CreateTable(t)],
+        };
+        let mut blog = autumn_schema_core::Table::new("report", Backend::Postgres);
+        blog.schema = Some("blog".to_owned());
+        // A public view named `report` does not block `blog.report`.
+        let public_view: std::collections::BTreeSet<String> = ["report".to_owned()].into();
+        assert_eq!(relation_clash(&plan(blog.clone()), &[], &public_view), None);
+        // A `blog.report` view does.
+        let blog_view: std::collections::BTreeSet<String> = ["blog.report".to_owned()].into();
+        assert!(relation_clash(&plan(blog), &[], &blog_view).is_some());
+        // A public table still clashes with a public view.
+        let public = autumn_schema_core::Table::new("report", Backend::Postgres);
+        assert!(relation_clash(&plan(public), &[], &public_view).is_some());
+    }
+
+    #[test]
+    fn an_index_of_a_table_stored_in_public_clashes_in_the_default_schema() {
+        use autumn_schema_core::{Index, Table};
+        let mut audit = Table::new("audit", Backend::Postgres);
+        audit.schema = Some("public".to_owned());
+        audit
+            .indexes
+            .push(Index::new("idx_taken", vec!["x".to_owned()], false));
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddIndex {
+                table: "reports".to_owned(),
+                index: Index::new("idx_taken", vec!["slug".to_owned()], false),
+            }],
+        };
+        let none = std::collections::BTreeSet::new();
+        assert!(relation_clash(&plan, &[audit], &none).is_some());
     }
 
     #[test]
@@ -2606,7 +2769,7 @@ mod tests {
         );
     }
 
-    /// Findings 2 & 3 (#2036): the schema-command backend derives from the
+    /// #2036: the schema-command backend derives from the
     /// profile-resolved URL when one is configured (its scheme is authoritative),
     /// and only falls back to the project default when no URL is present — so
     /// `--profile <name>` picks the apply path / provider-lock of the database it
@@ -2731,6 +2894,94 @@ mod tests {
             "retained index depending on the dropped column must be pruned: {:?}",
             users.indexes
         );
+    }
+
+    #[test]
+    fn project_plan_target_keeps_an_explicit_cross_schema_fk_target() {
+        use autumn_schema_core::{Column, ColumnType, ForeignKey};
+        let mut posts = Table::new("posts", Backend::Postgres);
+        posts.schema = Some("blog".to_owned());
+        let mut owner = Column::new("owner_id".to_string(), ColumnType::Int64);
+        owner.references = Some(ForeignKey::new("auth.users", "id"));
+        let mut author = Column::new("author_id".to_string(), ColumnType::Int64);
+        author.references = Some(ForeignKey::new("blog.authors", "id"));
+        posts.columns = vec![owner, author];
+        let mut authors = Table::new("authors", Backend::Postgres);
+        authors.schema = Some("blog".to_owned());
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::CreateTable(authors),
+                SchemaChange::CreateTable(posts),
+            ],
+        };
+        let projected = project_plan_target(&[], &plan);
+        let t = projected.iter().find(|t| t.name == "posts").expect("posts");
+        let targets: Vec<&str> = t
+            .columns
+            .iter()
+            .filter_map(|c| c.references.as_ref().map(|f| f.table.as_str()))
+            .collect();
+        assert_eq!(targets, ["auth.users", "authors"]);
+    }
+
+    #[test]
+    fn a_projected_qualified_fk_target_diffs_clean_against_its_model() {
+        use autumn_schema_core::{Column, ColumnType, ForeignKey};
+        let mut authors = Table::new("authors", Backend::Postgres);
+        authors.schema = Some("blog".to_owned());
+        let mut posts = Table::new("posts", Backend::Postgres);
+        let mut author = Column::new("author_id".to_string(), ColumnType::Int64);
+        author.references = Some(ForeignKey::new("blog.authors", "id"));
+        posts.columns = vec![author];
+        let desired = parse::ParsedSchema::from_tables(vec![authors, posts]);
+        let opts = diff::DiffOptions::default();
+        let plan = diff::diff_schema(&[], &desired, opts);
+        diff::guard_plan(&plan, opts).expect("create plan");
+        let snapshot = project_plan_target(&[], &plan);
+        let next = diff::diff_schema(&snapshot, &desired, opts);
+        assert!(next.is_empty(), "{:?}", next.changes);
+    }
+
+    #[test]
+    fn project_plan_target_follows_changes_on_a_schema_table() {
+        use autumn_schema_core::{Column, ColumnType};
+        let mut base = Table::new("posts", Backend::Postgres);
+        base.schema = Some("blog".to_owned());
+        base.columns = vec![Column::new("id".to_string(), ColumnType::Int64)];
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::RenameTable {
+                    from: "blog.posts".to_owned(),
+                    to: "articles".to_owned(),
+                },
+                SchemaChange::AddColumn {
+                    table: "blog.articles".to_owned(),
+                    column: Column::new("body".to_string(), ColumnType::Text),
+                },
+                SchemaChange::AddIndex {
+                    table: "blog.articles".to_owned(),
+                    index: autumn_schema_core::Index::new(
+                        "idx_articles_body",
+                        vec!["body".to_owned()],
+                        false,
+                    ),
+                },
+            ],
+        };
+        let projected = project_plan_target(&[base], &plan);
+        let t = projected
+            .iter()
+            .find(|t| t.name == "articles")
+            .expect("renamed");
+        assert!(
+            t.columns.iter().any(|c| c.name == "body"),
+            "{:?}",
+            t.columns
+        );
+        assert_eq!(t.schema.as_deref(), Some("blog"));
+        assert!(t.indexes.iter().any(|i| i.name == "idx_articles_body"));
     }
 
     #[test]

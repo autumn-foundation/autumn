@@ -1,0 +1,30 @@
+# Bolt profile: autumn-web/csrf_verify
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 100,223
+blocks allocated: 477
+peak live bytes (whole run): 518,157
+
+         bytes      blocks  site
+
+        15,264          18  <autumn_web::reporting::ReportingService as core::clone::Clone>::clone
+         8,112          78  <autumn_web::router::TrustedHostService as core::clone::Clone>::clone
+         7,838         100  <autumn_web::test::RequestBuilder>::send::{closure#0}
+         7,387          18  <autumn_web::security::submit_token::SubmitTokenService as tower_service::Service>::call
+         6,000          12  <autumn_web::security::headers::SecurityHeadersFuture as core::future::future::Future>::poll
+         5,712           9  <http::header::map::HeaderMap>::try_reserve_one
+         5,561          15  <autumn_web::reporting::ReportingService as tower_service::Service>::call
+         5,268          33  <autumn_web::middleware::method_override::MethodOverrideService as tower_service::Service>::call
+         5,104          16  <autumn_web::middleware::exception_filter::ExceptionFilterService as tower_service::Service>::call
+         4,896           6  <autumn_web::middleware::log_context::LogContextService as tower_service::Service>::call
+         4,104          18  <autumn_web::middleware::access_log::AccessLogService as tower_service::Service>::call
+         4,056          18  <autumn_web::security::trusted_proxies::TrustedProxiesService as tower_service::Service>::call
+         3,997          20  <autumn_web::security::csrf::CsrfService as tower_service::Service>::call
+         3,840           3  <autumn_web::session::SessionService as tower_service::Service>::call
+         3,096           6  <autumn_web::security::headers::SecurityHeadersService as tower_service::Service>::call
+         1,800           6  <autumn_web::idempotency::IdempotencyReplayService as tower_service::Service>::call
+         1,056           3  <autumn_web::middleware::access_log::AccessLogFuture as core::future::future::Future>::poll
+         1,008           3  <autumn_web::middleware::short_circuit::ShortCircuitFuture as core::future::future::Future>::poll
+           936           9  <autumn_web::router::TrustedHostService as tower_service::Service>::call
+           888           6  <autumn_web::assets::AssetCacheControlService as tower_service::Service>::call

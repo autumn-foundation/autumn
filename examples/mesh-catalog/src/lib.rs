@@ -3,12 +3,18 @@
 //! Two handlers, each marked `#[endpoint]`. The attribute reads the request and
 //! response types straight off the signature and emits the contract the
 //! storefront is compiled against — there is no IDL and no hand-written schema.
+//!
+//! One event, `ItemRepriced`. `#[event]` records its payload shape, and the
+//! storefront's listener is checked against it.
 
 use autumn_web::prelude::*;
 
 /// A catalog item, as the service puts it on the wire.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, WireShape)]
 pub struct Item {
+    /// Shelf label. Optional, and no caller reads it, so a later release may
+    /// remove it.
+    pub subtitle: Option<String>,
     /// Stable item identifier.
     pub id: String,
     /// Display name.
@@ -35,12 +41,23 @@ pub struct NewItem {
     pub note: Option<String>,
 }
 
+/// Sent when an item's price changes. The storefront keeps its own copy of
+/// the price, so it reads this event instead of calling `get_item`.
+#[event(name = "catalog.item_repriced")]
+pub struct ItemRepriced {
+    /// Stable item identifier.
+    pub id: String,
+    /// New price in cents.
+    pub price_cents: u32,
+}
+
 impl Item {
     /// A stand-in record. A real service would read one from its store; the
     /// example keeps every construction in one place so the README's seeded
     /// change is a one-line edit.
     fn sample(id: String, name: String, price_cents: u32) -> Self {
         Self {
+            subtitle: None,
             id,
             name,
             price_cents,

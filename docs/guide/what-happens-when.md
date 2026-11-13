@@ -120,7 +120,16 @@ This is intentional -- static sites and API gateways don't need a database.
 Startup fails immediately with a clear parse error:
 
 ```
-Failed to load configuration: TOML parse error at line 3, column 5
+Failed to load configuration: invalid autumn.toml: TOML parse error at line 3, column 5
+```
+
+### A value of the wrong type
+
+Startup fails immediately. The error names the full key:
+
+```
+Failed to load configuration: invalid autumn.toml: invalid type: string "eighty", expected u16
+in `server.port`
 ```
 
 ### Unknown or misspelled profile
@@ -209,7 +218,7 @@ status code you chose in the extractor.
 | `Auth<T>`     | Request extensions       | 401 if not authenticated |
 | `Session`     | Session store            | 500 if session backend fails |
 | `Valid<Json<T>>` | Request body + validation | 422 with field-level errors |
-| `CsrfToken`   | Session                  | 500 if session unavailable |
+| `CsrfToken`   | `CsrfLayer`              | never; empty with CSRF off |
 | `Path<T>`     | URL path segments        | 400 if parse fails   |
 | `Query<T>`    | URL query string         | 400 if parse fails   |
 | `Json<T>`     | Request body             | 400/422 if parse fails |

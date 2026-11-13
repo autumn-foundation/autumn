@@ -28,8 +28,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
-autumn-media-plugin = "0.8"
+autumn-web = "0.10"
+autumn-media-plugin = "0.10"
 ```
 
 ## `[media]` configuration
@@ -99,8 +99,23 @@ no routes, extensions or jobs. It logs a warning.
 | `with_rooms()` | Room routes, `RoomService` and the room reaper |
 | Either one | `MediaStorage`, `MediaWorkflows` and the encode jobs |
 
-The retention sweep also starts if you set `recordings_root`. If the storage
-config is not valid, the plugin installs no storage, workflows, jobs or sweep.
+The retention sweep also starts if you set `recordings_root` and
+`retention_days` is not 0. If the storage config is not valid, the plugin
+installs no storage, workflows, jobs or sweep.
+
+The room reaper and the retention sweep are background tasks. The role of the
+process decides where they run:
+
+| Task | Runs on | Why |
+|---|---|---|
+| `media.room_reaper`, `db` store | `combined`, `worker` | The rooms are in the shared database. |
+| `media.room_reaper`, `memory` store | `combined`, `web` | The rooms are in the memory of the process that serves the room routes. |
+| `media.recording_retention` | roles that drain the media queue | The encode jobs read the same recordings root. |
+
+Call `retention_on_every_role()` if each replica has its own recordings disk.
+Call `room_reaper_on_every_role()` for a fleet of only `web` replicas on a
+`db` room store.
+See [docs/guide/media.md](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/media.md#background-tasks-and-roles).
 
 ### Migrating from Arroyo
 

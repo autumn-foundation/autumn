@@ -31,9 +31,10 @@ pub use crate::paths::PathExt;
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, authorize, cached, cached_impl, delete, event, feature_flag, get, job, jobs, listener,
-    listeners, main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, query_budget,
-    routes, scheduled, secured, static_get, static_routes, step_up, task, tasks, throttle,
+    api_doc, authorize, cached, cached_impl, delete, event, event_consumer, feature_flag, get, job,
+    jobs, listener, listeners, main, oauth2_callback, one_off_tasks, patch, paths, post, public,
+    put, query_budget, routes, scheduled, secured, static_get, static_routes, step_up, task, tasks,
+    throttle,
 };
 /// Define a service for cross-model orchestration and non-DB side effects.
 #[cfg(feature = "db")]
@@ -232,22 +233,39 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 /// regardless of the `maud` feature, unlike [`locale_switcher`] above which
 /// renders `maud::Markup`.
 pub use crate::widgets::localized_path;
-/// Card, stat tile, hero, active search, autocomplete, data table, property
-/// list, and breadcrumb configuration types and rendering helpers.
+/// Widget configuration types and rendering helpers. The search and social
+/// families need their features (#3408).
 ///
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
-    BadgeConfig, BadgeVariant, CardConfig, Column, CommentThread, CommentView, ConfirmActionConfig,
-    Crumb, Cta, CtaStyle, DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode,
-    HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch,
-    NavMenu, ReactionControls, SearchMethod, active_search, active_search_empty_state,
-    active_search_input, active_search_results, alert, alert_with, autocomplete_empty_state,
-    autocomplete_input, autocomplete_option, avatar, badge, badge_with, breadcrumb, card,
-    comment_thread, confirm_action, data_table, error_summary, feed_page, hero, infinite_feed,
-    locale_switcher, modal, modal_close_button, modal_trigger, nav_bar, nav_link, nav_link_matched,
-    property_list, reaction_controls, stat_card, status_tag, tabs, toast, toast_in, toast_region,
+    AccordionConfig, AlertConfig, AlertVariant, AvatarConfig, AvatarGroupConfig, AvatarSize,
+    BadgeConfig, BadgeVariant, ButtonConfig, ButtonGroupConfig, ButtonSize, ButtonVariant,
+    CardConfig, CollapsibleConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
+    DEFAULT_AVATAR_GROUP_MAX, DEFAULT_TOAST_DURATION, DEFAULT_TOAST_REGION_ID, DataTableConfig,
+    DialogSize, DrawerConfig, DrawerSide, EmptyStateConfig, HeadingLevel, HeroConfig,
+    MAX_SKELETON_COUNT, MenuEntry, MeterConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem,
+    NavLinkMatch, NavMenu, PopoverAlign, PopoverConfig, PopoverSide, ProgressConfig,
+    SeparatorConfig, SkeletonConfig, SkeletonShape, SpinnerConfig, SpinnerSize, ToastConfig,
+    TooltipConfig, TooltipPlacement, accordion, alert, alert_with, avatar, avatar_group,
+    avatar_group_with, badge, badge_with, breadcrumb, button, button_group, button_group_with,
+    card, collapsible, collapsible_with, confirm_action, data_table, drawer, drawer_trigger,
+    dropdown_menu, empty_state, empty_state_with, error_summary, hero, kbd, kbd_combo,
+    locale_switcher, meter, meter_with, modal, modal_close_button, modal_trigger, nav_bar,
+    nav_link, nav_link_matched, popover, progress, progress_with, property_list, separator,
+    separator_with, skeleton, skeleton_with, spinner, spinner_with, stat_card, status_tag, tabs,
+    toast, toast_in, toast_region, toast_with, tooltip, tooltip_with,
+};
+#[cfg(feature = "widgets-search")]
+pub use crate::widgets::{
+    ActiveSearchConfig, AutocompleteConfig, SearchMethod, active_search, active_search_empty_state,
+    active_search_input, active_search_results, autocomplete_create_option,
+    autocomplete_empty_state, autocomplete_input, autocomplete_input_for, autocomplete_option,
+};
+#[cfg(feature = "widgets-social")]
+pub use crate::widgets::{
+    CommentThread, CommentView, FeedConfig, FeedMode, ReactionControls, comment_thread, feed_page,
+    infinite_feed, reaction_controls,
 };
 
 // ── Widget stories ───────────────────────────────────────────────
@@ -297,6 +315,7 @@ pub use crate::notifications::Notifications;
 /// Web Push service/extractor (deliver a notification to a subscribed browser
 /// even when the app's tab is closed). See [`crate::push`] for the full
 /// surface.
+#[cfg(feature = "push")]
 pub use crate::push::{PushMessage, WebPush};
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
@@ -364,12 +383,15 @@ pub use crate::time::{Clock, MonotonicInstant};
 
 // ── Feature flags ─────────────────────────────────────────────────
 /// The main feature-flag service, typically stored as an `AppState` extension.
+#[cfg(feature = "feature-flags")]
 pub use crate::feature_flags::FeatureFlagService;
 /// Request-scoped feature flag extractor — call `flags.enabled("my_flag")`
 /// in handlers to gate behaviour without a redeploy.
+#[cfg(feature = "feature-flags")]
 pub use crate::feature_flags::Flags;
 /// In-memory flag store — use in tests and `dev` profile; swap for
 /// `autumn_web::feature_flags::pg::PgFlagStore` in production.
+#[cfg(feature = "feature-flags")]
 pub use crate::feature_flags::InMemoryFlagStore;
 
 // ── Internationalization ───────────────────────────────────────
@@ -393,6 +415,9 @@ pub use crate::format::format_datetime;
 /// Format a [`rust_decimal::Decimal`] as currency (`$1,234.50`) using sane defaults.
 #[cfg(feature = "maud")]
 pub use crate::format::number_to_currency;
+/// Render a byte count as a human-readable size (`1.5 KB`).
+#[cfg(feature = "maud")]
+pub use crate::format::number_to_human_size;
 /// Render an integer or decimal with grouped thousands (`1,234,567`).
 #[cfg(feature = "maud")]
 pub use crate::format::number_with_delimiter;

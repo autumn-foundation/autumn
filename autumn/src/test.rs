@@ -271,7 +271,7 @@ use crate::state::AppState;
 // `AsyncPgConnection` by its short name now; the `TestClient` pool fields use the
 // `RuntimeConnection` alias, and the transactional establish path uses the fully
 // qualified path — so without `test-support` this import would be unused.
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 use diesel_async::AsyncPgConnection;
 // Used by the Postgres transactional establish path (the `.get_result()` on
 // `TransactionalDbInterceptor`), which is itself gated `not(feature = "sqlite")`;
@@ -715,7 +715,11 @@ pub struct TestApp {
     routes: Vec<Route>,
     scoped_groups: Vec<crate::app::ScopedGroup>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
+    /// Parallel to `merge_routers`: the route group of each router (#3544).
+    merge_router_groups: Vec<Option<crate::route::RouteGroup>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
+    /// Parallel to `nest_routers`.
+    nest_router_groups: Vec<Option<crate::route::RouteGroup>>,
     /// Routes declared for opaque `nest` mounts, mirroring
     /// [`AppBuilder::declare_plugin_routes`]. Carried so a `TestApp` runs the
     /// same duplicate-route preflight production does — without this, a plugin
@@ -732,6 +736,8 @@ pub struct TestApp {
     openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "mcp")]
     mcp: Option<crate::mcp::McpRuntime>,
+    #[cfg(feature = "webmcp")]
+    webmcp: Option<crate::webmcp::WebMcpRuntime>,
     #[cfg(feature = "db")]
     pool: Option<Pool<crate::db::RuntimeConnection>>,
     #[cfg(feature = "db")]
@@ -784,6 +790,8 @@ pub struct TestApp {
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
     tasks: Vec<crate::task::TaskInfo>,
+    /// Role-aware background tasks (#3545).
+    background: crate::background::Registry,
     listeners: Vec<crate::events::ListenerInfo>,
     #[cfg(feature = "db")]
     outbox_handlers: crate::outbox::OutboxHandlers,
@@ -819,10 +827,24 @@ pub struct TestApp {
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
+/// The group of an app route that names no group (#3544).
+const fn default_route_group() -> crate::route::RouteGroup {
+    crate::route::RouteGroup::DEFAULT
+}
+
+/// Fill `groups` with shared entries up to `len`, so it stays parallel to its
+/// router list.
+fn pad_groups(groups: &mut Vec<Option<crate::route::RouteGroup>>, len: usize) {
+    groups.resize(len.max(groups.len()), None);
+}
+
 impl TestApp {
     /// Create a new test app builder with default configuration.
     #[must_use]
     pub fn new() -> Self {
+        // Connections the test opens from here on are in the Ledger capture.
+        #[cfg(feature = "ledger-capture")]
+        crate::ledger_capture::install();
         let mut config = AutumnConfig::default();
         config.profile = Some("test".into());
         // Disable CSRF for tests by default (like Spring Security's test support)
@@ -832,7 +854,9 @@ impl TestApp {
             routes: Vec::new(),
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
+            merge_router_groups: Vec::new(),
             nest_routers: Vec::new(),
+            nest_router_groups: Vec::new(),
             declared_routes: Vec::new(),
             plugin_asset_bundles: Vec::new(),
             custom_layers: Vec::new(),
@@ -842,6 +866,8 @@ impl TestApp {
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
             #[cfg(feature = "db")]
             pool: None,
             #[cfg(feature = "db")]
@@ -876,6 +902,7 @@ impl TestApp {
             state_initializers: Vec::new(),
             jobs: Vec::new(),
             tasks: Vec::new(),
+            background: crate::background::Registry::default(),
             listeners: Vec::new(),
             #[cfg(feature = "db")]
             outbox_handlers: crate::outbox::OutboxHandlers::default(),
@@ -982,6 +1009,26 @@ impl TestApp {
         self
     }
 
+    /// Serve the `WebMCP` tool list, as
+    /// [`AppBuilder::mount_webmcp`](crate::app::AppBuilder::mount_webmcp)
+    /// does.
+    #[cfg(feature = "webmcp")]
+    #[must_use]
+    pub fn mount_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default);
+        self
+    }
+
+    /// Make each eligible `GET` a `WebMCP` tool, as
+    /// [`AppBuilder::expose_all_as_webmcp`](crate::app::AppBuilder::expose_all_as_webmcp)
+    /// does.
+    #[cfg(feature = "webmcp")]
+    #[must_use]
+    pub fn expose_all_as_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default).expose_all = true;
+        self
+    }
+
     /// Enable the whole-API MCP hatch, mirroring
     /// [`AppBuilder::expose_all_as_mcp`](crate::app::AppBuilder::expose_all_as_mcp).
     ///
@@ -1076,6 +1123,7 @@ impl TestApp {
     #[must_use]
     pub fn merge(mut self, router: axum::Router<crate::state::AppState>) -> Self {
         self.merge_routers.push(router);
+        self.merge_router_groups.push(Some(default_route_group()));
         self
     }
 
@@ -1111,6 +1159,7 @@ impl TestApp {
     #[must_use]
     pub fn nest(mut self, path: &str, router: axum::Router<crate::state::AppState>) -> Self {
         self.nest_routers.push((path.to_owned(), router));
+        self.nest_router_groups.push(Some(default_route_group()));
         self
     }
 
@@ -1150,7 +1199,7 @@ impl TestApp {
     ///
     /// Mirrors [`crate::app::AppBuilder::with_error_reporter`]. Call multiple
     /// times to chain reporters; each receives every panic + 5xx event.
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[must_use]
     pub fn with_error_reporter<R: crate::reporting::ErrorReporter>(mut self, reporter: R) -> Self {
         let reporter =
@@ -1208,6 +1257,7 @@ impl TestApp {
             state,
             _job_runtime: None,
             _task_scheduler: None,
+            _background: None,
             clock_as_any: None,
             #[cfg(feature = "mail")]
             mail_recorder: None,
@@ -1239,6 +1289,19 @@ impl TestApp {
         self
     }
 
+    /// Register routes in the route group `group`. Mirrors
+    /// [`AppBuilder::routes_in`](crate::app::AppBuilder::routes_in).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `group` is blank.
+    #[must_use]
+    #[track_caller]
+    pub fn routes_in(self, group: impl Into<crate::route::RouteGroup>, routes: Vec<Route>) -> Self {
+        let routes = crate::route_group::put_in_group(&group.into(), routes);
+        self.routes(routes)
+    }
+
     /// Register a callback to configure/initialize the application state before building the router.
     #[must_use]
     pub fn state_initializer<F>(mut self, f: F) -> Self
@@ -1249,6 +1312,7 @@ impl TestApp {
         self
     }
 
+    #[cfg(feature = "upgrade")]
     /// Install a designated live-state block, so handlers that read it through
     /// [`AppState::live_state`](crate::AppState::live_state) can be tested.
     ///
@@ -1275,6 +1339,7 @@ impl TestApp {
         self
     }
 
+    #[cfg(feature = "feature-flags")]
     /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend so
     /// the [`Flags`](crate::feature_flags::Flags) extractor works in test handlers.
     ///
@@ -1289,6 +1354,7 @@ impl TestApp {
         self.with_flag_service(service)
     }
 
+    #[cfg(feature = "feature-flags")]
     /// Mirrors [`crate::app::AppBuilder::with_flag_service`]. The build
     /// preloads the store before the first request.
     #[must_use]
@@ -1315,6 +1381,7 @@ impl TestApp {
 
     /// Mirrors
     /// [`crate::app::AppBuilder::with_push_subscription_store`].
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_push_subscription_store<S>(mut self, store: S) -> Self
     where
@@ -1332,6 +1399,7 @@ impl TestApp {
     /// The usual reason is a
     /// [`RecordingPushTransport`](crate::push::RecordingPushTransport), so a
     /// test can assert exactly what would have gone to the push service.
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_web_push(mut self, push: crate::push::WebPush) -> Self {
         self.state_initializers.push(Box::new(move |state| {
@@ -1368,8 +1436,14 @@ impl TestApp {
         // Merge properties from the plugin's app_builder into self:
         self.routes.extend(app_builder.routes);
         self.scoped_groups.extend(app_builder.scoped_groups);
+        pad_groups(&mut self.merge_router_groups, self.merge_routers.len());
+        pad_groups(&mut self.nest_router_groups, self.nest_routers.len());
         self.merge_routers.extend(app_builder.merge_routers);
+        self.merge_router_groups
+            .extend(app_builder.merge_router_groups);
         self.nest_routers.extend(app_builder.nest_routers);
+        self.nest_router_groups
+            .extend(app_builder.nest_router_groups);
         self.declared_routes.extend(app_builder.declared_routes);
         self.plugin_asset_bundles = app_builder.plugin_asset_bundles;
         self.custom_layers.extend(app_builder.custom_layers);
@@ -1377,6 +1451,7 @@ impl TestApp {
             .extend(app_builder.static_gate_layers);
         self.jobs.extend(app_builder.jobs);
         self.tasks.extend(app_builder.tasks);
+        self.background.extend(app_builder.background);
         self.listeners.extend(app_builder.listeners);
         #[cfg(feature = "db")]
         self.outbox_handlers.extend(app_builder.outbox_handlers);
@@ -1420,7 +1495,7 @@ impl TestApp {
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
         // that they get from `AppBuilder::run`.
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         {
             let reporters = std::mem::take(&mut app_builder.error_reporters);
             if !reporters.is_empty() {
@@ -1602,6 +1677,46 @@ impl TestApp {
         self
     }
 
+    /// Register a background task, as
+    /// [`AppBuilder::background_task`](crate::app::AppBuilder::background_task)
+    /// does (#3545).
+    ///
+    /// [`build`](Self::build) starts it when the test role runs its
+    /// capability. Dropping the [`TestClient`] cancels its shutdown token.
+    /// `build` panics on a `[roles] capabilities` key that `run()` refuses.
+    ///
+    /// # Panics
+    ///
+    /// As [`AppBuilder::background_task`](crate::app::AppBuilder::background_task).
+    #[track_caller]
+    #[must_use]
+    pub fn background_task<F, Fut>(
+        self,
+        name: impl Into<std::borrow::Cow<'static, str>>,
+        capability: impl Into<crate::background::BackgroundCapability>,
+        run: F,
+    ) -> Self
+    where
+        F: Fn(AppState, tokio_util::sync::CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.background(crate::background::BackgroundTask::new(
+            name, capability, run,
+        ))
+    }
+
+    /// Register a [`BackgroundTask`](crate::background::BackgroundTask), as
+    /// [`AppBuilder::background`](crate::app::AppBuilder::background) does.
+    ///
+    /// # Panics
+    ///
+    /// As [`AppBuilder::background_task`](crate::app::AppBuilder::background_task).
+    #[must_use]
+    pub fn background(mut self, task: crate::background::BackgroundTask) -> Self {
+        self.background.add_task(task);
+        self
+    }
+
     /// Install `entropy` unless the test already injected a source with
     /// [`with_entropy`](Self::with_entropy). [`crate::sim::Sim::build`] uses
     /// this to seed the app from the simulation seed by default.
@@ -1634,7 +1749,7 @@ impl TestApp {
     /// [`crate::outbox::ensure_schema`] in the test first.
     #[cfg(feature = "db")]
     #[must_use]
-    pub const fn with_outbox(mut self, config: crate::config::OutboxConfig) -> Self {
+    pub fn with_outbox(mut self, config: crate::config::OutboxConfig) -> Self {
         self.config.outbox = config;
         self.config.outbox.enabled = true;
         self
@@ -1967,6 +2082,26 @@ impl TestApp {
     #[must_use]
     #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
     pub fn build(mut self) -> TestClient {
+        // Keep only the route groups the test role mounts (#3544), as
+        // `AppBuilder::run` does. A bad role fails later, with its own message.
+        if let Ok(role) = self.config.resolve_role() {
+            pad_groups(&mut self.merge_router_groups, self.merge_routers.len());
+            pad_groups(&mut self.nest_router_groups, self.nest_routers.len());
+            let retained = crate::route_group::MountTargets {
+                routes: &mut self.routes,
+                route_sources: &mut Vec::new(),
+                scoped_groups: &mut self.scoped_groups,
+                merge_routers: &mut self.merge_routers,
+                merge_router_groups: &mut self.merge_router_groups,
+                nest_routers: &mut self.nest_routers,
+                nest_router_groups: &mut self.nest_router_groups,
+                declared_routes: &mut self.declared_routes,
+            }
+            .retain(&role);
+            if let Err(error) = retained {
+                panic!("{error}");
+            }
+        }
         // Reset the global cache to prevent cross-test contamination. Briefly
         // held so this can't land mid-flight inside another same-process
         // test's own global-cache critical section (issue #2218) — see
@@ -1991,7 +2126,7 @@ impl TestApp {
                 "a fault plan needs `jobs.workers = 1`: concurrent workers can swap \
                  which execution is the Nth, so the ordinals would not replay"
             );
-            #[cfg(feature = "reporting")]
+            #[cfg(feature = "error-reporting")]
             assert!(
                 self.config.reporting.enabled && self.config.reporting.sample_rate >= 1.0,
                 "a fault plan needs `reporting.enabled = true` and \
@@ -2177,7 +2312,7 @@ impl TestApp {
         });
 
         #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
-        let mut state = AppState {
+        let mut state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -2222,7 +2357,10 @@ impl TestApp {
             #[cfg(all(feature = "db", feature = "reporting"))]
             db_capture_gap: None,
             profile: self.config.profile.as_deref().map(std::sync::Arc::from),
-            role: self.config.role,
+            role: self
+                .config
+                .resolve_role()
+                .expect("the test config role must name a built-in role or a declared preset"),
             started_at,
             health_detailed: self.config.health.detailed,
             probes: probes.clone(),
@@ -2257,7 +2395,7 @@ impl TestApp {
                 .entropy
                 .unwrap_or_else(|| std::sync::Arc::new(crate::entropy::OsEntropy)),
             app_id: crate::state::AppState::next_app_id(),
-        };
+        });
 
         // Mirror `App::run`'s failure-capsule clock wiring (#1598): the layer
         // itself is installed by the shared router builder, but the recording
@@ -2289,6 +2427,15 @@ impl TestApp {
         state.insert_extension(self.commerce_docs);
         crate::app::install_webhook_registry(&state, &self.config);
 
+        // `[database.roles]` in the test config: build its role pools, so a
+        // `BoundaryDb` connects as the role, as in production.
+        #[cfg(feature = "db")]
+        if !self.config.database.roles.is_empty() {
+            state.insert_extension(
+                crate::db::create_role_pools(&self.config.database)
+                    .expect("test role pools should build from config"),
+            );
+        }
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
         // and HTTP Client resilience can read the test-supplied config.
         state.insert_extension(self.config.clone());
@@ -2386,24 +2533,7 @@ impl TestApp {
             // AC6: install nothing (and leave production `Channels` untouched)
             // unless at least one interceptor was requested.
             if !interceptors.is_empty() {
-                state.channels = crate::channels::Channels::with_shared_backend(
-                    std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
-                        state.channels.backend().clone(),
-                        interceptors,
-                    )),
-                );
-                #[cfg(feature = "presence")]
-                {
-                    state.presence = crate::presence::Presence::new(state.channels.clone());
-                    // Same reason as `app.rs`: the hub captured the old pair.
-                    #[cfg(feature = "collab")]
-                    {
-                        state.collab = crate::collab::CollabHub::new(
-                            state.channels.clone(),
-                            state.presence.clone(),
-                        );
-                    }
-                }
+                state.intercept_channels(interceptors);
             }
             recorder_for_client
         };
@@ -2419,7 +2549,8 @@ impl TestApp {
             &state,
             &self.config.outbox,
             std::mem::take(&mut self.outbox_handlers),
-        );
+        )
+        .unwrap_or_else(|error| panic!("TestApp: outbox: {error}"));
 
         #[cfg(feature = "mail")]
         {
@@ -2506,7 +2637,7 @@ impl TestApp {
         // built and resolves immediately, so leading the chain delays nobody.
         // Must land before the router is built, which is where
         // `ReportingLayer` reads the chain.
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         if let Some(ledger) = fault_ledger.as_ref() {
             let mut reporters = state
                 .extension::<crate::reporting::RegisteredReporters>()
@@ -2550,6 +2681,23 @@ impl TestApp {
             },
         );
 
+        // Check `[roles] capabilities` and publish the task queues before the
+        // job runtime starts, as `run()` does (#3545).
+        match self
+            .background
+            .validate_roles(&self.config, state.role().name())
+        {
+            Ok(warnings) => {
+                for warning in warnings {
+                    tracing::warn!(warning = %warning, "[roles] capabilities on another role");
+                }
+            }
+            Err(error) => panic!("{error}"),
+        }
+        state.insert_extension(crate::background::BackgroundQueues(
+            self.background.queues(),
+        ));
+
         let job_runtime = if self.jobs.is_empty() {
             None
         } else {
@@ -2580,6 +2728,17 @@ impl TestApp {
             )
             .expect("Failed to start scheduled tasks in test");
             Some(TestTaskScheduler { shutdown })
+        };
+
+        // Start the background tasks the test role places (#3545), after
+        // every state initializer and plugin startup hook, as `run()` does.
+        let background = if self.background.is_empty() {
+            None
+        } else {
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let _runtime =
+                crate::background::start(&self.background, &state, &shutdown, &self.config);
+            Some(TestBackground { shutdown })
         };
 
         // Retain the registered job metadata so `perform_enqueued_jobs` can look
@@ -2684,6 +2843,8 @@ impl TestApp {
                 openapi: self.openapi,
                 #[cfg(feature = "mcp")]
                 mcp: self.mcp,
+                #[cfg(feature = "webmcp")]
+                webmcp: self.webmcp,
             },
         )
         .expect("failed to build test router");
@@ -2724,6 +2885,7 @@ impl TestApp {
             state,
             _job_runtime: job_runtime,
             _task_scheduler: task_scheduler,
+            _background: background,
             clock_as_any: self.clock_as_any,
             #[cfg(feature = "mail")]
             mail_recorder: Some(mail_recorder_for_client),
@@ -2788,6 +2950,8 @@ pub struct TestClient {
     _job_runtime: Option<TestJobRuntime>,
     /// Stops the `#[scheduled]` task loops [`TestApp::build`] started.
     _task_scheduler: Option<TestTaskScheduler>,
+    /// Cancels the background tasks [`TestApp::build`] started (#3545).
+    _background: Option<TestBackground>,
     /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// `None` when built via [`TestApp::from_router`], which bypasses recorder
@@ -2865,6 +3029,17 @@ struct TestTaskScheduler {
 }
 
 impl Drop for TestTaskScheduler {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+/// Cancels the background tasks of one [`TestClient`] when it drops.
+struct TestBackground {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for TestBackground {
     fn drop(&mut self) {
         self.shutdown.cancel();
     }
@@ -3339,28 +3514,28 @@ impl TestClient {
     /// no [`crate::sim::FaultPlan`] is attached (so an ordinary test app never
     /// touches an atomic per request).
     ///
-    /// Also `None` without the `reporting` feature: nothing can ever populate
+    /// Also `None` without the `error-reporting` feature: nothing can ever populate
     /// `FaultOutcome::server_errors` then, so counting observed 5xx would only
     /// make [`fault_outcome`](Self::fault_outcome) spin out its whole settle
     /// budget against a list that stays empty by contract.
     #[cfg_attr(
-        not(feature = "reporting"),
+        not(feature = "error-reporting"),
         allow(
             clippy::unused_self,
             clippy::missing_const_for_fn,
-            reason = "without `reporting` the answer is a constant `None`, but the \
+            reason = "without `error-reporting` the answer is a constant `None`, but the \
                       signature has to stay one method so every request builder \
                       keeps a single call site"
         )
     )]
     fn fault_error_counter(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         {
             self.fault_ledger
                 .as_ref()
                 .map(|_| std::sync::Arc::clone(&self.observed_server_errors))
         }
-        #[cfg(not(feature = "reporting"))]
+        #[cfg(not(feature = "error-reporting"))]
         {
             None
         }
@@ -4666,6 +4841,9 @@ impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
 
 /// Shared Postgres testcontainer for database integration tests.
 ///
+/// Under `--features sqlite` this type is a tempfile `SQLite` database instead
+/// (issue #2555); the API is the same.
+///
 /// Rather than spinning up a new container per test (slow!), `TestDb`
 /// provides a shared container that all tests in a binary can reuse.
 /// This mirrors Spring Boot's `@Testcontainers` with `@Container` +
@@ -4696,14 +4874,14 @@ impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
 ///     client.get("/data").send().await.assert_ok();
 /// }
 /// ```
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 pub struct TestDb {
     _container: testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
     pool: Pool<AsyncPgConnection>,
     url: String,
 }
 
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 impl TestDb {
     /// Start a new Postgres testcontainer and create a connection pool.
     ///
@@ -4791,6 +4969,189 @@ impl TestDb {
             .await
             .unwrap_or_else(|e| panic!("SQL execution failed: {e}\nSQL: {sql}"));
     }
+
+    /// Empty `table` and restart its id sequence (`TRUNCATE … RESTART IDENTITY`).
+    ///
+    /// `table` must match `[A-Za-z0-9_]+`. Schema-qualified names are not allowed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a plain identifier, or if the SQL fails.
+    pub async fn reset_table(&self, table: &str) {
+        assert_plain_identifier(table);
+        self.execute_sql(&format!("TRUNCATE \"{table}\" RESTART IDENTITY"))
+            .await;
+    }
+}
+
+/// Throwaway `SQLite` database for integration tests (issue #2555).
+///
+/// This is the `--features sqlite` counterpart of the Postgres `TestDb`. It has
+/// the same API and needs no Docker. Each instance owns a tempfile database.
+/// [`TestDb::shared`] reuses one per test binary.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::test::{TestApp, TestDb};
+///
+/// #[tokio::test]
+/// async fn db_test() {
+///     let db = TestDb::shared().await;
+///     db.execute_sql("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)").await;
+///     let client = TestApp::new().routes(routes![h]).with_db(db.pool()).build();
+///     client.get("/t").send().await.assert_ok();
+/// }
+/// ```
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+pub struct TestDb {
+    pool: Pool<crate::db::RuntimeConnection>,
+    url: String,
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+impl TestDb {
+    /// Create a new tempfile database and a connection pool for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool cannot be built.
+    pub async fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "autumn-testdb-{}-{}.db",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A file from a crashed run can share this name (the process id is
+        // reused). Remove it so the database starts empty.
+        remove_sqlite_files(&path);
+        let url = format!("sqlite://{}", path.display());
+        let config = crate::config::DatabaseConfig {
+            primary_url: Some(url.clone()),
+            ..Default::default()
+        };
+        let pool = crate::db::create_pool(&config)
+            .expect("failed to build SQLite test pool")
+            .expect("SQLite test URL did not yield a pool");
+        // Create the file now so a failure shows up here, not in a later test.
+        drop(
+            pool.get()
+                .await
+                .expect("failed to open SQLite test database"),
+        );
+        Self { pool, url, path }
+    }
+
+    /// Get a shared `TestDb`, created on first use.
+    ///
+    /// The database is created once per test binary. Rust never drops a
+    /// static, so its file stays in the temp directory. Use [`TestDb::new`] when
+    /// the file must be removed.
+    pub async fn shared() -> &'static Self {
+        use std::sync::OnceLock;
+        use tokio::sync::OnceCell;
+
+        static CELL: OnceLock<OnceCell<TestDb>> = OnceLock::new();
+        let once = CELL.get_or_init(OnceCell::new);
+        once.get_or_init(Self::new).await
+    }
+
+    /// Get the database connection pool.
+    #[must_use]
+    pub fn pool(&self) -> Pool<crate::db::RuntimeConnection> {
+        self.pool.clone()
+    }
+
+    /// Get the `sqlite://` connection URL.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Execute raw SQL against the test database.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the SQL fails.
+    pub async fn execute_sql(&self, sql: &str) {
+        use diesel_async::SimpleAsyncConnection as _;
+        let mut conn = self.pool.get().await.expect("failed to get connection");
+        conn.batch_execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("SQL execution failed: {e}\nSQL: {sql}"));
+    }
+
+    /// Empty `table` and restart its id counter.
+    ///
+    /// `SQLite` has no `TRUNCATE`. This deletes every row, then clears the
+    /// `AUTOINCREMENT` counter in `sqlite_sequence`. `table` must match
+    /// `[A-Za-z0-9_]+`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a plain identifier, or if the SQL fails.
+    pub async fn reset_table(&self, table: &str) {
+        use diesel_async::RunQueryDsl as _;
+        use diesel_async::SimpleAsyncConnection as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct Found {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        assert_plain_identifier(table);
+        // One connection for all steps, so no other writer slips in between.
+        let mut conn = self.pool.get().await.expect("failed to get connection");
+        conn.batch_execute(&format!("DELETE FROM \"{table}\""))
+            .await
+            .unwrap_or_else(|e| panic!("failed to empty {table}: {e}"));
+        // `sqlite_sequence` exists only after the first AUTOINCREMENT table.
+        let found = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'sqlite_sequence'",
+        )
+        .get_result::<Found>(&mut *conn)
+        .await
+        .expect("failed to probe sqlite_sequence");
+        if found.n > 0 {
+            conn.batch_execute(&format!(
+                "DELETE FROM sqlite_sequence WHERE name = '{table}'"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("failed to reset the id counter of {table}: {e}"));
+        }
+    }
+}
+
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        self.pool.close();
+        remove_sqlite_files(&self.path);
+    }
+}
+
+/// Remove a `SQLite` database file and its `-wal` and `-shm` files.
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+fn remove_sqlite_files(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(name);
+    }
+}
+
+/// Reject anything but `[A-Za-z0-9_]+`: table names go into SQL text.
+#[cfg(all(feature = "db", feature = "test-support"))]
+fn assert_plain_identifier(name: &str) {
+    assert!(
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "table name must be a plain identifier: {name:?}"
+    );
 }
 
 /// Deterministically claims and runs up to `max_rows` ready durable repository
@@ -4897,6 +5258,27 @@ pub async fn drain_ready_repository_commit_hooks(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    fn plain_identifiers_are_accepted() {
+        super::assert_plain_identifier("posts");
+        super::assert_plain_identifier("Post_2");
+    }
+
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    #[should_panic(expected = "plain identifier")]
+    fn an_empty_identifier_is_rejected() {
+        super::assert_plain_identifier("");
+    }
+
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    #[should_panic(expected = "plain identifier")]
+    fn sql_in_an_identifier_is_rejected() {
+        super::assert_plain_identifier("t; DROP TABLE x");
+    }
+
     use super::*;
 
     fn cleanup_probe_job(
@@ -4963,6 +5345,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             },
             Route {
                 method: Method::POST,
@@ -4983,6 +5366,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             },
             Route {
                 method: Method::POST,
@@ -5003,6 +5387,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             },
         ]
     }
@@ -5177,6 +5562,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }];
         let client = TestApp::new().routes(routes).build();
 

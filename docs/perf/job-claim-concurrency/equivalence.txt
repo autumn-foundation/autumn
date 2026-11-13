@@ -1,0 +1,14 @@
+--- shipped claim
+deferred={} ack=0: d_1 d_2 esc_1 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 m_l1_a m_l3_a m_l3_b u_edge
+deferred={} ack=1: d_1 d_2 esc_1 esc_2 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 k_null_2 k_empty_2 k_str_2 m_l1_a m_l1_b m_l3_a m_l3_b m_l3_c u_edge
+deferred={} ack=2: d_1 d_2 esc_1 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 k_empty_2 m_l1_a m_l3_a m_l3_b m_l3_c u_edge
+deferred={parked} ack=0: esc_1 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 m_l1_a m_l3_a m_l3_b u_edge
+deferred={parked} ack=1: esc_1 esc_2 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 k_null_2 k_empty_2 k_str_2 m_l1_a m_l1_b m_l3_a m_l3_b m_l3_c u_edge
+deferred={parked} ack=2: esc_1 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 k_empty_2 m_l1_a m_l3_a m_l3_b m_l3_c u_edge
+deferred={parked,no.such.job} ack=0: esc_1 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 m_l1_a m_l3_a m_l3_b u_edge
+deferred={parked,no.such.job} ack=1: esc_1 esc_2 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 k_null_2 k_empty_2 k_str_2 m_l1_a m_l1_b m_l3_a m_l3_b m_l3_c u_edge
+deferred={parked,no.such.job} ack=2: esc_1 esc_3 u_tie_a u_tie_b k_null_1 k_empty_1 k_str_1 k_empty_2 m_l1_a m_l3_a m_l3_b m_l3_c u_edge
+deferred={grp,mix,plain,parked,sat,xq,z} ack=0: esc_1 esc_3
+deferred={grp,mix,plain,parked,sat,xq,z} ack=1: esc_1 esc_2 esc_3
+deferred={grp,mix,plain,parked,sat,xq,z} ack=2: esc_1 esc_3
+IDENTICAL: 12 scenarios

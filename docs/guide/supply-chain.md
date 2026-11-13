@@ -317,7 +317,7 @@ Run the same gate yourself against any checkout:
 
 ```bash
 ./scripts/check-sbom.sh                     # against the working tree
-RELEASE_TAG=v0.8.0 ./scripts/check-sbom.sh  # also enforce tag agreement
+RELEASE_TAG=v0.10.0 ./scripts/check-sbom.sh  # also enforce tag agreement
 ```
 
 **Downloads during an image build are checksum-verified.** Every artifact the
@@ -365,6 +365,11 @@ Run it locally. CI derives its check list from the sections `deny.toml`
 declares, so the exact command depends on your policy — `autumn doctor` does
 that derivation for you and reports the same verdict:
 
+In a workspace, `autumn doctor` and `autumn dev` read the outermost
+`deny.toml`, up to the `.git` folder. This is the file CI reads. A `deny.toml`
+in a member crate is ignored. A nested workspace (its own `[workspace]` table)
+keeps its own policy.
+
 ```bash
 cargo install --locked cargo-deny   # once
 autumn doctor                       # derives the checks, as CI does
@@ -395,7 +400,7 @@ error[vulnerability]: Marvin Attack: potential key recovery through timing sidec
     ├ Solution: No safe upgrade is available!
     ├ rsa v0.9.10
       └── jsonwebtoken v10.1.0
-          └── autumn-web v0.8.0
+          └── autumn-web v0.10.0
               └── my-app v0.1.0
 
 advisories FAILED
@@ -431,7 +436,7 @@ When there is no fix — or the vulnerable code path is unreachable from your ap
 [advisories]
 ignore = [
     # Why this is acceptable *here*, and when you will look again.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    { id = "RUSTSEC-2023-0071", reason = "verify-only; reaches this app only through jsonwebtoken's RSA-family JWT verification path (autumn-web `jwt` feature, default-on), never signing; rsa 0.10.0 final now exists but jsonwebtoken (^0.9) and webauthn-rs/crypto-glue (rc pin vs. final's mandatory sha2 feature) both block taking it; reconfirmed unreachable 2026-11-09; review-by 2026-12-05" },
 ]
 ```
 
@@ -440,14 +445,22 @@ one in the same crate — still fails, and the gate itself stays on. The id and
 the rationale are committed to your repository, so the decision is reviewable
 in a pull request rather than living in someone's memory.
 
-Your generated `deny.toml` ships with a waiver already in it:
-`RUSTSEC-2023-0071`. `rsa` reaches every Autumn app through `jsonwebtoken`,
-which `autumn-web` depends on unconditionally, and no patched `rsa` release
-exists. An app generated with `--bundled-pg` gets a second one
-(`RUSTSEC-2024-0384`, `instant`, unmaintained, reachable only through the
-embedded-Postgres build stack) — and only that flavor gets it, so cargo-deny's
-"this waiver is unused" warning stays available to tell you when one of *your*
-waivers has gone stale.
+Your generated `deny.toml` has three waivers. Two are `RUSTSEC-2023-0071`
+(`rsa`) and `RUSTSEC-2026-0387` (`crypto-bigint` 0.5). Both reach an Autumn app through
+`jsonwebtoken`, which `autumn-web` compiles behind its default-on `jwt`
+feature. A fix exists upstream for `rsa` (0.10.0 final, 2026-11) but nothing
+in either dependency chain can consume it yet, and no fix an app can take
+exists for `crypto-bigint`. An app that needs neither
+JWT tenancy nor OIDC can set `default-features = false`, leave out `jwt` (and
+`oauth2`, which turns it on), and delete both waivers. A passkey app still
+reaches `rsa` through `webauthn-rs`. cargo-deny's "this waiver is unused"
+warning tells you when one of *your* waivers has gone stale.
+
+A third waiver, `RUSTSEC-2026-0441`, is for `pin-utils`, which is
+unmaintained: no one fixes a new bug in it. It reaches the graph through
+`loom`, which `autumn-web` names only for its own `cfg(loom_models)` model
+checks. A normal build never compiles it, but cargo-deny audits every target.
+No `loom` release drops it yet.
 
 Those waivers are why a freshly scaffolded app's CI is green on day one instead
 of red on the first push. Autumn's CI generates each app flavor and audits it with
@@ -534,8 +547,8 @@ job uses. Nothing here is a second implementation, and there is no second
 waiver format: a waiver is an `[advisories] ignore` entry, read by doctor, dev
 and CI alike.
 
-Two differences remain, and doctor reports both on its own line so you can
-judge them:
+Three differences remain. Doctor reports the first two on its own line so you
+can judge them:
 
 - **The auditor version.** The generated workflow pins `cargo-deny@0.20.2`; a
   local run uses whatever `cargo deny` is on your PATH. Doctor names the
@@ -546,6 +559,16 @@ judge them:
   (see *Offline and air-gapped* below) and names its data age. An advisory
   published since your last fetch is red in CI and silent locally — run
   `cargo deny fetch db` to close the gap.
+
+A third difference has no line, because doctor cannot see it. Only cargo-deny
+knows the `deny.toml` schema. Doctor checks that the file is valid TOML. If
+cargo-deny is not installed, doctor does not check the schema: `yanked =
+"bogus"` is valid TOML, so doctor passes and CI rejects it. Without cargo-deny,
+the doctor line says `not evaluated` and that doctor cannot check `deny.toml`. Install cargo-deny to close the gap.
+
+When a doctor or dev audit reaches its deadline (30 seconds), Autumn kills the
+`cargo-deny` process and the processes it started, so they cannot hold Cargo's
+package-cache lock. A finished audit is never killed.
 
 Uncommenting a section widens both sides at once. The generated workflow
 derives its check list from the file:
@@ -568,6 +591,12 @@ the same table. The two are held together by a test —
 `autumn doctor` over every one of those spellings and requires the same answer —
 so a rule that drifts fails the build rather than silently un-enforcing your
 policy.
+
+The two agree on every hand-written policy. They can split in two cases: an
+escaped key, which only doctor sees, and header-like text inside a string, which
+only the grep sees. Then doctor reports no verdict and names the sections. Write
+each section as a plain `[bans]` header, and keep header-like text out of
+strings.
 
 ### `autumn doctor` — the dependency check
 
@@ -695,7 +724,8 @@ On an air-gapped machine, set `[advisories] db-path` in `deny.toml` to a
 directory *holding* database checkouts — the same shape as
 `~/.cargo/advisory-dbs`, not a checkout itself — and mirror the RustSec
 repository into it. `~` and `$CARGO_HOME` are expanded, as cargo-deny expands
-them. Doctor reads that path and ages it the same way.
+them. A relative path is relative to the directory that holds `deny.toml`.
+Doctor reads that path and ages it the same way.
 
 ---
 

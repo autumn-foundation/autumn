@@ -37,10 +37,8 @@
 
 use axum::extract::FromRequestParts;
 use diesel;
-// Named by the default Postgres pool builder/TLS connector and by the
-// Postgres migration connection (`MigrationConnection`), which stays compiled
-// under the `sqlite` feature (diesel's `postgres` backend is still in the graph
-// via `db`), so this import is used on both builds.
+// Named by the Postgres pool builder, TLS connector and migration connection.
+#[cfg(feature = "postgres")]
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 #[cfg(not(feature = "sqlite"))]
@@ -106,11 +104,13 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
-/// One `SQLite` database per tenant or per routing slot (ADR 0019).
-#[cfg(feature = "sqlite")]
+// The fleet modules carry their own `//!` docs. An outer doc here would
+// make rustdoc resolve their links in this module.
 pub mod fleet;
-/// Slot-ownership epochs and fencing for a fleet (issue #3233).
+pub mod fleet_engine;
+/// Cross-tenant analytics over a fleet's replicas (issue #3236, ADR 0032).
 #[cfg(feature = "sqlite")]
+pub mod fleet_lake;
 pub mod fleet_ownership;
 /// Continuous replication of a fleet's databases (ADR 0019 §5).
 #[cfg(feature = "sqlite")]
@@ -118,7 +118,28 @@ pub mod fleet_replication;
 /// Background work on fleet databases nobody asks for (issue 3234).
 #[cfg(feature = "sqlite")]
 pub mod fleet_sweeper;
+pub mod fleet_tombstones;
 pub mod pooler;
+
+/// Diesel's prelude for async code. Use it in place of `diesel::prelude::*`.
+///
+/// `diesel::prelude::*` also imports the blocking `RunQueryDsl` and
+/// `SaveChangesDsl`. In a module with `#[model]` or `#[repository]`, the
+/// generated code then fails with E0034 ("multiple applicable items in
+/// scope"). This prelude has all of Diesel's prelude, but those two names
+/// are the `diesel_async` traits.
+///
+/// ```rust,ignore
+/// use autumn_web::db::prelude::*;
+///
+/// let n: i64 = notes::table.count().get_result(&mut *db).await?;
+/// ```
+pub mod prelude {
+    pub use diesel::prelude::*;
+    // A named import hides the glob import of the same name.
+    pub use diesel_async::{AsyncConnection, RunQueryDsl, SaveChangesDsl};
+}
+
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
 pub mod sqlite_types;
@@ -214,27 +235,93 @@ impl TxTimeouts {
         TX_TIMEOUTS.scope(self, fut).await
     }
 
-    /// Run a request `fut` with these timeouts as its defaults. A route's
-    /// [`StatementTimeout`] replaces the statement value when an extractor
-    /// sees it (see [`note_route_statement_timeout`]).
-    pub(crate) async fn scope_request<F: std::future::Future>(self, fut: F) -> F::Output {
-        REQUEST_TX_TIMEOUTS
-            .scope(Arc::new(Mutex::new(self)), fut)
-            .await
-    }
-
     /// The timeouts in scope for this task: the innermost `Db` scope, else
     /// the request defaults, else `None`.
     pub(crate) fn current() -> Option<Self> {
-        TX_TIMEOUTS.try_with(|t| *t).ok().or_else(|| {
-            REQUEST_TX_TIMEOUTS
-                .try_with(|cell| {
-                    *cell
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                })
-                .ok()
-        })
+        TX_TIMEOUTS
+            .try_with(|t| *t)
+            .ok()
+            .or_else(|| REQUEST_TX_TIMEOUTS.try_with(std::cell::Cell::get).ok())
+    }
+}
+
+/// Tower layer that puts the request defaults of [`TxTimeouts`] in scope for
+/// each request (#3057).
+///
+/// It has a named future, so a request allocates no box and does not clone
+/// the inner service (#2830).
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
+#[derive(Clone, Copy)]
+pub(crate) struct TxTimeoutsLayer(TxTimeouts);
+
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
+impl TxTimeoutsLayer {
+    pub(crate) const fn new(timeouts: TxTimeouts) -> Self {
+        Self(timeouts)
+    }
+}
+
+impl<S> tower::Layer<S> for TxTimeoutsLayer {
+    type Service = TxTimeoutsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TxTimeoutsService {
+            inner,
+            timeouts: self.0,
+        }
+    }
+}
+
+/// Tower service of [`TxTimeoutsLayer`].
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
+#[derive(Clone)]
+pub(crate) struct TxTimeoutsService<S> {
+    inner: S,
+    timeouts: TxTimeouts,
+}
+
+impl<S, Req> tower::Service<Req> for TxTimeoutsService<S>
+where
+    S: tower::Service<Req>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tokio::task::futures::TaskLocalFuture<std::cell::Cell<TxTimeouts>, S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Req) -> Self::Future {
+        // The inner call can record a route override. The future starts with
+        // the value that the call left.
+        let (fut, timeouts) =
+            REQUEST_TX_TIMEOUTS.sync_scope(std::cell::Cell::new(self.timeouts), || {
+                let fut = self.inner.call(req);
+                (fut, REQUEST_TX_TIMEOUTS.with(std::cell::Cell::get))
+            });
+        REQUEST_TX_TIMEOUTS.scope(std::cell::Cell::new(timeouts), fut)
     }
 }
 
@@ -272,9 +359,9 @@ pub fn note_route_statement_timeout(parts: &axum::http::request::Parts) {
 pub(crate) fn note_statement_timeout(timeout: StatementTimeout) {
     let ms = pg_timeout_ms(Some(timeout.0));
     let _ = REQUEST_TX_TIMEOUTS.try_with(|cell| {
-        cell.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .statement_ms = Some(ms);
+        let mut timeouts = cell.get();
+        timeouts.statement_ms = Some(ms);
+        cell.set(timeouts);
     });
 }
 
@@ -297,7 +384,7 @@ tokio::task_local! {
     /// The request's [`TxTimeouts`], for code that opens a transaction on a
     /// connection of its own (generated repositories). Set by the request
     /// layer. Mutable so that a route override can replace the default.
-    static REQUEST_TX_TIMEOUTS: Arc<Mutex<TxTimeouts>>;
+    static REQUEST_TX_TIMEOUTS: std::cell::Cell<TxTimeouts>;
 }
 
 /// Issue the in-scope [`TxTimeouts`] as `SET LOCAL`, at transaction depth 1
@@ -717,6 +804,12 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
         use diesel::connection::InstrumentationEvent;
         match event {
             InstrumentationEvent::StartQuery { query, .. } => {
+                // This timer replaces the capture on the connection, so it
+                // forwards the statement.
+                #[cfg(feature = "ledger-capture")]
+                if crate::ledger_capture::enabled() {
+                    crate::ledger_capture::observe(&query.to_string(), None);
+                }
                 // `query` is an opaque `&dyn DebugQuery`; its `Display` impl
                 // renders the SQL text, which we inspect to skip housekeeping /
                 // transaction-control statements (see the type-level docs). The
@@ -968,6 +1061,23 @@ pub trait DbState {
     /// changes.
     fn shards(&self) -> Option<&crate::sharding::ShardSet> {
         None
+    }
+
+    /// Returns the pool of the database role of boundary `name`.
+    ///
+    /// Defaults to the primary pool, so a state with no roles needs no
+    /// changes. [`AppState`](crate::state::AppState) gives the pool of
+    /// `[database.roles.<name>]`. See
+    /// [`AppState::pool_for`](crate::state::AppState::pool_for).
+    fn boundary_pool(&self, name: &str) -> Option<Pool<RuntimeConnection>> {
+        let _ = name;
+        self.pool().cloned()
+    }
+
+    /// Whether [`Self::boundary_pool`] gives role pools, not the primary
+    /// pool. A role pool does not record failure-capture traffic.
+    fn boundary_roles_configured(&self) -> bool {
+        false
     }
 
     /// Returns any registered database connection checkout interceptors.
@@ -1375,6 +1485,7 @@ where
 /// [`tokio_postgres::error::DbError`] in turn. Shared by [`is_query_canceled`]
 /// and [`is_retryable_txn_error`] — both need the same downcast-through-the-
 /// chain strategy, only with a different SQLSTATE to look for.
+#[cfg(feature = "postgres")]
 fn source_chain_has_sqlstate(
     err: &(dyn std::error::Error + 'static),
     predicate: impl Fn(&tokio_postgres::error::SqlState) -> bool,
@@ -1414,9 +1525,17 @@ fn is_query_canceled(err: &diesel::result::Error) -> bool {
         return true;
     }
 
-    source_chain_has_sqlstate(err, |state| {
-        *state == tokio_postgres::error::SqlState::QUERY_CANCELED
-    })
+    // Without the Postgres client there is no SQLSTATE to read.
+    #[cfg(feature = "postgres")]
+    {
+        source_chain_has_sqlstate(err, |state| {
+            *state == tokio_postgres::error::SqlState::QUERY_CANCELED
+        })
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        false
+    }
 }
 
 /// Error type for pool creation failures.
@@ -1442,6 +1561,15 @@ pub enum PoolError {
     /// [`DatabaseBackend`](crate::config::DatabaseBackend).
     #[error("{0}")]
     UnsupportedBackend(String),
+
+    /// A `[database.roles.<name>]` entry has no usable URL.
+    #[error("database.roles.{name}: {message}")]
+    Role {
+        /// The role name.
+        name: String,
+        /// Why the URL is not usable.
+        message: String,
+    },
 }
 
 /// Primary plus optional read-replica database pools.
@@ -1561,9 +1689,11 @@ impl DatabaseTopology {
 static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+pub(crate) use crate::config::SqliteTuning;
+
 /// The per-connection pragma batch a pooled `SQLite` connection is set up with.
 ///
-/// Pure over its two inputs so the decision is unit-testable without a pool, a
+/// Pure over its inputs so the decision is unit-testable without a pool, a
 /// database, or the process-global replication latch.
 ///
 /// * A **read-only** target gets the non-writing pragmas only: `journal_mode =
@@ -1579,9 +1709,17 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 ///   without invoking the busy handler at all (the pool does not wire
 ///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
 ///   harmless, not harmful (issue #2881).
+/// * A non-zero [`SqliteTuning`] value adds `mmap_size` or `cache_size` at the
+///   end, in every variant. Neither writes to the file.
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-pub(crate) const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
-    if read_only {
+pub(crate) fn sqlite_connection_pragmas(
+    read_only: bool,
+    replicating: bool,
+    tuning: SqliteTuning,
+) -> String {
+    use std::fmt::Write as _;
+
+    let base = if read_only {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA foreign_keys = ON;"
     } else if replicating {
@@ -1595,7 +1733,23 @@ pub(crate) const fn sqlite_connection_pragmas(read_only: bool, replicating: bool
          PRAGMA journal_mode = WAL; \
          PRAGMA synchronous = NORMAL; \
          PRAGMA foreign_keys = ON;"
+    };
+    let mut pragmas = String::from(base);
+    // Writing to a `String` cannot fail. Config validation refuses values
+    // that SQLite cannot read. A config built in code skips it, so clamp:
+    // SQLite sets `cache_size` to 0 when its value overflows.
+    if tuning.mmap_size > 0 {
+        let mmap_size = tuning.mmap_size.min(i64::MAX.unsigned_abs());
+        let _ = write!(pragmas, " PRAGMA mmap_size = {mmap_size};");
     }
+    if tuning.cache_size_kib > 0 {
+        let kib = tuning
+            .cache_size_kib
+            .min(u64::from(i32::MAX.unsigned_abs()));
+        // A negative value is a size in KiB, not a page count.
+        let _ = write!(pragmas, " PRAGMA cache_size = -{kib};");
+    }
+    pragmas
 }
 
 /// Declare that continuous replication is active in this process.
@@ -1658,7 +1812,10 @@ fn build_pool(
     url: &str,
     pool_size: usize,
     connect_timeout_secs: u64,
+    tuning: SqliteTuning,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
+    #[cfg(feature = "ledger-capture")]
+    crate::ledger_capture::install();
     // Under the `sqlite` feature `RuntimeConnection` is a SQLite connection, so
     // the pool must be built over `SyncConnectionWrapper<SqliteConnection>`
     // rather than the Postgres manager below. Route to the dedicated SQLite
@@ -1667,7 +1824,7 @@ fn build_pool(
     // expression — no `return` needed.
     #[cfg(feature = "sqlite")]
     {
-        build_sqlite_pool(url, pool_size, connect_timeout_secs)
+        build_sqlite_pool(url, pool_size, connect_timeout_secs, tuning)
     }
 
     // Default (Postgres) build. A SQLite target is recognized here but its
@@ -1688,6 +1845,7 @@ fn build_pool(
 
     #[cfg(not(feature = "sqlite"))]
     {
+        warn_if_sqlite_tuning_on_postgres(tuning);
         let _ = crate::lock::pooler::warn_if_pooled(url);
         let timeout = Duration::from_secs(connect_timeout_secs);
         let config = pg_manager_config(url);
@@ -1700,6 +1858,22 @@ fn build_pool(
             .runtime(deadpool::Runtime::Tokio1)
             .build()?)
     }
+}
+
+/// Log a warning when a Postgres pool gets `SQLite` read tuning: Postgres has
+/// no such pragmas, so the pool ignores it. Returns `true` when it warns.
+#[cfg(not(feature = "sqlite"))]
+fn warn_if_sqlite_tuning_on_postgres(tuning: SqliteTuning) -> bool {
+    if tuning == SqliteTuning::OFF {
+        return false;
+    }
+    tracing::warn!(
+        mmap_size = tuning.mmap_size,
+        cache_size_kib = tuning.cache_size_kib,
+        "database.mmap_size and database.cache_size_kib apply only to SQLite; \
+         this Postgres pool ignores them"
+    );
+    true
 }
 
 /// Normalize a configured `SQLite` target into the filename token diesel's
@@ -1934,12 +2108,14 @@ fn build_sqlite_pool(
     url: &str,
     pool_size: usize,
     connect_timeout_secs: u64,
+    tuning: SqliteTuning,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
     build_sqlite_pool_with(
         url,
         pool_size,
         connect_timeout_secs,
         SqliteCheckpointOwner::ProcessLatch,
+        tuning,
     )
 }
 
@@ -1974,6 +2150,7 @@ pub(crate) fn build_sqlite_pool_with(
     pool_size: usize,
     connect_timeout_secs: u64,
     checkpoint_owner: SqliteCheckpointOwner,
+    tuning: SqliteTuning,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
     // Under the `sqlite` feature the runtime targets SQLite, so the URL must
     // actually NAME a SQLite target. Everything past this point treats the
@@ -2090,47 +2267,33 @@ pub(crate) fn build_sqlite_pool_with(
     // and serves reads. In-memory targets are not read-only and keep the full batch.
     let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
     config.custom_setup = Box::new(move |url: &str| {
-        use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
+        // The whole setup is synchronous and runs on one blocking thread. At
+        // `create_timeout`, deadpool drops only the `JoinHandle`, and the setup
+        // finishes on its thread. Two failures this prevents:
+        //
+        // - An async setup holds a diesel-async `CancelWrapper` for the query in
+        //   flight. When deadpool drops it, its `Drop` calls `block_in_place`,
+        //   which panics on a current-thread runtime.
+        // - A setup in `tokio::spawn` needs the runtime thread to poll it. When
+        //   a startup hook runs under `Handle::block_on` on a helper thread (as
+        //   `TestApp` does) and the runtime thread waits for it, it never runs.
+        //
+        // A blocking thread needs neither the scheduler nor a tokio timer.
+        //
+        // Not gated: on a sim runtime whose thread waits for a startup hook,
+        // the gate never opens, so each new connection waited 2 s and counted
+        // a give-up. The setup touches no sim state.
+        let setup = crate::time::spawn_blocking_ungated(move || {
+            sqlite_connection_setup(&url, checkpoint_owner, tuning)
+        });
         async move {
-            let mut conn = RuntimeConnection::establish(&url).await?;
-            let pragmas = sqlite_connection_pragmas(
-                sqlite_target_is_read_only(&url),
-                checkpoint_owner.replicating(),
-            );
-            apply_sqlite_pragmas(&mut conn, pragmas)
-                .await
-                .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
-            // #1910 FTS5 capability probe. Searchable repositories emit FTS5 virtual
-            // tables and `bm25()` ranking, and the `AddSearch` migration's `CREATE
-            // VIRTUAL TABLE ... USING fts5(...)` is the hard stop that fails loudly at
-            // boot if the linked SQLite lacks FTS5. Probe it here — create and drop a
-            // throwaway FTS5 table in the always-writable `temp` database, harmless on
-            // read-only main targets — so the failure is a clear diagnostic naming FTS5
-            // and the fix, rather than a bare "no such module: fts5" from a migration.
-            // There is no silent fallback to LIKE: full-text search requires FTS5.
-            if let Err(e) = conn
-                .batch_execute(
-                    "CREATE VIRTUAL TABLE temp.__autumn_fts5_probe USING fts5(x); \
-                     DROP TABLE temp.__autumn_fts5_probe;",
-                )
-                .await
-            {
-                return Err(diesel::ConnectionError::CouldntSetupConfiguration(
-                    diesel::result::Error::QueryBuilderError(
-                        format!(
-                            "SQLite FTS5 is not available in the linked SQLite library, but \
-                             autumn-web full-text search (searchable repositories / the \
-                             `--search` scaffold, issue #1910) requires it. Build with the \
-                             bundled, FTS5-enabled SQLite by enabling autumn-web's `sqlite` \
-                             feature (it turns on `libsqlite3-sys/bundled`, whose amalgamation \
-                             defines SQLITE_ENABLE_FTS5). Underlying probe error: {e}"
-                        )
-                        .into(),
-                    ),
-                ));
-            }
-            Ok(conn)
+            let conn = setup.await.map_err(|e| {
+                diesel::ConnectionError::BadConnection(format!(
+                    "SQLite connection setup task failed: {e}"
+                ))
+            })??;
+            Ok(RuntimeConnection::new(conn))
         }
         .boxed()
     });
@@ -2144,6 +2307,59 @@ pub(crate) fn build_sqlite_pool_with(
         .build()?)
 }
 
+/// Open one pool connection and set it up. Blocking: it runs on the blocking
+/// thread that `build_sqlite_pool_with` starts for each new connection.
+///
+/// It applies the per-connection pragmas, then probes for FTS5.
+#[cfg(feature = "sqlite")]
+fn sqlite_connection_setup(
+    url: &str,
+    checkpoint_owner: SqliteCheckpointOwner,
+    tuning: SqliteTuning,
+) -> diesel::ConnectionResult<diesel::SqliteConnection> {
+    use diesel::connection::{Connection as _, SimpleConnection as _};
+
+    let mut conn = diesel::SqliteConnection::establish(url)?;
+    let pragmas = sqlite_connection_pragmas(
+        sqlite_target_is_read_only(url),
+        checkpoint_owner.replicating(),
+        tuning,
+    );
+    apply_sqlite_pragmas(&mut conn, &pragmas)
+        .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+    // #1910 FTS5 capability probe. Searchable repositories emit FTS5 virtual
+    // tables and `bm25()` ranking, and the `AddSearch` migration's `CREATE
+    // VIRTUAL TABLE ... USING fts5(...)` is the hard stop that fails loudly at
+    // boot if the linked SQLite lacks FTS5. Probe it here — create and drop a
+    // throwaway FTS5 table in the always-writable `temp` database, harmless on
+    // read-only main targets — so the failure is a clear diagnostic naming FTS5
+    // and the fix, rather than a bare "no such module: fts5" from a migration.
+    // There is no silent fallback to LIKE: full-text search requires FTS5.
+    conn.batch_execute(
+        "CREATE VIRTUAL TABLE temp.__autumn_fts5_probe USING fts5(x); \
+         DROP TABLE temp.__autumn_fts5_probe;",
+    )
+    .map_err(|e| sqlite_fts5_missing(&e))?;
+    Ok(conn)
+}
+
+/// The setup error when the linked `SQLite` library has no FTS5. `probe` is the
+/// error of the FTS5 probe.
+#[cfg(feature = "sqlite")]
+fn sqlite_fts5_missing(probe: &diesel::result::Error) -> diesel::ConnectionError {
+    diesel::ConnectionError::CouldntSetupConfiguration(diesel::result::Error::QueryBuilderError(
+        format!(
+            "SQLite FTS5 is not available in the linked SQLite library, but \
+             autumn-web full-text search (searchable repositories / the \
+             `--search` scaffold, issue #1910) requires it. Build with the \
+             bundled, FTS5-enabled SQLite by enabling autumn-web's `sqlite` \
+             feature (it turns on `libsqlite3-sys/bundled`, whose amalgamation \
+             defines SQLITE_ENABLE_FTS5). Underlying probe error: {probe}"
+        )
+        .into(),
+    ))
+}
+
 /// Apply the per-connection pragmas, retrying while the database is locked.
 ///
 /// `PRAGMA journal_mode = WAL` takes an exclusive lock, and `SQLite` does not run
@@ -2154,13 +2370,13 @@ pub(crate) fn build_sqlite_pool_with(
 ///
 /// The journal mode is a persistent property of the file, so one winner settles
 /// it and each retry is then a no-op. The whole retry budget is well inside the
-/// pool's `create_timeout`.
+/// pool's `create_timeout`. Blocking: it sleeps on the thread between attempts.
 #[cfg(feature = "sqlite")]
-async fn apply_sqlite_pragmas(
-    conn: &mut RuntimeConnection,
+fn apply_sqlite_pragmas(
+    conn: &mut diesel::SqliteConnection,
     pragmas: &str,
 ) -> Result<(), diesel::result::Error> {
-    use diesel_async::SimpleAsyncConnection as _;
+    use diesel::connection::SimpleConnection as _;
 
     /// Attempts in total, the first one included.
     const ATTEMPTS: u32 = 10;
@@ -2169,11 +2385,11 @@ async fn apply_sqlite_pragmas(
 
     let mut attempt = 1;
     loop {
-        match conn.batch_execute(pragmas).await {
+        match conn.batch_execute(pragmas) {
             Ok(()) => return Ok(()),
             Err(error) if attempt < ATTEMPTS && sqlite_error_is_locked(&error) => {
                 attempt += 1;
-                tokio::time::sleep(RETRY_DELAY).await;
+                std::thread::sleep(RETRY_DELAY);
             }
             Err(error) => return Err(error),
         }
@@ -2212,9 +2428,44 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
         url,
         config.effective_primary_pool_size(),
         config.connect_timeout_secs,
+        config.sqlite_tuning(),
     )?;
 
     Ok(Some(pool))
+}
+
+/// Build one pool for each `[database.roles.<name>]` entry.
+///
+/// A role pool has `pool_size` connections, or `database.pool_size`. Each
+/// connection uses the URL of
+/// [`DatabaseRoleConfig::effective_url`](crate::db_roles::DatabaseRoleConfig::effective_url).
+/// The pools connect on first use.
+///
+/// # Errors
+///
+/// Returns [`PoolError::Role`] when a role has no usable URL, and the
+/// errors of [`create_pool`].
+pub fn create_role_pools(config: &DatabaseConfig) -> Result<crate::db_roles::RolePools, PoolError> {
+    let mut pools = std::collections::BTreeMap::new();
+    for (name, role) in &config.roles {
+        let url = role
+            .effective_url(config.effective_primary_url())
+            .map_err(|message| PoolError::Role {
+                name: name.clone(),
+                message,
+            })?;
+        let size = role.pool_size.unwrap_or(config.pool_size);
+        pools.insert(
+            name.clone(),
+            build_pool(
+                &url,
+                size,
+                config.connect_timeout_secs,
+                config.sqlite_tuning(),
+            )?,
+        );
+    }
+    Ok(crate::db_roles::RolePools::new(pools))
 }
 
 /// Reject a configured `database.statement_timeout` under the `SQLite` backend.
@@ -2370,6 +2621,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
         primary_url,
         config.effective_primary_pool_size(),
         config.connect_timeout_secs,
+        config.sqlite_tuning(),
     )?;
 
     #[cfg(feature = "sqlite")]
@@ -2385,6 +2637,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
                 url,
                 config.effective_replica_pool_size(),
                 config.connect_timeout_secs,
+                config.sqlite_tuning(),
             )
         })
         .transpose()?;
@@ -2414,6 +2667,7 @@ pub fn create_shard_topology(
         &shard.primary_url,
         shard.effective_primary_pool_size(defaults),
         defaults.connect_timeout_secs,
+        defaults.sqlite_tuning(),
     )?;
 
     // A per-shard `replica_url` is subject to the same SQLite-replica rule as the
@@ -2434,6 +2688,7 @@ pub fn create_shard_topology(
                 url,
                 shard.effective_replica_pool_size(defaults),
                 defaults.connect_timeout_secs,
+                defaults.sqlite_tuning(),
             )
         })
         .transpose()?;
@@ -2709,13 +2964,8 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// domain/validation error as a transient conflict, silently re-running a
 /// non-idempotent closure and delaying the response.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
+#[must_use]
 pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
-    use tokio_postgres::error::SqlState;
-
-    fn is_retryable_sqlstate(state: &SqlState) -> bool {
-        *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
-    }
-
     if let Some(diesel_err) = err.downcast_chain_ref::<diesel::result::Error>() {
         return match diesel_err {
             // Fast path: diesel-async maps 40001 to SerializationFailure from
@@ -2736,7 +2986,7 @@ pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
                 diesel::result::DatabaseErrorKind::Unknown,
                 info,
             ) => {
-                source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate)
+                chain_has_retryable_sqlstate(diesel_err)
                     || info
                         .message()
                         .trim()
@@ -2745,19 +2995,47 @@ pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
             // Any other kind (UniqueViolation, NotNullViolation, ...) is
             // authoritatively non-retryable — no string matching against its
             // message/constraint text.
-            _ => source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate),
+            _ => chain_has_retryable_sqlstate(diesel_err),
         };
     }
 
-    // No `diesel::result::Error` anywhere in the chain — check for a raw
-    // `tokio_postgres` SQLSTATE directly. No text-based fallback beyond this;
-    // see the doc comment above for why.
+    raw_error_has_retryable_sqlstate(err)
+}
+
+/// Whether a Postgres `40001` or `40P01` SQLSTATE is in `err`'s source chain.
+#[cfg(feature = "postgres")]
+fn chain_has_retryable_sqlstate(err: &(dyn std::error::Error + 'static)) -> bool {
+    source_chain_has_sqlstate(err, is_retryable_sqlstate)
+}
+
+/// Without the Postgres client there is no SQLSTATE to read.
+#[cfg(not(feature = "postgres"))]
+fn chain_has_retryable_sqlstate(_err: &(dyn std::error::Error + 'static)) -> bool {
+    false
+}
+
+#[cfg(feature = "postgres")]
+fn is_retryable_sqlstate(state: &tokio_postgres::error::SqlState) -> bool {
+    use tokio_postgres::error::SqlState;
+    *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
+}
+
+/// A raw `tokio_postgres` error with a retryable SQLSTATE (no diesel error in
+/// the chain).
+#[cfg(feature = "postgres")]
+fn raw_error_has_retryable_sqlstate(err: &AutumnError) -> bool {
+    // No text-based fallback; see `is_retryable_txn_error` for why.
     err.downcast_chain_ref::<tokio_postgres::Error>()
         .and_then(tokio_postgres::Error::code)
         .is_some_and(is_retryable_sqlstate)
         || err
             .downcast_chain_ref::<tokio_postgres::error::DbError>()
             .is_some_and(|db| is_retryable_sqlstate(db.code()))
+}
+
+#[cfg(not(feature = "postgres"))]
+const fn raw_error_has_retryable_sqlstate(_err: &AutumnError) -> bool {
+    false
 }
 
 /// Run `f` inside a transaction on `conn`, adapting the `ScopedBoxFuture`
@@ -3585,7 +3863,7 @@ impl Db {
 
         let span = tracing::info_span!(
             "db.transaction",
-            db.system = "postgresql",
+            db.system = DB_SYSTEM,
             db.isolation = opts.isolation.as_str(),
             db.tx.attempts = tracing::field::Empty,
         );
@@ -3822,6 +4100,14 @@ impl std::fmt::Display for RouteKey {
     }
 }
 
+/// The OpenTelemetry `db.system` value of the runtime backend. The `sqlite`
+/// feature makes the whole runtime `SQLite`.
+const DB_SYSTEM: &str = if cfg!(feature = "sqlite") {
+    "sqlite"
+} else {
+    "postgresql"
+};
+
 /// Everything required to check out and instrument a pooled connection.
 ///
 /// Shared by the plain [`Db`] extractor and shard-routed checkouts so that
@@ -3917,7 +4203,7 @@ impl Db {
     /// This is the single code path behind the [`Db`] extractor and all
     /// shard-routed checkouts: span creation, checkout interceptors,
     /// `SET statement_timeout`, and the metrics captured for the
-    /// slow-query warning on `Drop`.
+    /// long-hold warning on `Drop`.
     #[allow(
         clippy::too_many_lines,
         reason = "one checkout sequence; the deadline wait (#3058) is one more step"
@@ -3936,13 +4222,13 @@ impl Db {
         // Span covers the full time the connection is held — from
         // checkout through the end of the request — rather than just
         // `pool.get()`. Dropping `Db` closes the span, so span duration
-        // reflects real connection hold time and `db.system=postgresql`
-        // propagates to any query futures handlers instrument with
-        // `db.span()`.
+        // reflects real connection hold time and `db.system` propagates to
+        // any query futures handlers instrument with `db.span()`.
         let span = tracing::info_span!(
             "db.connection",
             otel.kind = "client",
-            db.system = "postgresql",
+            db.system = DB_SYSTEM,
+            db.pool = params.pool_name,
             db.shard = tracing::field::Empty,
         );
         if let Some(shard) = params.shard {
@@ -4349,6 +4635,107 @@ where
     }
 }
 
+/// Why a capsule is not complete when a request uses a role pool.
+#[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+const BOUNDARY_CAPTURE_GAP: &str = "a [database.roles] pool does not record capture traffic";
+
+/// A [`Db`] connection as the database role of boundary `B`.
+///
+/// The connection comes from
+/// [`AppState::pool_for::<B>()`](crate::state::AppState::pool_for). With
+/// `[database.roles.<B::NAME>]` set, the database refuses a query on a table
+/// outside the grant of that role. With no `[database.roles]`, it is the
+/// primary connection.
+///
+/// ```rust,no_run
+/// use autumn_web::db::BoundaryDb;
+/// use autumn_web::db_roles::Boundary;
+/// use autumn_web::prelude::*;
+///
+/// pub struct Marketing;
+///
+/// impl Boundary for Marketing {
+///     const NAME: &'static str = "marketing";
+/// }
+///
+/// #[get("/campaigns/count")]
+/// async fn count(mut db: BoundaryDb<Marketing>) -> AutumnResult<String> {
+///     let _conn: &mut Db = &mut db;
+///     Ok("ok".to_owned())
+/// }
+/// ```
+pub struct BoundaryDb<B> {
+    db: Db,
+    boundary: std::marker::PhantomData<fn() -> B>,
+}
+
+impl<B> BoundaryDb<B> {
+    /// The inner connection.
+    #[must_use]
+    pub fn into_inner(self) -> Db {
+        self.db
+    }
+}
+
+impl<B> std::ops::Deref for BoundaryDb<B> {
+    type Target = Db;
+
+    fn deref(&self) -> &Db {
+        &self.db
+    }
+}
+
+impl<B> std::ops::DerefMut for BoundaryDb<B> {
+    fn deref_mut(&mut self) -> &mut Db {
+        &mut self.db
+    }
+}
+
+impl<S, B> FromRequestParts<S> for BoundaryDb<B>
+where
+    S: DbState + Send + Sync,
+    B: crate::db_roles::Boundary,
+{
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let pool = state.boundary_pool(B::NAME).ok_or_else(|| {
+            AutumnError::service_unavailable_msg(format!(
+                "Database role for boundary `{}` not configured",
+                B::NAME
+            ))
+        })?;
+        let ctx = RequestDbContext::from_parts(parts, state);
+        let db = Db::checkout(DbCheckoutParams {
+            pool: &pool,
+            pool_name: B::NAME,
+            shard: None,
+            statement_timeout: ctx.statement_timeout,
+            idle_in_transaction_timeout: ctx.idle_in_transaction_timeout,
+            route_key: ctx.route_key,
+            metrics: ctx.metrics,
+            slow_query_threshold: ctx.slow_query_threshold,
+            interceptors: ctx.interceptors,
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: if state.boundary_roles_configured() {
+                Some(std::sync::Arc::from(BOUNDARY_CAPTURE_GAP))
+            } else {
+                state.db_capture_gap()
+            },
+            clock: ctx.clock,
+        })
+        .await?;
+        crate::read_your_writes::mark_write();
+        Ok(Self {
+            db,
+            boundary: std::marker::PhantomData,
+        })
+    }
+}
+
 impl Drop for Db {
     fn drop(&mut self) {
         if let (Some(route_key), Some(metrics)) = (&self.route_key, &self.metrics) {
@@ -4358,8 +4745,13 @@ impl Drop for Db {
                 .saturating_duration_since(self.start_time);
             let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
-            // Record DB query metric. Composed on the stack: this runs once
-            // per request that extracts `Db`.
+            // The hold is not a query. Record it under the route alone.
+            // Compose both keys on the stack. This code runs once for each
+            // `Db`.
+            metrics.record_db_connection_hold_fmt(format_args!("{route_key}"), elapsed_ms);
+            // Deprecated: the old `"<route> SELECT"` query key. It records the
+            // same sample. Remove this call in the next release. Until then,
+            // dashboards can move to `db_connection_holds`.
             metrics.record_db_query_fmt(format_args!("{route_key} SELECT"), elapsed_ms);
             // Deliberately not recorded into the Server-Timing per-request
             // accumulator. `elapsed` here is the whole connection
@@ -4371,13 +4763,16 @@ impl Drop for Db {
             // `run_instrumented`. The accumulator must reflect genuine
             // instrumented queries only.
 
-            // Log slow query if it exceeds the threshold
+            // A long hold is not one query. It covers
+            // all work in the hold, for example a fan-out. So it has its own
+            // message and no `sql` field. Enter the span so that the log shows
+            // the pool and the shard (`db.pool`, `db.shard`).
             if elapsed >= self.slow_query_threshold {
+                let _entered = self.span.enter();
                 tracing::warn!(
                     route = %route_key,
-                    sql = "SELECT ?",
-                    duration_ms = elapsed_ms,
-                    "slow database query"
+                    held_ms = elapsed_ms,
+                    "database connection held past slow_query_threshold"
                 );
             }
         }
@@ -4481,6 +4876,7 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
                         url,
                         config.effective_replica_pool_size(),
                         config.connect_timeout_secs,
+                        config.sqlite_tuning(),
                     )
                 })
                 .transpose()?;
@@ -4536,6 +4932,152 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 
 #[cfg(test)]
 mod tests {
+    /// The logs of one `Db` that `route` holds for `held` on a ticking clock,
+    /// with a `500ms` slow-query threshold.
+    #[cfg(feature = "sqlite")]
+    async fn logs_after_a_hold(
+        route: &str,
+        held: std::time::Duration,
+    ) -> Vec<crate::log::capture::CapturedLogEntry> {
+        hold_with_metrics(route, held, crate::middleware::MetricsCollector::new()).await
+    }
+
+    /// As [`logs_after_a_hold`], but the `Db` records into `metrics`.
+    #[cfg(feature = "sqlite")]
+    async fn hold_with_metrics(
+        route: &str,
+        held: std::time::Duration,
+        metrics: crate::middleware::MetricsCollector,
+    ) -> Vec<crate::log::capture::CapturedLogEntry> {
+        use crate::log::capture::{LogBuffer, LogCaptureLayer};
+        use crate::log::filter::ParameterFilter;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let pool = super::create_pool(&crate::config::DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        })
+        .expect("sqlite pool builds")
+        .expect("url configured");
+        let clock = crate::time::TickingClock::starting_at(chrono::DateTime::UNIX_EPOCH);
+        let logs = LogBuffer::new(16, ParameterFilter::default());
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer::new(logs.clone()));
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let db = super::Db::checkout(super::DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            route_key: Some(super::RouteKey::Composed(route.to_owned())),
+            metrics: Some(metrics),
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            clock: std::sync::Arc::new(clock.clone()),
+        })
+        .await
+        .expect("checkout");
+        clock.advance(held);
+        drop(db);
+        logs.snapshot(None, None)
+    }
+
+    /// The hold goes in `db_connection_holds` under the route. The old
+    /// `"<route> SELECT"` query key stays for one release, with the same
+    /// sample. It is deprecated.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_connection_hold_is_recorded_as_a_hold() {
+        let metrics = crate::middleware::MetricsCollector::new();
+        hold_with_metrics(
+            "POST /census",
+            std::time::Duration::from_millis(6653),
+            metrics.clone(),
+        )
+        .await;
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.db_connection_holds.len(),
+            1,
+            "{:?}",
+            snap.db_connection_holds
+        );
+        let hold = &snap.db_connection_holds["POST /census"];
+        assert_eq!(hold.count, 1);
+        assert_eq!(hold.p50_ms, 6653);
+
+        let legacy = &snap.db_queries["POST /census SELECT"];
+        assert_eq!(legacy.count, 1, "the deprecated key stays one release");
+        assert_eq!(legacy.p50_ms, 6653);
+        assert_eq!(snap.db_queries.len(), 1, "{:?}", snap.db_queries);
+    }
+
+    /// The metric records a short hold too. Only the log uses the threshold.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_short_connection_hold_is_recorded() {
+        let metrics = crate::middleware::MetricsCollector::new();
+        hold_with_metrics(
+            "GET /fast",
+            std::time::Duration::from_millis(3),
+            metrics.clone(),
+        )
+        .await;
+        assert_eq!(
+            metrics.snapshot().db_connection_holds["GET /fast"].p50_ms,
+            3
+        );
+    }
+
+    /// A handler that holds `Db` across a long fan-out must not log the hold as
+    /// one query with `sql: "SELECT ?"`. The hold gets its own event.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_long_connection_hold_is_not_logged_as_a_query() {
+        let entries =
+            logs_after_a_hold("POST /census", std::time::Duration::from_millis(6653)).await;
+        assert!(
+            entries.iter().all(|e| e.message != "slow database query"),
+            "a hold is not a query: {entries:?}"
+        );
+        let held: Vec<_> = entries
+            .iter()
+            .filter(|e| e.message.contains("connection held"))
+            .collect();
+        assert_eq!(held.len(), 1, "{entries:?}");
+        let event = held[0];
+        assert_eq!(event.level, "WARN");
+        assert_eq!(event.fields["route"], "POST /census");
+        assert_eq!(event.fields["held_ms"], 6653);
+        assert!(!event.fields.contains_key("sql"), "{event:?}");
+    }
+
+    /// Spans name the backend that runs. A `SQLite` fleet said `postgresql`.
+    #[test]
+    fn db_system_names_the_runtime_backend() {
+        let expected = if cfg!(feature = "sqlite") {
+            "sqlite"
+        } else {
+            "postgresql"
+        };
+        assert_eq!(super::DB_SYSTEM, expected);
+    }
+
+    /// A hold under the threshold logs nothing.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_short_connection_hold_logs_nothing() {
+        let entries = logs_after_a_hold("GET /fast", std::time::Duration::from_millis(499)).await;
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.message.contains("connection held")),
+            "{entries:?}"
+        );
+    }
+
     /// An unset statement timeout keeps the session's `0` from checkout; an
     /// unset idle timeout keeps the session value through `DEFAULT`.
     #[test]
@@ -4556,6 +5098,46 @@ mod tests {
                 "SET LOCAL statement_timeout = 30000; \
                  SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
             )
+        );
+    }
+
+    /// The request defaults are in scope for the synchronous inner call and
+    /// for the inner future. A route override in the future changes them.
+    #[tokio::test]
+    async fn tx_timeouts_layer_scopes_the_inner_call_and_future() {
+        use std::time::Duration;
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let defaults = super::TxTimeouts::new(Some(Duration::from_secs(30)), None);
+        let mut svc = super::TxTimeoutsLayer::new(defaults).layer(tower::service_fn(
+            |_req: axum::extract::Request| {
+                let at_call = super::TxTimeouts::current();
+                async move {
+                    let before = super::TxTimeouts::current();
+                    super::note_statement_timeout(super::StatementTimeout(Duration::from_secs(90)));
+                    Ok::<_, std::convert::Infallible>((
+                        at_call,
+                        before,
+                        super::TxTimeouts::current(),
+                    ))
+                }
+            },
+        ));
+
+        let request = axum::extract::Request::new(axum::body::Body::empty());
+        let (at_call, before, after) = svc.ready().await.unwrap().call(request).await.unwrap();
+
+        assert_eq!(at_call, Some(defaults), "in scope for the inner call");
+        assert_eq!(before, Some(defaults), "in scope for the inner future");
+        assert_eq!(
+            after,
+            Some(super::TxTimeouts::new(Some(Duration::from_secs(90)), None)),
+            "a route override changes the request value"
+        );
+        assert_eq!(
+            super::TxTimeouts::current(),
+            None,
+            "no scope after the request"
         );
     }
 
@@ -4807,11 +5389,11 @@ mod tests {
     fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
         // Continuous replication (#1628) needs the replicator to be the only
         // component that ever checkpoints.
-        let plain = super::sqlite_connection_pragmas(false, false);
-        let replicating = super::sqlite_connection_pragmas(false, true);
+        let plain = super::sqlite_connection_pragmas(false, false, SqliteTuning::OFF);
+        let replicating = super::sqlite_connection_pragmas(false, true, SqliteTuning::OFF);
         assert!(!plain.contains("wal_autocheckpoint"));
         assert!(replicating.contains("PRAGMA wal_autocheckpoint = 0"));
-        for pragmas in [plain, replicating] {
+        for pragmas in [&plain, &replicating] {
             assert!(pragmas.contains("journal_mode = WAL"));
             assert!(pragmas.contains("foreign_keys = ON"));
             assert!(pragmas.contains("busy_timeout = 5000"));
@@ -4820,11 +5402,228 @@ mod tests {
         // A read-only target still gets no writing pragmas — including under
         // replication, which cannot apply to a database nothing writes to.
         for replicating in [false, true] {
-            let read_only = super::sqlite_connection_pragmas(true, replicating);
+            let read_only = super::sqlite_connection_pragmas(true, replicating, SqliteTuning::OFF);
             assert!(!read_only.contains("journal_mode"));
             assert!(!read_only.contains("wal_autocheckpoint"));
             assert!(read_only.contains("foreign_keys = ON"));
         }
+    }
+
+    /// The pragma batch of each variant: default, replicating, read-only.
+    fn pragma_variants(tuning: SqliteTuning) -> [String; 3] {
+        [
+            super::sqlite_connection_pragmas(false, false, tuning),
+            super::sqlite_connection_pragmas(false, true, tuning),
+            super::sqlite_connection_pragmas(true, false, tuning),
+        ]
+    }
+
+    #[test]
+    fn the_tuning_pragmas_are_absent_when_off() {
+        assert_eq!(SqliteTuning::default(), SqliteTuning::OFF);
+        for pragmas in pragma_variants(SqliteTuning::OFF) {
+            assert!(!pragmas.contains("mmap_size"), "{pragmas}");
+            assert!(!pragmas.contains("cache_size"), "{pragmas}");
+        }
+    }
+
+    #[test]
+    fn mmap_size_is_in_every_variant_only_when_set() {
+        let tuning = SqliteTuning {
+            mmap_size: 268_435_456,
+            cache_size_kib: 0,
+        };
+        for pragmas in pragma_variants(tuning) {
+            assert!(
+                pragmas.contains("PRAGMA mmap_size = 268435456;"),
+                "{pragmas}"
+            );
+            assert!(!pragmas.contains("cache_size"), "{pragmas}");
+            // `busy_timeout` stays first: it covers the statements after it.
+            assert!(
+                pragmas.starts_with("PRAGMA busy_timeout = 5000;"),
+                "{pragmas}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_size_kib_is_a_negative_cache_size_only_when_set() {
+        let tuning = SqliteTuning {
+            mmap_size: 0,
+            cache_size_kib: 524_288,
+        };
+        for pragmas in pragma_variants(tuning) {
+            // A negative `cache_size` is in KiB, not in pages.
+            assert!(
+                pragmas.contains("PRAGMA cache_size = -524288;"),
+                "{pragmas}"
+            );
+            assert!(!pragmas.contains("mmap_size"), "{pragmas}");
+        }
+    }
+
+    #[test]
+    fn the_tuning_pragmas_clamp_values_sqlite_cannot_read() {
+        // A config built in code skips validation. SQLite reads `cache_size`
+        // as a 32-bit integer and sets 0 on overflow, so clamp it.
+        let tuning = SqliteTuning {
+            mmap_size: u64::MAX,
+            cache_size_kib: u64::MAX,
+        };
+        for pragmas in pragma_variants(tuning) {
+            assert!(
+                pragmas.contains(&format!("PRAGMA mmap_size = {};", i64::MAX)),
+                "{pragmas}"
+            );
+            assert!(
+                pragmas.contains(&format!("PRAGMA cache_size = -{};", i32::MAX)),
+                "{pragmas}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn a_postgres_pool_warns_only_when_sqlite_tuning_is_set() {
+        assert!(!warn_if_sqlite_tuning_on_postgres(SqliteTuning::OFF));
+        assert!(warn_if_sqlite_tuning_on_postgres(SqliteTuning {
+            mmap_size: 1,
+            cache_size_kib: 0,
+        }));
+        assert!(warn_if_sqlite_tuning_on_postgres(SqliteTuning {
+            mmap_size: 0,
+            cache_size_kib: 1,
+        }));
+    }
+
+    #[test]
+    fn the_tuning_pragmas_run_on_a_real_connection() {
+        use diesel::connection::{Connection as _, SimpleConnection as _};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tuned.db");
+        let mut conn = diesel::SqliteConnection::establish(&path.display().to_string()).unwrap();
+        let tuning = SqliteTuning {
+            mmap_size: 64 * 1024 * 1024,
+            cache_size_kib: 4096,
+        };
+        conn.batch_execute(&super::sqlite_connection_pragmas(false, false, tuning))
+            .unwrap();
+        assert_eq!(
+            sqlite_pragma_value(&mut conn, "mmap_size"),
+            64 * 1024 * 1024
+        );
+        assert_eq!(sqlite_pragma_value(&mut conn, "cache_size"), -4096);
+    }
+
+    /// Read `mmap_size` or `cache_size` from a plain connection.
+    fn sqlite_pragma_value(conn: &mut diesel::SqliteConnection, pragma: &str) -> i64 {
+        use diesel::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct MmapSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct CacheSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache_size: i64,
+        }
+        let query = diesel::sql_query(format!("PRAGMA {pragma}"));
+        match pragma {
+            "mmap_size" => query.get_result::<MmapSize>(conn).unwrap().mmap_size,
+            "cache_size" => query.get_result::<CacheSize>(conn).unwrap().cache_size,
+            other => panic!("no reader for PRAGMA {other}"),
+        }
+    }
+
+    /// Continuous replication with mmap on. The replicator checkpoints, which
+    /// writes the main file, while the app connection has it mapped. The app
+    /// must read the checkpointed rows, and a restore must hold every row.
+    #[test]
+    fn replication_ships_and_restores_with_mmap_on() {
+        use crate::replication::{
+            FileDestination, ReplicaDestination, ReplicationSettings, ReplicationStatus,
+            Replicator, restore, segment,
+        };
+        use diesel::RunQueryDsl as _;
+        use diesel::connection::{Connection as _, SimpleConnection as _};
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            v: String,
+        }
+        fn rows(conn: &mut diesel::SqliteConnection) -> Vec<String> {
+            diesel::sql_query("SELECT v FROM t ORDER BY id")
+                .load::<Row>(conn)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.v)
+                .collect()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("app.db");
+        let tuning = SqliteTuning {
+            mmap_size: 256 * 1024 * 1024,
+            cache_size_kib: 0,
+        };
+        let mut app = diesel::SqliteConnection::establish(&db.display().to_string()).unwrap();
+        app.batch_execute(&super::sqlite_connection_pragmas(false, true, tuning))
+            .unwrap();
+        assert_eq!(
+            sqlite_pragma_value(&mut app, "mmap_size"),
+            256 * 1024 * 1024
+        );
+        app.batch_execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+            .unwrap();
+
+        let destination: Arc<dyn ReplicaDestination> =
+            Arc::new(FileDestination::new(tmp.path().join("replica")).unwrap());
+        let settings = ReplicationSettings {
+            database_path: db,
+            root: segment::root_prefix(None, "mmap"),
+            sync_interval: Duration::from_secs(1),
+            snapshot_interval: Duration::from_secs(3600),
+            // Checkpoint often: each one writes the mapped main file.
+            max_wal_bytes: 4096,
+            retention: Duration::from_hours(24),
+            verify_interval: None,
+        };
+        let root = settings.root.clone();
+        let status = Arc::new(ReplicationStatus::new(destination.describe()));
+        let mut replicator = Replicator::new(settings, Arc::clone(&destination), status);
+
+        let mut expected = Vec::new();
+        let mut checkpoints = 0;
+        for round in 0..40 {
+            let value = format!("row-{round}-{}", "x".repeat(200));
+            diesel::sql_query(format!("INSERT INTO t (v) VALUES ('{value}')"))
+                .execute(&mut app)
+                .unwrap();
+            expected.push(value);
+            if replicator.tick().unwrap().checkpointed {
+                checkpoints += 1;
+            }
+        }
+        assert!(
+            checkpoints > 0,
+            "no checkpoint ran; the test proves nothing"
+        );
+        // The mapped connection reads what the checkpoints wrote.
+        assert_eq!(rows(&mut app), expected);
+
+        drop(app);
+        drop(replicator);
+        let restored = tmp.path().join("restored.db");
+        restore::restore(destination.as_ref(), &root, None, &restored).unwrap();
+        let mut conn =
+            diesel::SqliteConnection::establish(&restored.display().to_string()).unwrap();
+        conn.batch_execute(&super::sqlite_connection_pragmas(false, false, tuning))
+            .unwrap();
+        assert_eq!(rows(&mut conn), expected);
     }
 
     use super::*;
@@ -5756,6 +6555,290 @@ mod tests {
         }
     }
 
+    // A connection setup that passes `create_timeout` must give an error, not a
+    // panic. deadpool drops the setup future at the limit. Each query in it is
+    // a diesel-async `CancelWrapper`, whose `Drop` calls `block_in_place` for
+    // a task in flight. That panics on a current-thread runtime, the runtime
+    // `#[tokio::test]` uses. The `SQLite fleet (windows-latest)` job hit it
+    // when a loaded runner took more than the 5 s limit to open a file.
+    // A second connection holds an exclusive lock, so `journal_mode = WAL`
+    // retries for about 225 ms. So the setup is still in flight when the zero
+    // limit passes, at the next 1 ms timer tick.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_setup_timeout_is_an_error_on_a_current_thread_runtime() {
+        use diesel::connection::{Connection as _, SimpleConnection as _};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("slow.db");
+        let url = format!("sqlite://{}", path.display());
+        let mut holder = diesel::SqliteConnection::establish(&path.display().to_string())
+            .expect("open the lock holder");
+        holder
+            .batch_execute("BEGIN EXCLUSIVE")
+            .expect("take the exclusive lock");
+        let pool = build_sqlite_pool_with(
+            &url,
+            1,
+            0,
+            SqliteCheckpointOwner::ProcessLatch,
+            SqliteTuning::OFF,
+        )
+        .expect("the pool builds");
+        let Err(err) = pool.get().await else {
+            panic!("a zero create limit must time out");
+        };
+        assert!(
+            matches!(
+                err,
+                deadpool::managed::PoolError::Timeout(deadpool::managed::TimeoutType::Create)
+            ),
+            "expected a create timeout, got: {err:?}"
+        );
+        // The setup finishes on its own thread. When the lock is gone, the
+        // next connection, with a real limit, opens the same file.
+        holder.batch_execute("COMMIT").expect("release the lock");
+        drop(holder);
+        let pool = build_sqlite_pool_with(
+            &url,
+            1,
+            5,
+            SqliteCheckpointOwner::ProcessLatch,
+            SqliteTuning::OFF,
+        )
+        .expect("the pool builds");
+        drop(pool.get().await.expect("a real limit opens the file"));
+    }
+
+    // The bundled SQLite has FTS5, so the probe never fails here. The error
+    // must still name FTS5, the issue and the fix.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_fts5_missing_error_names_the_module_and_the_fix() {
+        let probe = diesel::result::Error::QueryBuilderError("no such module: fts5".into());
+        let message = sqlite_fts5_missing(&probe).to_string();
+        for needle in [
+            "FTS5",
+            "#1910",
+            "`sqlite`",
+            "libsqlite3-sys/bundled",
+            "no such module: fts5",
+        ] {
+            assert!(
+                message.contains(needle),
+                "{needle} is missing from: {message}"
+            );
+        }
+        assert!(matches!(
+            sqlite_fts5_missing(&probe),
+            diesel::ConnectionError::CouldntSetupConfiguration(_)
+        ));
+    }
+
+    // TestApp runs a plugin startup hook so: a helper thread calls
+    // `Handle::block_on`, and the runtime thread waits in `join()`. Then
+    // nothing polls a task spawned on this current-thread runtime, and no
+    // tokio timer fires. A connection setup must not need either.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_setup_finishes_while_the_runtime_thread_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("hook.db").display());
+        let pool = build_sqlite_pool_with(
+            &url,
+            1,
+            5,
+            SqliteCheckpointOwner::ProcessLatch,
+            SqliteTuning::OFF,
+        )
+        .expect("the pool builds");
+        let handle = tokio::runtime::Handle::current();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = handle
+                .block_on(pool.get())
+                .map(drop)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(got);
+        });
+        // This blocks the runtime thread on purpose, as TestApp does.
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the setup hung: it needs the blocked runtime thread");
+        got.expect("the connection opens");
+    }
+
+    /// Read `mmap_size` and `cache_size` from one pooled connection.
+    #[cfg(feature = "sqlite")]
+    async fn pooled_tuning(pool: &Pool<RuntimeConnection>) -> (i64, i64) {
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct MmapSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            mmap_size: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct CacheSize {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache_size: i64,
+        }
+        let mut conn = pool.get().await.expect("a pooled connection");
+        let mmap = diesel::sql_query("PRAGMA mmap_size")
+            .get_result::<MmapSize>(&mut *conn)
+            .await
+            .expect("read mmap_size")
+            .mmap_size;
+        let cache = diesel::sql_query("PRAGMA cache_size")
+            .get_result::<CacheSize>(&mut *conn)
+            .await
+            .expect("read cache_size")
+            .cache_size;
+        (mmap, cache)
+    }
+
+    /// `[database] mmap_size` and `cache_size_kib` reach the primary and the
+    /// replica pool. A role pool is Postgres only.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pools_apply_the_configured_tuning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("tuned.db").display());
+        let config = DatabaseConfig {
+            url: Some(url.clone()),
+            replica_url: Some(url.clone()),
+            mmap_size: 128 * 1024 * 1024,
+            cache_size_kib: 8192,
+            ..Default::default()
+        };
+        let expected = (128 * 1024 * 1024, -8192);
+
+        let pool = create_pool(&config).unwrap().expect("a primary pool");
+        assert_eq!(pooled_tuning(&pool).await, expected);
+
+        let topology = create_topology(&config).unwrap().expect("a topology");
+        assert_eq!(pooled_tuning(topology.primary()).await, expected);
+        let replica = topology.replica().expect("a replica pool");
+        assert_eq!(pooled_tuning(replica).await, expected);
+
+        // A shard takes the `[database]` values.
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: url.clone(),
+            replica_url: Some(url.clone()),
+            ..Default::default()
+        };
+        let topology = create_shard_topology(&shard, &config).unwrap();
+        assert_eq!(pooled_tuning(topology.primary()).await, expected);
+        let replica = topology.replica().expect("a shard replica pool");
+        assert_eq!(pooled_tuning(replica).await, expected);
+    }
+
+    /// With the defaults, a pool keeps SQLite's own values: no mmap, and the
+    /// default page cache.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pools_keep_sqlite_defaults_when_tuning_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("plain.db").display());
+        let pool = create_pool(&DatabaseConfig {
+            url: Some(url),
+            ..Default::default()
+        })
+        .unwrap()
+        .expect("a primary pool");
+        let (mmap, cache) = pooled_tuning(&pool).await;
+        assert_eq!(mmap, 0, "mmap is off by default");
+        assert_eq!(cache, -2000, "SQLite's default cache_size");
+    }
+
+    /// A read-only target gets the tuning pragmas too: they do not write.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_read_only_pools_apply_the_tuning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ref.db");
+        drop(
+            build_sqlite_pool_with(
+                &format!("sqlite://{}", path.display()),
+                1,
+                5,
+                SqliteCheckpointOwner::ProcessLatch,
+                SqliteTuning::OFF,
+            )
+            .unwrap()
+            .get()
+            .await
+            .expect("create the file"),
+        );
+        let tuning = SqliteTuning {
+            mmap_size: 32 * 1024 * 1024,
+            cache_size_kib: 1024,
+        };
+        let url = format!("sqlite://file:{}?mode=ro", path.display());
+        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch, tuning)
+            .unwrap();
+        assert_eq!(pooled_tuning(&pool).await, (32 * 1024 * 1024, -1024));
+    }
+
+    /// SQLite caps `mmap_size` at its compile-time limit and does not fail.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_caps_an_mmap_size_above_its_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("big.db").display());
+        let tuning = SqliteTuning {
+            mmap_size: 1 << 40,
+            cache_size_kib: 0,
+        };
+        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch, tuning)
+            .unwrap();
+        let (mmap, _) = pooled_tuning(&pool).await;
+        assert_eq!(
+            mmap, 0x7fff_0000,
+            "SQLITE_MAX_MMAP_SIZE of the bundled build"
+        );
+    }
+
+    // The same blocked runtime thread on a sim runtime, with a sim alive. The
+    // runtime thread cannot park, so gated blocking work waits for the 2 s
+    // give-up and counts a give-up, and the run is then not sure to replay.
+    // The connection setup touches no sim state, so it must not be gated.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sim_sqlite_setup_is_not_gated_while_the_runtime_thread_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("sim.db").display());
+        let rt = crate::sim::gate::runtime().unwrap();
+        let seat = crate::sim::gate::SimSeat::default();
+        seat.take();
+        let before = crate::sim::gate::give_ups();
+        rt.block_on(async {
+            let pool = build_sqlite_pool_with(
+                &url,
+                1,
+                5,
+                SqliteCheckpointOwner::ProcessLatch,
+                SqliteTuning::OFF,
+            )
+            .expect("the pool builds");
+            let handle = tokio::runtime::Handle::current();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let got = handle
+                    .block_on(pool.get())
+                    .map(drop)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(got);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the setup hung")
+                .expect("the connection opens");
+        });
+        let after = crate::sim::gate::give_ups();
+        seat.leave();
+        assert_eq!(after, before, "the connection setup waited for the gate");
+    }
+
     // …but the two scheme-less spellings `normalize_sqlite_target` explicitly
     // maps to `:memory:` are NOT "unrecognized": `DatabaseBackend::detect`
     // classifies by scheme and these carry none, yet the pool has always taken
@@ -6599,8 +7682,8 @@ mod tests {
         use axum::routing::{any, get};
         use tower::ServiceExt;
 
-        /// Answers with the context's route key, then the metric key `Db`'s
-        /// drop records under it (composed on the stack, as `Drop` does).
+        /// Answers with the context's route key, then the two metric keys
+        /// `Db`'s drop records: the deprecated query key and the hold key.
         async fn handler(parts: axum::http::request::Parts) -> String {
             let ctx = RequestDbContext::from_parts(&parts, &TestDbState);
             assert!(
@@ -6615,14 +7698,16 @@ mod tests {
             let metrics = crate::middleware::MetricsCollector::new();
             if let Some(key) = &ctx.route_key {
                 metrics.record_db_query_fmt(format_args!("{key} SELECT"), 1);
+                metrics.record_db_connection_hold_fmt(format_args!("{key}"), 1);
             }
-            let metric_key = metrics
-                .snapshot()
-                .db_queries
+            let snapshot = metrics.snapshot();
+            let query_key = snapshot.db_queries.into_keys().next().unwrap_or_default();
+            let hold_key = snapshot
+                .db_connection_holds
                 .into_keys()
                 .next()
                 .unwrap_or_default();
-            format!("{route_key}\n{metric_key}")
+            format!("{route_key}\n{query_key}\n{hold_key}")
         }
 
         async fn body_of(app: Router, request: Request<Body>) -> String {
@@ -6643,7 +7728,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             body_of(app.clone(), request).await,
-            "GET /users/{id}\nGET /users/{id} SELECT"
+            "GET /users/{id}\nGET /users/{id} SELECT\nGET /users/{id}"
         );
 
         // An extension method too long for `Method`'s inline storage writes
@@ -6655,7 +7740,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             body_of(app, request).await,
-            "X-LONG-EXTENSION-VERB /dav/{*rest}\nX-LONG-EXTENSION-VERB /dav/{*rest} SELECT"
+            "X-LONG-EXTENSION-VERB /dav/{*rest}\n\
+             X-LONG-EXTENSION-VERB /dav/{*rest} SELECT\n\
+             X-LONG-EXTENSION-VERB /dav/{*rest}"
         );
 
         let (parts, ()) = Request::builder()
@@ -6676,7 +7763,7 @@ mod tests {
     }
 
     /// A composed key (a shard-tagged label, an unmatched path) is written
-    /// verbatim into both the metric key and the slow-query `route` field.
+    /// verbatim into both the metric key and the held-connection `route` field.
     #[test]
     fn route_key_composed_writes_verbatim() {
         let key = RouteKey::Composed("GET /notes shard=shard0".to_owned());
@@ -7096,6 +8183,26 @@ mod tests {
 
     // ── Retryable-error classification ───────────────────────────
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn only_serialization_failure_and_deadlock_sqlstates_are_retryable() {
+        use tokio_postgres::error::SqlState;
+        assert!(is_retryable_sqlstate(&SqlState::T_R_SERIALIZATION_FAILURE));
+        assert!(is_retryable_sqlstate(&SqlState::T_R_DEADLOCK_DETECTED));
+        assert!(!is_retryable_sqlstate(&SqlState::UNIQUE_VIOLATION));
+        assert!(!is_retryable_sqlstate(&SqlState::QUERY_CANCELED));
+    }
+
+    #[test]
+    fn a_plain_diesel_error_is_not_a_cancelled_query() {
+        // No timeout text and no SQLSTATE in the chain.
+        assert!(!is_query_canceled(&diesel::result::Error::NotFound));
+        assert!(is_query_canceled(&diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "canceling statement due to statement timeout",
+        )));
+    }
+
     #[test]
     fn serialization_failure_is_retryable() {
         let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
@@ -7278,6 +8385,7 @@ mod tests {
 // `pub(crate)` so the failure-capsule recording pool can reuse the same
 // `sslmode` classification when deciding whether a database URL can be teed
 // (#1598) instead of re-implementing the parse.
+#[cfg(feature = "postgres")]
 pub(crate) mod tls {
     use std::sync::Arc;
 
@@ -7883,6 +8991,7 @@ pub(crate) mod tls {
 ///
 /// [`AsyncConnectionWrapper`]:
 ///     diesel_async::async_connection_wrapper::AsyncConnectionWrapper
+#[cfg(feature = "postgres")]
 #[allow(clippy::large_enum_variant)] // short-lived, one per migration target
 pub(crate) enum MigrationConnection {
     /// The historical libpq-backed connection (TLS posture `Off`).
@@ -7910,6 +9019,7 @@ pub(crate) enum MigrationConnection {
 /// rustls wrapper rather than the native libpq path. Split out of
 /// [`establish_migration_connection`] so the path selection is unit-testable
 /// without a server.
+#[cfg(feature = "postgres")]
 fn migration_connection_needs_rustls(database_url: &str) -> bool {
     !matches!(
         tls::TlsPosture::from_database_url(database_url),
@@ -7953,6 +9063,7 @@ fn migration_connection_needs_rustls(database_url: &str) -> bool {
 /// which fail with their documented guidance).
 ///
 /// [`TlsPosture::Unsupported`]: tls::TlsPosture::Unsupported
+#[cfg(feature = "postgres")]
 pub(crate) fn establish_migration_connection(
     database_url: &str,
 ) -> Result<MigrationConnection, diesel::ConnectionError> {
@@ -8024,7 +9135,7 @@ pub(crate) fn establish_sqlite_migration_connection(
     Ok(conn)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod migration_connection_tests {
     use super::migration_connection_needs_rustls;
 

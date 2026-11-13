@@ -1,0 +1,38 @@
+# Bolt profile: autumn-search/keyword_search
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+       1,951,110   21.2%  <autumn_search::memory::MemorySearchBackend as autumn_search::backend::SearchBackend>::keyword_search::{closure#0}
+       1,800,090   19.5%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one
+       1,625,297   17.6%  <core::hash::sip::Hasher as core::hash::Hasher>::write
+         579,984    6.3%  _int_malloc
+         565,457    6.1%  _int_free
+         395,000    4.3%  <autumn_web::search::IndexDefinition>::weight_of
+         370,092    4.0%  calloc
+         368,258    4.0%  __memcmp_avx2_movbe
+         265,741    2.9%  free
+         265,000    2.9%  <autumn_search::backend::SearchFilter>::permits
+         221,678    2.4%  core::slice::sort::unstable::quicksort::partition
+         199,562    2.2%  malloc_consolidate
+         160,747    1.7%  malloc
+          95,000    1.0%  __rustc::__rdl_alloc_zeroed
+          79,124    0.9%  __memcpy_avx_unaligned_erms
+          77,405    0.8%  unlink_chunk.isra.0
+          53,316    0.6%  fmaf
+          35,818    0.4%  alloc::vec::in_place_collect::from_iter_in_place
+          32,151    0.3%  __rustc::__rdl_alloc
+          17,772    0.2%  compiler_builtins::math::libm_math::arch::x86::fma::fmaf_with_fma
+          14,040    0.2%  alloc_perturb
+           8,572    0.1%  __rustc::__rust_dealloc
+           8,572    0.1%  __rustc::__rdl_dealloc
+           8,572    0.1%  __rustc::__rust_no_alloc_shim_is_unstable_v2
+           5,000    0.1%  __rustc::__rust_alloc_zeroed
+           3,572    0.0%  __rustc::__rust_alloc
+           3,249    0.0%  core::slice::sort::shared::pivot::median3_rec'2
+           1,590    0.0%  core::slice::sort::select::partition_at_index
+           1,502    0.0%  core::slice::sort::shared::smallsort::insertion_sort_shift_left
+             800    0.0%  realloc
+
+       9,218,304  100.0%  TOTAL

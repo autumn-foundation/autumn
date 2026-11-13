@@ -1,8 +1,8 @@
 //! `autumn plugin-check` — run conformance checks against a plugin's routes.
 //!
 //! Compiles the target binary (debug profile), runs it with
-//! `AUTUMN_DUMP_ROUTES=1` to collect the route manifest, then applies
-//! five conformance checks and outputs a pass/fail report.
+//! `AUTUMN_DUMP_ROUTES=1` to collect the route manifest, then applies the
+//! conformance checks and outputs a pass/fail report.
 //!
 //! # Checks
 //!
@@ -13,10 +13,15 @@
 //! | `route-prefix` | Plugin routes live under the declared prefix |
 //! | `route-collision` | No two routes share (method, path) |
 //! | `sensitive-surfaces` | Sensitive-named routes declared with auth info |
+//! | `duplicate-registration` | No plugin route appears more than once |
 //! | `plugin-contract` | The plugin declares a parseable `autumn-web` range |
 //! | `experimental-surface` | The plugin's declared use of experimental API |
 //!
-//! The last two read the contract the built binary dumps after
+//! The route rules and the report types come from
+//! [`autumn_web::plugin_conformance`] (issue #2828). This module collects the
+//! routes and adds the checks that need the built binary.
+//!
+//! The last two checks read the contract the built binary dumps after
 //! [`PLUGIN_CONTRACT_MARKER`](autumn_web::plugin_contract::PLUGIN_CONTRACT_MARKER)
 //! (issue #1601). A binary that emits no marker — an app built before the
 //! contract existed — skips both rather than failing.
@@ -25,47 +30,24 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use autumn_web::plugin_conformance::{self as rules, ConformanceConfig, ConformanceReport};
+pub use autumn_web::plugin_conformance::{CheckResult, CheckStatus, SensitiveRoute};
 use autumn_web::plugin_contract::{
-    ContractVerdict, PLUGIN_CONTRACT_MARKER, PluginContract, SurfaceTier, evaluate, surface,
+    ContractVerdict, PLUGIN_CONTRACT_MARKER, PluginContract, evaluate,
 };
+use autumn_web::route_listing::RouteSource;
 
 use crate::routes::{self, RouteInfo, compile_binary, find_binary};
 
 // ── Report types ───────────────────────────────────────────────────────────
 
-/// Status of a conformance check item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CheckStatus {
-    Pass,
-    Fail,
-    Skip,
-}
-
-impl std::fmt::Display for CheckStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pass => write!(f, "PASS"),
-            Self::Fail => write!(f, "FAIL"),
-            Self::Skip => write!(f, "SKIP"),
-        }
-    }
-}
-
-/// Result of a single conformance check.
+/// The `autumn plugin-check` report: the library report and the data the
+/// plugin index reads. Its JSON is the library report's JSON with more keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckResult {
-    pub name: String,
-    pub status: CheckStatus,
-    pub message: String,
-    pub diagnostics: Vec<String>,
-}
-
-/// Full conformance report for a plugin.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConformanceReport {
-    pub plugin_name: String,
-    pub checks: Vec<CheckResult>,
+pub struct PluginCheckReport {
+    /// The plugin name and the check results.
+    #[serde(flatten)]
+    pub report: ConformanceReport,
     /// The contract the plugin declared, when the binary dumped one. The
     /// plugin index records its range and tier from this (issue #1625).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,57 +68,29 @@ pub struct ConformanceReport {
     pub intentional_root: Vec<String>,
 }
 
-impl ConformanceReport {
-    /// Returns `true` when no check has `CheckStatus::Fail`.
-    pub fn passed(&self) -> bool {
-        self.checks.iter().all(|c| c.status != CheckStatus::Fail)
+impl PluginCheckReport {
+    /// A report with the given checks and no index data.
+    pub fn new(plugin_name: impl Into<String>, checks: Vec<CheckResult>) -> Self {
+        Self {
+            report: ConformanceReport {
+                plugin_name: plugin_name.into(),
+                checks,
+            },
+            contract: None,
+            autumn_web: None,
+            prefix: None,
+            intentional_root: Vec::new(),
+        }
     }
 
-    /// Render the report as human-readable text.
+    /// Returns `true` when no check has `CheckStatus::Fail`.
+    pub fn passed(&self) -> bool {
+        self.report.passed()
+    }
+
+    /// The report as human-readable text.
     pub fn to_text_report(&self) -> String {
-        let mut out = String::new();
-        let overall = if self.passed() { "PASS" } else { "FAIL" };
-        out.push_str("Plugin conformance: ");
-        out.push_str(&self.plugin_name);
-        out.push_str(" \u{2014} ");
-        out.push_str(overall);
-        out.push('\n');
-        out.push_str(&"\u{2500}".repeat(60));
-        out.push('\n');
-        for check in &self.checks {
-            let icon = match check.status {
-                CheckStatus::Pass => "\u{2713}",
-                CheckStatus::Fail => "\u{2717}",
-                CheckStatus::Skip => "\u{2212}",
-            };
-            out.push_str(icon);
-            out.push_str(" [");
-            out.push_str(&check.status.to_string());
-            out.push_str("] ");
-            out.push_str(&check.name);
-            out.push_str(": ");
-            out.push_str(&check.message);
-            out.push('\n');
-            for diag in &check.diagnostics {
-                out.push_str("  \u{2192} ");
-                out.push_str(diag);
-                out.push('\n');
-            }
-        }
-        out.push_str(&"\u{2500}".repeat(60));
-        out.push('\n');
-        if self.passed() {
-            out.push_str("All conformance checks passed.\n");
-        } else {
-            let fails = self
-                .checks
-                .iter()
-                .filter(|c| c.status == CheckStatus::Fail)
-                .count();
-            out.push_str(&fails.to_string());
-            out.push_str(" check(s) failed.\n");
-        }
-        out
+        self.report.to_text_report()
     }
 }
 
@@ -161,15 +115,6 @@ impl std::str::FromStr for ReportFormat {
     }
 }
 
-/// A declared sensitive route with its auth/profile gating description.
-#[derive(Debug, Clone)]
-pub struct SensitiveRouteDecl {
-    /// Path prefix (e.g. `"/admin"`).
-    pub path_pattern: String,
-    /// Human-readable auth description (e.g. `"Role: admin required"`).
-    pub auth_mechanism: String,
-}
-
 /// Options for `autumn plugin-check`.
 pub struct PluginCheckOptions<'a> {
     /// Cargo package to build (workspace multi-package projects).
@@ -189,7 +134,7 @@ pub struct PluginCheckOptions<'a> {
     /// `route-prefix` FAIL for the same route the crate's own test passes.
     pub intentional_root_routes: &'a [String],
     /// Declared sensitive routes with their auth mechanisms.
-    pub sensitive_routes: &'a [SensitiveRouteDecl],
+    pub sensitive_routes: &'a [SensitiveRoute],
     /// Output format.
     pub format: ReportFormat,
     /// What the built binary's stderr said about its plugin contracts
@@ -202,8 +147,8 @@ pub struct PluginCheckOptions<'a> {
     /// `--deny-experimental`.
     pub deny_experimental: bool,
     /// `--no-routes`: the plugin asserts it mounts no routes (a cache, a
-    /// search index). Only then may `route-attribution` skip when none are
-    /// found; without it, none found fails, as an unannotated `nest` would.
+    /// search index). Only then may `route-attribution` skip when no routes
+    /// are found. The contract dump must also give `registered_as`.
     pub no_routes: bool,
 }
 
@@ -306,10 +251,8 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
 /// Build the conformance report from a route listing and options.
 ///
 /// Public so callers can unit-test the analysis without running a binary.
-pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> ConformanceReport {
-    let mut checks = Vec::new();
-
-    checks.push(CheckResult {
+pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> PluginCheckReport {
+    let mut checks = vec![CheckResult {
         name: "installability".to_owned(),
         status: CheckStatus::Pass,
         // Deliberately source-neutral: `autumn plugin-check` collects these by
@@ -321,45 +264,40 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
             plural = if routes.len() == 1 { "" } else { "s" }
         ),
         diagnostics: vec![],
-    });
+    }];
+    let routes = library_routes(routes);
 
     let declared = match opts.contracts {
         ContractDump::Present(all) => find_declared(all, opts.plugin_name),
         ContractDump::Absent | ContractDump::Malformed(_) => None,
     };
 
-    // Routes are attributed to `Plugin::name()`, by default the type path.
-    // When only the contract's registered name carries routes, the route
-    // checks run under it. The report keeps `--plugin-name`, the crate the
-    // index lists.
-    let registered_as = declared.and_then(|c| c.registered_as.as_deref());
-    let route_key = route_key(opts.plugin_name, registered_as, routes);
+    let mut config = ConformanceConfig::new(opts.plugin_name);
+    config.expected_prefix = opts.expected_prefix.map(str::to_owned);
+    config.intentional_root_routes = opts.intentional_root_routes.to_vec();
+    config.sensitive_routes = opts.sensitive_routes.to_vec();
+    config.contract = declared.cloned();
+    config.no_routes = opts.no_routes;
+    let mut route_checks = rules::run_route_checks(&config, &routes);
 
-    // Only an explicit `--no-routes` lets none found skip; a plugin that
-    // mounted an unannotated router would otherwise skip every route check.
-    let registered_routeless = registered_as.filter(|_| opts.no_routes);
-    checks.push(
-        check_split_attribution(declared, opts.plugin_name, routes).unwrap_or_else(|| {
-            check_route_attribution(opts.plugin_name, route_key, routes, registered_routeless)
-        }),
-    );
-
-    if let Some(prefix) = opts.expected_prefix {
-        checks.push(check_route_prefix(
-            route_key,
-            prefix,
-            opts.intentional_root_routes,
-            routes,
-        ));
+    // The library lets `no_routes` skip with no contract. The CLI skips only
+    // when the contract dump gives the registered name. In all other cases,
+    // no routes found fails.
+    if opts.no_routes
+        && declared.and_then(|c| c.registered_as.as_ref()).is_none()
+        && let Some(attribution) = route_checks
+            .iter_mut()
+            .find(|c| c.name == "route-attribution" && c.status == CheckStatus::Skip)
+    {
+        attribution.status = CheckStatus::Fail;
+        attribution.message = format!(
+            "--no-routes skips only when the contract dump gives the registered name of \
+             {}. The dump gives none",
+            opts.plugin_name
+        );
     }
+    checks.append(&mut route_checks);
 
-    checks.push(check_collisions(routes));
-    checks.push(check_sensitive_surfaces(
-        route_key,
-        routes,
-        opts.sensitive_routes,
-    ));
-    checks.push(check_duplicate_registration(route_key, routes));
     checks.push(check_plugin_contract(
         opts.plugin_name,
         opts.contracts,
@@ -371,14 +309,28 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
         opts.deny_experimental,
     ));
 
-    ConformanceReport {
-        plugin_name: opts.plugin_name.to_owned(),
-        checks,
-        contract: declared.cloned(),
-        autumn_web: None,
-        prefix: opts.expected_prefix.map(str::to_owned),
-        intentional_root: opts.intentional_root_routes.to_vec(),
-    }
+    let mut report = PluginCheckReport::new(opts.plugin_name, checks);
+    report.contract = declared.cloned();
+    report.prefix = opts.expected_prefix.map(str::to_owned);
+    report.intentional_root = opts.intentional_root_routes.to_vec();
+    report
+}
+
+/// Converts the dumped routes to the library `RouteInfo`, so that the library
+/// rules can run on them. The checks read only the fields that this function
+/// sets.
+fn library_routes(routes: &[RouteInfo]) -> Vec<autumn_web::route_listing::RouteInfo> {
+    routes
+        .iter()
+        .map(|r| autumn_web::route_listing::RouteInfo {
+            method: r.method.clone(),
+            path: r.path.clone(),
+            handler: r.handler.clone(),
+            source: RouteSource::from_wire(&r.source),
+            middleware: r.middleware.clone(),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// The `autumn-web` version the workspace's `Cargo.lock` resolved for the app
@@ -393,11 +345,12 @@ pub fn locked_autumn_web(dir: &std::path::Path, package: Option<&str>) -> Option
 
 /// Fail `route-attribution` when the dump omitted raw routers: their routes
 /// were never attributed, prefix-checked or reviewed for sensitive paths.
-fn fail_on_omitted_routers(report: &mut ConformanceReport, omitted: usize) {
+fn fail_on_omitted_routers(report: &mut PluginCheckReport, omitted: usize) {
     if omitted == 0 {
         return;
     }
     if let Some(check) = report
+        .report
         .checks
         .iter_mut()
         .find(|check| check.name == "route-attribution")
@@ -615,9 +568,9 @@ fn check_plugin_contract(
 
 /// Report the experimental plugin surface this plugin declares (issue #1601).
 ///
-/// Reports rather than gates by default — see
-/// [`autumn_web::plugin_conformance::check_experimental_surface`], whose rules
-/// this mirrors for the CLI's own report type. `deny_experimental` (the
+/// Reports rather than gates by default. The rule is
+/// [`autumn_web::plugin_conformance::check_experimental_surface`]. This
+/// function adds the contract-dump outcomes. `deny_experimental` (the
 /// `--deny-experimental` flag) turns a clean report into a hard failure for
 /// authors who want to forbid it in their own CI.
 fn check_experimental_surface(
@@ -665,445 +618,306 @@ fn check_experimental_surface(
         );
     };
 
-    if contract.experimental_surfaces.is_empty() {
-        return CheckResult {
-            name,
-            status: CheckStatus::Pass,
-            message: "declares no dependency on experimental plugin surface".to_owned(),
-            diagnostics: vec![],
-        };
-    }
-
-    let mut diagnostics = Vec::new();
-    let mut invalid = 0usize;
-    for entry in &contract.experimental_surfaces {
-        match surface(entry) {
-            None => {
-                invalid += 1;
-                diagnostics.push(format!(
-                    "{entry}: not a known plugin surface — check the spelling against \
-                     `autumn_web::plugin_contract::PLUGIN_SURFACES`"
-                ));
-            }
-            Some(s) if s.tier == SurfaceTier::Stable => {
-                invalid += 1;
-                diagnostics.push(format!(
-                    "{entry}: declared experimental, but it is a STABLE surface — drop the \
-                     declaration; it overstates this plugin's exposure"
-                ));
-            }
-            Some(s) => diagnostics.push(format!("{}: {}", s.name, s.note)),
-        }
-    }
-
+    // The library rule, and then `--deny-experimental` on top of it.
+    let mut result = rules::check_experimental_surface(Some(contract));
     let count = contract.experimental_surfaces.len();
-    if invalid > 0 {
-        return CheckResult {
-            name,
-            status: CheckStatus::Fail,
-            message: format!(
-                "{invalid} of {count} declared experimental surface(s) could not be resolved \
-                 against the registry"
-            ),
-            diagnostics,
-        };
+    if deny && count > 0 && result.status == CheckStatus::Pass {
+        result.status = CheckStatus::Fail;
+        result.message =
+            format!("{count} experimental surface(s) declared, and --deny-experimental is set");
     }
-
-    CheckResult {
-        name,
-        status: if deny {
-            CheckStatus::Fail
-        } else {
-            CheckStatus::Pass
-        },
-        message: if deny {
-            format!("{count} experimental surface(s) declared, and --deny-experimental is set")
-        } else {
-            format!("depends on {count} experimental surface(s); these may change in any release")
-        },
-        diagnostics,
-    }
-}
-
-// ── Individual check helpers ───────────────────────────────────────────────
-
-/// The name the route checks match `plugin:<name>` against: `plugin_name`,
-/// or the contract's `registered_as` when only that name carries routes.
-fn route_key<'a>(
-    plugin_name: &'a str,
-    registered_as: Option<&'a str>,
-    routes: &[RouteInfo],
-) -> &'a str {
-    let carries = |name: &str| {
-        let source = format!("plugin:{name}");
-        routes.iter().any(|r| r.source == source)
-    };
-    match registered_as {
-        Some(registered) if !carries(plugin_name) && carries(registered) => registered,
-        _ => plugin_name,
-    }
-}
-
-/// A failed `route-attribution` when routes carry more than one of the
-/// plugin's linked names (`--plugin-name`, the contract's crate, its
-/// `registered_as`). The other checks read one name's routes, so they would
-/// miss the rest. `None` when at most one name carries routes.
-fn check_split_attribution(
-    declared: Option<&PluginContract>,
-    plugin_name: &str,
-    routes: &[RouteInfo],
-) -> Option<CheckResult> {
-    let declared = declared?;
-    let mut names = vec![plugin_name, declared.plugin.as_str()];
-    names.extend(declared.registered_as.as_deref());
-    names.sort_unstable();
-    names.dedup();
-    let carrying: Vec<&str> = names
-        .into_iter()
-        .filter(|name| {
-            let source = format!("plugin:{name}");
-            routes.iter().any(|r| r.source == source)
-        })
-        .collect();
-    (carrying.len() > 1).then(|| CheckResult {
-        name: "route-attribution".to_owned(),
-        status: CheckStatus::Fail,
-        message: format!(
-            "routes are attributed to more than one of this plugin's names: {}",
-            carrying.join(", ")
-        ),
-        diagnostics: vec![
-            "one plugin registers under one `Plugin::name()`; the checks cannot tell which \
-             routes are its own"
-                .to_owned(),
-        ],
-    })
-}
-
-/// `route_key` is the name routes are matched under (see [`route_key`]).
-/// `registered_as` is the `Plugin::name()` the contract dump gives, passed
-/// only with `--no-routes`. Then no routes (a cache, a search index) skips,
-/// and routes found contradict the assertion and fail. Without it, no routes
-/// found fails.
-fn check_route_attribution(
-    plugin_name: &str,
-    route_key: &str,
-    routes: &[RouteInfo],
-    registered_as: Option<&str>,
-) -> CheckResult {
-    let expected = format!("plugin:{route_key}");
-    let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
-
-    if let Some(registered) = registered_as {
-        return if plugin_routes.is_empty() {
-            CheckResult {
-                name: "route-attribution".to_owned(),
-                status: CheckStatus::Skip,
-                message: format!(
-                    "{plugin_name} is registered as `{registered}` and contributes no routes"
-                ),
-                diagnostics: vec![],
-            }
-        } else {
-            CheckResult {
-                name: "route-attribution".to_owned(),
-                status: CheckStatus::Fail,
-                message: format!(
-                    "--no-routes was given, but {} route(s) are attributed to plugin:{route_key}",
-                    plugin_routes.len()
-                ),
-                diagnostics: vec![],
-            }
-        };
-    }
-
-    if plugin_routes.is_empty() {
-        return CheckResult {
-            name: "route-attribution".to_owned(),
-            status: CheckStatus::Fail,
-            message: format!(
-                "No routes attributed to plugin:{plugin_name} — \
-                 check the plugin name or call AppBuilder::declare_plugin_routes"
-            ),
-            diagnostics: vec![],
-        };
-    }
-
-    let via = if route_key == plugin_name {
-        String::new()
-    } else {
-        format!(" (the registered name of {plugin_name})")
-    };
-    CheckResult {
-        name: "route-attribution".to_owned(),
-        status: CheckStatus::Pass,
-        message: format!(
-            "{} route(s) correctly attributed to plugin:{route_key}{via}",
-            plugin_routes.len()
-        ),
-        diagnostics: vec![],
-    }
-}
-
-/// Check that all plugin routes live under `prefix`.
-///
-/// Routes listed in `intentional_root` (exact path match) are exempt — the
-/// same exemption the library API's `check_route_prefix` grants via
-/// `ConformanceConfig::intentional_root_routes` (issue #2828).
-/// Returns `Skip` when no routes are attributed to the plugin.
-fn check_route_prefix(
-    plugin_name: &str,
-    prefix: &str,
-    intentional_root: &[String],
-    routes: &[RouteInfo],
-) -> CheckResult {
-    let expected = format!("plugin:{plugin_name}");
-    let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
-
-    if plugin_routes.is_empty() {
-        return CheckResult {
-            name: "route-prefix".to_owned(),
-            status: CheckStatus::Skip,
-            message: format!("No routes attributed to plugin:{plugin_name}"),
-            diagnostics: vec![],
-        };
-    }
-
-    let off_prefix: Vec<String> = plugin_routes
-        .iter()
-        .filter(|r| {
-            let p = &r.path;
-            p != prefix
-                && !p.starts_with(&format!("{prefix}/"))
-                && !intentional_root.contains(p)
-                && !is_plugin_asset_route(r)
-        })
-        .map(|r| format!("{} {}", r.method, r.path))
-        .collect();
-
-    if off_prefix.is_empty() {
-        CheckResult {
-            name: "route-prefix".to_owned(),
-            status: CheckStatus::Pass,
-            message: format!("All plugin routes live under {prefix}"),
-            diagnostics: vec![],
-        }
-    } else {
-        CheckResult {
-            name: "route-prefix".to_owned(),
-            status: CheckStatus::Fail,
-            message: format!(
-                "{} route(s) not under prefix {prefix} and not declared as intentional root routes",
-                off_prefix.len()
-            ),
-            diagnostics: off_prefix,
-        }
-    }
-}
-
-/// `true` for a file of the plugin's own `PluginAssets` bundle: a route under
-/// `/static/_plugins/` carrying the marker label `AppBuilder::plugin_assets`
-/// attaches.
-///
-/// The framework mounts those, not the plugin's router: they live outside the
-/// plugin's prefix by design and are public static bytes, so a file named
-/// `admin.js` is not a sensitive surface. Both conditions are required:
-/// `declare_plugin_routes` strips the marker, so a route a plugin merely
-/// declares at such a path gets no exemption.
-fn is_plugin_asset_route(route: &RouteInfo) -> bool {
-    route
-        .path
-        .strip_prefix(autumn_web::assets::PLUGIN_ASSETS_PREFIX)
-        .is_some_and(|rest| rest.starts_with('/'))
-        && route
-            .middleware
-            .iter()
-            .any(|label| label == autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER)
-}
-
-const SENSITIVE_KEYWORDS: &[&str] = &[
-    "admin",
-    "debug",
-    "credential",
-    "operator",
-    "secret",
-    "metrics",
-];
-
-fn is_sensitive_path(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    SENSITIVE_KEYWORDS.iter().any(|kw| {
-        lower
-            .split('/')
-            .any(|segment| segment == *kw || segment.starts_with(kw))
-    })
-}
-
-fn check_sensitive_surfaces(
-    plugin_name: &str,
-    routes: &[RouteInfo],
-    declared: &[SensitiveRouteDecl],
-) -> CheckResult {
-    let expected = format!("plugin:{plugin_name}");
-    let sensitive: Vec<&RouteInfo> = routes
-        .iter()
-        .filter(|r| r.source == expected && is_sensitive_path(&r.path) && !is_plugin_asset_route(r))
-        .collect();
-
-    if sensitive.is_empty() {
-        return CheckResult {
-            name: "sensitive-surfaces".to_owned(),
-            status: CheckStatus::Pass,
-            message: "No sensitive-named routes detected".to_owned(),
-            diagnostics: vec![],
-        };
-    }
-
-    let mut undeclared: Vec<String> = Vec::new();
-    for route in &sensitive {
-        let is_ok = declared.iter().any(|d| {
-            route.path.starts_with(&d.path_pattern) && !d.auth_mechanism.trim().is_empty()
-        });
-        if !is_ok {
-            undeclared.push(format!(
-                "{} {} \u{2014} document auth/profile gating with --sensitive-route",
-                route.method, route.path
-            ));
-        }
-    }
-
-    if undeclared.is_empty() {
-        CheckResult {
-            name: "sensitive-surfaces".to_owned(),
-            status: CheckStatus::Pass,
-            message: format!(
-                "{} sensitive route(s) declared with auth/profile gating",
-                sensitive.len()
-            ),
-            diagnostics: vec![],
-        }
-    } else {
-        CheckResult {
-            name: "sensitive-surfaces".to_owned(),
-            status: CheckStatus::Fail,
-            message: format!(
-                "{} sensitive-named route(s) not declared with auth/profile gating",
-                undeclared.len()
-            ),
-            diagnostics: undeclared,
-        }
-    }
-}
-
-fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
-    use std::collections::HashMap;
-
-    let expected = format!("plugin:{plugin_name}");
-    let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
-
-    if plugin_routes.is_empty() {
-        return CheckResult {
-            name: "duplicate-registration".to_owned(),
-            status: CheckStatus::Skip,
-            message: format!("No routes attributed to plugin:{plugin_name}"),
-            diagnostics: vec![],
-        };
-    }
-
-    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
-    for route in &plugin_routes {
-        *counts.entry((&route.method, &route.path)).or_insert(0) += 1;
-    }
-
-    let mut duplicates: Vec<String> = counts
-        .into_iter()
-        .filter(|(_, count)| *count > 1)
-        .map(|((method, path), count)| format!("{method} {path} \u{2014} appears {count} times"))
-        .collect();
-    duplicates.sort();
-
-    if duplicates.is_empty() {
-        CheckResult {
-            name: "duplicate-registration".to_owned(),
-            status: CheckStatus::Pass,
-            message: format!("No duplicate route registrations for plugin:{plugin_name}"),
-            diagnostics: vec![],
-        }
-    } else {
-        CheckResult {
-            name: "duplicate-registration".to_owned(),
-            status: CheckStatus::Fail,
-            message: format!(
-                "{} route(s) registered more than once; plugin:{plugin_name} \
-                 may have been installed twice",
-                duplicates.len()
-            ),
-            diagnostics: duplicates,
-        }
-    }
-}
-
-fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            if seg.starts_with('{') && seg.ends_with('}') {
-                "{}"
-            } else {
-                seg
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn check_collisions(routes: &[RouteInfo]) -> CheckResult {
-    use std::collections::HashMap;
-
-    let mut by_key: HashMap<(String, String), Vec<&RouteInfo>> = HashMap::new();
-    for route in routes {
-        by_key
-            .entry((
-                route.method.clone(),
-                normalize_path_for_collision(&route.path),
-            ))
-            .or_default()
-            .push(route);
-    }
-
-    let mut collisions: Vec<String> = by_key
-        .iter()
-        .filter(|(_, rs)| rs.len() > 1)
-        .map(|((method, path), rs)| {
-            let contributors: Vec<String> = rs
-                .iter()
-                .map(|r| format!("{} ({})", r.handler, r.source))
-                .collect();
-            format!(
-                "{method} {path} \u{2014} collides between: {}",
-                contributors.join(", ")
-            )
-        })
-        .collect();
-    collisions.sort();
-
-    if collisions.is_empty() {
-        CheckResult {
-            name: "route-collision".to_owned(),
-            status: CheckStatus::Pass,
-            message: "No route collisions detected".to_owned(),
-            diagnostics: vec![],
-        }
-    } else {
-        CheckResult {
-            name: "route-collision".to_owned(),
-            status: CheckStatus::Fail,
-            message: format!("{} route collision(s) detected", collisions.len()),
-            diagnostics: collisions,
-        }
-    }
+    result
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod shared_rules_tests {
+    use super::*;
+    use autumn_web::plugin_conformance::{self as lib, ConformanceConfig};
+    use autumn_web::plugin_contract::PluginContract;
+
+    /// The CLI must reuse the library's rules and report types (#2828).
+    /// A local copy would drift from `autumn_web::plugin_conformance`.
+    #[test]
+    fn rules_and_report_types_are_not_redefined_here() {
+        let src = include_str!("plugin_check.rs");
+        let body = &src[..src.find("mod shared_rules_tests").unwrap_or(src.len())];
+        for name in [
+            "fn is_sensitive_path",
+            "fn is_plugin_asset_path",
+            "fn normalize_path_for_collision",
+            "fn is_plugin_asset_route",
+            "const SENSITIVE_KEYWORDS",
+            "fn check_route_attribution",
+            "fn check_route_prefix",
+            "fn check_sensitive_surfaces",
+            "fn check_duplicate_registration",
+            "fn check_collisions",
+            "fn check_no_routes",
+            "fn check_split_attribution",
+            "fn route_key",
+            "fn carries",
+            "fn route_name",
+            "fn plugin_names",
+            "fn check_attribution",
+            "fn check_prefix_with_no_routes",
+            "enum CheckStatus",
+            "struct CheckResult",
+            "struct ConformanceReport",
+            "struct SensitiveRoute",
+            "Plugin conformance: ",
+        ] {
+            assert!(!body.contains(name), "`{name}` must live in the library");
+        }
+    }
+
+    fn route(method: &str, path: &str, source: &str) -> RouteInfo {
+        RouteInfo {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            handler: format!("h{path}"),
+            source: source.to_owned(),
+            middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
+            group: None,
+        }
+    }
+
+    fn asset(path: &str, source: &str) -> RouteInfo {
+        let mut asset = route("GET", path, source);
+        asset.middleware = vec![autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER.to_owned()];
+        asset
+    }
+
+    fn options<'a>(
+        plugin_name: &'a str,
+        sensitive: &'a [lib::SensitiveRoute],
+        root: &'a [String],
+        dump: &'a ContractDump,
+    ) -> PluginCheckOptions<'a> {
+        PluginCheckOptions {
+            package: None,
+            bin: None,
+            plugin_name,
+            expected_prefix: Some("/shop"),
+            intentional_root_routes: root,
+            sensitive_routes: sensitive,
+            format: ReportFormat::Text,
+            contracts: dump,
+            deny_experimental: false,
+            no_routes: false,
+        }
+    }
+
+    fn fixtures(name: &str) -> Vec<Vec<RouteInfo>> {
+        let src = format!("plugin:{name}");
+        let src = src.as_str();
+        vec![
+            vec![route("GET", "/shop", src)],
+            vec![route("GET", "/shop", src), route("POST", "/shop/{id}", src)],
+            vec![route("GET", "/other", src)],
+            vec![route("GET", "/hook", src)],
+            vec![
+                route("POST", "/shop/{id}", "user"),
+                route("POST", "/shop/{item}", src),
+                route("GET", "/a/{x}", "framework"),
+                route("GET", "/a/{*rest}", "plugin:other"),
+            ],
+            vec![
+                route("GET", "/shop/admin", src),
+                route("GET", "/shop/debug", src),
+            ],
+            vec![route("GET", "/shop/debug", src)],
+            vec![route("GET", "/shop", src), route("GET", "/shop", src)],
+            vec![
+                route("GET", "/shop", src),
+                asset("/static/_plugins/shop/admin.js", src),
+            ],
+            vec![route("GET", "/static/_plugins/x/admin", src)],
+            vec![route("GET", "/x", "user")],
+        ]
+    }
+
+    /// Compare every check the library runs, except `experimental-surface`
+    /// (the CLI reads it from the contract dump).
+    fn assert_same_route_checks(
+        cli: &PluginCheckReport,
+        library: &lib::ConformanceReport,
+        routes: &[RouteInfo],
+    ) {
+        for check in library
+            .checks
+            .iter()
+            .filter(|c| c.name != "experimental-surface")
+        {
+            let found = cli
+                .report
+                .checks
+                .iter()
+                .find(|c| c.name == check.name)
+                .unwrap_or_else(|| panic!("the CLI does not run `{}`", check.name));
+            assert_eq!(
+                (&found.status, &found.message, &found.diagnostics),
+                (&check.status, &check.message, &check.diagnostics),
+                "`{}` differs for {routes:?}",
+                check.name
+            );
+        }
+    }
+
+    /// For the same routes, `autumn plugin-check` and `run_conformance` give
+    /// the same status, message and diagnostics for each route check (#2828).
+    #[test]
+    fn route_checks_match_the_library() {
+        let root = vec!["/hook".to_owned()];
+        let sensitive = vec![lib::SensitiveRoute {
+            path_pattern: "/shop/debug".to_owned(),
+            auth_mechanism: "Role: ops".to_owned(),
+        }];
+        let base = ConformanceConfig::new("shop")
+            .prefix("/shop")
+            .intentional_root_route("/hook")
+            .sensitive_route("/shop/debug", "Role: ops");
+
+        // No contract dump.
+        for routes in &fixtures("shop") {
+            let cli = build_report(
+                &options("shop", &sensitive, &root, &ContractDump::Absent),
+                routes,
+            );
+            let library = lib::run_conformance(&base, &by_serde(routes));
+            assert_same_route_checks(&cli, &library, routes);
+        }
+
+        // A contract whose registered name carries the routes.
+        let mut contract = PluginContract::new("shop").autumn_web("0.7");
+        contract.registered_as = Some("shop::Shop".to_owned());
+        let dump = ContractDump::Present(vec![contract.clone()]);
+        let config = base.contract(contract);
+        let mut with_contract = fixtures("shop::Shop");
+        with_contract.push(vec![
+            route("GET", "/shop", "plugin:shop"),
+            route("GET", "/shop/x", "plugin:shop::Shop"),
+        ]);
+        for routes in &with_contract {
+            let cli = build_report(&options("shop", &sensitive, &root, &dump), routes);
+            let library = lib::run_conformance(&config, &by_serde(routes));
+            assert_same_route_checks(&cli, &library, routes);
+        }
+
+        // `--no-routes` with a registered name: the CLI and the library agree.
+        let mut config = config.no_routes();
+        config.expected_prefix = None;
+        let mut opts = options("shop", &sensitive, &root, &dump);
+        opts.expected_prefix = None;
+        opts.no_routes = true;
+        for routes in &with_contract {
+            let cli = build_report(&opts, routes);
+            let library = lib::run_conformance(&config, &by_serde(routes));
+            assert_same_route_checks(&cli, &library, routes);
+        }
+    }
+
+    /// The library routes, made through serde rather than `library_routes`, so
+    /// that the parity test also checks the conversion.
+    fn by_serde(routes: &[RouteInfo]) -> Vec<autumn_web::route_listing::RouteInfo> {
+        let json = serde_json::to_value(routes).expect("json");
+        serde_json::from_value(json).expect("library routes")
+    }
+
+    /// The conversion keeps what the checks read: the source and the asset
+    /// marker.
+    #[test]
+    fn library_routes_keeps_source_and_middleware() {
+        let converted = library_routes(&[asset("/static/_plugins/shop/a.js", "plugin:shop")]);
+        assert_eq!(converted[0].source, RouteSource::Plugin("shop".to_owned()));
+        assert_eq!(
+            converted[0].middleware,
+            [autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER]
+        );
+        assert_eq!(converted[0].path, "/static/_plugins/shop/a.js");
+        assert_eq!(converted[0].method, "GET");
+    }
+
+    /// `--no-routes` counts a route under any name of the plugin, as the
+    /// library does. Here `--plugin-name` is the registered name, and the
+    /// route carries the crate name.
+    #[test]
+    fn no_routes_counts_every_name_of_the_plugin() {
+        let mut contract = PluginContract::new("autumn-plugin-demo").autumn_web("0.7");
+        contract.registered_as = Some("demo::DemoPlugin".to_owned());
+        let dump = ContractDump::Present(vec![contract]);
+        let mut opts = options("demo::DemoPlugin", &[], &[], &dump);
+        opts.expected_prefix = None;
+        opts.no_routes = true;
+        let attribution = |routes: &[RouteInfo]| {
+            build_report(&opts, routes)
+                .report
+                .checks
+                .into_iter()
+                .find(|c| c.name == "route-attribution")
+                .expect("route-attribution")
+        };
+        let result = attribution(&[route("GET", "/x", "plugin:autumn-plugin-demo")]);
+        assert_eq!(result.status, CheckStatus::Fail, "{}", result.message);
+        assert!(
+            result.message.starts_with("no_routes was declared"),
+            "{}",
+            result.message
+        );
+        assert_eq!(attribution(&[]).status, CheckStatus::Skip);
+    }
+
+    /// `--no-routes` without a registered name never passes: routes under
+    /// the plugin name contradict it, and no routes cannot skip.
+    #[test]
+    fn no_routes_without_a_registered_name_never_passes() {
+        let mut opts = options("shop", &[], &[], &ContractDump::Absent);
+        opts.expected_prefix = None;
+        opts.no_routes = true;
+        for routes in [vec![route("GET", "/shop", "plugin:shop")], vec![]] {
+            let report = build_report(&opts, &routes);
+            let attribution = &report.report.checks[1];
+            assert_eq!(attribution.name, "route-attribution");
+            assert_eq!(
+                attribution.status,
+                CheckStatus::Fail,
+                "{routes:?}: {}",
+                attribution.message
+            );
+            if routes.is_empty() {
+                assert!(
+                    attribution.message.starts_with("--no-routes skips only"),
+                    "{}",
+                    attribution.message
+                );
+            }
+        }
+    }
+
+    /// The CLI JSON report reads as the library report: one wire shape.
+    #[test]
+    fn the_json_report_reads_as_the_library_report() {
+        let dump = ContractDump::Absent;
+        let root = vec!["/hook".to_owned()];
+        let report = build_report(
+            &options("shop", &[], &root, &dump),
+            &[route("GET", "/shop", "plugin:shop")],
+        );
+        let json = serde_json::to_string(&report).expect("json");
+        let library: lib::ConformanceReport = serde_json::from_str(&json).expect("library");
+        assert_eq!(library.plugin_name, "shop");
+        assert_eq!(library.checks[0].name, "installability");
+        let back: PluginCheckReport = serde_json::from_str(&json).expect("cli");
+        assert_eq!(back.prefix.as_deref(), Some("/shop"));
+        assert_eq!(back.intentional_root, root);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1121,406 +935,8 @@ mod tests {
             sunset_opt_out: None,
             resource_shape: String::new(),
             pools: Vec::new(),
+            group: None,
         }
-    }
-
-    fn no_sensitive() -> Vec<SensitiveRouteDecl> {
-        vec![]
-    }
-
-    /// A plugin's `PluginAssets` files live under `/static/_plugins/`, mounted
-    /// by the framework outside the plugin's prefix, and are public static
-    /// bytes: neither an off-prefix route nor a sensitive surface, even when a
-    /// file is named `admin.js`. Anything else outside the prefix still fails.
-    #[test]
-    fn plugin_asset_routes_are_exempt_from_prefix_and_sensitive_checks() {
-        let asset = |path: &str| {
-            let mut route = make_route("GET", path, "plugin:admin");
-            route.middleware = vec![autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER.to_owned()];
-            route
-        };
-        let routes = vec![
-            make_route("GET", "/admin", "plugin:admin"),
-            asset("/static/_plugins/autumn-admin/admin.js"),
-            asset("/static/_plugins/autumn-admin/admin.cb7ccaab.js"),
-        ];
-        let prefix = check_route_prefix("admin", "/admin", &[], &routes);
-        assert_eq!(prefix.status, CheckStatus::Pass, "{}", prefix.message);
-        let declared = vec![SensitiveRouteDecl {
-            path_pattern: "/admin".to_owned(),
-            auth_mechanism: "Role: admin required".to_owned(),
-        }];
-        let sensitive = check_sensitive_surfaces("admin", &routes, &declared);
-        assert_eq!(sensitive.status, CheckStatus::Pass, "{}", sensitive.message);
-
-        // `/static/_pluginsX/...` is not the asset prefix, even with the marker.
-        let lookalike = vec![asset("/static/_pluginsx/admin.js")];
-        let prefix = check_route_prefix("admin", "/admin", &[], &lookalike);
-        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
-
-        // A route a plugin merely declared at an asset path, without the marker
-        // `AppBuilder::plugin_assets` attaches, is checked like any other.
-        let forged = vec![make_route(
-            "GET",
-            "/static/_plugins/x/admin",
-            "plugin:admin",
-        )];
-        let prefix = check_route_prefix("admin", "/admin", &[], &forged);
-        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
-        let sensitive = check_sensitive_surfaces("admin", &forged, &declared);
-        assert_eq!(sensitive.status, CheckStatus::Fail, "{}", sensitive.message);
-    }
-
-    // ── check_route_attribution ────────────────────────────────────────────
-
-    #[test]
-    fn attribution_all_attributed_passes() {
-        let routes = vec![
-            make_route("GET", "/admin", "plugin:admin"),
-            make_route("POST", "/admin/items", "plugin:admin"),
-        ];
-        let result = check_route_attribution("admin", "admin", &routes, None);
-        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
-    }
-
-    #[test]
-    fn attribution_no_plugin_routes_fails() {
-        let routes = vec![make_route("GET", "/posts", "user")];
-        let result = check_route_attribution("admin", "admin", &routes, None);
-        assert_eq!(result.status, CheckStatus::Fail);
-        assert!(
-            result.message.contains("plugin:admin"),
-            "message should name the plugin: {}",
-            result.message
-        );
-    }
-
-    #[test]
-    fn attribution_message_includes_count() {
-        let routes = vec![
-            make_route("GET", "/admin", "plugin:admin"),
-            make_route("GET", "/admin/items", "plugin:admin"),
-        ];
-        let result = check_route_attribution("admin", "admin", &routes, None);
-        assert!(result.message.contains('2'), "{}", result.message);
-    }
-
-    // ── check_route_prefix ─────────────────────────────────────────────────
-
-    #[test]
-    fn prefix_all_under_prefix_passes() {
-        let routes = vec![
-            make_route("GET", "/admin", "plugin:admin"),
-            make_route("POST", "/admin/items", "plugin:admin"),
-        ];
-        let result = check_route_prefix("admin", "/admin", &[], &routes);
-        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
-    }
-
-    #[test]
-    fn prefix_route_outside_fails_with_diagnostic() {
-        let routes = vec![
-            make_route("GET", "/admin", "plugin:admin"),
-            make_route("GET", "/webhook", "plugin:admin"),
-        ];
-        let result = check_route_prefix("admin", "/admin", &[], &routes);
-        assert_eq!(result.status, CheckStatus::Fail);
-        assert!(result.diagnostics.iter().any(|d| d.contains("/webhook")));
-    }
-
-    #[test]
-    fn prefix_no_plugin_routes_skips() {
-        let routes = vec![make_route("GET", "/posts", "user")];
-        let result = check_route_prefix("admin", "/admin", &[], &routes);
-        assert_eq!(result.status, CheckStatus::Skip);
-    }
-
-    // ── check_collisions ───────────────────────────────────────────────────
-
-    #[test]
-    fn collisions_no_collisions_passes() {
-        let routes = vec![
-            make_route("GET", "/posts", "user"),
-            make_route("GET", "/admin", "plugin:admin"),
-        ];
-        let result = check_collisions(&routes);
-        assert_eq!(result.status, CheckStatus::Pass);
-    }
-
-    #[test]
-    fn collisions_host_plugin_collision_fails() {
-        let routes = vec![
-            make_route("GET", "/posts", "user"),
-            make_route("GET", "/posts", "plugin:harvest"),
-        ];
-        let result = check_collisions(&routes);
-        assert_eq!(result.status, CheckStatus::Fail);
-        assert_eq!(result.diagnostics.len(), 1);
-    }
-
-    #[test]
-    fn collisions_plugin_plugin_collision_fails() {
-        let routes = vec![
-            make_route("GET", "/api/feed", "plugin:harvest"),
-            make_route("GET", "/api/feed", "plugin:feeds"),
-        ];
-        let result = check_collisions(&routes);
-        assert_eq!(result.status, CheckStatus::Fail);
-    }
-
-    #[test]
-    fn collisions_diagnostic_names_method_path_contributors() {
-        let routes = vec![
-            make_route("POST", "/items", "user"),
-            make_route("POST", "/items", "plugin:inventory"),
-        ];
-        let result = check_collisions(&routes);
-        assert_eq!(result.status, CheckStatus::Fail);
-        let diag = &result.diagnostics[0];
-        assert!(diag.contains("POST"), "missing method: {diag}");
-        assert!(diag.contains("/items"), "missing path: {diag}");
-        assert!(diag.contains("user"), "missing user: {diag}");
-        assert!(diag.contains("plugin:inventory"), "missing plugin: {diag}");
-    }
-
-    #[test]
-    fn collisions_different_methods_no_collision() {
-        let routes = vec![
-            make_route("GET", "/posts", "user"),
-            make_route("POST", "/posts", "plugin:blog"),
-        ];
-        let result = check_collisions(&routes);
-        assert_eq!(result.status, CheckStatus::Pass);
-    }
-
-    #[test]
-    fn collisions_dynamic_segment_different_names_detected() {
-        let routes = vec![
-            make_route("GET", "/users/{user_id}", "user"),
-            make_route("GET", "/users/{id}", "plugin:auth"),
-        ];
-        let result = check_collisions(&routes);
-        assert_eq!(
-            result.status,
-            CheckStatus::Fail,
-            "different param names should collide: {}",
-            result.message
-        );
-    }
-
-    #[test]
-    fn collisions_catchall_different_names_detected() {
-        let routes = vec![
-            make_route("GET", "/files/{*path}", "user"),
-            make_route("GET", "/files/{*rest}", "plugin:storage"),
-        ];
-        let result = check_collisions(&routes);
-        assert_eq!(
-            result.status,
-            CheckStatus::Fail,
-            "different catch-all names should collide"
-        );
-    }
-
-    #[test]
-    fn collisions_catchall_vs_named_param_detected() {
-        // matchit treats {id} and {*rest} at the same position as a conflict.
-        let routes = vec![
-            make_route("GET", "/files/{id}", "user"),
-            make_route("GET", "/files/{*rest}", "plugin:storage"),
-        ];
-        let result = check_collisions(&routes);
-        assert_eq!(
-            result.status,
-            CheckStatus::Fail,
-            "catch-all and named param at same position conflict in matchit"
-        );
-    }
-
-    #[test]
-    fn normalize_path_replaces_param_names() {
-        assert_eq!(
-            normalize_path_for_collision("/users/{user_id}/posts/{post_id}"),
-            "/users/{}/posts/{}"
-        );
-        assert_eq!(normalize_path_for_collision("/files/{*rest}"), "/files/{}");
-        assert_eq!(
-            normalize_path_for_collision("/static/app.js"),
-            "/static/app.js"
-        );
-    }
-
-    // ── check_sensitive_surfaces ───────────────────────────────────────────
-
-    #[test]
-    fn sensitive_no_sensitive_routes_passes() {
-        let routes = vec![
-            make_route("GET", "/posts", "plugin:blog"),
-            make_route("GET", "/api/users", "plugin:blog"),
-        ];
-        let result = check_sensitive_surfaces("blog", &routes, &no_sensitive());
-        assert_eq!(result.status, CheckStatus::Pass);
-    }
-
-    #[test]
-    fn sensitive_admin_route_undeclared_fails() {
-        let routes = vec![make_route("GET", "/admin/dashboard", "plugin:myplugin")];
-        let result = check_sensitive_surfaces("myplugin", &routes, &no_sensitive());
-        assert_eq!(result.status, CheckStatus::Fail);
-    }
-
-    #[test]
-    fn sensitive_admin_route_declared_passes() {
-        let routes = vec![make_route("GET", "/admin/dashboard", "plugin:myplugin")];
-        let declared = vec![SensitiveRouteDecl {
-            path_pattern: "/admin".to_owned(),
-            auth_mechanism: "Role: admin required".to_owned(),
-        }];
-        let result = check_sensitive_surfaces("myplugin", &routes, &declared);
-        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
-    }
-
-    #[test]
-    fn sensitive_empty_auth_mechanism_fails() {
-        let routes = vec![make_route("GET", "/admin/users", "plugin:myplugin")];
-        let declared = vec![SensitiveRouteDecl {
-            path_pattern: "/admin".to_owned(),
-            auth_mechanism: String::new(),
-        }];
-        let result = check_sensitive_surfaces("myplugin", &routes, &declared);
-        assert_eq!(
-            result.status,
-            CheckStatus::Fail,
-            "empty auth_mechanism must fail"
-        );
-    }
-
-    #[test]
-    fn sensitive_only_checks_plugin_routes() {
-        let routes = vec![
-            make_route("GET", "/admin/panel", "user"),
-            make_route("GET", "/posts", "plugin:blog"),
-        ];
-        let result = check_sensitive_surfaces("blog", &routes, &no_sensitive());
-        assert_eq!(result.status, CheckStatus::Pass);
-    }
-
-    #[test]
-    fn sensitive_debug_route_fails() {
-        let routes = vec![make_route("GET", "/debug/state", "plugin:myplugin")];
-        let result = check_sensitive_surfaces("myplugin", &routes, &no_sensitive());
-        assert_eq!(result.status, CheckStatus::Fail);
-    }
-
-    // ── ConformanceReport ──────────────────────────────────────────────────
-
-    #[test]
-    fn report_passed_true_all_pass() {
-        let report = ConformanceReport {
-            plugin_name: "test".to_owned(),
-            checks: vec![
-                CheckResult {
-                    name: "c1".to_owned(),
-                    status: CheckStatus::Pass,
-                    message: "ok".to_owned(),
-                    diagnostics: vec![],
-                },
-                CheckResult {
-                    name: "c2".to_owned(),
-                    status: CheckStatus::Skip,
-                    message: "skipped".to_owned(),
-                    diagnostics: vec![],
-                },
-            ],
-            contract: None,
-            autumn_web: None,
-            prefix: None,
-            intentional_root: Vec::new(),
-        };
-        assert!(report.passed());
-    }
-
-    #[test]
-    fn report_passed_false_any_fail() {
-        let report = ConformanceReport {
-            plugin_name: "test".to_owned(),
-            checks: vec![CheckResult {
-                name: "c1".to_owned(),
-                status: CheckStatus::Fail,
-                message: "fail".to_owned(),
-                diagnostics: vec![],
-            }],
-            contract: None,
-            autumn_web: None,
-            prefix: None,
-            intentional_root: Vec::new(),
-        };
-        assert!(!report.passed());
-    }
-
-    #[test]
-    fn report_text_contains_plugin_name() {
-        let report = ConformanceReport {
-            plugin_name: "autumn-admin-plugin".to_owned(),
-            checks: vec![],
-            contract: None,
-            autumn_web: None,
-            prefix: None,
-            intentional_root: Vec::new(),
-        };
-        assert!(report.to_text_report().contains("autumn-admin-plugin"));
-    }
-
-    #[test]
-    fn report_text_shows_overall_pass() {
-        let report = ConformanceReport {
-            plugin_name: "test".to_owned(),
-            checks: vec![],
-            contract: None,
-            autumn_web: None,
-            prefix: None,
-            intentional_root: Vec::new(),
-        };
-        assert!(report.to_text_report().contains("PASS"));
-    }
-
-    #[test]
-    fn report_text_shows_overall_fail() {
-        let report = ConformanceReport {
-            plugin_name: "test".to_owned(),
-            checks: vec![CheckResult {
-                name: "c1".to_owned(),
-                status: CheckStatus::Fail,
-                message: "fail".to_owned(),
-                diagnostics: vec![],
-            }],
-            contract: None,
-            autumn_web: None,
-            prefix: None,
-            intentional_root: Vec::new(),
-        };
-        assert!(report.to_text_report().contains("FAIL"));
-    }
-
-    #[test]
-    fn report_serializes_to_json() {
-        let report = ConformanceReport {
-            plugin_name: "test-plugin".to_owned(),
-            checks: vec![CheckResult {
-                name: "route-attribution".to_owned(),
-                status: CheckStatus::Pass,
-                message: "ok".to_owned(),
-                diagnostics: vec![],
-            }],
-            contract: None,
-            autumn_web: None,
-            prefix: None,
-            intentional_root: Vec::new(),
-        };
-        let json = serde_json::to_string(&report).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["plugin_name"], "test-plugin");
-        assert_eq!(parsed["checks"][0]["status"], "pass");
     }
 
     // ── ReportFormat parsing ───────────────────────────────────────────────
@@ -1549,69 +965,6 @@ mod tests {
         assert!(r.is_err());
     }
 
-    // ── is_sensitive_path ──────────────────────────────────────────────────
-
-    #[test]
-    fn admin_path_is_sensitive() {
-        assert!(is_sensitive_path("/admin"));
-        assert!(is_sensitive_path("/admin/users"));
-    }
-
-    #[test]
-    fn debug_path_is_sensitive() {
-        assert!(is_sensitive_path("/debug"));
-        assert!(is_sensitive_path("/api/debug/state"));
-    }
-
-    #[test]
-    fn normal_paths_not_sensitive() {
-        assert!(!is_sensitive_path("/posts"));
-        assert!(!is_sensitive_path("/api/users"));
-    }
-
-    // ── check_duplicate_registration ──────────────────────────────────────
-
-    #[test]
-    fn duplicate_no_duplicates_passes() {
-        let routes = vec![
-            make_route("GET", "/admin", "plugin:admin"),
-            make_route("POST", "/admin/items", "plugin:admin"),
-        ];
-        let result = check_duplicate_registration("admin", &routes);
-        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
-    }
-
-    #[test]
-    fn duplicate_same_route_twice_fails() {
-        let routes = vec![
-            make_route("GET", "/admin", "plugin:admin"),
-            make_route("GET", "/admin", "plugin:admin"),
-        ];
-        let result = check_duplicate_registration("admin", &routes);
-        assert_eq!(result.status, CheckStatus::Fail);
-        assert_eq!(result.diagnostics.len(), 1);
-    }
-
-    #[test]
-    fn duplicate_diagnostic_names_route() {
-        let routes = vec![
-            make_route("POST", "/admin/items", "plugin:admin"),
-            make_route("POST", "/admin/items", "plugin:admin"),
-        ];
-        let result = check_duplicate_registration("admin", &routes);
-        assert_eq!(result.status, CheckStatus::Fail);
-        let diag = &result.diagnostics[0];
-        assert!(diag.contains("POST"), "missing method: {diag}");
-        assert!(diag.contains("/admin/items"), "missing path: {diag}");
-    }
-
-    #[test]
-    fn duplicate_no_plugin_routes_skips() {
-        let routes = vec![make_route("GET", "/posts", "user")];
-        let result = check_duplicate_registration("admin", &routes);
-        assert_eq!(result.status, CheckStatus::Skip);
-    }
-
     // ── build_report ───────────────────────────────────────────────────────
 
     #[test]
@@ -1630,7 +983,13 @@ mod tests {
         };
         let routes = vec![make_route("GET", "/posts", "user")];
         let report = build_report(&opts, &routes);
-        assert!(report.checks.iter().any(|c| c.name == "installability"));
+        assert!(
+            report
+                .report
+                .checks
+                .iter()
+                .any(|c| c.name == "installability")
+        );
     }
 
     #[test]
@@ -1648,7 +1007,13 @@ mod tests {
             no_routes: false,
         };
         let report = build_report(&opts, &[]);
-        assert!(!report.checks.iter().any(|c| c.name == "route-prefix"));
+        assert!(
+            !report
+                .report
+                .checks
+                .iter()
+                .any(|c| c.name == "route-prefix")
+        );
     }
 
     #[test]
@@ -1667,7 +1032,13 @@ mod tests {
         };
         let routes = vec![make_route("GET", "/admin", "plugin:admin")];
         let report = build_report(&opts, &routes);
-        assert!(report.checks.iter().any(|c| c.name == "route-prefix"));
+        assert!(
+            report
+                .report
+                .checks
+                .iter()
+                .any(|c| c.name == "route-prefix")
+        );
         // The report names the prefix it tested, for `plugin index record`.
         assert_eq!(report.prefix.as_deref(), Some("/admin"));
     }
@@ -1696,6 +1067,7 @@ mod tests {
         ];
         let report = build_report(&opts, &routes);
         let check = report
+            .report
             .checks
             .iter()
             .find(|c| c.name == "route-prefix")
@@ -1729,6 +1101,7 @@ mod tests {
         let routes = vec![make_route("POST", "/webhook", "plugin:admin")];
         let report = build_report(&opts, &routes);
         let check = report
+            .report
             .checks
             .iter()
             .find(|c| c.name == "route-prefix")
@@ -1765,6 +1138,7 @@ mod tests {
         ];
         let report = build_report(&opts, &routes);
         let check = report
+            .report
             .checks
             .iter()
             .find(|c| c.name == "route-prefix")
@@ -1788,7 +1162,7 @@ mod tests {
             no_routes: false,
         };
         let report = build_report(&opts, &[]);
-        assert_eq!(report.plugin_name, "autumn-admin-plugin");
+        assert_eq!(report.report.plugin_name, "autumn-admin-plugin");
     }
 }
 
@@ -1883,24 +1257,20 @@ mod contract_tests {
     /// pass: its routes were never checked.
     #[test]
     fn omitted_routers_fail_route_attribution() {
-        let mut report = ConformanceReport {
-            plugin_name: "autumn-plugin-x".to_owned(),
-            checks: vec![CheckResult {
+        let mut report = PluginCheckReport::new(
+            "autumn-plugin-x",
+            vec![CheckResult {
                 name: "route-attribution".to_owned(),
                 status: CheckStatus::Pass,
                 message: String::new(),
                 diagnostics: vec![],
             }],
-            contract: None,
-            autumn_web: None,
-            prefix: None,
-            intentional_root: Vec::new(),
-        };
+        );
         fail_on_omitted_routers(&mut report, 0);
         assert!(report.passed());
         fail_on_omitted_routers(&mut report, 2);
         assert!(!report.passed());
-        assert!(report.checks[0].message.contains("2 raw router(s)"));
+        assert!(report.report.checks[0].message.contains("2 raw router(s)"));
     }
 
     /// `--bin` without `-p` names the member that owns that binary.
@@ -1951,11 +1321,13 @@ mod contract_tests {
             sunset_opt_out: None,
             resource_shape: String::new(),
             pools: Vec::new(),
+            group: None,
         }
     }
 
-    fn find<'a>(report: &'a ConformanceReport, name: &str) -> &'a CheckResult {
+    fn find<'a>(report: &'a PluginCheckReport, name: &str) -> &'a CheckResult {
         report
+            .report
             .checks
             .iter()
             .find(|c| c.name == name)
@@ -1982,6 +1354,24 @@ mod contract_tests {
         assert!(report.passed(), "{}", report.to_text_report());
     }
 
+    /// `--no-routes` together with `--prefix` is a contradiction, not a
+    /// combination that passes on nothing: the same rule
+    /// `autumn_web::plugin_conformance::run_conformance` enforces for
+    /// `ConformanceConfig::no_routes` (issue #2828's drift class — this is
+    /// the library's own special case, mirrored here, not a new rule).
+    #[test]
+    fn no_routes_with_a_prefix_fails_route_prefix_instead_of_skipping() {
+        let dump = present(vec![demo_contract()]);
+        let mut o = opts(&dump);
+        o.no_routes = true;
+        o.expected_prefix = Some("/demo");
+        let report = build_report(&o, &[]);
+        let prefix = find(&report, "route-prefix");
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+        assert!(prefix.message.contains("no_routes") || prefix.message.contains("--no-routes"));
+        assert!(!report.passed());
+    }
+
     /// No routes skips only on an explicit `--no-routes`: an unannotated
     /// `nest` also dumps none, and must not pass unchecked.
     #[test]
@@ -1996,7 +1386,7 @@ mod contract_tests {
         let attribution = find(&report, "route-attribution");
         assert_eq!(attribution.status, CheckStatus::Fail);
         assert!(
-            attribution.message.contains("--no-routes"),
+            attribution.message.contains("no_routes"),
             "{}",
             attribution.message
         );
@@ -2037,7 +1427,7 @@ mod contract_tests {
         let mut o = opts(&dump);
         o.expected_prefix = Some("/elsewhere");
         let report = build_report(&o, &[hidden]);
-        assert_eq!(report.plugin_name, "autumn-plugin-demo");
+        assert_eq!(report.report.plugin_name, "autumn-plugin-demo");
         let attribution = find(&report, "route-attribution");
         assert_eq!(
             attribution.status,
@@ -2072,7 +1462,13 @@ mod contract_tests {
     fn a_contract_without_a_registered_name_does_not_skip() {
         let mut contract = demo_contract();
         contract.registered_as = None;
-        let report = build_report(&opts(&present(vec![contract])), &[]);
+        let dump = present(vec![contract]);
+        let report = build_report(&opts(&dump), &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
+        // `--no-routes` cannot skip without the registered name either.
+        let mut o = opts(&dump);
+        o.no_routes = true;
+        let report = build_report(&o, &[]);
         assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
     }
 

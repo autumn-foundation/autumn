@@ -4,12 +4,12 @@
 #
 # WHY THIS EXISTS: the corpus already gates the six things a reader copies off a
 # page and the one thing they cannot copy at all.
-# `scripts/check-docs-links.sh` gates its *links* (a 404 on GitHub),
+# `xtask/src/docs/links.rs` gates its *links* (a 404 on GitHub),
 # `scripts/check-docs-cli.sh` its *commands* (`unrecognized subcommand`),
 # `scripts/check-docs-config.sh` the `AUTUMN_*` variables they SET (a silent
 # no-op), `scripts/check-docs-toml.sh` the `autumn.toml` keys they WRITE
 # (dropped silently), `scripts/check-docs-symbols.sh` the `autumn_web::…` paths
-# they IMPORT (E0432 against their own file), `scripts/check-docs-routes.sh` the
+# they IMPORT (E0432 against their own file), `xtask/src/docs/routes.rs` the
 # `/actuator/…` URLs they CURL, and `scripts/check-docs-orphans.sh` asserts the
 # page can be reached at all. Nothing gated the line the reader copies FIRST and
 # that every one of those other checks is implicitly relative to: the dependency
@@ -216,7 +216,7 @@
 # The same stale pin further down the page is still reported.
 #
 # HTML comments are blanked before pins are extracted, on the same
-# visible-vs-invisible line `check-docs-orphans.sh` and `check-docs-routes.sh`
+# visible-vs-invisible line `check-docs-orphans.sh` and `xtask/src/docs/routes.rs`
 # draw: a comment renders as nothing, so it is not a pin a reader can see or
 # paste. That rule is also what lets a waiver name the pin it exempts without
 # the gate re-reporting its own marker one line down.
@@ -280,7 +280,7 @@ def in_scope(path):
 
 # `readme = "…"` in a crate manifest names that crate's crates.io landing page.
 # It is reader-facing by PUBLICATION rather than by where it sits in the tree,
-# which is why a directory-shaped rule cannot reach it — `check-docs-routes.sh`
+# which is why a directory-shaped rule cannot reach it — `xtask/src/docs/routes.rs`
 # reads the manifests for exactly this reason, and its argument carries here
 # unchanged: these pages carry `autumn_web::…` paths and `AUTUMN_*` variables
 # the same way they carry `/actuator/…` URLs.

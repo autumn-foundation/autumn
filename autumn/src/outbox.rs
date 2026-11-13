@@ -73,8 +73,16 @@ pub const TOPIC_MAIL: &str = "autumn.mail";
 #[cfg(feature = "http-client")]
 pub const TOPIC_WEBHOOK: &str = "autumn.webhook";
 
+/// Topic of a message that the inbox endpoint took for one `#[listener]`.
+/// See [`INBOX_PATH`].
+pub const TOPIC_INBOX: &str = "autumn.inbox";
+
+pub(crate) mod remote;
+pub(crate) use remote::inbox_router;
+pub use remote::{INBOX_PATH, MESSAGE_ID_HEADER, SIGNATURE_HEADER, TOPIC_HEADER, inbox_signature};
+
 /// Topics that start with this prefix belong to the framework.
-pub const RESERVED_TOPIC_PREFIX: &str = "autumn.";
+pub const RESERVED_TOPIC_PREFIX: &str = crate::config::OUTBOX_RESERVED_TOPIC_PREFIX;
 
 /// How often the relay worker deletes old rows.
 const PURGE_INTERVAL: Duration = Duration::from_secs(60);
@@ -105,6 +113,9 @@ CREATE TABLE IF NOT EXISTS autumn_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_autumn_outbox_pending
     ON autumn_outbox (aggregate, seq)
+    WHERE dispatched_at IS NULL AND dead_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_autumn_outbox_claim
+    ON autumn_outbox (seq)
     WHERE dispatched_at IS NULL AND dead_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_autumn_outbox_dispatched
     ON autumn_outbox (dispatched_at)
@@ -138,6 +149,9 @@ CREATE TABLE IF NOT EXISTS autumn_outbox (
 CREATE INDEX IF NOT EXISTS idx_autumn_outbox_pending
     ON autumn_outbox (aggregate, seq)
     WHERE dispatched_at IS NULL AND dead_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_autumn_outbox_claim
+    ON autumn_outbox (seq)
+    WHERE dispatched_at IS NULL AND dead_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_autumn_outbox_dispatched
     ON autumn_outbox (dispatched_at)
     WHERE dispatched_at IS NOT NULL;
@@ -157,7 +171,11 @@ const SCHEMA_LOCK_KEY: i64 = 0x0A17_0B0C_0000_3062;
 ///
 /// On Postgres, it sends no DDL when both tables exist. Thus a role that
 /// cannot create or own tables can use tables made by a migration. An
-/// advisory lock serializes replicas that create the tables together.
+/// advisory lock serializes replicas that create the tables together. It
+/// then builds `idx_autumn_outbox_claim` in a background task.
+///
+/// On `SQLite`, it sends all the DDL at each call. Thus tables from an older
+/// release get new indexes.
 ///
 /// # Errors
 ///
@@ -169,6 +187,23 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
     crate::backend_select! {
         pg => {
             if tables_exist(&mut conn, &["autumn_outbox", "autumn_inbox"]).await? {
+                // Off the startup path: the build waits for every older
+                // transaction on the table, however long that takes.
+                let pool = pool.clone();
+                // The build holds a pooled connection until every older
+                // transaction on the table ends. A pool of one has none to spare.
+                if pool.status().max_size < 2 {
+                    tracing::warn!(
+                        "pool too small to build idx_autumn_outbox_claim in the background; run \
+                         `{CLAIM_INDEX_SQL}` by hand to speed up the outbox claim"
+                    );
+                    return Ok(());
+                }
+                tokio::spawn(async move {
+                    if let Err(error) = build_claim_index(&pool).await {
+                        tracing::warn!(%error, "could not build idx_autumn_outbox_claim; the outbox claim stays slow on a large backlog of sent rows");
+                    }
+                });
                 return Ok(());
             }
             conn.batch_execute(&format!(
@@ -184,6 +219,34 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
         },
     }
 }
+
+/// Add the claim index to tables made before it existed (Postgres).
+///
+/// The claim reads pending rows in `seq` order. Without this index it walks
+/// the primary key past every sent row that the purge has not deleted yet.
+/// The build is `CONCURRENTLY`, so it blocks no writes, and the index covers
+/// only pending rows. [`ensure_schema`] runs it in a background task, because
+/// the build waits for older transactions on the table and must not delay
+/// boot. A role that cannot create indexes keeps working, only slower: the
+/// failure is a warning. After a failed build, drop the invalid
+/// `idx_autumn_outbox_claim` and restart.
+#[cfg(not(feature = "sqlite"))]
+async fn build_claim_index(pool: &Pool<RuntimeConnection>) -> Result<(), String> {
+    let mut conn = pool.get().await.map_err(|error| error.to_string())?;
+    let present = tables_exist(&mut conn, &["idx_autumn_outbox_claim"])
+        .await
+        .map_err(|error| error.to_string())?;
+    if present {
+        return Ok(());
+    }
+    conn.batch_execute(CLAIM_INDEX_SQL)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "sqlite"))]
+const CLAIM_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_autumn_outbox_claim \
+     ON autumn_outbox (seq) WHERE dispatched_at IS NULL AND dead_at IS NULL";
 
 /// `true` when every table in `tables` exists (Postgres).
 #[cfg(not(feature = "sqlite"))]
@@ -588,7 +651,7 @@ impl Outbox {
             .filter(|listener| listener.mode == crate::events::DispatchMode::Durable)
             .filter_map(|listener| listener.job_name.as_deref())
         {
-            let body = serde_json::json!({ "name": job_name, "args": payload });
+            let body = self.job_body(job_name, payload.clone());
             if let Err(error) = self.insert(conn, None, TOPIC_EVENT, &body).await {
                 first_error.get_or_insert(error);
             }
@@ -615,8 +678,30 @@ impl Outbox {
         args: &A,
     ) -> AutumnResult<String> {
         let args = to_json(args, &format!("job {name} args"))?;
-        let body = serde_json::json!({ "name": name, "args": args });
+        let body = self.job_body(name, args);
         self.insert(conn, None, TOPIC_JOB, &body).await
+    }
+
+    /// The stored body of a job enqueue, as the after-commit path keeps it.
+    ///
+    /// The args get the schema-version envelope of the job now, not at relay
+    /// time, so a message that outlives a deploy keeps the version it was
+    /// written at. The enqueuing tenant goes in too: the relay runs in its own
+    /// task, and without it the job loses its tenant lane and cost tenant.
+    fn job_body(&self, name: &str, args: Value) -> Value {
+        let client = self
+            .state
+            .extension::<crate::job::JobClient>()
+            .or_else(crate::job::global_job_client);
+        let args = match client {
+            Some(client) => client.wrap_payload_version(name, args),
+            None => args,
+        };
+        let mut body = serde_json::json!({ "name": name, "args": args });
+        if let Some(tenant) = crate::cost::enqueuing_tenant() {
+            body["tenant"] = Value::String(tenant);
+        }
+        body
     }
 
     /// Deliver `mail` through the outbox. Returns the message id.
@@ -739,6 +824,18 @@ async fn insert_message(
     payload: &Value,
 ) -> AutumnResult<String> {
     let id = entropy.uuid_v4().to_string();
+    insert_message_with_id(conn, id, clock, aggregate, topic, payload).await
+}
+
+/// [`insert_message`] with a given `id`.
+async fn insert_message_with_id(
+    conn: &mut RuntimeConnection,
+    id: String,
+    clock: &dyn ClockSource,
+    aggregate: Option<&str>,
+    topic: &str,
+    payload: &Value,
+) -> AutumnResult<String> {
     let now = to_millis(clock.now());
     diesel::sql_query(sql(INSERT_SQL))
         .bind::<Text, _>(&id)
@@ -825,10 +922,7 @@ impl std::fmt::Debug for OutboxHandlers {
 /// `true` when `topic` uses only `A-Z a-z 0-9 . _ : -`. The relay puts
 /// topics in its SQL text, so no other character is allowed.
 fn is_valid_topic(topic: &str) -> bool {
-    !topic.is_empty()
-        && topic
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    crate::config::is_valid_outbox_topic(topic)
 }
 
 impl OutboxHandlers {
@@ -907,6 +1001,7 @@ impl OutboxRelay {
         all.insert_unchecked(TOPIC_MAIL.to_owned(), run_mail_delivery);
         #[cfg(feature = "http-client")]
         all.insert_unchecked(TOPIC_WEBHOOK.to_owned(), run_webhook_dispatch);
+        all.insert_unchecked(TOPIC_INBOX.to_owned(), remote::run_inbox_listener);
 
         let mut topics: Vec<&String> = all.handlers.keys().collect();
         topics.sort();
@@ -960,19 +1055,37 @@ impl OutboxRelay {
 /// Install the relay on `state` when `config.enabled`. With the `mail`
 /// feature, also send `deliver_later` through the outbox, unless the app
 /// set its own queue.
-pub(crate) fn install(state: &AppState, config: &OutboxConfig, handlers: OutboxHandlers) {
+///
+/// The relay also sends the topics of `outbox.destinations` to other
+/// services. With `outbox.inbox.enabled`, it installs the inbox verifier.
+///
+/// # Errors
+///
+/// Returns an error when a destination topic also has a handler or is not
+/// an `#[event(name = "...")]`, or a signing secret is not set.
+pub(crate) fn install(
+    state: &AppState,
+    config: &OutboxConfig,
+    handlers: OutboxHandlers,
+) -> AutumnResult<()> {
     if !config.enabled {
-        if !handlers.is_empty() {
+        if !handlers.is_empty() || !config.destinations.is_empty() || config.inbox.enabled {
             tracing::warn!(
-                "outbox handlers are registered but outbox.enabled = false; the relay does not run"
+                "outbox handlers, destinations or the inbox are configured but \
+                 outbox.enabled = false; the relay does not run"
             );
         }
-        return;
+        return Ok(());
     }
     let Some(pool) = mail_pool(state) else {
         tracing::warn!("outbox.enabled = true needs a database; the relay does not run");
-        return;
+        return Ok(());
     };
+    let mut handlers = handlers;
+    remote::add_destinations(&mut handlers, config)?;
+    if config.inbox.enabled {
+        state.insert_extension(remote::InboxVerifier::from_config(&config.inbox)?);
+    }
     state.insert_extension(OutboxRelay::new(config.clone(), handlers));
     #[cfg(feature = "mail")]
     if state
@@ -987,6 +1100,7 @@ pub(crate) fn install(state: &AppState, config: &OutboxConfig, handlers: OutboxH
     }
     #[cfg(not(feature = "mail"))]
     drop(pool);
+    Ok(())
 }
 
 /// Whether [`install`] gives `deliver_later` an outbox queue.
@@ -1559,14 +1673,22 @@ pub(crate) fn start_relay_worker(
 struct JobBody {
     name: String,
     args: Value,
+    /// The enqueuing tenant. Rows written before it was stored have none.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
-async fn run_job_enqueue(state: AppState, message: OutboxMessage) -> AutumnResult<()> {
+pub(crate) async fn run_job_enqueue(state: AppState, message: OutboxMessage) -> AutumnResult<()> {
     let body: JobBody = message.payload_as()?;
-    match state.extension::<crate::job::JobClient>() {
-        Some(client) => client.enqueue(&body.name, body.args).await,
-        None => crate::job::enqueue(&body.name, body.args).await,
-    }
+    // The enqueue tenant only: it sets the job's lane and cost tenant, and
+    // does not scope repository queries the way `CURRENT_TENANT` would.
+    crate::cost::with_enqueue_tenant(body.tenant, async move {
+        match state.extension::<crate::job::JobClient>() {
+            Some(client) => client.enqueue(&body.name, body.args).await,
+            None => crate::job::enqueue(&body.name, body.args).await,
+        }
+    })
+    .await
 }
 
 #[cfg(feature = "mail")]

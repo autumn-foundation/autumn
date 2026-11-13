@@ -490,3 +490,109 @@ fn every_error_says_what_went_wrong() {
     assert!(message.contains("2499"), "{message}");
     assert!(message.contains("USD"), "{message}");
 }
+
+// ── Characterization: hex rendering (Echo clone class, `hex_lower`) ────────
+//
+// `request_hash` and `IdempotencyKey::derive` both render a SHA-256 digest as
+// lowercase hex through this file's own `hex_lower`, one of six byte-identical
+// copies across the crate (autumn/src/{idempotency,repository_commit_hooks,
+// derivation,money/ledger}.rs, autumn/src/security/submit_token.rs,
+// autumn/src/etag.rs). These two values are pinned here before `hex_lower` is
+// replaced by the `hex` crate (already a dependency, already used this way in
+// ~20 other places in this crate) at its call sites.
+
+#[test]
+fn request_hash_is_pinned_hex() {
+    let checked = Transaction::new(key("k1"), balanced()).validate().unwrap();
+    assert_eq!(
+        checked.request_hash(),
+        "669e73bbe4962768af2f08ff85a6bf43329b6e24f075e478f3d55a228deb5afd",
+    );
+}
+
+#[test]
+fn idempotency_key_derive_is_pinned_hex() {
+    let derived = IdempotencyKey::derive("orders", &balanced());
+    assert_eq!(
+        derived.as_str(),
+        "f683f5c367fb84a014f99a1efc2e3f429b2e47bef3aea2158602c81bd7eeb1a6"
+    );
+}
+
+// ── The balance check (issue #3339) ─────────────────────────────────────────
+//
+// `check_resulting_balances` does no I/O. `post` gives it the stored balances.
+
+fn stored_account(id: &str, allow_negative: bool) -> (String, StoredAccount) {
+    let mut account = Account::new(id, Usd::currency());
+    if !allow_negative {
+        account = account.disallow_negative();
+    }
+    (
+        id.to_owned(),
+        StoredAccount {
+            account,
+            balance: None,
+        },
+    )
+}
+
+fn transfer(postings: Vec<Posting>) -> Transaction {
+    Transaction::new(key("check"), postings)
+}
+
+#[test]
+fn the_check_adds_the_net_change_to_the_stored_balance() {
+    let accounts = BTreeMap::from([stored_account("float", false), stored_account("cash", true)]);
+    let stored = BTreeMap::from([("float".to_owned(), 100), ("cash".to_owned(), -100)]);
+    let payout = |amount| {
+        transfer(vec![
+            Posting::credit("float", usd(amount)),
+            Posting::debit("cash", usd(amount)),
+        ])
+    };
+
+    assert!(check_resulting_balances(&accounts, &stored, &payout(100)).is_ok());
+    assert!(matches!(
+        check_resulting_balances(&accounts, &stored, &payout(101)),
+        Err(LedgerError::NegativeBalance { ref account, balance: -1, .. }) if account == "float"
+    ));
+}
+
+#[test]
+fn the_check_uses_the_net_change_not_the_posting_order() {
+    let accounts = BTreeMap::from([stored_account("cash", true)]);
+    let stored = BTreeMap::from([("cash".to_owned(), i64::MAX)]);
+    for postings in [
+        vec![
+            Posting::debit("cash", usd(i64::MAX)),
+            Posting::credit("cash", usd(i64::MAX)),
+        ],
+        vec![
+            Posting::credit("cash", usd(i64::MAX)),
+            Posting::debit("cash", usd(i64::MAX)),
+        ],
+    ] {
+        assert!(check_resulting_balances(&accounts, &stored, &transfer(postings)).is_ok());
+    }
+}
+
+#[test]
+fn the_check_refuses_a_balance_outside_i64() {
+    let accounts = BTreeMap::from([
+        stored_account("cash", true),
+        stored_account("revenue", true),
+    ]);
+    let stored = BTreeMap::from([
+        ("cash".to_owned(), i64::MAX),
+        ("revenue".to_owned(), i64::MIN + 1),
+    ]);
+    let one_more = transfer(vec![
+        Posting::debit("cash", usd(1)),
+        Posting::credit("revenue", usd(1)),
+    ]);
+    assert!(matches!(
+        check_resulting_balances(&accounts, &stored, &one_more),
+        Err(LedgerError::Money(MoneyError::Overflow))
+    ));
+}

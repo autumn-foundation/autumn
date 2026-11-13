@@ -25,7 +25,7 @@ crate itself is [`examples/island-flock`](../island-flock).
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - To (re)build the island's wasm artifacts:
   - the `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
   - `wasm-bindgen-cli`, **pinned to the exact `wasm-bindgen` library version**

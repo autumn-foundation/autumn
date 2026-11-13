@@ -597,7 +597,7 @@ pub struct FaultOutcome {
     /// Planned faults whose ordinal was never reached, sorted.
     pub unfired: Vec<PlannedFault>,
     /// 5xx responses captured through autumn's error-reporting layer, in report
-    /// order. Always present; empty when the `reporting` feature is off.
+    /// order. Always present; empty when the `error-reporting` feature is off.
     pub server_errors: Vec<ReportedError>,
     /// Totals for the whole run.
     pub final_state: FinalState,
@@ -830,9 +830,9 @@ impl FaultState {
         counter.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Only the `reporting`-gated [`FaultReporter`] pushes here; without that
+    /// Only the `error-reporting`-gated [`FaultReporter`] pushes here; without that
     /// feature [`FaultOutcome::server_errors`] is always empty (by contract).
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     fn record_server_error(&self, error: ReportedError) {
         self.server_errors
             .lock()
@@ -954,7 +954,7 @@ impl FaultLedger {
 
     /// The error reporter that projects 5xx events into
     /// [`FaultOutcome::server_errors`].
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     pub(crate) fn reporter(&self) -> Arc<dyn crate::reporting::ErrorReporter> {
         Arc::new(FaultReporter {
             state: Arc::clone(&self.0),
@@ -1134,12 +1134,12 @@ impl crate::interceptor::DbConnectionInterceptor for FaultDbInterceptor {
 ///
 /// Registered alongside (never instead of) the app's own reporters. The
 /// projection drops the request id on purpose — see [`ReportedError`].
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 struct FaultReporter {
     state: Arc<FaultState>,
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 impl crate::reporting::ErrorReporter for FaultReporter {
     fn report<'a>(
         &'a self,

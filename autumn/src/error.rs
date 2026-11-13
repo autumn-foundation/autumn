@@ -244,6 +244,7 @@ where
         // ones, so an app calling `push.subscribe(…).await?` from its own
         // handler gets the same status the built-in push router would return
         // rather than a blanket 500.
+        #[cfg(feature = "push")]
         if let Some(push_err) = any_err.downcast_ref::<crate::push::PushError>() {
             status = push_err.status();
         }
@@ -265,20 +266,27 @@ where
         // a refused negative balance are state conflicts, so they take 409.
         // An overflow is a value the server built and could not hold, so it
         // stays a 500. Mapped by downcast for the reason on the Constela arm.
-        // A SQLite fleet (ADR 0019): an unusable tenant id is the client's
+        // A fleet (ADR 0019): an unusable tenant id is the client's
         // fault (400), an unknown tenant database is 404, a pending migration
         // is 503. Mapped by downcast for the reason on the Constela arm.
-        #[cfg(feature = "sqlite")]
+        #[cfg(feature = "db")]
         if let Some(fleet_err) = any_err.downcast_ref::<crate::db::fleet::FleetError>() {
             status = fleet_err.http_status();
         }
 
+        #[cfg(feature = "money")]
         if let Some(money_err) = any_err.downcast_ref::<crate::money::MoneyError>() {
             status = money_err.http_status();
         }
         #[cfg(feature = "db")]
         if let Some(ledger_err) = any_err.downcast_ref::<crate::money::ledger::LedgerError>() {
             status = ledger_err.http_status();
+        }
+
+        // Issue #3394: a form body that does not decode is the client's fault.
+        // 422 for a repeated single-value field, 400 for the rest.
+        if let Some(form_err) = any_err.downcast_ref::<crate::form::FormDecodeError>() {
+            status = form_err.status();
         }
 
         if matches!(
@@ -912,6 +920,7 @@ impl AutumnError {
 
     #[doc(hidden)]
     #[must_use]
+    #[cfg_attr(not(feature = "idempotency"), allow(dead_code))]
     pub(crate) const fn cache_idempotency_response(mut self) -> Self {
         self.cache_idempotency_response = true;
         self
@@ -1592,7 +1601,13 @@ impl IntoResponse for AutumnError {
         let message = self.inner.to_string();
         let (status, problem_type) = self.rendered_problem();
 
+        #[cfg(feature = "db")]
+        let retry_after = self
+            .inner
+            .downcast_ref::<crate::db::fleet::FleetError>()
+            .and_then(crate::db::fleet::FleetError::retry_after_secs);
         let details = self.details.clone();
+        #[cfg(feature = "idempotency")]
         let cache_idempotency_response = self.cache_idempotency_response;
 
         // Stash error metadata for exception filters to inspect without
@@ -1622,12 +1637,19 @@ impl IntoResponse for AutumnError {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),
         );
+        #[cfg(feature = "db")]
+        if let Some(secs) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
         if status == StatusCode::CONFLICT {
             response.headers_mut().insert(
                 "HX-Trigger",
                 HeaderValue::from_static(r#"{"autumn:conflict":true}"#),
             );
         }
+        #[cfg(feature = "idempotency")]
         if cache_idempotency_response {
             response
                 .extensions_mut()
@@ -1910,6 +1932,29 @@ mod tests {
         assert_eq!(
             err.source_chain(),
             vec!["database connection dropped".to_string()]
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_full_fleet_answers_503_with_retry_after() {
+        let err = AutumnError::from(crate::db::fleet::FleetError::AtCapacity {
+            name: "slot-1".into(),
+            max_open: 2,
+            retry_after_secs: 3,
+        });
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "3");
+
+        let other = AutumnError::from(crate::db::fleet::FleetError::NotFound {
+            name: "slot-1".into(),
+        });
+        assert!(
+            !other
+                .into_response()
+                .headers()
+                .contains_key(header::RETRY_AFTER)
         );
     }
 

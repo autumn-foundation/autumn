@@ -1,28 +1,51 @@
 #!/usr/bin/env python3
 """Seeded-mutation sweep for Autumn's wire contracts (issue #1755).
 
-Applies each mutation to `mesh-catalog`, rebuilds `mesh-storefront`, and reports
-how many wire-breaking changes turned the build red and how many compatible
-changes were falsely rejected. Restores the file when it finishes.
+Part 1 applies each mutation to `mesh-catalog`, rebuilds `mesh-storefront`, and
+reports how many wire-breaking changes turned the build red and how many
+compatible changes were falsely rejected.
+
+Part 2 is the two-release scenario. Release 1 is the committed bundle
+`examples/mesh-storefront/contracts/release-1.json`. Each case edits both
+services into a release 2 and runs `autumn contracts check` against release 1.
+The exit code and the named deploy order must match. Part 2 also exports the
+unchanged tree twice and requires the same bytes as the committed bundle.
+
+Part 3 exports the unchanged tree with `--proto` twice and requires the same
+bytes as the committed `examples/mesh-storefront/contracts/proto/` and its
+lock. `--check` must pass on the committed files. It does the same with
+`--avro` and the committed `examples/mesh-storefront/contracts/avro/`.
+
+The script restores every file when it finishes.
 
 Run from the workspace root:
 
-    python3 examples/mesh-storefront/contract-sweep.py
+    python3 scripts/wire-contract-sweep.py
 
-Exits non-zero when a wire-breaking change builds green, or a compatible change
-does not.
+Set AUTUMN_BIN to use a built `autumn` binary. Otherwise the script builds one.
+Exits non-zero when any case does not give the expected result.
 """
 
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 LIB = 'examples/mesh-catalog/src/lib.rs'
+MAIN = 'examples/mesh-storefront/src/main.rs'
+RELEASE_1 = 'examples/mesh-storefront/contracts/release-1.json'
+PROTO = 'examples/mesh-storefront/contracts/proto'
+PROTO_LOCK = 'examples/mesh-storefront/contracts/proto.lock'
+AVRO = 'examples/mesh-storefront/contracts/avro'
 BASE = open(LIB).read()
+BASE_MAIN = open(MAIN).read()
+PACKAGES = ['-p', 'mesh-catalog', '-p', 'mesh-storefront']
 
 WIRE_BREAKING = [
  ("response field removed", [("    /// Price in cents.\n    pub price_cents: u32,\n}", "}"),
-                             ("fn sample(id: String, name: String, price_cents: u32) -> Self {\n        Self {\n            id,\n            name,\n            price_cents,\n        }",
-                              "fn sample(id: String, name: String, _price_cents: u32) -> Self {\n        Self { id, name }")]),
+                             ("fn sample(id: String, name: String, price_cents: u32) -> Self {\n        Self {\n            subtitle: None,\n            id,\n            name,\n            price_cents,\n        }",
+                              "fn sample(id: String, name: String, _price_cents: u32) -> Self {\n        Self { subtitle: None, id, name }")]),
  ("response field renamed", [("    /// Display name.\n    pub name: String,\n    /// Price in cents.", "    /// Display name.\n    pub title: String,\n    /// Price in cents."),
                              ("            id,\n            name,\n            price_cents,", "            id,\n            title: name,\n            price_cents,")]),
  ("response field serde(skip)", [("    /// Display name.\n    pub name: String,\n    /// Price in cents.", "    /// Display name.\n    #[serde(skip)]\n    pub name: String,\n    /// Price in cents.")]),
@@ -37,6 +60,8 @@ WIRE_BREAKING = [
  ("optional request field became required and omittable", [("    /// Optional note. Absent from a request body is fine.\n    #[serde(default)]\n    pub note: Option<String>,", "    /// Now required, and dropped when empty.\n    #[serde(skip_serializing_if = \"String::is_empty\")]\n    pub note: String,")]),
  ("route path parameter renamed", [('#[get("/items/{id}")]', '#[get("/items/{item_id}")]')]),
  ("route path gained a parameter", [('#[get("/items/{id}")]', '#[get("/tenants/{tenant}/items/{id}")]')]),
+ ("event field the listener reads skip_serializing", [("    /// New price in cents.\n    pub price_cents: u32,", "    /// New price in cents.\n    #[serde(skip_serializing)]\n    pub price_cents: u32,")]),
+ ("event field the listener reads skip_deserializing", [("    /// New price in cents.\n    pub price_cents: u32,", "    /// New price in cents.\n    #[serde(skip_deserializing)]\n    pub price_cents: u32,")]),
 ]
 
 COMPATIBLE = [
@@ -59,13 +84,94 @@ COMPATIBLE = [
  ("skip_serializing_if on a new response field", [("    /// Price in cents.\n    pub price_cents: u32,\n}", '    /// Price in cents.\n    pub price_cents: u32,\n    /// Sometimes absent.\n    #[serde(skip_serializing_if = "Option::is_none")]\n    pub badge: Option<String>,\n}'),
                                                   ("            price_cents,\n        }", "            price_cents,\n            badge: None,\n        }")]),
  ("response field type widened in place", [("    /// Stable item identifier.\n    pub id: String,", "    /// Stable item identifier.\n    pub id: std::string::String,")]),
+ ("new event field", [("    /// New price in cents.\n    pub price_cents: u32,", "    /// New price in cents.\n    pub price_cents: u32,\n    /// Currency code. Added later.\n    pub currency: Option<String>,")]),
+ ("event renamed on the wire, listener reads the Rust name", [("    /// New price in cents.\n    pub price_cents: u32,", "    /// New price in cents.\n    #[serde(rename = \"priceCents\")]\n    pub price_cents: u32,")]),
  ("a new endpoint added", [("/// The catalog service's routes.", '/// Count items.\n#[endpoint(service = "catalog")]\n#[get("/items")]\n#[public]\npub async fn count_items() -> AutumnResult<Json<Item>> {\n    Ok(Json(Item::sample("n".to_owned(), "n".to_owned(), 0)))\n}\n\n/// The catalog service\'s routes.')]),
+]
+
+# Release 2 cases: (label, [(file, old, new)], exit code, text the report
+# must hold). Exit 0 is safe in any order, 1 is safe in no order, 3 is safe
+# only in the order the report names.
+DEPLOY_CALLERS_FIRST = 'Deploy mesh-storefront before catalog'
+DEPLOY_CALLEES_FIRST = 'Deploy catalog before mesh-storefront'
+# An event's crate has endpoints, so the order names its service.
+EVENT_CONSUMERS_FIRST = DEPLOY_CALLERS_FIRST
+EVENT_PRODUCERS_FIRST = DEPLOY_CALLEES_FIRST
+EVENT = "    /// New price in cents.\n    pub price_cents: u32,\n}"
+LISTENER_READ = "    let _price = (event.id, event.price_cents);\n"
+CROSS_RELEASE = [
+ ("unchanged release", [], 0, 'safe in any deploy order'),
+ ("unread optional response field removed", [
+    (LIB, "    /// Shelf label. Optional, and no caller reads it, so a later release may\n    /// remove it.\n    pub subtitle: Option<String>,\n", ""),
+    (LIB, "            subtitle: None,\n", ""),
+ ], 0, 'safe in any deploy order'),
+ ("read response field removed, storefront stops reading it", [
+    (LIB, "    /// Price in cents.\n    pub price_cents: u32,\n}", "}"),
+    (LIB, "            name,\n            price_cents,\n        }", "            name,\n        }"),
+    (LIB, "fn sample(id: String, name: String, price_cents: u32)", "fn sample(id: String, name: String, _price_cents: u32)"),
+    (MAIN, '        p { "$" (item.price_cents / 100) }\n', ""),
+ ], 3, DEPLOY_CALLERS_FIRST),
+ ("new required request field", [
+    (LIB, "    /// Optional note. Absent from a request body is fine.", "    /// Stock code. Required.\n    pub sku: String,\n    /// Optional note. Absent from a request body is fine."),
+ ], 3, DEPLOY_CALLERS_FIRST),
+ ("new optional request field", [
+    (LIB, "    /// Optional note. Absent from a request body is fine.", "    /// Coupon code. Optional.\n    pub coupon: Option<String>,\n    /// Optional note. Absent from a request body is fine."),
+ ], 0, 'safe in any deploy order'),
+ ("new response field the new storefront reads", [
+    (LIB, "    /// Price in cents.\n    pub price_cents: u32,\n}", "    /// Price in cents.\n    pub price_cents: u32,\n    /// Promotion badge. Optional.\n    pub badge: Option<String>,\n}"),
+    (LIB, "            price_cents,\n        }", "            price_cents,\n            badge: None,\n        }"),
+    (MAIN, '        h1 { (item.name) }\n', '        h1 { (item.name) }\n        p { (item.badge.clone().unwrap_or_default()) }\n'),
+ ], 3, DEPLOY_CALLEES_FIRST),
+ ("path changed", [
+    (LIB, '#[get("/items/{id}")]', '#[get("/catalog/items/{id}")]'),
+ ], 1, 'not safe in any deploy order'),
+ ("path changed, old route kept", [
+    (LIB, '#[get("/items/{id}")]', '#[get("/catalog/items/{id}")]'),
+    (LIB, "/// The catalog service's routes.", '/// The old route of `get_item`, kept for deployed callers.\n#[endpoint(service = "catalog")]\n#[get("/items/{id}")]\n#[public]\npub async fn get_item_legacy(id: Path<String>) -> AutumnResult<Json<Item>> {\n    Ok(Json(Item::sample(id.to_string(), format!(\"Item {}\", *id), 1299)))\n}\n\n/// The catalog service\'s routes.'),
+    (LIB, "routes![get_item, create_item]", "routes![get_item, get_item_legacy, create_item]"),
+ ], 3, DEPLOY_CALLEES_FIRST),
+ ("method changed", [
+    (LIB, '#[get("/items/{id}")]', '#[post("/items/{id}")]'),
+ ], 1, 'not safe in any deploy order'),
+ # The handler keeps its `#[endpoint]`, and the router no longer serves it.
+ ("endpoint removed from the router", [
+    (LIB, "routes![get_item, create_item]", "routes![create_item]"),
+ ], 1, 'not safe in any deploy order'),
+ ("event field a listener reads removed, listener stops reading it", [
+    (LIB, EVENT, "}"),
+    (MAIN, LISTENER_READ, "    let _price = event.id;\n"),
+ ], 3, EVENT_CONSUMERS_FIRST),
+ ("new event field the new listener reads", [
+    (LIB, EVENT, "    /// New price in cents.\n    pub price_cents: u32,\n    /// Currency code. Required.\n    pub currency: String,\n}"),
+    (MAIN, LISTENER_READ, "    let _price = (event.id, event.price_cents, event.currency);\n"),
+ ], 3, EVENT_PRODUCERS_FIRST),
+ ("new optional event field", [
+    (LIB, EVENT, "    /// New price in cents.\n    pub price_cents: u32,\n    /// Currency code. Optional.\n    pub currency: Option<String>,\n}"),
+ ], 0, 'safe in any deploy order'),
+ # The new listener reads only v2, and the deployed catalog sends only v1:
+ # the catalog ships first, or v1 events are lost.
+ ("event v2 beside v1, listener moves to v2", [
+    (LIB, "impl Item {", "/// Version 2: the price carries its currency.\n#[event(name = \"catalog.item_repriced\", version = 2)]\npub struct ItemRepricedV2 {\n    /// Stable item identifier.\n    pub id: String,\n    /// New price in minor units.\n    pub amount: u32,\n    /// Currency code.\n    pub currency: String,\n}\n\nimpl Item {"),
+    (MAIN, "#[listener(mesh_catalog::ItemRepriced)]", "#[listener(mesh_catalog::ItemRepricedV2)]"),
+    (MAIN, "event: mesh_catalog::ItemRepriced)", "event: mesh_catalog::ItemRepricedV2)"),
+    (MAIN, LISTENER_READ, "    let _price = (event.id, event.amount, event.currency);\n"),
+ ], 3, EVENT_PRODUCERS_FIRST),
+ # The Rust type stays `u32`. The JSON form changes from a number to a
+ # string, so only the field's wire type shows the break.
+ ("response field written in a new JSON form", [
+    (LIB, "    /// Price in cents.\n    pub price_cents: u32,\n}", "    /// Price in cents, written as text.\n    #[serde(with = \"cents_text\")]\n    #[wire(type = \"string\", format = \"decimal\")]\n    pub price_cents: u32,\n}\n\n/// Writes cents as decimal text.\nmod cents_text {\n    pub fn serialize<S: serde::Serializer>(v: &u32, s: S) -> Result<S::Ok, S::Error> {\n        s.collect_str(v)\n    }\n\n    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {\n        let text = <String as serde::Deserialize>::deserialize(d)?;\n        text.parse().map_err(serde::de::Error::custom)\n    }\n}"),
+ ], 1, 'not safe in any deploy order'),
+ ("path parameter renamed", [
+    (LIB, '#[get("/items/{id}")]\n#[public]\npub async fn get_item(id: Path<String>)', '#[get("/items/{item_id}")]\n#[public]\npub async fn get_item(item_id: Path<String>)'),
+    (LIB, "        id.to_string(),\n        format!(\"Item {}\", *id),", "        item_id.to_string(),\n        format!(\"Item {}\", *item_id),"),
+    (MAIN, "mesh_catalog::get_item_endpoint(id),", "mesh_catalog::get_item_endpoint(item_id),"),
+ ], 0, 'safe in any deploy order'),
 ]
 
 def build():
     out = subprocess.run(['cargo','build','-p','mesh-storefront'], capture_output=True, text=True)
     text = out.stdout + out.stderr
-    if 'wire contract broken' in text: return 'caught'
+    if 'wire contract broken' in text or 'event contract broken' in text: return 'caught'
     if any(l.startswith('error') for l in text.splitlines()): return 'rustc-only'
     return 'green'
 
@@ -76,13 +182,91 @@ def apply(edits):
         s = s.replace(old, new, 1)
     open(LIB,'w').write(s)
 
+def apply_release(edits):
+    files = {LIB: BASE, MAIN: BASE_MAIN}
+    for path, old, new in edits:
+        assert old in files[path], f'mutation text not found in {path}: {old!r}'
+        files[path] = files[path].replace(old, new, 1)
+    for path, text in files.items():
+        open(path, 'w').write(text)
 
-results = []
-for label, edits in WIRE_BREAKING:
-    apply(edits); results.append((label, 'red', build()))
-for label, edits in COMPATIBLE:
-    apply(edits); results.append((label, 'green', build()))
-open(LIB,'w').write(BASE)
+def restore():
+    open(LIB, 'w').write(BASE)
+    open(MAIN, 'w').write(BASE_MAIN)
+
+def autumn_bin():
+    explicit = os.environ.get('AUTUMN_BIN')
+    if explicit:
+        return explicit
+    subprocess.run(['cargo', 'build', '-q', '-p', 'autumn-cli'], check=True)
+    return os.path.join('target', 'debug', 'autumn')
+
+def tree(root):
+    out = {}
+    for base, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(base, name)
+            out[os.path.relpath(path, root).replace(os.sep, '/')] = open(path, 'rb').read()
+    return out
+
+def contracts(binary, *args):
+    out = subprocess.run([binary, 'contracts', *args, *PACKAGES], capture_output=True, text=True)
+    return out.returncode, out.stdout, out.stderr
+
+try:
+    results = []
+    for label, edits in WIRE_BREAKING:
+        apply(edits); results.append((label, 'red', build()))
+    for label, edits in COMPATIBLE:
+        apply(edits); results.append((label, 'green', build()))
+    restore()
+
+    binary = autumn_bin()
+    stable = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for n in (1, 2):
+            out = os.path.join(scratch, f'export-{n}.json')
+            code, _, err = contracts(binary, 'export', '--out', out)
+            assert code == 0, err
+            stable.append(open(out, 'rb').read())
+    stable_ok = stable[0] == stable[1] == open(RELEASE_1, 'rb').read()
+
+    proto_runs = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for n in (1, 2):
+            out = os.path.join(scratch, f'proto-{n}')
+            lock = os.path.join(scratch, f'proto-{n}.lock')
+            shutil.copyfile(PROTO_LOCK, lock)
+            code, _, err = contracts(binary, 'export', '--proto', '--out', out, '--lock', lock)
+            assert code == 0, err
+            proto_runs.append((tree(out), open(lock, 'rb').read()))
+    committed = (tree(PROTO), open(PROTO_LOCK, 'rb').read())
+    code, _, err = contracts(binary, 'export', '--proto', '--check', '--out', PROTO, '--lock', PROTO_LOCK)
+    proto_ok = proto_runs[0] == proto_runs[1] == committed and code == 0
+    if not proto_ok:
+        print(err)
+
+    avro_runs = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for n in (1, 2):
+            out = os.path.join(scratch, f'avro-{n}')
+            code, _, err = contracts(binary, 'export', '--avro', '--out', out)
+            assert code == 0, err
+            avro_runs.append(tree(out))
+    code, _, err = contracts(binary, 'export', '--avro', '--check', '--out', AVRO)
+    avro_ok = avro_runs[0] == avro_runs[1] == tree(AVRO) and code == 0
+    if not avro_ok:
+        print(err)
+
+    cross = []
+    for label, edits, want_code, want_text in CROSS_RELEASE:
+        apply_release(edits)
+        code, out, err = contracts(binary, 'check', '--against', RELEASE_1)
+        ok = code == want_code and want_text in out
+        cross.append((label, want_code, code, ok, out + err))
+    restore()
+finally:
+    restore()
 
 breaking = [r for r in results if r[1]=='red']
 compatible = [r for r in results if r[1]=='green']
@@ -95,7 +279,16 @@ print('---')
 print(f'wire-breaking: {len(breaking)}  turned the build red: {len(red)} ({100*len(red)//len(breaking)}%)  '
       f'named by the contract check: {len(caught)} ({100*len(caught)//len(breaking)}%)')
 print(f'compatible:    {len(compatible)}  falsely rejected: {len(false_pos)}')
+print('--- two releases: release 2 checked against release 1')
+for label, want, got, ok, text in cross:
+    print(f'{label:<56} want=exit {want} got=exit {got} {"ok" if ok else "WRONG"}')
+    if not ok:
+        print(text)
+cross_wrong = [c for c in cross if not c[3]]
+print(f'bundle byte-stable across two exports and equal to {RELEASE_1}: {stable_ok}')
+print(f'proto export byte-stable across two exports and equal to {PROTO}: {proto_ok}')
+print(f'avro export byte-stable across two exports and equal to {AVRO}: {avro_ok}')
 
 # The acceptance criterion is a CALLER-NAMED error, not merely a red build, so
 # the exit code gates on `caught` rather than on `red`.
-sys.exit(1 if false_pos or len(caught) < len(breaking) else 0)
+sys.exit(1 if false_pos or len(caught) < len(breaking) or cross_wrong or not stable_ok or not proto_ok or not avro_ok else 0)

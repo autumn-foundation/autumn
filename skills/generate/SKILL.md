@@ -84,6 +84,9 @@ accept aliases like `Integer` or `Boolean`.
 | `references` **(trunk-dev)** | `post:references` → `post_id BIGINT NOT NULL REFERENCES posts(id)` + auto index | `i64` (field name gets `_id` appended; `post:references?` for `Option<i64>`) |
 | `enum{a,b,c}` **(trunk-dev)** | `TEXT` + `CHECK (col IN (...))` | Generated PascalCase Rust enum with Diesel/serde impls + `<select>` widget; `--default field=variant` sets SQL DEFAULT + `#[default]`. Quote the token in bash/zsh (brace expansion) |
 | `decimal` / `decimal{10,2}` **(trunk-dev)** | `NUMERIC(12,2)` default, or explicit precision/scale | `rust_decimal::Decimal` (dependency added automatically); use for money, never `f64` |
+| `time` (alias `NaiveTime`) **(trunk-dev, #3405)** | `TIME NOT NULL` (`TEXT` on SQLite) | `chrono::NaiveTime`; the form renders `<input type="time">` |
+| `phone` (alias `tel`) / `color` **(trunk-dev, #3405)** | `TEXT NOT NULL` | `String`; the form renders `<input type="tel">` / `<input type="color">`. No `{…}` modifier (use `String{…}`); `Option<color>` is refused because a color input always posts a value |
+| `money` **(trunk-dev, #3405)** | `NUMERIC(12,2)` | Alias of bare `decimal`; `money{…}` is refused (use `decimal{p,s}`) |
 | `:unique` modifier **(trunk-dev)** | `email:String:unique` → `CREATE UNIQUE INDEX` in the migration | Also generates a free `find_by_<field>` lookup and 23505 → 422 inline "already exists" form error. `--unique FIELD` is the flag equivalent |
 | `slug{from:col}` **(trunk-dev)** | `TEXT NOT NULL` + implicit `:unique`'s `CREATE UNIQUE INDEX` | `String`; free `find_by_slug`; `show`/`edit`/`update`/`delete` routes and generated links key off the slug, not `id` (`GET /posts/{slug}`); blank on create auto-derives via `autumn_web::slugify(&new.<col>)` with a deterministic `-2`/`-3` collision suffix. At most one per model; not yet supported with `--live`/`--live-validation`/`--sharded`/an `Attachment` field/a `:states(...)` field. Quote the token in bash/zsh (brace expansion) |
 | `{encrypted}` / `{encrypted:deterministic}` modifier **(trunk-dev)** | `api_token:String{encrypted}` → unbounded `TEXT NOT NULL` sized for the base64 ciphertext envelope | `String` (plaintext in Rust, ciphertext at rest). Emits `#[encrypted]` / `#[encrypted(deterministic)]` on the model (issue #1340); the deterministic mode keeps `find_by`/`exists_by` lookups and a real UNIQUE index, the randomized default keeps nothing queryable. `String`/`Text` and non-null only. Randomized + `:unique`/`--unique`/`--query`/`--index` is refused at generate time pointing at `deterministic`; `--searchable`, `--default`, `--shard-key`, `:states(...)` and `slug{from:<encrypted col>}` are refused in both modes. The generated index cell shows `••••••••` (unsorted), the CSV export omits the column, and the admin redacts it. Needs key material under `[active_record_encryption]` — run `autumn credentials edit`. Quote the token in bash/zsh (brace expansion) |
@@ -130,9 +133,10 @@ bundled `libsqlite3-sys`, `autumn-web/sqlite`, no `pq-sys`), a generated
 newtypes that are `Copy`, deref to the wrapped type, and are
 `#[serde(transparent)]` (`uuid::Uuid` and `rust_decimal::Decimal` are foreign
 types no crate but their own can convert for SQLite). `--searchable` works via
-FTS5 (#1910); UUID primary keys and `--sharded` remain Postgres-only. A
-scaffolded SQLite app's `tests/<model>.rs` still uses the Postgres-only
-`TestDb`, so `cargo test` on it does not compile yet (#1905).
+FTS5 (#1910); `--id uuid` works too (#2555): the database fills the id with a
+`randomblob` default. `--sharded` remains Postgres-only. A scaffolded SQLite
+app's `tests/<model>.rs` uses the SQLite `TestDb` (a temp-file database), so it
+runs in a plain `cargo test` with no Docker.
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and
@@ -188,7 +192,7 @@ three additive scaffold behaviors (issues #1388, #1146, #1718):
   --count/--model` resolves the model's factory; `autumn destroy` removes those
   links again. See `docs/guide/generators.md`.
 
-**Constrained-required numerics & `--live-validation` parity (unreleased — trunk-dev, issues #1748, #1750)**: two refinements to the `{…}` block above:
+**Constrained-required numerics & `--live-validation` parity (0.6.0, issues #1748, #1750)**: two refinements to the `{…}` block above:
 
 - **Blank-state for constrained required numerics** — a required numeric field
   with a `{min,max}` range (e.g. `age:i32{min=0,max=130}`) is emitted as
@@ -262,8 +266,12 @@ index list ships a no-JavaScript bulk-delete flow — a leading
 `bulk_select_checkbox` column, the list (and, with `--searchable`, the whole
 htmx-swapped results container) wrapped in a `bulk_actions_form`, and a
 `#[secured] POST /<plural>/bulk_delete` handler mounted right after `destroy`.
-The handler drops malformed ids and redirects on an empty selection (a
-list-write endpoint never 400s), per-row authorizes with the same `"delete"`
+The handler decodes the repeated `ids` checkboxes into a
+`BulkSelection { ids: Vec<i64> }` (the `ids[]` spelling works too) through
+`autumn_web::form::from_urlencoded`. A malformed selection flashes an error and
+deletes nothing, and an empty selection redirects (a list-write endpoint never
+400s). There is no generated `parse_bulk_ids` any more (issue #3394). It
+per-row authorizes with the same `"delete"`
 action `destroy` uses when policy wiring is on (an unauthorized row is dropped
 from the batch, not 403'd), and deletes through `repo.delete_many` so
 soft-delete, hooks and `dependent(...)` cascades all apply. Not emitted for
@@ -545,9 +553,9 @@ Next steps:
    `magic_link_token`).
 ```
 
-**Magic-link account-lock recheck (trunk-dev)**: the generated `POST
-/login/magic/verify` handler re-checks the account lock **(unreleased —
-trunk-dev, issue #1777)** after consuming the single-use token and before
+**Magic-link account-lock recheck (0.6.0)**: the generated `POST
+/login/magic/verify` handler re-checks the account lock **(0.6.0,
+issue #1777)** after consuming the single-use token and before
 establishing a session, so a magic link minted before an account was locked can
 no longer complete a login after lockout. The recheck is a fresh guarded
 `UPDATE` on `locked_at` (same time-bounded `[auth.lockout]` cool-off semantics

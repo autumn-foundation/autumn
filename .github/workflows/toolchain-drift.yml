@@ -28,6 +28,16 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # kache S3 remote (.github/actions/kache). Unset variables keep the GitHub
+  # Actions cache. The write token is mapped only on a protected ref, so only
+  # pushes to trunk and trunk-dev (and scheduled runs) add to the store.
+  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET || secrets.AUTUMN_KACHE_S3_BUCKET }}
+  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT || secrets.AUTUMN_KACHE_S3_ENDPOINT }}
+  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION || secrets.AUTUMN_KACHE_S3_REGION }}
+  AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID: ${{ secrets.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
+  AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY: ${{ secrets.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY }}
+  AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || '' }}
+  AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || '' }}
 
 jobs:
   drift:
@@ -38,7 +48,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Compare stable with the pin
         id: versions
@@ -57,25 +67,20 @@ jobs:
 
       # Each lane runs even if an earlier one failed, so one run reports
       # everything stable breaks rather than just the first thing.
+      # The commands are the `lint` lane's own (xtask/src/lanes.rs), one step
+      # each, so this workflow lints exactly what ci.yml's `lint` job lints.
       - name: Format
-        run: cargo fmt --all -- --check
+        run: cargo xtask ci lint --only fmt
 
       - name: Clippy (workspace, all targets)
         if: ${{ !cancelled() }}
-        # `-j 2` is ci.yml's cap for this exact command: at the default four
-        # workers it is OOM-killed on ubuntu-latest while checking autumn-web,
-        # which would read here as Rust-stable fallout when it is the runner.
-        run: cargo clippy -j 2 --workspace --all-targets -- -D warnings
+        run: cargo xtask ci lint --only clippy-workspace
 
       - name: Clippy (request-path gated features, all targets)
         if: ${{ !cancelled() }}
-        # Read from the script the `lint` job's list is kept in sync with, so this
-        # lane cannot drift from it. The default-feature lane above never compiles
-        # these modules, which is how 1.99 hid two `fetch_update` calls (#3082).
-        run: |
-          features="$(sed -n 's/^GATED_REQUEST_PATH_FEATURES="\(.*\)"$/\1/p' scripts/pre-push-check.sh)"
-          test -n "$features" || { echo "::error::could not read GATED_REQUEST_PATH_FEATURES from scripts/pre-push-check.sh"; exit 1; }
-          cargo clippy -p autumn-web --features "$features" --all-targets -- -D warnings
+        # The default-feature lane above never compiles these modules, which is
+        # how 1.99 hid two `fetch_update` calls (#3082).
+        run: cargo xtask ci lint --only clippy-gated
 
       - name: What to do
         if: ${{ failure() }}

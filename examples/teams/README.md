@@ -23,7 +23,7 @@ stored in the session, and is switchable via `POST /organizations/{id}/switch`.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - PostgreSQL (a `docker-compose.yml` is included for local development)
 
 ## Quick start

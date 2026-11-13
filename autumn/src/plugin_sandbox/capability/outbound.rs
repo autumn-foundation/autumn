@@ -306,6 +306,121 @@ pub fn attempted_authority(url: &str) -> String {
     }
 }
 
+/// Check an `http-fetch` request's shape and size, without copying any of it.
+///
+/// Run by `CapabilityRuntime::dispatch` *before* the per-capability quota is
+/// charged, so a call refused here spends no backend budget. Returns the
+/// canonical method.
+///
+/// # Errors
+///
+/// The denial to answer with.
+pub(super) fn check_request(
+    runtime: &CapabilityRuntime,
+    call: &CapabilityCall,
+) -> Result<&'static str, CallResult> {
+    let id = call.id();
+    let CapabilityCall::HttpFetch {
+        method,
+        url,
+        headers,
+        body,
+        ..
+    } = call
+    else {
+        return Err(CallResult::denied(
+            id,
+            DenialReason::Malformed,
+            "not an outbound call",
+        ));
+    };
+    // Matched without allocating, and without folding the guest's string
+    // first. `to_ascii_uppercase` built a second full copy of whatever arrived
+    // *before* anything decided it was a method at all, so a frame carrying a
+    // megabyte-long "method" was copied once for the case fold and once more
+    // for the denial — work done ahead of the check that refuses it, and not
+    // covered by `outbound_request_bytes`, which is measured later and does not
+    // count the method. `eq_ignore_ascii_case` compares lengths first, so an
+    // overlong method loses against `GET` in constant time.
+    let Some(&method) = ALLOWED_OUTBOUND_METHODS
+        .iter()
+        .find(|allowed| allowed.eq_ignore_ascii_case(method))
+    else {
+        return Err(CallResult::denied(
+            id,
+            DenialReason::Malformed,
+            format!(
+                "method {method} is not one of {allowed}",
+                method = super::super::manifest::rejected(method),
+                allowed = ALLOWED_OUTBOUND_METHODS.join(", ")
+            ),
+        ));
+    };
+    if headers.len() > MAX_OUTBOUND_HEADERS {
+        return Err(CallResult::denied(
+            id,
+            DenialReason::Malformed,
+            format!("at most {MAX_OUTBOUND_HEADERS} outbound request headers"),
+        ));
+    }
+    for (name, value) in headers {
+        if !ALLOWED_OUTBOUND_REQUEST_HEADERS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(name))
+        {
+            return Err(CallResult::denied(
+                id,
+                DenialReason::NotInGrant,
+                format!(
+                    "outbound request header {name:?} is not one a sandboxed plugin may set",
+                    name = super::super::manifest::rejected(name)
+                ),
+            ));
+        }
+        // A CR or LF in a value splits one request into two at the wire, which
+        // is a way to reach a path — or a host — the allow-list never saw.
+        if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+            return Err(CallResult::denied(
+                id,
+                DenialReason::Malformed,
+                "an outbound header value may not carry CR or LF",
+            ));
+        }
+    }
+
+    // Refused before the request is built, not after the backend has copied it:
+    // everything here is the guest's, and an unbounded request is host memory
+    // and egress an operator never agreed to when they granted a hostname.
+    //
+    // Headers count against the same budget as the body. Bounding only the body
+    // left the quota trivially sidesteppable: the allow-list caps how *many*
+    // headers may be set and says nothing about their size, so one `user-agent`
+    // could carry what the body was just refused for.
+    let request_ceiling = runtime.quotas().outbound_request_bytes as usize;
+    let header_weight: usize = headers
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value.len()))
+        .fold(0, usize::saturating_add);
+    // The URL counts too. It is cloned into the request and handed to the
+    // backend like everything else, and a budget that omitted it left a guest
+    // free to send multi-megabyte request targets with an empty body — the
+    // quota reading zero for a call that is anything but.
+    let request_weight = header_weight
+        .saturating_add(body.len())
+        .saturating_add(url.len());
+    if request_weight > request_ceiling {
+        return Err(CallResult::denied(
+            id,
+            DenialReason::QuotaExceeded,
+            format!(
+                "the request is {request_weight} bytes of url, headers and body, over this \
+                 plugin's {request_ceiling}-byte `outbound_request_bytes` quota"
+            ),
+        ));
+    }
+    Ok(method)
+}
+
 /// Answer one `http-fetch`. Capability, scope and quota are already checked.
 #[allow(
     clippy::too_many_lines,
@@ -319,11 +434,7 @@ pub(super) fn perform(
 ) -> CallResult {
     let id = call.id();
     let CapabilityCall::HttpFetch {
-        method,
-        url,
-        headers,
-        body,
-        ..
+        url, headers, body, ..
     } = call
     else {
         return CallResult::denied(id, DenialReason::Malformed, "not an outbound call");
@@ -336,93 +447,14 @@ pub(super) fn perform(
         );
     };
 
-    // Matched without allocating, and without folding the guest's string
-    // first. `to_ascii_uppercase` built a second full copy of whatever arrived
-    // *before* anything decided it was a method at all, so a frame carrying a
-    // megabyte-long "method" was copied once for the case fold and once more
-    // for the denial — work done ahead of the check that refuses it, and not
-    // covered by `outbound_request_bytes`, which is measured later and does not
-    // count the method. `eq_ignore_ascii_case` compares lengths first, so an
-    // overlong method loses against `GET` in constant time.
-    let Some(method) = ALLOWED_OUTBOUND_METHODS
-        .iter()
-        .find(|allowed| allowed.eq_ignore_ascii_case(method))
-    else {
-        return CallResult::denied(
-            id,
-            DenialReason::Malformed,
-            format!(
-                "method {method} is not one of {allowed}",
-                method = super::super::manifest::rejected(method),
-                allowed = ALLOWED_OUTBOUND_METHODS.join(", ")
-            ),
-        );
+    let method = match check_request(runtime, call) {
+        Ok(method) => method.to_owned(),
+        Err(result) => return result,
     };
-    let method = (*method).to_owned();
-    if headers.len() > MAX_OUTBOUND_HEADERS {
-        return CallResult::denied(
-            id,
-            DenialReason::Malformed,
-            format!("at most {MAX_OUTBOUND_HEADERS} outbound request headers"),
-        );
-    }
-    let mut allowed = Vec::with_capacity(headers.len().min(MAX_OUTBOUND_HEADERS));
-    for (name, value) in headers {
-        if !ALLOWED_OUTBOUND_REQUEST_HEADERS
-            .iter()
-            .any(|known| known.eq_ignore_ascii_case(name))
-        {
-            return CallResult::denied(
-                id,
-                DenialReason::NotInGrant,
-                format!(
-                    "outbound request header {name:?} is not one a sandboxed plugin may set",
-                    name = super::super::manifest::rejected(name)
-                ),
-            );
-        }
-        // A CR or LF in a value splits one request into two at the wire, which
-        // is a way to reach a path — or a host — the allow-list never saw.
-        if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-            return CallResult::denied(
-                id,
-                DenialReason::Malformed,
-                "an outbound header value may not carry CR or LF",
-            );
-        }
-        allowed.push((name.to_ascii_lowercase(), value.clone()));
-    }
-
-    // Refused before the request is built, not after the backend has copied it:
-    // everything here is the guest's, and an unbounded request is host memory
-    // and egress an operator never agreed to when they granted a hostname.
-    //
-    // Headers count against the same budget as the body. Bounding only the body
-    // left the quota trivially sidesteppable: the allow-list caps how *many*
-    // headers may be set and says nothing about their size, so one `user-agent`
-    // could carry what the body was just refused for.
-    let request_ceiling = runtime.quotas().outbound_request_bytes as usize;
-    let header_weight: usize = allowed
+    let allowed: Vec<(String, String)> = headers
         .iter()
-        .map(|(name, value)| name.len().saturating_add(value.len()))
-        .fold(0, usize::saturating_add);
-    // The URL counts too. It is cloned into the request and handed to the
-    // backend like everything else, and a budget that omitted it left a guest
-    // free to send multi-megabyte request targets with an empty body — the
-    // quota reading zero for a call that is anything but.
-    let request_weight = header_weight
-        .saturating_add(body.len())
-        .saturating_add(url.len());
-    if request_weight > request_ceiling {
-        return CallResult::denied(
-            id,
-            DenialReason::QuotaExceeded,
-            format!(
-                "the request is {request_weight} bytes of url, headers and body, over this \
-                 plugin's {request_ceiling}-byte `outbound_request_bytes` quota"
-            ),
-        );
-    }
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
 
     let ceiling = runtime.quotas().outbound_response_bytes as usize;
     let request = OutboundRequest {

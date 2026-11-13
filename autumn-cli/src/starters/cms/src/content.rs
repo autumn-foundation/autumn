@@ -1308,6 +1308,27 @@ pub async fn revisions_for(
         .await?)
 }
 
+/// The public name of each given account, in one query whatever the count.
+///
+/// Ids with no account (a deleted editor) are absent from the map.
+pub async fn public_names(
+    conn: &mut AsyncPgConnection,
+    ids: &[i64],
+) -> AutumnResult<std::collections::HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let accounts: Vec<User> = users::table
+        .filter(users::id.eq_any(ids))
+        .select(User::as_select())
+        .load(conn)
+        .await?;
+    Ok(accounts
+        .into_iter()
+        .map(|user| (user.id, user.public_name().to_owned()))
+        .collect())
+}
+
 /// Rebuild the published-post counts of the given terms.
 ///
 /// The single fan-out: every path that recounts more than one term goes

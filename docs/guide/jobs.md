@@ -169,7 +169,7 @@ poll_interval_ms = 250          # default: 250 ms
   for development or single-process demos.
 - `postgres`: Postgres-backed queue that reuses your existing `[database]` pool.
   Jobs survive restarts and are claimed atomically across replicas via
-  `SELECT … FOR UPDATE SKIP LOCKED`. Requires the `db` feature and an
+  `SELECT … FOR UPDATE SKIP LOCKED`. Requires the `postgres` feature (on by default) and an
   `autumn migrate` run before the first worker starts.
 - `redis`: Durable, Redis-backed queue for multi-replica workers. Higher
   throughput ceiling than `postgres` but adds Redis as an infrastructure dependency.
@@ -208,7 +208,7 @@ Three equivalent mechanisms:
 
 ```bash
 # Environment variable — the usual container knob.
-AUTUMN_ROLE=web     # or: worker | combined
+AUTUMN_ROLE=web     # or: worker | combined | a [roles.<name>] preset
 ```
 
 ```toml
@@ -221,52 +221,290 @@ role = "worker"     # or: web | combined
 autumn serve --role worker   # or: --role web
 ```
 
-### Self-gating app-owned background work
+The env var and the TOML key accept the same values. Case is not important.
+The aliases are `all`, `web_and_worker` and `server_and_worker` (combined),
+`server` and `http` (web), and `jobs` and `worker_only` (worker).
 
-The framework already uses the resolved role to gate the `#[job]` runtime, the
-`#[scheduled]` cron scheduler, and commit-hook workers — but that gate only
-covers **framework-managed** work. If your app wires its own background loop in
-an `on_startup` hook (a poller, a warm-cache refresher, a queue consumer you
-manage yourself), that loop runs on **every** replica unless you gate it too.
+A value can also name a `[roles.<name>]` preset. See
+[Named roles](#named-roles).
 
-The resolved role is available as a first-class accessor on `AppState`, so you
-can self-gate without re-reading `AUTUMN_ROLE` by hand. It is the same value the
-framework resolved (config + `AUTUMN_ROLE` env override + `--role` flag) — one
-source of truth, no second parse:
+An unknown value stops the boot. It does not fall back to `combined`. The
+error names the value, lists the accepted values and lists the declared
+presets:
 
-```rust
-use autumn_web::{AppState, ProcessRole};
+```text
+configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: combined, all, web_and_worker, server_and_worker, web, server, http, worker, jobs, worker_only), and no [roles.workers] is declared (no roles are declared)
+```
 
-// In an on_startup hook, plugin, state_initializer, or handler:
-fn start_background_work(state: &AppState) {
-    if state.role().runs_workers() {
-        // Only replicas that run workers (combined or worker) spin up the loop.
-        tokio::spawn(my_embedded_worker(state.clone()));
-    }
+An empty `AUTUMN_ROLE=` is unset: the `role` key applies, or `combined`.
+`autumn doctor` shows the same error on its `process_role_backend` row.
 
-    if state.role().serves_http() {
-        // Web-facing warmups belong on replicas that serve user routes.
-        warm_render_caches(state);
-    }
+### Role capabilities
+
+A process resolves its role into a capability set once at boot. Each
+framework subsystem reads its own capability:
+
+| Capability | Subsystem | `combined` | `web` | `worker` |
+|---|---|---|---|---|
+| `serves_http` | User routes | Yes | Yes | No |
+| `job_workers` | `#[job]` worker loops | Yes | No | Yes |
+| `scheduler` | `#[scheduled]` tasks | Yes | No | Yes |
+| `outbox_relay` | Outbox relay | Yes | No | Yes |
+| `commit_hooks` | Durable commit-hook workers (app pool and each shard) | Yes | No | Yes |
+| `fleet_relay` | SQLite fleet sweeper: open closed databases, relay, backfill | Yes | No | Yes |
+| `restore_check` | Fleet replication restore check | Yes | No | Yes |
+| `retention` | Retention sweeps (`#[repository(retention(...))]`, `[retention]`) | Yes | No | Yes |
+| `maintenance` | Plugin and app housekeeping [background tasks](#background-tasks-for-plugins-and-apps) | Yes | No | Yes |
+
+Read the set with `state.capabilities()`. Read one field, or ask about one
+subsystem with `state.capabilities().runs(Capability::Scheduler)`.
+`GET /actuator/info` shows the set under `role`. For a `worker`:
+
+```json
+"role": {
+  "name": "worker",
+  "base": "worker",
+  "preset": false,
+  "capabilities": {
+    "serves_http": false,
+    "job_workers": true,
+    "scheduler": true,
+    "outbox_relay": true,
+    "commit_hooks": true,
+    "fleet_relay": true,
+    "restore_check": true,
+    "retention": true,
+    "maintenance": true
+  }
 }
 ```
 
-`state.role()` returns a `ProcessRole` (exported at `autumn_web::ProcessRole`);
-its `serves_http()` and `runs_workers()` predicates map roles to tiers exactly
-as the table above does. The value is reachable from `state_initializer`,
-`on_startup`/`on_shutdown` hooks, plugins, and request handlers.
+`serves_http()` and `runs_workers()` stay on `ProcessRole` and `Role`. Framework code
+does not use `runs_workers()` as a gate: a test fails on a new gate in
+`autumn/src/app.rs`, so a new subsystem must name its capability.
 
-> **Footgun: `AUTUMN_ROLE` alone does not gate app-owned background work.**
-> Setting `AUTUMN_ROLE=web` stops the framework's `#[job]`/`#[scheduled]`
-> workers, but a background task you `tokio::spawn` yourself in `on_startup` has
-> nothing to do with that gate — it will still run on your web replicas and
-> double-process work alongside the worker tier. Wrap app-owned loops in
-> `if state.role().runs_workers() { … }` so they land only where you intend.
+### Background tasks for plugins and apps
 
-Custom or named roles beyond `combined`/`web`/`worker` are not supported today;
-if you need finer-grained placement, use per-queue worker pinning (#1623)
-combined with app-level `state.role()` gating rather than inventing new role
-names.
+The framework gates each subsystem in the [capability table](#role-capabilities)
+on its own capability. A loop that a plugin or an app starts itself, with
+`tokio::spawn` in `on_startup`, runs on **every** replica. Do not do that.
+Declare the loop. The framework then places it (#3545):
+
+```rust
+use autumn_web::Capability;
+
+app.background_task("app.cleanup", Capability::Maintenance, |state, shutdown| async move {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => reap(&state).await?,
+        }
+    }
+})
+```
+
+- The framework starts the task after the startup hooks, only on a role that
+  runs its capability. `maintenance` runs on `combined` and `worker`, and not
+  on `web`.
+- The task gets a child of the server shutdown token. The graceful drain
+  waits for the tasks for at most half of the remaining
+  `server.shutdown_timeout_secs`. If a task does not stop in that time, the
+  framework aborts it. The fleet close and the `on_shutdown` hooks keep the
+  other half.
+- The framework does not restart a task that returns or panics.
+  `/actuator/tasks` shows its status.
+- `autumn task` (one-off tasks) starts no background tasks.
+
+Use the capability that matches the work: `job_workers` for a queue
+consumer, `scheduler` for a periodic loop, `maintenance` for housekeeping.
+
+#### Plugin capabilities
+
+A plugin can declare its own capability. Its parent, a built-in capability,
+gives the default:
+
+```rust
+use autumn_web::Capability;
+use autumn_web::background::PluginCapability;
+
+pub const WORKER: PluginCapability = PluginCapability::new("harvest.worker", Capability::JobWorkers);
+
+app.background_task("harvest.dispatch", WORKER, |state, shutdown| async move { /* ... */ Ok(()) })
+```
+
+A named role can set it:
+
+```toml
+[roles.cron]
+base = "worker"
+pin = []                                     # no job workers: harvest.worker is off
+capabilities = { "harvest.worker" = true }  # turn it on for this role
+```
+
+- A plugin capability name is `<plugin>.<name>`.
+- A role cannot turn on a plugin capability that its base does not run, as
+  for the built-in keys. `true` is valid only when the base runs the parent.
+- A built-in name in `capabilities` fails the load. Use its top-level key.
+- `true` above the base fails the boot, on every declared preset.
+- A key that no plugin declares fails the boot of that role. On another
+  preset, the boot logs a warning: that binary may not link the plugin.
+  `autumn graph` prints the same warnings.
+- Code that is not a task reads the same value with
+  `state.role().runs_plugin(WORKER)`. Declare such a capability with
+  `app.plugin_capability(WORKER)`.
+
+#### Queues and explicit switches
+
+`app.background(BackgroundTask)` is the full form:
+
+```rust
+use autumn_web::background::BackgroundTask;
+
+app.background(
+    BackgroundTask::new("harvest.dispatch", WORKER, dispatch)
+        .queues(["harvest"])                  // the role must drain one
+        .explicit(config.worker_enabled),     // Option<bool> from the plugin config
+)
+```
+
+- **Queues.** The task runs only on a role that runs job workers and drains
+  one of its queues. The role `pin` (or `jobs.pin`) applies, as for `#[job]`
+  queues. `autumn jobs manifest` lists the queues, so the `autumn doctor`
+  coverage check includes them. A pin that names only a task queue is not an
+  error.
+- **Explicit switch.** The plugin config wins. `Some(true)` runs the task on
+  every role. The boot logs a warning on a role that does not place it.
+  `Some(false)` never runs the task, and its queues leave the manifest.
+  `None` lets the role decide.
+- The boot logs a warning for a task that no role of the config runs.
+
+#### Where to see them
+
+- `GET /actuator/tasks` has `background_tasks`, a map from task name to:
+
+  | Key | Value |
+  |---|---|
+  | `capability` | The capability name, built-in or plugin |
+  | `parent` | The built-in parent of a plugin capability |
+  | `queues` | The queues of the task |
+  | `explicit` | The explicit switch, when set |
+  | `registered_by` | The plugin that registered the task. Not set for the app |
+  | `location` | `file:line` of the registration |
+  | `roles` | The roles of the loaded config that run the task |
+  | `runs_here` | Whether this process runs the task |
+  | `status` | `running`, `not_placed`, `disabled`, `stopped`, `exited`, `failed`, `panicked` or `aborted` |
+  | `last_error` | The error or panic message |
+
+  `/actuator/tasks` is mounted only with `[actuator] sensitive = true`.
+- `autumn graph` has one `background_task` node for each task, with the same
+  roles.
+- `roles` uses the loaded config, with its env overrides. For example, a
+  process with `AUTUMN_JOBS__PIN=critical` gives each built-in role that pin.
+
+#### Tasks of the in-repo plugins
+
+| Plugin | Task | Capability | Queues | Default roles |
+|---|---|---|---|---|
+| `autumn-media-plugin` | `media.room_reaper` (`db` store) | `media.maintenance` | | `combined`, `worker` |
+| `autumn-media-plugin` | `media.room_reaper` (`memory` store) | `serves_http` | | `combined`, `web` |
+| `autumn-media-plugin` | `media.recording_retention` | `media.retention` | `media` (or `.queue(...)`) | `combined`, `worker` |
+| `autumn-billing` | `billing.dunning_rearm` (re-arms once per process) | `billing.dunning` | `billing` | `combined`, `worker` |
+| `autumn-plugin-reference` | `reference.heartbeat` | `maintenance` | | `combined`, `worker` |
+
+The `memory` room store is in the memory of the process that serves the room
+routes, so its reaper runs there. The media guide gives the reason for each
+row. The job queues of `autumn-media-plugin`, `autumn-billing` and
+`autumn-search` come from their `JobInfo` lists, so `autumn jobs manifest`
+and the role `pin` include them.
+
+A test in `xtask` (`plugin_spawns`) fails on a spawn that a plugin crate's
+`on_startup` argument reaches, directly or through a function of the same
+crate. Request-scoped spawns go on its allow-list.
+
+`state.role()` returns a `&Role` (exported at `autumn_web::Role`).
+`role.name()` is the role name, for example `"critical"` or `"worker"`.
+`role.base()` is the built-in `ProcessRole`. `state.capabilities()` returns its
+`RoleCapabilities`, one field for each row of the capability table above.
+
+### Named roles
+
+Declare a tier once in `autumn.toml` as a `[roles.<name>]` preset (#3543).
+Each Deployment or Fly process then sets only `AUTUMN_ROLE=<name>`.
+`autumn release init --target kubernetes` and `--target fly` write one
+workload per preset (see [Kubernetes](kubernetes.md#one-workload-per-role)),
+and `[[deploy.groups]]` sets a role per fleet host group (see
+[Fleet deploys](fleet-deploys.md#per-group-roles)):
+
+```toml
+[roles.critical]
+base = "worker"          # combined | web | worker: the safety contract
+pin = ["critical"]       # replaces jobs.pin
+workers = 8              # replaces jobs.workers
+scheduler = false        # capability overrides; unset = base default
+outbox_relay = false
+
+[roles.cron]
+base = "worker"
+pin = []                 # drains no queue: no job workers
+scheduler = true
+
+[roles.marketing]
+base = "combined"
+```
+
+Select a preset with `AUTUMN_ROLE=critical`, `role = "critical"` or
+`autumn serve --role critical`.
+
+| Key | Value | Unset |
+|---|---|---|
+| `base` | `combined`, `web` or `worker`. Required. | — |
+| `pin` | Queues this role drains. `[]` = no job workers. | `jobs.pin` |
+| `workers` | Concurrent worker loops. 1 or more. | `jobs.workers` |
+| `job_workers`, `scheduler`, `outbox_relay`, `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `maintenance` | `true` or `false` | the base default |
+| `capabilities` | Plugin capability values, for example `{ "harvest.worker" = false }`. See [Plugin capabilities](#plugin-capabilities). | the parent value |
+| `mount` | Route groups this role serves. Needs a `web` or `combined` base. See [Route groups](route-groups.md). | every group |
+
+Rules:
+
+- **The base is the ceiling.** An override can only turn a capability off.
+  `scheduler = true` on a `web` base fails the load. Use `base = "combined"`
+  and turn the other capabilities off.
+- **The base decides HTTP.** `serves_http` is not a key. A `worker`-based
+  preset serves only the probes and the actuator.
+- **The guards read the base.** A preset over `web` or `worker` needs a
+  durable jobs backend, as the built-in roles do. On the `sqlite` jobs
+  backend, it also needs a file-backed database. A `combined` preset with no
+  job workers counts as `web`: it enqueues jobs and does not drain them. See
+  [Split roles require a durable backend](#split-roles-require-a-durable-backend).
+- **The built-in names are reserved.** `[roles.worker]`, `[roles.jobs]` and
+  every other built-in spelling fail the load.
+- **A name** starts with a lowercase letter and has only `a-z`, `0-9`, `_` and
+  `-`, with at most 63 characters. Case in `AUTUMN_ROLE` is not important.
+- **A preset holds only role keys.** An unknown key fails the load, so a
+  preset cannot become a second config profile.
+- **A preset `pin` wins** over `jobs.pin` from every source, including
+  `AUTUMN_JOBS__PIN` and `autumn serve --pin`. The boot logs a warning when
+  it replaces a different pin.
+- **`[roles]` belongs to the framework.** Do not use a top-level `[roles]`
+  table for app data.
+- `pin` with no job workers, `pin = []` with `job_workers = true`, `workers`
+  with no job workers, and `workers = 0` fail the load.
+- An undeclared name fails the load. The error lists the declared presets.
+
+The name is visible in these places:
+
+- `state.role().name()` in handlers, `on_startup` hooks, plugins and
+  `state_initializer`.
+- `GET /actuator/info` (`role.name`, `role.base`, `role.preset`) and
+  `GET /actuator/jobs` (`role.name`, `role.base`, `role.pin`).
+- A `role="<name>"` label on every framework metric family in
+  `/actuator/prometheus`. A built-in role adds no label, so its series do not
+  change.
+- The default scheduler `replica_id`: `<name>-<host>`. An explicit
+  `scheduler.replica_id` stays as it is.
+
+`autumn doctor --strict` derives `[jobs.fleet] tiers` from the presets when
+`tiers` is not set. See [Zero-coverage guard](#zero-coverage-guard).
 
 ### Split roles require a durable backend
 
@@ -420,8 +658,8 @@ directly; work another process enqueued is seen within
 `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
 to cut idle wakeups.
 
-Terminal rows are pruned by the runtime, not by `autumn db retention`, whose
-sweep is Postgres-only. Set `retention.job_history` to bound the table; leave it
+The runtime prunes terminal rows. `autumn db retention` also sweeps them
+(#2553). Set `retention.job_history` to bound the table; leave it
 unset and history is kept forever, exactly as on Postgres.
 
 The runtime creates the table and its indexes at start, because framework
@@ -753,6 +991,31 @@ it just leaves doctor blind to the queues it did not see.
 > checked-in description of the whole fleet, and update it when you add or
 > remove a worker tier.
 
+**Or declare the tiers once as `[roles.*]`.** When `tiers` is not set,
+doctor derives it from the [named roles](#named-roles). Each preset that runs
+job workers is one tier: its `pin`, else `jobs.pin`. A preset with no job
+workers (`pin = []`, `job_workers = false`, or a `web` base) is not a tier.
+The check detail says `derived from [roles.*]`. An explicit `tiers` wins.
+`tiers = []` is the same as no `tiers`.
+
+A gap in derived tiers is a **warning**, not a failure, because a tier that
+runs as a plain built-in role can drain the gap. `autumn doctor --strict`
+turns the warning into a failure.
+
+```toml
+[roles.critical]
+base = "worker"
+pin = ["critical"]
+
+[roles.bulk]
+base = "worker"
+pin = ["bulk", "default", "thumbnails"]
+```
+
+The derived tiers list only the presets. A tier that runs as a built-in role
+(for example a plain `AUTUMN_ROLE=worker` Deployment) is not in the list.
+Declare it as a preset, or set `tiers`.
+
 `[jobs.fleet]` is purely declarative. A running process never acts on it — it
 describes the *other* tiers, which no single process can observe — so it changes
 no runtime behavior, and an app that declares nothing keeps today's behavior.
@@ -770,9 +1033,13 @@ addition to the existing per-job-type gauges under `jobs`:
 ```json
 {
   "jobs": { "send_password_reset": { "queued": 0, "in_flight": 1, "...": 0 } },
-  "queues": { "critical": { "depth": 3, "oldest_waiting_age_ms": 1200 } }
+  "queues": { "critical": { "depth": 3, "oldest_waiting_age_ms": 1200 } },
+  "role": { "name": "critical", "base": "worker", "pin": ["critical"] }
 }
 ```
+
+The `role` key names the process role. `pin` is there only when a
+[named role](#named-roles) sets it.
 
 On the durable backends (Postgres/Redis) these gauges are **not** per-process
 approximations: a periodic survey of the durable store wholesale-replaces this
@@ -851,7 +1118,9 @@ Semantics:
 - Operator actions respect uniqueness: canceling an enqueued job (including
   one parked behind a concurrency slot) releases its key immediately, and
   retrying a failed unique job re-takes the key — or fails with a clear
-  conflict error when an equivalent job is already pending or running.
+  conflict error when an equivalent job is already pending or running. A
+  retried `pending`-window job gets its key back at once, so an equal enqueue
+  stays deduplicated while the retry waits.
 - On Redis, pending/running unique locks carry a 24-hour crash backstop TTL
   that is refreshed every time the job is claimed, retried, or recovered, so
   only a job left completely untouched for a full day can lose its lock.
@@ -986,7 +1255,7 @@ work off the request thread.
 `autumn_web::data::csv` is behind the non-default `csv` feature:
 
 ```toml
-autumn-web = { version = "0.8", features = ["csv"] }
+autumn-web = { version = "0.10", features = ["csv"] }
 ```
 
 ```rust,ignore
@@ -1047,20 +1316,33 @@ The browser gets a progress bar within milliseconds and a download link the
 moment the job finishes — no hand-written status table, token, or polling
 endpoint anywhere in app code.
 
-### Known limitation: tracked status vs. the durable queue record
+### Tracked status follows the queue ack
 
-On the Redis and Postgres backends, a job's tracked status (`succeeded`/
-`failed`) is settled *before* that backend's own success/dead-letter
-acknowledgement is written. In the rare case where that ack later fails or
-is skipped (e.g. the claim changed because another worker recovered it as
-stale in between), the tracked status can briefly report a terminal state
-the durable queue record hasn't actually reached — a poller may stop
-watching a moment before the durable backend finishes catching up, which it
-does automatically on its own retry/recovery path. This window only opens
-on an ack failure, not on ordinary success/failure/retry. Treat the tracked
-status as a progress/UX signal for the caller, not as the source of truth
-for whether a job will run again — use the admin dashboard
-([Observability](#observability)) or `JobAdminBackend` for that.
+On the `sqlite`, `postgres` and `redis` backends, a worker writes the
+terminal tracked status (`succeeded` or `failed`) only after the queue
+accepts its acknowledgement. The queue checks that the worker still owns the
+claim.
+
+Delivery is at-least-once. An attempt can run past its visibility timeout
+while a second worker claims the same job. The queue rejects the ack of the
+first attempt, so Autumn does not write its status. The second attempt
+settles the record.
+
+If the ack fails with an error, the record stays `running`. Autumn recovers
+the job and runs it again. The next attempt settles the record. If the worker
+crashes after the ack and before the status write, the record stays
+`running` until its TTL ends. If a failed ack was for the last attempt, the
+queue dead-letters the job and the record ends `failed`, even when the handler
+succeeded. The `local` backend has no claim, so it writes
+the status at once.
+
+The queue row can be retried as soon as the ack lands. An operator retry in
+the short time before the status write can reset the record first. The late
+write then overwrites that reset. This needs a compare-and-swap token on the
+tracking write, which Autumn does not have yet.
+
+To see the durable queue state, use the admin dashboard
+([Observability](#observability)) or `JobAdminBackend`.
 
 ### Known limitation: stale progress writes on the Redis/Postgres stores
 
@@ -1163,6 +1445,8 @@ The migration is bundled with the framework and is applied automatically by
 works the same way regardless of `jobs.backend` — the framework migration
 also creates `autumn_job_tracking`, the table the Postgres-backed tracking
 store uses (see [Tracked jobs and progress polling](#tracked-jobs-and-progress-polling)).
+A later migration adds its `version` column. Run `autumn migrate` before you
+deploy a new binary.
 
 ---
 

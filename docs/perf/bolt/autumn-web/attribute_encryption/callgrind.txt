@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/attribute_encryption
+# unit: whole process
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+       8,802,712   10.4%  <base64::engine::general_purpose::GeneralPurpose as base64::engine::Engine>::internal_decode
+       5,327,736    6.3%  _int_free
+       5,126,986    6.0%  <aes::autodetect::Aes256 as cipher::block::BlockEncrypt>::encrypt_with_backend::inner
+       4,560,000    5.4%  base64::engine::general_purpose::encode_scalar_tail
+       4,419,800    5.2%  <polyval::backend::autodetect::Polyval as universal_hash::UniversalHash>::update_with_backend
+       4,394,544    5.2%  <polyval::backend::clmul::Polyval>::mul
+       3,958,714    4.7%  _int_malloc
+       3,737,720    4.4%  <aes_gcm::AesGcm as aead::AeadInPlace>::decrypt_in_place
+       3,309,714    3.9%  core::slice::sort::unstable::quicksort::quicksort'2
+       2,732,203    3.2%  malloc
+       2,651,362    3.1%  free
+       2,337,550    2.8%  __memcpy_avx_unaligned_erms
+       2,323,552    2.7%  <aes_gcm::AesGcm>::compute_tag
+       2,303,656    2.7%  base64::engine::general_purpose::decode_suffix::decode_suffix
+       2,120,891    2.5%  attribute_encryption::main
+       2,040,534    2.4%  calloc
+       1,280,000    1.5%  <aes_gcm::AesGcm as aead::AeadInPlace>::encrypt_in_place
+       1,190,005    1.4%  <autumn_web::encryption::KeyRing>::encrypt
+       1,151,080    1.4%  <alloc::string::String as core::fmt::Write>::write_char
+       1,110,037    1.3%  <std::sys::pal::unix::time::Timespec>::sub_timespec
+       1,083,176    1.3%  <autumn_web::encryption::KeyRing>::decrypt
+       1,078,585    1.3%  <core::fmt::Formatter>::pad_integral
+       1,070,000    1.3%  core::str::converts::from_utf8
+       1,060,752    1.3%  <&aes::autodetect::Aes256 as cipher::block::BlockEncryptMut>::encrypt_with_backend_mut
+         980,000    1.2%  alloc::fmt::format::format_inner
+         960,016    1.1%  <std::sys::pal::unix::time::Timespec>::now
+         950,863    1.1%  core::fmt::write
+         808,568    1.0%  base64::engine::Engine::decode::inner
+         780,000    0.9%  <std::time::Instant>::elapsed
+         778,107    0.9%  <str>::trim_matches
+
+      84,798,193  100.0%  TOTAL

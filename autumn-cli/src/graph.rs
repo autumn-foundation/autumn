@@ -136,6 +136,11 @@ fn completeness_changes(committed: &Completeness, current: &Completeness) -> Vec
     count("repositories", committed.repositories, current.repositories);
     count("jobs", committed.jobs, current.jobs);
     count(
+        "background tasks",
+        committed.background_tasks,
+        current.background_tasks,
+    );
+    count(
         "repository auto-API routes",
         committed.generated_routes,
         current.generated_routes,
@@ -161,6 +166,11 @@ fn completeness_changes(committed: &Completeness, current: &Completeness) -> Vec
         "route declared but not mounted",
         &committed.unmounted_routes,
         &current.unmounted_routes,
+    );
+    list(
+        "route mounted by another role",
+        &committed.mounted_elsewhere,
+        &current.mounted_elsewhere,
     );
     list(
         "mounted with no macro declaration",
@@ -453,19 +463,29 @@ fn write_manifest(graph: &ArchitectureGraph, path: &std::path::Path) -> std::io:
     std::fs::write(path, format!("{}\n", graph.to_json()))
 }
 
-/// Run `autumn graph`.
-pub fn run(opts: &GraphOptions<'_>) {
-    eprintln!("\u{1F342} autumn graph\n");
-    if !opts.features.is_default() {
-        eprintln!("Building with {}\n", opts.features.to_args().join(" "));
+/// How to build the app whose graph is read.
+pub struct BuildTarget<'a> {
+    /// Cargo package to build and run.
+    pub package: Option<&'a str>,
+    /// Binary target name for packages that expose multiple bin targets.
+    pub bin: Option<&'a str>,
+    /// Cargo feature selection the inspected binary is built under.
+    pub features: routes::CargoFeatures,
+    /// Build and inspect the release binary rather than the debug one.
+    pub release: bool,
+}
+
+/// Build the app, run it in dump mode and read its graph. Exits on failure.
+pub fn dump(target: &BuildTarget<'_>) -> ArchitectureGraph {
+    if !target.features.is_default() {
+        eprintln!("Building with {}\n", target.features.to_args().join(" "));
     }
-    if opts.release {
+    if target.release {
         eprintln!("Building the release profile\n");
     }
-    let profile = routes::CargoProfile::from_release(opts.release);
-    routes::compile_binary_with(opts.package, opts.bin, &opts.features, &profile);
-    let binary = routes::find_binary_in_profile(opts.package, opts.bin, &profile);
-
+    let profile = routes::CargoProfile::from_release(target.release);
+    routes::compile_binary_with(target.package, target.bin, &target.features, &profile);
+    let binary = routes::find_binary_in_profile(target.package, target.bin, &profile);
     let mut command = Command::new(&binary);
     command.env(DUMP_ENV, "1");
     routes::clear_other_dump_modes(&mut command, DUMP_ENV);
@@ -502,6 +522,18 @@ pub fn run(opts: &GraphOptions<'_>) {
         eprintln!("Raw output: {stdout}");
         std::process::exit(1);
     };
+    graph
+}
+
+/// Run `autumn graph`.
+pub fn run(opts: &GraphOptions<'_>) {
+    eprintln!("\u{1F342} autumn graph\n");
+    let graph = dump(&BuildTarget {
+        package: opts.package,
+        bin: opts.bin,
+        features: opts.features.clone(),
+        release: opts.release,
+    });
 
     // Read the committed copy BEFORE writing anything. `--manifest P --check P`
     // would otherwise compare the fresh graph against the copy this very run
@@ -562,6 +594,41 @@ mod tests {
 
     use super::*;
 
+    /// A new background task shows in the `--check` drift report (#3545).
+    #[test]
+    fn completeness_changes_reports_background_tasks() {
+        let committed = Completeness::default();
+        let current = Completeness {
+            background_tasks: 2,
+            ..Completeness::default()
+        };
+        let lines = completeness_changes(&committed, &current);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "  completeness background tasks 0 -> 2"),
+            "{lines:?}"
+        );
+    }
+
+    /// A route that moves to another role shows in the `--check` drift
+    /// report (#3544).
+    #[test]
+    fn completeness_changes_reports_mounted_elsewhere() {
+        let committed = Completeness::default();
+        let current = Completeness {
+            mounted_elsewhere: vec!["route:app::desk".to_owned()],
+            ..Completeness::default()
+        };
+        let lines = completeness_changes(&committed, &current);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "  + route mounted by another role route:app::desk"),
+            "{lines:?}"
+        );
+    }
+
     const MODELS: &[ModelGraphDescriptor] = &[ModelGraphDescriptor {
         model: "Post",
         model_path: "app::models::Post",
@@ -570,6 +637,7 @@ mod tests {
         module_path: "app::models",
         file: "src/models.rs",
         line: 1,
+        crate_version: "0.1.0",
     }];
 
     const REPOSITORIES: &[RepositoryGraphDescriptor] = &[RepositoryGraphDescriptor {
@@ -581,6 +649,7 @@ mod tests {
         module_path: "app::repositories",
         file: "src/repositories.rs",
         line: 1,
+        crate_version: "0.1.0",
     }];
 
     const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
@@ -591,6 +660,7 @@ mod tests {
         static_route: false,
         file: "src/routes/posts.rs",
         line: 1,
+        crate_version: "0.1.0",
         signature_symbols: &["PgPostRepository"],
         body_symbols: &[],
         sql_symbols: &[],
@@ -606,6 +676,7 @@ mod tests {
         mutating_symbols: &[],
         file: "src/jobs.rs",
         line: 1,
+        crate_version: "0.1.0",
         signature_symbols: &[],
         signature_bindings: &[],
         dot_mutation_receivers: &[],

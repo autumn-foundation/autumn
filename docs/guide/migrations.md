@@ -6,6 +6,41 @@ covers the advisory-lock serialisation that prevents schema divergence during
 rolling deploys, how to monitor contention, and what to expect on non-Postgres
 backends.
 
+Keep each Diesel `table!` at 32 columns or fewer. A wider declaration forces
+diesel's `64-column-tables` feature, which makes every crate that uses diesel
+slower to compile. A wide table is fine when Rust declares it in halves with
+`#[sql_name]`. `autumn build` warns when a migration widens a table past 32
+columns and no declaration splits it. See [Table width](./table-width.md).
+
+---
+
+## Scope: control only, or shards only
+
+`AppBuilder::migrations` sends a set to the control database and to every
+shard (`[[database.shards]]`, or each `[database.fleet]` file). Use
+`migrations_for` (or `plugin_migrations_for` in a plugin) to keep a set on
+one side:
+
+```rust
+use autumn_web::migrate::MigrationScope;
+
+autumn_web::app()
+    .migrations_for(MigrationScope::Control, CONTROL_MIGRATIONS)
+    .migrations_for(MigrationScope::Shards, TENANT_MIGRATIONS)
+    .plugin_migrations_for("my-plugin", MigrationScope::Control, PLUGIN_MIGRATIONS)
+```
+
+- Boot and `AUTUMN_MIGRATE=1` obey the scope.
+- With no shard and no fleet, the one database gets every scope.
+- The framework control-plane set always applies as `Control`.
+- The CLI reads the scope from the directory name: `migrations/`,
+  `migrations-control/`, `migrations-shards/`. Embed each directory with its
+  scope. `autumn migrate` applies them to a SQLite database only. On
+  Postgres it stops: use `AUTUMN_MIGRATE=1`. `autumn migrate down` reads
+  `migrations/` only, so it stops when a scope directory exists.
+
+See [SQLite fleet: migrations](sqlite-fleet.md#control-only-and-tenant-only-sets).
+
 ---
 
 ## Advisory lock serialisation

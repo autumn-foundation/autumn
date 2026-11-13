@@ -9,7 +9,7 @@ caller: [`examples/mesh-storefront`](../mesh-storefront).
 
 ## Prerequisites
 
-Rust 1.88.0+. No database, no config file.
+Rust 1.97.0+. No database, no config file.
 
 ## Quick start
 

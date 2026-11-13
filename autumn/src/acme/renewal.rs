@@ -51,7 +51,7 @@ const RENEWAL_TASK_NAME: &str = "acme-renewal";
 /// How long an ACME leader holds its key if it crashes before it frees it
 /// (issue #3052). Longer than one issuance: DNS-01 propagation alone can wait
 /// up to one hour. A leader that finishes frees the key at once.
-pub(crate) const ACME_LEADER_HOLD: Duration = Duration::from_secs(2 * 60 * 60);
+pub(crate) const ACME_LEADER_HOLD: Duration = Duration::from_hours(2);
 
 /// A per-failure callback invoked by the renewal task with a message.
 ///

@@ -1,0 +1,5 @@
+ relname | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch 
+---------+----------+--------------+----------+---------------
+ posts   |        2 |       200018 |      306 |        570348
+(1 row)
+

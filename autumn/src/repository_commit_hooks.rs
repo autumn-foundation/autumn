@@ -2281,7 +2281,7 @@ fn repository_commit_hook_id(
     } else {
         push_hook_id_component(&mut hasher, "record", record.as_bytes());
     }
-    format!("idempotent:{}", hex_lower(hasher.finalize()))
+    format!("idempotent:{}", hex::encode(hasher.finalize()))
 }
 
 fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
@@ -2291,17 +2291,6 @@ fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) 
     hasher.update(b":");
     hasher.update(value);
     hasher.update(b";");
-}
-
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
 }
 
 pub fn repository_commit_hook_worker_id() -> String {
@@ -2454,6 +2443,21 @@ mod tests {
             .build()
             .expect("pool");
 
+        // The first call in a fresh process also pays one-time costs: paging in
+        // the code of the pool, driver and runtime paths it touches. nextest
+        // runs each test in its own process, and on a macOS runner that alone
+        // took the call past 750ms. Warm those paths first, under a bound wide
+        // enough for any runner that still fails a call that hangs.
+        let warm = tokio::time::timeout(
+            Duration::from_secs(30),
+            mark_repository_commit_hook_after_hook_failed(&pool, "hook-id", "owner", "boom"),
+        )
+        .await;
+        assert!(
+            warm.is_ok(),
+            "after-hook failure marking must not block a committed mutation forever when the pool/database is down"
+        );
+
         let result = tokio::time::timeout(
             Duration::from_millis(750),
             mark_repository_commit_hook_after_hook_failed(&pool, "hook-id", "owner", "boom"),
@@ -2462,7 +2466,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "after-hook failure marking must not block a committed mutation forever when the pool/database is down"
+            "after-hook failure marking must give up within its retry budget when the pool/database is down"
         );
     }
 
@@ -2953,5 +2957,17 @@ mod tests {
         );
 
         assert!(!is_missing_hook_table_error(&unrelated));
+    }
+
+    /// Characterization for the Echo clone class: `repository_commit_hook_id`
+    /// renders its digest through this file's own `hex_lower`, one of six
+    /// byte-identical copies across the crate. Pinned before `hex_lower` is
+    /// replaced by the `hex` crate (already a dependency) at its call site.
+    #[test]
+    fn repository_commit_hook_id_is_pinned_hex() {
+        assert_eq!(
+            repository_commit_hook_id(Some("order-42"), None, "handler", "hook", "record-1"),
+            "idempotent:b8fceec62ab6e24e8d96034789e38d8fe64c5e3f593675d5704ac980b6944ebf",
+        );
     }
 }

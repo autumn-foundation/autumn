@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use super::index::{self, CheckOutcome, Listing, ListingOrigin, Status, Tier};
-use crate::plugin_check::{CheckStatus, ConformanceReport};
+use crate::plugin_check::{CheckStatus, PluginCheckReport};
 
 /// What `record` did to a listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,14 +29,14 @@ pub enum Transition {
 /// When the report names a different plugin.
 pub fn apply_report(
     listing: &mut Listing,
-    report: &ConformanceReport,
+    report: &PluginCheckReport,
     against: &str,
     date: &str,
 ) -> Result<Transition, String> {
-    if index::canonical(&report.plugin_name) != index::canonical(&listing.name) {
+    if index::canonical(&report.report.plugin_name) != index::canonical(&listing.name) {
         return Err(format!(
             "the report is for `{}`, not `{}`",
-            index::sanitize(&report.plugin_name),
+            index::sanitize(&report.report.plugin_name),
             listing.name
         ));
     }
@@ -99,6 +99,7 @@ pub fn apply_report(
     }
 
     let failed: Vec<&str> = report
+        .report
         .checks
         .iter()
         .filter(|c| c.status == CheckStatus::Fail)
@@ -116,8 +117,8 @@ pub fn apply_report(
 /// # Errors
 ///
 /// When the report tested another release, or passes without naming one.
-pub fn check_tested_release(report: &ConformanceReport, against: &str) -> Result<(), String> {
-    let name = index::sanitize(&report.plugin_name);
+pub fn check_tested_release(report: &PluginCheckReport, against: &str) -> Result<(), String> {
+    let name = index::sanitize(&report.report.plugin_name);
     match report.autumn_web.as_deref() {
         Some(tested) if tested == against => Ok(()),
         Some(tested) => Err(format!(
@@ -184,18 +185,18 @@ const REQUIRED_CHECKS: [&str; 7] = [
 /// Refuse a report that `plugin-check` did not make, or a pass with no
 /// declared range (AC 3: a listing needs the #1601 contract).
 fn check_report_shape(
-    report: &ConformanceReport,
+    report: &PluginCheckReport,
     prefix: &str,
     no_routes: bool,
 ) -> Result<(), String> {
-    let name = index::sanitize(&report.plugin_name);
+    let name = index::sanitize(&report.report.plugin_name);
     // A failing report is always taken: it can only flag, never vouch.
     if !report.passed() {
         return Ok(());
     }
     let with_prefix = (!prefix.is_empty()).then_some("route-prefix");
     for required in REQUIRED_CHECKS.into_iter().chain(with_prefix) {
-        if !report.checks.iter().any(|c| c.name == required) {
+        if !report.report.checks.iter().any(|c| c.name == required) {
             return Err(format!(
                 "the report for `{name}` has no `{required}` check; use a report from \
                  `autumn plugin-check --format json`"
@@ -231,6 +232,7 @@ fn check_report_shape(
     // that mounts routes, and none of them would have been prefix-checked.
     if no_routes
         && !report
+            .report
             .checks
             .iter()
             .any(|c| c.name == "route-attribution" && c.status == CheckStatus::Skip)
@@ -241,6 +243,7 @@ fn check_report_shape(
         ));
     }
     let contract_passed = report
+        .report
         .checks
         .iter()
         .any(|c| c.name == "plugin-contract" && c.status == CheckStatus::Pass);
@@ -271,7 +274,7 @@ pub struct InspectReport {
     /// Whether the module loads into the sandbox.
     pub loads: bool,
     /// The route-conformance report.
-    pub conformance: ConformanceReport,
+    pub conformance: PluginCheckReport,
     /// What the artifact asks for beyond the one named by `--against`.
     #[serde(default)]
     pub upgrade: Option<serde_json::Value>,
@@ -356,10 +359,10 @@ impl InspectReport {
 fn check_inspect_shape(listing: &Listing, report: &InspectReport) -> Result<(), String> {
     // `inspect` runs the route checks from `plugin-check` over the manifest.
     // A report without them was not made by `inspect`.
-    if index::canonical(&report.conformance.plugin_name) != index::canonical(&listing.name) {
+    if index::canonical(&report.conformance.report.plugin_name) != index::canonical(&listing.name) {
         return Err(format!(
             "the inspect report's conformance is for `{}`, not `{}`",
-            index::sanitize(&report.conformance.plugin_name),
+            index::sanitize(&report.conformance.report.plugin_name),
             listing.name
         ));
     }
@@ -369,6 +372,7 @@ fn check_inspect_shape(listing: &Listing, report: &InspectReport) -> Result<(), 
     for required in ["route-attribution", "route-prefix", "route-collision"] {
         match report
             .conformance
+            .report
             .checks
             .iter()
             .find(|c| c.name == required)
@@ -540,6 +544,7 @@ pub fn apply_inspect(
     failed.extend(
         report
             .conformance
+            .report
             .checks
             .iter()
             .filter(|c| c.status == CheckStatus::Fail)
@@ -974,10 +979,10 @@ fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
 
     for path in opts.reports {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let report: ConformanceReport = serde_json::from_str(&text)
+        let report: PluginCheckReport = serde_json::from_str(&text)
             .map_err(|e| format!("{} is not a plugin-check JSON report: {e}", path.display()))?;
         check_tested_release(&report, opts.against)?;
-        let mut listing = listing_in(&src, &report.plugin_name)?;
+        let mut listing = listing_in(&src, &report.report.plugin_name)?;
         claim(&listing.name)?;
         let transition = apply_report(&mut listing, &report, opts.against, opts.date)?;
         src = write_listing(&src, &listing)?;
@@ -1061,10 +1066,10 @@ mod tests {
         }
     }
 
-    fn report(name: &str, pass: bool, contract: Option<PluginContract>) -> ConformanceReport {
-        ConformanceReport {
-            plugin_name: name.to_owned(),
-            checks: vec![
+    fn report(name: &str, pass: bool, contract: Option<PluginContract>) -> PluginCheckReport {
+        let mut report = PluginCheckReport::new(
+            name,
+            vec![
                 check("installability", CheckStatus::Pass),
                 check("route-attribution", CheckStatus::Pass),
                 check(
@@ -1081,12 +1086,11 @@ mod tests {
                 check("sensitive-surfaces", CheckStatus::Pass),
                 check("duplicate-registration", CheckStatus::Pass),
             ],
-            contract,
-            autumn_web: None,
-            // The prefix its `route-prefix` check tested: the fixtures'.
-            prefix: Some("/admin".to_owned()),
-            intentional_root: Vec::new(),
-        }
+        );
+        report.contract = contract;
+        // The prefix its `route-prefix` check tested: the fixtures'.
+        report.prefix = Some("/admin".to_owned());
+        report
     }
 
     fn lockstep(name: &str, version: &str) -> PluginContract {
@@ -1113,7 +1117,7 @@ mod tests {
         assert!(err.contains("--no-routes"), "{err}");
         assert_eq!(l, before);
         let mut r = report("autumn-search", true, contract);
-        for c in &mut r.checks {
+        for c in &mut r.report.checks {
             if c.name == "route-attribution" {
                 c.status = CheckStatus::Skip;
             }
@@ -1282,10 +1286,10 @@ mod tests {
         let mut l = listing("autumn-admin-plugin");
         let contract = Some(lockstep("autumn-admin-plugin", "0.7.0"));
         let mut r = report("autumn-admin-plugin", true, contract);
-        r.checks.retain(|c| c.name != "plugin-contract");
+        r.report.checks.retain(|c| c.name != "plugin-contract");
         let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
         assert!(err.contains("plugin-contract"), "{err}");
-        r.checks.clear();
+        r.report.checks.clear();
         assert!(apply_report(&mut l, &r, "0.7.0", "2026-10-01").is_err());
     }
 
@@ -1484,18 +1488,14 @@ mod tests {
                 path: "/hello".to_owned(),
             }],
             loads: pass,
-            conformance: ConformanceReport {
-                plugin_name: "autumn-plugin-hello".to_owned(),
-                checks: vec![
+            conformance: PluginCheckReport::new(
+                "autumn-plugin-hello",
+                vec![
                     check("route-attribution", CheckStatus::Pass),
                     check("route-prefix", CheckStatus::Pass),
                     check("route-collision", CheckStatus::Pass),
                 ],
-                contract: None,
-                autumn_web: None,
-                prefix: None,
-                intentional_root: Vec::new(),
-            },
+            ),
             // A baseline with nothing new: the new artifact asks for no more.
             upgrade: Some(delta(&[])),
             upgrade_against: Some("00".repeat(32)),
@@ -1600,7 +1600,7 @@ mod tests {
     fn an_inspect_report_that_skips_a_route_check_is_refused() {
         for name in ["route-attribution", "route-prefix", "route-collision"] {
             let mut r = inspect(true);
-            for c in &mut r.conformance.checks {
+            for c in &mut r.conformance.report.checks {
                 if c.name == name {
                     c.status = CheckStatus::Skip;
                 }
@@ -1629,12 +1629,12 @@ mod tests {
     #[test]
     fn an_inspect_report_without_its_route_checks_is_refused() {
         let mut r = inspect(true);
-        r.conformance.checks.clear();
+        r.conformance.report.checks.clear();
         let err = apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").unwrap_err();
         assert!(err.contains("route-attribution"), "{err}");
 
         let mut r = inspect(true);
-        r.conformance.plugin_name = "autumn-plugin-other".to_owned();
+        r.conformance.report.plugin_name = "autumn-plugin-other".to_owned();
         assert!(apply_inspect(&mut sandboxed(), &r, "0.7.0", "2026-10-01").is_err());
     }
 
@@ -1944,7 +1944,7 @@ mod tests {
         assert_eq!(s3.conformance.checked, "2026-10-01");
     }
 
-    fn write_report(dir: &Path, file: &str, r: &ConformanceReport) -> PathBuf {
+    fn write_report(dir: &Path, file: &str, r: &PluginCheckReport) -> PathBuf {
         let path = dir.join(file);
         std::fs::write(&path, serde_json::to_string(r).expect("json")).expect("write");
         path
@@ -1998,7 +1998,7 @@ mod tests {
             "route-collision",
         ] {
             let mut r = report("autumn-admin-plugin", true, contract());
-            r.checks.retain(|c| c.name != cut);
+            r.report.checks.retain(|c| c.name != cut);
             let err = apply_report(
                 &mut listing("autumn-admin-plugin"),
                 &r,
@@ -2009,7 +2009,7 @@ mod tests {
             assert!(err.contains(cut), "{err}");
         }
         let mut r = report("autumn-admin-plugin", true, contract());
-        r.checks.retain(|c| c.name != "route-prefix");
+        r.report.checks.retain(|c| c.name != "route-prefix");
         let mut prefixed = listing("autumn-admin-plugin");
         prefixed.prefix = "/admin".to_owned();
         assert!(apply_report(&mut prefixed, &r, "0.8.0", "2026-10-01").is_err());

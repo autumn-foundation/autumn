@@ -1,12 +1,14 @@
-# autumn-web API Reference (0.8.0)
+# autumn-web API Reference (0.10.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.8.0**, the current release line,
+Version identity: this reference tracks **0.10.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
 arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
-earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries predate 0.6.0.
+earlier, **(0.8.0)** is absent from 0.7.x and earlier, **(0.9.0)** is absent
+from 0.8.x and earlier, and **(0.10.0)** is absent from 0.9.x and earlier.
+Unmarked entries predate 0.6.0.
 
 ## Published crates
 
@@ -28,7 +30,7 @@ earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries pred
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.8.0`. This table lists the same crates, in the same order, as
+together at `0.10.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 
@@ -132,7 +134,7 @@ copy of the publish order.
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
-| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802) |
+| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802). Scalar fields (`Uuid`, `DateTime`, `NaiveDate`, `NaiveDateTime`, `Decimal`, `SqliteUuid`, `SqliteDecimal`) document as inline scalars, never `$ref`. `Decimal` is `string`/`decimal`, or `number` if serde writes a number (#2582) |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
 | `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
@@ -409,8 +411,9 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `#[normalize(downcase)]` with a `unique` column yields case-insensitive
   uniqueness. Non-`String` fields are a compile error (mirrors `#[encrypted]`).
   Generated hooks: `impl autumn_web::normalize::Normalize` on the model and
-  `NewX`; `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on
-  every model.
+  on every `NewX` (a no-op when the model has no `#[normalize]` columns);
+  `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on every
+  model.
 
 ## Repository-generated methods (`#[repository]`)
 
@@ -420,7 +423,7 @@ Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `cursor_key_type =` attr keys), bulk `save_many` / `save_many_skip_invalid` /
 `update_many` / `delete_many` / `upsert_many` (compile error on hooked repos),
 `with_lock`, `on_primary()`. Attr keys: `api =`, `policy =`,
-`scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
+`scope =`, `primary_reads`, `boundary =`, `soft_delete`, `tenant_scoped`, `hooks =`,
 `mcp` / `mcp = "read"`.
 
 **(0.6.0)**: `preload(records, spec)` (declarative associations);
@@ -484,11 +487,17 @@ helpers). Import the trait as `_`, then:
 
 ```rust
 use crate::models::PostComments as _;
-use autumn_web::commentable::{Comment, CommentNode};
+use autumn_web::commentable::{Comment, CommentNode, ThreadPage};
 
 async fn add_comment(&self, parent_id: i64, author_id: i64, body: &str,
                      reply_to: Option<i64>) -> AutumnResult<Comment>;
 async fn comment_thread(&self, parent_id: i64) -> AutumnResult<Vec<CommentNode>>;
+// One page of top-level comments and all their replies (#3325).
+async fn comment_thread_page(&self, parent_id: i64, after: Option<i64>,
+                             page_size: usize) -> AutumnResult<ThreadPage>;
+// The page that shows `comment_id`.
+async fn comment_thread_page_containing(&self, parent_id: i64, comment_id: i64,
+                                        page_size: usize) -> AutumnResult<ThreadPage>;
 async fn delete_comment(&self, parent_id: i64, comment_id: i64) -> AutumnResult<usize>;
 async fn recompute_comment_count(&self, parent_id: i64) -> AutumnResult<i64>;
 
@@ -497,6 +506,9 @@ pub struct Comment { pub id: i64, pub parent_id: Option<i64>, pub author_id: i64
                      pub author_name: Option<String> }
 pub struct CommentNode { pub comment: Comment, pub depth: usize,
                          pub replies: Vec<CommentNode> }
+#[non_exhaustive]
+pub struct ThreadPage { pub nodes: Vec<CommentNode>, pub after: Option<i64>,
+                        pub next: Option<i64> }
 ```
 
 One `comments` table keyed on `(commentable_type, commentable_id)` serves every
@@ -506,7 +518,9 @@ be `i64` — both are compile-checked. `add_comment` row-locks the parent (the
 polymorphic column has no foreign key, so the probe is the referential check),
 enforces `max_depth` (default 5) and same-record `reply_to`, and moves
 `comment_count` with the #1325 counter-cache primitive in the same transaction.
-`comment_thread` is one query at any depth; `delete_comment` cascades to the
+`comment_thread` is one query at any depth, and reads the whole thread. On a
+request path use `comment_thread_page`: the page size sets its cost, and
+`next` is the cursor of the next page. `delete_comment` cascades to the
 descendant subtree and is idempotent, and takes `parent_id` so a comment id
 alone is never authority over a comment on another record. With
 `soft_delete = false` it refuses (`422`) a subtree that has a reply on another
@@ -516,10 +530,16 @@ be WRONG here — it keys on the fk column alone, which is shared across models)
 Like `react()`, all four take their own pooled connection — never hold a `Db`
 extractor across one. `autumn_web::commentable::router(cfg)` serves
 `GET`/`POST /{commentable_type}/{parent_id}` for every registered model from a
-single mount; it authorizes the **tenant**, never the record, so an app with
+single mount. Both read one page (`CommentsConfig::page_size`, default 50;
+`GET ?after=<id>` for a later page), and a `POST` shows the page that holds
+the new comment. It authorizes the **tenant**, never the record, so an app with
 private records must set `CommentsConfig::authorize(...)`. Build a host page's
 own thread with `commentable::thread_dom_id`/`thread_action` so the router's
-re-render lands on the same element. See `docs/guide/commentable.md`.
+re-render lands on the same element. Pair the `nest` with
+`.declare_plugin_routes(commentable::route_infos("/comments"))` (trunk-dev):
+the nested router is opaque to `autumn routes audit`, which fails without it.
+`GET` is `public`; `POST` is `gated` with `provenance: "declared"`. See
+`docs/guide/commentable.md`.
 
 **(0.7.0)** — `#[votable]` reaction helpers (#1362): declaring
 `#[votable(by = User, aggregate = sum|count)]` on a `#[model]` emits a
@@ -602,7 +622,10 @@ So prefer a real nested type over the comma-separated-string and
 JSON-in-a-string workarounds. This is the same bracket syntax `ListQuery`'s
 `?filter[<col>]=<val>` already used, generalized to arbitrary objects,
 sequences and depths — and it applies to the **query string only**: `Form<T>`
-still decodes bodies through `serde_urlencoded`.
+still decodes bodies through `serde_urlencoded`. `ChangesetForm` and
+`NestedChangesetForm` bodies decode through `form::from_urlencoded` (issue
+#3394): a repeated key fills a `Vec`/`HashSet`/`Option<Vec>`, a repeat on a
+single-value field is a 422, and brackets stay part of the key.
 
 Behaviour worth knowing when writing handlers:
 
@@ -670,6 +693,14 @@ delete actions remain last-write-wins.
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
 
+## Hedged requests (`autumn_web::hedge`)
+
+- `hedged(HedgePolicy::new(delay).with_max_hedges(n), allow, |attempt| fut)`
+  starts `make(0)`, and after each `delay` of silence starts another copy
+  (up to `n`, default 1). It returns the first output and drops the rest.
+  `allow` is asked before each extra copy; return `false` (for example from a
+  retry budget) to stop hedging. Only hedge calls that are safe to run twice.
+
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
 Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
@@ -694,13 +725,14 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
 - `MoneyError` {`Overflow`, `CurrencyMismatch`, `UnknownCurrency`, `Inexact`,
   `InvalidWeights`} → 422, except `Overflow` → 500.
 - `money::ledger::{ensure_account, set_allow_negative, account, post, balance,
-  transaction_by_key, trial_balance}` — all take `&mut RuntimeConnection`, so
+  transaction_by_key, trial_balance, balance_drift}` — all take `&mut RuntimeConnection`, so
   they nest inside `Db::tx`. `post` **requires** a transaction.
 - `Account::new(id, currency)` / `.disallow_negative()`; `Posting::debit(...)` /
   `::credit(...)`; `Transaction::new(key, postings).memo(...)` /
   `.validate()`; `IdempotencyKey::new(s)` / `::derive(namespace, &postings)`;
   `PostOutcome::{Posted, Replayed}` with `is_posted` / `is_replayed` /
-  `transaction`; `PostedTransaction`, `CurrencyTotal`, `Side`.
+  `transaction`; `PostedTransaction`, `CurrencyTotal`, `BalanceDrift`
+  (`account_id` / `stored` / `posted`), `Side`.
 - `LedgerError` {`Money`, `Unbalanced`, `PostingCount`, `OneSided`,
   `ZeroPosting`, `MixedCurrencies`, `NegativeAmount`, `UnknownAccount`,
   `AccountCurrency`, `KeyReuse`, `InvalidText`, `NegativeBalance`,
@@ -709,7 +741,11 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
   `EmptyTransaction` / `Database`, 422 for the rest.
 - Tables `ACCOUNTS_TABLE` / `TRANSACTIONS_TABLE` / `POSTINGS_TABLE`
   (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
-  framework migration set.
+  framework migration set. The account row stores the balance
+  (`balance_minor`, 0.10.0, #3339). A trigger keeps it, so `post` and `balance` do not
+  read the posting history, except one time for each account after the
+  migration. `NULL` means "not known": the next `post` sums the
+  postings and stores the result.
 
 ## SLA obligations (`autumn_web::sla`, 0.8.0, #1826)
 
@@ -764,6 +800,21 @@ Free functions rendering changeset-aware, accessible inputs:
   `form.text_input(...)`).
 - **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
+- **(0.9.0, #3395)**: `FieldOptions` + a `*_with` variant of each helper
+  (`text_input_with`, `text_input_htmx_with(.., url, token_field, &opts)`,
+  `password_input_with`, `textarea_input_with`, `checkbox_input_with`,
+  `number_input_with`, `date_input_with`, `datetime_input_with`,
+  `select_input_with`, `rich_text_area_with`, `rich_text_area_htmx_with`,
+  `RowScope::{text,number,textarea}_input_with`). `FieldOptions::new()
+  .hint(..).required().placeholder(..).autocomplete(..).inputmode(..)
+  .pattern(..).min(..).max(..).disabled().readonly().data(name, v).hx(name, v)`.
+  The hint is `{field}-hint`, named in `aria-describedby` before the error.
+  No setter for `id`/`name`/`class`/`aria-*`; the label stays positional.
+  Every control has a `required_*` helper (`required_password_input`,
+  `required_textarea_input`, `required_checkbox_input` added); a required
+  label shows an `aria-hidden` `*` marker. `FormFor::field_options(field,
+  FieldOptions)` sets options per field (a checkbox and a password take
+  `required` only from options).
 - **(0.6.0)**: `form_for(&changeset,
   action, method) -> FormFor` whole-form builder. Renders the opening
   `<form>` (audited CSRF injection + hidden `_method` override, as
@@ -784,7 +835,52 @@ Free functions rendering changeset-aware, accessible inputs:
   `FieldControl` variants (`#[non_exhaustive]`): `Text`, `Textarea`,
   `Password`, `Number { step: Option<String> }`, `Checkbox`, `Date`,
   `DateTime`, `Select { options: Vec<(String, String)> }`, `File` (any
-  `File` field ⇒ `enctype="multipart/form-data"`).
+  `File` field ⇒ `enctype="multipart/form-data"`), and **(0.10.0, #3405)**
+  `Switch`, `Range { step }`, `Radio { options }`, `CheckboxGroup { options }`,
+  `Segmented { options }`, `Email`, `Tel`, `Url`, `Time` (derived for a
+  `NaiveTime` column), `Month`, `Color`, `Hidden`, and **(0.10.0, #3412)**
+  `Otp(OtpFormat)`.
+- **(0.10.0, #3412)** `otp_input`, `required_otp_input`,
+  `otp_input_with(.., OtpFormat, &FieldOptions)`: one
+  `<input autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{n}">`
+  over `aria-hidden` boxes; the value is never rendered; `maxlength="{n}"`
+  for no-JS pages (the runtime removes it). An `autocomplete`, `inputmode`,
+  `pattern` or `maxlength` option replaces the default.
+  `OtpFormat::digits(n)` (clamped 4..=10, default 6), `.group(g)` (2..=5 and
+  `< n`, needs `autumn-widgets.js`; `formdata` and `htmx:configRequest` strip
+  the spaces). The runtime keeps only digits of a paste (full-width too). Password options on `FieldOptions`:
+  `.current_password()` / `.new_password()` (`autocomplete`), `.reveal()` /
+  `.reveal_label(t)` (`hidden` `aria-pressed` button; the input gets
+  `spellcheck="false"`; JS shows it, hides the password on submit /
+  `reset` / `pagehide`), `.strength_hint()` /
+  `.strength_labels([..; 4])` (`{field}-strength` polite live region in
+  `aria-describedby`; a hint, not a policy). Also `.minlength(n)` /
+  `.maxlength(n)` on text-entry controls.
+- **(0.10.0, #3405)** native input helpers, each with `*_with(.., &FieldOptions)`:
+  `switch_input` (`role="switch"` checkbox, `#[serde(default)] bool`),
+  `range_input(.., step)`, `radio_group(.., &[(value, label)])`,
+  `checkbox_group(..)` (bind `#[serde(default)] Vec<String>`; prefilled from
+  `Changeset::field_values`), `segmented_control(..)`, `email_input`,
+  `tel_input`, `url_input`, `time_input` (`HH:MM`, reads into `NaiveTime`),
+  `month_input` (`YYYY-MM` `String`), `color_input` (lowercase `#rrggbb`),
+  `hidden_input(&cs, field)` (no label, no wrapper). `required_*` exists for
+  switch, radio group, segmented, email, tel, url, time, month. Range, color
+  and hidden drop `required`; a required checkbox group shows the marker
+  only (validate "one or more" on the server). A group is a `<fieldset>` +
+  `<legend>`; the first input has `id="{field}"` so `error_summary` links
+  land on it, the rest `id="{field}-{index}"`.
+- **(0.10.0, #3409)** select: `grouped_select_input(&cs, field, label, &[(value,
+  label)], &[(group_label, &[(value, label)])])` (+ `_with`, `required_`)
+  writes top-level options, then one `<optgroup>` per group;
+  `FieldControl::GroupedSelect { options, groups }` for `form_for`.
+  `FieldOptions::multiple()` writes `multiple` on a `<select>` or a file
+  input; a multiple select marks every `Changeset::field_values` value (bind
+  `#[serde(default)] Vec<T>`; in `form_for` the model `required` flag skips
+  it). A single select marks only the first matching option.
+  `FieldOptions::styled_select()` adds `autumn-select`: `appearance:
+  base-select` behind `@supports`; other browsers and `multiple` keep the
+  native control. No JS. `FieldContext::control` writes `multiple` on a
+  custom `select` or file `input`.
   Decode-side contracts handled by the `#[model]`-generated `NewX`:
   non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
   `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`
@@ -830,6 +926,11 @@ primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`,
 - `MenuItem::new(name)` (renders `role="menuitem"` on a `<button>`; `.href(..)`
   switches to `<a>`); `.icon(markup)` (name ⇒ `aria-label`) / `.class(..)`.
   WCAG 4.1.2.
+- The types prove that a name is present, not that it holds text. An empty or
+  blank name (`Img::new(src, "")`, `.aria_label("")`, a blank
+  `RadioOption`/`SelectOption` label) trips a `debug_assert!` at the call site
+  (#2666). Give a name from data a fallback (`a11y::is_blank(text)` uses the
+  same rule); use `Img::decorative(src)` for an image with no information.
 
 ### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` / `RadioGroup`)
 
@@ -869,7 +970,10 @@ Per-primitive setters (in addition to the shared set):
 - **`RadioGroup::new(name, first)`** — the first `RadioOption` is a constructor
   argument, so a group always has a choice; `.option(RadioOption)` /
   `.options(iter)`, `.checked_value(s)`, `.id_prefix(s)` (for the same group
-  rendered repeatedly). `RadioOption::new(value, label)`
+  rendered repeatedly). `.option` takes a built `RadioOption`, as `new` does;
+  `Select::option` takes the `(value, label)` pair. Choice ids are valid CSS
+  selectors: a first part that does not start with a letter after any
+  leading `_` gets one more `_` (`1plan` → `_1plan-…`). `RadioOption::new(value, label)`
   requires the choice label; `.checked()` / `.disabled()`. The group renders
   `<fieldset><legend>` (visible name) or `<div>` (ARIA name), both with
   `role="radiogroup"`; `aria-invalid` and `hx-*` land on each `<input>`,
@@ -880,7 +984,9 @@ Per-primitive setters (in addition to the shared set):
 - `autumn_web::widgets`: `card(&body, &CardConfig)`,
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
-  `modal_close_button`, `confirm_action(...)`.
+  `modal_close_button`, `confirm_action(...)`,
+  `drawer(id, title, &body, &DrawerConfig)`, `drawer_trigger` (0.10.0, #3403);
+  `DialogSize` sizes both, `close_button(label)` adds a ×.
 - `autumn_web::widgets::transition_controls(action, field, current,
   transitions, can, csrf, csrf_field)` (#1917) — renders one CSRF-protected,
   no-JS `POST` form + submit button per field-level `#[state_machine]`
@@ -927,7 +1033,9 @@ Per-primitive setters (in addition to the shared set):
   `422`), `.label(s)` / `.empty_text(s)` / `.submit_label(s)` /
   `.reply_label(s)` / `.placeholder(s)`, `.body_field(s)` / `.reply_field(s)`,
   `.hx_target(s)` (defaults `#{dom_id}`), and `.read_only(Option<String>)` for
-  a signed-out visitor (thread renders, every form disappears, prompt shown).
+  a signed-out visitor (thread renders, every form disappears, prompt shown),
+  and `.page(after, next)` (from a `ThreadPage`) for the "More comments" /
+  "Earlier comments" links, with `.more_label(s)` / `.earlier_label(s)`.
   Render with `comment_thread(&cfg, &CommentView::from_thread(&nodes)) ->
   Markup`; `CommentView` is a plain view struct so the widget compiles without
   `db` and can be built from any source. Nested `<ol>`s (depth is exposed to
@@ -945,7 +1053,8 @@ Per-primitive setters (in addition to the shared set):
   `.autumn-comment-meta` / `.autumn-comment-author` / `.autumn-comment-time` /
   `.autumn-comment-body` / `.autumn-comment-reply` /
   `.autumn-comment-reply-toggle` / `.autumn-comment-form` /
-  `.autumn-comment-label` / `.autumn-comment-input` / `.autumn-comment-submit`.
+  `.autumn-comment-label` / `.autumn-comment-input` / `.autumn-comment-submit` /
+  `.autumn-comments-more` / `.autumn-comments-earlier`.
 - `autumn_web::widgets::{BulkActionsConfig, bulk_actions_form,
   bulk_select_checkbox, bulk_actions_toolbar}` (#1312) — the no-JavaScript
   bulk-select + delete-selected flow. `BulkActionsConfig::new(action_url)`
@@ -985,11 +1094,49 @@ Per-primitive setters (in addition to the shared set):
   &AvatarConfig)` with `AvatarSize::{Small,Medium,Large}` (image or
   colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
   &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
-  `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+  `error_summary(&Changeset) -> Option<Markup>` (each entry links to
+  `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
+  focus moves to it on a failed submit — one per page). All prelude
+  re-exported.
+- `autumn_web::widgets` small display set (0.10.0, #3406,
+  `docs/guide/display-widgets.md`): `button(label, &ButtonConfig)` with
+  `ButtonVariant::{Primary,Secondary,Ghost,Destructive,Link}`,
+  `ButtonSize::{Small,Medium,Large}`, `.kind/.submit/.icon/.icon_only/
+  .disabled/.id/.class/.attrs`, `.loading()` (static `aria-busy="true"` +
+  `disabled`) and `.loading_on_request()` (`data-autumn-busy`: busy during its own
+  request — it sends it, submits the form, or `hx-indicator` names it;
+  `autumn-widgets.js` sets `aria-busy` on it and the swap target);
+  `.attrs` passes app attributes through (widget-owned names win); `button_group(label, &[Markup])` /
+  `button_group_with(.., &ButtonGroupConfig::new().vertical())`;
+  `spinner(label)` / `spinner_with(.., &SpinnerConfig)` (`SpinnerSize`,
+  `.indicator(id)`); `skeleton(SkeletonShape::{Line,Block,Circle})` /
+  `skeleton_with(.., &SkeletonConfig::new().count(n).indicator(id))` — an
+  indicator has `autumn-indicator`, hidden until `.htmx-request`;
+  `progress(label, Option<f64>, max)` / `progress_with(.., &ProgressConfig)`
+  and `meter(label, value, min..=max)` / `meter_with(.., &MeterConfig)`
+  (`low/high/optimum/visible_label/value_text`, values clamped);
+  `separator()` / `separator_with(&SeparatorConfig::new().vertical()
+  .decorative())`; `kbd(key)` / `kbd_combo(&[keys])`;
+  `empty_state(title, body, Option<&Markup>)` / `empty_state_with(..,
+  &EmptyStateConfig)`; `avatar_group(label, &[Markup])` /
+  `avatar_group_with(.., &AvatarGroupConfig)` (`max` counts the `+N` item,
+  default `DEFAULT_AVATAR_GROUP_MAX` = 5; `.total`, `.size`,
+  `.more_label("{count} more")`). `FieldOptions::auto_grow()` and
+  `a11y::TextArea::auto_grow()` add `autumn-auto-grow`
+  (`field-sizing: content`). All prelude re-exported.
+- `autumn_web::widgets::{accordion, collapsible, collapsible_with}` +
+  `AccordionConfig::new(name)` / `CollapsibleConfig` — no-JS disclosure on
+  native `<details>`. Exclusive by default; `.multiple()`, `.open(i)`,
+  `.level()`, `.class()`, `.attrs()`. See `docs/guide/accordion.md`.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
-  `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
+  `toast_in(region_id, message, AlertVariant)` /
+  `toast_with(message, AlertVariant, &ToastConfig)` / `toast_region(id)` +
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
-  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS).
+  (`hx-swap-oob="beforeend:#<region-id>"`), CSS auto-dismiss after
+  `DEFAULT_TOAST_DURATION` (5 s). Hover or focus pauses the timer.
+  `ToastConfig` setters: `region`, `duration`, `persistent`, `close_label`.
+  A persistent toast ignores `duration`. Each toast has a close button;
+  `autumn-widgets.js` shows it and moves focus on close (no JS: no button). The region is `popover="manual"`, so toasts show above a modal.
   `toast_region` is a persistent `aria-live="polite"` region; non-error toasts
   inherit its politeness (no own `role`/`aria-live`) while `Error` announces
   assertively via its own `role="alert"` (reuses the `AlertVariant` color
@@ -998,7 +1145,12 @@ Per-primitive setters (in addition to the shared set):
   — htmx infinite-scroll / "Load more" feed from a `CursorPage`: one cursored
   `hx-get` sentinel appends the next page in place (no reload, no duplicate
   rows), progressive `<a href>` fallback; `feed_page` is the per-page append
-  fragment. All prelude re-exported.
+  fragment. `tooltip(id, text, |tip| trigger)` /
+  `tooltip_with(id, text, &TooltipConfig, |tip| trigger)` with
+  `TooltipPlacement::{Top,Bottom,Start,End}` — accessible tooltip: the
+  closure gets the `role="tooltip"` id for `aria-describedby` (or
+  `aria-labelledby`); hover/focus show it, Escape hides it, `interestfor` on
+  Chromium (`docs/guide/tooltip.md`). All prelude re-exported.
 - `autumn_web::flash::{flash_messages, flash_messages_with,
   FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
   `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,
@@ -1039,6 +1191,29 @@ Per-primitive setters (in addition to the shared set):
 (Typed accessible primitives — `Img` / `Button` / `Link` / `MenuItem` /
 `TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` — are documented
 in **Typed accessible primitives** above.)
+
+## Widget packs (`autumn_web::widget_pack`, feature `maud`, 0.10.0, #3400)
+
+| API | Notes |
+|---|---|
+| `WidgetPack::new(name)` | `name` is `[a-z0-9]` words joined by `-`; panics otherwise. Classes are `autumn-<name>-*`. |
+| `.extend(stories)` / `.assets(&'static PluginAssets)` | Stories (slug must start `<name>-`) and the CSS/JS bundle. |
+| `.head()` / `.gallery()` / `.stylesheet_urls()` / `.script_urls()` | Layout tags with SRI; a `StoryGallery` with the asset links. |
+| `AppBuilder::widget_pack(pack)` | Serves the bundle and merges the stories into `/_stories`. Second install of a name is a no-op. |
+| `AppBuilder::with_story_gallery(g)` | Adds (merges); duplicate slugs panic at startup. |
+| `StoryGallery::stylesheet(href)` / `.script(src)` / `.merge(other)` | Extra assets each gallery page links. |
+| `form::FieldRenderer` (`name`, `render`, `multipart`, `grouped`) | Plugin form control. `FieldControl::custom(r)`, `custom_input_with(&cs, field, label, &r, &opts)`. |
+| `form::FieldContext::control(tag, attrs, body)` | Writes the control with `id`/`name`/`value`/`required`/`aria-*` + passthrough; drops owned names, `on*`/`hx-on*`, `style`; never pre-fills password/file/checkbox/radio. |
+| `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required` (not on a checkbox: check "one or more" on the server), `aria-invalid`, passthrough. |
+| `widget_pack::element(tag, attrs, &FieldOptions, body)` | Root of a non-input widget with the app `data-*`/`hx-*` passthrough. |
+| `plugin_conformance::run_conformance(&ConformanceConfig::new(name).contract(c).no_routes(), &routes)` | For a plugin that mounts no routes (cache, background runtime): no route under the config name or the contract's `plugin`/`registered_as` skips `route-attribution`; such a route fails it. Take the contract from `builder.plugin_contracts()` (it carries `registered_as`); without that, every plugin route fails. Do not set a `prefix` with it. Library counterpart of `autumn plugin-check --no-routes`. |
+| `plugin_conformance::run_route_checks(&config, &routes)` | The route checks of `run_conformance` (all but `experimental-surface`). With a contract, if no route carries the config name and a route carries `registered_as`, the checks use `registered_as`. `autumn plugin-check` calls it on its route dump, so the CLI and the library give the same results, except that `--no-routes` needs `registered_as` to skip (#2828). |
+| `RouteSource::from_wire("plugin:<name>")` | Reads the route-dump source string: `framework`, `plugin:<name>`, else `User`. |
+| `plugin_conformance::widgets::run_widget_conformance(&pack)` | Static: `widget-pack-name`, `widget-stories`, `widget-class-names`, `widget-markup-csp`, `widget-tokens`, `widget-scripts`. |
+| `plugin_conformance::widgets::browser::run_widget_browser_conformance(&pack, axe_src).await` | Feature `system-tests`: `widget-axe` (light + dark), `widget-console`, `widget-keyboard`. |
+| `Page::axe_violations(axe_src)` / `SystemTest::plugin_assets(&ASSETS)` | Shared axe check; serve a bundle in a system test. |
+| `autumn:init` event | Fires on `document` at `DOMContentLoaded` and on each htmx-swapped root, before roving init. |
+| Tree keys (`role="tree"` + `data-autumn-roving`) | The keyboard core gives the APG tree keys: ArrowRight opens or goes to the first child, ArrowLeft closes or goes to the parent, `*` opens the siblings; typeahead and arrows skip items in a `hidden` subtree; disabled tree items take focus. A parent `treeitem` has `aria-expanded` and holds its `role="group"` or names it in `aria-owns`. Fires `autumn:expand` / `autumn:collapse` on the item (load lazy children there). Pack JS adds no arrow-key code (`docs/guide/keyboard.md#tree-keys`). |
 
 ## Cache read-through (0.6.0)
 
@@ -1164,7 +1339,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
-- Unreleased (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
+- 0.9.0 (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
   durable claims renew on a heartbeat; `JobContext::lease_lost()`,
   `is_cancelled()`, `cancelled()`.
 
@@ -1190,8 +1365,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 
 - `autumn_web::cluster` — zero-dependency two-node clustering: authenticated
   TCP gossip membership plus one shared primitive, an eventually consistent
-  cluster-wide grow-only counter. Always compiled (no cargo feature); inert
-  unless `[cluster] enabled = true`. Not leader election, not mutual
+  cluster-wide grow-only counter. Needs the `cluster` feature (in `default`;
+  #2795). Inert unless `[cluster] enabled = true`. Without the feature,
+  `[cluster]` parses and `enabled = true` fails boot. Not leader election, not mutual
   exclusion, not durable — for run-once work use `Lock` above.
 - Handle: `state.extension::<ClusterHandle>() -> Option<Arc<ClusterHandle>>`
   (`None` when disabled). `ClusterHandle::{node_id() -> &str, local_addr() ->
@@ -1327,7 +1503,11 @@ double-submits and replays.
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
   `ValidateExt`, `Validated`, `Flash`, `Multipart`, `HxRequest`,
-  `HxResponseExt`, `Sse`, `Event`, `TaskArgs`, `SignedWebhook`.
+  `HxResponseExt`, `Sse`, `Event`, `TaskArgs`, `SignedWebhook`. With CSRF off
+  (the dev default), `CsrfToken` is empty; `Option<CsrfToken>` is `None`.
+- Database: `autumn_web::db::prelude::*` (Diesel's prelude with the async
+  `RunQueryDsl`), `AppBuilder::migrations_for(MigrationScope, set)`,
+  `AppBuilder::plugin_migrations_for(name, MigrationScope, set)`.
 - Error and response: `AutumnError`, `AutumnResult`, `IntoResponse`,
   `StatusCode`, `Redirect`.
 - Data helpers: `Changeset`, `ChangesetForm`, `IntoChangeset`, mutation hook
@@ -1346,7 +1526,7 @@ double-submits and replays.
 | `jobs(Vec<JobInfo>)` | Background jobs |
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
-| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived). Get the document out with `autumn openapi export` — no boot, no database (#802) |
+| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived, in both request and response positions). Get the document out with `autumn openapi export` — no boot, no database (#802). A type with different request and response shapes gets two components, `Widget` and `WidgetRequest` (#2607). To render a ref yourself, use `openapi::schema_entry_to_value_in(entry, &openapi::schema_component_index_for(&config, &routes), SchemaDirection::Request)` for a request; `schema_entry_to_value` renders a response |
 | `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)`, `mcp_tasks(config)`, `mcp_instructions(text)`, `mcp_catalog(catalog)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()/mcp_task()/mcp_core()` toggle exposure per route (plugin fluent opt-in); `mcp_tasks` sets task-tool limits; `mcp_instructions` sets the server instructions; `mcp_catalog(McpCatalog::Progressive)` lists core tools plus `search_tools` and `call_tool` |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
@@ -1355,7 +1535,9 @@ double-submits and replays.
 | `merge(router)`, `nest(path, router)` | Raw Axum composition |
 | `declare_plugin_routes(...)` | Plugin route declarations |
 | `plugin_assets(&'static PluginAssets)` | Serve a plugin's compiled-in assets under `/static/_plugins/<ns>/`: hashed URL `immutable`, plain URL `must-revalidate`, ETag/304/Range, routes declared public. Build the bundle with `plugin_assets!("ns")` (embeds `assets/`, `embed-assets`) or `PluginAssets::from_files(ns, &[(path, bytes)])`; emit tags with `ASSETS.script_tag(path)` / `deferred_script_tag` / `stylesheet_tag` (hashed URL + `integrity`). A second, different bundle with the same namespace panics. Guide: `docs/guide/plugin-assets.md` |
-| `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks |
+| `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks. Every role runs them: use `background_task` for a loop |
+| `background_task(name, capability, run)`, `background(BackgroundTask)` | A loop that runs until shutdown, only on the roles that run `capability` (a `Capability` or a `PluginCapability`). `BackgroundTask::queues` and `::explicit` add queues and the plugin switch. Listed in `/actuator/tasks` and `autumn graph` (#3545) |
+| `plugin_capability(PluginCapability)` | Declare a plugin capability that no task uses, so `[roles.<name>] capabilities` can name it |
 | `with_extension(value)`, `update_extension(...)`, `extension<T>()` | Typed state extensions |
 | `i18n(bundle)`, `i18n_auto()` | I18n bundle setup |
 | `with_config_loader(loader)` | Replace config loading |
@@ -1491,8 +1673,8 @@ middleware (tenant scoping, an auth shim, request enrichment) — mapping the
 layer onto individual handlers instead tests a stack the real app never
 serves.
 
-`Page`: `visit`, `fill`, `click`, `expect_text`, `expect_url`,
-`expect_attribute`, `expect_hx_settle`, `expect_sse_event`,
+`Page`: `visit`, `fill`, `click`, `press`, `paste(text)`, `hover`, `move_mouse(x, y)`, `set_javascript_enabled`, `expect_text`, `expect_url`,
+`expect_attribute`, `expect_on_top`, `expect_hx_settle`, `expect_sse_event`,
 `expect_no_console_errors`, `console_errors`, `snapshot`, `evaluate`. The
 `expect_*` assertions poll to a deadline and ignore the transient CDP errors a
 mid-poll navigation produces; `evaluate` is a single raw call that does not.
@@ -1503,8 +1685,11 @@ See `docs/guide/system-tests.md`.
 
 ```toml
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
-ws = ["dep:tokio-stream"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "error-reporting", "plugin-conformance", "runtime-config", "axum-ws"]
+axum-ws = ["axum/ws"]            # axum's WebSocket extractor (in `default`)
+ws = ["axum-ws", "dep:tokio-stream"]
+plugin-conformance = []          # `plugin_conformance` harness (in `default`)
+runtime-config = []              # `runtime_config` store (in `default`)
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
@@ -1513,7 +1698,7 @@ multipart = ["axum/multipart"]
 tailwind = []
 oauth2 = ["http-client"]
 http-client = ["dep:reqwest"]
-openapi = ["dep:serde_yaml"]
+openapi = ["dep:serde-saphyr"]
 mcp = ["openapi"]
 markdown = ["dep:pulldown-cmark"]
 constela = ["maud"]
@@ -1542,13 +1727,14 @@ storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
 seed = ["db"]
 system-info = []
-reporting = []
+error-reporting = []            # panic catch + ErrorReporter (in `default`)
+reporting = ["error-reporting"]  # adds failure capture and `autumn replay` (in `default`)
 webauthn = ["dep:webauthn-rs"]
 csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.8"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.10"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 
@@ -1586,6 +1772,7 @@ Limits are two independent sets. `Limits { max_bytes: 512 KiB, max_depth: 64,
 max_nodes: 20_000 }` bounds the **document** and is applied before and around
 deserialization. `RenderLimits { max_depth: 128, max_nodes: 50_000, max_each_items: 5_000,
 max_output_bytes: 4 MiB }` bounds the **expansion** against runtime state.
+Work is bounded too: 320 fuel units per allowed node, spent on nodes, expressions and bytes scanned.
 `max_output_bytes` spans the body and every portal together and also caps what
 one expression may *build* (`concat`/`array`/`obj`/`+` assemble a value inside
 the evaluator before any of it is emitted); `max_depth` caps the shape of state
@@ -1604,7 +1791,7 @@ Guide: `docs/guide/constela.md`.
 ## Workspace dependency versions
 
 ```toml
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
 tokio-util = "0.7"
 diesel = { version = "2", features = ["sqlite", "postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
@@ -1628,7 +1815,6 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["tra
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
-tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
 validator = { version = "0.21", features = ["derive"] }
 bcrypt = "0.19"
@@ -1746,6 +1932,8 @@ An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
 | `node::ttfb::measure(&Probe)` | TTFB edge vs origin and a byte compare of each pair; `Report::passes(min_percent)` |
 | `autumn edge serve --origin URL` | CLI edge node; `--capsule`, `--listen`, `--kv FILE`, `--probe-path`, `--no-probe`, `--response-header`, `--trusted-proxy`, `--quiet`; stops on Ctrl-C or SIGTERM |
 | `autumn edge ttfb --edge URL --origin URL --path P` | CLI probe; exit 0 pass, 1 divergence or reduction < `--min-reduction` (50), 2 error; `--divergence-only` |
+| `autumn edge bundle --target cloudflare --origin URL` | Writes `edge/cloudflare/`: capsule, JS host, `worker.mjs` (rewritten each run) and `wrangler.toml` (written once); `--response-header`, `--probe-path`, `--no-probe`, `--name`, `--out`, `--capsule`. Deploy with `wrangler deploy` |
+| `js::HOST` / `js/autumn-edge-host.mjs` | Web-standard JS host: `Capsule` (same WASI surface as `host`), `createEdgeGateway({ capsule, origin, kv, identity, responseHeaders, probeOrigin, clientIp, onLane })`; async KV by replay-on-miss (ADR-0024) |
 | `paths![…]` / `paths::PathExt::with_query` | Typed path helpers of `#[edge]` routes; compile for wasm; same bytes as `autumn_web::paths` |
 | `autumn build --embed` | Embedded native binary, then the capsule (with `embed-assets`) |
 | `conformance::compare_capsule(origin, capsule)` | Raw capsule vs origin; excuses `VOLATILE_HEADERS`, `SECURITY_HEADERS` and `CORS_HEADERS` only |
@@ -1830,6 +2018,10 @@ Frequently used env keys:
 | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` |
 | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` |
 | `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS` | `database.replica_max_lag_ms` |
+| `AUTUMN_DATABASE__MMAP_SIZE` | `database.mmap_size` (SQLite, bytes; `0` = off) |
+| `AUTUMN_DATABASE__CACHE_SIZE_KIB` | `database.cache_size_kib` (SQLite, KiB; `0` = default) |
+| `AUTUMN_DATABASE__FLEET__MMAP_SIZE` | `database.fleet.mmap_size` |
+| `AUTUMN_DATABASE__FLEET__CACHE_SIZE_KIB` | `database.fleet.cache_size_kib` |
 | `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS` | `server.http.header_read_timeout_ms` |
 | `AUTUMN_REALTIME__MAX_MESSAGE_BYTES` | `realtime.max_message_bytes` |
 | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` |
@@ -2167,7 +2359,9 @@ record lives in the tenant's zone, where autumn holds no credential.
 A failure names the domain AND its tenant in the `custom_domains` health
 indicator and raises #1610's `scheduled_task_failure` alert for
 `custom_domain_certificates`, while every other domain keeps serving and
-renewing. `autumn doctor` grades the section and, with `--online`, flags
+renewing. The same indicator reports `issuance_budget` (orders used this hour,
+both caps, `global_retry_after_secs`, `domains_at_limit`). A spent budget stays
+`Up`: it means throttled, not broken. `autumn doctor` grades the section and, with `--online`, flags
 registered domains whose DNS no longer points here. Offboarding stops routing,
 serving and renewal and deletes the stored certificate; the `custom_domains`
 retention dataset prunes abandoned registrations and orphaned certificates.

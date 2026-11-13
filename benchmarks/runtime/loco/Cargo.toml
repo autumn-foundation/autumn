@@ -11,15 +11,18 @@ name = "bench-loco"
 path = "src/main.rs"
 
 [dependencies]
-loco-rs = { version = "0.14", features = ["with-db"] }
-sea-orm = { version = "1", features = [
+# Pinned to loco-rs 1.3 with sea-orm 2.0 and sea-orm-migration 2.0, the
+# current stable releases (loco-rs 1.3 requires sea-orm 2 and sqlx 0.9). The
+# Docker image uses the same Rust as the Autumn image.
+loco-rs = { version = "1.3", features = ["with-db"] }
+sea-orm = { version = "2.0", features = [
     "sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono"
 ] }
-sea-orm-migration = { version = "1" }
+sea-orm-migration = { version = "2.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+axum = "0.8.1"
 async-trait = "0.1"
 tracing = "0.1"
 

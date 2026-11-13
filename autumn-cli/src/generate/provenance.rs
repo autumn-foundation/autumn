@@ -28,6 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::config::GENERATE_CONFIG_FILENAME;
+use super::spelling;
 
 /// Project-relative location of the generator provenance manifest.
 ///
@@ -75,6 +76,32 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// How a recorded file relates to the resource that wrote it (issue #2557).
+///
+/// Only a plan that claims to be the sole resource of its invocation records
+/// a scope (see `Plan::claim_sole_resource`). No scope means an older CLI or
+/// an unclaimed plan wrote the entry. `destroy` never sweeps such an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// A `Create`/`CreateBytes` file. Only this resource uses it.
+    Owned,
+    /// A `CreateIfAbsent` file. Sibling resources can use it too.
+    Shared,
+}
+
+/// One entry, as the orphan sweep reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded<'a> {
+    /// Project-relative, forward-slashed key. Not validated: it is manifest
+    /// data.
+    pub key: &'a str,
+    /// Digest of the file as it was written.
+    pub digest: &'a str,
+    /// See [`Scope`].
+    pub scope: Option<Scope>,
+}
+
 /// One recorded file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {
@@ -92,6 +119,68 @@ struct Entry {
     /// claiming another's output — `autumn new --starter` writes files through
     /// this same engine, and `autumn destroy auth` must not delete them.
     invocation: String,
+    /// See [`Scope`]. Absent in manifests from 0.8.0 and from unclaimed plans.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_scope"
+    )]
+    scope: Option<Scope>,
+}
+
+/// Read a `scope`, and read a value this CLI does not know as no scope.
+///
+/// A strict parse would fail the whole manifest on one unknown value (from a
+/// newer CLI, or a hand edit). `load` reads a failed parse as empty, and the
+/// next `save` would then drop every other entry.
+fn lenient_scope<'de, D>(deserializer: D) -> Result<Option<Scope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<toml::Value>::deserialize(deserializer)?;
+    Ok(match value.as_ref().and_then(toml::Value::as_str) {
+        Some("owned") => Some(Scope::Owned),
+        Some("shared") => Some(Scope::Shared),
+        _ => None,
+    })
+}
+
+/// The stored description of one shared-file edit that a run made (issue
+/// #2560).
+///
+/// `destroy` compares anchors with the reverts of its own plan. An anchor holds
+/// no template text, so a template change does not alter it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RevertAnchor {
+    /// Project-relative, forward-slashed path of the edited file.
+    pub path: String,
+    /// The revert kind and the values that name the edit, as `Kind(values)`.
+    pub revert: String,
+}
+
+impl RevertAnchor {
+    /// The revert kind: the text before the first `(`.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        self.revert.split('(').next().unwrap_or(&self.revert)
+    }
+
+    /// Whether the path names a file inside the project.
+    ///
+    /// The path comes from the manifest. Only plain components qualify: an
+    /// absolute path or a `..` is not a target.
+    #[must_use]
+    pub fn is_project_relative(&self) -> bool {
+        Path::new(&self.path)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+    }
+}
+
+impl std::fmt::Display for RevertAnchor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path, self.revert)
+    }
 }
 
 /// The on-disk shape of [`MANIFEST_PATH`].
@@ -100,6 +189,15 @@ struct ManifestFile {
     /// Project-relative path → what was written there, and by what.
     #[serde(default)]
     files: BTreeMap<String, Entry>,
+    /// Maps a run id ([`run_id`]) to the shared-file edits of that run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    runs: BTreeMap<String, Vec<RevertAnchor>>,
+}
+
+/// The run id of an invocation. The invocation has control characters, so the
+/// id is its hash. A hash is a valid TOML key.
+fn run_id(invocation: &str) -> String {
+    digest(invocation.as_bytes())
 }
 
 /// What identifies the generator inputs of this run, for a project at `root`.
@@ -237,6 +335,7 @@ fn normalize_invocation(args: impl Iterator<Item = String>) -> String {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Provenance {
     entries: BTreeMap<String, Entry>,
+    runs: BTreeMap<String, Vec<RevertAnchor>>,
 }
 
 impl Provenance {
@@ -256,6 +355,7 @@ impl Provenance {
         let file: ManifestFile = toml::from_str(&text).unwrap_or_default();
         Self {
             entries: file.files,
+            runs: file.runs,
         }
     }
 
@@ -275,13 +375,13 @@ impl Provenance {
     ///
     /// False when nothing is recorded — an unproven file is never assumed ours
     /// — and false when a different command recorded it (see [`Entry`]).
+    /// Reads the entry of another spelling when there is no exact entry
+    /// (issue #3382).
     #[must_use]
     pub fn is_ours(&self, root: &Path, path: &Path, digest: &str, invocation: &str) -> bool {
-        key(root, path).is_some_and(|k| {
-            self.entries
-                .get(&k)
-                .is_some_and(|e| e.digest == digest && e.invocation == invocation)
-        })
+        self.owners(root, path)
+            .iter()
+            .any(|e| e.digest == digest && e.invocation == invocation)
     }
 
     /// Whether ANY command wrote exactly `digest` to `path`.
@@ -294,33 +394,153 @@ impl Provenance {
     /// does before it asks.
     #[must_use]
     pub fn was_written(&self, root: &Path, path: &Path, digest: &str) -> bool {
-        key(root, path).is_some_and(|k| self.entries.get(&k).is_some_and(|e| e.digest == digest))
+        self.owners(root, path).iter().any(|e| e.digest == digest)
+    }
+
+    /// Every entry `invocation` wrote, for the orphan sweep (issue #2557).
+    pub fn recorded_by<'a>(&'a self, invocation: &'a str) -> impl Iterator<Item = Recorded<'a>> {
+        self.entries
+            .iter()
+            .filter(move |(_, e)| e.invocation == invocation)
+            .map(|(key, e)| Recorded {
+                key,
+                digest: &e.digest,
+                scope: e.scope,
+            })
     }
 
     /// Record `digest` as the content `invocation` wrote to `path`.
     ///
+    /// `scope` is `None` for an unclaimed writer. `destroy` never sweeps such
+    /// an entry.
+    ///
     /// A path outside `root` cannot be keyed and is dropped: the manifest
     /// describes one project, and destroy would never look it up.
-    pub fn record(&mut self, root: &Path, path: &Path, digest: String, invocation: &str) {
+    pub fn record(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        digest: String,
+        invocation: &str,
+        scope: Option<Scope>,
+    ) {
         if let Some(k) = key(root, path) {
             // Keyed by path, so the newest writer replaces the previous one:
             // a file has exactly one owner, and the manifest cannot grow an
-            // entry per regeneration.
+            // entry per regeneration. Another spelling of the file goes too.
+            self.forget(root, path);
             self.entries.insert(
                 k,
                 Entry {
                     digest,
                     invocation: invocation.to_owned(),
+                    scope,
                 },
             );
         }
     }
 
-    /// Drop the entry for `path`, if any.
+    /// Record the shared-file edits `invocation` made.
+    ///
+    /// Add to the earlier record, do not replace it. An earlier run made its
+    /// edits, and they stay in the files.
+    pub fn record_reverts(&mut self, invocation: &str, anchors: Vec<RevertAnchor>) {
+        if anchors.is_empty() {
+            return;
+        }
+        let run = self.runs.entry(run_id(invocation)).or_default();
+        run.extend(anchors);
+        run.sort();
+        run.dedup();
+    }
+
+    /// The recorded edits that a destroy with `planned` would leave behind
+    /// (issue #2560).
+    ///
+    /// An anchor counts when all three hold:
+    ///
+    /// - its target file still exists;
+    /// - `planned` has no equal anchor;
+    /// - `planned` has an anchor of the same kind. The revert moved, so an
+    ///   input changed. A kind that is missing from `planned` is a skip that
+    ///   depends on file state, such as an append that was already done.
+    ///
+    /// A revert in `planned` that was not recorded is fine: it only cleans
+    /// more. Empty when nothing was recorded. A manifest from an older CLI keeps
+    /// the old behaviour.
+    #[must_use]
+    pub fn dropped_reverts(
+        &self,
+        root: &Path,
+        invocation: &str,
+        planned: &[RevertAnchor],
+    ) -> Vec<RevertAnchor> {
+        self.runs
+            .get(&run_id(invocation))
+            .into_iter()
+            .flatten()
+            .filter(|anchor| !planned.contains(anchor))
+            .filter(|anchor| planned.iter().any(|p| p.kind() == anchor.kind()))
+            .filter(|anchor| anchor.is_project_relative() && root.join(&anchor.path).exists())
+            .cloned()
+            .collect()
+    }
+
+    /// Forget the run of `invocation`: its edits were reverted, or the user
+    /// chose `--force`.
+    pub fn forget_run(&mut self, invocation: &str) {
+        self.runs.remove(&run_id(invocation));
+    }
+
+    /// Drop the entries of [`Self::keys_for`].
+    ///
+    /// Another spelling resolves only while the file exists. After a delete,
+    /// use [`Self::forget_key`] with the keys you read before the delete.
     pub fn forget(&mut self, root: &Path, path: &Path) {
-        if let Some(k) = key(root, path) {
+        for k in self.keys_for(root, path) {
             self.entries.remove(&k);
         }
+    }
+
+    /// Every recorded key for the file at `path` (issue #3382).
+    ///
+    /// The key of `path`, and each key that is another spelling of the same
+    /// directory entry (see [`spelling::one_entry`]). For example, on a
+    /// case-insensitive file system, `foo.rs` finds the entry for `Foo.rs`.
+    /// On a case-sensitive host, only the exact key matches.
+    #[must_use]
+    pub fn keys_for(&self, root: &Path, path: &Path) -> Vec<String> {
+        let Some(own) = key(root, path) else {
+            return Vec::new();
+        };
+        self.entries
+            .keys()
+            .filter(|k| **k == own || is_alias(root, k, &own, path))
+            .cloned()
+            .collect()
+    }
+
+    /// The entries that tell who wrote `path`.
+    ///
+    /// The exact entry, when there is one: the newest writer is recorded
+    /// under it. Otherwise, the entries of [`Self::keys_for`].
+    fn owners(&self, root: &Path, path: &Path) -> Vec<&Entry> {
+        let Some(own) = key(root, path) else {
+            return Vec::new();
+        };
+        if let Some(entry) = self.entries.get(&own) {
+            return vec![entry];
+        }
+        self.entries
+            .iter()
+            .filter(|(k, _)| is_alias(root, k, &own, path))
+            .map(|(_, e)| e)
+            .collect()
+    }
+
+    /// Drop the entry with exactly the key `k`, if any.
+    pub fn forget_key(&mut self, k: &str) {
+        self.entries.remove(k);
     }
 
     /// Drop every entry for a file under `dir` — what removing a whole
@@ -348,8 +568,21 @@ impl Provenance {
                 other => other,
             };
         }
+        // A run lives as long as one file it wrote does.
+        let live: std::collections::BTreeSet<String> = self
+            .entries
+            .values()
+            .map(|e| run_id(&e.invocation))
+            .collect();
+        let runs = self
+            .runs
+            .iter()
+            .filter(|(id, _)| live.contains(*id))
+            .map(|(id, anchors)| (id.clone(), anchors.clone()))
+            .collect();
         let body = toml::to_string(&ManifestFile {
             files: self.entries.clone(),
+            runs,
         })
         .map_err(std::io::Error::other)?;
         let directory = path
@@ -415,6 +648,12 @@ fn refuse_symlink(root: &Path, path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether the recorded key `k` is another spelling of `own`, the key of
+/// `path` (issue #3382).
+fn is_alias(root: &Path, k: &str, own: &str, path: &Path) -> bool {
+    k.eq_ignore_ascii_case(own) && spelling::one_entry(&root.join(k), path)
+}
+
 /// `path` as a project-relative, forward-slashed manifest key.
 ///
 /// Built from ordinary components only. `strip_prefix` is lexical, so
@@ -422,7 +661,7 @@ fn refuse_symlink(root: &Path, path: &Path) -> std::io::Result<()> {
 /// project. Rejecting anything but [`Component::Normal`] keeps every key
 /// project-relative, and joining the parts spells a key the same way on Windows
 /// as on Unix without rewriting a separator a filename may legitimately hold.
-fn key(root: &Path, path: &Path) -> Option<String> {
+pub(super) fn key(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
     let mut parts = Vec::new();
     for component in relative.components() {
@@ -452,7 +691,7 @@ mod tests {
         let dir = tmp();
         let file = dir.path().join("src/models/post.rs");
         let mut p = Provenance::default();
-        p.record(dir.path(), &file, text_digest("// model\n"), OWNER);
+        p.record(dir.path(), &file, text_digest("// model\n"), OWNER, None);
         p.save(dir.path()).unwrap();
 
         let reloaded = Provenance::load(dir.path());
@@ -465,7 +704,7 @@ mod tests {
         let dir = tmp();
         let file = dir.path().join("src/models/post.rs");
         let mut p = Provenance::default();
-        p.record(dir.path(), &file, text_digest("// model\n"), OWNER);
+        p.record(dir.path(), &file, text_digest("// model\n"), OWNER, None);
 
         assert!(!p.is_ours(
             dir.path(),
@@ -533,7 +772,13 @@ mod tests {
     fn a_path_outside_the_project_is_dropped() {
         let dir = tmp();
         let mut p = Provenance::default();
-        p.record(dir.path(), Path::new("/etc/passwd"), text_digest(""), OWNER);
+        p.record(
+            dir.path(),
+            Path::new("/etc/passwd"),
+            text_digest(""),
+            OWNER,
+            None,
+        );
         assert_eq!(p, Provenance::default());
     }
 
@@ -546,6 +791,7 @@ mod tests {
             &dir.path().join("../secret.toml"),
             text_digest(""),
             OWNER,
+            None,
         );
         assert_eq!(p, Provenance::default());
     }
@@ -705,7 +951,7 @@ mod tests {
         let dir = tmp();
         let file = dir.path().join("a.rs");
         let mut p = Provenance::default();
-        p.record(dir.path(), &file, text_digest("x"), OWNER);
+        p.record(dir.path(), &file, text_digest("x"), OWNER, None);
         p.save(dir.path()).unwrap();
         assert!(dir.path().join(MANIFEST_PATH).is_file());
 
@@ -723,17 +969,350 @@ mod tests {
             &dir.path().join("migrations/a/up.sql"),
             "1".to_owned(),
             OWNER,
+            None,
         );
         p.record(
             dir.path(),
             &dir.path().join("migrations/ab/up.sql"),
             "2".to_owned(),
             OWNER,
+            None,
         );
         p.forget_dir(dir.path(), &dir.path().join("migrations/a"));
 
         assert!(!p.contains("migrations/a/up.sql"));
         assert!(p.contains("migrations/ab/up.sql"));
+    }
+
+    #[test]
+    fn a_scope_survives_a_save_and_load() {
+        let dir = tmp();
+        let owned = dir.path().join("src/a.rs");
+        let shared = dir.path().join("templates/_layout.html");
+        let mut p = Provenance::default();
+        p.record(
+            dir.path(),
+            &owned,
+            "1".to_owned(),
+            OWNER,
+            Some(Scope::Owned),
+        );
+        p.record(
+            dir.path(),
+            &shared,
+            "2".to_owned(),
+            OWNER,
+            Some(Scope::Shared),
+        );
+        p.save(dir.path()).unwrap();
+
+        let reloaded = Provenance::load(dir.path());
+        let mut seen: Vec<_> = reloaded.recorded_by(OWNER).collect();
+        seen.sort_by_key(|r| r.key);
+        assert_eq!(
+            seen,
+            vec![
+                Recorded {
+                    key: "src/a.rs",
+                    digest: "1",
+                    scope: Some(Scope::Owned)
+                },
+                Recorded {
+                    key: "templates/_layout.html",
+                    digest: "2",
+                    scope: Some(Scope::Shared)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_scope_writes_no_scope_key() {
+        // A 0.8.0 CLI reads this manifest too. It must see the shape it wrote.
+        let dir = tmp();
+        let mut p = Provenance::default();
+        p.record(
+            dir.path(),
+            &dir.path().join("a.rs"),
+            "1".to_owned(),
+            OWNER,
+            None,
+        );
+        p.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_PATH)).unwrap();
+        assert!(!text.contains("scope"), "{text}");
+    }
+
+    #[test]
+    fn a_legacy_entry_loads_with_no_scope() {
+        let dir = tmp();
+        std::fs::create_dir_all(dir.path().join(".autumn")).unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_PATH),
+            "[files.\"src/a.rs\"]\ndigest = \"1\"\ninvocation = \"x\"\n",
+        )
+        .unwrap();
+        let p = Provenance::load(dir.path());
+        let seen: Vec<_> = p.recorded_by("x").collect();
+        assert_eq!(
+            seen,
+            vec![Recorded {
+                key: "src/a.rs",
+                digest: "1",
+                scope: None
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unknown_scope_reads_as_none_and_keeps_the_other_entries() {
+        let dir = tmp();
+        std::fs::create_dir_all(dir.path().join(".autumn")).unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_PATH),
+            "[files.\"a.rs\"]\ndigest = \"1\"\ninvocation = \"x\"\nscope = \"Owned\"\n\n\
+             [files.\"b.rs\"]\ndigest = \"2\"\ninvocation = \"x\"\nscope = 7\n\n\
+             [files.\"c.rs\"]\ndigest = \"3\"\ninvocation = \"x\"\nscope = \"owned\"\n",
+        )
+        .unwrap();
+        let p = Provenance::load(dir.path());
+        let mut seen: Vec<_> = p.recorded_by("x").map(|r| (r.key, r.scope)).collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![("a.rs", None), ("b.rs", None), ("c.rs", Some(Scope::Owned))]
+        );
+    }
+
+    #[test]
+    fn recorded_by_lists_only_that_invocation() {
+        let dir = tmp();
+        let mut p = Provenance::default();
+        p.record(
+            dir.path(),
+            &dir.path().join("a.rs"),
+            "1".to_owned(),
+            OWNER,
+            None,
+        );
+        p.record(
+            dir.path(),
+            &dir.path().join("b.rs"),
+            "2".to_owned(),
+            "other",
+            None,
+        );
+        let keys: Vec<_> = p.recorded_by(OWNER).map(|r| r.key).collect();
+        assert_eq!(keys, vec!["a.rs"]);
+    }
+
+    fn anchor(path: &str, revert: &str) -> RevertAnchor {
+        RevertAnchor {
+            path: path.to_owned(),
+            revert: revert.to_owned(),
+        }
+    }
+
+    fn recorded_run(dir: &Path, anchors: Vec<RevertAnchor>) -> Provenance {
+        let mut p = Provenance::default();
+        p.record(dir, &dir.join("a.rs"), text_digest("x"), OWNER, None);
+        p.record_reverts(OWNER, anchors);
+        p.save(dir).unwrap();
+        Provenance::load(dir)
+    }
+
+    #[test]
+    fn reverts_survive_a_save_and_load() {
+        let dir = tmp();
+        let a = anchor("i18n/en.ftl", "I18nFtlKeys(Post)");
+        let p = recorded_run(dir.path(), vec![a.clone()]);
+        std::fs::create_dir_all(dir.path().join("i18n")).unwrap();
+        std::fs::write(dir.path().join("i18n/en.ftl"), "").unwrap();
+
+        let moved = anchor("elsewhere", "I18nFtlKeys(Post)");
+        assert_eq!(p.dropped_reverts(dir.path(), OWNER, &[moved]), vec![a]);
+    }
+
+    #[test]
+    fn a_revert_that_vanished_is_a_skip_not_a_drop() {
+        let dir = tmp();
+        let p = recorded_run(
+            dir.path(),
+            vec![anchor(
+                "autumn.toml",
+                "SubmitTokenValidateExempt(posts, validate)",
+            )],
+        );
+        std::fs::write(dir.path().join("autumn.toml"), "").unwrap();
+
+        // The plan holds no revert of that kind: the append was a no-op.
+        assert!(
+            p.dropped_reverts(dir.path(), OWNER, &[anchor("src/main.rs", "ModDecl(post)")])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_revert_that_moved_within_its_kind_is_a_drop() {
+        let dir = tmp();
+        let old = anchor("i18n/en.ftl", "I18nFtlKeys(Post)");
+        let p = recorded_run(dir.path(), vec![old.clone()]);
+        std::fs::create_dir_all(dir.path().join("i18n")).unwrap();
+        std::fs::write(dir.path().join("i18n/en.ftl"), "").unwrap();
+
+        assert_eq!(
+            p.dropped_reverts(
+                dir.path(),
+                OWNER,
+                &[anchor("translations/en.ftl", "I18nFtlKeys(Post)")]
+            ),
+            vec![old]
+        );
+    }
+
+    #[test]
+    fn a_recorded_path_that_leaves_the_project_is_ignored() {
+        let dir = tmp();
+        let outside = tmp();
+        std::fs::write(outside.path().join("x"), "").unwrap();
+        let absolute = outside.path().join("x").to_string_lossy().into_owned();
+        let parent = format!(
+            "../{}/x",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        for path in [absolute, parent] {
+            let p = recorded_run(dir.path(), vec![anchor(&path, "A(x)")]);
+            let planned = [anchor("elsewhere", "A(y)")];
+            assert!(
+                p.dropped_reverts(dir.path(), OWNER, &planned).is_empty(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_kind_is_the_text_before_the_first_paren() {
+        assert_eq!(anchor("a", "ModDecl(post)").kind(), "ModDecl");
+        assert_eq!(
+            anchor("a", "PwaMainRsInjection").kind(),
+            "PwaMainRsInjection"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_run_leaves_another_invocations_run() {
+        let dir = tmp();
+        let mut p = recorded_run(dir.path(), vec![anchor("a", "A(x)")]);
+        p.record(
+            dir.path(),
+            &dir.path().join("b.rs"),
+            "2".to_owned(),
+            "other",
+            None,
+        );
+        p.record_reverts("other", vec![anchor("b", "B(y)")]);
+        p.forget_run(OWNER);
+        p.save(dir.path()).unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_PATH)).unwrap();
+        assert!(text.contains("B(y)") && !text.contains("A(x)"), "{text}");
+    }
+
+    #[test]
+    fn a_recorded_revert_that_is_still_planned_is_not_dropped() {
+        let dir = tmp();
+        let a = anchor("i18n/en.ftl", "I18nFtlKeys(Post)");
+        let p = recorded_run(dir.path(), vec![a.clone()]);
+        std::fs::create_dir_all(dir.path().join("i18n")).unwrap();
+        std::fs::write(dir.path().join("i18n/en.ftl"), "").unwrap();
+
+        assert!(p.dropped_reverts(dir.path(), OWNER, &[a]).is_empty());
+    }
+
+    #[test]
+    fn an_extra_planned_revert_is_not_a_drop() {
+        let dir = tmp();
+        let a = anchor("i18n/en.ftl", "I18nFtlKeys(Post)");
+        let extra = anchor("i18n/fr.ftl", "I18nFtlKeys(Post)");
+        let p = recorded_run(dir.path(), vec![a.clone()]);
+        std::fs::create_dir_all(dir.path().join("i18n")).unwrap();
+        std::fs::write(dir.path().join("i18n/en.ftl"), "").unwrap();
+
+        assert!(p.dropped_reverts(dir.path(), OWNER, &[a, extra]).is_empty());
+    }
+
+    #[test]
+    fn a_dropped_revert_whose_target_is_gone_is_not_reported() {
+        let dir = tmp();
+        let p = recorded_run(dir.path(), vec![anchor("i18n/en.ftl", "I18nFtlKeys(Post)")]);
+
+        assert!(p.dropped_reverts(dir.path(), OWNER, &[]).is_empty());
+    }
+
+    #[test]
+    fn another_invocations_reverts_are_not_this_ones() {
+        let dir = tmp();
+        let p = recorded_run(dir.path(), vec![anchor("i18n/en.ftl", "I18nFtlKeys(Post)")]);
+        std::fs::create_dir_all(dir.path().join("i18n")).unwrap();
+        std::fs::write(dir.path().join("i18n/en.ftl"), "").unwrap();
+
+        let moved = [anchor("elsewhere", "I18nFtlKeys(Post)")];
+        assert!(p.dropped_reverts(dir.path(), "other", &moved).is_empty());
+    }
+
+    #[test]
+    fn a_manifest_without_runs_records_no_reverts() {
+        let dir = tmp();
+        std::fs::create_dir_all(dir.path().join(".autumn")).unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_PATH),
+            "[files.\"a.rs\"]\ndigest = \"1\"\ninvocation = \"x\"\n",
+        )
+        .unwrap();
+        let p = Provenance::load(dir.path());
+
+        assert!(p.dropped_reverts(dir.path(), "x", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_run_with_no_entries_is_pruned_on_save() {
+        let dir = tmp();
+        let mut p = recorded_run(dir.path(), vec![anchor("a", "A")]);
+        p.forget(dir.path(), &dir.path().join("a.rs"));
+        p.record(
+            dir.path(),
+            &dir.path().join("b.rs"),
+            "2".to_owned(),
+            "other",
+            None,
+        );
+        p.save(dir.path()).unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_PATH)).unwrap();
+        assert!(!text.contains("runs"), "{text}");
+    }
+
+    #[test]
+    fn a_run_without_reverts_writes_no_runs_key() {
+        let dir = tmp();
+        let _ = recorded_run(dir.path(), Vec::new());
+
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_PATH)).unwrap();
+        assert!(!text.contains("runs"), "{text}");
+    }
+
+    #[test]
+    fn a_later_record_adds_to_the_earlier_one() {
+        let dir = tmp();
+        let mut p = recorded_run(dir.path(), vec![anchor("old", "Old(a)")]);
+        std::fs::write(dir.path().join("old"), "").unwrap();
+        p.record_reverts(OWNER, vec![anchor("new", "Old(b)")]);
+
+        assert_eq!(
+            p.dropped_reverts(dir.path(), OWNER, &[anchor("new", "Old(b)")]),
+            vec![anchor("old", "Old(a)")],
+            "the first run's edit is still in its file"
+        );
     }
 
     #[cfg(unix)]
@@ -754,9 +1333,195 @@ mod tests {
             &dir.path().join("a.rs"),
             text_digest("x"),
             OWNER,
+            None,
         );
 
         assert!(p.save(dir.path()).is_err());
         assert!(!outside.path().join("escaped.toml").exists());
+    }
+
+    /// Write `contents` at `rel` and record it for [`OWNER`].
+    fn written(p: &mut Provenance, root: &Path, rel: &str, contents: &str) -> PathBuf {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        p.record(
+            root,
+            &path,
+            text_digest(contents),
+            OWNER,
+            Some(Scope::Owned),
+        );
+        path
+    }
+
+    #[test]
+    fn a_case_only_alias_is_ours_only_when_it_is_one_entry() {
+        // Issue #3382: a template renamed `Foo.rs` to `foo.rs`.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        let one_entry = new.exists();
+        let digest = text_digest("// v1\n");
+
+        assert_eq!(p.is_ours(root, &new, &digest, OWNER), one_entry);
+        assert_eq!(p.was_written(root, &new, &digest), one_entry);
+        assert!(!p.is_ours(root, &new, &digest, "other"), "another command");
+        let aliases: Vec<String> = if one_entry {
+            vec!["src/Foo.rs".to_owned()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(p.keys_for(root, &new), aliases);
+        assert_eq!(p.keys_for(root, &old), vec!["src/Foo.rs".to_owned()]);
+    }
+
+    #[test]
+    fn a_second_file_with_a_case_only_name_is_not_an_alias() {
+        // A case-sensitive host holds two files. Each keeps its own entry.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if new.exists() {
+            return; // case-insensitive: one entry, not two.
+        }
+        std::fs::write(&new, "// v1\n").unwrap();
+        let digest = text_digest("// v1\n");
+
+        assert!(!p.is_ours(root, &new, &digest, OWNER));
+        assert!(!p.was_written(root, &new, &digest));
+        assert!(p.keys_for(root, &new).is_empty());
+        p.forget(root, &new);
+        assert!(p.contains("src/Foo.rs"));
+    }
+
+    #[test]
+    fn a_hard_linked_case_only_name_is_not_an_alias() {
+        // Two hard-linked names are two entries to remove.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if new.exists() || std::fs::hard_link(&old, &new).is_err() {
+            return; // case-insensitive, or no hard links: nothing to test.
+        }
+
+        assert!(!p.is_ours(root, &new, &text_digest("// v1\n"), OWNER));
+        assert!(p.keys_for(root, &new).is_empty());
+    }
+
+    #[test]
+    fn forget_drops_a_case_only_alias_while_the_file_exists() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if !new.exists() {
+            return; // case-sensitive: `foo.rs` is no alias.
+        }
+
+        p.forget(root, &new);
+
+        assert!(!p.contains("src/Foo.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_case_only_name_is_not_an_alias() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if new.exists() {
+            return; // case-insensitive: one name, no room for a link.
+        }
+        std::os::unix::fs::symlink(&old, &new).unwrap();
+
+        assert!(!p.is_ours(root, &new, &text_digest("// v1\n"), OWNER));
+        assert!(p.keys_for(root, &new).is_empty());
+    }
+
+    #[test]
+    fn the_exact_entry_decides_when_both_spellings_are_recorded() {
+        // An older manifest can hold `Foo.rs` and `foo.rs` for one file. The
+        // newest writer is under the exact key, so only it owns the file.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if !new.exists() {
+            return; // case-sensitive: two files, see the tests above.
+        }
+        p.entries.insert(
+            "src/foo.rs".to_owned(),
+            Entry {
+                digest: text_digest("// v1\n"),
+                invocation: "newer".to_owned(),
+                scope: None,
+            },
+        );
+        let digest = text_digest("// v1\n");
+
+        assert!(p.is_ours(root, &new, &digest, "newer"));
+        assert!(!p.is_ours(root, &new, &digest, OWNER), "a stale alias");
+        let mut keys = p.keys_for(root, &new);
+        keys.sort();
+        assert_eq!(keys, vec!["src/Foo.rs".to_owned(), "src/foo.rs".to_owned()]);
+    }
+
+    #[test]
+    fn record_replaces_the_entry_of_another_spelling() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        let one_entry = new.exists();
+        if !one_entry {
+            std::fs::write(&new, "// v2\n").unwrap(); // a second file.
+        }
+
+        p.record(root, &new, text_digest("// v2\n"), OWNER, None);
+
+        assert!(p.contains("src/foo.rs"));
+        assert_eq!(p.contains("src/Foo.rs"), !one_entry);
+    }
+
+    #[test]
+    fn forget_after_the_delete_finds_only_the_exact_key() {
+        // Why `destroy` reads the keys before it deletes a file.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        std::fs::remove_file(&old).unwrap();
+
+        p.forget(root, &new);
+        assert!(p.contains("src/Foo.rs"));
+        p.forget_key("src/Foo.rs");
+        assert!(!p.contains("src/Foo.rs"));
+    }
+
+    #[test]
+    fn forget_key_drops_only_that_key() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/a.rs", "a");
+        written(&mut p, root, "src/b.rs", "b");
+
+        p.forget_key("src/a.rs");
+
+        assert!(!p.contains("src/a.rs"));
+        assert!(p.contains("src/b.rs"));
     }
 }

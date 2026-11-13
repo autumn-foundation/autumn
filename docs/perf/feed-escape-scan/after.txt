@@ -1,0 +1,3 @@
+Same harness/command/machine/session as baseline.txt (final code, after clippy fix).
+Total Ir:  208,077,632 -> 174,868,566  (-33,209,066, -15.96%)
+push_escaped+skip_clean self: 82,419,750 -> ~47.8M (35,389,200 skip_clean + 12,417,300 push_escaped)

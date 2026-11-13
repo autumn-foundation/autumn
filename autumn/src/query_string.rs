@@ -24,9 +24,12 @@
 //! bracketed dialect whose `items[0][sku]` shape matches the repeated-row
 //! encoding [`nested_form`](crate::nested_form) renders — generalized here to
 //! arbitrary objects, sequences and depths. Note this applies to the **query
-//! string only**: [`Form<T>`](crate::form) and
-//! [`NestedChangesetForm`](crate::nested_form::NestedChangesetForm) still decode
-//! request *bodies* through `serde_urlencoded` and its own nested-row parser.
+//! string only**. Request *bodies* use flat keys: [`Form<T>`](crate::extract::Form)
+//! decodes through `serde_urlencoded`, and
+//! [`ChangesetForm`](crate::form::ChangesetForm) and
+//! [`NestedChangesetForm`](crate::nested_form::NestedChangesetForm) decode
+//! through [`from_urlencoded`](crate::form::from_urlencoded) (repeated keys
+//! fill a `Vec`, brackets stay part of the key).
 //!
 //! ```text
 //! q=foo                       // scalar
@@ -102,6 +105,7 @@
     )
 )]
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -344,21 +348,63 @@ fn classify_segment(inner: &str) -> Segment<'_> {
 // Tree
 // ──────────────────────────────────────────────────────────────────
 
+/// The values submitted under one key, in submission order.
+///
+/// Nearly every key is submitted once, so the first value lives inline instead
+/// of behind a `Vec` allocation. Derefs to `[String]`, so readers see the same
+/// slice either way. An empty `Many` is the empty state.
+#[derive(Debug)]
+enum Values<'q> {
+    One(Cow<'q, str>),
+    Many(Vec<Cow<'q, str>>),
+}
+
+impl Default for Values<'_> {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl<'q> Values<'q> {
+    fn push(&mut self, value: Cow<'q, str>) {
+        match self {
+            Self::Many(values) if values.is_empty() => *self = Self::One(value),
+            Self::Many(values) => values.push(value),
+            Self::One(_) => {
+                if let Self::One(first) = std::mem::take(self) {
+                    *self = Self::Many(vec![first, value]);
+                }
+            }
+        }
+    }
+}
+
+impl<'q> std::ops::Deref for Values<'q> {
+    type Target = [Cow<'q, str>];
+
+    fn deref(&self) -> &[Cow<'q, str>] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
+}
+
 /// One decoded position in the query tree.
 #[derive(Debug)]
-enum Node {
+enum Node<'q> {
     /// Every value submitted under this exact key path, in submission order.
     ///
     /// Holding all of them (rather than collapsing to one) is what lets the
     /// same node serve a scalar field (first wins) and a sequence field (all
     /// values) without the parser needing to know the target type.
-    Scalar(Vec<String>),
+    Scalar(Values<'q>),
     /// Positional children (`k[]`, `k[3]`), ordered by [`SeqKey`]. A `BTreeMap`
     /// keeps sparse and out-of-order indices cheap: `tags[4000000000]` costs
     /// one entry, not four billion.
     Seq(BTreeMap<SeqKey, Self>),
     /// Named children (`k[name]`).
-    Map(BTreeMap<String, Self>),
+    Map(BTreeMap<Cow<'q, str>, Self>),
     /// A key the grammar could not resolve — one name used as two shapes
     /// (`?filter=flat&filter[status]=open`), or nesting past [`MAX_DEPTH`].
     ///
@@ -370,7 +416,7 @@ enum Node {
     Conflict(String),
 }
 
-impl Node {
+impl Node<'_> {
     /// Human-readable shape name, for conflict and type-mismatch messages.
     const fn kind(&self) -> &'static str {
         match self {
@@ -464,14 +510,20 @@ fn key_path(base: &str, segments: &[Segment<'_>], upto: usize) -> String {
 /// Infallible by design: a key the grammar cannot resolve poisons **that key's
 /// node** ([`Node::Conflict`]) rather than failing the request, so an
 /// unrecognised parameter stays ignorable and only a claimed one errors.
-fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>], value: String) {
+fn insert<'q, 's>(
+    root: &mut BTreeMap<Cow<'q, str>, Node<'q>>,
+    base: &'s str,
+    segments: &[Segment<'s>],
+    value: Cow<'q, str>,
+    own: impl Fn(&'s str) -> Cow<'q, str>,
+) {
     // `segments.len()` counts the bracketed steps; the base key is the first
     // level, so the total depth is `len + 1` — expressed as `>=` to stay clear
     // of the request-path gate's arithmetic ban.
     if segments.len() >= MAX_DEPTH {
         let node = root
-            .entry(base.to_owned())
-            .or_insert_with(|| Node::Scalar(Vec::new()));
+            .entry(own(base))
+            .or_insert_with(|| Node::Scalar(Values::default()));
         poison(
             node,
             format!(
@@ -486,7 +538,7 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
     // The *next* segment decides which container the current entry must be, so
     // the shape is always known before the entry is materialized.
     let mut node = root
-        .entry(base.to_owned())
+        .entry(own(base))
         .or_insert_with(|| empty_for(segments.first()));
 
     for (position, segment) in segments.iter().enumerate() {
@@ -502,9 +554,7 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
                 let Node::Map(entries) = node else {
                     return poison(node, conflict(base, segments, position, "an object"));
                 };
-                node = entries
-                    .entry((*name).to_owned())
-                    .or_insert_with(|| empty_for(next));
+                node = entries.entry(own(name)).or_insert_with(|| empty_for(next));
             }
             // A position addressed on an already-promoted map keeps its decimal
             // key, so the two orderings of the same query agree.
@@ -521,9 +571,7 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
                         .or_insert_with(|| empty_for(next));
                 }
                 Node::Map(entries) => {
-                    node = entries
-                        .entry((*raw).to_owned())
-                        .or_insert_with(|| empty_for(next));
+                    node = entries.entry(own(raw)).or_insert_with(|| empty_for(next));
                 }
                 other => {
                     return poison(other, conflict(base, segments, position, "a sequence"));
@@ -559,11 +607,13 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
                     // this loop always finds a free one.
                     let mut key = index.to_string();
                     let mut suffix = 0usize;
-                    while entries.contains_key(&key) {
+                    while entries.contains_key(key.as_str()) {
                         key = format!("{index}-{suffix}");
                         suffix = suffix.saturating_add(1);
                     }
-                    node = entries.entry(key).or_insert_with(|| empty_for(next));
+                    node = entries
+                        .entry(Cow::Owned(key))
+                        .or_insert_with(|| empty_for(next));
                 }
                 other => {
                     return poison(other, conflict(base, segments, position, "a sequence"));
@@ -580,11 +630,11 @@ fn insert(root: &mut BTreeMap<String, Node>, base: &str, segments: &[Segment<'_>
 
 /// Turn a positional node into a named one, rendering each index as its decimal
 /// key, so a container that mixes `k[0]=` and `k[name]=` stays usable.
-fn promote_to_map(node: &mut Node) {
+fn promote_to_map(node: &mut Node<'_>) {
     if let Node::Seq(entries) = node {
         let promoted = std::mem::take(entries)
             .into_iter()
-            .map(|(key, child)| (key.spelling().into_owned(), child))
+            .map(|(key, child)| (Cow::Owned(key.spelling().into_owned()), child))
             .collect();
         *node = Node::Map(promoted);
     }
@@ -592,16 +642,16 @@ fn promote_to_map(node: &mut Node) {
 
 /// Mark a node unresolvable, keeping the FIRST diagnosis when a key collides
 /// more than once.
-fn poison(node: &mut Node, message: String) {
+fn poison(node: &mut Node<'_>, message: String) {
     if !matches!(node, Node::Conflict(_)) {
         *node = Node::Conflict(message);
     }
 }
 
 /// The empty container a segment's *successor* requires.
-const fn empty_for(next: Option<&Segment<'_>>) -> Node {
+const fn empty_for<'q>(next: Option<&Segment<'_>>) -> Node<'q> {
     match next {
-        None => Node::Scalar(Vec::new()),
+        None => Node::Scalar(Values::Many(Vec::new())),
         Some(Segment::Key(_)) => Node::Map(BTreeMap::new()),
         Some(Segment::Append | Segment::Index { .. }) => Node::Seq(BTreeMap::new()),
     }
@@ -616,14 +666,27 @@ fn conflict(base: &str, segments: &[Segment<'_>], upto: usize, wanted: &str) -> 
 
 /// Build the query tree from an already-percent-decoded pair sequence.
 fn build_tree<'a>(
-    pairs: impl Iterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
-) -> BTreeMap<String, Node> {
+    pairs: impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>)>,
+) -> BTreeMap<Cow<'a, str>, Node<'a>> {
     let mut root = BTreeMap::new();
     for (key, value) in pairs {
-        match parse_key(&key) {
-            Some((base, segments)) => insert(&mut root, base, &segments, value.into_owned()),
-            // Not a well-formed bracket key: treat it as a flat literal name.
-            None => insert(&mut root, &key, &[], value.into_owned()),
+        match key {
+            // The key still borrows the query string, so the tree can hold the
+            // base and every segment name as slices of it without copying.
+            Cow::Borrowed(key) => match parse_key(key) {
+                Some((base, segments)) => insert(&mut root, base, &segments, value, Cow::Borrowed),
+                // Not a well-formed bracket key: treat it as a flat literal name.
+                None => insert(&mut root, key, &[], value, Cow::Borrowed),
+            },
+            // A percent-decoded key is a fresh allocation owned by this loop
+            // iteration, so the tree takes its own copy of each piece.
+            Cow::Owned(key) => {
+                let own = |text: &str| Cow::Owned(text.to_owned());
+                match parse_key(&key) {
+                    Some((base, segments)) => insert(&mut root, base, &segments, value, own),
+                    None => insert(&mut root, &key, &[], value, own),
+                }
+            }
         }
     }
     root
@@ -849,11 +912,11 @@ impl<'de> VariantAccess<'de> for UnitVariant<'_> {
 // Node deserializer
 // ──────────────────────────────────────────────────────────────────
 
-struct NodeDeserializer<'a> {
-    node: &'a Node,
+struct NodeDeserializer<'a, 'q> {
+    node: &'a Node<'q>,
 }
 
-impl<'a> NodeDeserializer<'a> {
+impl<'a> NodeDeserializer<'a, '_> {
     /// Refuse a node whose key the grammar could not resolve.
     ///
     /// Checked by every entry point EXCEPT `deserialize_ignored_any`, so a
@@ -883,7 +946,7 @@ impl<'a> NodeDeserializer<'a> {
             Node::Scalar(values) => Ok(ValueDeserializer {
                 // A scalar node is only ever created by pushing a value, so it
                 // is never empty; the fallback keeps this total regardless.
-                value: values.first().map_or("", String::as_str),
+                value: values.first().map_or("", |v| &**v),
             }),
             // The caller sent the bracketed form for a key the target types as
             // a plain value. Name the fix rather than just the mismatch: this is
@@ -910,7 +973,7 @@ macro_rules! forward_scalar {
     };
 }
 
-impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
+impl<'de> de::Deserializer<'de> for NodeDeserializer<'_, '_> {
     type Error = QueryError;
 
     /// Self-describing decode, used by untyped targets such as
@@ -920,7 +983,7 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
         self.check()?;
         match self.node {
             Node::Scalar(values) if values.len() == 1 => {
-                visitor.visit_str(values.first().map_or("", String::as_str))
+                visitor.visit_str(values.first().map_or("", |v| &**v))
             }
             Node::Scalar(_) | Node::Seq(_) => self.deserialize_seq(visitor),
             Node::Map(_) | Node::Conflict(_) => self.deserialize_map(visitor),
@@ -1011,7 +1074,7 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
             Node::Map(entries) => visitor.visit_map(NodeMap {
                 entries: entries.iter(),
                 value: None,
-                key: String::new(),
+                key: "",
             }),
             // An all-digit key (`counts[2024]=5`) parses as a position, because
             // the tree is built before the target type is known. Serving a
@@ -1072,31 +1135,33 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_> {
 }
 
 /// One `(key, value)` pair of a map addressed as a sequence.
-enum PairValue<'a> {
+enum PairValue<'a, 'q> {
     Value(&'a str),
-    Node(&'a Node),
+    Node(&'a Node<'q>),
 }
 
 /// Flatten a map into `(key, value)` pairs, expanding a repeated key into one
 /// pair per submitted value so the pair view matches the wire.
-fn flatten_pairs(entries: &BTreeMap<String, Node>) -> Vec<(&str, PairValue<'_>)> {
+fn flatten_pairs<'a, 'q>(
+    entries: &'a BTreeMap<Cow<'q, str>, Node<'q>>,
+) -> Vec<(&'a str, PairValue<'a, 'q>)> {
     let mut out = Vec::new();
     for (key, node) in entries {
         match node {
             Node::Scalar(values) => {
-                out.extend(values.iter().map(|v| (key.as_str(), PairValue::Value(v))));
+                out.extend(values.iter().map(|v| (&**key, PairValue::Value(v))));
             }
-            other => out.push((key.as_str(), PairValue::Node(other))),
+            other => out.push((&**key, PairValue::Node(other))),
         }
     }
     out
 }
 
-struct ValueSeq<'a> {
-    values: std::slice::Iter<'a, String>,
+struct ValueSeq<'a, 'q> {
+    values: std::slice::Iter<'a, Cow<'q, str>>,
 }
 
-impl<'de> SeqAccess<'de> for ValueSeq<'_> {
+impl<'de> SeqAccess<'de> for ValueSeq<'_, '_> {
     type Error = QueryError;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(
@@ -1114,11 +1179,11 @@ impl<'de> SeqAccess<'de> for ValueSeq<'_> {
     }
 }
 
-struct NodeSeq<'a> {
-    entries: std::collections::btree_map::Iter<'a, SeqKey, Node>,
+struct NodeSeq<'a, 'q> {
+    entries: std::collections::btree_map::Iter<'a, SeqKey, Node<'q>>,
 }
 
-impl<'de> SeqAccess<'de> for NodeSeq<'_> {
+impl<'de> SeqAccess<'de> for NodeSeq<'_, '_> {
     type Error = QueryError;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(
@@ -1140,11 +1205,11 @@ impl<'de> SeqAccess<'de> for NodeSeq<'_> {
     }
 }
 
-struct PairSeq<'a> {
-    pairs: std::vec::IntoIter<(&'a str, PairValue<'a>)>,
+struct PairSeq<'a, 'q> {
+    pairs: std::vec::IntoIter<(&'a str, PairValue<'a, 'q>)>,
 }
 
-impl<'de> SeqAccess<'de> for PairSeq<'_> {
+impl<'de> SeqAccess<'de> for PairSeq<'_, '_> {
     type Error = QueryError;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(
@@ -1167,12 +1232,12 @@ impl<'de> SeqAccess<'de> for PairSeq<'_> {
 }
 
 /// Deserializes one `(key, value)` pair as a two-element tuple.
-struct PairDeserializer<'a> {
+struct PairDeserializer<'a, 'q> {
     key: &'a str,
-    value: PairValue<'a>,
+    value: PairValue<'a, 'q>,
 }
 
-impl<'de> de::Deserializer<'de> for PairDeserializer<'_> {
+impl<'de> de::Deserializer<'de> for PairDeserializer<'_, '_> {
     type Error = QueryError;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, QueryError> {
@@ -1189,12 +1254,12 @@ impl<'de> de::Deserializer<'de> for PairDeserializer<'_> {
     }
 }
 
-struct PairElements<'a> {
+struct PairElements<'a, 'q> {
     key: Option<&'a str>,
-    value: Option<PairValue<'a>>,
+    value: Option<PairValue<'a, 'q>>,
 }
 
-impl<'de> SeqAccess<'de> for PairElements<'_> {
+impl<'de> SeqAccess<'de> for PairElements<'_, '_> {
     type Error = QueryError;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(
@@ -1214,13 +1279,13 @@ impl<'de> SeqAccess<'de> for PairElements<'_> {
     }
 }
 
-struct NodeMap<'a> {
-    entries: std::collections::btree_map::Iter<'a, String, Node>,
-    value: Option<&'a Node>,
-    key: String,
+struct NodeMap<'a, 'q> {
+    entries: std::collections::btree_map::Iter<'a, Cow<'q, str>, Node<'q>>,
+    value: Option<&'a Node<'q>>,
+    key: &'a str,
 }
 
-impl<'de> MapAccess<'de> for NodeMap<'_> {
+impl<'de> MapAccess<'de> for NodeMap<'_, '_> {
     type Error = QueryError;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(
@@ -1231,7 +1296,7 @@ impl<'de> MapAccess<'de> for NodeMap<'_> {
             return Ok(None);
         };
         self.value = Some(node);
-        self.key = key.clone();
+        self.key = key;
         seed.deserialize(ValueDeserializer { value: key }).map(Some)
     }
 
@@ -1245,7 +1310,7 @@ impl<'de> MapAccess<'de> for NodeMap<'_> {
         // Tag the failure with the field it came from, so a caller sees
         // `filter.limit: invalid value …` rather than a bare parse error.
         seed.deserialize(NodeDeserializer { node })
-            .map_err(|err| err.with_segment(sanitize_key(&self.key)))
+            .map_err(|err| err.with_segment(sanitize_key(self.key)))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -1254,13 +1319,13 @@ impl<'de> MapAccess<'de> for NodeMap<'_> {
 }
 
 /// `MapAccess` over a positional node, rendering each index as its decimal key.
-struct IndexMap<'a> {
-    entries: std::collections::btree_map::Iter<'a, SeqKey, Node>,
-    value: Option<&'a Node>,
+struct IndexMap<'a, 'q> {
+    entries: std::collections::btree_map::Iter<'a, SeqKey, Node<'q>>,
+    value: Option<&'a Node<'q>>,
     key: String,
 }
 
-impl<'de> MapAccess<'de> for IndexMap<'_> {
+impl<'de> MapAccess<'de> for IndexMap<'_, '_> {
     type Error = QueryError;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(
@@ -1296,19 +1361,19 @@ impl<'de> MapAccess<'de> for IndexMap<'_> {
 }
 
 /// `EnumAccess` for the single-entry-object variant form.
-struct NodeVariant<'a> {
+struct NodeVariant<'a, 'q> {
     variant: &'a str,
-    content: &'a Node,
+    content: &'a Node<'q>,
 }
 
-impl<'de, 'a> EnumAccess<'de> for NodeVariant<'a> {
+impl<'de, 'a, 'q> EnumAccess<'de> for NodeVariant<'a, 'q> {
     type Error = QueryError;
-    type Variant = NodeContent<'a>;
+    type Variant = NodeContent<'a, 'q>;
 
     fn variant_seed<V: DeserializeSeed<'de>>(
         self,
         seed: V,
-    ) -> Result<(V::Value, NodeContent<'a>), QueryError> {
+    ) -> Result<(V::Value, NodeContent<'a, 'q>), QueryError> {
         let variant = seed.deserialize(ValueDeserializer {
             value: self.variant,
         })?;
@@ -1321,11 +1386,11 @@ impl<'de, 'a> EnumAccess<'de> for NodeVariant<'a> {
     }
 }
 
-struct NodeContent<'a> {
-    content: &'a Node,
+struct NodeContent<'a, 'q> {
+    content: &'a Node<'q>,
 }
 
-impl<'de> VariantAccess<'de> for NodeContent<'_> {
+impl<'de> VariantAccess<'de> for NodeContent<'_, '_> {
     type Error = QueryError;
 
     /// A unit variant carries no data, but the node selecting it is still

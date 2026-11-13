@@ -62,6 +62,16 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   K6_VERSION: "v0.55.0"
+  # kache S3 remote (.github/actions/kache). Unset variables keep the GitHub
+  # Actions cache. The write token is mapped only on a protected ref, so only
+  # pushes to trunk and trunk-dev (and scheduled runs) add to the store.
+  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET || secrets.AUTUMN_KACHE_S3_BUCKET }}
+  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT || secrets.AUTUMN_KACHE_S3_ENDPOINT }}
+  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION || secrets.AUTUMN_KACHE_S3_REGION }}
+  AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID: ${{ secrets.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
+  AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY: ${{ secrets.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY }}
+  AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || '' }}
+  AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || '' }}
 
 jobs:
   # ── Gate crate unit tests (runs on every PR, no live server) ────────────────
@@ -71,7 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Run gate crate unit tests
@@ -87,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Build gate binary
@@ -125,11 +135,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
-        with:
-          workspaces: |
-            . -> target
-            benchmarks/runtime/autumn -> benchmarks/runtime/autumn/target
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       # ── Apply schema and seed ────────────────────────────────────────────────

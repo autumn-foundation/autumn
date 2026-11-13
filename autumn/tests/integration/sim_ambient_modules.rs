@@ -62,7 +62,7 @@ async fn sim_ambient_modules_global_breakers_stay_on_real_time(sim: Sim) {
     }
     assert_eq!(breaker.state(), CircuitState::Open);
 
-    sim.advance(Duration::from_secs(2 * 3600)).await;
+    sim.advance(Duration::from_hours(2)).await;
     assert_eq!(
         breaker.state(),
         CircuitState::Open,

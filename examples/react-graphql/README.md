@@ -54,7 +54,7 @@ untouched because the bundle is an external ES module.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - PostgreSQL (or Docker: `docker compose up -d` in this directory starts one on
   `localhost:5432` matching `autumn.toml`)
 

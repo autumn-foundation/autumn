@@ -42,16 +42,26 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 
 use super::ast::{
     ActionStep, ComponentDef, Expr, Node, ParamDef, PayloadSpec, Program, Prop, StateType,
     UpdateOperation,
 };
 use super::error::{ConstelaError, Diagnostic, codes};
+use super::path::Path;
 use super::policy;
 
 /// The DSL versions this implementation accepts.
 pub const SUPPORTED_VERSIONS: &[&str] = &["1.0"];
+
+/// The most faults one [`ConstelaError::Invalid`] reports.
+///
+/// A hostile document can have thousands of faults. After this many,
+/// validation keeps no more and adds one [`codes::LIMIT`] diagnostic, so the
+/// list holds at most `MAX_DIAGNOSTICS + 1` entries. The generator must fix
+/// these faults and send the document again.
+pub const MAX_DIAGNOSTICS: usize = 256;
 
 /// What is in lexical scope at a point in the view tree.
 struct Scope<'a> {
@@ -81,6 +91,9 @@ struct Scope<'a> {
     /// an ordering mistake, not a payload key, and it is caught against
     /// [`Validator::action_results`].
     allow_unbound_vars: bool,
+    /// Whether this node can render more than one time: inside an `each`
+    /// body, and not under an `if` there. A literal `id` here repeats.
+    repeats: bool,
 }
 
 impl Scope<'_> {
@@ -91,6 +104,7 @@ impl Scope<'_> {
             params: None,
             in_component: false,
             allow_unbound_vars: false,
+            repeats: false,
         }
     }
 }
@@ -104,6 +118,8 @@ struct Validator<'a> {
     /// `result`, anywhere in it. Empty while walking the view.
     action_results: BTreeSet<&'a str>,
     diagnostics: Vec<Diagnostic>,
+    /// Whether a fault was found after [`MAX_DIAGNOSTICS`] were kept.
+    truncated: bool,
 }
 
 /// Whether `name` is usable as a binding, state field, or action name.
@@ -132,6 +148,7 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
         action_names: BTreeSet::new(),
         action_results: BTreeSet::new(),
         diagnostics: Vec::new(),
+        truncated: false,
     };
 
     validator.check_version();
@@ -141,12 +158,12 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
     // Cycles first: the component walk below would not terminate on a cyclic
     // graph, so this is the one check that gates the rest.
     if let Some(cycle) = validator.find_component_cycle() {
-        validator.diagnostics.push(Diagnostic::new(
+        validator.error(
             "components",
             codes::CYCLE,
             format!("components reference each other in a cycle: {cycle}"),
-        ));
-        return Err(ConstelaError::Invalid(validator.diagnostics));
+        );
+        return Err(validator.finish());
     }
 
     validator.check_styles();
@@ -156,20 +173,51 @@ pub fn validate(program: &Program) -> Result<(), ConstelaError> {
     validator.check_components();
 
     let mut scope = Scope::top();
-    validator.check_node(&program.view, "view", &mut scope);
+    validator.check_node(&program.view, Path::root("view"), &mut scope);
 
     validator.check_island_ids();
 
     if validator.diagnostics.is_empty() {
         Ok(())
     } else {
-        Err(ConstelaError::Invalid(validator.diagnostics))
+        Err(validator.finish())
     }
 }
 
 impl<'a> Validator<'a> {
-    fn error(&mut self, path: impl Into<String>, code: &'static str, message: impl Into<String>) {
-        self.diagnostics.push(Diagnostic::new(path, code, message));
+    /// Record one fault. The only way a diagnostic enters the list.
+    ///
+    /// After [`MAX_DIAGNOSTICS`] the fault is not kept. [`Self::finish`] then
+    /// adds one diagnostic that says the list was cut.
+    fn error(&mut self, path: impl Display, code: &'static str, message: impl Into<String>) {
+        if self.is_full() {
+            self.truncated = true;
+            return;
+        }
+        self.diagnostics
+            .push(Diagnostic::new(path.to_string(), code, message));
+    }
+
+    /// Whether the list holds [`MAX_DIAGNOSTICS`] faults.
+    ///
+    /// A loop that can report one fault per entry checks this, so that it
+    /// stops formatting messages nobody keeps.
+    const fn is_full(&self) -> bool {
+        self.diagnostics.len() >= MAX_DIAGNOSTICS
+    }
+
+    /// The error for the faults found.
+    fn finish(mut self) -> ConstelaError {
+        if self.truncated {
+            self.diagnostics.push(Diagnostic::new(
+                "",
+                codes::LIMIT,
+                format!(
+                    "validation stopped after {MAX_DIAGNOSTICS} problems; fix these and validate again to see the rest"
+                ),
+            ));
+        }
+        ConstelaError::Invalid(self.diagnostics)
     }
 
     fn check_version(&mut self) {
@@ -264,10 +312,11 @@ impl<'a> Validator<'a> {
         // and no component encloses it.
         let scope = Scope::top();
         if let Some(title) = &route.title {
-            self.check_expr(title, "route.title", &scope);
+            self.check_expr(title, Path::root("route.title"), &scope);
         }
         for (key, value) in &route.meta {
-            self.check_expr(value, &format!("route.meta.{key}"), &scope);
+            let meta = Path::root("route.meta");
+            self.check_expr(value, meta.name(key), &scope);
         }
     }
 
@@ -282,7 +331,7 @@ impl<'a> Validator<'a> {
             ("onRouteLeave", &lifecycle.on_route_leave),
         ] {
             if let Some(action) = hook {
-                self.check_action_ref(action, &format!("lifecycle.{field}"));
+                self.check_action_ref(action, Path::root("lifecycle").name(field));
             }
         }
     }
@@ -292,25 +341,28 @@ impl<'a> Validator<'a> {
             self.action_results.clear();
             collect_result_names(&action.steps, &mut self.action_results);
             let mut bound: Vec<&'a str> = Vec::new();
-            self.check_steps(&action.steps, &format!("actions[{i}].steps"), &mut bound);
+            let actions = Path::root("actions");
+            let action_path = actions.index(i);
+            self.check_steps(&action.steps, action_path.key("steps"), &mut bound);
         }
         self.action_results.clear();
     }
 
     /// Walk a step list, threading the `result` names each step binds for the
     /// steps that follow it.
-    fn check_steps(&mut self, steps: &'a [ActionStep], path: &str, bound: &mut Vec<&'a str>) {
+    fn check_steps(&mut self, steps: &'a [ActionStep], path: Path<'_>, bound: &mut Vec<&'a str>) {
         for (i, step) in steps.iter().enumerate() {
-            self.check_step(step, &format!("{path}[{i}]"), bound);
+            self.check_step(step, path.index(i), bound);
         }
     }
 
-    fn check_step(&mut self, step: &'a ActionStep, path: &str, bound: &mut Vec<&'a str>) {
+    fn check_step(&mut self, step: &'a ActionStep, path: Path<'_>, bound: &mut Vec<&'a str>) {
         let scope = Scope {
             vars: bound.clone(),
             params: None,
             in_component: false,
             allow_unbound_vars: true,
+            repeats: false,
         };
 
         match step {
@@ -322,13 +374,13 @@ impl<'a> Validator<'a> {
                 then,
                 otherwise,
             } => {
-                self.check_expr(condition, &format!("{path}.condition"), &scope);
+                self.check_expr(condition, path.key("condition"), &scope);
                 // Branches cannot leak bindings to each other or to what
                 // follows, so each walks a copy.
                 let mut then_bound = bound.clone();
-                self.check_steps(then, &format!("{path}.then"), &mut then_bound);
+                self.check_steps(then, path.key("then"), &mut then_bound);
                 let mut else_bound = bound.clone();
-                self.check_steps(otherwise, &format!("{path}.else"), &mut else_bound);
+                self.check_steps(otherwise, path.key("else"), &mut else_bound);
             }
             ActionStep::Fetch {
                 url,
@@ -338,10 +390,10 @@ impl<'a> Validator<'a> {
                 on_error,
                 ..
             } => {
-                self.check_expr(url, &format!("{path}.url"), &scope);
-                self.check_literal_url(url, &format!("{path}.url"));
+                self.check_expr(url, path.key("url"), &scope);
+                self.check_literal_url(url, path.key("url"));
                 if let Some(body) = body {
-                    self.check_expr(body, &format!("{path}.body"), &scope);
+                    self.check_expr(body, path.key("body"), &scope);
                 }
                 self.check_result_and_branches(result.as_ref(), on_success, on_error, path, bound);
             }
@@ -354,7 +406,7 @@ impl<'a> Validator<'a> {
                 on_error,
                 ..
             } => {
-                self.check_expr(key, &format!("{path}.key"), &scope);
+                self.check_expr(key, path.key("key"), &scope);
                 if matches!(operation, super::ast::StorageOperation::Set) && value.is_none() {
                     self.error(
                         path,
@@ -363,32 +415,32 @@ impl<'a> Validator<'a> {
                     );
                 }
                 if let Some(value) = value {
-                    self.check_expr(value, &format!("{path}.value"), &scope);
+                    self.check_expr(value, path.key("value"), &scope);
                 }
                 self.check_result_and_branches(result.as_ref(), on_success, on_error, path, bound);
             }
             ActionStep::Navigate { url, .. } => {
-                self.check_expr(url, &format!("{path}.url"), &scope);
-                self.check_literal_url(url, &format!("{path}.url"));
+                self.check_expr(url, path.key("url"), &scope);
+                self.check_literal_url(url, path.key("url"));
             }
             ActionStep::Delay { ms, then } => {
-                self.check_expr(ms, &format!("{path}.ms"), &scope);
+                self.check_expr(ms, path.key("ms"), &scope);
                 let mut inner = bound.clone();
-                self.check_steps(then, &format!("{path}.then"), &mut inner);
+                self.check_steps(then, path.key("then"), &mut inner);
             }
             ActionStep::Interval { ms, action } => {
-                self.check_expr(ms, &format!("{path}.ms"), &scope);
-                self.check_action_ref(action, &format!("{path}.action"));
+                self.check_expr(ms, path.key("ms"), &scope);
+                self.check_action_ref(action, path.key("action"));
             }
             ActionStep::Focus { target, operation } => {
-                self.check_expr(target, &format!("{path}.target"), &scope);
+                self.check_expr(target, path.key("target"), &scope);
                 self.check_focus_operation(operation, path);
             }
         }
     }
 
     /// Check that `action` names a declared action.
-    fn check_action_ref(&mut self, action: &str, path: &str) {
+    fn check_action_ref(&mut self, action: &str, path: Path<'_>) {
         if !self.action_names.contains(action) {
             self.error(
                 path,
@@ -400,10 +452,10 @@ impl<'a> Validator<'a> {
 
     /// Check a `focus` step's operation against the three DOM methods it maps
     /// to.
-    fn check_focus_operation(&mut self, operation: &str, path: &str) {
+    fn check_focus_operation(&mut self, operation: &str, path: Path<'_>) {
         if !["focus", "blur", "select"].contains(&operation) {
             self.error(
-                format!("{path}.operation"),
+                path.key("operation"),
                 codes::STEP_SHAPE,
                 format!("unknown focus operation {operation:?}; write `focus`, `blur` or `select`"),
             );
@@ -412,11 +464,11 @@ impl<'a> Validator<'a> {
 
     /// Check the three steps that write state directly: their target must be a
     /// declared field, and their operands must fit the operation.
-    fn check_state_step(&mut self, step: &'a ActionStep, path: &str, scope: &Scope<'a>) {
+    fn check_state_step(&mut self, step: &'a ActionStep, path: Path<'_>, scope: &Scope<'a>) {
         match step {
             ActionStep::Set { target, value } => {
                 self.check_state_target(target, path);
-                self.check_expr(value, &format!("{path}.value"), scope);
+                self.check_expr(value, path.key("value"), scope);
             }
             ActionStep::Update {
                 target,
@@ -435,13 +487,13 @@ impl<'a> Validator<'a> {
                     path,
                 );
                 if let Some(value) = value {
-                    self.check_expr(value, &format!("{path}.value"), scope);
+                    self.check_expr(value, path.key("value"), scope);
                 }
                 if let Some(index) = index {
-                    self.check_expr(index, &format!("{path}.index"), scope);
+                    self.check_expr(index, path.key("index"), scope);
                 }
                 if let Some(count) = delete_count {
-                    self.check_expr(count, &format!("{path}.deleteCount"), scope);
+                    self.check_expr(count, path.key("deleteCount"), scope);
                 }
             }
             ActionStep::SetPath {
@@ -450,8 +502,8 @@ impl<'a> Validator<'a> {
                 value,
             } => {
                 self.check_state_target(target, path);
-                self.check_expr(target_path, &format!("{path}.path"), scope);
-                self.check_expr(value, &format!("{path}.value"), scope);
+                self.check_expr(target_path, path.key("path"), scope);
+                self.check_expr(value, path.key("value"), scope);
             }
             other => debug_assert!(false, "check_state_step reached a {} step", other.kind()),
         }
@@ -468,16 +520,16 @@ impl<'a> Validator<'a> {
         result: Option<&'a String>,
         on_success: &'a [ActionStep],
         on_error: &'a [ActionStep],
-        path: &str,
+        path: Path<'_>,
         bound: &mut Vec<&'a str>,
     ) {
         let mut inner = bound.clone();
         if let Some(result) = result {
-            self.check_binding_name(result, &format!("{path}.result"));
+            self.check_binding_name(result, path.key("result"));
             inner.push(result.as_str());
         }
-        self.check_steps(on_success, &format!("{path}.onSuccess"), &mut inner.clone());
-        self.check_steps(on_error, &format!("{path}.onError"), &mut inner);
+        self.check_steps(on_success, path.key("onSuccess"), &mut inner.clone());
+        self.check_steps(on_error, path.key("onError"), &mut inner);
         if let Some(result) = result {
             bound.push(result.as_str());
         }
@@ -492,7 +544,7 @@ impl<'a> Validator<'a> {
         value: Option<&Expr>,
         index: Option<&Expr>,
         delete_count: Option<&Expr>,
-        path: &str,
+        path: Path<'_>,
     ) {
         if let Some(required) = operation.required_target_type()
             && let Some(actual) = self.state_types.get(target).copied()
@@ -547,17 +599,17 @@ impl<'a> Validator<'a> {
         }
     }
 
-    fn check_state_target(&mut self, target: &str, path: &str) {
+    fn check_state_target(&mut self, target: &str, path: Path<'_>) {
         if !self.state_types.contains_key(target) {
             self.error(
-                format!("{path}.target"),
+                path.key("target"),
                 codes::UNKNOWN_REF,
                 format!("no state field named {target:?} is declared"),
             );
         }
     }
 
-    fn check_binding_name(&mut self, name: &str, path: &str) {
+    fn check_binding_name(&mut self, name: &str, path: Path<'_>) {
         if !is_identifier(name) {
             self.error(
                 path,
@@ -578,10 +630,11 @@ impl<'a> Validator<'a> {
                 params: Some(&component.params),
                 in_component: true,
                 allow_unbound_vars: false,
+                repeats: false,
             };
             self.check_node(
                 &component.view,
-                &format!("components.{name}.view"),
+                Path::root("components").name(name).key("view"),
                 &mut scope,
             );
 
@@ -670,9 +723,9 @@ impl<'a> Validator<'a> {
     fn check_island_ids(&mut self) {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         let mut ids = Vec::new();
-        collect_island_ids(&self.program.view, "view", &mut ids);
+        collect_island_ids(&self.program.view, Path::root("view"), &mut ids);
         for component in self.program.components.values() {
-            collect_island_ids(&component.view, "components", &mut ids);
+            collect_island_ids(&component.view, Path::root("components"), &mut ids);
         }
         for (id, path) in ids {
             if !seen.insert(id) {
@@ -686,7 +739,7 @@ impl<'a> Validator<'a> {
     }
 
     /// Walk a view node.
-    fn check_node(&mut self, node: &'a Node, path: &str, scope: &mut Scope<'a>) {
+    fn check_node(&mut self, node: &'a Node, path: Path<'_>, scope: &mut Scope<'a>) {
         match node {
             Node::Element {
                 tag,
@@ -694,17 +747,21 @@ impl<'a> Validator<'a> {
                 props,
                 children,
             } => self.check_element(tag, element_ref.as_deref(), props, children, path, scope),
-            Node::Text { value } => self.check_expr(value, &format!("{path}.value"), scope),
+            Node::Text { value } => self.check_expr(value, path.key("value"), scope),
             Node::If {
                 condition,
                 then,
                 otherwise,
             } => {
-                self.check_expr(condition, &format!("{path}.condition"), scope);
-                self.check_node(then, &format!("{path}.then"), scope);
+                self.check_expr(condition, path.key("condition"), scope);
+                // A branch can select one pass of a loop, so a literal id in
+                // it is not a sure repeat. The render-time check covers it.
+                let repeats = std::mem::replace(&mut scope.repeats, false);
+                self.check_node(then, path.key("then"), scope);
                 if let Some(otherwise) = otherwise {
-                    self.check_node(otherwise, &format!("{path}.else"), scope);
+                    self.check_node(otherwise, path.key("else"), scope);
                 }
+                scope.repeats = repeats;
             }
             Node::Each {
                 items,
@@ -742,33 +799,44 @@ impl<'a> Validator<'a> {
                     codes::FEATURE_REQUIRED,
                     "a `markdown` node needs autumn-web's `markdown` Cargo feature, which this build does not have",
                 );
-                self.check_expr(content, &format!("{path}.content"), scope);
+                self.check_expr(content, path.key("content"), scope);
             }
             Node::Code { language, content } => {
-                self.check_expr(language, &format!("{path}.language"), scope);
-                self.check_expr(content, &format!("{path}.content"), scope);
+                self.check_expr(language, path.key("language"), scope);
+                self.check_expr(content, path.key("content"), scope);
             }
-            Node::Portal { children, .. } => {
+            Node::Portal { target, children } => {
+                if target.len() > policy::MAX_PORTAL_TARGET_BYTES {
+                    self.error(
+                        path.key("target"),
+                        codes::LIMIT,
+                        format!(
+                            "portal target is {} bytes, over the {}-byte limit; name a place in the host layout, e.g. \"body\" or \"#modal-root\"",
+                            target.len(),
+                            policy::MAX_PORTAL_TARGET_BYTES
+                        ),
+                    );
+                }
                 for (i, child) in children.iter().enumerate() {
-                    self.check_node(child, &format!("{path}.children[{i}]"), scope);
+                    self.check_node(child, path.key("children").index(i), scope);
                 }
             }
             Node::Island { id, content, .. } => {
                 if id.is_empty() {
                     self.error(
-                        format!("{path}.id"),
+                        path.key("id"),
                         codes::UNKNOWN_REF,
                         "an island needs a non-empty `id`",
                     );
                 }
-                self.check_node(content, &format!("{path}.content"), scope);
+                self.check_node(content, path.key("content"), scope);
             }
             Node::Suspense {
                 fallback, content, ..
             }
             | Node::ErrorBoundary { fallback, content } => {
-                self.check_node(fallback, &format!("{path}.fallback"), scope);
-                self.check_node(content, &format!("{path}.content"), scope);
+                self.check_node(fallback, path.key("fallback"), scope);
+                self.check_node(content, path.key("content"), scope);
             }
         }
     }
@@ -781,7 +849,7 @@ impl<'a> Validator<'a> {
         element_ref: Option<&str>,
         props: &'a BTreeMap<String, Prop>,
         children: &'a [Node],
-        path: &str,
+        path: Path<'_>,
         scope: &mut Scope<'a>,
     ) {
         if !policy::is_allowed_tag(tag) {
@@ -795,13 +863,13 @@ impl<'a> Validator<'a> {
         }
         if policy::is_void_tag(tag) && !children.is_empty() {
             self.error(
-                format!("{path}.children"),
+                path.key("children"),
                 codes::MISPLACED,
                 format!("<{tag}> is a void element and cannot have children"),
             );
         }
         if let Some(name) = element_ref {
-            self.check_binding_name(name, &format!("{path}.ref"));
+            self.check_binding_name(name, path.key("ref"));
         }
         // Both maps guard the same failure: two props that collapse onto one
         // emitted name, where HTML keeps whichever came first and the other
@@ -817,7 +885,7 @@ impl<'a> Validator<'a> {
                     let canonical = policy::canonical_attr(attr);
                     if let Some(previous) = canonical_seen.insert(canonical.clone(), attr) {
                         self.error(
-                            format!("{path}.props.{attr}"),
+                            path.key("props").name(attr),
                             codes::DUPLICATE,
                             format!(
                                 "{attr:?} and {previous:?} are both the {canonical:?} attribute; write only one"
@@ -835,7 +903,7 @@ impl<'a> Validator<'a> {
                         && let Some(previous) = event_seen.insert(canonical.clone(), attr)
                     {
                         self.error(
-                            format!("{path}.props.{attr}"),
+                            path.key("props").name(attr),
                             codes::DUPLICATE,
                             format!(
                                 "{attr:?} and {previous:?} both bind the {canonical:?} event; only one would be emitted"
@@ -844,10 +912,10 @@ impl<'a> Validator<'a> {
                     }
                 }
             }
-            self.check_prop(attr, prop, &format!("{path}.props.{attr}"), scope);
+            self.check_prop(attr, prop, path.key("props").name(attr), scope);
         }
         for (i, child) in children.iter().enumerate() {
-            self.check_node(child, &format!("{path}.children[{i}]"), scope);
+            self.check_node(child, path.key("children").index(i), scope);
         }
     }
 
@@ -865,19 +933,19 @@ impl<'a> Validator<'a> {
         index: Option<&'a str>,
         key: Option<&'a Expr>,
         body: &'a Node,
-        path: &str,
+        path: Path<'_>,
         scope: &mut Scope<'a>,
     ) {
-        self.check_expr(items, &format!("{path}.items"), scope);
+        self.check_expr(items, path.key("items"), scope);
         if !is_identifier(binding) {
             self.error(
-                format!("{path}.as"),
+                path.key("as"),
                 codes::UNKNOWN_REF,
                 "loop binding names must be identifiers",
             );
         }
         if let Some(index) = index {
-            self.check_binding_name(index, &format!("{path}.index"));
+            self.check_binding_name(index, path.key("index"));
         }
 
         // The bindings are in scope for the key and the body, and nowhere
@@ -889,9 +957,11 @@ impl<'a> Validator<'a> {
             scope.vars.push(index);
         }
         if let Some(key) = key {
-            self.check_expr(key, &format!("{path}.key"), scope);
+            self.check_expr(key, path.key("key"), scope);
         }
-        self.check_node(body, &format!("{path}.body"), scope);
+        let repeats = std::mem::replace(&mut scope.repeats, true);
+        self.check_node(body, path.key("body"), scope);
+        scope.repeats = repeats;
         scope.vars.truncate(restore);
     }
 
@@ -901,33 +971,44 @@ impl<'a> Validator<'a> {
         name: &str,
         props: &'a BTreeMap<String, Expr>,
         children: &'a [Node],
-        path: &str,
+        path: Path<'_>,
         scope: &mut Scope<'a>,
     ) {
         match self.program.components.get(name) {
             None => self.error(
-                format!("{path}.name"),
+                path.key("name"),
                 codes::UNKNOWN_REF,
                 format!("no component named {name:?} is declared"),
             ),
             Some(component) => {
+                // One fault per param, so stop once the list is full. The
+                // path names the invocation, so the message does not repeat
+                // the component name: a name can be as long as the document.
                 for (param, def) in &component.params {
                     if def.required && !props.contains_key(param) {
+                        if self.is_full() {
+                            self.truncated = true;
+                            break;
+                        }
                         self.error(
-                            format!("{path}.props"),
+                            path.key("props"),
                             codes::UNKNOWN_REF,
                             format!(
-                                "component {name:?} requires a {param:?} prop, which is not supplied"
+                                "this component requires a {param:?} prop, which is not supplied"
                             ),
                         );
                     }
                 }
                 for supplied in props.keys() {
                     if !component.params.contains_key(supplied) {
+                        if self.is_full() {
+                            self.truncated = true;
+                            break;
+                        }
                         self.error(
-                            format!("{path}.props.{supplied}"),
+                            path.key("props").name(supplied),
                             codes::UNKNOWN_REF,
-                            format!("component {name:?} declares no parameter {supplied:?}"),
+                            format!("this component declares no parameter {supplied:?}"),
                         );
                     }
                 }
@@ -936,25 +1017,25 @@ impl<'a> Validator<'a> {
         // Props and slot children are written in the *caller's* scope, so they
         // are checked here rather than inside the component.
         for (key, value) in props {
-            self.check_expr(value, &format!("{path}.props.{key}"), scope);
+            self.check_expr(value, path.key("props").name(key), scope);
         }
         for (i, child) in children.iter().enumerate() {
-            self.check_node(child, &format!("{path}.children[{i}]"), scope);
+            self.check_node(child, path.key("children").index(i), scope);
         }
     }
 
     /// Check one entry of an element's `props`.
-    fn check_prop(&mut self, attr: &str, prop: &'a Prop, path: &str, scope: &Scope<'a>) {
+    fn check_prop(&mut self, attr: &str, prop: &'a Prop, path: Path<'_>, scope: &Scope<'a>) {
         match prop {
             Prop::Handler(handler) => {
-                self.check_action_ref(&handler.action, &format!("{path}.action"));
+                self.check_action_ref(&handler.action, path.key("action"));
                 // Judged by the same reduction the renderer will apply, so a
                 // name that survives validation is a name that reaches the
                 // page. `"_"` and an emoji are non-empty but reduce to
                 // nothing, and would have vanished silently at render time.
                 if policy::canonical_event(&handler.event).is_empty() {
                     self.error(
-                        format!("{path}.event"),
+                        path.key("event"),
                         codes::STEP_SHAPE,
                         format!(
                             "event name {:?} has no letters, digits or `-`, so it cannot be written as a `{}on-*` attribute; name the DOM event, e.g. \"click\"",
@@ -966,11 +1047,11 @@ impl<'a> Validator<'a> {
                 match &handler.payload {
                     None => {}
                     Some(PayloadSpec::Single(expr)) => {
-                        self.check_expr(expr, &format!("{path}.payload"), scope);
+                        self.check_expr(expr, path.key("payload"), scope);
                     }
                     Some(PayloadSpec::Map(props)) => {
                         for (key, expr) in props {
-                            self.check_expr(expr, &format!("{path}.payload.{key}"), scope);
+                            self.check_expr(expr, path.key("payload").name(key), scope);
                         }
                     }
                 }
@@ -1000,6 +1081,19 @@ impl<'a> Validator<'a> {
                 if policy::is_url_attr(&canonical) {
                     self.check_literal_url(expr, path);
                 }
+                // Found here, not only at render time: a loop over a list that
+                // is empty now renders, and fails later when the list grows.
+                if canonical == "id"
+                    && scope.repeats
+                    && let Expr::Lit { value } = expr
+                    && value.as_str().is_some_and(|id| !id.is_empty())
+                {
+                    self.error(
+                        path,
+                        codes::DUPLICATE,
+                        "a literal id in an `each` body repeats on each pass; set \"index\": \"i\" on the `each` and build the id with `concat`",
+                    );
+                }
                 self.check_expr(expr, path, scope);
             }
         }
@@ -1012,7 +1106,7 @@ impl<'a> Validator<'a> {
     /// known. Doing it in both places is deliberate: the static check gives the
     /// author a diagnostic to act on, and the render-time check is the one that
     /// actually holds.
-    fn check_literal_url(&mut self, expr: &Expr, path: &str) {
+    fn check_literal_url(&mut self, expr: &Expr, path: Path<'_>) {
         if let Expr::Lit { value } = expr
             && let Some(url) = value.as_str()
             && !policy::is_allowed_url(url)
@@ -1029,7 +1123,7 @@ impl<'a> Validator<'a> {
     }
 
     /// Walk an expression, checking every name it reads.
-    fn check_expr(&mut self, expr: &'a Expr, path: &str, scope: &Scope<'a>) {
+    fn check_expr(&mut self, expr: &'a Expr, path: Path<'_>, scope: &Scope<'a>) {
         match expr {
             Expr::Lit { .. } | Expr::Route { .. } => {}
             Expr::State { name, .. } => {
@@ -1084,41 +1178,41 @@ impl<'a> Validator<'a> {
                     );
                 }
                 for (axis, value) in variants {
-                    self.check_expr(value, &format!("{path}.variants.{axis}"), scope);
+                    self.check_expr(value, path.key("variants").name(axis), scope);
                 }
             }
-            Expr::Not { operand } => self.check_expr(operand, &format!("{path}.operand"), scope),
+            Expr::Not { operand } => self.check_expr(operand, path.key("operand"), scope),
             Expr::Bin { left, right, .. } => {
-                self.check_expr(left, &format!("{path}.left"), scope);
-                self.check_expr(right, &format!("{path}.right"), scope);
+                self.check_expr(left, path.key("left"), scope);
+                self.check_expr(right, path.key("right"), scope);
             }
             Expr::Cond {
                 condition,
                 then,
                 otherwise,
             } => {
-                self.check_expr(condition, &format!("{path}.if"), scope);
-                self.check_expr(then, &format!("{path}.then"), scope);
-                self.check_expr(otherwise, &format!("{path}.else"), scope);
+                self.check_expr(condition, path.key("if"), scope);
+                self.check_expr(then, path.key("then"), scope);
+                self.check_expr(otherwise, path.key("else"), scope);
             }
-            Expr::Get { base, .. } => self.check_expr(base, &format!("{path}.base"), scope),
+            Expr::Get { base, .. } => self.check_expr(base, path.key("base"), scope),
             Expr::Index { base, key } => {
-                self.check_expr(base, &format!("{path}.base"), scope);
-                self.check_expr(key, &format!("{path}.key"), scope);
+                self.check_expr(base, path.key("base"), scope);
+                self.check_expr(key, path.key("key"), scope);
             }
             Expr::Concat { items } => {
                 for (i, item) in items.iter().enumerate() {
-                    self.check_expr(item, &format!("{path}.items[{i}]"), scope);
+                    self.check_expr(item, path.key("items").index(i), scope);
                 }
             }
             Expr::Array { elements } => {
                 for (i, element) in elements.iter().enumerate() {
-                    self.check_expr(element, &format!("{path}.elements[{i}]"), scope);
+                    self.check_expr(element, path.key("elements").index(i), scope);
                 }
             }
             Expr::Obj { props } => {
                 for (key, value) in props {
-                    self.check_expr(value, &format!("{path}.props.{key}"), scope);
+                    self.check_expr(value, path.key("props").name(key), scope);
                 }
             }
         }
@@ -1256,34 +1350,34 @@ fn collect_component_refs<'a>(node: &'a Node, out: &mut Vec<&'a str>) {
 }
 
 /// Collect every island id in a node tree, with the path that reached it.
-fn collect_island_ids<'a>(node: &'a Node, path: &str, out: &mut Vec<(&'a str, String)>) {
+fn collect_island_ids<'a>(node: &'a Node, path: Path<'_>, out: &mut Vec<(&'a str, String)>) {
     match node {
         Node::Island { id, content, .. } => {
             out.push((id.as_str(), path.to_string()));
-            collect_island_ids(content, &format!("{path}.content"), out);
+            collect_island_ids(content, path.key("content"), out);
         }
         Node::Element { children, .. }
         | Node::Portal { children, .. }
         | Node::Component { children, .. } => {
             for (i, child) in children.iter().enumerate() {
-                collect_island_ids(child, &format!("{path}.children[{i}]"), out);
+                collect_island_ids(child, path.key("children").index(i), out);
             }
         }
         Node::If {
             then, otherwise, ..
         } => {
-            collect_island_ids(then, &format!("{path}.then"), out);
+            collect_island_ids(then, path.key("then"), out);
             if let Some(otherwise) = otherwise {
-                collect_island_ids(otherwise, &format!("{path}.else"), out);
+                collect_island_ids(otherwise, path.key("else"), out);
             }
         }
-        Node::Each { body, .. } => collect_island_ids(body, &format!("{path}.body"), out),
+        Node::Each { body, .. } => collect_island_ids(body, path.key("body"), out),
         Node::Suspense {
             fallback, content, ..
         }
         | Node::ErrorBoundary { fallback, content } => {
-            collect_island_ids(fallback, &format!("{path}.fallback"), out);
-            collect_island_ids(content, &format!("{path}.content"), out);
+            collect_island_ids(fallback, path.key("fallback"), out);
+            collect_island_ids(content, path.key("content"), out);
         }
         Node::Text { .. } | Node::Slot { .. } | Node::Markdown { .. } | Node::Code { .. } => {}
     }

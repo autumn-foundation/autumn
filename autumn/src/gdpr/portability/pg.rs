@@ -468,20 +468,27 @@ impl CapsuleStore for PgCapsuleStore {
                     // Check every move first: one `setval` that fails after
                     // another one ran would leave a changed sequence.
                     // Each imported column can own a sequence, not only the key.
-                    let mut owned = Vec::new();
+                    let mut columns = Vec::new();
                     for (_, _, batch) in &statements {
                         for field in batch.model.fields.iter().filter(|f| !f.generated) {
-                            if let Some(seq) =
-                                serial_sequence(conn, &batch.model.table, &field.name).await?
-                            {
-                                let keys = imported_keys(batch.records, &field.name);
-                                owned.push((
-                                    seq,
-                                    batch.model.table.as_str(),
-                                    field.name.as_str(),
-                                    keys,
-                                ));
-                            }
+                            columns.push((batch, field));
+                        }
+                    }
+                    let pairs: Vec<(&str, &str)> = columns
+                        .iter()
+                        .map(|(batch, field)| (batch.model.table.as_str(), field.name.as_str()))
+                        .collect();
+                    let sequences = serial_sequences(conn, &pairs).await?;
+                    let mut owned = Vec::new();
+                    for ((batch, field), seq) in columns.into_iter().zip(sequences) {
+                        if let Some(seq) = seq {
+                            let keys = imported_keys(batch.records, &field.name);
+                            owned.push((
+                                seq,
+                                batch.model.table.as_str(),
+                                field.name.as_str(),
+                                keys,
+                            ));
                         }
                     }
                     // Another import of the same sequence plans from its own
@@ -695,20 +702,33 @@ fn is_decimal(s: &str) -> bool {
             .is_ok_and(|e| (-1000..=1000).contains(&e))
 }
 
-/// The serial or identity sequence of `table.column`, if it has one.
-async fn serial_sequence(
+/// The serial or identity sequence of each `(table, column)` pair, if it has
+/// one, in the order of `pairs`. One statement for all pairs: a statement per
+/// column made an import cost one round trip per imported column.
+async fn serial_sequences(
     conn: &mut AsyncPgConnection,
-    table: &str,
-    column: &str,
-) -> Result<Option<String>, DataCapsuleError> {
+    pairs: &[(&str, &str)],
+) -> Result<Vec<Option<String>>, DataCapsuleError> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
     // `pg_get_serial_sequence` reads the column name as it is, unquoted.
-    let seq: SequenceRow = diesel::sql_query("SELECT pg_get_serial_sequence($1, $2) AS seq")
-        .bind::<diesel::sql_types::Text, _>(quote(table)?)
-        .bind::<diesel::sql_types::Text, _>(column)
-        .get_result(conn)
-        .await
-        .map_err(|e| store_error(&format!("sequence of {table}.{column}"), &e))?;
-    Ok(seq.seq)
+    let tables = pairs
+        .iter()
+        .map(|(table, _)| quote(table))
+        .collect::<Result<Vec<_>, _>>()?;
+    let columns: Vec<&str> = pairs.iter().map(|(_, column)| *column).collect();
+    let rows: Vec<SequenceRow> = diesel::sql_query(
+        "SELECT pg_get_serial_sequence(t.tbl, t.col) AS seq \
+         FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS t(tbl, col, ord) \
+         ORDER BY t.ord",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(tables)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(columns)
+    .get_results(conn)
+    .await
+    .map_err(|e| store_error("sequences of the imported columns", &e))?;
+    Ok(rows.into_iter().map(|row| row.seq).collect())
 }
 
 /// The `setval` that moves `seq`, the sequence of `column`, past the imported

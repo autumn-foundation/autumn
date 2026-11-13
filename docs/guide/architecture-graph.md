@@ -104,9 +104,14 @@ its auth requirement, and the table each one touches — a map of exactly where 
 attacker would look first. It is available when `actuator.sensitive = true`
 (the default in dev), and absent in production unless you opt in.
 
-A process that never built an application router answers `503` with an
-explanation rather than `404`, so "this process published no graph" reads
-differently from "this build has no such endpoint".
+Each application serves its own graph. When `AppBuilder` builds the router, it
+keeps the graph in the app's `AppState`. Two such applications in one process
+(an embedded host, say) each serve their own paths and auth. Read the graph in
+code with `autumn_web::graph::served(&state)`.
+
+A state with no installed graph gets `503` from `/actuator/graph`, with an
+explanation, not `404`. Then "this app published no graph" reads differently
+from "this build has no such endpoint". A `TestApp` installs no graph.
 
 A **worker** (`AUTUMN_ROLE=worker`) serves the probe-only router and mounts no
 application route, so its graph reports every declared route as
@@ -116,6 +121,14 @@ in, they are just not being served here. Its
 `unmodelled_mounted_routes` names the probes and actuator it does serve, and
 nothing else. `autumn graph` reads `role` from the app's configuration and
 shows the same worker view.
+
+A role with `[roles.<name>] mount = [...]` serves only its route groups, so
+its graph marks the routes of other groups `mounted: false` (#3544). A route
+that another declared preset mounts is in `completeness.mounted_elsewhere`,
+not in `unmounted_routes`: it is served, but not here. A route that no
+preset mounts stays in `unmounted_routes`. A worker preset gets the same
+`mounted_elsewhere` list. Set `AUTUMN_ROLE` to see the graph of one role. See
+[Route groups](route-groups.md).
 
 The dump reads configuration through the loader the app installs with
 `.with_config_loader(...)`, as normal startup does. It starts no telemetry,
@@ -130,7 +143,7 @@ committed document does.
 
 ## What is in the graph
 
-**Nodes** — one per macro-declared element:
+**Nodes** — one per macro-declared element, and one per background task:
 
 | Node kind        | Declared by                        | Carries |
 |------------------|------------------------------------|---------|
@@ -141,6 +154,12 @@ committed document does.
 | `job`            | `#[job]`                           | the registered job name |
 | `scheduled_task` | `#[scheduled]`                     | the schedule as declared |
 | `one_off_task`   | `#[task]`                          | the registered task name |
+| `background_task` | `AppBuilder::background_task`     | its capability, queues and the roles that run it (#3545) |
+
+A `background_task` node has the id `background_task:<name>`. It comes from
+the builder, not from a macro, so it has no edges. Its `roles` list the roles
+of the loaded config that start it. `completeness.background_tasks` counts
+them. See [Background tasks](jobs.md#background-tasks-for-plugins-and-apps).
 
 A route is a node whether or not the app mounts it. One that no `routes![]`
 list mounts is reported in `completeness.unmounted_routes` — a route that
@@ -212,13 +231,14 @@ read as more than it is:
   `completeness.opaque_mounted_routers` (the same count `autumn routes audit`
   hard-fails its coverage gate on). Either way the document says what it could
   not see rather than reading as a complete account of the served surface.
-* **One graph per process.** The first application built in a process installs
-  the graph that `/actuator/graph` serves. A later application in the same
-  process (an embedded host, a test) serves the first one's graph, including its
-  mounted paths and auth. Use one application per process.
 * **Duplicate crate versions.** Node ids come from `module_path!()`. If a binary
-  links two versions of one crate, both give the same ids, and one node replaces
-  the other. This is a known limit.
+  links two versions of one crate, each id they share ends in `@<version>`, for
+  example `model:plugin::models::Post@1.2.0`. Other ids do not change. A query
+  by model path (`plugin::models::Post`) or by the id with no version finds
+  every version. A mounted route records only its module and handler, so the
+  route node of each version shows the mounts of both versions. An auto-API
+  route links to the repository of each version. Two copies of one version
+  (from two sources) still share one node.
 * **Name-only matching.** It applies only where no qualified identity exists. A
   repository edge uses the model name and table. An auto-API route is matched to
   its repository by prefix and model name. If two repositories share both, the
@@ -250,6 +270,8 @@ graph describes the binary that produced it, and an element behind
 
 ## Related
 
+* [Table ownership boundaries](table-ownership.md) — fails when code in one
+  boundary reaches a table another boundary owns. It reads this graph.
 * [Route auth coverage](route-auth-coverage.md) — proves each route's auth posture; the
   graph *states* it.
 * [Data classification](data-classification.md) — which columns can leave the

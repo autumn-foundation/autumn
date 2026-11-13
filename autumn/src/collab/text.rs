@@ -1546,6 +1546,7 @@ mod db {
         }
     }
 
+    #[cfg(feature = "postgres")]
     impl ToSql<Text, diesel::pg::Pg> for CollabText {
         fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, diesel::pg::Pg>) -> serialize::Result {
             use std::io::Write as _;

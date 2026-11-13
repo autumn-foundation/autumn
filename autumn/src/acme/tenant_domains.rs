@@ -53,6 +53,18 @@ pub const CUSTOM_DOMAIN_TASK: &str = "custom_domain_certificates";
 /// How many pending domains one tick verifies at the same time.
 const VERIFY_CONCURRENCY: usize = 16;
 
+/// How long one renewal DNS lookup may run before it counts as a blip.
+const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one verification may run. A longer one is a failure with backoff.
+///
+/// Without it, hung names sort first, fill every slot each tick, and are
+/// never backed off. Domains behind them would never be checked.
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Verification time per tick when the caller sets no budget.
+const DEFAULT_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Callback that dispatches a custom-domain failure to the operator (#1610).
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -268,26 +280,36 @@ impl PruneOnlyCustomDomainPruner {
     /// Remove one hostname while `guard` holds for the stored record, then drop
     /// what this process holds for it.
     ///
-    /// Every offboarding path goes through here. The guard runs inside the
-    /// registry's per-hostname write gate, so a caller that chose this hostname
-    /// before an `.await` — a retention sweep, a tenant-wide teardown — re-
-    /// asserts that choice against the record as it is now rather than
-    /// disconnecting whoever holds the hostname by the time its turn comes.
+    /// Every offboarding path goes through here. The removal and the purge run
+    /// in one gate section. The guard runs in it too. It checks the record as
+    /// it is now, not as it was before an `.await`. A retention sweep or a
+    /// tenant teardown therefore never disconnects a new owner.
     async fn offboard_guarded(
         &self,
         host: &str,
         guard: impl FnOnce(&crate::custom_domain::CustomDomain) -> bool,
     ) -> std::io::Result<bool> {
-        let removed = self.registry.remove_if(host, guard).await?;
-        // Purge only while the hostname is still nobody's. A successor that
-        // registered in the gap owns whatever sits at this hostname's cache
-        // slot and certificate id now, and deleting those would leave THEIR
-        // domain recorded as active with nothing to serve.
-        let purged = if self.registry.get(host).is_none() {
-            self.purge_local(host).await
-        } else {
-            true
+        // One critical section: the record, the cache slot and the certificate
+        // go together. A successor cannot register, or save its certificate,
+        // until the purge is done, so the purge cannot take its pair.
+        let Some(outcome) = self
+            .registry
+            .with_hostname(host, async |gate| {
+                let removed = gate.remove_if(guard).await?;
+                // Purge only while the hostname is nobody's: after a rejected
+                // guard, the record belongs to a live domain.
+                let purged = if gate.get().is_none() {
+                    self.purge_local(host).await
+                } else {
+                    true
+                };
+                std::io::Result::Ok((removed, purged))
+            })
+            .await
+        else {
+            return Ok(false);
         };
+        let (removed, purged) = outcome?;
         // A cleanup that failed has just raised its own alert, naming a private
         // key still on disk. Retracting it here — because the registry is
         // empty and therefore "healthy" — would leave that key with nothing
@@ -338,6 +360,9 @@ impl PruneOnlyCustomDomainPruner {
     /// else retries it: the orphan prune only runs when a `[retention]
     /// custom_domains` window is configured, and it is unset by default.
     /// Returns whether everything local actually went.
+    ///
+    /// Runs inside the hostname's gate. The reporter must not call the
+    /// registry.
     async fn purge_local(&self, host: &str) -> bool {
         self.cache.remove(host);
         self.limiter.forget(host);
@@ -436,35 +461,55 @@ impl PruneOnlyCustomDomainPruner {
             .stored_records()
             .await
             .map_err(|e| format!("failed to re-read the custom-domain registry: {e}"))?;
-        let live: std::collections::HashSet<String> = self
-            .registry
-            .list()
+        let live_ids = |extra: Vec<crate::custom_domain::CustomDomain>| {
+            self.registry
+                .list()
+                .into_iter()
+                .chain(extra)
+                .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
+                .collect::<std::collections::HashSet<String>>()
+        };
+        let live = live_ids(fresh.clone());
+        // Only orphans take the exclusive section. A live pair never does.
+        let candidates: Vec<_> = stored
             .into_iter()
-            .chain(fresh)
-            .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
+            .map(|(id, _, _)| id)
+            .filter(|id| {
+                !self.retained_cert_ids.contains(id.as_str()) && !live.contains(id.as_str())
+            })
             .collect();
-        let mut removed = 0;
-        for (id, chain, key) in stored {
-            if live.contains(id.as_str()) || self.retained_cert_ids.contains(id.as_str()) {
-                continue;
-            }
-            if dry_run {
-                removed += 1;
-                continue;
-            }
-            let mut deleted = true;
-            // The KEY first. `list_certs` discovers candidates from their
-            // `.chain.pem`, so a crash after removing the chain would strand a
-            // private key no later sweep can ever find again. This order leaves
-            // at worst a public chain behind, which the next sweep re-lists.
-            for path in [&key, &chain] {
-                if let Err(e) = std::fs::remove_file(path) {
-                    tracing::warn!(path = %path.display(), "failed to remove an orphaned certificate: {e}");
-                    deleted = false;
-                }
-            }
-            // Count only what actually went: the retention report must not
-            // claim a deletion that failed.
+        if dry_run {
+            return Ok(candidates.len() as u64);
+        }
+        // Delete under `exclusive`. A cert id is a hash, so the hostname is
+        // unknown and no single gate fits. No install or offboard runs during
+        // a delete. Each id gets its own section, so writers wait for one
+        // delete, not for the whole sweep. The live set is read again inside
+        // the section: a hostname registered since the snapshot keeps its pair.
+        let mut removed = 0_u64;
+        for id in &candidates {
+            let deleted = self
+                .registry
+                .exclusive(async || {
+                    if live_ids(fresh.clone()).contains(id.as_str()) {
+                        return false;
+                    }
+                    // The store deletes the key first. `list_certs` finds a
+                    // pair by its chain, so a crash after the chain went would
+                    // strand a key that no later sweep can find.
+                    match self.certs.delete_cert(id).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                id = id.as_str(),
+                                "failed to remove an orphaned certificate: {e}"
+                            );
+                            false
+                        }
+                    }
+                })
+                .await;
+            // Count only what went. The report must not claim a failed delete.
             if deleted {
                 removed += 1;
             }
@@ -490,6 +535,17 @@ impl crate::custom_domain::CustomDomainPruner for PruneOnlyCustomDomainPruner {
                      every certificate would look orphaned"
                         .to_owned(),
                 );
+            }
+            // A record that did not load leaves its certificate looking
+            // orphaned, and the prune would delete a live tenant's key.
+            let skipped = self.registry.skipped_records();
+            if !skipped.is_empty() {
+                return Err(format!(
+                    "refusing to prune: {} custom-domain record(s) will not load ({}), so their \
+                     certificates would look orphaned",
+                    skipped.len(),
+                    skipped.join(", ")
+                ));
             }
             let mut removed = 0_u64;
             // What the store holds NOW, not only what this process's index
@@ -573,12 +629,13 @@ impl CustomDomainTask {
         // Warm the cache before the first tick so a restart serves stored
         // certificates on the first handshake instead of after an order.
         self.warm_all().await;
-        self.hydrate_limiter(crate::custom_domain::now_unix());
+        self.hydrate_limiter(crate::custom_domain::now_unix()).await;
         loop {
             // The tick is inside the `select!`: a pass over a thousand domains
-            // is long, and shutdown must not wait for it.
+            // is long, and shutdown must not wait for it. Verification gets
+            // half the interval, so issuance and renewal start in time.
             tokio::select! {
-                () = self.tick(crate::custom_domain::now_unix()) => {}
+                () = self.tick_within(crate::custom_domain::now_unix(), interval / 2) => {}
                 () = shutdown.cancelled() => break,
             }
             tokio::select! {
@@ -590,6 +647,14 @@ impl CustomDomainTask {
 
     /// One pass over every registered domain.
     pub async fn tick(&self, now_unix: i64) {
+        self.tick_within(now_unix, DEFAULT_VERIFY_BUDGET).await;
+    }
+
+    /// One pass. The verification step stops after `verify_budget`.
+    ///
+    /// Domains it did not reach stay pending for the next tick. This keeps
+    /// one tenant's slow DNS from delaying issuance and renewal for others.
+    pub async fn tick_within(&self, now_unix: i64, verify_budget: std::time::Duration) {
         // `now_unix` is when the pass began. A pass over many domains, each a
         // CA round trip, runs for minutes, so an order late in it must not be
         // stamped with the start time: its budget entry would age early and a
@@ -601,12 +666,44 @@ impl CustomDomainTask {
         // Each check can wait out a DNS timeout, so checks run
         // `VERIFY_CONCURRENCY` at a time instead of adding up. Each write goes
         // through the registry's per-hostname gate.
+        //
+        // The budget is a deadline for DNS work only. A write that has begun
+        // always finishes: cancelling one can leave a detached save that lands
+        // after a newer record or an offboard. Under a short budget the
+        // per-check limit shrinks with it, so a check the deadline would cut
+        // short still fails and backs off first.
+        let deadline = tokio::time::Instant::now() + verify_budget;
+        let limit = VERIFY_TIMEOUT.min(verify_budget / 2);
+        // Domains that keep failing go last. A short backoff can expire before
+        // the next tick, and hostname order alone would then put the same hung
+        // names first again. The sort is stable, so ties stay in hostname order.
+        let mut pending = self.registry.pending_verification(now_unix);
+        pending.sort_by_key(|domain| domain.consecutive_failures);
+        let skipped = std::sync::atomic::AtomicUsize::new(0);
         futures::StreamExt::for_each_concurrent(
-            futures::stream::iter(self.registry.pending_verification(now_unix)),
+            futures::stream::iter(pending),
             VERIFY_CONCURRENCY,
-            |domain| async move { self.verify_one(&domain.hostname, now_unix).await },
+            |domain| {
+                let skipped = &skipped;
+                async move {
+                    if !self
+                        .verify_one(&domain.hostname, now_unix, limit, deadline)
+                        .await
+                    {
+                        skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            },
         )
         .await;
+        let skipped = skipped.into_inner();
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                budget_ms = verify_budget.as_millis(),
+                "custom-domain verification hit its time budget; the rest wait for the next tick"
+            );
+        }
         for domain in self.registry.due_for_issuance(now_unix) {
             self.issue_one(
                 &domain.hostname,
@@ -620,11 +717,23 @@ impl CustomDomainTask {
         // domain would otherwise be renewed forever: every cycle spends an
         // order plus a failed validation against the shared ACME account, for a
         // certificate that reaches nobody.
-        for domain in self
+
+        // The re-checks run `VERIFY_CONCURRENCY` at a time and finish before
+        // any order starts: an order takes minutes, and a re-check left half
+        // done would be stale by then.
+        let due = self
             .registry
-            .due_for_renewal(now_unix, self.renew_before_days)
-        {
-            if !self.still_points_here(&domain, now_unix).await {
+            .due_for_renewal(now_unix, self.renew_before_days);
+        let checked: Vec<_> = futures::StreamExt::collect(futures::StreamExt::buffered(
+            futures::StreamExt::map(futures::stream::iter(due), |domain| async move {
+                let here = self.still_points_here(&domain, now_unix).await;
+                (domain, here)
+            }),
+            VERIFY_CONCURRENCY,
+        ))
+        .await;
+        for (domain, here) in checked {
+            if !here {
                 continue;
             }
             self.issue_one(
@@ -719,11 +828,21 @@ impl CustomDomainTask {
         now_unix: i64,
     ) -> bool {
         let hostname = domain.hostname.as_str();
-        let observed = self.verifier.observe(hostname).await;
+        // A lookup past `RECHECK_TIMEOUT`, for the tenant's name or for the
+        // ingress, proves nothing. The renewal goes ahead.
+        let Ok(observed) =
+            tokio::time::timeout(RECHECK_TIMEOUT, self.verifier.observe(hostname)).await
+        else {
+            return true;
+        };
         if matches!(observed, crate::custom_domain::ObservedTarget::None) {
             return true;
         }
-        let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
+        let Ok(ingress) = tokio::time::timeout(RECHECK_TIMEOUT, self.effective_ingress()).await
+        else {
+            return true;
+        };
+        let outcome = grade_dns_verification(&observed, &ingress);
         if outcome.is_verified() {
             return true;
         }
@@ -749,15 +868,55 @@ impl CustomDomainTask {
         false
     }
 
+    /// Back off a domain whose verification ran past `VERIFY_TIMEOUT`.
+    async fn record_lookup_timeout(
+        &self,
+        domain: &crate::custom_domain::CustomDomain,
+        now_unix: i64,
+    ) {
+        let backoff = i64::try_from(
+            self.limiter
+                .backoff_for(domain.consecutive_failures.saturating_add(1)),
+        )
+        .unwrap_or(i64::MAX);
+        let recorded = self
+            .registry
+            .record_verification_failure_for(
+                &domain.hostname,
+                &domain.tenant,
+                domain.verification_token.as_deref(),
+                now_unix,
+                "the DNS lookup timed out",
+                backoff,
+            )
+            .await;
+        if let Err(e) = recorded {
+            tracing::warn!(
+                hostname = %domain.hostname,
+                "failed to persist custom-domain lookup timeout: {e}"
+            );
+        }
+    }
+
     /// Check where one hostname points, and that its owner published this
     /// registration's token, and record the result.
     ///
     /// Pointing here is not enough on its own: a record another tenant left
     /// behind also points here, and HTTP-01 would then issue to whoever
     /// registered the hostname next (#2642).
-    async fn verify_one(&self, hostname: &str, now_unix: i64) {
+    ///
+    /// Only the DNS lookups are time-limited: by `limit`, and by `deadline`.
+    /// A lookup past `limit` fails the domain with a backoff. One cut short by
+    /// `deadline` is left for the next tick. Returns `false` for the latter.
+    async fn verify_one(
+        &self,
+        hostname: &str,
+        now_unix: i64,
+        limit: std::time::Duration,
+        deadline: tokio::time::Instant,
+    ) -> bool {
         let Some(mut domain) = self.registry.get(hostname) else {
-            return;
+            return true;
         };
         // `load` gives a pre-token record its token; this retries a load whose
         // write failed.
@@ -771,22 +930,24 @@ impl CustomDomainTask {
                     hostname,
                     "could not give a custom domain its verification token: {e}"
                 );
-                return;
+                return true;
             }
             match self.registry.get(hostname) {
                 Some(adopted) if adopted.verification_token.is_some() => domain = adopted,
-                _ => return,
+                _ => return true,
             }
         }
-        let observed = self.verifier.observe(hostname).await;
-        let mut outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
-        if outcome.is_verified() {
-            let txt = self
-                .verifier
-                .observe_txt(&domain.verification_record_name())
-                .await;
-            outcome = grade_ownership(&domain, &txt);
+        let allowed = limit.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if allowed.is_zero() {
+            return false;
         }
+        let Ok(outcome) = tokio::time::timeout(allowed, self.grade_lookups(&domain)).await else {
+            if allowed < limit {
+                return false;
+            }
+            self.record_lookup_timeout(&domain, now_unix).await;
+            return true;
+        };
         let backoff = i64::try_from(
             self.limiter
                 .backoff_for(domain.consecutive_failures.saturating_add(1)),
@@ -800,6 +961,26 @@ impl CustomDomainTask {
                 "failed to persist custom-domain verification: {e}"
             );
         }
+        true
+    }
+
+    /// Look up where `domain` points, and whether its owner published the
+    /// token, and grade both. This is the only part of a verification that
+    /// waits on DNS.
+    async fn grade_lookups(
+        &self,
+        domain: &crate::custom_domain::CustomDomain,
+    ) -> crate::custom_domain::VerificationOutcome {
+        let observed = self.verifier.observe(&domain.hostname).await;
+        let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
+        if !outcome.is_verified() {
+            return outcome;
+        }
+        let txt = self
+            .verifier
+            .observe_txt(&domain.verification_record_name())
+            .await;
+        grade_ownership(domain, &txt)
     }
 
     /// The ingress to compare a tenant's DNS against.
@@ -990,26 +1171,6 @@ impl CustomDomainTask {
         issued: &IssuedCertificate,
         now_unix: i64,
     ) -> Result<(), String> {
-        // The order took a network round trip. If the app offboarded the domain
-        // — or another tenant registered it — meanwhile, installing would
-        // resurrect a deleted certificate and promote a record straight to
-        // active that was never verified, past the gate this module exists to
-        // enforce. Discard instead.
-        match self.registry.get(hostname) {
-            Some(record) if record.tenant == tenant => {}
-            Some(record) => {
-                return Err(format!(
-                    "discarding the certificate: {hostname} now belongs to tenant {}",
-                    record.tenant
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "discarding the certificate: {hostname} was offboarded while the order ran"
-                ));
-            }
-        }
-
         let stored = StoredCert {
             chain_pem: issued.chain_pem.clone(),
             key_pem: issued.key_pem.clone(),
@@ -1020,50 +1181,66 @@ impl CustomDomainTask {
             stored.key_pem.as_bytes(),
             &self.provider,
         )?;
-        self.certs
-            .save_cert(&cert_id_for(hostname), &stored)
-            .await
-            .map_err(|e| format!("failed to persist the certificate for {hostname}: {e}"))?;
-        // Activate only while `tenant` STILL owns the hostname. The ownership
-        // check above ran before `save_cert` awaited; an offboard plus a
-        // re-registration in that window would otherwise stamp `Active` onto
-        // the new tenant's record, carrying it from `pending_dns` to serving on
-        // a certificate issued for someone else. Losing the race means the
-        // certificate belongs to nobody: drop it rather than leave a private
-        // key on disk for a hostname its owner never verified.
-        let activated = self
-            .registry
-            .record_active_for(hostname, tenant, now_unix, not_after)
-            .await
-            .map_err(|e| format!("failed to persist the active state for {hostname}: {e}"))?;
-        if !activated {
-            self.cache.remove(hostname);
-            // Delete only the pair THIS order wrote. The certificate id is a
-            // hash of the hostname, so a successor that issued and saved its
-            // own pair in the meantime holds the same id: an unconditional
-            // delete here would take that valid certificate with it, leaving
-            // the successor recorded as active with nothing on disk.
-            match self.certs.load_cert(&cert_id_for(hostname)).await {
-                Ok(Some(current)) if current.chain_pem == stored.chain_pem => {
+        // Save, activate and cache in one gate section. No offboard, successor
+        // or cold load can run between the steps. The owner is checked inside
+        // the section, so the check still holds at the write. The save comes
+        // first: after a crash, the next boot finds the certificate on disk.
+        self.registry
+            .with_hostname(hostname, async |gate| {
+                // The order took a network round trip. If the app offboarded
+                // the domain, or another tenant registered it, installing would
+                // resurrect a deleted certificate and promote a record that
+                // was never verified, past the gate this module exists to
+                // enforce. Discard instead, before anything is written.
+                match gate.get() {
+                    Some(record) if record.tenant != tenant => {
+                        return Err(format!(
+                            "discarding the certificate: {hostname} now belongs to tenant {}",
+                            record.tenant
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "discarding the certificate: {hostname} was offboarded while the \
+                             order ran"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                self.certs
+                    .save_cert(&cert_id_for(hostname), &stored)
+                    .await
+                    .map_err(|e| {
+                        format!("failed to persist the certificate for {hostname}: {e}")
+                    })?;
+                let activated = gate
+                    .record_active_for(tenant, now_unix, not_after)
+                    .await
+                    .map_err(|e| {
+                        format!("failed to persist the active state for {hostname}: {e}")
+                    })?;
+                if !activated {
+                    // The record changed hands, or is not verified yet. We hold
+                    // the gate, so the pair at this id is the one just written.
+                    // Delete it: do not leave an unverified key on disk.
+                    self.cache.remove(hostname);
                     if let Err(e) = self.certs.delete_cert(&cert_id_for(hostname)).await {
                         tracing::warn!(hostname, "failed to delete a superseded certificate: {e}");
                     }
+                    return Err(format!(
+                        "discarding the certificate: {hostname} changed hands while it was being \
+                         issued"
+                    ));
                 }
-                Ok(Some(_)) => tracing::debug!(
-                    hostname,
-                    "leaving the stored certificate alone: it is the successor's, not this order's"
-                ),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    hostname,
-                    "cannot tell whether the stored certificate is this order's, so leaving it: {e}"
-                ),
-            }
-            return Err(format!(
-                "discarding the certificate: {hostname} changed hands while it was being issued"
-            ));
-        }
-        self.cache.insert(hostname, certified);
+                self.cache.insert(hostname, certified);
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "discarding the certificate: {hostname} is unusable"
+                ))
+            })?;
         tracing::info!(hostname, not_after, "custom domain is active");
         // Backstop: a certificate already inside its renew-before window the
         // moment it is issued — a CA issuing a shorter lifetime than
@@ -1098,7 +1275,7 @@ impl CustomDomainTask {
     /// record, so a restart does not hand the shared ACME account a fresh
     /// quota. Called once before the first pass of [`Self::run`]; safe to call
     /// again.
-    pub fn hydrate_limiter(&self, now_unix: i64) {
+    pub async fn hydrate_limiter(&self, now_unix: i64) {
         self.limiter.hydrate(
             self.registry.list().into_iter().flat_map(|d| {
                 let hostname = d.hostname;
@@ -1108,6 +1285,25 @@ impl CustomDomainTask {
             }),
             now_unix,
         );
+        // Copy orders the ledger lacks, such as those from before an upgrade.
+        // Do it before a domain can be offboarded and take its record away.
+        let recent = self
+            .registry
+            .list()
+            .into_iter()
+            .flat_map(|d| d.issuance_attempts_unix)
+            .collect();
+        if let Err(e) = self.registry.merge_global_attempts(recent, now_unix).await {
+            tracing::warn!(error = %e, "cannot copy orders into the custom-domain attempt ledger");
+        }
+        // The ledger also holds orders for offboarded domains.
+        match self.registry.load_global_attempts().await {
+            Ok(ledger) => self.limiter.hydrate_global(ledger, now_unix),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "cannot read the custom-domain attempt ledger; offboarded orders do not count"
+            ),
+        }
     }
 
     /// Is there issuance budget for `hostname`? A refusal defers the domain
@@ -1149,6 +1345,14 @@ impl CustomDomainTask {
         token: Option<&str>,
         now_unix: i64,
     ) {
+        if let Err(e) = self.registry.record_global_attempt(now_unix).await {
+            tracing::warn!(
+                hostname,
+                error = %e,
+                "cannot persist the attempt ledger; this order is lost if the domain goes and the \
+                 process restarts"
+            );
+        }
         if let Err(e) = self
             .registry
             .record_attempt_for_registration(hostname, tenant, token, now_unix)
@@ -1313,30 +1517,41 @@ impl CustomDomainTask {
         if !self.registry.is_servable(hostname) {
             return false;
         }
-        match self.certs.load_cert(&cert_id_for(hostname)).await {
-            Ok(Some(stored)) => match crate::tls::certified_key_from_pem(
-                stored.chain_pem.as_bytes(),
-                stored.key_pem.as_bytes(),
-                &self.provider,
-            ) {
-                Ok(certified) => {
-                    self.cache.insert(hostname, certified);
-                    true
+        // Load and publish inside the hostname's gate, so a renewal cannot
+        // persist and cache a new pair between the two. Only a cache refill
+        // takes it, never a handshake.
+        self.registry
+            .with_hostname(hostname, async |gate| {
+                if !gate.get().is_some_and(|d| d.is_servable()) {
+                    return false;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        hostname,
-                        "stored custom-domain certificate is unusable: {e}"
-                    );
-                    false
+                match self.certs.load_cert(&cert_id_for(hostname)).await {
+                    Ok(Some(stored)) => match crate::tls::certified_key_from_pem(
+                        stored.chain_pem.as_bytes(),
+                        stored.key_pem.as_bytes(),
+                        &self.provider,
+                    ) {
+                        Ok(certified) => {
+                            self.cache.insert_if_not_older(hostname, certified);
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                hostname,
+                                "stored custom-domain certificate is unusable: {e}"
+                            );
+                            false
+                        }
+                    },
+                    Ok(None) => false,
+                    Err(e) => {
+                        tracing::warn!(hostname, "failed to read a custom-domain certificate: {e}");
+                        false
+                    }
                 }
-            },
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(hostname, "failed to read a custom-domain certificate: {e}");
-                false
-            }
-        }
+            })
+            .await
+            .unwrap_or(false)
     }
 
     /// Warm as many active domains as the cache holds, newest activation
@@ -1484,6 +1699,19 @@ mod tests {
         }
         fn delete<'a>(&'a self, hostname: &'a str) -> StoreFuture<'a, std::io::Result<()>> {
             self.inner.delete(hostname)
+        }
+        fn load_attempts(&self) -> StoreFuture<'_, std::io::Result<Vec<i64>>> {
+            self.inner.load_attempts()
+        }
+        fn append_attempt(&self, at_unix: i64) -> StoreFuture<'_, std::io::Result<()>> {
+            self.inner.append_attempt(at_unix)
+        }
+        fn merge_attempts(
+            &self,
+            attempts: Vec<i64>,
+            now_unix: i64,
+        ) -> StoreFuture<'_, std::io::Result<()>> {
+            self.inner.merge_attempts(attempts, now_unix)
         }
     }
 

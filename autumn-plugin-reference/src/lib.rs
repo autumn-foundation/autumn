@@ -39,6 +39,13 @@ use autumn_web::prelude::*;
 #[cfg(feature = "db")]
 use autumn_web::reexports::diesel_migrations;
 
+// surface: widget_pack
+// surface: form::FieldRenderer
+//
+// The `swatch` widget pack: a `WidgetPack` with stories and assets, and a
+// `FieldRenderer` that binds to `Changeset<T>` and `form_for`.
+pub mod swatch;
+
 /// The URL prefix every route this plugin mounts lives under.
 pub const PREFIX: &str = "/reference";
 
@@ -47,7 +54,7 @@ pub const PREFIX: &str = "/reference";
 /// Derived from the crate's own version rather than hard-coded, because the
 /// reference plugin ships *inside* the framework repository and is by
 /// construction always in lockstep with it. A real out-of-tree plugin either
-/// writes a literal (`"0.8"`) or, if it too releases in lockstep, calls this
+/// writes a literal (`"0.10"`) or, if it too releases in lockstep, calls this
 /// same helper.
 #[must_use]
 pub fn declared_autumn_web_range() -> String {
@@ -64,6 +71,31 @@ static ASSETS: autumn_web::assets::PluginAssets = autumn_web::assets::PluginAsse
     "autumn-plugin-reference",
     &[("reference.js", b"window.autumnPluginReference = true;\n")],
 );
+
+// surface: background
+//
+// A plugin capability. A role runs it when the role runs job workers. A named
+// role can set it with `[roles.<name>] capabilities = { "reference.sweeper" = false }`.
+/// The capability of the reference sweeper.
+pub const SWEEPER: autumn_web::background::PluginCapability =
+    autumn_web::background::PluginCapability::new(
+        "reference.sweeper",
+        autumn_web::Capability::JobWorkers,
+    );
+
+/// A capability that no task uses. The plugin reads it with
+/// `state.role().runs_plugin(WARMER)`.
+pub const WARMER: autumn_web::background::PluginCapability =
+    autumn_web::background::PluginCapability::new(
+        "reference.warmer",
+        autumn_web::Capability::ServesHttp,
+    );
+
+/// The background task name of the reference heartbeat.
+pub const HEARTBEAT_TASK: &str = "reference.heartbeat";
+
+/// The interval of the reference heartbeat.
+const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A plugin that exercises every stable plugin-facing API.
 #[derive(Debug, Default, Clone, Copy)]
@@ -97,10 +129,57 @@ impl Plugin for ReferencePlugin {
         let app = app.routes(routes![index]);
 
         // surface: AppBuilder::on_startup
+        //
+        // One-time setup that every role needs. Every role runs every
+        // startup hook, so do not start a loop here.
         let app = app.on_startup(|_state| async move {
             autumn_web::reexports::tracing::debug!("autumn-plugin-reference started");
             Ok(())
         });
+
+        // surface: AppBuilder::background_task
+        //
+        // A loop that runs until shutdown. The framework starts it only on
+        // roles that run `maintenance` (`combined` and `worker`), and the
+        // drain waits for it. Select on `shutdown` at each wait.
+        let app = app.background_task(
+            HEARTBEAT_TASK,
+            autumn_web::Capability::Maintenance,
+            |_state, shutdown| async move {
+                let mut ticker = autumn_web::reexports::tokio::time::interval(HEARTBEAT_EVERY);
+                loop {
+                    autumn_web::reexports::tokio::select! {
+                        () = shutdown.cancelled() => return Ok(()),
+                        _ = ticker.tick() => {
+                            autumn_web::reexports::tracing::trace!("reference heartbeat");
+                        }
+                    }
+                }
+            },
+        );
+
+        // surface: AppBuilder::background
+        //
+        // The full form: a plugin capability, a queue and the plugin's own
+        // switch. `None` lets the role decide.
+        let app = app.background(
+            autumn_web::background::BackgroundTask::new(
+                "reference.sweeper",
+                SWEEPER,
+                |state, shutdown| async move {
+                    if state.role().runs_plugin(WARMER) {
+                        autumn_web::reexports::tracing::debug!("reference sweeper on an HTTP role");
+                    }
+                    shutdown.cancelled().await;
+                    Ok(())
+                },
+            )
+            .queues(["reference"])
+            .explicit(None),
+        );
+
+        // surface: AppBuilder::plugin_capability
+        let app = app.plugin_capability(WARMER);
 
         // surface: AppBuilder::on_shutdown
         let app = app.on_shutdown(|| async move {
@@ -146,6 +225,17 @@ impl Plugin for ReferencePlugin {
 
         // surface: AppBuilder::merge
         let app = app.merge(autumn_web::reexports::axum::Router::new());
+
+        // surface: AppBuilder::widget_pack
+        //
+        // Serves the pack assets and adds its stories to the gallery.
+        let app = app.widget_pack(swatch::pack());
+
+        // surface: AppBuilder::with_story_gallery
+        //
+        // Each call adds to the gallery. A plugin starts from `new`, not
+        // `builtin`.
+        let app = app.with_story_gallery(autumn_web::stories::StoryGallery::new());
 
         // surface: AppBuilder::error_pages
         let app = app.error_pages(ReferenceErrorPages);
@@ -405,6 +495,71 @@ mod tests {
         }
     }
 
+    /// The sweeper runs where the role drains `reference`. A named role turns
+    /// it off.
+    #[tokio::test]
+    async fn the_sweeper_follows_the_role() {
+        let config: autumn_web::config::AutumnConfig = toml::from_str(
+            "[actuator]\nsensitive = true\n\n[roles.quiet]\nbase = \"worker\"\n\
+             capabilities = { \"reference.sweeper\" = false }\n",
+        )
+        .expect("config parses");
+        let client = autumn_web::test::TestApp::new()
+            .config(config)
+            .plugin(ReferencePlugin::new())
+            .build();
+        let body: serde_json::Value = client
+            .get("/actuator/tasks")
+            .send()
+            .await
+            .assert_ok()
+            .json();
+        let tasks = &body["background_tasks"];
+        assert_eq!(
+            tasks["reference.sweeper"]["roles"],
+            serde_json::json!(["combined", "worker"])
+        );
+        assert_eq!(
+            tasks["reference.sweeper"]["queues"],
+            serde_json::json!(["reference"])
+        );
+        assert_eq!(
+            tasks["reference.heartbeat"]["roles"],
+            serde_json::json!(["combined", "worker", "quiet"])
+        );
+        assert_eq!(tasks["reference.heartbeat"]["runs_here"], true);
+    }
+
+    /// The heartbeat status on `role`.
+    async fn heartbeat_on(role: &str) -> serde_json::Value {
+        let config: autumn_web::config::AutumnConfig = toml::from_str(&format!(
+            "role = \"{role}\"\n[actuator]\nsensitive = true\n"
+        ))
+        .expect("config parses");
+        let client = autumn_web::test::TestApp::new()
+            .config(config)
+            .plugin(ReferencePlugin::new())
+            .build();
+        let body: serde_json::Value = client
+            .get("/actuator/tasks")
+            .send()
+            .await
+            .assert_ok()
+            .json();
+        body["background_tasks"][HEARTBEAT_TASK].clone()
+    }
+
+    /// The heartbeat runs on `maintenance` roles. `web` does not start it.
+    #[tokio::test]
+    async fn the_heartbeat_runs_on_worker_and_not_on_web() {
+        let web = heartbeat_on("web").await;
+        assert_eq!(web["runs_here"], false, "{web}");
+        assert_eq!(web["status"], "not_placed", "{web}");
+        let worker = heartbeat_on("worker").await;
+        assert_eq!(worker["runs_here"], true, "{worker}");
+        assert_eq!(worker["status"], "running", "{worker}");
+    }
+
     #[test]
     fn the_declared_range_admits_the_framework_it_is_built_against() {
         let contract = ReferencePlugin::new().contract().expect("a contract");
@@ -461,6 +616,91 @@ mod tests {
             "the reference plugin must model what it documents:\n{}",
             report.to_text_report()
         );
+    }
+
+    #[test]
+    fn the_swatch_pack_passes_widget_conformance() {
+        let report =
+            autumn_web::plugin_conformance::widgets::run_widget_conformance(&swatch::pack());
+        assert!(report.passed(), "{}", report.to_text_report());
+    }
+
+    #[test]
+    fn the_swatch_picker_binds_to_form_for() {
+        use autumn_web::form::{Changeset, FieldControl, FormField, FormModel, form_for};
+
+        #[derive(serde::Serialize)]
+        struct Theme {
+            accent: String,
+        }
+        impl FormModel for Theme {
+            fn form_fields() -> Vec<FormField> {
+                vec![FormField::new("accent", "Accent", FieldControl::Text, true)]
+            }
+        }
+        let changeset = Changeset::new(Theme {
+            accent: "danger".into(),
+        });
+        let html = form_for(&changeset, "/theme", "post")
+            .override_field("accent", FieldControl::custom(swatch::SwatchPicker))
+            .render()
+            .into_string();
+        assert!(
+            html.contains(
+                r#"<fieldset id="accent-field" class="autumn-field autumn-field--group">"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<input type="radio" id="accent-danger" name="accent" required class="autumn-swatch-radio" value="danger" checked="">"#
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn mounting_the_reference_plugin_serves_the_swatch_pack() {
+        let builder = autumn_web::app()
+            .with_story_gallery(autumn_web::stories::StoryGallery::builtin())
+            .plugin(ReferencePlugin::new());
+        let routes = builder.plugin_route_infos().expect("routes");
+        for file in ["swatch.css", "swatch.js"] {
+            assert!(
+                routes
+                    .iter()
+                    .any(|r| r.path == format!("/static/_plugins/swatch/{file}")),
+                "{file} is not served: {routes:?}"
+            );
+        }
+        let pack = swatch::pack();
+        let slugs: Vec<&str> = pack
+            .stories()
+            .iter()
+            .map(autumn_web::stories::Story::slug)
+            .collect();
+        assert_eq!(slugs, ["swatch-picker", "swatch-toolbar"]);
+    }
+
+    /// The swatch pack in Chromium: the same axe gate as core, plus the
+    /// keyboard and console checks.
+    #[cfg(feature = "system-tests")]
+    #[tokio::test]
+    #[ignore = "requires Chromium"]
+    async fn the_swatch_pack_passes_widget_browser_conformance() {
+        let axe = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../autumn/tests/fixtures/axe-core/axe.min.js"
+        ))
+        .expect("read the vendored axe-core");
+        let report =
+            autumn_web::plugin_conformance::widgets::browser::run_widget_browser_conformance(
+                &swatch::pack(),
+                &axe,
+            )
+            .await
+            .expect("browser conformance runs");
+        assert!(report.passed(), "{}", report.to_text_report());
     }
 
     #[test]

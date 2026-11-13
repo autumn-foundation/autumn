@@ -36,7 +36,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::normalize_profile_name;
+use crate::config::{from_table, normalize_profile_name};
 
 /// Schema version of the `capacity.lock` document.
 ///
@@ -474,17 +474,22 @@ impl CapacityContract {
     /// # Errors
     ///
     /// [`CapacityError::Parse`] when the document is not a well-formed
-    /// contract, or [`CapacityError::UnsupportedVersion`] when it was written
-    /// by a newer autumn.
+    /// contract: a syntax error names the line, and a value of the wrong
+    /// type names the key path. [`CapacityError::UnsupportedVersion`] when it
+    /// was written by a newer autumn.
     pub fn parse(toml_src: &str) -> Result<Self, CapacityError> {
-        let probe: VersionProbe = toml::from_str(toml_src)?;
+        // The text is parsed one time, into a raw table. The two reads below
+        // use the config deserializer, so this module compiles no second
+        // TOML reader for its types.
+        let table = toml::from_str::<toml::Table>(toml_src)?;
+        let probe: VersionProbe = from_table(table.clone())?;
         if probe.version > CONTRACT_VERSION {
             return Err(CapacityError::UnsupportedVersion {
                 found: probe.version,
                 supported: CONTRACT_VERSION,
             });
         }
-        Ok(toml::from_str(toml_src)?)
+        Ok(from_table(table)?)
     }
 
     /// Read and parse a contract from disk.
@@ -511,10 +516,16 @@ impl CapacityContract {
     /// # Errors
     ///
     /// [`CapacityError::Serialize`] when the document cannot be rendered.
+    /// [`CapacityError::Parse`] when [`Self::parse`] cannot read the rendered
+    /// text: an unsigned value above `i64::MAX`.
     pub fn to_toml(&self) -> Result<String, CapacityError> {
         let mut canonical = self.clone();
         canonical.canonicalize();
         let body = toml::to_string_pretty(&canonical)?;
+        // A TOML integer is a signed 64-bit number. The writer does not
+        // check an unsigned field above that range, and the reader refuses
+        // it. Do not write a contract that does not load.
+        toml::from_str::<toml::Table>(&body)?;
         Ok(format!("{CONTRACT_HEADER}{body}"))
     }
 
@@ -645,7 +656,7 @@ pub fn route_graph_digest(routes: &[RouteShape]) -> String {
         hasher.update(line.as_bytes());
         hasher.update(b"\n");
     }
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 /// Where a load-shedding admission ceiling came from.
@@ -918,6 +929,64 @@ mod tests {
     fn parse_reports_malformed_toml() {
         let err = CapacityContract::parse("this is not = = toml").expect_err("must reject garbage");
         assert!(matches!(err, CapacityError::Parse(_)), "got {err}");
+        assert!(err.to_string().contains("line 1"), "got {err}");
+    }
+
+    #[test]
+    fn parse_names_the_key_of_a_bad_value() {
+        let mut contract = toml::Table::try_from(sample_contract()).expect("raw serialize");
+        let envelope = contract["envelope"].as_table_mut().expect("a table");
+        envelope.insert("admission_limit".to_owned(), "many".into());
+        let rendered = toml::to_string_pretty(&contract).expect("raw serialize");
+
+        let err = CapacityContract::parse(&rendered).expect_err("a string is not a limit");
+        assert!(matches!(err, CapacityError::Parse(_)), "got {err}");
+        let message = err.to_string();
+        assert!(message.contains("invalid type: string"), "got {message}");
+        assert!(
+            message.contains("in `envelope.admission_limit`"),
+            "got {message}"
+        );
+    }
+
+    /// A TOML integer is a signed 64-bit number. The reader refuses a larger
+    /// one, so the writer must not write it.
+    #[test]
+    fn to_toml_refuses_a_value_that_the_reader_cannot_read() {
+        let mut contract = sample_contract();
+        contract.calibration.seed = u64::MAX;
+
+        let err = contract
+            .to_toml()
+            .expect_err("the reader refuses this seed");
+        assert!(matches!(err, CapacityError::Parse(_)), "got {err}");
+
+        let raw = toml::to_string_pretty(&contract).expect("raw serialize");
+        let err = CapacityContract::parse(&raw).expect_err("above the TOML range");
+        assert!(matches!(err, CapacityError::Parse(_)), "got {err}");
+    }
+
+    #[test]
+    fn to_toml_writes_the_largest_toml_integer() {
+        let mut contract = sample_contract();
+        contract.calibration.seed = u64::try_from(i64::MAX).expect("positive");
+
+        let rendered = contract.to_toml().expect("in range");
+        let parsed = CapacityContract::parse(&rendered).expect("parses back");
+        assert_eq!(parsed.calibration.seed, contract.calibration.seed);
+    }
+
+    #[test]
+    fn parse_needs_a_version() {
+        let mut contract = toml::Table::try_from(sample_contract()).expect("raw serialize");
+        contract.remove("version");
+        let rendered = toml::to_string_pretty(&contract).expect("raw serialize");
+
+        let err = CapacityContract::parse(&rendered).expect_err("no version");
+        assert!(
+            err.to_string().contains("missing field `version`"),
+            "got {err}"
+        );
     }
 
     #[test]

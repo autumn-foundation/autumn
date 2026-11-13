@@ -281,19 +281,21 @@ pub fn plan_pull(
     // none of which a freshly-`autumn new`-ed project carries. The `#[model]`
     // macro itself is exported only behind `autumn-web`'s `db` feature, which a
     // DB-free `autumn new --daemon` project disables; enable it so the pulled
-    // models compile there too.
+    // models compile there too. `db` needs a backend (#2605), and `db pull`
+    // reads Postgres, so enable `postgres` too.
     let cargo_path = project_root.join("Cargo.toml");
     let existing = read_or_empty(&cargo_path);
     let with_deps = super::model::ensure_cargo_dependencies(&existing, super::model::MODEL_DEPS);
-    let (updated, db_enabled) =
+    let (with_db, db_enabled) =
         super::schema_edit::ensure_autumn_web_feature_status(&with_deps, "db");
+    let (updated, _) = super::schema_edit::ensure_autumn_web_feature_status(&with_db, "postgres");
     if !db_enabled {
         // No `autumn-web` dependency could be located to enable `db` on. The
         // generated `#[autumn_web::model]` code needs that feature, so warn
         // rather than emit silently-uncompilable output.
         eprintln!(
             "  \u{26a0} Could not enable autumn-web's `db` feature automatically. \
-             Add `features = [\"db\"]` to the `autumn-web` dependency in Cargo.toml \
+             Add `features = [\"db\", \"postgres\"]` to the `autumn-web` dependency in Cargo.toml \
              so the generated models compile."
         );
     }
@@ -617,12 +619,30 @@ pub fn is_in_comment_or_string(text: &str, at: usize) -> bool {
 
 /// The table name of the `table!` block whose body opens at `open`: the
 /// first code word after attributes (`#[...]`). Doc comments are not code.
+/// In a schema-qualified header (`marketing.campaigns (id) {`), the name is
+/// the word after the `.`.
 fn block_table_name(text: &str, open: usize) -> Option<String> {
+    let (first, end) = block_first_word(text, open)?;
+    let rest = text[end..].trim_start();
+    let Some(after_dot) = rest.strip_prefix('.') else {
+        return Some(first);
+    };
+    let after_dot = after_dot.trim_start();
+    let table: String = after_dot
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '#')
+        .collect();
+    Some(if table.is_empty() { first } else { table })
+}
+
+/// The first code word of a block and the byte just past it.
+fn block_first_word(text: &str, open: usize) -> Option<(String, usize)> {
+    let mut stop = text.len();
     let mut name: Vec<u8> = Vec::new();
     let mut brackets = 0usize;
     // In a `use ...;` declaration (diesel `print-schema` writes them first).
     let mut in_use = false;
-    scan_code(text, open + 1, |_, c| {
+    scan_code(text, open + 1, |i, c| {
         if in_use {
             in_use = c != b';';
             return false;
@@ -649,9 +669,13 @@ fn block_table_name(text: &str, open: usize) -> Option<String> {
             in_use = c != b';';
             return false;
         }
+        stop = i;
         true
     });
-    String::from_utf8(name).ok().filter(|n| !n.is_empty())
+    String::from_utf8(name)
+        .ok()
+        .filter(|n| !n.is_empty())
+        .map(|n| (n, stop))
 }
 
 /// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
@@ -798,6 +822,20 @@ fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_block_range_finds_a_schema_qualified_block() {
+        let text =
+            "diesel::table! {\n    marketing.campaigns (id) {\n        id -> Int8,\n    }\n}\n";
+        assert_eq!(
+            schema_block_range(text, "campaigns"),
+            Some((0, text.len() - 1))
+        );
+        // The schema is not a table name.
+        assert_eq!(schema_block_range(text, "marketing"), None);
+        let spaced = "table! { marketing . campaigns (id) { id -> Int8, } }";
+        assert!(schema_block_range(spaced, "campaigns").is_some());
+    }
     use crate::generate::Flags;
     use crate::generate::emit::Action;
     use std::fs;
@@ -1573,8 +1611,8 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert!(
-            cargo.contains("autumn-web = { version = \"0.5\", features = [\"db\"] }"),
-            "pull must enable autumn-web's db feature: {cargo}"
+            cargo.contains("autumn-web = { version = \"0.5\", features = [\"db\", \"postgres\"] }"),
+            "pull must enable autumn-web's db feature and its postgres backend: {cargo}"
         );
     }
 

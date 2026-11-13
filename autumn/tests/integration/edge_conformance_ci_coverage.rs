@@ -4,10 +4,10 @@
 //! "Build the edge capsule" step, then `examples/edge-greeting/tests/conformance.rs`
 //! builds it again inside the conformance suite. The suite's own build points
 //! `CARGO_TARGET_DIR` at `<workspace target dir>/edge-conformance` (see
-//! `workspace_target_directory` and `build_capsule` there), a subtree
-//! `Swatinem/rust-cache` does not manage. If the CI step's build does not land
-//! in that same subtree, cargo treats the suite's build as a second, separate
-//! compile: wasted CI time and an uncached, ever-growing target directory.
+//! `workspace_target_directory` and `build_capsule` there). If the CI step's
+//! build does not land in that same subtree, cargo treats the suite's build as
+//! a second, separate compile: wasted CI time and an ever-growing target
+//! directory.
 //!
 //! This test pins the CI step's `CARGO_TARGET_DIR` so a future edit cannot
 //! silently reintroduce the double build.
@@ -90,7 +90,7 @@ fn build_edge_capsule_step_reuses_the_conformance_suites_target_dir() {
         "the edge-conformance job's \"Build the edge capsule\" step no longer sets \
          `{expected}` — without it, the CI step's build and the conformance suite's own \
          `build_capsule()` compile the wasm32-wasip1 capsule twice, into two different \
-         target-dir subtrees, wasting CI time and leaving one uncached by rust-cache.\n\
+         target-dir subtrees, wasting CI time.\n\
          step text was:\n{build_step}"
     );
 }

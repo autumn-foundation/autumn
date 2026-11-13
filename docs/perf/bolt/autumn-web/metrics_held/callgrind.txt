@@ -1,0 +1,15 @@
+# Bolt profile: autumn-web/metrics_held
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+              66   26.9%  <autumn_web::metrics::Series>::observe
+              48   19.6%  <autumn_web::metrics::Counter>::increment
+              42   17.1%  <autumn_web::metrics::Histogram>::record
+              39   15.9%  <autumn_web::metrics::Gauge>::set
+              24    9.8%  autumn_web::metrics::limits
+              22    9.0%  metrics_held::main
+               4    1.6%  <autumn_web::metrics::Series>::set
+
+             245  100.0%  TOTAL

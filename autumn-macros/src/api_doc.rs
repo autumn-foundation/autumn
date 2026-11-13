@@ -44,7 +44,7 @@ pub use autumn_macros_support::schema::{
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
 // Each bool models a distinct, orthogonal attribute flag (`hidden`, `mcp`,
-// `mcp = false`, `stream`, `task`, `core`); grouping them would obscure rather than clarify.
+// `mcp = false`, `stream`, `task`, `core`, `webmcp`); grouping them would obscure rather than clarify.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 pub struct ApiDocAttr {
@@ -73,6 +73,12 @@ pub struct ApiDocAttr {
     /// `#[api_doc(mcp, core)]` — a core MCP tool. A client that defers tools
     /// loads it first. It does not opt the endpoint in.
     pub mcp_core: bool,
+    /// `#[api_doc(webmcp)]` — make this endpoint a `WebMCP` tool. `mcp` does
+    /// not set it.
+    pub webmcp_tool: bool,
+    /// `#[api_doc(webmcp = false)]` — never a `WebMCP` tool, also under the
+    /// whole-API hatch.
+    pub webmcp_exclude: bool,
 }
 
 enum KeyValue {
@@ -91,6 +97,8 @@ enum KeyValue {
     Task,
     /// `core` flag — a client that defers tools loads this MCP tool first.
     Core,
+    /// `true` => a `WebMCP` tool, `false` => explicit exclusion.
+    WebMcp(bool),
 }
 
 impl Parse for KeyValue {
@@ -123,6 +131,15 @@ impl Parse for KeyValue {
             }
             // Bare `mcp` flag opts in.
             return Ok(KeyValue::Mcp(true));
+        }
+
+        if key_str == "webmcp" {
+            if input.peek(Token![=]) {
+                let _eq: Token![=] = input.parse()?;
+                let value: LitBool = input.parse()?;
+                return Ok(KeyValue::WebMcp(value.value));
+            }
+            return Ok(KeyValue::WebMcp(true));
         }
 
         if key_str == "stream" {
@@ -191,7 +208,7 @@ impl Parse for KeyValue {
                 key.span(),
                 format!(
                     "unknown key `{other}` in `#[api_doc(...)]`. \
-                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp, stream, task, core."
+                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp, stream, task, core, webmcp."
                 ),
             )),
         }
@@ -228,6 +245,8 @@ impl ApiDocAttr {
             KeyValue::Stream => self.mcp_stream = true,
             KeyValue::Task => self.mcp_task = true,
             KeyValue::Core => self.mcp_core = true,
+            KeyValue::WebMcp(true) => self.webmcp_tool = true,
+            KeyValue::WebMcp(false) => self.webmcp_exclude = true,
         }
     }
 }
@@ -319,6 +338,12 @@ impl ApiDocAttr {
         if other.mcp_core {
             self.mcp_core = true;
         }
+        if other.webmcp_tool {
+            self.webmcp_tool = true;
+        }
+        if other.webmcp_exclude {
+            self.webmcp_exclude = true;
+        }
     }
 
     /// Emit field initializers `summary: ..., description: ..., tags: ..., hidden: ...`
@@ -342,6 +367,8 @@ impl ApiDocAttr {
         let mcp_stream = self.mcp_stream;
         let mcp_task = self.mcp_task;
         let mcp_core = self.mcp_core;
+        let webmcp_tool = self.webmcp_tool;
+        let webmcp_exclude = self.webmcp_exclude;
         quote! {
             operation_id: #op_id,
             summary: #summary,
@@ -354,6 +381,8 @@ impl ApiDocAttr {
             mcp_stream: #mcp_stream,
             mcp_task: #mcp_task,
             mcp_core: #mcp_core,
+            webmcp_tool: #webmcp_tool,
+            webmcp_exclude: #webmcp_exclude,
         }
     }
 }
@@ -1251,9 +1280,47 @@ mod tests {
     }
 
     #[test]
-    fn api_doc_unknown_key_error_lists_core() {
+    fn api_doc_unknown_key_error_lists_core_and_webmcp() {
         let err = syn::parse_str::<ApiDocAttr>("bogus = 1").err().unwrap();
-        assert!(err.to_string().contains("task, core."), "{err}");
+        assert!(err.to_string().contains("task, core, webmcp."), "{err}");
+    }
+
+    #[test]
+    fn api_doc_webmcp_flag_parses() {
+        let attr: ApiDocAttr = syn::parse_str("webmcp").unwrap();
+        assert!(attr.webmcp_tool && !attr.webmcp_exclude && !attr.mcp_tool);
+        let attr: ApiDocAttr = syn::parse_str("webmcp = true").unwrap();
+        assert!(attr.webmcp_tool);
+        let attr: ApiDocAttr = syn::parse_str("webmcp = false").unwrap();
+        assert!(attr.webmcp_exclude && !attr.webmcp_tool);
+    }
+
+    #[test]
+    fn api_doc_mcp_does_not_imply_webmcp() {
+        let attr: ApiDocAttr = syn::parse_str("mcp").unwrap();
+        assert!(attr.mcp_tool && !attr.webmcp_tool);
+        let attr: ApiDocAttr = syn::parse_str("mcp, webmcp").unwrap();
+        assert!(attr.mcp_tool && attr.webmcp_tool);
+    }
+
+    #[test]
+    fn api_doc_webmcp_survives_a_merge() {
+        let mut first: ApiDocAttr = syn::parse_str("mcp").unwrap();
+        first.absorb(syn::parse_str("webmcp").unwrap());
+        first.absorb(syn::parse_str("summary = \"x\"").unwrap());
+        assert!(first.webmcp_tool);
+        let mut other: ApiDocAttr = syn::parse_str("summary = \"x\"").unwrap();
+        other.absorb(syn::parse_str("webmcp = false").unwrap());
+        assert!(other.webmcp_exclude);
+    }
+
+    #[test]
+    fn api_doc_webmcp_fields_are_emitted() {
+        let attr: ApiDocAttr = syn::parse_str("webmcp").unwrap();
+        let ident = syn::Ident::new("handler", Span::call_site());
+        let out = attr.emit_ident_fields(&ident).to_string();
+        assert!(out.contains("webmcp_tool : true"), "{out}");
+        assert!(out.contains("webmcp_exclude : false"), "{out}");
     }
 
     #[test]

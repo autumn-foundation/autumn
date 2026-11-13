@@ -140,7 +140,7 @@ the limiter. Deadline headers are the scope of issue #3058.
 ### Negative
 
 - `Route`, `ServerConfig` and `HttpClientConfig` have new public fields.
-  Struct literals must add them. See `docs/migrations/next.md`.
+  Struct literals must add them. See `docs/migrations/0.9.0.md`.
 - An adaptive limit is harder to reason about than a fixed number. The
   `autumn_admission_limit` gauge shows its value.
 - After a long latency increase, the Gradient2 limit can stay low for

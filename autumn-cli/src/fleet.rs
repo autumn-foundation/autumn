@@ -41,6 +41,15 @@ pub enum FleetCommand {
         /// The path of the new file.
         dest: PathBuf,
     },
+    /// Copy a database file into the fleet as a key, for example a backup.
+    Import {
+        /// Profile overlay for the config.
+        profile: Option<String>,
+        /// The database name.
+        key: String,
+        /// The file to copy in.
+        source: PathBuf,
+    },
     /// Remove one database.
     Delete {
         /// Profile overlay for the config.
@@ -50,7 +59,7 @@ pub enum FleetCommand {
         /// Confirm the deletion.
         force: bool,
     },
-    /// Rebuild one database from its replica.
+    /// Rebuild one database from its replica, or from a local file.
     Restore {
         /// Profile overlay for the config.
         profile: Option<String>,
@@ -58,8 +67,37 @@ pub enum FleetCommand {
         key: String,
         /// Restore to this RFC 3339 instant instead of the latest state.
         timestamp: Option<String>,
+        /// Restore from this local file instead of the replica.
+        from: Option<PathBuf>,
+        /// With `from`: accept a backup of another key.
+        allow_rekey: bool,
+        /// With `from`: restore a deleted key, and drop its tombstone.
+        clear_tombstone: bool,
         /// Confirm the replacement.
         force: bool,
+    },
+    /// Run one SQL query over the replicas of every tenant (issue #3236).
+    Lake {
+        /// Profile overlay for the config.
+        profile: Option<String>,
+        /// The SQL file. `-` reads stdin.
+        sql: PathBuf,
+        /// Write the CSV here instead of stdout.
+        out: Option<PathBuf>,
+        /// Also keep the lake as a `SQLite` file here.
+        keep: Option<PathBuf>,
+        /// Restore each tenant at or before this RFC 3339 instant.
+        timestamp: Option<String>,
+        /// The number of tenants to restore at the same time.
+        concurrency: usize,
+        /// Load only these tables. Empty: every table.
+        tables: Vec<String>,
+        /// The parent of the scratch directory.
+        scratch: Option<PathBuf>,
+        /// Skip a tenant that fails, and report it.
+        skip_failed: bool,
+        /// Run with no tombstone rows: markers only.
+        markers_only: bool,
     },
 }
 
@@ -106,17 +144,49 @@ mod imp {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use std::io::Write as _;
+    use std::ops::ControlFlow;
+
     use autumn_web::config::{AutumnConfig, DatabaseFleetConfig};
-    use autumn_web::db::fleet::{DatabaseFleet, FleetError};
+    use autumn_web::db::fleet::{DatabaseFleet, FleetError, LocalRestore};
+    use autumn_web::db::fleet_lake::{FleetLake, LakeSnapshot, LakeValue, SkipReason};
     use autumn_web::db::fleet_replication::{FleetReplication, replica_root};
+    use autumn_web::db::fleet_tombstones::FleetTombstones;
     use autumn_web::fleet_layout::FleetDbKey;
+    use autumn_web::migrate::MigrationScope;
     use autumn_web::replication::ReplicationSettings;
 
     use super::FleetCommand;
     use crate::db::replica;
 
-    /// The app's migration directory, relative to the app directory.
-    const MIGRATIONS_DIR: &str = "migrations";
+    /// The scopes whose directories a fleet database gets, as at boot:
+    /// `migrations/` and `migrations-shards/`. Never `migrations-control/`.
+    const FLEET_SCOPES: [MigrationScope; 2] = [MigrationScope::Everywhere, MigrationScope::Shards];
+
+    /// The migration sets of a fleet database, read from disk: each
+    /// directory of [`FLEET_SCOPES`] that exists, in that order. One of them
+    /// must exist.
+    fn fleet_sources() -> Result<Vec<diesel_migrations::FileBasedMigrations>, String> {
+        let mut sources = Vec::new();
+        for scope in FLEET_SCOPES {
+            let dir = Path::new(scope.directory());
+            if !dir.is_dir() {
+                continue;
+            }
+            sources.push(
+                diesel_migrations::FileBasedMigrations::from_path(dir)
+                    .map_err(|e| format!("could not read {}/: {e}", dir.display()))?,
+            );
+        }
+        if sources.is_empty() {
+            return Err(format!(
+                "Migrations directory not found: {}/\n  Run this command from the app \
+                 directory.",
+                MigrationScope::Everywhere.directory()
+            ));
+        }
+        Ok(sources)
+    }
 
     pub fn run(command: &FleetCommand) -> Result<(), String> {
         match command {
@@ -137,6 +207,11 @@ mod imp {
             FleetCommand::Backup { profile, key, dest } => {
                 backup(&Target::load(profile.as_deref())?, key, dest)
             }
+            FleetCommand::Import {
+                profile,
+                key,
+                source,
+            } => import(&Target::load(profile.as_deref())?, key, source),
             FleetCommand::Delete {
                 profile,
                 key,
@@ -145,13 +220,57 @@ mod imp {
             FleetCommand::Restore {
                 profile,
                 key,
+                from: Some(from),
+                allow_rekey,
+                clear_tombstone,
+                force,
+                ..
+            } => restore_from_file(
+                &Target::load(profile.as_deref())?,
+                key,
+                from,
+                LocalRestore::new()
+                    .allow_rekey(*allow_rekey)
+                    .clear_tombstone(*clear_tombstone)
+                    .apply_migrations(true),
+                *force,
+            ),
+            FleetCommand::Restore {
+                profile,
+                key,
                 timestamp,
                 force,
+                ..
             } => restore(
                 &Target::load(profile.as_deref())?,
                 key,
                 timestamp.as_deref(),
                 *force,
+            ),
+            FleetCommand::Lake {
+                profile,
+                sql,
+                out,
+                keep,
+                timestamp,
+                concurrency,
+                tables,
+                scratch,
+                skip_failed,
+                markers_only,
+            } => lake(
+                &Target::load(profile.as_deref())?,
+                &LakeArgs {
+                    sql,
+                    out: out.as_deref(),
+                    keep: keep.as_deref(),
+                    timestamp: timestamp.as_deref(),
+                    concurrency: *concurrency,
+                    tables,
+                    scratch: scratch.as_deref(),
+                    skip_failed: *skip_failed,
+                    markers_only: *markers_only,
+                },
             ),
         }
     }
@@ -204,20 +323,23 @@ mod imp {
             ))
         }
 
-        /// The fleet, with `migrations` when given. An open never migrates.
+        /// The fleet, with `migrations` and the framework sets when
+        /// `migrations` is not empty. An open never migrates.
         fn build(
             &self,
-            migrations: Option<diesel_migrations::FileBasedMigrations>,
+            migrations: Vec<diesel_migrations::FileBasedMigrations>,
         ) -> Result<DatabaseFleet, String> {
             self.require_root()?;
             let mut builder = DatabaseFleet::builder(self.fleet.clone())
                 .connect_timeout_secs(self.config.database.connect_timeout_secs)
                 .apply_migrations_on_open(false);
-            if let Some(migrations) = migrations {
+            if !migrations.is_empty() {
+                for source in migrations {
+                    builder = builder.migration_source("app", source);
+                }
                 // The check of `refuse_unknown_versions` again, on the file
                 // each run migrates: another process can replace it between.
                 builder = builder
-                    .migration_source("app", migrations)
                     .framework_migrations()
                     .refuse_unknown_migrations(true);
             }
@@ -275,7 +397,7 @@ mod imp {
 
     /// What the `--open` columns compare a database with.
     struct AppView {
-        /// The versions in `migrations/`, as named on disk.
+        /// The versions in [`fleet_sources`], as named on disk.
         versions: Vec<String>,
         /// Every version the CLI's sets record, sorted.
         known: Vec<String>,
@@ -284,16 +406,19 @@ mod imp {
         exact: bool,
     }
 
-    /// The app view, or `None` when `migrations/` cannot be read.
+    /// The app view, or `None` when [`fleet_sources`] cannot be read.
     fn app_view(target: &Target) -> Option<AppView> {
-        let source = diesel_migrations::FileBasedMigrations::from_path(MIGRATIONS_DIR).ok()?;
-        let versions =
-            diesel::migration::MigrationSource::<diesel::sqlite::Sqlite>::migrations(&source)
-                .ok()?
-                .iter()
-                .map(|m| m.name().version().to_string())
-                .collect();
-        let fleet = target.build(Some(source)).ok()?;
+        let sources = fleet_sources().ok()?;
+        let mut versions = Vec::new();
+        for source in &sources {
+            versions.extend(
+                diesel::migration::MigrationSource::<diesel::sqlite::Sqlite>::migrations(source)
+                    .ok()?
+                    .iter()
+                    .map(|m| m.name().version().to_string()),
+            );
+        }
+        let fleet = target.build(sources).ok()?;
         Some(AppView {
             versions,
             known: fleet.known_migration_versions(),
@@ -326,7 +451,7 @@ mod imp {
     }
 
     fn list(target: &Target, open: bool, json: bool) -> Result<(), String> {
-        let fleet = target.build(None)?;
+        let fleet = target.build(Vec::new())?;
         let rt = runtime()?;
         let keys = rt.block_on(fleet.list()).map_err(|e| e.to_string())?;
         eprintln!("  \u{2139} root: {}", fleet.root().display());
@@ -417,16 +542,7 @@ mod imp {
 
     fn migrate(target: &Target, concurrency: usize, key: Option<&str>) -> Result<(), String> {
         target.require_root()?;
-        let dir = Path::new(MIGRATIONS_DIR);
-        if !dir.is_dir() {
-            return Err(format!(
-                "Migrations directory not found: {MIGRATIONS_DIR}/\n  Run this command from \
-                 the app directory."
-            ));
-        }
-        let source = diesel_migrations::FileBasedMigrations::from_path(dir)
-            .map_err(|e| format!("could not read {MIGRATIONS_DIR}/: {e}"))?;
-        let fleet = target.build(Some(source))?;
+        let fleet = target.build(fleet_sources()?)?;
         // A shared version gets a substitute that depends on every set the app
         // registers. This command does not have them all, so it could record
         // other versions than boot does.
@@ -518,15 +634,17 @@ mod imp {
             return Ok(checked);
         }
         Err(format!(
-            "These databases record migrations that are not in {MIGRATIONS_DIR}/ or the \
-             framework sets:\n  {}\n  A plugin set probably applied them. Run the app once \
-             with AUTUMN_MIGRATE=1 instead.",
+            "These databases record migrations that are not in {}/, {}/ or the framework \
+             sets:\n  {}\n  A plugin set probably applied them. Run the app once with \
+             AUTUMN_MIGRATE=1 instead.",
+            MigrationScope::Everywhere.directory(),
+            MigrationScope::Shards.directory(),
             found.join("\n  ")
         ))
     }
 
     fn backup(target: &Target, key: &str, dest: &Path) -> Result<(), String> {
-        let fleet = target.build(None)?;
+        let fleet = target.build(Vec::new())?;
         let key = parse_key(&fleet, key)?;
         let taken = || {
             format!(
@@ -616,8 +734,8 @@ mod imp {
             let shared = mode & 0o022 != 0 && mode & 0o1000 == 0;
             if !owned || shared {
                 return Err(format!(
-                    "{} is writable by other users, or belongs to another user.\n  Write the \
-                     backup under directories that only you (or root) can change.",
+                    "{} is writable by other users, or belongs to another user.\n  Keep \
+                     backups under directories that only you (or root) can change.",
                     ancestor.display()
                 ));
             }
@@ -625,8 +743,77 @@ mod imp {
         Ok(canonical)
     }
 
+    fn import(target: &Target, key: &str, source: &Path) -> Result<(), String> {
+        // The copy must carry the epoch of the host that owns the slot. This
+        // process holds no lease, so the app's next open could replace the
+        // copy from the replica.
+        if target.fleet.ownership.is_some() {
+            return Err(
+                "Import stopped: [database.fleet.ownership] is on, and this command holds no \
+                 slot lease.\n  Call `DatabaseFleet::import` in the app that owns the slot."
+                    .to_owned(),
+            );
+        }
+        if !source.is_file() {
+            return Err(format!("{} is not a file.", source.display()));
+        }
+        target.require_root()?;
+        let fleet = target.build(fleet_sources()?)?;
+        let remapped = fleet.remapped_migrations();
+        if !remapped.is_empty() {
+            return Err(format!(
+                "These migrations share a version with another migration: {}.\n  \
+                 `autumn fleet import` cannot record them as boot does. Use \
+                 `DatabaseFleet::import` in the app instead.",
+                remapped.join(", ")
+            ));
+        }
+        let key = parse_key(&fleet, key)?;
+        let path = fleet.path_of(&key);
+        // With replication on, the import purges a deleted key's tombstone
+        // and old replica first, so the retry task cannot purge the new one.
+        if target.replicated() {
+            let purge = |error: String| {
+                format!(
+                    "Import stopped: with [replication] on, an import first purges the \
+                     replica of a deleted database, and it cannot reach it.\n  {error}"
+                )
+            };
+            let loaded = validated_replication(target).map_err(purge)?;
+            let replication = replication_for(target, &loaded).map_err(purge)?;
+            fleet
+                .install_replication(replication)
+                .map_err(|_| "the fleet already replicates".to_owned())?;
+        }
+        // Publish only: an open would start a replicator in this process.
+        let rt = runtime()?;
+        let imported = rt.block_on(async {
+            let result = fleet.import_file(&key, source).await;
+            fleet.close_all().await;
+            result
+        });
+        imported.map_err(|e| match e {
+            FleetError::AlreadyExists { .. } => format!(
+                "{key} already has a database at {}.\n  An import never replaces a file. \
+                 Run `autumn fleet delete {key} --force` first.",
+                path.display()
+            ),
+            FleetError::Migration { .. } => format!(
+                "{e}\n  If the copy records a plugin migration, call \
+                 `DatabaseFleet::import` in the app instead."
+            ),
+            other => format!("{other}\n  Nothing was imported."),
+        })?;
+        eprintln!(
+            "\u{2713} Imported {} as {key} ({}).",
+            source.display(),
+            path.display()
+        );
+        Ok(())
+    }
+
     fn delete(target: &Target, key: &str, force: bool) -> Result<(), String> {
-        let fleet = target.build(None)?;
+        let fleet = target.build(Vec::new())?;
         let key = parse_key(&fleet, key)?;
         let path = fleet.path_of(&key);
         if !force {
@@ -637,40 +824,59 @@ mod imp {
                 target.profile
             ));
         }
-        let deleted = runtime()?
-            .block_on(fleet.delete(&key))
-            .map_err(|e| e.to_string())?;
+        // With replication on, the replica goes too (issue #3235).
+        let replication = if target.replicated() {
+            let purge = |error: String| {
+                format!(
+                    "Delete stopped: with [replication] on, a delete also removes the replica, \
+                     and it cannot reach it.\n  {error}"
+                )
+            };
+            let loaded = validated_replication(target).map_err(purge)?;
+            let replication = replication_for(target, &loaded).map_err(purge)?;
+            fleet
+                .install_replication(Arc::clone(&replication))
+                .map_err(|_| "the fleet already replicates".to_owned())?;
+            Some(replication)
+        } else {
+            None
+        };
+        let rt = runtime()?;
+        let deleted = rt.block_on(fleet.delete(&key)).map_err(|e| e.to_string())?;
         if !deleted {
             return Err(format!("{key} does not exist at {}.", path.display()));
         }
         eprintln!("\u{2713} Deleted {key} ({}).", path.display());
-        if target.config.replication.is_some() {
-            eprintln!("  \u{2139} Its replica stays at the replica destination.");
-            if target.fleet.restore_missing {
-                eprintln!(
-                    "  \u{26A0} restore_missing is on: the app restores {key} from its \
-                     replica on the next request for it."
-                );
-            }
+        let Some(tombstones) = replication.as_ref().and_then(|r| r.tombstones()) else {
+            return Ok(());
+        };
+        let kept = |row: &autumn_web::db::fleet_tombstones::Tombstone| {
+            row.confirmed && row.attempts == 0 && row.purge_after > tombstones.now()
+        };
+        match rt.block_on(tombstones.get(&key.name())) {
+            Ok(None) => eprintln!("  \u{2713} Its replica is purged."),
+            Ok(Some(row)) if kept(&row) => eprintln!(
+                "  \u{2139} Its replica is kept until {} \
+                 (database.fleet.replica_retention_after_delete). Until that time, `autumn \
+                 fleet restore {key} --force` brings it back. After that time, the app \
+                 purges it.",
+                row.purge_after.to_rfc3339()
+            ),
+            Ok(Some(row)) => eprintln!(
+                "  \u{26A0} Its replica is not purged yet: {}.\n    A tombstone records it: \
+                 restore_missing does not bring it back, and the app tries the purge again.",
+                row.last_error
+                    .as_deref()
+                    .unwrap_or("the purge did not finish")
+            ),
+            Err(error) => eprintln!("  \u{26A0} Could not read the replica tombstone: {error}."),
         }
         Ok(())
     }
 
-    fn restore(
-        target: &Target,
-        key: &str,
-        timestamp: Option<&str>,
-        force: bool,
-    ) -> Result<(), String> {
-        // Every check that can refuse runs before the fleet is built.
-        if !force {
-            return Err(format!(
-                "Restore stopped: this replaces the database file of {key} with its replica \
-                 ({} profile).\n  Run again with --force.",
-                target.profile
-            ));
-        }
-        let at = replica::parse_timestamp(timestamp).map_err(|e| e.to_string())?;
+    /// `[replication]` as `delete` and `restore` read it. It must name
+    /// exactly one destination, whether replication is on or not.
+    fn validated_replication(target: &Target) -> Result<replica::Loaded, String> {
         let loaded = replica::Loaded::new(target.profile.clone(), target.config.clone())
             .map_err(|e| e.to_string())?;
         // The check boot makes, and one more: a restore must not guess
@@ -695,18 +901,20 @@ mod imp {
                 errors.join("; ")
             ));
         }
-        let fleet = target.build(None)?;
-        let key = parse_key(&fleet, key)?;
-        let destination = loaded.destination().map_err(|e| e.to_string())?;
-        let root = loaded.root();
-        let prefix = replica_root(&root, &key);
-        eprintln!("  \u{2139} source: {}", destination.describe());
-        eprintln!("  \u{2139} prefix: {prefix}");
+        Ok(loaded)
+    }
 
-        // A restore uses only `root`. This process does not upload WAL frames.
+    /// The fleet replication of `delete` and `restore`: the `[replication]`
+    /// destination, and the tombstones on the control database (issue
+    /// #3235). This process does not upload WAL frames.
+    fn replication_for(
+        target: &Target,
+        loaded: &replica::Loaded,
+    ) -> Result<Arc<FleetReplication>, String> {
+        let destination = loaded.destination().map_err(|e| e.to_string())?;
         let settings = ReplicationSettings {
             database_path: PathBuf::new(),
-            root,
+            root: loaded.root(),
             sync_interval: loaded.replication.sync_interval(),
             snapshot_interval: Duration::from_secs(
                 loaded.replication.snapshot_interval_secs.max(1),
@@ -721,13 +929,49 @@ mod imp {
             ),
             verify_interval: None,
         };
-        let replication = Arc::new(FleetReplication::new(
-            destination,
-            settings,
-            loaded.replication.rpo(),
-            false,
-            Arc::new(autumn_web::time::SystemClock),
-        ));
+        let clock: Arc<dyn autumn_web::time::ClockSource> = Arc::new(autumn_web::time::SystemClock);
+        let control = autumn_web::db::create_pool(&target.config.database)
+            .map_err(|e| format!("could not open the control database: {e}"))?
+            .ok_or_else(|| "no control database is configured ([database] url)".to_owned())?;
+        Ok(Arc::new(
+            FleetReplication::new(
+                destination,
+                settings,
+                loaded.replication.rpo(),
+                false,
+                Arc::clone(&clock),
+            )
+            .with_tombstones(Arc::new(FleetTombstones::new(control, clock)))
+            .with_retention_after_delete(target.fleet.replica_retention_after_delete),
+        ))
+    }
+
+    fn restore(
+        target: &Target,
+        key: &str,
+        timestamp: Option<&str>,
+        force: bool,
+    ) -> Result<(), String> {
+        // Every check that can refuse runs before the fleet is built.
+        if !force {
+            return Err(format!(
+                "Restore stopped: this replaces the database file of {key} with its replica \
+                 ({} profile).\n  Run again with --force.",
+                target.profile
+            ));
+        }
+        let at = replica::parse_timestamp(timestamp).map_err(|e| e.to_string())?;
+        let loaded = validated_replication(target)?;
+        let fleet = target.build(Vec::new())?;
+        let key = parse_key(&fleet, key)?;
+        let prefix = replica_root(&loaded.root(), &key);
+        // The restore also drops the tombstone of a deleted database.
+        let replication = replication_for(target, &loaded)?;
+        eprintln!(
+            "  \u{2139} source: {}",
+            loaded.destination().map_err(|e| e.to_string())?.describe()
+        );
+        eprintln!("  \u{2139} prefix: {prefix}");
         fleet
             .install_replication(replication)
             .map_err(|_| "the fleet already replicates".to_owned())?;
@@ -757,10 +1001,462 @@ mod imp {
         Ok(())
     }
 
+    /// `fleet restore --from`: replace the database of `key` with a local
+    /// file, as `DatabaseFleet::restore_from_file` does. With `[replication]`
+    /// on, it also ships a new base snapshot of the restored file.
+    fn restore_from_file(
+        target: &Target,
+        key: &str,
+        source: &Path,
+        opts: LocalRestore,
+        force: bool,
+    ) -> Result<(), String> {
+        if !force {
+            return Err(format!(
+                "Restore stopped: this replaces the database file of {key} with {} ({} \
+                 profile).\n  Run again with --force.",
+                source.display(),
+                target.profile
+            ));
+        }
+        // The copy must carry the epoch of the host that owns the slot.
+        if target.fleet.ownership.is_some() {
+            return Err(
+                "Restore stopped: [database.fleet.ownership] is on, and this command holds no \
+                 slot lease.\n  Call `DatabaseFleet::restore_from_file` in the app that owns \
+                 the slot."
+                    .to_owned(),
+            );
+        }
+        let source = checked_source(source)?;
+        target.require_root()?;
+        let fleet = target.build(fleet_sources()?)?;
+        let remapped = fleet.remapped_migrations();
+        if !remapped.is_empty() {
+            return Err(format!(
+                "These migrations share a version with another migration: {}.\n  \
+                 `autumn fleet restore --from` cannot record them as boot does. Use \
+                 `DatabaseFleet::restore_from_file` in the app instead.",
+                remapped.join(", ")
+            ));
+        }
+        let key = parse_key(&fleet, key)?;
+        // With replication on, the restore ships a new base snapshot, and
+        // reads the tombstone of a deleted key.
+        if target.replicated() {
+            let needs = |error: String| {
+                format!(
+                    "Restore stopped: with [replication] on, a restore ships the restored \
+                     database and reads its tombstone, and it cannot reach them.\n  {error}"
+                )
+            };
+            let loaded = validated_replication(target).map_err(needs)?;
+            let replication = replication_for(target, &loaded).map_err(needs)?;
+            fleet
+                .install_replication(replication)
+                .map_err(|_| "the fleet already replicates".to_owned())?;
+        }
+        let restored = runtime()?.block_on(async {
+            let result = fleet.restore_from_file(&key, &source, opts).await;
+            // Ships the last frames of the restored database.
+            fleet.close_all().await;
+            result
+        });
+        let outcome = restored.map_err(|e| match &e {
+            FleetError::Restore { detail, .. } if detail.contains("is a copy of") => format!(
+                "{e}\n  Nothing was restored. To restore it as {key}, run again with \
+                 --allow-rekey."
+            ),
+            FleetError::Restore { detail, .. } if detail.contains("clear_tombstone") => format!(
+                "{key} was deleted, and its tombstone keeps the replica for undo.\n  Nothing \
+                 was restored. Run again with --clear-tombstone: this purges the old replica."
+            ),
+            FleetError::Migration { .. } => format!(
+                "{e}\n  Nothing was restored. If the file records a plugin migration, call \
+                 `DatabaseFleet::restore_from_file` in the app instead."
+            ),
+            _ => format!("{e}\n  Nothing was restored."),
+        })?;
+        eprintln!(
+            "\u{2713} Restored {key} from {} ({}).",
+            source.display(),
+            if outcome.replaced {
+                "replaced the old file"
+            } else {
+                "created the file"
+            }
+        );
+        if let Some(found) = &outcome.rekeyed_from {
+            eprintln!("  \u{2139} The file was a copy of {found}; it now records {key}.");
+        }
+        if outcome.migrations_applied > 0 {
+            eprintln!(
+                "  \u{2139} {} migration(s) applied.",
+                outcome.migrations_applied
+            );
+        }
+        if outcome.tombstone_cleared {
+            eprintln!("  \u{2139} The tombstone and the old replica are gone.");
+        }
+        if let Some(shipped) = &outcome.shipped {
+            eprintln!(
+                "  \u{2713} New base snapshot shipped: {} object(s), {} byte(s).",
+                shipped.shipped, shipped.bytes
+            );
+        }
+        if let Some(error) = &outcome.ship_error {
+            eprintln!(
+                "  \u{26A0} The new base snapshot did not ship: {error}.\n    The restored file \
+                 is in place. A replica restore would bring back older data. If the app \
+                 serves {key}, it ships a new base when it opens it. Otherwise run this \
+                 restore again."
+            );
+        }
+        Ok(())
+    }
+
+    /// The `--from` file, checked. It must be a regular file, not a symlink.
+    /// On Unix it must belong to root or to this user, and every directory on
+    /// the way must pass [`refuse_unsafe_path`]: another user must not swap
+    /// the file under the restore. Returns the checked path.
+    fn checked_source(source: &Path) -> Result<PathBuf, String> {
+        let not_a_file = || {
+            format!(
+                "Restore stopped: {} is not a file.\n  Nothing was restored.",
+                source.display()
+            )
+        };
+        let meta = source.symlink_metadata().map_err(|_| not_a_file())?;
+        if !meta.file_type().is_file() {
+            return Err(not_a_file());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let me = nix::unistd::geteuid().as_raw();
+            if meta.uid() != 0 && meta.uid() != me {
+                return Err(format!(
+                    "Restore stopped: {} belongs to another user.\n  Restore only a file \
+                     that you (or root) own.",
+                    source.display()
+                ));
+            }
+            let parent = source
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let dir = refuse_unsafe_path(parent)?;
+            let name = source.file_name().ok_or_else(not_a_file)?;
+            Ok(dir.join(name))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(source.to_path_buf())
+        }
+    }
+
+    /// The arguments of `fleet lake`.
+    struct LakeArgs<'a> {
+        sql: &'a Path,
+        out: Option<&'a Path>,
+        keep: Option<&'a Path>,
+        timestamp: Option<&'a str>,
+        concurrency: usize,
+        tables: &'a [String],
+        scratch: Option<&'a Path>,
+        skip_failed: bool,
+        markers_only: bool,
+    }
+
+    /// `fleet lake`: restore the live tenants from `[replication]` into a
+    /// scratch lake, run one query, and write CSV. It never builds the fleet,
+    /// so the fleet root need not exist.
+    fn lake(target: &Target, args: &LakeArgs<'_>) -> Result<(), String> {
+        let sql = if args.sql == Path::new("-") {
+            std::io::read_to_string(std::io::stdin())
+                .map_err(|e| format!("could not read the SQL from stdin: {e}"))?
+        } else {
+            std::fs::read_to_string(args.sql)
+                .map_err(|e| format!("could not read {}: {e}", args.sql.display()))?
+        };
+        let at = replica::parse_timestamp(args.timestamp).map_err(|e| e.to_string())?;
+        let loaded = validated_replication(target)?;
+        let destination = loaded.destination().map_err(|e| e.to_string())?;
+        eprintln!("  \u{2139} source: {}", destination.describe());
+        eprintln!("  \u{2139} prefix: {}/fleet/tenant", loaded.root());
+
+        // Cheap checks first: a restore of every tenant comes after them.
+        if let Some(keep) = args.keep {
+            refuse_keep(keep, &target.fleet.root)?;
+        }
+        let out = args
+            .out
+            .map(|out| create_private(out).map(|file| (out, file)));
+        let out = out.transpose()?;
+        let result = run_lake(target, args, &sql, at, destination, loaded.root(), out);
+        if result.is_err()
+            && let Some(out) = args.out
+        {
+            let _ = std::fs::remove_file(out);
+        }
+        result
+    }
+
+    /// The rest of [`lake`], after the outputs are checked.
+    fn run_lake(
+        target: &Target,
+        args: &LakeArgs<'_>,
+        sql: &str,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+        destination: Arc<dyn autumn_web::replication::ReplicaDestination>,
+        base: String,
+        out: Option<(&Path, std::fs::File)>,
+    ) -> Result<(), String> {
+        let mut lake = FleetLake::new(destination, base)
+            .outside_root(&target.fleet.root)
+            .with_workers(args.concurrency);
+        if args.markers_only {
+            eprintln!("  \u{26a0} --markers-only: deleted tenants come from the markers only");
+            lake = lake.markers_only();
+        } else {
+            let tombstones = control_tombstones(target)?.ok_or_else(|| {
+                "This host has no control database, so the lake cannot read the tombstone \
+                 rows of deleted tenants.\n  Run where the control database is, or pass \
+                 --markers-only to use the markers in object storage only."
+                    .to_owned()
+            })?;
+            lake = lake.with_tombstones(tombstones);
+        }
+        if args.skip_failed {
+            lake = lake.skip_failed_tenants();
+        }
+        if let Some(at) = at {
+            lake = lake.as_of(at);
+        }
+        if !args.tables.is_empty() {
+            lake = lake.with_tables(args.tables.iter().cloned());
+        }
+        if let Some(scratch) = args.scratch {
+            lake = lake.with_scratch_dir(scratch);
+        }
+
+        let snapshot = runtime()?
+            .block_on(lake.materialize())
+            .map_err(|e| e.to_string())?;
+        report_load(&snapshot);
+        if let Some(keep) = args.keep {
+            snapshot.persist(keep).map_err(|e| e.to_string())?;
+            eprintln!("  \u{2139} lake kept at {}", keep.display());
+        }
+        let rows = match out {
+            Some((path, file)) => {
+                let mut writer = std::io::BufWriter::new(file);
+                let rows = write_csv(&snapshot, sql, &mut writer)?;
+                writer
+                    .flush()
+                    .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+                rows
+            }
+            None => {
+                let stdout = std::io::stdout();
+                let mut writer = std::io::BufWriter::new(stdout.lock());
+                let rows = write_csv(&snapshot, sql, &mut writer)?;
+                writer
+                    .flush()
+                    .map_err(|e| format!("could not write stdout: {e}"))?;
+                rows
+            }
+        };
+        eprintln!("\n\u{2713} {rows} row(s).");
+        Ok(())
+    }
+
+    /// Refuse a `--keep` path that exists or is under the fleet root.
+    fn refuse_keep(keep: &Path, root: &str) -> Result<(), String> {
+        if keep.exists() {
+            return Err(format!("--keep {} already exists.", keep.display()));
+        }
+        let parent = match keep.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let parent = parent
+            .canonicalize()
+            .map_err(|e| format!("--keep {}: {e}", keep.display()))?;
+        if let Ok(root) = Path::new(root).canonicalize()
+            && parent.starts_with(&root)
+        {
+            return Err(format!(
+                "--keep {} is under the fleet root {}.",
+                keep.display(),
+                root.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The tombstone rows of the control database, when it is on this host.
+    /// A missing file is not created.
+    fn control_tombstones(target: &Target) -> Result<Option<Arc<FleetTombstones>>, String> {
+        let Some(url) = target.config.database.effective_primary_url() else {
+            return Ok(None);
+        };
+        if !autumn_web::replication::database_file(url).is_some_and(|file| file.is_file()) {
+            return Ok(None);
+        }
+        let control = autumn_web::db::create_pool(&target.config.database)
+            .map_err(|e| format!("could not open the control database: {e}"))?
+            .ok_or_else(|| "no control database is configured ([database] url)".to_owned())?;
+        let clock: Arc<dyn autumn_web::time::ClockSource> = Arc::new(autumn_web::time::SystemClock);
+        Ok(Some(Arc::new(FleetTombstones::new(control, clock))))
+    }
+
+    /// Create `path` for writing, owner-only on unix. Never replace a file.
+    fn create_private(path: &Path) -> Result<std::fs::File, String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options
+            .open(path)
+            .map_err(|e| format!("could not create {}: {e}", path.display()))
+    }
+
+    /// Write the result of `sql` as CSV. Returns the number of rows.
+    fn write_csv(
+        snapshot: &LakeSnapshot,
+        sql: &str,
+        writer: &mut impl std::io::Write,
+    ) -> Result<usize, String> {
+        let mut failed: Option<std::io::Error> = None;
+        let mut header = false;
+        let rows = snapshot
+            .for_each_row(sql, |columns, row| {
+                let mut line = String::new();
+                if !header {
+                    header = true;
+                    line = csv_line(columns.iter().map(|c| csv_field(c)));
+                }
+                line.push_str(&csv_line(row.iter().map(csv_value)));
+                match writer.write_all(line.as_bytes()) {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(e) => {
+                        failed = Some(e);
+                        ControlFlow::Break(())
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        if let Some(e) = failed {
+            return Err(format!("could not write the CSV: {e}"));
+        }
+        if !header {
+            let columns = snapshot.columns(sql).map_err(|e| e.to_string())?;
+            writer
+                .write_all(csv_line(columns.iter().map(|c| csv_field(c))).as_bytes())
+                .map_err(|e| format!("could not write the CSV: {e}"))?;
+        }
+        Ok(rows)
+    }
+
+    fn csv_line(fields: impl Iterator<Item = String>) -> String {
+        let mut line = fields.collect::<Vec<_>>().join(",");
+        line.push('\n');
+        line
+    }
+
+    /// One CSV field (RFC 4180): quoted when it holds a comma, a quote or a
+    /// line break.
+    fn csv_field(text: &str) -> String {
+        if text.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", text.replace('"', "\"\""))
+        } else {
+            text.to_owned()
+        }
+    }
+
+    /// NULL is empty, a blob is lowercase hex.
+    fn csv_value(value: &LakeValue) -> String {
+        match value {
+            LakeValue::Null => String::new(),
+            LakeValue::Integer(n) => n.to_string(),
+            LakeValue::Real(r) => r.to_string(),
+            LakeValue::Text(text) => csv_field(text),
+            LakeValue::Blob(bytes) => {
+                use std::fmt::Write as _;
+                bytes.iter().fold(String::new(), |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                })
+            }
+        }
+    }
+
+    /// The load summary on stderr: what was loaded and what was skipped.
+    fn report_load(snapshot: &LakeSnapshot) {
+        let count = |want: fn(&SkipReason) -> bool| {
+            snapshot
+                .skipped()
+                .iter()
+                .filter(|skip| want(&skip.reason))
+                .count()
+        };
+        for skip in snapshot.skipped() {
+            if let SkipReason::Failed(detail) = &skip.reason {
+                eprintln!("  \u{2717} {}: {detail}", skip.name);
+            }
+        }
+        let tenants = snapshot.tenants();
+        if let (Some(oldest), Some(newest)) = (
+            tenants.iter().map(|t| t.effective).min(),
+            tenants.iter().map(|t| t.effective).max(),
+        ) {
+            eprintln!(
+                "  \u{2139} each tenant is current as of its own instant: oldest {}, newest {}",
+                oldest.to_rfc3339(),
+                newest.to_rfc3339()
+            );
+        }
+        eprintln!(
+            "  \u{2139} {} tenant(s) loaded, {} deleted, {} unreplicated, {} absent at the \
+             timestamp, {} failed, {} invalid name(s), {} slot database(s).",
+            tenants.len(),
+            count(|r| *r == SkipReason::Deleted),
+            count(|r| *r == SkipReason::Unreplicated),
+            count(|r| *r == SkipReason::AbsentAtTarget),
+            count(|r| matches!(r, SkipReason::Failed(_))),
+            count(|r| *r == SkipReason::InvalidName),
+            count(|r| *r == SkipReason::SlotDatabase),
+        );
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use autumn_web::fleet_layout::FleetMode;
+
+        #[test]
+        fn lake_csv_quotes_and_encodes_values() {
+            assert_eq!(csv_field("plain"), "plain");
+            assert_eq!(csv_field("a,b"), "\"a,b\"");
+            assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+            assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
+            assert_eq!(csv_value(&LakeValue::Null), "");
+            assert_eq!(csv_value(&LakeValue::Integer(-3)), "-3");
+            assert_eq!(
+                csv_value(&LakeValue::Real(0.1 + 0.2)),
+                "0.30000000000000004"
+            );
+            assert_eq!(csv_value(&LakeValue::Text("x,y".into())), "\"x,y\"");
+            assert_eq!(csv_value(&LakeValue::Blob(vec![0, 0xab])), "00ab");
+            assert_eq!(
+                csv_line(["a".to_owned(), String::new()].into_iter()),
+                "a,\n"
+            );
+        }
 
         fn fleet(mode: FleetMode) -> (tempfile::TempDir, DatabaseFleet) {
             let tmp = tempfile::tempdir().unwrap();
@@ -769,11 +1465,19 @@ mod imp {
                 root: tmp.path().display().to_string(),
                 path: None,
                 max_open: 1,
+                max_resident_bytes: 0,
                 pool_size: 1,
                 create_on_demand: None,
                 idle_close_secs: 0,
                 restore_missing: false,
                 ownership: None,
+                replica_retention_after_delete: std::time::Duration::ZERO,
+                restore_check_sample: 0,
+                replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
+                max_open_policy: autumn_web::config::FleetMaxOpenPolicy::Soft,
+                mmap_size: 0,
+                cache_size_kib: 0,
             })
             .build()
             .unwrap();

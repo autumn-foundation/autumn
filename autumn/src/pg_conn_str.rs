@@ -1,5 +1,5 @@
 //! Postgres connection-string shape helpers, shared between the pool's TLS
-//! module (`db::tls`, feature `db`) and config validation (`config`, always
+//! module (`db::tls`, feature `postgres`) and config validation (`config`, always
 //! compiled).
 //!
 //! tokio-postgres accepts two syntaxes: `postgres://`/`postgresql://` URLs,

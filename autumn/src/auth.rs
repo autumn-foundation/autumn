@@ -1107,7 +1107,7 @@ pub async fn oauth2_authorize_url(
 
     // PKCE S256: generate a 32-byte random verifier, base64url-encode it.
     let mut verifier_bytes = [0u8; 32];
-    getrandom::getrandom(&mut verifier_bytes).map_err(|e| {
+    getrandom::fill(&mut verifier_bytes).map_err(|e| {
         crate::AutumnError::service_unavailable_msg(format!("pkce rng failed: {e}"))
     })?;
     let code_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
@@ -1725,7 +1725,7 @@ fn refused_oauth_request(
 
 #[cfg(feature = "oauth2")]
 fn oauth_http_client() -> crate::AutumnResult<HttpClient> {
-    let client = reqwest::Client::builder()
+    let client = crate::reqwest_tls::client_builder()
         .timeout(Duration::from_secs(OAUTH_HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| {
@@ -2664,7 +2664,8 @@ fn api_token_problem_context(req: &axum::extract::Request) -> (Option<String>, O
 pub const API_TOKEN_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!("migrations");
 
-#[cfg(feature = "db")]
+// The store is typed on `AsyncPgConnection`, so it needs the Postgres client.
+#[cfg(feature = "postgres")]
 mod db_store {
     use std::future::Future;
     use std::pin::Pin;
@@ -2680,7 +2681,7 @@ mod db_store {
 
     use super::{
         ApiTokenStore, IssueTokenSpec, TokenMetadata, VerifiedToken, generate_raw_token,
-        hash_api_token,
+        hash_api_token, scopes_from_json,
     };
     use crate::error::AutumnError;
     use crate::time::{ClockSource, SystemClock};
@@ -2733,18 +2734,6 @@ mod db_store {
                 .map(|s| serde_json::Value::String(s.clone()))
                 .collect(),
         )
-    }
-
-    #[must_use]
-    pub fn scopes_from_json(value: &serde_json::Value) -> Vec<String> {
-        value
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Postgres-backed [`ApiTokenStore`].
@@ -3031,16 +3020,26 @@ mod db_store {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub use db_store::DbApiTokenStore;
 /// Convert a JSONB `serde_json::Value` (array of strings) to a flat scope list.
 ///
 /// Returns an empty `Vec` for non-array values; non-string array elements are
 /// silently skipped. This is the canonical deserializer for the `scopes` JSONB
-/// column shared by [`DbApiTokenStore`] and the admin panel.
+/// column shared by `DbApiTokenStore` and the admin panel.
 #[cfg(feature = "db")]
 #[doc(hidden)]
-pub use db_store::scopes_from_json;
+#[must_use]
+pub fn scopes_from_json(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 #[cfg(test)]
 mod tests {
@@ -3050,10 +3049,10 @@ mod tests {
     /// the auth session key (the sole field these tests vary). Collapses the
     /// otherwise-identical struct literal that each test would copy verbatim.
     fn test_app_state(auth_session_key: &str) -> crate::state::AppState {
-        crate::state::AppState {
+        crate::state::AppState::from_inner(crate::state::AppStateInner {
             auth_session_key: auth_session_key.into(),
-            ..crate::state::AppState::test_default()
-        }
+            ..crate::state::AppStateInner::test_default_fields()
+        })
     }
 
     #[tokio::test]

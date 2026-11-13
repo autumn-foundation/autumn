@@ -946,18 +946,24 @@ fn emit_binding_slice(pairs: &[(String, String)]) -> TokenStream {
 
 /// Emit the `inventory::submit!` for a `#[route]`/`#[static_get]` handler.
 #[must_use]
+#[cfg_attr(not(feature = "graph"), allow(unreachable_code, unused_variables))]
 pub fn emit_route_descriptor(
     input_fn: &syn::ItemFn,
     method: &str,
     path: &TokenStream,
     static_route: bool,
 ) -> TokenStream {
+    #[cfg(not(feature = "graph"))]
+    {
+        return TokenStream::new();
+    }
     let signature = emit_symbol_slice(&signature_symbols(&input_fn.sig));
     let block = &input_fn.block;
     let body_tokens = quote! { #block };
     let body = emit_symbol_slice(&candidate_symbols(&body_tokens));
     let sql = emit_symbol_slice(&sql_candidate_symbols(&body_tokens));
     let handler = input_fn.sig.ident.to_string();
+    let crate_version = autumn_macros_support::graph::crate_version();
     quote! {
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::graph::RouteGraphDescriptor {
@@ -966,6 +972,7 @@ pub fn emit_route_descriptor(
                 method: #method,
                 path: #path,
                 static_route: #static_route,
+                crate_version: #crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
                 signature_symbols: #signature,
@@ -978,12 +985,17 @@ pub fn emit_route_descriptor(
 
 /// Emit the `inventory::submit!` for a `#[job]`/`#[scheduled]`/`#[task]` handler.
 #[must_use]
+#[cfg_attr(not(feature = "graph"), allow(unreachable_code, unused_variables))]
 pub fn emit_job_descriptor(
     input_fn: &syn::ItemFn,
     name: &TokenStream,
     kind: &str,
     schedule: &TokenStream,
 ) -> TokenStream {
+    #[cfg(not(feature = "graph"))]
+    {
+        return TokenStream::new();
+    }
     let signature = emit_symbol_slice(&signature_symbols(&input_fn.sig));
     let block = &input_fn.block;
     let body_tokens = quote! { #block };
@@ -999,6 +1011,7 @@ pub fn emit_job_descriptor(
     let bindings = emit_binding_slice(&signature_bindings(&input_fn.sig));
     let handler = input_fn.sig.ident.to_string();
     let kind_ident = syn::Ident::new(kind, proc_macro2::Span::call_site());
+    let crate_version = autumn_macros_support::graph::crate_version();
     quote! {
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::graph::JobGraphDescriptor {
@@ -1009,6 +1022,7 @@ pub fn emit_job_descriptor(
                 schedule: #schedule,
                 mutating: #mutating,
                 mutating_symbols: #mutating_symbols,
+                crate_version: #crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
                 signature_symbols: #signature,
@@ -1021,7 +1035,7 @@ pub fn emit_job_descriptor(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "graph"))]
 mod tests {
     use super::*;
     use quote::quote;
@@ -1317,6 +1331,22 @@ mod tests {
     fn sql_symbols(source: &str) -> Vec<String> {
         let stream: TokenStream = source.parse().expect("a parseable literal");
         sql_candidate_symbols(&stream)
+    }
+
+    /// A boundary check needs every joined table, not only the `FROM` table
+    /// (#3549).
+    #[test]
+    fn every_joined_table_is_a_candidate() {
+        let symbols = sql_symbols(
+            "\"SELECT c.id FROM campaigns c INNER JOIN contacts ct ON ct.id = c.contact_id \
+             LEFT OUTER JOIN deals d ON d.contact_id = ct.id\"",
+        );
+        for table in ["campaigns", "contacts", "deals"] {
+            assert!(
+                symbols.contains(&table.to_owned()),
+                "{table} missing: {symbols:?}"
+            );
+        }
     }
 
     /// A comment above the statement is ordinary SQL style. Reading the verb off

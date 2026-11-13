@@ -405,16 +405,12 @@ impl Drop for InboundRegistration {
 struct InboundSlot(Arc<AtomicUsize>);
 
 impl Drop for InboundSlot {
-    #[allow(
-        deprecated,
-        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
-    )]
     fn drop(&mut self) {
-        // `fetch_update` rather than `fetch_sub`: a counter that underflowed
+        // `try_update` rather than `fetch_sub`: a counter that underflowed
         // would wrap to `usize::MAX` and permanently close the port.
         let _ = self
             .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
                 Some(live.saturating_sub(1))
             });
     }
@@ -813,12 +809,8 @@ async fn accept_loop(
 
 /// Take one inbound connection's slot in the [`MAX_INBOUND_CONNECTIONS`]
 /// budget, or `None` when the budget is spent.
-#[allow(
-    deprecated,
-    reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
-)]
 fn claim_inbound_slot(live: &Arc<AtomicUsize>) -> Option<InboundSlot> {
-    live.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+    live.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
         (live < MAX_INBOUND_CONNECTIONS).then(|| live.saturating_add(1))
     })
     .ok()
@@ -942,16 +934,12 @@ impl InFlightFrame {
 }
 
 impl Drop for InFlightFrame {
-    #[allow(
-        deprecated,
-        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
-    )]
     fn drop(&mut self) {
-        // `fetch_update` rather than `fetch_sub`: an underflow would wrap to
+        // `try_update` rather than `fetch_sub`: an underflow would wrap to
         // `usize::MAX` and make every departure flush wait out its whole budget.
         let _ = self
             .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 Some(held.saturating_sub(1))
             });
     }

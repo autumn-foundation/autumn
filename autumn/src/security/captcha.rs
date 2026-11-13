@@ -214,7 +214,7 @@ impl TurnstileProvider {
     pub fn new(secret_key: impl Into<String>) -> Self {
         Self {
             secret_key: secret_key.into(),
-            client: reqwest::Client::builder()
+            client: crate::reqwest_tls::client_builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("failed to build reqwest client"),
@@ -289,7 +289,7 @@ impl HCaptchaProvider {
     pub fn new(secret_key: impl Into<String>) -> Self {
         Self {
             secret_key: secret_key.into(),
-            client: reqwest::Client::builder()
+            client: crate::reqwest_tls::client_builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("failed to build reqwest client"),

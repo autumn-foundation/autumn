@@ -24,10 +24,10 @@ internet connection.
 
 ## Prerequisites
 
-- **Rust 1.88.0+** with `cargo`
+- **Rust 1.97.0+** with `cargo`
 - **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
-- The `autumn` CLI - `cargo install autumn-cli --version 0.8.0`
+- The `autumn` CLI - `cargo install autumn-cli --version 0.10.0`
 
 ---
 
@@ -352,6 +352,9 @@ host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
 # keep_releases = 3               # prior releases retained for rollback (default: 3)
 # install_proxy = false           # decline host preparation — you install
 #                                 # kamal-proxy yourself (default: true)
+# [[deploy.groups]]               # a role per group of hosts. Remove `host`
+# role = "worker"                 # and `hosts` when you use groups (see the
+# hosts = ["10.0.0.3"]            # fleet deploys guide, "Per-group roles")
 ```
 
 Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
@@ -1311,6 +1314,10 @@ autumn deploy plan
 
 `plan` is a pure dry-run: it prints a **representative** systemd unit and the
 ordered zero-downtime rollout steps for review, without connecting to the host.
+For a SQLite app it reads `[database]` under the deploy profile and shows the
+data-file steps (`link-data` or `check-data-dir`, and `record-data-adopted`) in
+the order the deploy runs them, or the reason preflight refuses the database. If
+that config does not load, `plan` says so and shows the other steps.
 The printed unit is illustrative — it mirrors the shape of what gets installed
 (`User`, working directory, `EnvironmentFile`, restart policy) but is **not**
 byte-for-byte what a real `deploy up` writes. Live deploys write **slot-specific**
@@ -1376,7 +1383,9 @@ created, and never guarded. It has to: if `app_dir`
 is itself a symlink (`/srv/autumn/myapp -> /mnt/apps/myapp`) and your database URL
 uses the resolved spelling, the CLI compares two unrelated strings and sees a file
 outside the app dir — while release retention walks the symlink to the same
-directory and deletes it. Only the host can resolve that.
+directory and deletes it. Only the host can resolve that. The host also decides
+when to record `sqlite-data-adopted`, with the same resolver, so both steps agree
+on what is in `shared/data`. `shared/data` can be a symlink to a mounted volume.
 
 `shared/` is created by the deploy's `prepare-dirs` step, is never pruned, and is
 seen by both blue/green slots, so the file a release writes is the file the next
@@ -1694,7 +1703,7 @@ binary, then deploy again.
 Two layers exercise the real `autumn deploy` lifecycle over real ssh/scp +
 systemd + kamal-proxy — nothing is mocked:
 
-- **Container e2e (every CI run):** `autumn-cli/tests/deploy_e2e.rs` drives first
+- **Container e2e (`Test (Docker deploy)` CI job):** `autumn-cli/tests/deploy_e2e.rs` drives first
   deploy, zero-downtime redeploy, on-demand rollback, and forced-failure
   auto-rollback against a privileged systemd+sshd container. The same binary also
   drives a **two-host fleet lifecycle** across two containers — rolling both
@@ -1732,9 +1741,9 @@ systemd + kamal-proxy — nothing is mocked:
   harness's curl/ssh assertions while driving the real `autumn` binary; the
   Hetzner-specific provisioning is isolated in the workflow so another provider
   can be swapped in without touching the script. The in-container half of the
-  pam_systemd socket check runs as part of the standard
-  `cargo test -p autumn-cli --test deploy_e2e -- --ignored` Docker sweep (no
-  separate feature needed).
+  pam_systemd socket check runs in the `Test (Docker deploy)` CI job. The job
+  runs `cargo test -p autumn-cli --test deploy_e2e -- --ignored`. No separate
+  feature is needed.
 
 ---
 
@@ -1832,7 +1841,7 @@ Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
-{ "status": "ok", "version": "0.8.0" }
+{ "status": "ok", "version": "0.10.0" }
 ```
 
 > **Migration failure stops the rollout.** If the primary URL is wrong or the
@@ -1844,7 +1853,7 @@ response looks like:
 ## How the production image works
 
 ```
-rust:1.88.0-bookworm (chef stage)
+rust:1.97.0-bookworm (chef stage)
   └─ cargo chef prepare          # snapshot dependency graph
        └─ cargo chef cook        # build all dependencies (cached layer)
             └─ autumn build --embed         # fingerprint + embed assets (embed-assets feature)
@@ -2048,6 +2057,27 @@ fly secrets set AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/mya
 fly secrets set AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 fly deploy
 ```
+
+**Split roles.** With `[roles.*]` presets in `autumn.toml`, `--split-workers`
+or `--roles`, the generator writes one process group per role:
+
+```toml
+# fly.toml
+[processes]
+  web = "env AUTUMN_ROLE=web /usr/local/bin/myapp"
+  worker = "env AUTUMN_ROLE=worker /usr/local/bin/myapp"
+
+[http_service]
+  processes = ["web"]
+```
+
+Fly balances `[http_service]` over its groups with no path routing. So only
+one group gets it: `web` or `combined`, else the first role that serves HTTP.
+A comment names each other HTTP role. Give such a role its own `[[services]]`
+block, or its own Fly app. The `/live` check runs on every group. Scale each
+group with `fly scale count web=2 worker=1`. A split role needs a shared jobs
+backend (`[jobs] backend = "postgres"`). An app with only the `combined` role
+gets no `[processes]` block.
 
 **Using a database?** Uncomment the `release_command` line in `fly.toml` before
 the first `fly deploy`:
@@ -3472,7 +3502,7 @@ fires on your first push no matter what the default branch is named:
 | Build | `cargo build` |
 | Test | `cargo test` |
 
-The Rust toolchain is pinned to the project MSRV (1.88.0+) via
+The Rust toolchain is pinned to the project MSRV (1.97.0+) via
 `dtolnay/rust-toolchain@<msrv>` so local and CI toolchains can't drift.
 
 A Postgres 16 service container is provisioned and `DATABASE_URL` is wired in

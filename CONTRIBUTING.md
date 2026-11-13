@@ -6,8 +6,16 @@ Run the pre-push gate, which compiles the **same targets CI compiles** so a
 cross-package break is caught locally instead of on the PR:
 
 ```sh
-./scripts/pre-push-check.sh
+cargo xtask pre-push
 ```
+
+(`./scripts/pre-push-check.sh` runs the same thing.) The steps are the
+`pre-push` lane in `xtask/src/lanes.rs`; `cargo xtask pre-push --list` names
+them, `--from <step>` resumes after a fix, and `--dry-run` prints the commands.
+CI's `lint` job is the `lint` lane of the same file (`cargo xtask ci lint`,
+run in CI as one job per shard: `--shard <shard>`), and
+the two lanes share their clippy feature lists, so they cannot drift apart.
+`cargo xtask list` shows every lane and every script under `scripts/`.
 
 It mirrors CI's always-on `lint` + `test` jobs (`.github/workflows/ci.yml`) —
 `./scripts/check-panic-gate.sh` (the [#1611][issue-1611] request-path panic
@@ -42,11 +50,14 @@ target it never triggers trybuild.
 The gate does **not** cover the Docker/testcontainer, `sqlite`-backend, or
 Chromium `system-tests` lanes (those run in dedicated CI jobs); `cargo test -p
 <pkg>` remains fine for iterating on a single crate — just run
-`./scripts/pre-push-check.sh` before you push.
+`cargo xtask pre-push` before you push.
 
 In CI that blocking gate is **sharded across runners**, so a red PR points at
-one of several jobs rather than a single `Test (<os>)`: `test` runs the
-workspace suite, `trybuild` runs `compile_fail::` in four shards,
+one of several jobs rather than a single `Test (<os>)`. Each OS builds the
+workspace tests once with `cargo nextest archive --workspace` (`Build tests
+(<os>)`). From that build, `test` runs the workspace suite as partitioned
+slices plus a `sim` shard per OS, and `trybuild` runs `compile_fail::` in four
+shards. `doctest` runs the doctests, which nextest does not.
 `test-features` runs one job per non-default feature set, and `test-docker`
 runs the Linux testcontainer sweep. `Test suite` (`test-gate`) is the
 aggregate check that must be green. Nothing about how you *write* a test
@@ -90,6 +101,80 @@ edits `CHANGELOG.md`. `./scripts/update-changelog.sh` folds the fragments into
 the changelog when a release is cut. See
 [`changelog.d/README.md`](changelog.d/README.md).
 
+## Widget browser gate
+
+`.github/workflows/widgets-browser.yml` runs the widgets in headless Chromium
+(issue #3398). It runs when a PR changes widget code: `autumn/src/widgets/`,
+`autumn/src/ui/`, `autumn/vendor/autumn-widgets*.js`, `autumn/src/stories/`
+and the other paths in its `paths:` filter. It also runs each week.
+
+The job runs eight suites:
+
+- `stories_browser` loads each `/_stories/{slug}` page. It injects axe-core
+  and fails on a `serious` or `critical` violation. It checks each page in
+  the light scheme and again in the dark scheme. It also fails on a browser
+  console error. Each interactive story has a `keyboard_<slug>` test, which
+  also checks open dialogs, menus and popups with axe.
+- `widgets_keyboard_browser` checks the #3397 keyboard core on its own page.
+- `widgets_toast_browser` checks the #3399 toast: hover and focus pause the
+  timer, the close button removes the toast and moves focus, and toasts
+  show above a modal.
+- `widgets_popover_browser` checks the #3402 popover and dropdown menu: mouse
+  and keyboard, the APG menu-button keys, focus return, anchor positioning
+  and the no-JS fallback.
+- `widgets_tooltip_browser` checks the #3404 tooltip in the CSS mode and the
+  Chromium `interestfor` mode: focus shows it, Escape hides it, the hover
+  bridge keeps it open, and axe passes.
+- `widgets_drawer_browser` checks the #3403 drawer and modal: focus trap and
+  focus return, Escape and backdrop dismissal, the close button, edges and
+  sizes, the non-modal drawer, and the no-JS path.
+- `widget_pack_browser` checks widget pack conformance (#3400): a good
+  pack passes, three canary packs fail (axe, keyboard trap, console), and
+  pack JS gets `autumn:init`.
+- `the_swatch_pack_passes_widget_browser_conformance` runs the reference
+  `swatch` pack (`autumn-plugin-reference`) through the same gate.
+
+Two canary tests make sure that the gate can fail: a page with an unlabelled
+input must fail axe, and tabs without `autumn-widgets.js` must fail the
+keyboard check.
+
+Run the suites locally (set `AUTUMN_CHROMIUM` if Chromium is not on `PATH`):
+
+```sh
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests stories_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widgets_keyboard_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widgets_toast_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widgets_popover_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widgets_drawer_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widget_pack_browser -- --include-ignored
+cargo test -p autumn-plugin-reference --features system-tests --lib \
+  the_swatch_pack_passes_widget_browser_conformance -- --include-ignored
+```
+
+When you add a widget:
+
+1. Add a story in `autumn/src/stories/builtin.rs`. The default `test` lane
+   fails when a public render fn in `widgets/`, `ui/pagination.rs`,
+   `flash.rs` or `wizard.rs`, or an `a11y` primitive, has no story.
+   A widget in an opt-in family (`widgets-search`, `widgets-social`,
+   `widgets-workflow`, `widgets-charts`) goes in that family's module, and
+   its story in that family's `*_stories()` fn (#3408).
+2. If the story needs `autumn-widgets.js` or a CSS state, add
+   `async fn keyboard_<slug>()` to
+   `autumn/tests/integration/stories_browser.rs` and the slug to
+   `KEYBOARD_STORY_SLUGS` in `autumn/tests/integration/stories.rs`. The
+   `test` lane fails if you forget.
+3. Fix each axe violation in the widget. Do not disable an axe rule.
+
+axe-core is vendored at `autumn/tests/fixtures/axe-core/`. See
+`autumn/vendor/README.md` to update it.
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit
@@ -100,7 +185,8 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 |------|------|----------------|
 | `generated_project_compiles_runs_and_serves` | `e2e.rs` | `autumn new` → `cargo build` + HTTP responses |
 | `generated_scaffold_cargo_checks` | `generate.rs` | `generate scaffold` → `cargo check --tests` |
-| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) → `cargo check`. Not `--all-targets`: the scaffold smoke test is Postgres-only until #1905 (#1924) |
+| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) plus an `--id uuid` model → `cargo check` (#1924, #2555) |
+| `generated_sqlite_scaffold_smoke_tests_pass` | `generate.rs` | SQLite-configured HTML and `--api` scaffolds → `cargo test --tests`. The generated smoke tests run on the SQLite `TestDb` (#2555) |
 | `generated_scaffold_config_cargo_checks` | `generate.rs` | config-driven scaffold → `cargo check --tests` |
 | `generated_scaffold_serves_posts_index_and_json_api` | `generate.rs` | scaffold + Postgres migrations + live HTTP |
 | `generated_constrained_scaffold_enforces_validation_end_to_end` | `generate.rs` | scaffold DSL `{…}` constraints + Postgres + live HTTP: rendered HTML5 attributes, 422 + inline errors, nothing stored (#1388) |
@@ -126,13 +212,14 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `bulk_delete_generated_project_cargo_checks` | `integration/scaffold_bulk_delete.rs` | bulk-delete scaffold → `cargo check --tests` |
 | `richtext_scaffold_cargo_checks` | `integration/scaffold_rich_text.rs` | `{rich_text}` scaffold → `cargo check --tests` |
 | `searchable_scaffold_cargo_checks` | `integration/scaffold_search.rs` | `--searchable` scaffold → `cargo check --tests` |
+| `teams_scaffold_cargo_tests` | `integration/scaffold_teams.rs` | `generate teams` → `cargo test teams::` (the generated unit tests) (#3595) |
 | `trash_generated_project_cargo_checks` | `integration/scaffold_trash.rs` | soft-delete trash scaffold → `cargo check --tests` |
 | `linked_seed_binary_cargo_checks` | `integration/seed_model_linking.rs` | scaffolded model linked into `src/bin/seed.rs` → `cargo check --tests` (#1718) |
 | `serve_daemon_start_status_stop_over_unix_socket` | `integration/serve.rs` | fresh scaffold's `autumn serve --daemon` lifecycle over a Unix socket |
 | `generated_form_for_scaffold_cargo_checks` | `integration/scaffold_form_for.rs` | `form_for` view scaffold → `cargo check --tests` |
 | `generated_scaffold_with_missing_reference_target_cargo_checks` | `integration/scaffold_form_for.rs` | `{references}` with a missing target falls back to a number input → `cargo check --tests` |
 
-The `console.rs`, `scaffold_encrypted.rs`, `scaffold_validation.rs`, and the 15
+The `console.rs`, `scaffold_encrypted.rs`, `scaffold_validation.rs`, and the 16
 rows above compile into the consolidated `cli_tests` binary. `ci.yml`'s Docker
 sweep explicitly `--skip`s each of their tests **by exact name** — never by
 module prefix, which would also silently swallow any Docker test later added
@@ -371,7 +458,7 @@ Run it locally with `./scripts/check-panic-gate.sh` — the default invocation r
 its own `--self-test` (synthetic fixtures in a temp dir, asserting the checker
 still *fails* on each spoof it claims to catch, including the widened-predicate,
 inner-`expect`, group-allow, and unmarked-submodule bypasses) before checking the
-real tree, and both legs together take a couple of seconds. `./scripts/pre-push-check.sh`
+real tree, and both legs together take a couple of seconds. `cargo xtask pre-push`
 runs it as its first step, alongside the gated-features clippy run.
 
 ### Falsifying the gate (AC1)
@@ -479,13 +566,15 @@ the compiler's diagnostic text verbatim, are only valid for one compiler.
 - The pin is the single line in `.github/RUST_TOOLCHAIN`. Every
   `dtolnay/rust-toolchain@<version>` in `.github/workflows/` repeats it.
   `./scripts/check-toolchain-pin.sh` (run by the `MSRV` job) fails if any
-  reference disagrees, or if something floats on `stable` again.
+  reference disagrees, or if something floats on `stable` again. A static
+  `toolchain:` input must be the pin, the MSRV or `nightly`. Quotes and a
+  trailing comment do not hide a wrong value.
 - The matrix jobs keep `stable` as their *label*, so required-check names like
   `Compile-and-serve gates (stable)` do not change, and map it to the pin.
 - `.github/workflows/toolchain-drift.yml` is the only workflow that floats on
   `stable`. It runs `cargo fmt` and clippy weekly (and on demand), so the next
   release's fallout is a dedicated, non-blocking signal. It is not a PR gate.
-- The MSRV (`rust-version`, currently 1.88.0) is a separate floor and is checked by
+- The MSRV (`rust-version`, currently 1.97.0) is a separate floor and is checked by
   `scripts/check-msrv.sh`. Do not use an API newer than it because the pin has it:
   `cargo +<msrv> check -p autumn-web -p autumn-cli` catches that.
 - `publish-gate.yml` pins its own older toolchain for `cargo-semver-checks`, for
@@ -502,7 +591,8 @@ To move to a newer Rust, in one PR targeting `trunk-dev`:
    grandfather a lint in `[workspace.lints.clippy]` only with a written reason
    (the examples carry their own `[lints.clippy]` tables).
 3. `./scripts/check-toolchain-pin.sh --bump <version>` moves the pin and every
-   reference together and re-checks.
+   reference together and re-checks. It also rewrites a static
+   `toolchain: "<pin>"` value and keeps its quotes and comment.
 4. Re-bless any trybuild goldens whose wording changed:
    `TRYBUILD=overwrite cargo +<version> test --workspace --test integration_tests -- compile_fail::`
    (use `--workspace`; the cases depend on the unified feature set), and review

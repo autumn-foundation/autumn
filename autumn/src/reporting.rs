@@ -133,7 +133,21 @@ pub struct ErrorEvent {
     /// The capsule file already exists on disk by the time a reporter is
     /// invoked, so a reporter may safely attach the path (or read the file)
     /// while handling the event.
-    pub capsule: Option<crate::capsule::CapsuleRef>,
+    ///
+    /// Always `None` in a build without the `reporting` feature.
+    pub capsule: Option<CapsuleRef>,
+}
+
+/// Where a persisted capsule ended up.
+///
+/// Carried on [`ErrorEvent::capsule`] so a reporter can attach the path (or
+/// the id) to whatever it ships upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapsuleRef {
+    /// Capsule id — the request id when one was available.
+    pub id: String,
+    /// Absolute or project-relative path to the written capsule.
+    pub path: std::path::PathBuf,
 }
 
 /// Details of a caught handler panic.
@@ -244,7 +258,7 @@ impl ReporterChain {
     /// requests — and stall a current-thread runtime outright. Awaiting the
     /// join handle before reporting keeps the ordering guarantee: the file is
     /// on disk before any reporter sees the reference to it.
-    fn dispatch(self: &Arc<Self>, event: ErrorEvent, capture: Option<CaptureContext>) {
+    fn dispatch(self: &Arc<Self>, event: ErrorEvent, capture: Option<capture::Sealed>) {
         let deliver = self.enabled && sampled(self.sample_rate);
         if !deliver && capture.is_none() {
             return;
@@ -262,13 +276,7 @@ impl ReporterChain {
                 // write (before the file is visible), so a concurrent
                 // failure's prune has no window to delete it first.
                 let _pin = match capture {
-                    Some(capture) => {
-                        let written = persist_capsule(capture).await;
-                        written.map(|(reference, pin)| {
-                            event.capsule = Some(reference);
-                            pin
-                        })
-                    }
+                    Some(capture) => capture::persist(capture, &mut event).await,
                     None => None,
                 };
                 if deliver {
@@ -296,50 +304,6 @@ impl ReporterChain {
     }
 }
 
-/// A request's capture scope plus the outcome that seals it.
-///
-/// Passed to [`ReporterChain::dispatch`] alongside the event so the capsule is
-/// written on the reporting task, before reporters see the event.
-struct CaptureContext {
-    handle: crate::capsule::CaptureHandle,
-    outcome: crate::capsule::CapsuleOutcome,
-}
-
-/// Write the capsule for a failed request on the blocking pool, and wait for
-/// it.
-///
-/// The wait is the point: [`ErrorEvent::capsule`](ErrorEvent::capsule) is only
-/// worth carrying if the file it names is already on disk when a reporter
-/// follows it, so this resolves before `report_all` runs. Moving the work off
-/// the async worker is what keeps a slow disk (or a burst of failures) from
-/// blocking the runtime while that happens.
-///
-/// A join failure — the blocking task panicked or the runtime is shutting down
-/// — is logged and reported as "no capsule", exactly like a write failure:
-/// capsule persistence must never make a bad request worse.
-async fn persist_capsule(
-    capture: CaptureContext,
-) -> Option<(
-    crate::capsule::CapsuleRef,
-    crate::capsule::persist::ReportingPin,
-)> {
-    let written = crate::time::spawn_blocking(move || {
-        crate::capsule::persist::persist_pinned(capture.handle.scope(), capture.outcome)
-    })
-    .await;
-    match written {
-        Ok(reference) => reference,
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "failure capsule could not be written on the blocking pool; \
-                 the failure itself is still reported"
-            );
-            None
-        }
-    }
-}
-
 thread_local! {
     /// Per-thread Xorshift64 state, seeded once from the OS entropy source.
     /// Sampling does not need cryptographic randomness, so a userspace PRNG
@@ -351,7 +315,7 @@ thread_local! {
 /// non-zero constant if that ever fails (Xorshift must never start at zero).
 fn seed_rng() -> u64 {
     let mut buf = [0u8; 8];
-    if getrandom::getrandom(&mut buf).is_ok() {
+    if getrandom::fill(&mut buf).is_ok() {
         let seed = u64::from_ne_bytes(buf);
         if seed != 0 {
             return seed;
@@ -444,7 +408,7 @@ struct RequestContext {
     request_id: Option<String>,
     /// Handle to the request's capsule buffer, snapshotted here for the same
     /// reason the rest of this struct is: it must survive a handler unwind.
-    capture: Option<crate::capsule::CaptureHandle>,
+    capture: Option<capture::Handle>,
 }
 
 /// Tower [`Layer`] that catches handler panics and reports panics + 5xx
@@ -525,10 +489,7 @@ where
             .extensions()
             .get::<RequestId>()
             .map(std::string::ToString::to_string);
-        let capture = req
-            .extensions()
-            .get::<crate::capsule::CaptureHandle>()
-            .cloned();
+        let capture = capture::handle_of(&req);
         let context = Some(RequestContext {
             method,
             route,
@@ -546,13 +507,13 @@ where
         // inside the capture scope. A one-`call` difference between the two
         // boundaries would shift the whole clock/entropy tape by however many
         // readings an inner middleware takes synchronously.
-        let replaying = crate::capsule::effects::tape_active();
+        let replaying = capture::replaying();
         let called = || {
+            #[cfg(feature = "reporting")]
             if replaying {
-                crate::capsule::clock::sync_scope_replay_request(|| inner.call(req))
-            } else {
-                inner.call(req)
+                return crate::capsule::clock::sync_scope_replay_request(|| inner.call(req));
             }
+            inner.call(req)
         };
         let future = match std::panic::catch_unwind(AssertUnwindSafe(called)) {
             Ok(future) => ReportingFuture {
@@ -574,13 +535,15 @@ where
         // anything further out (a minted request id, a minted session id) was
         // never on the tape and must not eat it. See
         // `capsule::clock::with_replay_request_scope`.
+        #[cfg(feature = "reporting")]
         if replaying {
-            ReportingOuterFuture::Replaying {
+            return ReportingOuterFuture::Replaying {
                 inner: crate::capsule::clock::scope_replay_request(future),
-            }
-        } else {
-            ReportingOuterFuture::Plain { inner: future }
+            };
         }
+        // Without the `reporting` feature there is no replay.
+        let _ = replaying;
+        ReportingOuterFuture::Plain { inner: future }
     }
 }
 
@@ -698,42 +661,7 @@ fn report_response(response: &mut Response, context: RequestContext, chain: &Arc
         |info| (info.message.clone(), info.problem_type.map(str::to_owned)),
     );
 
-    // A body that is not yet materialized can run more handler code as it is
-    // polled — database queries, clock reads — after the snapshot below, so
-    // those effects would be missing from the tape while the capsule claims to
-    // be complete. A replay drains the body and would report divergences that
-    // never happened. Probed only when a capsule is actually being written: with
-    // capture off the response is handed on exactly as the handler produced it.
-    // A request in which a fault fired writes no capsule: a replay runs
-    // without the fault and would report a divergence (#3071).
-    let capture = context
-        .capture
-        .filter(|_| !crate::fault_injection::fault_fired());
-    let body_is_materialized = capture.is_some() && materialize_body(response);
-
-    let capture = capture.map(|handle| {
-        if !body_is_materialized {
-            handle.scope().note(
-                "the failing response body was still being produced when the response \
-                 head resolved; effects produced while the body streams are not recorded, \
-                 so the capsule is marked truncated",
-            );
-            handle.scope().mark_truncated();
-        }
-        // Close the scope here rather than leaving it to the capture layer's
-        // registry guard: persistence starts as soon as this is dispatched, and
-        // a connection recorder still appending effects would be racing the
-        // snapshot. Closing first makes the capsule's contents final.
-        handle.scope().close();
-        CaptureContext {
-            handle,
-            outcome: crate::capsule::CapsuleOutcome::Status {
-                code: response.status().as_u16(),
-                message: message.clone(),
-                problem_type: problem_type.clone(),
-            },
-        }
-    });
+    let capture = capture::for_status(context.capture, response, &message, problem_type.as_deref());
 
     chain.dispatch(
         ErrorEvent {
@@ -750,181 +678,6 @@ fn report_response(response: &mut Response, context: RequestContext, chain: &Arc
     );
 }
 
-/// Frames the probe will pull from a body before giving up on it.
-const PROBE_FRAMES: usize = 8;
-
-/// Bytes the probe will hold before giving up on a body.
-const PROBE_BYTES: usize = 64 * 1024;
-
-/// Whether the failing response's body was already produced in full, replacing
-/// it with an equivalent body either way.
-///
-/// The capture scope closes when the response future resolves, so anything a
-/// lazily-produced body does while it is polled happens *after* the capsule
-/// snapshot. Asking the body is the only way to know: a size hint states a
-/// byte count, not that the bytes exist yet, so a hand-written
-/// [`http_body::Body`] can advertise an exact length and still run database or
-/// clock work in `poll_frame`.
-///
-/// So the body is polled with a no-op waker, which cannot make it wait: a body
-/// that yields every frame and ends without once returning `Pending` had
-/// nothing left to run (axum's `String`/JSON/bytes responses take two polls),
-/// and its collected bytes are handed back as the response body. Anything that
-/// stalls, carries trailers, or outruns the probe budget is treated as lazy and
-/// handed back with the frames the probe pulled put back in front, so the
-/// client still sees the bytes the handler produced, in order.
-///
-/// A body of unknown length is never polled at all — an SSE stream would only
-/// answer `Pending` — so the common streaming case pays nothing and is reported
-/// as lazy, which it is.
-fn materialize_body(response: &mut Response) -> bool {
-    use axum::body::Body;
-    use bytes::Bytes;
-    use http_body::Body as _;
-
-    let body = response.body_mut();
-    if body.is_end_stream() {
-        return true;
-    }
-    if body.size_hint().exact().is_none() {
-        return false;
-    }
-
-    let mut body = std::mem::replace(response.body_mut(), Body::empty());
-    let mut frames: std::collections::VecDeque<http_body::Frame<Bytes>> =
-        std::collections::VecDeque::new();
-    let mut collected = 0usize;
-    // Trailers are frames too, and a body carrying them cannot be handed on as
-    // a plain buffer without losing them.
-    let mut data_only = true;
-    let waker = std::task::Waker::noop();
-    let mut cx = Context::from_waker(waker);
-
-    for _ in 0..PROBE_FRAMES {
-        match Pin::new(&mut body).poll_frame(&mut cx) {
-            // Ended without ever waiting: everything it had is in `frames`.
-            Poll::Ready(None) => {
-                *response.body_mut() = rebuild_probed_body(frames, None, None, data_only);
-                return true;
-            }
-            // An error ends the body, but it is part of what the client must
-            // observe — collapsing it into a clean EOF would report a
-            // successful response the handler never produced. Keep it, and do
-            // not call the capsule complete: the body did not finish.
-            Poll::Ready(Some(Err(error))) => {
-                *response.body_mut() = rebuild_probed_body(frames, Some(error), None, data_only);
-                return false;
-            }
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    collected = collected.saturating_add(data.len());
-                } else {
-                    data_only = false;
-                }
-                frames.push_back(frame);
-                if collected > PROBE_BYTES {
-                    break;
-                }
-            }
-            Poll::Pending => break,
-        }
-    }
-
-    *response.body_mut() = rebuild_probed_body(frames, None, Some(body), data_only);
-    false
-}
-
-/// Rebuild a response body out of what the probe pulled and whatever is left.
-///
-/// The probe must be invisible to the client: every frame it took goes back,
-/// in order, ahead of the error that ended the body or the body itself.
-fn rebuild_probed_body(
-    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
-    error: Option<axum::Error>,
-    rest: Option<axum::body::Body>,
-    data_only: bool,
-) -> axum::body::Body {
-    use axum::body::Body;
-
-    if frames.is_empty() && error.is_none() {
-        // Nothing was taken — a body that answered `Pending` on the first poll
-        // (every stream, in practice) goes back untouched.
-        return rest.unwrap_or_else(Body::empty);
-    }
-    if data_only && error.is_none() && rest.is_none() {
-        // The whole body, and all of it data: hand it on as a plain sized body
-        // so the response keeps an exact length.
-        return Body::from(concat_frames(frames));
-    }
-    Body::new(ProbedBody {
-        frames,
-        error,
-        rest,
-    })
-}
-
-/// Join the data frames the probe pulled into one buffer.
-fn concat_frames(
-    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
-) -> bytes::Bytes {
-    use bytes::Bytes;
-
-    let mut chunks = frames
-        .into_iter()
-        .filter_map(|frame| frame.into_data().ok());
-    let Some(first) = chunks.next() else {
-        return Bytes::new();
-    };
-    let Some(second) = chunks.next() else {
-        // The overwhelmingly common shape: one frame, handed on without a copy.
-        return first;
-    };
-    let mut joined = Vec::with_capacity(first.len().saturating_add(second.len()));
-    joined.extend_from_slice(&first);
-    joined.extend_from_slice(&second);
-    for chunk in chunks {
-        joined.extend_from_slice(&chunk);
-    }
-    Bytes::from(joined)
-}
-
-/// The body the probe hands back: the frames it pulled, then the error that
-/// ended the body or the remainder of the body itself.
-struct ProbedBody {
-    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
-    error: Option<axum::Error>,
-    rest: Option<axum::body::Body>,
-}
-
-impl http_body::Body for ProbedBody {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        if let Some(frame) = self.frames.pop_front() {
-            return Poll::Ready(Some(Ok(frame)));
-        }
-        if let Some(error) = self.error.take() {
-            return Poll::Ready(Some(Err(error)));
-        }
-        self.rest
-            .as_mut()
-            .map_or_else(|| Poll::Ready(None), |rest| Pin::new(rest).poll_frame(cx))
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.frames.is_empty()
-            && self.error.is_none()
-            && self
-                .rest
-                .as_ref()
-                .is_none_or(http_body::Body::is_end_stream)
-    }
-}
-
 /// Convert a caught panic into a sanitized 500 response and report it.
 fn handle_panic(
     payload: &(dyn Any + Send),
@@ -937,23 +690,7 @@ fn handle_panic(
         .and_then(|captured| captured.backtrace);
 
     if let Some(context) = context {
-        let capture = context
-            .capture
-            .filter(|_| !crate::fault_injection::fault_fired())
-            .map(|handle| {
-                // Same reason as `report_response`: seal the scope before the
-                // capsule is built, so nothing can append to it while it is
-                // being written.
-                handle.scope().close();
-                CaptureContext {
-                    handle,
-                    outcome: crate::capsule::CapsuleOutcome::Panic {
-                        status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                        payload: message.clone(),
-                        backtrace: backtrace.clone(),
-                    },
-                }
-            });
+        let capture = capture::for_panic(context.capture, &message, backtrace.as_deref());
         chain.dispatch(
             ErrorEvent {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -985,6 +722,373 @@ fn handle_panic(
         payload: format_panic_payload(payload),
     });
     response
+}
+
+// ── Failure capture ──────────────────────────────────────────────────────────
+
+/// Failure capture for a reported request (the `reporting` feature).
+///
+/// The layer above calls these functions in every build. The module below
+/// this one has the stand-ins for a build without the feature.
+#[cfg(feature = "reporting")]
+mod capture {
+    use std::pin::Pin as StdPin;
+    use std::task::{Context, Poll};
+
+    use super::{CapsuleRef, ErrorEvent, Request, Response, StatusCode};
+    use crate::capsule::CapsuleOutcome;
+
+    /// Handle to the request's capsule buffer.
+    pub(super) use crate::capsule::CaptureHandle as Handle;
+
+    /// Keeps a written capsule out of pruning's reach.
+    pub(super) type Pin = crate::capsule::persist::ReportingPin;
+
+    /// A request's capture scope plus the outcome that seals it.
+    ///
+    /// Passed to `ReporterChain::dispatch` alongside the event so the capsule
+    /// is written on the reporting task, before reporters see the event.
+    pub(super) struct Sealed {
+        handle: Handle,
+        outcome: CapsuleOutcome,
+    }
+
+    /// The capture handle of this request, if capture is on.
+    pub(super) fn handle_of<B>(req: &Request<B>) -> Option<Handle> {
+        req.extensions().get::<Handle>().cloned()
+    }
+
+    /// True while a capsule replay runs.
+    pub(super) fn replaying() -> bool {
+        crate::capsule::effects::tape_active()
+    }
+
+    /// Write the capsule for a failed request on the blocking pool, wait for
+    /// it, and put its reference on the event.
+    ///
+    /// The wait is the point: [`ErrorEvent::capsule`] is only worth carrying
+    /// if the file it names is already on disk when a reporter follows it, so
+    /// this resolves before the reporters run. Moving the work off the async
+    /// worker is what keeps a slow disk (or a burst of failures) from blocking
+    /// the runtime while that happens.
+    ///
+    /// A join failure — the blocking task panicked or the runtime is shutting
+    /// down — is logged and reported as "no capsule", exactly like a write
+    /// failure: capsule persistence must never make a bad request worse.
+    pub(super) async fn persist(capture: Sealed, event: &mut ErrorEvent) -> Option<Pin> {
+        let written = crate::time::spawn_blocking(move || {
+            crate::capsule::persist::persist_pinned(capture.handle.scope(), capture.outcome)
+        })
+        .await;
+        let written: Option<(CapsuleRef, Pin)> = match written {
+            Ok(reference) => reference,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "failure capsule could not be written on the blocking pool; \
+                     the failure itself is still reported"
+                );
+                None
+            }
+        };
+        written.map(|(reference, pin)| {
+            event.capsule = Some(reference);
+            pin
+        })
+    }
+
+    /// Seal the capture of a request that ended in a 5xx response.
+    pub(super) fn for_status(
+        handle: Option<Handle>,
+        response: &mut Response,
+        message: &str,
+        problem_type: Option<&str>,
+    ) -> Option<Sealed> {
+        // A body that is not yet materialized can run more handler code as it is
+        // polled — database queries, clock reads — after the capsule snapshot, so
+        // those effects would be missing from the tape while the capsule claims to
+        // be complete. A replay drains the body and would report divergences that
+        // never happened. Probed only when a capsule is actually being written: with
+        // capture off the response is handed on exactly as the handler produced it.
+        // A request in which a fault fired writes no capsule: a replay runs
+        // without the fault and would report a divergence (#3071).
+        let handle = handle.filter(|_| !crate::fault_injection::fault_fired());
+        let body_is_materialized = handle.is_some() && materialize_body(response);
+
+        handle.map(|handle| {
+            if !body_is_materialized {
+                handle.scope().note(
+                    "the failing response body was still being produced when the response \
+                     head resolved; effects produced while the body streams are not recorded, \
+                     so the capsule is marked truncated",
+                );
+                handle.scope().mark_truncated();
+            }
+            // Close the scope here rather than leaving it to the capture layer's
+            // registry guard: persistence starts as soon as this is dispatched, and
+            // a connection recorder still appending effects would be racing the
+            // snapshot. Closing first makes the capsule's contents final.
+            handle.scope().close();
+            Sealed {
+                handle,
+                outcome: CapsuleOutcome::Status {
+                    code: response.status().as_u16(),
+                    message: message.to_owned(),
+                    problem_type: problem_type.map(str::to_owned),
+                },
+            }
+        })
+    }
+
+    /// Seal the capture of a request whose handler panicked.
+    pub(super) fn for_panic(
+        handle: Option<Handle>,
+        message: &str,
+        backtrace: Option<&str>,
+    ) -> Option<Sealed> {
+        handle
+            .filter(|_| !crate::fault_injection::fault_fired())
+            .map(|handle| {
+                // Same reason as `for_status`: seal the scope before the
+                // capsule is built, so nothing can append to it while it is
+                // being written.
+                handle.scope().close();
+                Sealed {
+                    handle,
+                    outcome: CapsuleOutcome::Panic {
+                        status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        payload: message.to_owned(),
+                        backtrace: backtrace.map(str::to_owned),
+                    },
+                }
+            })
+    }
+
+    /// Frames the probe will pull from a body before giving up on it.
+    const PROBE_FRAMES: usize = 8;
+
+    /// Bytes the probe will hold before giving up on a body.
+    const PROBE_BYTES: usize = 64 * 1024;
+
+    /// Whether the failing response's body was already produced in full, replacing
+    /// it with an equivalent body either way.
+    ///
+    /// The capture scope closes when the response future resolves, so anything a
+    /// lazily-produced body does while it is polled happens *after* the capsule
+    /// snapshot. Asking the body is the only way to know: a size hint states a
+    /// byte count, not that the bytes exist yet, so a hand-written
+    /// [`http_body::Body`] can advertise an exact length and still run database or
+    /// clock work in `poll_frame`.
+    ///
+    /// So the body is polled with a no-op waker, which cannot make it wait: a body
+    /// that yields every frame and ends without once returning `Pending` had
+    /// nothing left to run (axum's `String`/JSON/bytes responses take two polls),
+    /// and its collected bytes are handed back as the response body. Anything that
+    /// stalls, carries trailers, or outruns the probe budget is treated as lazy and
+    /// handed back with the frames the probe pulled put back in front, so the
+    /// client still sees the bytes the handler produced, in order.
+    ///
+    /// A body of unknown length is never polled at all — an SSE stream would only
+    /// answer `Pending` — so the common streaming case pays nothing and is reported
+    /// as lazy, which it is.
+    pub(super) fn materialize_body(response: &mut Response) -> bool {
+        use axum::body::Body;
+        use bytes::Bytes;
+        use http_body::Body as _;
+
+        let body = response.body_mut();
+        if body.is_end_stream() {
+            return true;
+        }
+        if body.size_hint().exact().is_none() {
+            return false;
+        }
+
+        let mut body = std::mem::replace(response.body_mut(), Body::empty());
+        let mut frames: std::collections::VecDeque<http_body::Frame<Bytes>> =
+            std::collections::VecDeque::new();
+        let mut collected = 0usize;
+        // Trailers are frames too, and a body carrying them cannot be handed on as
+        // a plain buffer without losing them.
+        let mut data_only = true;
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        for _ in 0..PROBE_FRAMES {
+            match StdPin::new(&mut body).poll_frame(&mut cx) {
+                // Ended without ever waiting: everything it had is in `frames`.
+                Poll::Ready(None) => {
+                    *response.body_mut() = rebuild_probed_body(frames, None, None, data_only);
+                    return true;
+                }
+                // An error ends the body, but it is part of what the client must
+                // observe — collapsing it into a clean EOF would report a
+                // successful response the handler never produced. Keep it, and do
+                // not call the capsule complete: the body did not finish.
+                Poll::Ready(Some(Err(error))) => {
+                    *response.body_mut() =
+                        rebuild_probed_body(frames, Some(error), None, data_only);
+                    return false;
+                }
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        collected = collected.saturating_add(data.len());
+                    } else {
+                        data_only = false;
+                    }
+                    frames.push_back(frame);
+                    if collected > PROBE_BYTES {
+                        break;
+                    }
+                }
+                Poll::Pending => break,
+            }
+        }
+
+        *response.body_mut() = rebuild_probed_body(frames, None, Some(body), data_only);
+        false
+    }
+
+    /// Rebuild a response body out of what the probe pulled and whatever is left.
+    ///
+    /// The probe must be invisible to the client: every frame it took goes back,
+    /// in order, ahead of the error that ended the body or the body itself.
+    fn rebuild_probed_body(
+        frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+        error: Option<axum::Error>,
+        rest: Option<axum::body::Body>,
+        data_only: bool,
+    ) -> axum::body::Body {
+        use axum::body::Body;
+
+        if frames.is_empty() && error.is_none() {
+            // Nothing was taken — a body that answered `Pending` on the first poll
+            // (every stream, in practice) goes back untouched.
+            return rest.unwrap_or_else(Body::empty);
+        }
+        if data_only && error.is_none() && rest.is_none() {
+            // The whole body, and all of it data: hand it on as a plain sized body
+            // so the response keeps an exact length.
+            return Body::from(concat_frames(frames));
+        }
+        Body::new(ProbedBody {
+            frames,
+            error,
+            rest,
+        })
+    }
+
+    /// Join the data frames the probe pulled into one buffer.
+    fn concat_frames(
+        frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    ) -> bytes::Bytes {
+        use bytes::Bytes;
+
+        let mut chunks = frames
+            .into_iter()
+            .filter_map(|frame| frame.into_data().ok());
+        let Some(first) = chunks.next() else {
+            return Bytes::new();
+        };
+        let Some(second) = chunks.next() else {
+            // The overwhelmingly common shape: one frame, handed on without a copy.
+            return first;
+        };
+        let mut joined = Vec::with_capacity(first.len().saturating_add(second.len()));
+        joined.extend_from_slice(&first);
+        joined.extend_from_slice(&second);
+        for chunk in chunks {
+            joined.extend_from_slice(&chunk);
+        }
+        Bytes::from(joined)
+    }
+
+    /// The body the probe hands back: the frames it pulled, then the error that
+    /// ended the body or the remainder of the body itself.
+    struct ProbedBody {
+        frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+        error: Option<axum::Error>,
+        rest: Option<axum::body::Body>,
+    }
+
+    impl http_body::Body for ProbedBody {
+        type Data = bytes::Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            mut self: StdPin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if let Some(frame) = self.frames.pop_front() {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            if let Some(error) = self.error.take() {
+                return Poll::Ready(Some(Err(error)));
+            }
+            self.rest.as_mut().map_or_else(
+                || Poll::Ready(None),
+                |rest| StdPin::new(rest).poll_frame(cx),
+            )
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.frames.is_empty()
+                && self.error.is_none()
+                && self
+                    .rest
+                    .as_ref()
+                    .is_none_or(http_body::Body::is_end_stream)
+        }
+    }
+}
+
+/// Stand-ins for a build without the `reporting` feature.
+///
+/// That build has no capsule. No request has a capture handle, so
+/// `for_status` and `for_panic` always return `None`. `persist` cannot run,
+/// because `Sealed` has no value.
+#[cfg(not(feature = "reporting"))]
+mod capture {
+    use super::{ErrorEvent, Request, Response};
+
+    /// No request has a capture handle.
+    #[derive(Clone)]
+    pub(super) enum Handle {}
+
+    /// No request has a sealed capture.
+    pub(super) enum Sealed {}
+
+    pub(super) type Pin = std::convert::Infallible;
+
+    pub(super) const fn handle_of<B>(_req: &Request<B>) -> Option<Handle> {
+        None
+    }
+
+    pub(super) const fn replaying() -> bool {
+        false
+    }
+
+    #[allow(clippy::unused_async, reason = "same signature as the real function")]
+    pub(super) async fn persist(capture: Sealed, _event: &mut ErrorEvent) -> Option<Pin> {
+        match capture {}
+    }
+
+    pub(super) const fn for_status(
+        _handle: Option<Handle>,
+        _response: &mut Response,
+        _message: &str,
+        _problem_type: Option<&str>,
+    ) -> Option<Sealed> {
+        None
+    }
+
+    pub(super) const fn for_panic(
+        _handle: Option<Handle>,
+        _message: &str,
+        _backtrace: Option<&str>,
+    ) -> Option<Sealed> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1021,6 +1125,7 @@ mod tests {
     /// bytes exist yet: `SizeHint` is a byte count, and a hand-written
     /// `http_body::Body` can promise a length and still do database or clock
     /// work the first time it is polled. Only asking the body settles it.
+    #[cfg(feature = "reporting")]
     #[tokio::test]
     async fn a_body_is_materialized_only_when_it_finishes_without_waiting() {
         use axum::body::Body;
@@ -1028,7 +1133,7 @@ mod tests {
 
         fn probe(body: Body) -> (bool, Response) {
             let mut response = Response::new(body);
-            let materialized = materialize_body(&mut response);
+            let materialized = capture::materialize_body(&mut response);
             (materialized, response)
         }
 
@@ -1102,6 +1207,7 @@ mod tests {
     /// The probe must be invisible to the client. A trailer frame it pulls has
     /// to go back into the response: enabling failure capture must not strip
     /// integrity or diagnostic metadata off a 5xx.
+    #[cfg(feature = "reporting")]
     #[tokio::test]
     async fn a_probed_trailer_frame_is_put_back() {
         use axum::body::Body;
@@ -1137,7 +1243,7 @@ mod tests {
 
         let mut response = Response::new(Body::new(DataThenTrailers(0)));
         assert!(
-            materialize_body(&mut response),
+            capture::materialize_body(&mut response),
             "the body finished without waiting, so the capsule is complete"
         );
         let collected = response
@@ -1156,6 +1262,7 @@ mod tests {
     /// A body that fails mid-stream must still fail for the client: turning the
     /// error into a clean EOF would report a whole response the handler never
     /// sent, and the capsule cannot claim to be complete either.
+    #[cfg(feature = "reporting")]
     #[tokio::test]
     async fn a_probed_body_error_is_preserved_and_marks_the_capsule_incomplete() {
         use axum::body::Body;
@@ -1186,7 +1293,7 @@ mod tests {
 
         let mut response = Response::new(Body::new(DataThenError(true)));
         assert!(
-            !materialize_body(&mut response),
+            !capture::materialize_body(&mut response),
             "a body that failed did not finish, so the capsule must not claim to be complete"
         );
         let error = response
@@ -1202,6 +1309,7 @@ mod tests {
 
     /// Frames the probe pulled before a body stalled must go back in front of
     /// the remainder, or the client loses the beginning of the response.
+    #[cfg(feature = "reporting")]
     #[tokio::test]
     async fn probed_frames_are_put_back_in_front_of_a_stalling_body() {
         use axum::body::Body;
@@ -1238,7 +1346,7 @@ mod tests {
         }
 
         let mut response = Response::new(Body::new(ReadyThenStall(0)));
-        assert!(!materialize_body(&mut response), "the body stalls");
+        assert!(!capture::materialize_body(&mut response), "the body stalls");
         assert_eq!(
             response
                 .into_body()
@@ -1251,13 +1359,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reporting")]
     #[test]
-    fn capture_context_can_cross_to_the_blocking_pool() {
-        // `persist_capsule` hands the context to `spawn_blocking`, which needs
-        // `Send + 'static`. A future field that is neither would only show up
-        // as a confusing error inside `dispatch`, so pin it here.
+    fn a_sealed_capture_can_cross_to_the_blocking_pool() {
+        // `capture::persist` moves the `Sealed` value into `spawn_blocking`,
+        // which needs `Send + 'static`. A future field that is neither would
+        // only show up as a confusing error inside `dispatch`, so pin it here.
         const fn assert_send_static<T: Send + 'static>() {}
-        assert_send_static::<CaptureContext>();
+        assert_send_static::<capture::Sealed>();
     }
 
     #[test]
@@ -1302,6 +1411,7 @@ mod tests {
     /// queries, clock reads — while the client drains it, after the capsule
     /// snapshot. Such a capsule must say it is incomplete rather than send a
     /// replay chasing divergences that never happened.
+    #[cfg(feature = "reporting")]
     #[tokio::test]
     async fn a_streaming_5xx_marks_its_capsule_truncated() {
         use std::convert::Infallible;

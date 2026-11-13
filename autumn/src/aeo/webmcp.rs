@@ -31,6 +31,8 @@ pub(crate) fn script(facts: &SiteFacts, csrf_header: &str) -> String {
                 .iter()
                 .filter(|_| mcp.public_tools)
                 .filter(|t| valid_tool_name(&t.name))
+                // The `WebMCP` projection registers these itself.
+                .filter(|t| !facts.webmcp_projected.contains(&t.name))
                 // An in-browser agent runs with the visitor's session, so
                 // only a tool marked safe goes on the page.
                 .filter(|t| marked_safe(&t.annotations))
@@ -318,6 +320,13 @@ mod tests {
             let js = script(&f, "x-csrf-token");
             assert!(js.contains("const tools = [].filter("), "{js}");
         }
+    }
+
+    #[test]
+    fn projected_tools_are_left_to_the_webmcp_shim() {
+        let mut f = facts(true);
+        f.webmcp_projected = vec!["list_todos".to_owned()];
+        assert!(!script(&f, "x-csrf-token").contains("list_todos"));
     }
 
     #[test]

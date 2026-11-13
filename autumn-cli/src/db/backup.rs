@@ -340,7 +340,7 @@ impl TargetBackend {
 
     /// Read a manifest spelling. An empty or unknown value is Postgres, so a
     /// manifest without the field restores exactly as before.
-    fn from_manifest(raw: &str) -> Self {
+    const fn from_manifest(raw: &str) -> Self {
         if raw.eq_ignore_ascii_case("sqlite") {
             Self::Sqlite
         } else {
@@ -936,6 +936,40 @@ fn verify_artifact(
     }
 }
 
+/// Settings that a newer `pg_restore` sets to turn a timeout off, and that an
+/// older server does not know. The server has no such timeout, so the restore
+/// loses nothing when the `SET` fails.
+const NEWER_TIMEOUT_SETTINGS: &[&str] = &["transaction_timeout"];
+
+/// Whether `pg_restore` stderr reports only errors from an older server
+/// that does not know a timeout setting the newer client disables.
+///
+/// `pg_restore` goes on after such an error and exits 1 with a count of the
+/// errors it ignored. The restore is complete when each ignored error is one
+/// of these settings.
+fn only_unknown_timeout_settings(stderr: &str) -> bool {
+    let ignored = stderr.lines().find_map(|line| {
+        line.split("errors ignored on restore: ")
+            .nth(1)
+            .and_then(|n| n.trim().parse::<usize>().ok())
+    });
+    let Some(ignored) = ignored.filter(|n| *n > 0) else {
+        return false;
+    };
+    let errors = stderr.lines().filter(|l| l.contains("ERROR:")).count();
+    let known = stderr
+        .lines()
+        .filter(|l| {
+            NEWER_TIMEOUT_SETTINGS.iter().any(|setting| {
+                l.contains(&format!(
+                    "unrecognized configuration parameter \"{setting}\""
+                ))
+            })
+        })
+        .count();
+    errors == ignored && known == ignored
+}
+
 /// Structural integrity check for a custom-format archive: `pg_restore --list`
 /// parses the archive's TOC and fails on a truncated/corrupt file.
 fn verify_custom_archive(pg_restore: &Path, path: &Path, db: &str) -> Result<(), BackupError> {
@@ -1132,25 +1166,37 @@ fn run_restore_one(
             // `--clean --if-exists` drops existing objects first so the restore
             // is an overwrite, not a merge; `--no-owner` matches the dump flags.
             let (mut cmd, safe_url) = pg_command(&pg_restore, url);
-            let status = cmd
+            let output = cmd
                 .arg("--clean")
                 .arg("--if-exists")
                 .arg("--no-owner")
                 .arg("--dbname")
                 .arg(&safe_url)
                 .arg(artifact)
-                .status()
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::piped())
+                .output()
                 .map_err(|e| spawn_err("pg_restore", db, &e))?;
-            if !status.success() {
-                return Err(BackupError::ToolFailed {
-                    tool: "pg_restore".to_owned(),
-                    context: format!(
-                        "restore into database {db:?} exited {}",
-                        exit_desc(status.code())
-                    ),
-                });
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprint!("{stderr}");
+            if output.status.success() {
+                return Ok(());
             }
-            Ok(())
+            if only_unknown_timeout_settings(&stderr) {
+                eprintln!(
+                    "note: the server of database {db:?} is older than `pg_restore` and \
+                     does not know a timeout setting that `pg_restore` turns off. The \
+                     restore is complete."
+                );
+                return Ok(());
+            }
+            Err(BackupError::ToolFailed {
+                tool: "pg_restore".to_owned(),
+                context: format!(
+                    "restore into database {db:?} exited {}",
+                    exit_desc(output.status.code())
+                ),
+            })
         }
         BackupFormat::Plain => {
             let psql = tools.require("psql")?;
@@ -2964,6 +3010,42 @@ fn resolve_latest_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OLD_SERVER: &str = "pg_restore: error: could not execute query: ERROR:  \
+        unrecognized configuration parameter \"transaction_timeout\"\n\
+        Command was: SET transaction_timeout = 0;\n\
+        pg_restore: warning: errors ignored on restore: 1\n";
+
+    #[test]
+    fn a_restore_whose_only_error_is_an_unknown_timeout_setting_is_complete() {
+        assert!(only_unknown_timeout_settings(OLD_SERVER));
+    }
+
+    #[test]
+    fn another_error_beside_the_timeout_setting_still_fails() {
+        let both = OLD_SERVER.replace(
+            "errors ignored on restore: 1",
+            "errors ignored on restore: 2",
+        ) + "pg_restore: error: could not execute query: ERROR:  relation \"x\" does not exist\n";
+        assert!(!only_unknown_timeout_settings(&both));
+    }
+
+    #[test]
+    fn a_failure_with_no_ignored_error_count_still_fails() {
+        assert!(!only_unknown_timeout_settings(
+            "pg_restore: error: connection to server failed\n"
+        ));
+        assert!(!only_unknown_timeout_settings(""));
+        assert!(!only_unknown_timeout_settings(
+            "pg_restore: warning: errors ignored on restore: 0\n"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_setting_that_is_not_a_timeout_still_fails() {
+        let other = OLD_SERVER.replace("transaction_timeout", "work_mem_x");
+        assert!(!only_unknown_timeout_settings(&other));
+    }
 
     #[test]
     fn format_parse_accepts_documented_spellings() {

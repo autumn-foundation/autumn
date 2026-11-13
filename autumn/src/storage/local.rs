@@ -676,9 +676,9 @@ pub fn sign_upload(
     content_type: &str,
     expires_at: u64,
 ) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
     mac.update(b"upload:");
     mac.update(&(blob_key.len() as u64).to_be_bytes());
     mac.update(blob_key.as_bytes());
@@ -760,9 +760,9 @@ pub fn sign_upload_legacy(
     content_type: &str,
     expires_at: u64,
 ) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
     mac.update(b"upload:");
     mac.update(blob_key.as_bytes());
     mac.update(b":");
@@ -874,9 +874,9 @@ fn encode_query_value(value: &str) -> String {
 /// Never; `Hmac::new_from_slice` accepts any key length.
 #[must_use]
 pub fn sign(key_bytes: &[u8], blob_key: &str, expires_at: u64) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
     mac.update(blob_key.as_bytes());
     mac.update(b":");
     mac.update(expires_at.to_string().as_bytes());

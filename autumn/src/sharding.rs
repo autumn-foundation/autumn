@@ -49,6 +49,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::db::RuntimeConnection;
+#[cfg(feature = "postgres")]
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -347,6 +348,7 @@ struct ShardNameRow {
 /// invalidation listener subscribes to it; the trigger
 /// (`autumn_notify_shard_directory_change`, in the shard-directory migration)
 /// must `pg_notify` the same channel. Keep the two in sync.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 const DIRECTORY_NOTIFY_CHANNEL: &str = "autumn_shard_directory";
 
 /// How often the invalidation listener wakes while idle to sweep expired cache
@@ -445,6 +447,7 @@ impl DirectoryShardRouter {
     /// spawns this automatically when directory routing is enabled via the
     /// built-in path. `sweep_interval` only bounds idle housekeeping (see
     /// [`DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL`]).
+    #[cfg(feature = "postgres")]
     #[must_use]
     pub fn spawn_invalidation_listener(
         router: Arc<Self>,
@@ -521,6 +524,7 @@ impl DirectoryShardRouter {
     /// only reclaims keys that are looked up again; this bounds memory for
     /// pinned tenants that are never re-observed. Called periodically by the
     /// invalidation listener.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     fn sweep_expired(&self) {
         if let Ok(mut cache) = self.cache.write() {
             let now = crate::time::ambient_instant();
@@ -1208,6 +1212,22 @@ impl ShardSet {
                         .replica()
                         .map_or(0, |pool| pool.status().max_size)
             })
+            .sum()
+    }
+
+    /// The databases that this set opens: one per configured pool, or
+    /// `max_open` for a fleet. A fleet burst opens more. The boot warning
+    /// uses this count for the `SQLite` open-file estimate.
+    #[must_use]
+    pub fn total_databases(&self) -> usize {
+        #[cfg(feature = "sqlite")]
+        if let Some(backing) = &self.inner.fleet {
+            return backing.fleet.max_open();
+        }
+        self.inner
+            .shards
+            .iter()
+            .map(|shard| 1 + usize::from(shard.topology().replica().is_some()))
             .sum()
     }
 
@@ -2592,12 +2612,20 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedReadDb {
     }
 }
 
-/// Resolve the routing key for [`ShardedDb`]; see its docs for the
-/// resolution order.
-async fn resolve_shard_key(
+/// Why a request has no routing key.
+pub(crate) enum RoutingKeyError {
+    /// The app state has no config.
+    NoConfig,
+    /// The tenancy extraction failed.
+    Tenant(AutumnError),
+}
+
+/// The routing key of a request: a [`ShardKeyOverride`], then the tenant of
+/// the tenancy middleware, then the tenant from the request.
+pub(crate) async fn request_routing_key(
     parts: &mut axum::http::request::Parts,
     state: &crate::AppState,
-) -> Result<String, AutumnError> {
+) -> Result<String, RoutingKeyError> {
     if let Some(overridden) = parts.extensions.get::<ShardKeyOverride>() {
         return Ok(overridden.0.clone());
     }
@@ -2606,15 +2634,29 @@ async fn resolve_shard_key(
     }
     let config = state
         .extension::<crate::config::AutumnConfig>()
-        .ok_or_else(|| AutumnError::service_unavailable_msg("Config is not available"))?;
+        .ok_or(RoutingKeyError::NoConfig)?;
     crate::tenancy::extract_tenant_from_parts(parts, &config)
         .await
-        .map_err(|error| {
-            AutumnError::bad_request_msg(format!(
+        .map_err(RoutingKeyError::Tenant)
+}
+
+/// Resolve the routing key for [`ShardedDb`]; see its docs for the
+/// resolution order.
+async fn resolve_shard_key(
+    parts: &mut axum::http::request::Parts,
+    state: &crate::AppState,
+) -> Result<String, AutumnError> {
+    request_routing_key(parts, state)
+        .await
+        .map_err(|error| match error {
+            RoutingKeyError::NoConfig => {
+                AutumnError::service_unavailable_msg("Config is not available")
+            }
+            RoutingKeyError::Tenant(error) => AutumnError::bad_request_msg(format!(
                 "ShardedDb could not resolve a shard key: {error}. Enable [tenancy] so \
                  the tenant id can route the request, or insert a ShardKeyOverride \
                  request extension from middleware (see docs/guide/sharding.md)"
-            ))
+            )),
         })
 }
 
@@ -3541,6 +3583,63 @@ mod tests {
             .expect("configured");
         // a primary (7) + b primary (7).
         assert_eq!(set.total_max_connections(), 14);
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn total_databases_counts_every_pool() {
+        let mut config = sharded_config(&["a", "b"]);
+        config.shards[1].replica_url = Some("postgres://localhost/b_ro".to_owned());
+        let set = create_shard_set(&config, Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        // a primary + b primary + b replica.
+        assert_eq!(set.total_databases(), 3);
+    }
+
+    #[test]
+    fn total_databases_counts_every_primary() {
+        let set = create_shard_set(&sharded_config(&["a", "b"]), Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        assert_eq!(set.total_databases(), 2);
+    }
+
+    // A fleet opens `max_open` databases, not one per shard.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_fleet_counts_max_open_databases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fleet = crate::db::fleet::DatabaseFleet::builder(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: tmp.path().display().to_string(),
+            path: None,
+            max_open: 64,
+            max_resident_bytes: 0,
+            pool_size: 2,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
+            mmap_size: 0,
+            cache_size_kib: 0,
+        })
+        .build()
+        .expect("fleet builds");
+        let control = crate::db::create_pool(&crate::config::DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        })
+        .expect("control pool builds")
+        .expect("url configured");
+        let set = ShardSet::from_fleet(fleet, control);
+        assert_eq!(set.total_databases(), 64);
+        assert_eq!(set.total_max_connections(), 128);
     }
 
     // ── ShardRepositorySeed (#1273) ─────────────────────────────────────

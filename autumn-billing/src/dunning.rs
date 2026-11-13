@@ -2,22 +2,26 @@
 //!
 //! The `billing_dunning` row is the schedule. The job payload carries only the
 //! local invoice id; the job reads the row, so a duplicate or early run is a
-//! no-op and a restart re-arms from the store. Every write after the claim is
-//! a compare-and-set on the row's state and attempt, so a reconcile that
-//! settles the row while a retry is in flight wins.
+//! no-op and a restart re-arms from the store. Mirror writes come first. Every
+//! write to the row after the claim is a compare-and-set on its state and
+//! attempt, and the settle is last. A reconcile that settles the row while a
+//! retry is in flight wins.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_web::background::{BackgroundTask, PluginCapability};
 use autumn_web::job::{JobClient, JobInfo};
-use autumn_web::{AppState, AutumnResult, job};
+use autumn_web::{AppState, AutumnResult, Capability, job};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::BillingService;
 use crate::config::ExhaustionAction;
 use crate::error::BillingError;
-use crate::model::{DunningAttempt, DunningState, Invoice, InvoiceStatus, SubscriptionStatus};
+use crate::model::{
+    DunningAttempt, DunningState, Invoice, InvoiceStatus, Subscription, SubscriptionStatus,
+};
 use crate::notify;
 use crate::provider::PaymentAttemptOutcome;
 use crate::store::InvoiceUpsert;
@@ -27,13 +31,13 @@ pub const RETRY_JOB_NAME: &str = "autumn_billing_dunning_retry";
 
 /// A `Running` row not updated for this long was abandoned by a crashed run.
 /// The next job run resets it to `Pending` and claims it again.
-pub const RUNNING_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+pub const RUNNING_STALE_AFTER: Duration = Duration::from_mins(10);
 
 /// Delay before the same attempt runs again after a provider transport error.
-pub const TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
+pub const TRANSPORT_RETRY_DELAY: Duration = Duration::from_mins(15);
 
 /// Applied ledger rows older than this are deleted at startup.
-pub const EVENT_RETENTION: Duration = Duration::from_secs(30 * 86_400);
+pub const EVENT_RETENTION: Duration = Duration::from_hours(30 * 24);
 
 /// How long startup waits for the job runtime before it gives up re-arming.
 const REARM_WAIT: Duration = Duration::from_secs(30);
@@ -357,12 +361,6 @@ async fn recovered(
     now: DateTime<Utc>,
 ) -> Result<(), BillingError> {
     let store = service.store();
-    let mut settled = row.clone();
-    settled.state = DunningState::Recovered;
-    settled.updated_at = now;
-    if !settle(service, row, settled).await? {
-        return Ok(());
-    }
     let mut paid = InvoiceUpsert::new(
         state.entropy().uuid_v4().to_string(),
         invoice.customer_id.clone(),
@@ -377,7 +375,16 @@ async fn recovered(
     if let Some(subscription_id) = &invoice.subscription_id {
         paid = paid.with_subscription(subscription_id.clone());
     }
+    // Write the mirror first and settle last. If the write fails, the row
+    // stays `Running`. `run_retry` then restores it, and the next job repeats
+    // the write.
     let invoice = store.upsert_invoice(paid).await?.into_inner();
+    let mut settled = row.clone();
+    settled.state = DunningState::Recovered;
+    settled.updated_at = now;
+    if !settle(service, row, settled).await? {
+        return Ok(());
+    }
     tracing::info!(invoice_id = %invoice.id, "🍂 Autumn Billing: payment recovered");
     if let Some(customer) = store.customer_by_id(&invoice.customer_id).await? {
         notify::send_to_customer(
@@ -446,8 +453,12 @@ async fn declined(
     exhausted(state, service, row, invoice, reason, now).await
 }
 
-/// Every retry failed: the mirror stops entitlement first, then the
-/// provider is told.
+/// Every retry failed. The code stops entitlement in the mirror, settles the
+/// row, and then tells the provider.
+///
+/// The row stays `Running` until the mirror write ends. If the write fails,
+/// `run_retry` restores the row and the next job repeats the write. If an
+/// event settles the row first, the code undoes the mirror write.
 async fn exhausted(
     state: &AppState,
     service: &BillingService,
@@ -460,9 +471,6 @@ async fn exhausted(
     let mut exhausted = row.clone();
     exhausted.state = DunningState::Exhausted;
     exhausted.updated_at = now;
-    if !settle(service, row, exhausted.clone()).await? {
-        return Ok(());
-    }
     let customer = store.customer_by_id(&invoice.customer_id).await?;
     let action = service.config().dunning.on_exhausted;
     // The row was opened before the subscription was mirrored when the
@@ -480,31 +488,48 @@ async fn exhausted(
             .await?
             .map(|subscription| subscription.id);
     }
+    let mut unpaid = None;
     if let Some(subscription_id) = &subscription_id {
-        let subscription = store
-            .set_subscription_status(subscription_id, SubscriptionStatus::Unpaid, now)
-            .await?;
-        if action == ExhaustionAction::CancelSubscription {
-            if let Some(subscription) = subscription {
-                if let Err(error) = service
-                    .provider()
-                    .cancel_subscription(&subscription.provider_subscription_id)
-                    .await
-                {
-                    // The mirror says unpaid; the operator reconciles the provider.
-                    tracing::error!(
-                        subscription_id,
-                        provider_subscription_id = %subscription.provider_subscription_id,
-                        error = %error,
-                        "🍂 Autumn Billing: provider cancel failed after dunning exhausted"
-                    );
-                }
-            } else {
-                tracing::warn!(
+        let previous = store.subscription_by_id(subscription_id).await?;
+        // An ended subscription keeps its status. Its event closes the row.
+        if previous.as_ref().is_none_or(|p| !p.status.is_terminal()) {
+            unpaid = store
+                .set_subscription_status(subscription_id, SubscriptionStatus::Unpaid, now)
+                .await?;
+        }
+        if !settle(service, row, exhausted.clone()).await? {
+            // An event settled the row first. For example, a payment was
+            // recovered. Undo the `Unpaid` write.
+            if unpaid.is_some() {
+                undo_unpaid(service, subscription_id, previous, now).await?;
+            }
+            return Ok(());
+        }
+    } else if !settle(service, row, exhausted.clone()).await? {
+        return Ok(());
+    }
+    if action == ExhaustionAction::CancelSubscription
+        && let Some(subscription_id) = &subscription_id
+    {
+        if let Some(subscription) = unpaid {
+            if let Err(error) = service
+                .provider()
+                .cancel_subscription(&subscription.provider_subscription_id)
+                .await
+            {
+                // The mirror says unpaid; the operator reconciles the provider.
+                tracing::error!(
                     subscription_id,
-                    "🍂 Autumn Billing: dunning exhausted for an unknown subscription"
+                    provider_subscription_id = %subscription.provider_subscription_id,
+                    error = %error,
+                    "🍂 Autumn Billing: provider cancel failed after dunning exhausted"
                 );
             }
+        } else {
+            tracing::warn!(
+                subscription_id,
+                "🍂 Autumn Billing: dunning exhausted for an unknown subscription"
+            );
         }
     }
     tracing::warn!(
@@ -534,30 +559,72 @@ async fn exhausted(
     Ok(())
 }
 
-/// Re-enqueue every open schedule row at its due time and prune the event
-/// ledger. Waits for the job runtime (the test harness starts it after
-/// startup hooks). Fire-and-forget wrapper around [`rearm_pending_now`] — the
-/// startup hook cannot await it without blocking every other plugin's
-/// `on_startup`, so it spawns instead.
-pub(crate) fn rearm_pending(state: AppState, service: Arc<BillingService>) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        tracing::warn!("🍂 Autumn Billing: no async runtime; dunning rows not re-armed");
-        return;
-    };
-    handle.spawn(async move {
-        rearm_pending_now(&state, &service).await;
-    });
+/// Undo the `Unpaid` write of [`exhausted`] after it loses the settle. Do this
+/// only if the status is still `Unpaid`: a newer event can change it. This is
+/// best effort, because the store has no compare-and-set for the status. A
+/// re-run sees its own earlier `Unpaid` write as `previous`. The fallback is
+/// then `Active`, and the next provider event corrects it.
+async fn undo_unpaid(
+    service: &BillingService,
+    subscription_id: &str,
+    previous: Option<Subscription>,
+    now: DateTime<Utc>,
+) -> Result<(), BillingError> {
+    let store = service.store();
+    let restore = previous
+        .map(|p| p.status)
+        .filter(|status| *status != SubscriptionStatus::Unpaid)
+        .unwrap_or(SubscriptionStatus::Active);
+    let current = store.subscription_by_id(subscription_id).await?;
+    if current.is_some_and(|c| c.status == SubscriptionStatus::Unpaid) {
+        store
+            .set_subscription_status(subscription_id, restore, now)
+            .await?;
+        tracing::info!(
+            subscription_id,
+            "🍂 Autumn Billing: dunning settled by an event; unpaid status restored"
+        );
+    }
+    Ok(())
 }
 
-/// The re-arm body `rearm_pending` spawns.
+/// The job queue of the dunning retry job.
+pub const QUEUE: &str = "billing";
+
+/// The capability of the dunning re-arm. A role runs it when it runs job
+/// workers: `combined` and `worker`.
+pub const DUNNING: PluginCapability =
+    PluginCapability::new("billing.dunning", Capability::JobWorkers);
+
+/// The background task name of the dunning re-arm.
+pub const REARM_TASK: &str = "billing.dunning_rearm";
+
+/// The dunning re-arm as a background task.
+///
+/// It re-arms once, on a role that drains [`QUEUE`]. A `web` replica does not
+/// re-arm: it does not drain the queue. Two workers that re-arm one row queue
+/// one job, because the retry job is unique per invoice while it is pending.
+///
+/// After the re-arm, the task waits for shutdown. The framework logs a
+/// warning for a task that returns before shutdown.
+pub(crate) fn rearm_task() -> BackgroundTask {
+    BackgroundTask::new(REARM_TASK, DUNNING, |state, shutdown| async move {
+        let service = BillingService::require(&state)?;
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = rearm_pending_now(&state, &service) => {}
+        }
+        shutdown.cancelled().await;
+        Ok(())
+    })
+    .queues([QUEUE])
+}
+
+/// The body of the re-arm task ([`REARM_TASK`]).
 ///
 /// Waits for the job runtime, loads every open row, re-enqueues each one,
-/// then prunes the event ledger. Exposed (rather than kept file-private) so
-/// a Ledger profiling harness can await its completion deterministically
-/// instead of racing a spawned task — same shape as
-/// `autumn_web::test::drain_ready_repository_commit_hooks`'s exposure of the
-/// repository-commit-hooks drain loop for the same reason. Returns the
-/// number of rows successfully re-armed.
+/// then prunes the event ledger. Public so that a test can await it. Returns
+/// the number of rows re-armed.
 pub async fn rearm_pending_now(state: &AppState, service: &Arc<BillingService>) -> usize {
     if !wait_for_job_client(state).await {
         tracing::warn!(
@@ -662,5 +729,25 @@ async fn wait_for_job_client(state: &AppState) -> bool {
             return false;
         }
         tokio::time::sleep(REARM_POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DUNNING, QUEUE, REARM_TASK, job_infos, rearm_task};
+
+    #[test]
+    fn the_retry_job_runs_on_the_billing_queue() {
+        let infos = job_infos();
+        assert!(!infos.is_empty());
+        assert!(infos.iter().all(|info| info.queue == QUEUE));
+    }
+
+    #[test]
+    fn the_rearm_task_drains_the_billing_queue() {
+        let task = rearm_task();
+        assert_eq!(task.name(), REARM_TASK);
+        assert_eq!(task.capability(), DUNNING.into());
+        assert_eq!(task.queue_names(), [QUEUE]);
     }
 }

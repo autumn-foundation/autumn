@@ -468,8 +468,11 @@ fn resolve_project_edge_scan(
 }
 
 /// Run a cargo command, exiting the process on failure.
+///
+/// Records the executables Cargo reports, so [`find_binary`] finds a binary
+/// under `<target>/<triple>/` (#2638).
 fn run_cargo_or_exit(mut cargo: Command) {
-    let status = cargo.status().expect("failed to run cargo build");
+    let status = crate::built_artifact::run_build(&mut cargo).expect("failed to run cargo build");
     if !status.success() {
         eprintln!("\u{2717} Compilation failed");
         std::process::exit(1);
@@ -596,6 +599,18 @@ pub fn run(
     auditable: bool,
 ) {
     eprintln!("\u{1F342} autumn build\n");
+
+    // ── Diesel table width ───────────────────────────────────────────────────
+    // A warning, never a stop: a table over 32 columns forces diesel's
+    // `64-column-tables` feature on the whole graph, which costs every crate
+    // that uses diesel compile time and memory. The app may want that table
+    // anyway; it should know the price. Pure source reading plus one
+    // `cargo metadata`, before the compile so it is seen early.
+    if let Some(warning) =
+        crate::schema::width::format_build_warning(&crate::schema::width::scan(Path::new(".")))
+    {
+        eprintln!("{warning}\n");
+    }
 
     let profile = if debug { "dev" } else { "release" };
 
@@ -911,10 +926,15 @@ fn find_binary(
     let metadata = read_cargo_metadata();
     let cwd = std::env::current_dir().expect("current dir");
 
-    resolve_binary_from_metadata(&metadata, debug, package, bin, &cwd).unwrap_or_else(|error| {
+    let (path, manifest_dir, pkg) = resolve_binary_from_metadata(
+        &metadata, debug, package, bin, &cwd,
+    )
+    .unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
-    })
+    });
+    // `build.target` moves the artifact under `<triple>/`; use Cargo's own path.
+    (crate::built_artifact::prefer_built(path), manifest_dir, pkg)
 }
 
 /// Read `cargo metadata --no-deps` once, exiting with a clear message when the
@@ -1858,9 +1878,9 @@ mod tests {
 
     #[test]
     fn run_cargo_or_exit_succeeds_on_zero_exit() {
-        // `cargo --version` is always available and always exits 0.
+        // `cargo build --help` exits 0 and accepts the added `--message-format`.
         let mut cmd = Command::new("cargo");
-        cmd.arg("--version");
+        cmd.args(["build", "--help"]);
         run_cargo_or_exit(cmd);
     }
 

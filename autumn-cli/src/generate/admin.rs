@@ -473,7 +473,7 @@ fn model_has_uuid_id(model_source: &str, pascal_name: &str) -> bool {
                 .path
                 .segments
                 .last()
-                .is_some_and(|seg| seg.ident == "Uuid")
+                .is_some_and(|seg| seg.ident == "Uuid" || seg.ident == "SqliteUuid")
         })
     })
 }
@@ -614,11 +614,15 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // reintroduce the exact binary-float rounding this field type exists
         // to avoid. Routing it through `Text` leaves the raw decimal string
         // untouched for `rust_decimal`'s exact `FromStr`/`Deserialize`.
+        //
+        // `Time` (issue #3405) is text too: the admin panel has no time kind,
+        // and a `NaiveTime` reads `HH:MM` and `HH:MM:SS` from text.
         FieldKind::String
         | FieldKind::Uuid
         | FieldKind::Enum
         | FieldKind::Decimal { .. }
-        | FieldKind::Slug => "AdminFieldKind::Text",
+        | FieldKind::Slug
+        | FieldKind::Time => "AdminFieldKind::Text",
         // `RichText` (issue #1255) edits as a plain multi-line textarea in the
         // admin panel: the column holds Markdown source, and the admin's
         // record editor is a raw-value editor, not the app-facing form that
@@ -1554,6 +1558,22 @@ mod tests {
     /// Create a minimal project root: Cargo.toml + src/models/<snake>.rs.
     fn project_with_model(snake: &str) -> TempDir {
         project_with_model_source(snake, "// stub\n")
+    }
+
+    #[test]
+    fn sqlite_uuid_id_counts_as_a_uuid_id() {
+        for ty in [
+            "uuid::Uuid",
+            "Uuid",
+            "autumn_web::db::sqlite_types::SqliteUuid",
+        ] {
+            let src = format!("pub struct Post {{ #[id] pub id: {ty}, pub title: String }}");
+            assert!(model_has_uuid_id(&src, "Post"), "{ty}");
+        }
+        assert!(!model_has_uuid_id(
+            "pub struct Post { #[id] pub id: i64 }",
+            "Post"
+        ));
     }
 
     #[test]

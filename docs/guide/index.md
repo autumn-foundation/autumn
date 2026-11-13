@@ -4,8 +4,8 @@ Every guide page, grouped by what you came here to do. Each line says which
 question the page answers — open the one that matches yours.
 
 This page is an index only: it carries no answers of its own, so it can never
-disagree with the page it points at. `scripts/check-docs-guide-index.sh` fails
-the build when a guide page is missing from it, listed twice, or points
+disagree with the page it points at. `cargo xtask check docs-guide-index`
+fails the build when a guide page is missing from it, listed twice, or points
 nowhere.
 
 New to Autumn? Start with the first two entries under "Start here" below.
@@ -51,6 +51,13 @@ Looking for the API reference instead? That is
 - [View Formatting Helpers](format-helpers.md) — `number_to_currency`, `pluralize`, `truncate`, `time_ago_in_words` and friends
 - [Maud Fragment Caching](fragment-caching.md) — caching part of a rendered page
 - [Tabs](tabs.md) — tabbed panels without writing JavaScript
+- [Tooltip](tooltip.md) — accessible hover and focus text, with `interestfor` on Chromium
+- [Drawer and modal sizes](drawer.md) — edge panels, modal sizes and a built-in close button
+- [Accordion and collapsible](accordion.md) — native `<details>` disclosure, no JavaScript
+- [Buttons, loading states and small display widgets](display-widgets.md) — button variants and busy state, button group, spinner, skeleton, progress, meter, separator, kbd, empty state, avatar group, auto-grow textarea
+- [Widget Packs](widget-packs.md) — ship widgets as a plugin: the widget contract, stories, form binding, conformance
+- [Widget Keyboard Core](keyboard.md) — APG arrow keys, typeahead and dismiss for widgets, bound by `data-*`
+- [Popover and Dropdown Menu](popover-and-menu.md) — native popover and APG menu button: anchor positioning, items, keys
 - [Widget Styling](widget-styling.md) — restyling the shipped widgets to match your design
 - [Widget Stories](stories.md) — the `/_stories` gallery for previewing widgets in isolation
 - [Rich Text](rich-text.md) — accepting and safely rendering user-authored markup
@@ -61,6 +68,7 @@ Looking for the API reference instead? That is
 ## Database, models and queries
 
 - [Declarative Schema](declarative-schema.md) — describing tables on the model and letting Autumn derive the DDL
+- [Table Width](table-width.md) — why tables stay at 32 columns or fewer, and the `autumn build` warning
 - [Migrations](migrations.md) — writing, running, and rolling back schema changes
 - [Database Seeding](seeding.md) — populating a fresh database with development data
 - [Repositories and Bulk Operations](repositories.md) — querying, inserting and updating records
@@ -151,6 +159,7 @@ Looking for the API reference instead? That is
 
 - [OpenAPI Spec Generation](openapi.md) — the spec Autumn derives from your handlers, and Swagger UI
 - [Exposing Your API as MCP Tools](mcp.md) — projecting typed endpoints into a Model Context Protocol server
+- [WebMCP](webmcp.md) — routes and forms as tools for the agent in the user's browser, with the user's own session
 - [The Agent Authority Envelope](agent-authority.md) — bounding what an agent-callable handler is allowed to do
 - [Wire Contracts](wire-contracts.md) — failing a caller's build when a request or response field stops matching
 - [Signed Webhook Intake](signed-webhooks.md) — verifying a sender's signature on webhooks arriving in
@@ -198,6 +207,8 @@ Looking for the API reference instead? That is
 - [Dev Request Inspector](dev-inspector.md) — the in-browser view of recent requests
 - [Dev Error Overlay](dev-error-overlay.md) — the error page that shows the failing source line
 - [The Architecture Graph](architecture-graph.md) — `autumn graph impact Post`: what a change touches, as a query
+- [Table Ownership Boundaries](table-ownership.md) — `autumn graph check-boundaries`: fail when one module queries another module's tables
+- [Database Boundaries](database-boundaries.md) — a Postgres schema and role per boundary: the database refuses another boundary's tables
 
 ## Deploying and operating
 
@@ -209,6 +220,7 @@ Looking for the API reference instead? That is
 - [Maintenance Mode](maintenance-mode.md) — taking the app offline deliberately, with probes still answering
 - [Cloud-Native Autumn](cloud-native.md) — containers, Kubernetes, liveness/readiness probes, and the twelve-factor surface
 - [Kubernetes](kubernetes.md) — the generated Helm chart and Kustomize base, and Argo Rollouts or Flagger canaries
+- [Route Groups and Per-Role Mounting](route-groups.md) — one image, different routes on different pods, with `[roles.<name>] mount`
 - [SLOs as Code](slo.md) — `[[slo]]` objectives, burn-rate alerts, a Grafana dashboard, canary analysis, and the deploy bake
 - [Staging Fault Injection](fault-injection.md) — latency and errors on routes, the database, Redis and outbound HTTP, with a burn-rate stop
 - [Server Connection Limits](connection-limits.md) — header-read and idle timeouts, header size and connection caps

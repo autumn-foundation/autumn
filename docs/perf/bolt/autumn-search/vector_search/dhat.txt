@@ -1,0 +1,13 @@
+# Bolt profile: autumn-search/vector_search
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 746,768
+blocks allocated: 5,014
+peak live bytes (whole run): 20,311,256
+
+         bytes      blocks  site
+
+       745,200       5,012  <autumn_search::memory::MemorySearchBackend as autumn_search::backend::SearchBackend>::vector_search::{closure#0}
+         1,536           1  vector_search::main::{closure#3}
+            32           1  <autumn_search::memory::MemorySearchBackend as autumn_search::backend::SearchBackend>::vector_search

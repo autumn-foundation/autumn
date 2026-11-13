@@ -584,6 +584,26 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// The autumn-web store tests keep a copy of the `SQLite` DDL. The copy
+    /// must stay the same as the generator output.
+    #[test]
+    fn sqlite_ddl_matches_the_store_test_copy() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../autumn/src/mail.rs");
+        let Ok(src) = fs::read_to_string(path) else {
+            return; // Packaged crate: the sibling source is absent.
+        };
+        for line in UNSUBSCRIBE_MIGRATION_UP_SQLITE
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("--"))
+        {
+            assert!(
+                src.contains(line.trim_end_matches(';')),
+                "autumn/src/mail.rs test DDL lacks generator line: {line}"
+            );
+        }
+    }
+
     fn project_with_main(main_content: &str) -> TempDir {
         let tmp = TempDir::new().unwrap();
         fs::write(

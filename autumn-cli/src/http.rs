@@ -15,9 +15,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 /// 2026-09-03 hit exactly this on the `autumn setup` step
 /// (runs 33784307158, 33805758766; run 33797353571 in between passed with no
 /// code change in between, confirming it's transient, not a real break).
-/// Three attempts with a short backoff resolve almost all of them before the
-/// user ever sees an error.
-const MAX_ATTEMPTS: u32 = 3;
+/// A release host can also answer 5xx, or drop connections, for a minute or
+/// more. Five attempts with a doubling wait (2, 4, 8, 16 s) ride that out.
+const MAX_ATTEMPTS: u32 = 5;
+/// The first wait. Each next wait doubles.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Download `url` with a progress bar and return the response body as bytes.
@@ -30,7 +31,7 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, reqwest::Error> {
     retry_transient(
         MAX_ATTEMPTS,
         RETRY_DELAY,
-        |e: &reqwest::Error| !e.is_status(),
+        |e: &reqwest::Error| retryable_status(e.status()),
         || fetch_bytes_once(url),
     )
 }
@@ -41,7 +42,7 @@ pub fn fetch_text(url: &str) -> Result<String, reqwest::Error> {
     retry_transient(
         MAX_ATTEMPTS,
         RETRY_DELAY,
-        |e: &reqwest::Error| !e.is_status(),
+        |e: &reqwest::Error| retryable_status(e.status()),
         || fetch_text_once(url),
     )
 }
@@ -78,7 +79,19 @@ fn fetch_text_once(url: &str) -> Result<String, reqwest::Error> {
         .text()
 }
 
-/// Retry `attempt` up to `max_attempts` times, waiting `delay` between tries,
+/// Whether a failed download is worth another try: no status (the request
+/// did not complete), a server error, or a rate limit.
+fn retryable_status(status: Option<reqwest::StatusCode>) -> bool {
+    status.is_none_or(|s| s.is_server_error() || s == reqwest::StatusCode::TOO_MANY_REQUESTS)
+}
+
+/// The wait before retry `n` (1-based): `base`, then double each time.
+fn backoff(base: Duration, n: u32) -> Duration {
+    base.saturating_mul(1 << n.saturating_sub(1).min(16))
+}
+
+/// Retry `attempt` up to `max_attempts` times, waiting [`backoff`] of `delay`
+/// between tries,
 /// as long as `is_retryable` says the error is worth retrying. Returns the
 /// last error once attempts (or retryability) are exhausted.
 ///
@@ -97,8 +110,12 @@ fn retry_transient<T, E: fmt::Display>(
             Err(e) => {
                 let will_retry = n < max_attempts && is_retryable(&e);
                 if will_retry {
-                    eprintln!("  download attempt {n}/{max_attempts} failed ({e}), retrying...");
-                    sleep(delay);
+                    let wait = backoff(delay, n);
+                    eprintln!(
+                        "  download attempt {n}/{max_attempts} failed ({e}), retrying in {}s...",
+                        wait.as_secs()
+                    );
+                    sleep(wait);
                 }
                 last_err = Some(e);
                 if !will_retry {
@@ -114,6 +131,29 @@ fn retry_transient<T, E: fmt::Display>(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn server_errors_and_rate_limits_are_retried() {
+        use reqwest::StatusCode;
+        assert!(retryable_status(None), "a connection error is retried");
+        for code in [500, 502, 503, 504, 429] {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(retryable_status(Some(status)), "{code} is retried");
+        }
+        for code in [400, 401, 403, 404, 410] {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(!retryable_status(Some(status)), "{code} is not retried");
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_each_attempt() {
+        let base = Duration::from_secs(2);
+        let waits: Vec<u64> = (1..MAX_ATTEMPTS)
+            .map(|n| backoff(base, n).as_secs())
+            .collect();
+        assert_eq!(waits, [2, 4, 8, 16]);
+    }
 
     #[test]
     fn retry_transient_recovers_after_transient_failures() {

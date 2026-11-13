@@ -1,0 +1,13 @@
+                                                                   QUERY PLAN                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using idx_posts_published on public.posts  (cost=0.42..7478.90 rows=95069 width=63) (actual time=0.636..129.205 rows=95008 loops=1)
+   Output: id, title, slug, body, published, created_at, updated_at
+   Index Cond: (posts.published = true)
+   Buffers: shared hit=1226 read=653
+ Query Identifier: 1036034988430439631
+ Planning:
+   Buffers: shared hit=158 read=9
+ Planning Time: 2.300 ms
+ Execution Time: 133.282 ms
+(9 rows)
+

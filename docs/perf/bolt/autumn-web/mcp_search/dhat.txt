@@ -1,0 +1,30 @@
+# Bolt profile: autumn-web/mcp_search
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 243,240
+blocks allocated: 1,392
+peak live bytes (whole run): 6,635,842
+
+         bytes      blocks  site
+
+        36,464          26  autumn_web::mcp::json_response
+        33,588         277  autumn_web::mcp::catalog::search
+        29,616         260  autumn_web::mcp::catalog::entry
+        25,280          40  <<serde_json::value::Value as serde_core::de::Deserialize>::deserialize::ValueVisitor as serde_core::de::Visitor>::visit_map
+        17,696          28  autumn_web::mcp::search_tools
+        16,368          20  <serde_json::read::SliceRead as serde_json::read::Read>::parse_str
+        13,808          36  mcp_search::main::{closure#2}::{closure#0}
+        11,806          42  <autumn_web::test::TestResponse>::json
+         9,840          14  <tower::util::map_future::MapFuture as tower_service::Service>::call
+         7,204          18  autumn_web::mcp::tool_ok
+         7,044          84  <autumn_web::security::headers::SecurityHeadersFuture as core::future::future::Future>::poll
+         5,450          68  <tower::util::map_future::MapFuture as tower::util::boxed_clone_sync::CloneService>::clone_box
+         5,316         100  <serde_json::value::Value as serde_core::de::Deserialize>::deserialize
+         4,564          38  <autumn_web::mcp::serve_mcp as axum::handler::Handler>::call::{closure#0}
+         2,608          14  autumn_web::mcp::single_request
+         2,410          48  <autumn_web::security::headers::SecurityHeadersService as tower_service::Service>::call
+         2,370          48  <autumn_web::middleware::method_override::MethodOverrideService as tower_service::Service>::call
+         2,176           2  <axum::middleware::from_fn::FromFn as tower_service::Service>::call
+         1,624          34  <tokio::task::task_local::TaskLocalFuture as core::future::future::Future>::poll
+         1,504          12  <autumn_web::security::trusted_proxies::TrustedProxiesService as tower_service::Service>::call

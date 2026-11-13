@@ -244,9 +244,8 @@
     `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${editor.dataset.socket}`,
   );
 
-  socket.addEventListener("open", () => {
-    if (status) status.textContent = "connected";
-  });
+  // "connected" waits for the snapshot, not the socket's open: until the
+  // snapshot lands the editor is empty and closed.
   socket.addEventListener("close", () => {
     editor.disabled = true;
     if (status) status.textContent = "disconnected — reload to rejoin";
@@ -278,6 +277,7 @@
       editor.disabled = false;
       render();
       renderRoster(message.participants);
+      if (status) status.textContent = "connected";
     } else if (message.type === "ops") {
       for (const op of message.ops) {
         acknowledge(op);

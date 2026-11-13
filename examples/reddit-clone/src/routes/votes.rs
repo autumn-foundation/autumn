@@ -26,6 +26,7 @@ use super::layout::vote_controls;
 
 /// Upvote a post (+1). htmx requests get the updated vote-controls fragment;
 /// a plain form POST (JavaScript off) is redirected back to the post.
+#[secured]
 #[post("/posts/{post_id}/upvote")]
 pub async fn upvote(
     Path(post_id): Path<i64>,
@@ -40,6 +41,7 @@ pub async fn upvote(
 
 /// Downvote a post (-1). htmx requests get the updated vote-controls fragment;
 /// a plain form POST (JavaScript off) is redirected back to the post.
+#[secured]
 #[post("/posts/{post_id}/downvote")]
 pub async fn downvote(
     Path(post_id): Path<i64>,

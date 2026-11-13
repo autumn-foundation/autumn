@@ -172,7 +172,7 @@ let loaded = DataCapsule::read_dir("capsule-42".as_ref(), &signer)?;
 import_capsule(&loaded, registry.capsule_models(), &store).await?;
 ```
 
-`PgCapsuleStore` needs the `db` feature. It is not available with `sqlite`.
+`PgCapsuleStore` needs the `postgres` feature. It is not available with `sqlite`.
 `CapsuleService` does the same steps and includes blobs. To use a different
 `CapsuleStore`, install a `CapsuleService` extension. You can do this on
 SQLite.

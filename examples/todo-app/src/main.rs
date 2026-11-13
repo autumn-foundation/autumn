@@ -103,6 +103,8 @@ async fn main() {
             // browser and JSON to an API client based on `Accept`. Mounted here
             // (not under the `/api` bearer-token scope) so a browser reaches it.
             routes::api::summary,
+            // WebMCP (#2619): a tool for the agent in the user's browser.
+            routes::api::list_for_page,
         ])
         // Tracked background job powering the async CSV export (#1373):
         // enqueue_tracked -> ctx.set_progress -> a polled download link.
@@ -127,6 +129,9 @@ async fn main() {
         // dispatches through the real pipeline above, so the bearer token an
         // agent presents to `/mcp` is enforced by `RequireApiToken`.
         .mount_mcp("/mcp")
+        // Serve the WebMCP tool list. The page script calls each tool with the
+        // user's own session, so the route pipeline applies as for the page.
+        .mount_webmcp()
         // Wire the real DbApiTokenStore once the pool is ready.
         .on_startup(move |state| {
             let deferred = deferred_for_startup.clone();

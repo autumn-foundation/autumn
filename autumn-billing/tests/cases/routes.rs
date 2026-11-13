@@ -214,6 +214,69 @@ async fn concurrent_checkouts_link_one_customer() {
 }
 
 #[tokio::test]
+async fn concurrent_checkouts_create_one_provider_session() {
+    // The yielding store lets both requests pass the live-subscription check
+    // before either reaches the provider.
+    let store = FailingStore::wrap(MemoryBillingStore::shared());
+    let h = support::harness_dyn(support::config(), store, FakeProvider::new(), pinned);
+    h.client.acting_as("7").await;
+    let (a, b) = tokio::join!(
+        h.client.post("/billing/checkout").form("plan=pro").send(),
+        h.client.post("/billing/checkout").form("plan=pro").send(),
+    );
+    let mut statuses = [a.status.as_u16(), b.status.as_u16()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [303, 409], "{} / {}", a.text(), b.text());
+    let loser = if a.status.as_u16() == 409 { &a } else { &b };
+    assert!(loser.text().contains("in progress"), "{}", loser.text());
+    assert_eq!(checkout_calls(&h.provider), 1);
+}
+
+#[tokio::test]
+async fn checkout_retry_after_an_abandoned_session_is_allowed() {
+    let h = build();
+    h.client.acting_as("7").await;
+    for _ in 0..2 {
+        h.client
+            .post("/billing/checkout")
+            .form("plan=pro")
+            .send()
+            .await
+            .assert_status(303);
+    }
+    assert_eq!(checkout_calls(&h.provider), 2);
+}
+
+#[tokio::test]
+async fn a_rejected_checkout_frees_the_slot() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    seed_subscription(&h.store, &customer, SubscriptionStatus::Active).await;
+    h.client.acting_as("7").await;
+    h.client
+        .post("/billing/checkout")
+        .form("plan=pro")
+        .send()
+        .await
+        .assert_status(409);
+    seed_subscription(&h.store, &customer, SubscriptionStatus::Canceled).await;
+    h.client
+        .post("/billing/checkout")
+        .form("plan=pro")
+        .send()
+        .await
+        .assert_status(303);
+}
+
+fn checkout_calls(provider: &FakeProvider) -> usize {
+    provider
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, FakeCall::CreateCheckout(_)))
+        .count()
+}
+
+#[tokio::test]
 async fn checkout_creates_customer_then_session_and_redirects() {
     let h = build();
     h.client.acting_as("7").await;

@@ -7,7 +7,7 @@ use std::time::Duration;
 use autumn_billing::dunning::RETRY_JOB_NAME;
 use autumn_billing::event::{InvoiceSnapshot, SubscriptionSnapshot};
 use autumn_billing::model::{DunningAttempt, DunningState, Invoice, Subscription};
-use autumn_billing::store::CustomerUpsert;
+use autumn_billing::store::{CustomerUpsert, SubscriptionUpsert};
 use autumn_billing::{
     BillingEventKind, BillingStore, Currency, DunningPolicy, InvoiceStatus, MemoryBillingStore,
     Money, PlanId, ProviderId, ReconcileOutcome, SubscriptionStatus,
@@ -17,8 +17,8 @@ use serde_json::json;
 
 use super::support::{
     self, FailingStore, FakeParser, FakeProvider, Harness, PRO_PRICE, RecordingHooks, apply_event,
-    at, checkout_kind, event, harness, harness_dyn, harness_with_hooks, notification_kinds,
-    notification_routes, notifications_for, post_webhook,
+    at, checkout_kind, event, harness, harness_dyn, harness_dyn_hooks, harness_with_hooks,
+    notification_kinds, notification_routes, notifications_for, post_webhook,
 };
 
 const USER: &str = "42";
@@ -254,6 +254,114 @@ async fn same_second_pause_ends_paused_in_either_delivery_order() {
             "{first:?} then {second:?}"
         );
     }
+}
+
+/// Models the other webhook's write landing between this event's read of the
+/// row and its write: `racer` runs before the first `upsert_subscription`.
+async fn race_harness(live: SubscriptionStatus, racer: SubscriptionStatus) -> Harness {
+    race_harness_with_hooks(live, racer, RecordingHooks::new()).await
+}
+
+async fn race_harness_with_hooks(
+    live: SubscriptionStatus,
+    racer: SubscriptionStatus,
+    hooks: Arc<RecordingHooks>,
+) -> Harness {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", live).with_price(PRO_PRICE),
+    );
+    let h = harness_dyn_hooks(support::config(), hooks, store.clone(), provider, |app| {
+        app.with_clock(TickingClock::starting_at(support::base_time()))
+    });
+    inner
+        .upsert_customer(
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(0))
+                .with_user(USER)
+                .with_email("a@example.test"),
+        )
+        .await
+        .unwrap();
+    let rival = inner.clone();
+    store.before(
+        "upsert_subscription",
+        1,
+        Box::new(move || {
+            let rival = rival.clone();
+            Box::pin(async move {
+                rival
+                    .upsert_subscription(
+                        SubscriptionUpsert::new("rival", "local-1", "sub_1", racer, at(100), at(0))
+                            .with_tie_check(),
+                    )
+                    .await
+                    .unwrap();
+            })
+        }),
+    );
+    Harness {
+        client: h.client,
+        store: inner,
+        provider: h.provider,
+    }
+}
+
+#[tokio::test]
+async fn a_racing_same_second_event_for_a_new_subscription_ends_at_the_providers_status() {
+    use SubscriptionStatus::{Active, PastDue};
+    let h = race_harness(Active, PastDue).await;
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(subscription(&h).await.status, Active);
+    assert_eq!(h.provider.fetch_calls(), 1);
+}
+
+#[tokio::test]
+async fn the_hook_gets_the_row_the_tie_replaced_as_its_previous_state() {
+    use SubscriptionStatus::{Active, PastDue};
+    let hooks = RecordingHooks::new();
+    let h = race_harness_with_hooks(Active, PastDue, hooks.clone()).await;
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(hooks.calls(), vec!["subscription_changed:active:past_due"]);
+}
+
+#[tokio::test]
+async fn a_racing_same_second_event_for_an_existing_subscription_ends_at_the_providers_status() {
+    use SubscriptionStatus::{Active, PastDue};
+    let h = race_harness(Active, PastDue).await;
+    // The row exists at an earlier instant before the race starts.
+    h.store
+        .upsert_subscription(SubscriptionUpsert::new(
+            "sub-local",
+            "local-1",
+            "sub_1",
+            Active,
+            at(99),
+            at(0),
+        ))
+        .await
+        .unwrap();
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(subscription(&h).await.status, Active);
+    assert_eq!(h.provider.fetch_calls(), 1);
+}
+
+#[tokio::test]
+async fn a_reported_tie_without_a_lookup_falls_back_to_ranking() {
+    use SubscriptionStatus::{Active, PastDue};
+    let h = race_harness(Active, PastDue).await;
+    h.provider.clear_live_subscription();
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(subscription(&h).await.status, PastDue, "higher rank wins");
 }
 
 #[tokio::test]
@@ -907,4 +1015,110 @@ fn invoice_json_without_the_provider_subscription_id_reads() {
         .remove("provider_subscription_id");
     let read: Invoice = serde_json::from_value(json).unwrap();
     assert_eq!(read.provider_subscription_id, None);
+}
+
+/// An in-flight claim is not an applied event (#3097).
+#[tokio::test]
+async fn in_flight_claim_is_not_acknowledged_as_a_duplicate() {
+    let h = linked_harness().await;
+    let ev = event("evt_1", at(100), sub_changed(SubscriptionStatus::Active));
+    h.store
+        .claim_event(
+            "evt_1",
+            "subscription_changed",
+            at(0),
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    let outcome = apply_event(&h.client, ev.clone()).await.unwrap();
+    assert_eq!(outcome, ReconcileOutcome::InFlight);
+    assert_eq!(h.store.applied_event_count().await.unwrap(), 0);
+    h.store.release_event("evt_1").await.unwrap();
+    let outcome = apply_event(&h.client, ev).await.unwrap();
+    assert!(matches!(outcome, ReconcileOutcome::Applied { .. }));
+}
+
+/// A redelivery during a failing first attempt gets a retryable status, and
+/// the redelivery after the release is applied (#3097).
+#[tokio::test]
+async fn redelivery_during_a_failing_first_attempt_is_retried() {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let h = harness_dyn(
+        support::config(),
+        store.clone(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        |app| {
+            app.with_clock(TickingClock::starting_at(support::base_time()))
+                .routes(notification_routes())
+        },
+    );
+    inner
+        .upsert_customer(
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(0))
+                .with_user(USER)
+                .with_email("a@example.test"),
+        )
+        .await
+        .unwrap();
+    let ev = event("evt_fail", at(200), invoice_failed(1));
+    let body = serde_json::to_vec(&ev).unwrap();
+    // Attempt A fails after mirroring the invoice. Attempt B arrives first.
+    // `FailingStore` runs the hook before the injected failure.
+    store.fail_on("upsert_dunning", 1);
+    let state = h.client.state().clone();
+    let service = autumn_billing::BillingService::require(&state).expect("plugin started");
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let seen_hook = seen.clone();
+    store.before(
+        "upsert_dunning",
+        1,
+        Box::new(move || {
+            let (state, service, ev) = (state.clone(), service.clone(), ev.clone());
+            let seen = seen_hook.clone();
+            Box::pin(async move {
+                let outcome = autumn_billing::reconcile::apply(&state, &service, ev).await;
+                *seen.lock().unwrap() = Some(outcome.unwrap());
+            })
+        }),
+    );
+    let first = post_webhook(&h.client, &body).await;
+    assert_eq!(first.status.as_u16(), 500, "{}", first.text());
+    assert_eq!(
+        seen.lock().unwrap().take(),
+        Some(ReconcileOutcome::InFlight),
+        "the rival must not be acknowledged"
+    );
+    assert_eq!(inner.applied_event_count().await.unwrap(), 0);
+    let third = post_webhook(&h.client, &body).await;
+    assert_eq!(third.status.as_u16(), 200, "{}", third.text());
+    assert_eq!(third.json::<serde_json::Value>()["outcome"], "applied");
+    assert_eq!(inner.applied_event_count().await.unwrap(), 1);
+}
+
+/// The webhook route answers an in-flight event with a retryable 503.
+#[tokio::test]
+async fn webhook_route_answers_an_in_flight_event_with_503() {
+    let h = linked_harness().await;
+    let body = serde_json::to_vec(&event(
+        "evt_1",
+        at(100),
+        sub_changed(SubscriptionStatus::Active),
+    ))
+    .unwrap();
+    h.store
+        .claim_event(
+            "evt_1",
+            "subscription_changed",
+            at(0),
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    let busy = post_webhook(&h.client, &body).await;
+    assert_eq!(busy.status.as_u16(), 503, "{}", busy.text());
+    h.store.release_event("evt_1").await.unwrap();
+    let retry = post_webhook(&h.client, &body).await;
+    assert_eq!(retry.status.as_u16(), 200, "{}", retry.text());
 }

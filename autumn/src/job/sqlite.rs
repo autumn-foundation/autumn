@@ -66,10 +66,11 @@ use super::{
     QueueSlots, ResolvedJobConstraints, build_per_job_settings, collect_declared_queues,
     format_job_admin_time, install_job_client, is_final_attempt, job_admin_backend,
     job_payload_identity, job_unique_key, normalize_queue_name, record_pg_cancel_after_ack,
-    record_pg_lifecycle_ack_result, run_job_handler, should_warn_pin_coverage,
+    record_pg_lifecycle_ack_result, run_claimed_job_handler, should_warn_pin_coverage,
     sql_row_retry_delay_ms, validate_unique_job_names, warn_pinned_uncovered_queues,
 };
 use crate::db::RuntimeConnection;
+use crate::job_tracking::PendingSettle;
 use crate::state::AppState;
 use crate::{AutumnError, AutumnResult};
 
@@ -1266,10 +1267,11 @@ async fn execute_job(
             sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt),
         )
         .await;
-        record_pg_cancel_after_ack(ack, &row.name, &row.id, state);
+        let applied = record_pg_cancel_after_ack(ack, &row.name, &row.id, state);
         // The cancel reuses the ordinary retry-vs-dead-letter decision, so only
         // settle the tracked record when this really was the terminal attempt.
-        if is_final_attempt(&attempt, &max_attempts) {
+        // A rejected ack means another attempt owns the job (issue #2583).
+        if applied && is_final_attempt(&attempt, &max_attempts) {
             crate::job_tracking::settle_tracked_payload_as_failed(
                 state,
                 &payload,
@@ -1297,7 +1299,7 @@ async fn execute_job(
         // worker claim and discard the row until its attempts ran out.
         let error = format!("unknown job '{}'", row.name);
         let ack = ack_dead_letter(pool, now_ms(state), &row.id, worker_id, &error).await;
-        record_pg_lifecycle_ack_result(
+        let applied = record_pg_lifecycle_ack_result(
             ack,
             &row.name,
             &row.id,
@@ -1307,12 +1309,14 @@ async fn execute_job(
             state,
             job_admin,
         );
-        crate::job_tracking::settle_tracked_payload_as_failed(
-            state,
-            &payload,
-            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
-        )
-        .await;
+        if applied {
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &payload,
+                crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+            )
+            .await;
+        }
         return;
     };
 
@@ -1336,8 +1340,8 @@ async fn execute_job(
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
     };
-    let outcome = tracing::Instrument::instrument(
-        run_job_handler(
+    let (outcome, pending) = tracing::Instrument::instrument(
+        run_claimed_job_handler(
             &row.name,
             handler,
             state.clone(),
@@ -1352,6 +1356,7 @@ async fn execute_job(
     heartbeat
         .stop_after(settle_outcome(
             outcome,
+            pending,
             &row,
             pool,
             worker_id,
@@ -1364,9 +1369,12 @@ async fn execute_job(
 }
 
 /// Write a finished attempt back to the queue table and record it.
+///
+/// The tracked record settles only when the ack applies (issue #2583).
 #[allow(clippy::too_many_arguments)]
 async fn settle_outcome(
     outcome: JobExecutionOutcome,
+    pending: PendingSettle,
     row: &SqliteJobRow,
     pool: &SqlitePool,
     worker_id: &str,
@@ -1382,7 +1390,7 @@ async fn settle_outcome(
         }
         JobExecutionOutcome::Succeeded => {
             let ack = ack_success(pool, now_ms(state), &row.id, worker_id).await;
-            record_pg_lifecycle_ack_result(
+            let applied = record_pg_lifecycle_ack_result(
                 ack,
                 &row.name,
                 &row.id,
@@ -1392,6 +1400,9 @@ async fn settle_outcome(
                 state,
                 job_admin,
             );
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
         JobExecutionOutcome::Failed(error) => {
             // One draw for the gauge and the retry UPDATE, so both agree.
@@ -1424,16 +1435,19 @@ async fn settle_outcome(
                 delay_ms,
             )
             .await;
-            record_pg_lifecycle_ack_result(
+            let applied = record_pg_lifecycle_ack_result(
                 ack, &row.name, &row.id, attempt, "failure", lifecycle, state, job_admin,
             );
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
         // A panic dead-letters at once whatever the remaining attempts, as on
         // every other backend.
         JobExecutionOutcome::Panicked(error) => {
             tracing::error!(job = %row.name, error = %error, "sqlite job handler panicked");
             let ack = ack_dead_letter(pool, now_ms(state), &row.id, worker_id, &error).await;
-            record_pg_lifecycle_ack_result(
+            let applied = record_pg_lifecycle_ack_result(
                 ack,
                 &row.name,
                 &row.id,
@@ -1443,6 +1457,9 @@ async fn settle_outcome(
                 state,
                 job_admin,
             );
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
     }
 }
@@ -1579,7 +1596,7 @@ fn install_enqueue_client(
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             sqlite: Some(queue_handle.clone()),
             registry: state.job_registry.clone(),
@@ -1595,7 +1612,7 @@ fn install_enqueue_client(
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             shard_local: false,
         },
     );
@@ -1609,6 +1626,7 @@ fn queue_topology(
     config: &crate::config::JobConfig,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     run_workers: bool,
+    state: &AppState,
 ) -> (QueueSchedule, Arc<QueueSlots>) {
     let (mut schedule, unconfigured) =
         QueueSchedule::effective(&config.queues, &collect_declared_queues(jobs_by_name));
@@ -1623,7 +1641,12 @@ fn queue_topology(
     // Only worker roles claim queues, so a web replica must not warn about
     // queues it will never drain.
     if should_warn_pin_coverage(run_workers, &config.pin) {
-        warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+        warn_pinned_uncovered_queues(
+            &uncovered,
+            &config.pin,
+            schedule.names().is_empty(),
+            &super::background_task_queues(state),
+        );
     }
     let mut limits = QueueLimits::from_config(&config.queues);
     limits.retain_queues(&schedule.names());
@@ -1681,7 +1704,7 @@ pub(super) fn start_runtime(
         })));
     }
 
-    let (schedule, slots) = queue_topology(config, &jobs_by_name, run_workers);
+    let (schedule, slots) = queue_topology(config, &jobs_by_name, run_workers, state);
 
     install_enqueue_client(state, &queue_handle, &job_admin, per_job_settings, config);
 

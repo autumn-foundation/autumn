@@ -682,6 +682,8 @@ mod tests {
                 openapi: None,
                 #[cfg(feature = "mcp")]
                 mcp: None,
+                #[cfg(feature = "webmcp")]
+                webmcp: None,
             },
         )
         .expect("router builds");
@@ -718,6 +720,8 @@ mod tests {
                 openapi: None,
                 #[cfg(feature = "mcp")]
                 mcp: None,
+                #[cfg(feature = "webmcp")]
+                webmcp: None,
             },
         )
         .expect("router builds");

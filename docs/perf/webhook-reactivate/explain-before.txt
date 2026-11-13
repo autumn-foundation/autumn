@@ -1,0 +1,54 @@
+== subscription '1'
+ id | status | consecutive_failures 
+----+--------+----------------------
+ 1  | active |                    0
+(1 row)
+
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Update on public.autumn_webhook_subscriptions (actual rows=0 loops=1)
+   Buffers: shared hit=7
+   ->  Seq Scan on public.autumn_webhook_subscriptions (actual rows=1 loops=1)
+         Output: CASE WHEN (status = 'failed'::text) THEN 'active'::text ELSE status END, 0, ctid
+         Filter: (autumn_webhook_subscriptions.id = '1'::text)
+         Rows Removed by Filter: 199
+         Buffers: shared hit=5
+ Query Identifier: -4787883855328775849
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.087 ms
+ Execution Time: 0.080 ms
+(12 rows)
+
+ wrote_a_row_version 
+---------------------
+ t
+(1 row)
+
+== subscription '7'
+ id | status | consecutive_failures 
+----+--------+----------------------
+ 7  | active |                    3
+(1 row)
+
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Update on public.autumn_webhook_subscriptions (actual rows=0 loops=1)
+   Buffers: shared hit=7
+   ->  Seq Scan on public.autumn_webhook_subscriptions (actual rows=1 loops=1)
+         Output: CASE WHEN (status = 'failed'::text) THEN 'active'::text ELSE status END, 0, ctid
+         Filter: (autumn_webhook_subscriptions.id = '7'::text)
+         Rows Removed by Filter: 199
+         Buffers: shared hit=5
+ Query Identifier: -4787883855328775849
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.069 ms
+ Execution Time: 0.090 ms
+(12 rows)
+
+ wrote_a_row_version 
+---------------------
+ t
+(1 row)
+

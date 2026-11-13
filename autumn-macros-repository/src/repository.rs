@@ -250,6 +250,10 @@ pub(crate) struct RepoConfig {
     /// replica is configured (#971). Use for read-after-write-sensitive
     /// aggregates that cannot tolerate replication lag.
     primary_reads: bool,
+    /// `boundary = Type`: the repository connects as the Postgres role of this
+    /// `Boundary`, through `AppState::pool_for`. Implies `primary_reads`: a read
+    /// replica connects as the owner, not as the role.
+    boundary: Option<syn::Path>,
     /// When `true`, the generated `FromRequestParts` resolves the tenant → shard
     /// automatically so handlers can extract the repository directly without a
     /// [`ShardedDb`] extractor. Requires shards to be configured in `[[database.shards]]`.
@@ -968,6 +972,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut ledger_schema_version: Option<u32> = None;
     let mut ledger_upcast: Option<syn::Path> = None;
     let mut primary_reads = false;
+    let mut boundary: Option<syn::Path> = None;
     let mut sharded = false;
     let mut broadcasts = false;
     let mut broadcast_topic: Option<String> = None;
@@ -1166,6 +1171,9 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else if meta.path.is_ident("no_versioned_record_impl") {
             no_versioned_record_impl = true;
+            Ok(())
+        } else if meta.path.is_ident("boundary") {
+            boundary = Some(meta.value()?.parse()?);
             Ok(())
         } else if meta.path.is_ident("primary_reads") {
             primary_reads = true;
@@ -1386,7 +1394,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), retention(after = \"...\", basis = column, purge_deleted_after = \"...\", batch_size = N, every = \"...\"), position or position(column = \"...\", scope = \"...\"), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, boundary = Type, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), retention(after = \"...\", basis = column, purge_deleted_after = \"...\", batch_size = N, every = \"...\"), position or position(column = \"...\", scope = \"...\"), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -1654,6 +1662,16 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             ));
         }
     }
+    if boundary.is_some() && sharded {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`boundary` cannot be combined with `sharded`: a shard has its own pool, \
+             and a boundary role pool is for the one primary database. Remove one",
+        ));
+    }
+    // A replica connects as the owner, so a boundary repository reads on its
+    // role pool.
+    let primary_reads = primary_reads || boundary.is_some();
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
 
@@ -1680,6 +1698,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         ledger_schema_version: ledger_schema_version.unwrap_or(1),
         ledger_upcast,
         primary_reads,
+        boundary,
         sharded,
         broadcasts,
         broadcast_topic,
@@ -2341,40 +2360,7 @@ fn vh_insert_ts(
     // field on the audit-trail write path of every versioned repository. Output is
     // identical (`autumn/src/version_history.rs` holds the owned and borrowed
     // functions to an exact parity matrix); do not reintroduce a borrow here.
-    let changes_ts = match op {
-        "insert" => quote! {
-            {
-                use ::autumn_web::version_history::VersionedRecord as _;
-                let __vh_json = (#record_expr).version_column_values();
-                let __vh_changes = ::autumn_web::version_history::compute_insert_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
-                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
-                    .unwrap_or_else(|_| "[]".to_string())
-            }
-        },
-        "delete" => quote! {
-            {
-                use ::autumn_web::version_history::VersionedRecord as _;
-                let __vh_json = (#record_expr).version_column_values();
-                let __vh_changes = ::autumn_web::version_history::compute_delete_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
-                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
-                    .unwrap_or_else(|_| "[]".to_string())
-            }
-        },
-        _ => {
-            // "update" — needs before and after
-            let before = before_expr.unwrap_or(record_expr);
-            quote! {
-                {
-                    use ::autumn_web::version_history::VersionedRecord as _;
-                    let __vh_before_json = (#before).version_column_values();
-                    let __vh_after_json = (#record_expr).version_column_values();
-                    let __vh_changes = ::autumn_web::version_history::compute_diff_owned(__vh_before_json, __vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
-                    ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
-                        .unwrap_or_else(|_| "[]".to_string())
-                }
-            }
-        }
-    };
+    let changes_ts = vh_changes_ts(op, record_expr, before_expr, model_ident);
 
     let table_name_ts = table_name_str.to_string();
     let op_variant = version_op_variant(op);
@@ -2432,6 +2418,320 @@ fn vh_insert_ts(
     }
 }
 
+/// The serialized column diff of one version-history row. Expands to a
+/// `String` expression.
+fn vh_changes_ts(
+    op: &str,
+    record_expr: &TokenStream,
+    before_expr: Option<&TokenStream>,
+    model_ident: &proc_macro2::Ident,
+) -> TokenStream {
+    match op {
+        "insert" => quote! {
+            {
+                use ::autumn_web::version_history::VersionedRecord as _;
+                let __vh_json = (#record_expr).version_column_values();
+                let __vh_changes = ::autumn_web::version_history::compute_insert_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                    .unwrap_or_else(|_| "[]".to_string())
+            }
+        },
+        "delete" => quote! {
+            {
+                use ::autumn_web::version_history::VersionedRecord as _;
+                let __vh_json = (#record_expr).version_column_values();
+                let __vh_changes = ::autumn_web::version_history::compute_delete_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                    .unwrap_or_else(|_| "[]".to_string())
+            }
+        },
+        _ => {
+            // "update" — needs before and after
+            let before = before_expr.unwrap_or(record_expr);
+            quote! {
+                {
+                    use ::autumn_web::version_history::VersionedRecord as _;
+                    let __vh_before_json = (#before).version_column_values();
+                    let __vh_after_json = (#record_expr).version_column_values();
+                    let __vh_changes = ::autumn_web::version_history::compute_diff_owned(__vh_before_json, __vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                    ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                        .unwrap_or_else(|_| "[]".to_string())
+                }
+            }
+        }
+    }
+}
+
+/// Collect one row of a bulk write into the batch that [`vh_batch_ts`] opens
+/// (#3345).
+///
+/// Same inputs as [`vh_insert_ts`]. Sends no statement. The flush
+/// ([`ledger_flush_ts`]) runs the checks after the reload, in the order of
+/// [`ledger_append_ts`].
+fn vh_collect_ts(
+    op: &str,
+    with_ctx: bool,
+    record_expr: &TokenStream,
+    before_expr: Option<&TokenStream>,
+    model_ident: &proc_macro2::Ident,
+    ledgered: bool,
+) -> TokenStream {
+    let changes_ts = vh_changes_ts(op, record_expr, before_expr, model_ident);
+    let op_variant = version_op_variant(op);
+    let (actor_ts, request_id_ts) = if with_ctx {
+        (
+            quote! {
+                ctx.actor
+                    .as_deref()
+                    .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR)
+            },
+            quote! { ctx.request_id.as_deref() },
+        )
+    } else {
+        // `vh_batch_ts` reads the ambient actor one time for the batch.
+        (
+            quote! {
+                __vh_actor_scoped
+                    .as_deref()
+                    .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR)
+            },
+            quote! { ::core::option::Option::None::<&str> },
+        )
+    };
+
+    let ledger_push = if ledgered {
+        // #2319: an update or restore must not move the record to another tenant.
+        let before_tenant = if let ("update" | "restore", Some(before)) = (op, before_expr) {
+            quote! {
+                ::core::option::Option::Some(
+                    <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#before)),
+                )
+            }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
+        // #2326: a delete or restore writes no float. Check the reloaded row only
+        // when the row was finite before the write.
+        let before_write = match (op, before_expr) {
+            ("delete", _) => Some(record_expr),
+            ("restore", Some(before)) => Some(before),
+            _ => None,
+        };
+        let check_non_finite = before_write.map_or_else(
+            || quote! { true },
+            |before| quote! { (#before).__autumn_ledger_non_finite_column().is_none() },
+        );
+        // #2326: a delete or restore is valid from the moment it is made.
+        let model_valid_time = !matches!(op, "delete" | "restore");
+        quote! {
+            __lg_batch.push(::autumn_web::ledger::LedgerPending {
+                tenant_id: <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#record_expr)),
+                before_tenant_id: #before_tenant,
+                check_non_finite: #check_non_finite,
+                model_valid_time: #model_valid_time,
+            });
+        }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        {
+            use ::autumn_web::version_history::VersionedRecord as _;
+            __vh_batch.push(::autumn_web::version_history::VersionHistoryRow {
+                tenant_id: (#record_expr).version_tenant_id(),
+                record_id: (#record_expr).version_record_id(),
+                op: #op_variant,
+                actor: #actor_ts,
+                request_id: #request_id_ts,
+                changes_json: #changes_ts,
+            });
+            #ledger_push
+        }
+    }
+}
+
+/// Collect the rows of one bulk write and write them in batches (#3345).
+///
+/// `rows_loop` pushes each row with [`vh_collect_ts`]. Then the repository's
+/// `__autumn_history_flush` ([`history_flush_method_ts`]) writes the batch.
+/// Before, each row sent 5 statements.
+fn vh_batch_ts(with_ctx: bool, conn_ident: &TokenStream, rows_loop: &TokenStream) -> TokenStream {
+    let ambient_actor = if with_ctx {
+        quote! {}
+    } else {
+        quote! {
+            let __vh_actor_scoped: ::core::option::Option<::std::string::String> =
+                ::autumn_web::current::Current::actor();
+        }
+    };
+    quote! {
+        {
+            #ambient_actor
+            let mut __vh_batch: ::std::vec::Vec<::autumn_web::version_history::VersionHistoryRow<'_>> =
+                ::std::vec::Vec::new();
+            #[allow(unused_mut)]
+            let mut __lg_batch: ::std::vec::Vec<::autumn_web::ledger::LedgerPending<'_>> =
+                ::std::vec::Vec::new();
+            #rows_loop
+            Self::__autumn_history_flush(&mut *#conn_ident, __vh_batch, __lg_batch).await?;
+        }
+    }
+}
+
+/// The `__autumn_history_flush` method of a versioned repository (#3345).
+///
+/// Emitted one time for each repository, not at each bulk site, so the
+/// expansion stays small. Writes the history rows in one batch, then the
+/// ledger flush ([`ledger_flush_ts`]) when the repository is ledgered.
+fn history_flush_method_ts(config: &RepoConfig) -> TokenStream {
+    if !config.versioned {
+        return quote! {};
+    }
+    let table_name = &config.table_name;
+    let ledger_flush = if config.ledgered {
+        ledger_flush_ts(table_name, &quote! { conn }, &config.model_name)
+    } else {
+        quote! { let _ = __lg_batch; }
+    };
+    quote! {
+        /// Write the history rows and ledger revisions of one bulk write.
+        /// Generated; not a public API.
+        #[doc(hidden)]
+        pub async fn __autumn_history_flush(
+            conn: &mut ::autumn_web::RuntimeConnection,
+            __vh_batch: ::std::vec::Vec<::autumn_web::version_history::VersionHistoryRow<'_>>,
+            __lg_batch: ::std::vec::Vec<::autumn_web::ledger::LedgerPending<'_>>,
+        ) -> ::autumn_web::AutumnResult<()> {
+            ::autumn_web::version_history::append_version_history_many(
+                &mut *conn,
+                #table_name,
+                &__vh_batch,
+            )
+            .await?;
+            #ledger_flush
+            ::core::result::Result::Ok(())
+        }
+    }
+}
+
+/// The ledger half of [`vh_batch_ts`]: reload the written rows, run the model
+/// checks of [`ledger_append_ts`] for each row, and append all revisions.
+///
+/// `__lg_batch[i]` belongs to `__vh_batch[i]`: [`vh_collect_ts`] pushes both.
+fn ledger_flush_ts(
+    table_name_str: &str,
+    conn_ident: &TokenStream,
+    model_ident: &proc_macro2::Ident,
+) -> TokenStream {
+    let table_ident = format_ident!("{table_name_str}");
+    quote! {
+        if !__lg_batch.is_empty() {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            // Named, not glob-aliased: the sync prelude also brings a `load`.
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            use ::autumn_web::version_history::VersionedRecord as _;
+            // #2326: reload the rows as the write left them, after any trigger.
+            let __lg_ids: ::std::vec::Vec<i64> = __vh_batch.iter().map(|__r| __r.record_id).collect();
+            let mut __lg_rows: ::std::collections::HashMap<i64, #model_ident> =
+                ::std::collections::HashMap::with_capacity(__lg_ids.len());
+            for __lg_chunk in __lg_ids.chunks(::autumn_web::ledger::RELOAD_CHUNK) {
+                let __lg_loaded: ::std::vec::Vec<#model_ident> = #table_ident::table
+                    .filter(#table_ident::id.eq_any(__lg_chunk))
+                    .select(#model_ident::as_select())
+                    .load::<#model_ident>(&mut *#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                for __lg_row in __lg_loaded {
+                    __lg_rows.insert(__lg_row.version_record_id(), __lg_row);
+                }
+            }
+            let mut __lg_appends: ::std::vec::Vec<::autumn_web::ledger::LedgerAppend<'_>> =
+                ::std::vec::Vec::with_capacity(__lg_batch.len());
+            // The model checks of one row. On a failure, an earlier row's
+            // chain guard still comes first, as in the per-row path.
+            let mut __lg_failed: ::core::option::Option<::autumn_web::AutumnError> =
+                ::core::option::Option::None;
+            for (__vh_row, __lg_pending) in __vh_batch.iter().zip(&__lg_batch) {
+                let __lg_checked: ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerAppend<'_>> = (|| {
+                    let __lg_record_id = __vh_row.record_id;
+                    // A missing row would leave a stale snapshot. Refuse.
+                    let ::core::option::Option::Some(__lg_row) = __lg_rows.get(&__lg_record_id) else {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error(
+                                ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                    table: #table_name_str.to_string(),
+                                    record_id: __lg_record_id,
+                                    detail: "the row cannot be read back after the write".to_string(),
+                                },
+                            ),
+                        );
+                    };
+                    if __lg_pending.check_non_finite {
+                        ::autumn_web::ledger::refuse_non_finite(
+                            #table_name_str,
+                            __lg_record_id,
+                            __lg_row.__autumn_ledger_non_finite_column(),
+                        )?;
+                    }
+                    let __lg_tenant_id: ::core::option::Option<&str> = __lg_pending.tenant_id;
+                    if let ::core::option::Option::Some(__lg_before) = __lg_pending.before_tenant_id {
+                        ::autumn_web::ledger::refuse_tenant_change(
+                            #table_name_str,
+                            __lg_record_id,
+                            __lg_before,
+                            __lg_tenant_id,
+                        )?;
+                    }
+                    // #2319: a trigger that rewrote `tenant_id` would split the chain.
+                    ::autumn_web::ledger::refuse_tenant_change(
+                        #table_name_str,
+                        __lg_record_id,
+                        __lg_tenant_id,
+                        <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(__lg_row),
+                    )?;
+                    let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
+                        __lg_row.__autumn_commit_hook_to_value()?;
+                    // #2326: a model past schema version 1 records the version it wrote.
+                    ::autumn_web::ledger::stamp_schema_version(
+                        &mut __lg_snapshot,
+                        <#model_ident as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION,
+                    );
+                    let __lg_valid_from = if __lg_pending.model_valid_time {
+                        <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(__lg_row)
+                    } else {
+                        ::core::option::Option::None
+                    };
+                    ::core::result::Result::Ok(::autumn_web::ledger::LedgerAppend {
+                        table_name: #table_name_str,
+                        tenant_id: __lg_tenant_id,
+                        record_id: __lg_record_id,
+                        op: __vh_row.op,
+                        actor: __vh_row.actor,
+                        request_id: __vh_row.request_id,
+                        snapshot: __lg_snapshot,
+                        valid_from: __lg_valid_from,
+                    })
+                })();
+                match __lg_checked {
+                    ::core::result::Result::Ok(__lg_append) => __lg_appends.push(__lg_append),
+                    ::core::result::Result::Err(__lg_error) => {
+                        __lg_failed = ::core::option::Option::Some(__lg_error);
+                        break;
+                    }
+                }
+            }
+            if let ::core::option::Option::Some(__lg_error) = __lg_failed {
+                return ::core::result::Result::Err(
+                    ::autumn_web::ledger::first_batch_error(&mut *#conn_ident, __lg_appends, __lg_error)
+                        .await,
+                );
+            }
+            ::autumn_web::ledger::append_revisions(&mut *#conn_ident, __lg_appends).await?;
+        }
+    }
+}
+
 /// The [`VersionOp`] variant path for one of the three op strings this macro
 /// passes around (`"insert"`, `"update"`, `"delete"`).
 ///
@@ -2450,9 +2750,9 @@ fn version_op_variant(op: &str) -> TokenStream {
 /// holds shows it reliably. A delete holds its pre-delete load; an insert,
 /// update or restore holds the statement's `RETURNING` row, which does not
 /// show what an AFTER trigger changed. A trigger or a default may change any
-/// column (#2326), `tenant_id` included, so reload the whole row. The bulk
-/// paths share this builder. The reload is one indexed lookup per ledgered
-/// write, in the transaction that already reads the chain head.
+/// column (#2326), `tenant_id` included, so reload the whole row. The reload is
+/// one indexed lookup per ledgered write, in the transaction that already reads
+/// the chain head. The bulk paths reload in batches: see [`ledger_flush_ts`].
 ///
 /// Everything the revision takes from the row is read from this reload: the
 /// snapshot, the tenant check, the non-finite check and the valid time.
@@ -3054,6 +3354,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let table_ident = format_ident!("{table_name}");
     let trait_name = &trait_def.ident;
     let pg_name = format_ident!("Pg{trait_name}");
+    let sqlite_name = format_ident!("Sqlite{trait_name}");
+    let history_flush_method = history_flush_method_ts(&config);
     let new_name = format_ident!("New{model_name}");
     let update_name = format_ident!("Update{model_name}");
     let vis = &trait_def.vis;
@@ -4086,6 +4388,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let trait_name_lit = trait_name.to_string();
         let pg_name_lit = pg_name.to_string();
         let model_name_lit = config.model_name.to_string();
+        let crate_version = autumn_macros_support::graph::crate_version();
         quote! {
             ::autumn_web::reexports::inventory::submit! {
                 ::autumn_web::graph::RepositoryGraphDescriptor {
@@ -4095,6 +4398,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     table: #table_name,
                     api: #graph_api_path,
                     module_path: ::core::module_path!(),
+                    crate_version: #crate_version,
                     file: ::core::file!(),
                     line: ::core::line!(),
                 }
@@ -6180,6 +6484,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     } else {
+        // A boundary repository connects as the role of its boundary. When
+        // roles are set but not this one, there is no pool: the repository
+        // never falls back to the owner role.
+        let pool_init = config.boundary.as_ref().map_or_else(
+            || quote! {
+                let pool = state.pool()
+                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
+                    .clone();
+            },
+            |boundary| quote! {
+                let pool = state.pool_for::<#boundary>()
+                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg(
+                        ::std::format!(
+                            "Database role for boundary `{}` not configured",
+                            <#boundary as ::autumn_web::db_roles::Boundary>::NAME
+                        ),
+                    ))?;
+            },
+        );
         quote! {
             // Extractor: pull pool from AppState (same pattern as Db extractor)
             impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
@@ -6189,9 +6512,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _parts: &mut ::autumn_web::reexports::http::request::Parts,
                     state: &::autumn_web::AppState,
                 ) -> Result<Self, Self::Rejection> {
-                    let pool = state.pool()
-                        .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
-                        .clone();
+                    #pool_init
                     #extractor_init
                 }
             }
@@ -6301,10 +6622,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // traits (see `M2mConnSource`).
         #m2m_conn_source_impl
 
-        /// Postgres implementation of the repository.
+        /// The generated repository.
         #vis struct #pg_name {
             #struct_fields
         }
+
+        ::autumn_web::__sqlite_repository_alias!(#vis #sqlite_name = #pg_name);
 
         #from_request_parts_impl
 
@@ -6332,19 +6655,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
-                // #1379: normalize `#[normalize]` columns on the insert path, before
-                // the `before_create` hook and the DB write, so validators and the
-                // database see the canonical value. Dispatches through the
-                // autoref-specialization probe: the `Yes` arm clones and canonicalizes
-                // only for models whose `New*` implements `Normalize`, and the `No`
-                // arm hands back the caller's borrow unchanged, so a model with no
-                // `#[normalize]` columns pays no clone. `Borrow` unifies the owned and
-                // borrowed arms to `&#new_name`.
+                // #1379: normalize `#[normalize]` columns before the
+                // `before_create` hook and the DB write. Validators and the
+                // database see the canonical value. The probe arms, in order:
+                // 1. `Noop`: returns the borrow. No clone (#2634).
+                // 2. `Yes`: clones and normalizes.
+                // 3. `No`: returns the borrow (a hand-written `New*`).
+                // `Borrow` unifies the arms to `&#new_name`.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeNo as _, SpezNormalizeNoop as _, SpezNormalizeYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert();
                 let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
@@ -6379,35 +6703,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #soft_delete_impl_methods
 
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
-                // #1379: normalize each `#[normalize]` column before the bulk
-                // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
-                // only for `Normalize` `New*` types; the `No` arm hands back the
-                // caller's slice unchanged (no clone) for everything else.
-                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
+                // #1379: normalize each row before the bulk insert. Same probe
+                // as `save`: only the `Yes` arm clones the batch.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _, SpezNormalizeManyYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert_many();
                 let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
 
             async fn save_many_skip_invalid(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)> {
-                // #2586: normalize before the per-row `#[validate]` pass inside
-                // the body, so a skip-invalid import judges — and stores — the
-                // same canonical value `save_many` does.
-                //
-                // #2634: no clone when there is nothing to normalize. `#[model]`
-                // emits `impl Normalize` for the `New*` only when the model
-                // declares `#[normalize]` columns, so the probe's `Yes` arm wins
-                // exactly when normalization can change something; otherwise the
-                // borrowed `No` arm hands the caller's slice back untouched.
+                // #2586: normalize before the per-row `#[validate]` pass, so a
+                // skip-invalid import checks and stores the same canonical
+                // value as `save_many`. Same probe as `save_many`.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _, SpezNormalizeManyYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert_many();
                 let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_skip_invalid_body
             }
@@ -6427,6 +6746,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[allow(clippy::useless_let_if_seq)]
         impl #pg_name {
+            #history_flush_method
             #across_tenants_method
             #for_shard_method
             #find_all_one_shard_helper
@@ -8883,23 +9203,25 @@ fn emit_hooked_insert_many(
         };
 
         let vh_create_many_in_hooks = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "insert",
                 true,
                 &quote! { record },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for (idx, record) in chunk_inserted.iter().enumerate() {
-                    let global_idx = offset + idx;
-                    let ctx = &contexts_ref[global_idx];
-                    #vh
-                }
-            }
+            vh_batch_ts(
+                true,
+                &quote! { conn },
+                &quote! {
+                    for (idx, record) in chunk_inserted.iter().enumerate() {
+                        let global_idx = offset + idx;
+                        let ctx = &contexts_ref[global_idx];
+                        #collect
+                    }
+                },
+            )
         } else {
             quote! {}
         };
@@ -9828,6 +10150,31 @@ fn emit_hooked_mutate_many(
     let update_many_body = {
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
 
+        // `current_rows[i]` is the row before `chunk_updated[i - offset]`.
+        let vh_update_many_in_hooks = if config.versioned {
+            let collect = vh_collect_ts(
+                "update",
+                true,
+                &quote! { record },
+                Some(&quote! { current_rows[global_idx] }),
+                model_name,
+                config.ledgered,
+            );
+            vh_batch_ts(
+                true,
+                &quote! { conn },
+                &quote! {
+                    for (idx, record) in chunk_updated.iter().enumerate() {
+                        let global_idx = offset + idx;
+                        let ctx = &contexts[global_idx];
+                        #collect
+                    }
+                },
+            )
+        } else {
+            quote! {}
+        };
+
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
                 let tenant_id = if self.across_tenants {
@@ -10267,6 +10614,8 @@ fn emit_hooked_mutate_many(
                             chunk_updated.push(updated);
                         }
 
+                        #vh_update_many_in_hooks
+
                         #commit_hooks_enqueue_block
 
                         #cc_after_update_chunk
@@ -10472,21 +10821,23 @@ fn emit_hooked_mutate_many(
         };
 
         let vh_delete_write = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "delete",
                 false,
                 &quote! { r },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for r in &__vh_deleted_records {
-                    #vh
-                }
-            }
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! {
+                    for r in &__vh_deleted_records {
+                        #collect
+                    }
+                },
+            )
         } else {
             quote! {}
         };
@@ -12339,16 +12690,21 @@ fn emit_plain_insert_many(
     let tenant_extra = usize::from(config.tenant_scoped);
 
     let save_many_body = if config.tenant_scoped && config.versioned {
-        let vh_r = vh_insert_ts(
-            table_name,
-            "insert",
-            false,
-            &quote! { r },
-            None,
-            &quote! { conn },
-            model_name,
-            config.ledgered,
-        );
+        let vh_r = vh_batch_ts(false, &quote! { conn }, &{
+            let collect = vh_collect_ts(
+                "insert",
+                false,
+                &quote! { r },
+                None,
+                model_name,
+                config.ledgered,
+            );
+            quote! {
+                for r in &chunk_inserted {
+                    #collect
+                }
+            }
+        });
         quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -12429,9 +12785,7 @@ fn emit_plain_insert_many(
                 }
                         }
                         .map_err(::autumn_web::AutumnError::from)?;
-                        for r in &chunk_inserted {
-                            #vh_r
-                        }
+                        #vh_r
                         #cc_after_insert_chunk
                         inserted.extend(chunk_inserted);
                     }
@@ -12532,16 +12886,21 @@ fn emit_plain_insert_many(
             .await
         }
     } else if config.versioned {
-        let vh_r = vh_insert_ts(
-            table_name,
-            "insert",
-            false,
-            &quote! { r },
-            None,
-            &quote! { conn },
-            model_name,
-            config.ledgered,
-        );
+        let vh_r = vh_batch_ts(false, &quote! { conn }, &{
+            let collect = vh_collect_ts(
+                "insert",
+                false,
+                &quote! { r },
+                None,
+                model_name,
+                config.ledgered,
+            );
+            quote! {
+                for r in &chunk_inserted {
+                    #collect
+                }
+            }
+        });
         quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -12586,9 +12945,7 @@ fn emit_plain_insert_many(
                     },
                 }
                             .map_err(::autumn_web::AutumnError::from)?;
-                        for r in &chunk_inserted {
-                            #vh_r
-                        }
+                        #vh_r
                         #cc_after_insert_chunk
                         inserted.extend(chunk_inserted);
                     }
@@ -12656,17 +13013,19 @@ fn emit_plain_insert_many(
 
     let save_many_skip_invalid_body = {
         let vh_skip_batch = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "insert",
                 false,
                 &quote! { r },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! { for r in &results { #vh } }
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! { for r in &results { #collect } },
+            )
         } else {
             quote! {}
         };
@@ -13005,23 +13364,25 @@ fn emit_plain_mutate_many(
         // trigger firing sees a settled table (#1358).
         let update_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
         let vh_update_pair = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "update",
                 false,
                 &quote! { after_rec },
                 Some(&quote! { before_rec }),
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for after_rec in &chunk_updated {
-                    if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&after_rec.id) {
-                        #vh
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! {
+                    for after_rec in &chunk_updated {
+                        if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&after_rec.id) {
+                            #collect
+                        }
                     }
-                }
-            }
+                },
+            )
         } else {
             quote! {}
         };
@@ -13269,21 +13630,23 @@ fn emit_plain_mutate_many(
             quote! {}
         };
         let vh_delete_write = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "delete",
                 false,
                 &quote! { r },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for r in &__vh_deleted_records {
-                    #vh
-                }
-            }
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! {
+                    for r in &__vh_deleted_records {
+                        #collect
+                    }
+                },
+            )
         } else {
             quote! {}
         };
@@ -13526,35 +13889,35 @@ fn emit_plain_mutate_many(
             }
         };
         let vh_upsert_write = if config.versioned {
-            let vh_ins = vh_insert_ts(
-                table_name,
+            let vh_ins = vh_collect_ts(
                 "insert",
                 false,
                 &quote! { r },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            let vh_upd = vh_insert_ts(
-                table_name,
+            let vh_upd = vh_collect_ts(
                 "update",
                 false,
                 &quote! { r },
                 Some(&quote! { before_rec }),
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for r in &chunk_upserted {
-                    if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&r.id) {
-                        #vh_upd
-                    } else {
-                        #vh_ins
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! {
+                    for r in &chunk_upserted {
+                        if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&r.id) {
+                            #vh_upd
+                        } else {
+                            #vh_ins
+                        }
                     }
-                }
-            }
+                },
+            )
         } else {
             quote! {}
         };
@@ -19651,11 +20014,13 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                     // lookup: a found row is returned unchanged, because this
                     // call inserts nothing.
                     #[allow(unused_imports)]
-                    use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                    use ::autumn_web::normalize::{
+                        SpezNormalizeNo as _, SpezNormalizeNoop as _, SpezNormalizeYes as _,
+                    };
                     #[allow(unused_imports)]
                     use ::std::borrow::Borrow as _;
                     let __autumn_normalized =
-                        ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                        (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert();
                     let new: &#new_name = __autumn_normalized.borrow();
                     #validate_or_found
                     // Step 2: create on the primary with ON CONFLICT DO NOTHING.
@@ -22753,7 +23118,7 @@ mod tests {
         let section = section_between(&generated, "async fn save (", "async fn update (");
 
         let normalize_at = section
-            .find("spez_normalize ()")
+            .find("spez_normalize_insert ()")
             .expect("save must normalize the payload");
         // Pinned to the exact emitted form: `new` is already a `&New*`, so an
         // extra borrow would validate only via `validator`'s blanket
@@ -22849,7 +23214,7 @@ mod tests {
         );
 
         let normalize_at = section
-            .find("spez_normalize_many ()")
+            .find("spez_normalize_insert_many ()")
             .expect("skip-invalid must normalize rows");
         let validate_at = section
             .find("MaybeValidate (__autumn_row)")
@@ -23960,7 +24325,7 @@ mod tests {
             .find("let chunk_inserted =")
             .expect("hooked save_many should insert chunks");
         let history_pos = section
-            .find("append_version_history")
+            .find("Self :: __autumn_history_flush")
             .expect("hooked versioned save_many must write create history");
         let extend_pos = section
             .find("inserted . extend (chunk_inserted)")
@@ -24039,7 +24404,7 @@ mod tests {
             .find("let chunk_inserted =")
             .expect("commit-hook save_many should insert chunks");
         let history_pos = section
-            .find("append_version_history")
+            .find("Self :: __autumn_history_flush")
             .expect("commit-hook versioned save_many must write create history");
         let enqueue_pos = section
             .find("enqueue_repository_commit_hooks_pending_bulk_on_conn")
@@ -24065,7 +24430,7 @@ mod tests {
         let section = &generated[delete_many_pos..];
 
         let history_pos = section
-            .find("append_version_history")
+            .find("Self :: __autumn_history_flush")
             .expect("hooked versioned delete_many must write delete history");
 
         let delete_pos = section
@@ -26790,12 +27155,75 @@ mod tests {
         let generated =
             repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
         assert!(
-            generated.contains("SpezNormalize (new) . spez_normalize ()"),
+            generated.contains("SpezNormalize (new)) . spez_normalize_insert ()"),
             "save must normalize the New input before persisting: {generated}"
         );
+        assert_eq!(
+            generated
+                .matches("SpezNormalize (new)) . spez_normalize_insert_many ()")
+                .count(),
+            2,
+            "save_many and save_many_skip_invalid must normalize each New input: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_insert_probe_checks_noop_marker_first() {
+        // #2692: every `New*` implements `Normalize`, so the clone arm alone
+        // would always win. The probe starts at `&&SpezNormalize` so the
+        // `NormalizeNoop` arm wins first and returns the borrow (#2634).
+        let generated =
+            repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
+        // One `&` lets the clone arm win for every generated `New*`.
+        assert_eq!(
+            generated.matches("SpezNormalize (new)").count(),
+            generated
+                .matches("(&& :: autumn_web :: normalize :: SpezNormalize (new))")
+                .count(),
+            "every insert probe must start at `&&SpezNormalize`: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches("(&& :: autumn_web :: normalize :: SpezNormalize (new))")
+                .count(),
+            3,
+            "save, save_many and save_many_skip_invalid must each probe once: {generated}"
+        );
         assert!(
-            generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
-            "save_many must normalize each New input before persisting: {generated}"
+            generated.contains("SpezNormalizeNoop as _"),
+            "save must import the no-op arm: {generated}"
+        );
+        assert!(
+            generated.contains("SpezNormalizeManyNoop as _"),
+            "save_many must import the no-op arm: {generated}"
+        );
+
+        let generated = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    fn find_or_create_by_slug(&self, slug: String, new: &NewPost);
+                }
+            },
+        )
+        .to_string();
+        let start = generated
+            .find("pub async fn find_or_create_by_slug")
+            .expect("must generate find_or_create_by_slug");
+        assert!(
+            generated[start..].contains("pub async fn preload"),
+            "`preload` must follow, or the section runs to the end: {generated}"
+        );
+        let section = section_between(
+            &generated,
+            "pub async fn find_or_create_by_slug",
+            "pub async fn preload",
+        );
+        assert!(
+            section.contains(
+                "(&& :: autumn_web :: normalize :: SpezNormalize (new)) . spez_normalize_insert ()"
+            ) && section.contains("SpezNormalizeNoop as _"),
+            "find_or_create_by_* must use the three-arm probe: {section}"
         );
     }
 
@@ -27281,7 +27709,7 @@ mod tests {
             .find("let __vh_before_map")
             .expect("versioned upsert_many should snapshot before images for history");
         let history_pos = upsert_section
-            .find("append_version_history")
+            .find("Self :: __autumn_history_flush")
             .expect("versioned upsert_many should write history entries");
 
         assert!(
@@ -27629,6 +28057,72 @@ mod tests {
             generated.contains("save"),
             "non-versioned repository must still generate save"
         );
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_binds_the_role_and_pins_reads() {
+        let tokens: proc_macro2::TokenStream = "Post, boundary = Marketing".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let boundary = config.boundary.expect("boundary is set");
+        assert_eq!(quote! { #boundary }.to_string(), "Marketing");
+        assert!(
+            config.primary_reads,
+            "a replica connects as the owner, so reads stay on the role pool"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_defaults_off() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.boundary.is_none());
+        assert!(!config.primary_reads);
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_accepts_a_path() {
+        let tokens: proc_macro2::TokenStream = "Post, boundary = crate::marketing::Marketing"
+            .parse()
+            .unwrap();
+        assert!(parse_repo_args(tokens).unwrap().boundary.is_some());
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_with_sharded_is_refused() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, boundary = Marketing, sharded".parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("boundary with sharded must be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("boundary") && err.contains("sharded"), "{err}");
+    }
+
+    #[test]
+    fn repository_with_a_boundary_extracts_the_role_pool() {
+        let out = repository_macro(
+            quote! { Post, boundary = Marketing },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(out.contains("pool_for :: < Marketing >"), "{out}");
+        // Reads stay on the role pool: the route is not read from the state.
+        assert!(!out.contains("ReadRoute :: from_state (state)"), "{out}");
+    }
+
+    #[test]
+    fn repository_without_a_boundary_extracts_the_primary_pool() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(!out.contains("pool_for"), "{out}");
+        // Without `primary_reads`, the read route follows the state (replica).
+        assert!(out.contains("ReadRoute :: from_state (state)"), "{out}");
+    }
+
+    #[test]
+    fn parse_repo_args_boundary_needs_a_type() {
+        let tokens: proc_macro2::TokenStream = r#"Post, boundary = "x""#.parse().unwrap();
+        assert!(parse_repo_args(tokens).is_err());
     }
 
     #[test]
@@ -29362,7 +29856,8 @@ mod tests {
             generated
                 .matches("ledger :: stamp_schema_version (")
                 .count(),
-            generated.matches("ledger :: append_revision (").count(),
+            generated.matches("ledger :: append_revision (").count()
+                + generated.matches("ledger :: append_revisions (").count(),
             "every append site stamps its snapshot"
         );
         assert!(
@@ -29435,7 +29930,10 @@ mod tests {
         );
         // Parity, not a floor: the ledger append is emitted from the same token
         // builder as the version-history write, so every history write site must
-        // carry exactly one ledger append. A `>= 2` check would pass with 27 of
+        // carry exactly one ledger append. The bulk sites call one flush, which
+        // holds one of each batched call (#3345); these patterns also match them.
+        // `repository_macro_ledgered_bulk_writes_append_in_batches` checks that
+        // each bulk site collects a ledger row for each history row. A `>= 2` check would pass with 27 of
         // 28 write paths silently unledgered.
         let ledger_appends = generated.matches("ledger :: append_revision").count();
         let history_appends = generated
@@ -29465,6 +29963,87 @@ mod tests {
             assert!(
                 generated.contains(field),
                 "the ledger append must pass `{field}`: {generated}"
+            );
+        }
+    }
+
+    /// The bulk paths batch the history and ledger writes (#3345). A per-row
+    /// call there costs 5 statements for each row.
+    #[test]
+    fn repository_macro_ledgered_bulk_writes_append_in_batches() {
+        let cases = [
+            (
+                quote! { Post, soft_delete, ledgered = true },
+                &[
+                    "async fn save_many (",
+                    "async fn update_many (",
+                    "async fn delete_many (",
+                    "async fn upsert_many (",
+                ][..],
+            ),
+            (
+                quote! { Post, hooks = PostHooks, soft_delete, ledgered = true },
+                &[
+                    "async fn save_many (",
+                    "async fn update_many (",
+                    "async fn delete_many (",
+                ][..],
+            ),
+        ];
+        for (attrs, methods) in cases {
+            let generated =
+                repository_macro(attrs, quote! { pub trait PostRepository {} }).to_string();
+            for method in methods {
+                let body = generated_fn(&generated, method);
+                assert!(
+                    body.contains("Self :: __autumn_history_flush"),
+                    "{method} must flush one batch: {body}"
+                );
+                // Each history row has its ledger row, so no bulk site skips
+                // the ledger.
+                let history_rows = body.matches("__vh_batch . push (").count();
+                assert!(history_rows > 0, "{method} must collect rows: {body}");
+                assert_eq!(
+                    history_rows,
+                    body.matches("__lg_batch . push (").count(),
+                    "{method} must collect a ledger row for each history row: {body}"
+                );
+                for per_row in [
+                    "ledger :: append_revision (",
+                    "version_history :: append_version_history (",
+                ] {
+                    assert!(
+                        !body.contains(per_row),
+                        "{method} must not call `{per_row}`: {body}"
+                    );
+                }
+            }
+        }
+
+        // The batch path of `save_many_skip_invalid` batches. Its per-row
+        // fallback writes one row at a time.
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let body = generated_fn(&generated, "async fn save_many_skip_invalid (");
+        assert!(body.contains("Self :: __autumn_history_flush"), "{body}");
+
+        // The flush is emitted one time, and it sends the batched statements.
+        assert_eq!(
+            generated.matches("async fn __autumn_history_flush").count(),
+            1
+        );
+        let flush = generated_fn(&generated, "async fn __autumn_history_flush");
+        for batched in [
+            "ledger :: append_revisions (",
+            "version_history :: append_version_history_many (",
+            "eq_any (__lg_chunk)",
+        ] {
+            assert!(
+                flush.contains(batched),
+                "the flush must call `{batched}`: {flush}"
             );
         }
     }
@@ -29864,8 +30443,14 @@ mod tests {
             // Raised from 80_000 (#2364): each write descriptor gained a
             // `cascades_into` field, and each repository one name const.
             // Understood and intended: about 400 bytes.
-            ("plain", quote! { Post }, 81_000),
-            ("soft_delete", quote! { Post, soft_delete }, 89_000),
+            // Raised from 81_000 (#2520): the graph descriptor gained a
+            // `crate_version` field, an `option_env!` match of about 170
+            // bytes. Understood and intended.
+            ("plain", quote! { Post }, 82_000),
+            // Raised from 89_000: each repository emits one
+            // `__sqlite_repository_alias!` call (the `Sqlite<Trait>` name),
+            // about 90 bytes. Understood and intended.
+            ("soft_delete", quote! { Post, soft_delete }, 90_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
             // Raised from 95_000 (#2451): each repository publishes its
             // cascade consts. Understood and intended.

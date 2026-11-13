@@ -321,6 +321,12 @@ An app served below a path prefix, such as `[seo] base_url =
 That puts the script and the ARD link under `/shop`. The script finds the MCP
 endpoint relative to its own URL, so its calls go to `/shop/mcp`.
 
+This script calls the public `/mcp` tools through `/mcp`. To give the
+browser agent routes that use the session of the user, see
+[WebMCP](webmcp.md). When the app calls `mount_webmcp()`, this script skips
+each name that the WebMCP projection registers. Then add both head tags to
+the layout.
+
 The tags point at AEO documents, so remove them if you set
 `[aeo] enabled = false`: the script and the catalog then answer `404`.
 

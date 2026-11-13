@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use autumn_web::acme::store::{AcmeStore as _, CertId, FsAcmeStore};
 
 use autumn_web::acme::tenant_domains::CustomDomainTask;
+use autumn_web::custom_domain::CustomDomainStore as _;
 use autumn_web::custom_domain::{
     CustomDomainCertCache, CustomDomainRegistry, DomainIssuer, DomainStatus, DomainVerifier,
     ExpectedIngress, IssuanceLimiter, IssuedCertificate, MemoryCustomDomainStore, ObservedTarget,
@@ -622,7 +623,7 @@ async fn the_issuance_budget_survives_a_restart() {
         Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
     );
     after.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
-    after.hydrate_limiter(NOW + 10);
+    after.hydrate_limiter(NOW + 10).await;
     restarted
         .register("second.clientco.com", "tenant-b", NOW + 10)
         .await
@@ -637,6 +638,130 @@ async fn the_issuance_budget_survives_a_restart() {
     );
     let second = restarted.get("second.clientco.com").unwrap();
     assert_eq!(second.consecutive_failures, 0, "{second:?}");
+    assert!(
+        second.failure_reason.as_deref().unwrap().contains("budget"),
+        "{second:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_offboarded_domains_order_still_counts_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let backing = Arc::new(MemoryCustomDomainStore::new());
+    let store = || Arc::clone(&backing) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>;
+    let registry = Arc::new(CustomDomainRegistry::new(store(), 100));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(8));
+    let issuer = ScriptedIssuer::new(&[]);
+    let verifier = TableVerifier::new(&[
+        ("first.clientco.com", points_here()),
+        ("second.clientco.com", points_here()),
+    ]);
+
+    // First process: one order, then the domain is offboarded.
+    let mut before = task_over(
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+        Arc::clone(&certs),
+        Arc::clone(&verifier) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    before.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
+    registry
+        .register("first.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    before.tick(NOW).await;
+    assert_eq!(issuer.count(), 1);
+    before.offboard("first.clientco.com").await.unwrap();
+    assert!(registry.get("first.clientco.com").is_none());
+
+    // Restart: no record names that order any more.
+    let restarted = Arc::new(CustomDomainRegistry::new(store(), 100));
+    restarted.load().await.unwrap();
+    let mut after = task_over(
+        Arc::clone(&restarted),
+        cache,
+        certs,
+        verifier as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    after.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
+    after.hydrate_limiter(NOW + 10).await;
+    restarted
+        .register("second.clientco.com", "tenant-b", NOW + 10)
+        .await
+        .unwrap();
+
+    after.tick(NOW + 10).await;
+
+    assert_eq!(
+        issuer.count(),
+        1,
+        "an offboarded domain's order must still count after a restart"
+    );
+}
+
+#[tokio::test]
+async fn an_order_from_before_the_ledger_survives_offboarding_and_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let backing = Arc::new(MemoryCustomDomainStore::new());
+    let store = || Arc::clone(&backing) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>;
+    let registry = Arc::new(CustomDomainRegistry::new(store(), 100));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(8));
+    let issuer = ScriptedIssuer::new(&[]);
+    let verifier = TableVerifier::new(&[("second.clientco.com", points_here())]);
+
+    // An old version left an order on the record and no ledger.
+    let record = registry
+        .register("first.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry
+        .record_attempt_for_registration(
+            "first.clientco.com",
+            "tenant-a",
+            record.verification_token.as_deref(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert!(backing.load_attempts().await.unwrap().is_empty());
+
+    // First boot after the upgrade, then the domain goes.
+    let first = task_over(
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+        Arc::clone(&certs),
+        Arc::clone(&verifier) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    first.hydrate_limiter(NOW + 5).await;
+    first.offboard("first.clientco.com").await.unwrap();
+
+    // Second restart: no record names the order.
+    let restarted = Arc::new(CustomDomainRegistry::new(store(), 100));
+    restarted.load().await.unwrap();
+    let mut after = task_over(
+        Arc::clone(&restarted),
+        cache,
+        certs,
+        verifier as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    after.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
+    after.hydrate_limiter(NOW + 10).await;
+    restarted
+        .register("second.clientco.com", "tenant-b", NOW + 10)
+        .await
+        .unwrap();
+    after.tick(NOW + 10).await;
+
+    assert_eq!(issuer.count(), 0, "the old order must still count");
+    let second = restarted.get("second.clientco.com").unwrap();
     assert!(
         second.failure_reason.as_deref().unwrap().contains("budget"),
         "{second:?}"
@@ -1157,6 +1282,48 @@ async fn health_is_up_while_a_failing_domain_still_serves_and_down_once_it_expir
     assert_eq!(indicator.grade(NOW + 86_401).status, HealthStatus::Down);
 }
 
+#[tokio::test]
+async fn health_reports_the_spent_issuance_budget_without_going_down() {
+    use autumn_web::actuator::HealthStatus;
+    use autumn_web::custom_domain::{CustomDomainHealthIndicator, IssuanceLimiter};
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    let limiter = Arc::new(IssuanceLimiter::new(1, 2, 300, 3600));
+    limiter.record_attempt("a.clientco.com", NOW);
+    limiter.record_attempt("b.clientco.com", NOW);
+
+    let indicator = CustomDomainHealthIndicator::new(Arc::clone(&h.registry)).with_limiter(limiter);
+    let graded = indicator.grade(NOW + 10);
+    assert_eq!(
+        graded.status,
+        HealthStatus::Up,
+        "a spent budget is throttling, not an outage"
+    );
+    let budget = &graded.details["issuance_budget"];
+    assert_eq!(budget["global_used"], 2);
+    assert_eq!(budget["global_limit"], 2);
+    assert_eq!(budget["per_domain_limit"], 1);
+    assert_eq!(budget["global_retry_after_secs"], 3590);
+    let at_limit = serde_json::to_string(&budget["domains_at_limit"]).unwrap();
+    assert!(at_limit.contains("a.clientco.com"), "{at_limit}");
+}
+
+#[tokio::test]
+async fn health_has_no_budget_detail_without_a_limiter() {
+    use autumn_web::custom_domain::CustomDomainHealthIndicator;
+
+    let h = harness(
+        TableVerifier::new(&[]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    let graded = CustomDomainHealthIndicator::new(Arc::clone(&h.registry)).grade(NOW);
+    assert!(!graded.details.contains_key("issuance_budget"));
+}
+
 // ── Regressions found by review ──────────────────────────────────────────
 
 #[tokio::test]
@@ -1602,13 +1769,12 @@ impl autumn_web::acme::store::AcmeStore for PauseAfterSaveStore {
 }
 
 #[tokio::test]
-async fn a_stale_order_does_not_delete_the_successors_certificate() {
-    // The certificate id is a hash of the hostname, so a stale order and its
-    // successor address the same file. Losing the activation race, the stale
-    // order discards "its" certificate — but by then the successor has written
-    // its own pair over that id, and deleting it leaves that tenant recorded
-    // active with nothing on disk, failing every handshake until a repair
-    // order completes.
+async fn an_offboard_waits_for_an_install_that_is_saving() {
+    // An install saves its certificate and then activates the record. An
+    // offboard of the same hostname that landed between the two would leave a
+    // certificate on disk for a hostname nobody owns, or delete the one the
+    // install is about to record as active. Both writes sit inside the
+    // hostname's gate, so the offboard waits for the whole install.
     let dir = tempfile::tempdir().unwrap();
     let fs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
     let (certs, reached) = PauseAfterSaveStore::new(Arc::clone(&fs));
@@ -1617,90 +1783,54 @@ async fn a_stale_order_does_not_delete_the_successors_certificate() {
         100,
     ));
     registry.load().await.unwrap();
-    let task = Arc::new(CustomDomainTask {
-        registry: Arc::clone(&registry),
-        cache: Arc::new(CustomDomainCertCache::new(8)),
-        certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
-        provider: autumn_web::tls::crypto_provider(),
-        verifier: owner_publishes(
-            TableVerifier::new(&[("app.clientco.com", points_here())]),
-            &registry,
-        ),
-        issuer: ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
-        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
-        ingress: ExpectedIngress {
-            hostname: Some("ingress.myapp.com".to_owned()),
-            ipv4: vec!["203.0.113.10".parse().unwrap()],
-            ipv6: vec![],
-        },
-        renew_before_days: 30,
-        reporter: Arc::new(|_| {}),
-        recovery: None,
-        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
-            "test-replica",
-        )),
-        leadership_degraded: false,
-        cert_store_paths: Some(Arc::clone(&fs)),
-        retained_cert_ids: HashSet::new(),
-    });
+    let cache = Arc::new(CustomDomainCertCache::new(8));
+    let mut task = task_over(
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+        Arc::clone(&fs),
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    task.certs = Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>;
+    let task = Arc::new(task);
     registry
         .register("app.clientco.com", "tenant-a", NOW)
         .await
         .unwrap();
 
-    // tenant-a's order writes its certificate and suspends before activating.
     let tick = tokio::spawn({
         let task = Arc::clone(&task);
         async move { task.tick(NOW).await }
     });
-    reached
+    within(reached)
         .await
         .expect("the fixture must report reaching its pause");
 
-    // The hostname changes hands, and the successor installs its own pair over
-    // the same certificate id and activates it.
-    assert!(registry.remove("app.clientco.com").await.unwrap());
-    registry
-        .register("app.clientco.com", "tenant-b", NOW + 1)
-        .await
-        .unwrap();
-    let cert_id = CertId::from_domains(&["app.clientco.com".to_owned()]);
-    fs.save_cert(
-        &cert_id,
-        &autumn_web::acme::store::StoredCert {
-            chain_pem: RENEWED_CERT_PEM.to_owned(),
-            key_pem: RENEWED_KEY_PEM.to_owned(),
-        },
-    )
-    .await
-    .unwrap();
-    registry
-        .record_verified("app.clientco.com", NOW + 1)
-        .await
-        .unwrap();
+    let offboard = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.offboard("app.clientco.com").await }
+    });
+    settle().await;
     assert!(
-        registry
-            .record_active_for("app.clientco.com", "tenant-b", NOW + 2, NOW + 90 * 86_400)
-            .await
-            .unwrap()
+        !offboard.is_finished(),
+        "the offboard must wait for the install that holds the hostname"
     );
-
-    // The stale order now resumes and loses the activation race.
-    certs.release();
-    tick.await.unwrap();
-
-    let stored = fs
-        .load_cert(&cert_id)
+    // The gate is per hostname: another tenant's domain is not held up.
+    within(registry.register("other.clientco.com", "tenant-b", NOW))
         .await
-        .unwrap()
-        .expect("the successor's certificate must survive the stale order's cleanup");
-    assert_eq!(
-        stored.chain_pem, RENEWED_CERT_PEM,
-        "and must still be the successor's own pair, not the stale order's"
+        .unwrap();
+
+    certs.release();
+    within(tick).await.unwrap();
+    assert!(within(offboard).await.unwrap().unwrap());
+
+    let cert_id = CertId::from_domains(&["app.clientco.com".to_owned()]);
+    assert!(registry.get("app.clientco.com").is_none());
+    assert!(
+        fs.load_cert(&cert_id).await.unwrap().is_none(),
+        "the offboard must delete the certificate the install just wrote"
     );
-    let record = registry.get("app.clientco.com").unwrap();
-    assert_eq!(record.tenant, "tenant-b");
-    assert_eq!(record.status, DomainStatus::Active);
+    assert!(cache.get("app.clientco.com").is_none());
 }
 
 #[tokio::test]
@@ -2419,6 +2549,64 @@ async fn the_prune_refuses_to_run_when_the_registry_never_hydrated() {
         task.prune(NOW + 86_400, false).await.is_err(),
         "an index that never loaded would treat every certificate as an orphan"
     );
+    assert!(
+        store
+            .load_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing may be deleted"
+    );
+}
+
+#[tokio::test]
+async fn the_prune_refuses_to_run_after_a_partial_load() {
+    use autumn_web::custom_domain::{CustomDomainPruner as _, FsCustomDomainStore};
+
+    // A skipped record leaves its tenant's certificate looking orphaned.
+    let dir = tempfile::tempdir().unwrap();
+    let domains = dir.path().join("domains");
+    std::fs::create_dir_all(&domains).unwrap();
+    std::fs::write(domains.join("bad.json"), b"{").unwrap();
+    let store = Arc::new(FsAcmeStore::new(dir.path().join("acme"), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(FsCustomDomainStore::new(&domains)),
+        10,
+    ));
+    registry.load().await.unwrap();
+    store
+        .save_cert(
+            &CertId::from_domains(&["app.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let task = CustomDomainTask {
+        registry,
+        cache: Arc::new(CustomDomainCertCache::new(4)),
+        certs: Arc::clone(&store) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        provider: autumn_web::tls::crypto_provider(),
+        verifier: TableVerifier::new(&[]),
+        issuer: ScriptedIssuer::new(&[]),
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        ingress: ExpectedIngress::default(),
+        renew_before_days: 30,
+        reporter: Arc::new(|_| {}),
+        recovery: None,
+        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
+            "test-replica",
+        )),
+        leadership_degraded: false,
+        cert_store_paths: Some(store.clone()),
+        retained_cert_ids: HashSet::new(),
+    };
+
+    let err = task.prune(NOW + 86_400, false).await.unwrap_err();
+    assert!(err.contains("bad.json"), "{err}");
     assert!(
         store
             .load_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
@@ -3250,4 +3438,808 @@ async fn pending_domains_are_verified_at_the_same_time() {
         let domain = h.registry.get(&format!("app{i}.clientco.com")).unwrap();
         assert!(domain.failure_reason.is_some(), "app{i} was not verified");
     }
+}
+
+// ── One tenant's slow DNS cannot stall the others (#2650) ────────────────
+
+/// Names starting `slow` never answer; every other name points here.
+struct BlackholeVerifier;
+
+impl DomainVerifier for BlackholeVerifier {
+    fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+        Box::pin(async move {
+            if hostname.starts_with("slow") {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            points_here()
+        })
+    }
+    fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+        Box::pin(async { ObservedTxt::Values(Vec::new()) })
+    }
+}
+
+/// Registers `host` as active with a stored certificate inside its renew window.
+async fn register_due_for_renewal(h: &Harness, host: &str) {
+    h.task
+        .certs
+        .save_cert(
+            &CertId::from_domains(&[host.to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    h.registry.register(host, "tenant-b", NOW).await.unwrap();
+    h.registry
+        .record_active(host, NOW, NOW + 10 * 86_400)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_verifications_do_not_delay_issuance_or_renewal() {
+    let budget = std::time::Duration::from_secs(5);
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..64 {
+        h.registry
+            .register(&format!("slow{i}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("ready.clientco.com", "tenant-c", NOW)
+        .await
+        .unwrap();
+    h.registry
+        .record_verified("ready.clientco.com", NOW)
+        .await
+        .unwrap();
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    let started = tokio::time::Instant::now();
+    h.task.tick_within(NOW, budget).await;
+
+    assert!(
+        started.elapsed() <= budget + std::time::Duration::from_millis(100),
+        "the pass took {:?}",
+        started.elapsed()
+    );
+    let calls = issuer.calls();
+    assert!(
+        calls.contains(&"ready.clientco.com".to_owned()),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&"renew.clientco.com".to_owned()),
+        "{calls:?}"
+    );
+}
+
+/// Hangs `slow*` names while `hang` is set; every name points here.
+struct GateVerifier(std::sync::atomic::AtomicBool);
+
+impl DomainVerifier for GateVerifier {
+    fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+        Box::pin(async move {
+            if hostname.starts_with("slow") && self.0.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            points_here()
+        })
+    }
+    fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+        Box::pin(async { ObservedTxt::Values(Vec::new()) })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_domain_is_verified_once_its_backoff_ends() {
+    let gate = Arc::new(GateVerifier(std::sync::atomic::AtomicBool::new(true)));
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::clone(&gate) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("slow.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task
+        .tick_within(NOW, std::time::Duration::from_secs(5))
+        .await;
+    let record = h.registry.get("slow.clientco.com").unwrap();
+    assert_eq!(
+        record.failure_reason.as_deref(),
+        Some("the DNS lookup timed out")
+    );
+    assert!(h.registry.pending_verification(NOW + 1).is_empty());
+
+    gate.0.store(false, Ordering::SeqCst);
+    h.task.tick(NOW + 1_000).await;
+    assert_eq!(issuer.calls(), vec!["slow.clientco.com".to_owned()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_names_that_sort_first_cannot_starve_a_healthy_domain() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..32 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    // Tick one times out the first 16 and cuts off the rest. Those 16 are in
+    // backoff on tick two, so the next 16 take the slots and the healthy
+    // domain is reached.
+    let budget = std::time::Duration::from_secs(30);
+    h.task.tick_within(NOW, budget).await;
+    h.task.tick_within(NOW + 100, budget).await;
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
+    let timed_out = h.registry.get("slow00.clientco.com").unwrap();
+    assert_eq!(
+        timed_out.failure_reason.as_deref(),
+        Some("the DNS lookup timed out")
+    );
+}
+
+/// A short poll interval gives verification a budget below the per-domain
+/// limit. Cut-off checks must still back off, or the same names return first.
+#[tokio::test(start_paused = true)]
+async fn a_short_budget_still_lets_hung_names_yield_their_slots() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..20 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    let budget = std::time::Duration::from_secs(12);
+    h.task.tick_within(NOW, budget).await;
+    h.task.tick_within(NOW + 100, budget).await;
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
+}
+
+/// A store whose saves take `delay` once armed.
+#[derive(Debug, Default)]
+struct SlowSaveStore {
+    inner: MemoryCustomDomainStore,
+    delay_secs: AtomicUsize,
+}
+
+impl autumn_web::custom_domain::CustomDomainStore for SlowSaveStore {
+    fn load_all(
+        &self,
+    ) -> autumn_web::custom_domain::StoreFuture<
+        '_,
+        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+    > {
+        self.inner.load_all()
+    }
+
+    fn save<'a>(
+        &'a self,
+        domain: &'a autumn_web::custom_domain::CustomDomain,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            let secs = self.delay_secs.load(Ordering::SeqCst) as u64;
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            self.inner.save(domain).await
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.delete(hostname)
+    }
+}
+
+/// The budget limits DNS work only. A save that starts must finish, or a
+/// detached write could land after a newer record or an offboard.
+#[tokio::test(start_paused = true)]
+async fn the_budget_never_cancels_a_registry_write() {
+    let store = Arc::new(SlowSaveStore::default());
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    registry.load().await.unwrap();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    let task = CustomDomainTask {
+        registry: Arc::clone(&registry),
+        verifier: owner_publishes(Arc::new(BlackholeVerifier), &registry),
+        ..h.task
+    };
+
+    // DNS answers at once. The save then outlasts the 2 second budget.
+    store.delay_secs.store(3, Ordering::SeqCst);
+    task.tick_within(NOW, std::time::Duration::from_secs(2))
+        .await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_ne!(
+        record.status,
+        DomainStatus::PendingDns,
+        "the save was cut off"
+    );
+}
+
+/// A slow ingress lookup says nothing about the tenant's domain. The renewal
+/// goes ahead, as it does for any other slow lookup.
+#[tokio::test(start_paused = true)]
+async fn a_slow_ingress_lookup_does_not_skip_a_renewal() {
+    struct SlowIngress;
+    impl DomainVerifier for SlowIngress {
+        fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+            Box::pin(async move {
+                if hostname == "ingress.myapp.com" {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+                points_here()
+            })
+        }
+        fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+            Box::pin(async { ObservedTxt::Values(Vec::new()) })
+        }
+    }
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let mut h = harness(
+        Arc::new(SlowIngress),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.ingress = ExpectedIngress {
+        hostname: Some("ingress.myapp.com".to_owned()),
+        ipv4: vec![],
+        ipv6: vec![],
+    };
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    h.task.tick(NOW).await;
+
+    assert_eq!(issuer.calls(), vec!["renew.clientco.com".to_owned()]);
+    let record = h.registry.get("renew.clientco.com").unwrap();
+    assert!(
+        record.failure_reason.is_none(),
+        "{:?}",
+        record.failure_reason
+    );
+}
+
+/// With a tiny backoff, a failure expires before the next tick. Repeat
+/// offenders must still go behind domains that have not failed.
+#[tokio::test(start_paused = true)]
+async fn domains_that_keep_timing_out_go_behind_the_rest() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness_with_limiter(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        IssuanceLimiter::new(5, 50, 1, 1),
+    );
+    for i in 0..64 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    let budget = std::time::Duration::from_secs(30);
+    for tick in 0..4 {
+        h.task.tick_within(NOW + tick * 100, budget).await;
+    }
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_renewal_rechecks_run_at_the_same_time_and_time_out() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..32 {
+        register_due_for_renewal(&h, &format!("slow{i}.clientco.com")).await;
+    }
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    let started = tokio::time::Instant::now();
+    h.task.tick(NOW).await;
+
+    assert!(
+        started.elapsed() <= std::time::Duration::from_secs(30),
+        "the pass took {:?}",
+        started.elapsed()
+    );
+    // A re-check that times out is a blip: the renewal goes ahead.
+    assert_eq!(issuer.calls().len(), 33);
+    assert!(
+        h.registry
+            .get("slow0.clientco.com")
+            .unwrap()
+            .failure_reason
+            .is_none()
+    );
+}
+
+// ── Certificate and cache writes sit inside the hostname gate (#2649) ────
+
+/// Time for a spawned task to run into whatever it will block on.
+async fn settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// Bounds a wait, so a lost wake-up fails the test instead of hanging it.
+async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        .await
+        .expect("timed out: the code under test never reached the seam, or deadlocked")
+}
+
+/// Suspends the first caller of [`hit`](Self::hit) until the test releases it.
+#[derive(Debug)]
+struct PausePoint {
+    armed: Mutex<
+        Option<(
+            futures::channel::oneshot::Sender<()>,
+            futures::channel::oneshot::Receiver<()>,
+        )>,
+    >,
+}
+
+/// The test's side of a [`PausePoint`].
+struct PauseHandle {
+    entered: futures::channel::oneshot::Receiver<()>,
+    release: futures::channel::oneshot::Sender<()>,
+}
+
+impl PausePoint {
+    fn armed() -> (Arc<Self>, PauseHandle) {
+        let (entered_tx, entered) = futures::channel::oneshot::channel();
+        let (release, release_rx) = futures::channel::oneshot::channel();
+        (
+            Arc::new(Self {
+                armed: Mutex::new(Some((entered_tx, release_rx))),
+            }),
+            PauseHandle { entered, release },
+        )
+    }
+
+    fn disarmed() -> Arc<Self> {
+        Arc::new(Self {
+            armed: Mutex::new(None),
+        })
+    }
+
+    async fn hit(&self) {
+        let armed = self.armed.lock().unwrap().take();
+        if let Some((entered, release)) = armed {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+}
+
+impl PauseHandle {
+    /// Wait for the code under test to reach the pause.
+    async fn reached(&mut self) {
+        within(&mut self.entered)
+            .await
+            .expect("the pause point was dropped unreached");
+    }
+
+    fn release(self) {
+        let _ = self.release.send(());
+    }
+}
+
+/// A certificate store that can suspend a load after it read, or a delete
+/// before it removes anything.
+#[derive(Debug)]
+struct HookedCertStore {
+    inner: Arc<FsAcmeStore>,
+    after_load: Arc<PausePoint>,
+    before_delete: Arc<PausePoint>,
+}
+
+impl HookedCertStore {
+    fn new(
+        inner: Arc<FsAcmeStore>,
+        after_load: Arc<PausePoint>,
+        before_delete: Arc<PausePoint>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            after_load,
+            before_delete,
+        })
+    }
+}
+
+impl autumn_web::acme::store::AcmeStore for HookedCertStore {
+    fn load_account(
+        &self,
+    ) -> autumn_web::acme::store::StoreFuture<'_, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.load_account()
+    }
+
+    fn save_account<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.save_account(data)
+    }
+
+    fn load_cert<'a>(
+        &'a self,
+        id: &'a CertId,
+    ) -> autumn_web::acme::store::StoreFuture<
+        'a,
+        std::io::Result<Option<autumn_web::acme::store::StoredCert>>,
+    > {
+        Box::pin(async move {
+            let loaded = self.inner.load_cert(id).await;
+            self.after_load.hit().await;
+            loaded
+        })
+    }
+
+    fn save_cert<'a>(
+        &'a self,
+        id: &'a CertId,
+        cert: &'a autumn_web::acme::store::StoredCert,
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.save_cert(id, cert)
+    }
+
+    fn delete_cert<'a>(
+        &'a self,
+        id: &'a CertId,
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            self.before_delete.hit().await;
+            self.inner.delete_cert(id).await
+        })
+    }
+}
+
+/// An issuer whose first certificate is the original fixture and every later
+/// one the renewed fixture.
+#[derive(Debug, Default)]
+struct RenewingOnSecondOrder(AtomicUsize);
+
+impl DomainIssuer for RenewingOnSecondOrder {
+    fn issue<'a>(&'a self, _hostname: &'a str) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
+        Box::pin(async move {
+            let (chain_pem, key_pem) = if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                (CERT_PEM, KEY_PEM)
+            } else {
+                (RENEWED_CERT_PEM, RENEWED_KEY_PEM)
+            };
+            Ok(IssuedCertificate {
+                chain_pem: chain_pem.to_owned(),
+                key_pem: key_pem.to_owned(),
+            })
+        })
+    }
+}
+
+fn cert_id(host: &str) -> CertId {
+    CertId::from_domains(&[host.to_owned()])
+}
+
+/// Register `host` for `tenant` and drive it through one tick, as a successor
+/// to whoever held the hostname before.
+async fn successor_issues(task: Arc<CustomDomainTask>, host: &str, tenant: &str) {
+    task.registry.register(host, tenant, NOW + 1).await.unwrap();
+    task.tick(NOW + 1).await;
+}
+
+#[tokio::test]
+async fn a_certificate_written_during_the_prunes_deletion_pass_survives() {
+    // A stale pair sits at the id of a hostname with no record. The prune
+    // decides it is an orphan; while it deletes, that hostname registers and
+    // completes an issuance. The new certificate must not be swept up with the
+    // stale one.
+    let mut h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    let (before_delete, mut pause) = PausePoint::armed();
+    h.task.certs =
+        HookedCertStore::new(Arc::clone(&h.store), PausePoint::disarmed(), before_delete);
+    h.store
+        .save_cert(
+            &cert_id("app.clientco.com"),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: RENEWED_CERT_PEM.to_owned(),
+                key_pem: RENEWED_KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let store = Arc::clone(&h.store);
+    let registry = Arc::clone(&h.registry);
+    let task = Arc::new(h.task);
+
+    let prune = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { autumn_web::custom_domain::CustomDomainPruner::prune(&*task, NOW, false).await }
+    });
+    pause.reached().await;
+    let successor = tokio::spawn(successor_issues(
+        Arc::clone(&task),
+        "app.clientco.com",
+        "tenant-b",
+    ));
+    settle().await;
+    pause.release();
+
+    assert_eq!(within(prune).await.unwrap().unwrap(), 1);
+    within(successor).await.unwrap();
+
+    let stored = store
+        .load_cert(&cert_id("app.clientco.com"))
+        .await
+        .unwrap()
+        .expect("the certificate issued during the prune must survive it");
+    assert_eq!(stored.chain_pem, CERT_PEM);
+    assert_eq!(
+        registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn an_offboard_leaves_the_certificate_of_a_successor_that_issues_during_it() {
+    // The offboard has removed the record and is deleting the certificate. A
+    // successor registers and completes a CA issuance in that window. Its
+    // certificate and cache entry must both be intact afterwards.
+    let mut h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+    let (before_delete, mut pause) = PausePoint::armed();
+    h.task.certs =
+        HookedCertStore::new(Arc::clone(&h.store), PausePoint::disarmed(), before_delete);
+    let store = Arc::clone(&h.store);
+    let registry = Arc::clone(&h.registry);
+    let cache = Arc::clone(&h.cache);
+    let task = Arc::new(h.task);
+
+    let offboard = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.offboard("app.clientco.com").await }
+    });
+    pause.reached().await;
+    let successor = tokio::spawn(successor_issues(
+        Arc::clone(&task),
+        "app.clientco.com",
+        "tenant-b",
+    ));
+    settle().await;
+    pause.release();
+
+    assert!(within(offboard).await.unwrap().unwrap());
+    within(successor).await.unwrap();
+
+    assert!(
+        store
+            .load_cert(&cert_id("app.clientco.com"))
+            .await
+            .unwrap()
+            .is_some(),
+        "the successor's certificate must survive the offboard"
+    );
+    assert!(cache.get("app.clientco.com").is_some());
+    assert_eq!(
+        registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn a_successor_is_never_active_with_nothing_durable_after_a_slow_tenant_teardown() {
+    // A slow `delete_cert` is pending while the hostname is taken again. Once
+    // everything settles, "active" must mean "the certificate is on disk".
+    let mut h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+    let (before_delete, mut pause) = PausePoint::armed();
+    h.task.certs =
+        HookedCertStore::new(Arc::clone(&h.store), PausePoint::disarmed(), before_delete);
+    let store = Arc::clone(&h.store);
+    let registry = Arc::clone(&h.registry);
+    let task = Arc::new(h.task);
+
+    let teardown = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.offboard_tenant("tenant-a").await }
+    });
+    pause.reached().await;
+    let successor = tokio::spawn(successor_issues(
+        Arc::clone(&task),
+        "app.clientco.com",
+        "tenant-b",
+    ));
+    settle().await;
+    pause.release();
+
+    assert_eq!(within(teardown).await.unwrap().unwrap(), 1);
+    within(successor).await.unwrap();
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.status, DomainStatus::Active);
+    assert!(
+        store
+            .load_cert(&cert_id("app.clientco.com"))
+            .await
+            .unwrap()
+            .is_some(),
+        "an active domain must have a durable certificate"
+    );
+}
+
+#[tokio::test]
+async fn a_cold_load_that_overlaps_a_renewal_cannot_publish_the_older_pair() {
+    // A warm loads the stored pair and is preempted; a renewal then persists
+    // and caches the new pair. The warm must not publish its stale copy over
+    // it: the registry already records the new `notAfter`, so nothing would
+    // schedule a repair.
+    let mut h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::new(RenewingOnSecondOrder::default()) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+    // Inside the renew window, so the next tick orders again.
+    h.registry
+        .record_active("app.clientco.com", NOW, NOW + 10 * 86_400)
+        .await
+        .unwrap();
+    h.cache.remove("app.clientco.com");
+    let (after_load, mut pause) = PausePoint::armed();
+    h.task.certs = HookedCertStore::new(Arc::clone(&h.store), after_load, PausePoint::disarmed());
+    let cache = Arc::clone(&h.cache);
+    let task = Arc::new(h.task);
+
+    let warm = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.warm("app.clientco.com").await }
+    });
+    pause.reached().await;
+    let renewal = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.tick(NOW).await }
+    });
+    settle().await;
+    pause.release();
+
+    within(warm).await.unwrap();
+    within(renewal).await.unwrap();
+
+    let renewed = autumn_web::tls::certified_key_from_pem(
+        RENEWED_CERT_PEM.as_bytes(),
+        RENEWED_KEY_PEM.as_bytes(),
+        &autumn_web::tls::crypto_provider(),
+    )
+    .unwrap();
+    let served = cache.get("app.clientco.com").unwrap();
+    assert_eq!(
+        served.cert[0], renewed.cert[0],
+        "the cache must hold the renewed certificate"
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_prune_counts_what_a_real_one_deletes() {
+    let h = harness(
+        TableVerifier::new(&[]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    for host in ["gone-a.clientco.com", "gone-b.clientco.com"] {
+        h.store
+            .save_cert(
+                &cert_id(host),
+                &autumn_web::acme::store::StoredCert {
+                    chain_pem: CERT_PEM.to_owned(),
+                    key_pem: KEY_PEM.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let prune =
+        |dry_run| autumn_web::custom_domain::CustomDomainPruner::prune(&h.task, NOW, dry_run);
+
+    assert_eq!(prune(true).await.unwrap(), 2);
+    assert_eq!(
+        h.store.list_certs().unwrap().len(),
+        2,
+        "a dry run deletes nothing"
+    );
+    assert_eq!(prune(false).await.unwrap(), 2);
+    assert!(h.store.list_certs().unwrap().is_empty());
+    assert_eq!(prune(false).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_prune_does_not_count_a_certificate_it_could_not_delete() {
+    let mut h = harness(
+        TableVerifier::new(&[]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    h.task.certs = Arc::new(UndeletableCertStore(Arc::clone(&h.store)))
+        as Arc<dyn autumn_web::acme::store::AcmeStore>;
+    h.store
+        .save_cert(
+            &cert_id("gone.clientco.com"),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let removed = autumn_web::custom_domain::CustomDomainPruner::prune(&h.task, NOW, false)
+        .await
+        .unwrap();
+
+    assert_eq!(removed, 0);
+    assert_eq!(h.store.list_certs().unwrap().len(), 1);
 }

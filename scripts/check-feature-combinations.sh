@@ -8,8 +8,10 @@
 #             This builds with default features, once with NO features, then once
 #             per individual feature.  Linear in the number of features; ~31 builds
 #             after exclusions.
-#   Phase B — curated real-world combinations (5 fixed combos that mirror documented
-#             user journeys: db-only API, minimal web, mail, storage+db, telemetry).
+#   Phase B — curated real-world combinations (fixed combos that mirror documented
+#             user journeys: db-only API on each backend, minimal web, mail,
+#             storage+db, telemetry, and each feature that needs `db`, on each
+#             backend).
 #             Each is a discrete `cargo check` so a failure names the exact
 #             --features string.
 #
@@ -18,6 +20,11 @@
 #   managed-pg-bundled  — embeds Postgres binaries into the binary (~150 MB, huge)
 #   system-tests        — pulls chromiumoxide (headless Chromium)
 #   test-support        — dev-only; pulls testcontainers
+#
+# Also excluded from Phase A: the features that enable `db` but no backend.
+# Alone, each stops at autumn-web's `compile_error!` (#2605): db, seed, repl,
+# offline-sync, ledger-profile. Phase A still builds `postgres` and `sqlite`
+# alone. Phase B builds each of these with a backend.
 #
 # telemetry-otlp requires protoc; it is swept in Phase A and also verified in
 # Phase B. Install protoc with:
@@ -57,7 +64,7 @@ echo ""
 # Excluded: system-dep / build-cost heavy features (see header comment).
 
 echo "==> Phase A: each-feature sweep (default features + no features + each feature alone)"
-echo "    Excluded: managed-pg,managed-pg-bundled,system-tests,test-support"
+echo "    Excluded: managed-pg,managed-pg-bundled,system-tests,test-support,db,seed,repl,offline-sync,ledger-profile"
 echo ""
 
 # Tee Phase A output to a temp file so we can extract the actual build count
@@ -69,7 +76,7 @@ if ! cargo hack check \
   -p autumn-web \
   --no-dev-deps \
   --each-feature \
-  --exclude-features managed-pg-bundled,managed-pg,system-tests,test-support \
+  --exclude-features managed-pg-bundled,managed-pg,system-tests,test-support,db,seed,repl,offline-sync,ledger-profile \
   2>&1 | tee "$PHASE_A_LOG"; then
   echo ""
   echo "::error::Phase A failed — a feature did not compile in isolation."
@@ -92,11 +99,17 @@ echo ""
 # Failures print the exact --features string so the break is immediately actionable.
 
 CURATED_COMBOS=(
-  "db"
+  "db,postgres"
+  "db,sqlite"
   "mail"
-  "storage,db"
+  "storage,db,postgres"
   "maud,htmx"
   "telemetry-otlp"
+  # A feature that needs `db`, with each backend (#2605).
+  "seed,repl,ledger-profile,postgres"
+  "seed,repl,ledger-profile,sqlite"
+  "offline-sync,reporting,postgres"
+  "offline-sync,reporting,sqlite"
 )
 
 echo "==> Phase B: curated real-world feature combinations"

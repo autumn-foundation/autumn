@@ -255,6 +255,11 @@ to a CDN SDK and would have to be maintained per vendor. The reference host in
 `autumn-edge` is a worked specification instead: a shim author has one file to
 read and a protocol to implement.
 
+(Amended on 2026-10-22 by [ADR-0024](0024-web-standard-js-edge-host.md).
+A *vendor binding* is still rejected. A host written to the web-standard
+APIs only — `WebAssembly` and the Fetch API — is not one, and Autumn now
+ships one, with `autumn edge bundle`.)
+
 ## Amendment (2026-10-05): a runnable reference edge node
 
 The decision above says "Autumn ships no reverse proxy and no origin fetch".

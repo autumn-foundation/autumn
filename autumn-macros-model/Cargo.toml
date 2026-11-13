@@ -15,15 +15,13 @@ categories = ["web-programming", "web-programming::http-server"]
 proc-macro = true
 
 [dependencies]
-autumn-macros-support = { version = "0.8.0", path = "../autumn-macros-support" }
+autumn-macros-support = { version = "0.10.0", path = "../autumn-macros-support" }
+# The schema-name rule, and the `#[references]` action values, come from the IR.
+autumn-schema-core = { version = "0.10.0", path = "../autumn-schema-core" }
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
 proc-macro-crate.workspace = true
-
-[dev-dependencies]
-# Parity test: the `#[references]` action values match the schema IR.
-autumn-schema-core = { path = "../autumn-schema-core" }
 
 [lints]
 workspace = true

@@ -64,6 +64,16 @@ env:
   # are correct; only the stack they run on is marginal. Raise it explicitly
   # rather than leaving the suite one variant away from aborting.
   RUST_MIN_STACK: 8388608
+  # kache S3 remote (.github/actions/kache). Unset variables keep the GitHub
+  # Actions cache. The write token is mapped only on a protected ref, so only
+  # pushes to trunk and trunk-dev (and scheduled runs) add to the store.
+  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET || secrets.AUTUMN_KACHE_S3_BUCKET }}
+  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT || secrets.AUTUMN_KACHE_S3_ENDPOINT }}
+  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION || secrets.AUTUMN_KACHE_S3_REGION }}
+  AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID: ${{ secrets.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
+  AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY: ${{ secrets.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY }}
+  AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || '' }}
+  AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || '' }}
 
 # Minimal token scope: every job only needs to read the repo. Artifact upload
 # and step-summary writes do not require additional permissions.
@@ -78,7 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Build CLI
         run: cargo build -p autumn-cli
@@ -96,7 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Run cold-start measurement unit tests
         # `shell: bash` enables `pipefail` on the runner, so a failing
@@ -132,7 +142,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Build CLI
         run: cargo build -p autumn-cli
@@ -145,6 +155,11 @@ jobs:
         # the `tee` pipeline.
         shell: bash
         run: |
+          # Time the plain toolchain, not the CI cache. The driver already
+          # blanks RUSTC_WRAPPER for its cold build; the CMake compiler
+          # launchers kache-action exports would still wrap C builds.
+          export RUSTC_WRAPPER=""
+          unset CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
           export AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           export AUTUMN_BENCH_RUST_VERSION="$(rustc --version)"
           RUNS="${{ inputs.runs || '3' }}"

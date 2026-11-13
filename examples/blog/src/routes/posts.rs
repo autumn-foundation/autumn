@@ -74,7 +74,8 @@ pub fn layout_with_seo(
 ) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html lang=(locale.tag()) {
+        // Light-only page colors: pin the light scheme (#3396).
+        html lang=(locale.tag()) data-theme="light" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
@@ -434,7 +435,7 @@ pub async fn show(
 /// Admin dashboard — list all posts (published and drafts).
 #[get("/admin")]
 pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
-    let all_posts = Post::all(&mut db).await?;
+    let all_posts = Post::all_listings(&mut db).await?;
     let published_count = all_posts.iter().filter(|p| p.published).count();
     let draft_count = all_posts.len() - published_count;
 

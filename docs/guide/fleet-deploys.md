@@ -156,9 +156,10 @@ backends — it is the same configuration whether your replicas are containers o
 
 This is the row people miss, because on one host it is invisible.
 
-Every fleet host runs the **combined** process role — one env file and one unit
-go to every host, and nothing in `autumn deploy` sets a per-host role — so all
-three hosts serve HTTP *and* run job workers *and* run the cron scheduler. That
+With `[deploy] hosts`, every fleet host runs the **combined** process role —
+one env file and one unit go to every host — so all three hosts serve HTTP
+*and* run job workers *and* run the cron scheduler. (To split the roles, see
+[Per-group roles](#per-group-roles).) That
 is the right shape for a fleet, but only once the queue those workers drain is
 shared. `[jobs] backend` defaults to `local`, which is an in-process queue. Three
 hosts on the default are three independent queues:
@@ -224,13 +225,67 @@ for a single-host config, where the defaults are right.
 That warning is the **only** place this surfaces. It comes from the rollout
 driver, after the preflight report — so `deploy check`, `deploy plan` and
 `deploy status` say nothing about it, and neither does `autumn doctor` (its
-`process_role_backend` check only fires for a split `web`/`worker` role, and
-fleet hosts are all combined-role). Sessions and rate limiting get no warning at
+`process_role_backend` check fails only on an unknown role or a split
+`web`/`worker` role, and `[deploy] hosts` fleet hosts are all combined-role).
+A [group](#per-group-roles) with a split role is different: preflight fails it
+on `local`. Sessions and rate limiting get no warning at
 all. Work the table above yourself rather than waiting to be told.
 
 Full backend comparison, delivery semantics and the migration note are in the
 [jobs guide](jobs.md#backend-selection-autumntoml); don't duplicate them, read
 them there.
+
+---
+
+## Per-group roles
+
+`[[deploy.groups]]` puts a [role](jobs.md) on a group of hosts. Use it
+instead of `[deploy] hosts`:
+
+```toml
+[jobs]
+backend = "postgres"      # a split role needs a queue every host shares
+
+[[deploy.groups]]
+role = "web"
+hosts = ["10.0.0.1", "10.0.0.2"]
+
+[[deploy.groups]]
+role = "worker"
+hosts = ["10.0.0.3"]
+
+[[deploy.groups]]
+role = "critical"         # a [roles.critical] preset
+hosts = ["10.0.0.4"]
+```
+
+- Each release dir gets a `role.env` file with `AUTUMN_ROLE=<role>`. The
+  slot unit reads it after the shared env file, so the role wins. The release
+  and the shared env file are the same on every host.
+- `autumn deploy rollback` starts the old release with the `role.env` it
+  shipped with. A release from before the groups has no `role.env`, so it runs
+  the role in its own `autumn.toml`.
+- The rollout order is the group order, then the host order. The migration
+  runs on the first host, as with `hosts`.
+- A role is a built-in role (`combined`, `web`, `worker`) or a
+  `[roles.<name>]` preset in `autumn.toml`.
+- `[[deploy.groups]]` is not allowed together with `host` or `hosts`. A host
+  is in one group only. A group needs a role and at least one host.
+- `--only` keeps the role of each selected host.
+
+`deploy up` and `deploy check` have a `deploy_group_roles` preflight row. It
+fails when `autumn.toml` does not declare a group role. It also fails when a
+split role uses the `local` jobs backend. The hosts then do not share a queue,
+and the app does not boot. A rollback does not run this row.
+
+`deploy plan` lists each host with its role. The `manifest_roles` row of
+`autumn doctor` warns on the same problems.
+
+`AUTUMN_DEPLOY__HOST` or `AUTUMN_DEPLOY__HOSTS` replaces the groups. The
+groups have no env override.
+
+A worker host still binds the app port for `/live`, `/ready` and the actuator.
+Keep it out of your load balancer's pool for user traffic.
 
 ---
 
@@ -740,9 +795,9 @@ Stated plainly so you can plan around it:
   moving traffic weights at *your* load balancer — see
   [Canary deploys](staged-deploys.md#canary-deploys). `autumn deploy` does not
   shift traffic between hosts.
-- **No per-role fleets.** Every host in `[deploy] hosts` gets the same release,
-  the same env file and the same unit. Splitting web and worker roles across
-  different host lists is not expressible today.
+- **One release for every role.** Every host gets the same release and the
+  same env file. Only the `role.env` file of a
+  [group](#per-group-roles) host differs.
 - **No migration rollback.** As above.
 - **No media provisioning on a fleet.** `[media.mediamtx]` is refused for a
   multi-host deploy — host media provisioning has no teardown path. Deploy media

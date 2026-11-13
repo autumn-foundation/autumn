@@ -335,7 +335,7 @@ impl StaticFileLayer {
     /// The default is [`LocalIsrCoordinator`], which is suitable for
     /// single-replica and development deployments. For multi-replica
     /// deployments sharing a writable `dist/` volume, supply a distributed
-    /// backend such as `PostgresIsrCoordinator` (feature `db`) to prevent
+    /// backend such as `PostgresIsrCoordinator` (feature `postgres`) to prevent
     /// stampede writes.
     ///
     /// # Example (production multi-replica)
@@ -352,6 +352,17 @@ impl StaticFileLayer {
     #[must_use]
     pub fn with_isr_coordinator(mut self, coordinator: Arc<dyn IsrCoordinator>) -> Self {
         self.isr_coordinator = coordinator;
+        self
+    }
+
+    /// Keep only the manifest pages whose URL path `keep` admits (#3544). A
+    /// role with `mount` drops the pages of its unmounted route groups.
+    #[must_use]
+    pub(crate) fn retain_routes(mut self, keep: &dyn Fn(&str) -> bool) -> Self {
+        let mut manifest = (*self.manifest).clone();
+        manifest.routes.retain(|path, _| keep(path));
+        self.isr_state = Arc::new(build_isr_state(&manifest));
+        self.manifest = Arc::new(manifest);
         self
     }
 

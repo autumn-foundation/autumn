@@ -1,0 +1,15 @@
+{
+  "service": "catalog",
+  "name": "get_token",
+  "endpoint_ident": "get_token_endpoint",
+  "krate": "mesh-catalog",
+  "method": "GET",
+  "path": "/token",
+  "request_type": "NoBody",
+  "response_type": "NoBody",
+  "has_body": false,
+  "request_list": false,
+  "response_list": false,
+  "handler": "get_token",
+  "response_path": "NoBody"
+}

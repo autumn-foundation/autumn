@@ -51,13 +51,13 @@ autumn dev --show-config
 `autumn dev` uses the `dev` profile automatically in debug builds
 (`AUTUMN_ENV=dev` is the default).
 
-On trunk-dev (unreleased — not in the published 0.5.0 CLI) there is also
+Since 0.6.0 there is also
 `autumn serve` for a non-watch local daemon: `autumn serve --daemon` /
 `stop` / `status` / `restart`, `--release`, and `--bundled-pg` for a managed
-local Postgres. See `docs/guide/daemon.md`. Do not suggest it to users on the
-published 0.5.0 CLI.
+local Postgres. See `docs/guide/daemon.md`. Do not suggest it to users on a 0.5.x
+CLI.
 
-**The daemon runs natively on Windows** (unreleased — trunk-dev, issue #1639).
+**The daemon runs natively on Windows** (0.8.0, issue #1639).
 It was Tier 2/WSL2 until then; do not tell a user to reach for WSL2 for it any
 more. The contract is the same on both platforms — single-instance guard,
 readiness-gated start, `serve.addr` discovery file, `status` exit codes 0/3 —
@@ -99,7 +99,7 @@ If `autumn-admin-plugin` is installed:
 If the `mail` feature is enabled:
 | `http://localhost:3000/_autumn/mail` | Mailer preview (dev profile only) |
 
-## Dependency findings on startup (unreleased — trunk-dev, issue #1633)
+## Dependency findings on startup (0.8.0, issue #1633)
 
 `autumn dev` reports dependency-policy findings once per run, and only the ones
 that turn CI red — findings the app's `deny.toml` **denies**:
@@ -126,13 +126,13 @@ appear a second or two after the server does.
 recompiles + restarts automatically. Tailwind CSS is rebuilt on template
 changes.
 
-On trunk-dev (unreleased — not in the published 0.5.0 CLI), when a rebuild
+Since 0.6.0, when a rebuild
 **fails** the browser renders the compiler diagnostics as a full-screen overlay
 (under a strict nonce-based CSP) instead of leaving a blank or stale page; it
 clears on the next successful rebuild (issue #1115). See
 `docs/guide/dev-error-overlay.md`.
 
-### On Windows (unreleased — trunk-dev, issue #1616)
+### On Windows (0.8.0, issue #1616)
 
 Two behaviours differ, both deliberate:
 

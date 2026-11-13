@@ -3,7 +3,7 @@
 # to RUN must exist in the CLI.
 #
 # WHY THIS EXISTS: the corpus already gates its *links*
-# (`scripts/check-docs-links.sh`) and its *rustdoc* intra-doc links
+# (`xtask/src/docs/links.rs`) and its *rustdoc* intra-doc links
 # (`scripts/check-docs.sh`), so a reader can no longer be sent to a page that
 # does not exist. Nothing checked the other thing readers copy off a page: the
 # command. `autumn-cli` carries 51 top-level commands and 174 command paths,
@@ -270,10 +270,11 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Kept in Python for the same reason as scripts/check-docs-links.sh: brace
-# matching over clap derive input and code-fence stripping are both work that
-# bash renders unreadable, and python3 is already a dependency of
-# scripts/check-plugin-freshness.sh and scripts/check-docs-links.sh.
+# Kept in Python because brace matching over clap derive input and
+# code-fence stripping are both work that bash renders unreadable, and
+# python3 is already a dependency of scripts/check-plugin-freshness.sh.
+# (The link gate it once shared that reasoning with is now Rust:
+# xtask/src/docs/links.rs.)
 run_py() {
   python3 - "$@" <<'PYEOF'
 import tomllib
@@ -2448,7 +2449,7 @@ FLAG_WAIVER = re.compile(
 # `.claude/skills/` is a SECOND skill tree, not a copy of `skills/`: the agent
 # machinery loads a `SKILL.md` there by name, which is why
 # `check-docs-orphans.sh` seeds both trees as reader entry surfaces and why
-# `check-docs-routes.sh` reads both for `/actuator/…` paths. `run-autumn` lives
+# `xtask/src/docs/routes.rs` reads both for `/actuator/…` paths. `run-autumn` lives
 # only here, and its SKILL.md is copy-and-run text end to end — `autumn seed
 # --package`, `autumn routes --bin`, `AUTUMN_SERVER__PORT`,
 # `AUTUMN_DATABASE__URL`, `-p autumn-web`. It already carries
@@ -2483,7 +2484,7 @@ def in_scope(path):
 
 # `readme = "…"` in a crate manifest names that crate's crates.io landing page.
 # It is reader-facing by PUBLICATION rather than by where it sits in the tree,
-# which is why a directory-shaped rule cannot reach it — `check-docs-routes.sh`
+# which is why a directory-shaped rule cannot reach it — `xtask/src/docs/routes.rs`
 # reads the manifests for exactly this reason, and its argument carries here
 # unchanged: these pages carry `autumn_web::…` paths and `AUTUMN_*` variables
 # the same way they carry `/actuator/…` URLs.

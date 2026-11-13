@@ -153,7 +153,8 @@ fn api_scaffold_main_rs_has_json_handler_and_routes() {
 }
 
 /// AC #4: the `--api` `Cargo.toml` drops the `maud` dependency and disables the
-/// view features (`default-features = false`), keeping `db` so migrations work.
+/// view features (`default-features = false`), keeping `db` and `postgres` so
+/// migrations work.
 #[test]
 fn api_scaffold_cargo_toml_drops_view_stack() {
     let (_tmp, project) = api_project("api-cargo-app", &[]);
@@ -170,6 +171,11 @@ fn api_scaffold_cargo_toml_drops_view_stack() {
     assert!(
         cargo.contains("\"db\""),
         "--api Cargo.toml must keep the db feature so migrations compile:\n{cargo}"
+    );
+    // `db` has no backend of its own (#2605).
+    assert!(
+        cargo.contains("\"postgres\""),
+        "--api Cargo.toml must enable the postgres backend:\n{cargo}"
     );
 }
 

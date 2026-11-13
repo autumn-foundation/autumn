@@ -68,6 +68,13 @@
 #[allow(unused_extern_crates)]
 extern crate self as autumn_web;
 
+// `db` is the shared layer only (#2605). It needs a backend.
+#[cfg(all(feature = "db", not(any(feature = "postgres", feature = "sqlite"))))]
+compile_error!(
+    "autumn-web: the `db` feature needs a database backend. Enable `postgres` \
+     (a default feature) or `sqlite`."
+);
+
 /// Typed accessible UI primitives (issue #1706).
 ///
 /// These make the accessible name a compile-time obligation. See [`mod@a11y`].
@@ -82,12 +89,14 @@ pub mod aggregate;
 /// indicators, 5xx-rate spikes, scheduled-task failures) to the app's
 /// configured mailer and signed outbound webhook behind `[alerts]` config —
 /// with zero application code. See [`mod@alerts`].
+#[cfg_attr(not(feature = "alerts"), path = "alerts_off.rs")]
 pub mod alerts;
 pub mod app;
 pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod background;
 pub mod backoff;
 // The build-time agent authority envelope (issue #1691): what an MCP-exposed,
 // agent-operable handler is allowed to do -- which models it writes, whether it
@@ -157,6 +166,7 @@ mod media_type;
 pub mod classify;
 // A plain comment, not a doc comment: the module carries its own `//!` docs
 // and an outer `///` here would be merged with them.
+#[cfg(feature = "cluster")]
 pub mod cluster;
 #[cfg(feature = "collab")]
 pub mod collab;
@@ -176,12 +186,18 @@ pub mod constela;
 pub mod cost;
 pub mod credentials;
 pub mod current;
+#[cfg(feature = "custom-domains")]
 pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
 #[cfg(feature = "db")]
 pub(crate) mod db_ping;
+pub mod db_roles;
 pub(crate) mod db_url;
+// `fleet` has its own `//!` docs. An outer doc here would make rustdoc
+// resolve its links in this module.
+#[cfg(feature = "db")]
+pub mod fleet;
 pub mod fleet_layout;
 // Request deadlines (issue #3058). The module carries its own `//!` docs.
 pub mod deadline;
@@ -222,11 +238,13 @@ pub mod feed;
 pub mod format;
 pub mod health;
 pub(crate) mod health_cache;
+pub mod hedge;
 #[cfg(feature = "db")]
 pub mod hooks;
 pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;
+#[cfg_attr(not(feature = "idempotency"), path = "idempotency_off.rs")]
 pub mod idempotency;
 pub mod range;
 // NOTE: no outer `///` doc here. rustdoc MERGES an outer doc on a `pub mod`
@@ -272,6 +290,7 @@ pub mod plugin;
 /// name the type, match its variants, or write the signature of a function
 /// that forwards it.
 pub use router::RouterBuildError;
+#[cfg(feature = "plugin-conformance")]
 pub mod plugin_conformance;
 pub mod plugin_contract;
 #[cfg(feature = "plugin-sandbox")]
@@ -389,6 +408,7 @@ macro_rules! embed_locales {
 pub mod system_info;
 pub use plugin::{Plugin, Plugins};
 
+pub(crate) mod route_group;
 pub mod route_listing;
 
 /// In-place upgrades: swap a running app to a new binary without dropping
@@ -397,6 +417,7 @@ pub mod route_listing;
 /// Documented from inside the module: the `SIGUSR2` handoff protocol, the
 /// designated live-state block, and the compile-checked
 /// [`state_migration!`](crate::state_migration) between shapes.
+#[cfg_attr(not(feature = "upgrade"), path = "upgrade_off.rs")]
 pub mod upgrade;
 
 /// Inbound (server-side) TLS support (issues #1603 and #1640).
@@ -462,6 +483,7 @@ pub mod retention;
 // merge into the module's own `//!` header and make its unqualified
 // intra-doc links resolve in `lib.rs`'s scope instead of the module's,
 // breaking `scripts/check-docs.sh`.
+#[cfg(feature = "data-retention")]
 pub mod data_retention;
 
 /// Read-your-own-writes routing support.
@@ -491,17 +513,25 @@ pub mod sync;
 // `MoneyError` are deliberately not re-exported at the crate root — `Money` is
 // too plausible an application type name to take — so every one of those links
 // would break. Same reason as `data_retention` above.
+#[cfg(feature = "money")]
 pub mod money;
+
+// Ledger capture of every SQL statement the framework issues. The module
+// carries its own `//!` docs.
+#[cfg(feature = "ledger-capture")]
+pub mod ledger_capture;
 
 /// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
 ///
 /// See [`ledger`] module documentation for the full API (issue #1699). This
 /// records the history of a row. For money, see [`money`].
+#[cfg(feature = "ledger")]
 pub mod ledger;
 // The data types a caller handles. The two *evidence* enums the verification
 // entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are
 // deliberately not re-exported: they are arguments to one `ledger::` function,
 // and a caller reaching for them is already inside that module.
+#[cfg(feature = "ledger")]
 pub use ledger::{
     LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
     LedgerHighWater, LedgerPin, LedgerRevision, LedgerVerification, LedgeredRecord,
@@ -510,7 +540,9 @@ pub use ledger::{
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.
+#[cfg(feature = "version-history")]
 pub mod version_history;
+#[cfg(feature = "version-history")]
 pub use version_history::{
     ColumnChange, VersionEntry, VersionFilter, VersionOp, VersionPage, VersionedRecord,
     compute_delete_changes, compute_delete_changes_owned, compute_diff, compute_diff_owned,
@@ -597,6 +629,10 @@ pub mod etag;
 /// `autumn_web::http` so handler code can write `use autumn_web::http::Client`.
 #[cfg(feature = "http-client")]
 pub mod http_client;
+// TLS config for the framework's own `reqwest` clients: `ring` and the
+// Mozilla roots, with no process-wide provider.
+#[cfg(any(feature = "http-client", feature = "acme"))]
+pub(crate) mod reqwest_tls;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
 // Retry budget for outbound HTTP (issue #3058). Internal: the client uses it.
@@ -659,7 +695,9 @@ pub mod wire;
 // and an outer doc comment here would make rustdoc resolve that whole
 // combined block in the CRATE-ROOT scope — where `WebPush`, `PushError` and
 // friends are not in scope, breaking every intra-doc link in the module and
-// failing the `-D rustdoc::broken_intra_doc_links` docs gate.
+// failing the `-D rustdoc::broken_intra_doc_links` docs gate. Behind the
+// `push` feature, which owns `p256`.
+#[cfg(feature = "push")]
 pub mod push;
 /// Compile-time per-route database query budgets (#1667).
 ///
@@ -682,7 +720,7 @@ pub use presence::presence_stream;
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
 pub use admission::Criticality;
-pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
+pub use route::{RepositoryApiMeta, Route, RouteGroup, RouteIdempotency, RouteTimeout};
 // Re-exported alongside the other `Route` field types so a hand-built
 // `Route { .. }` needs only the `autumn_web::` prefix.
 pub use seo::SeoRouteDefaults;
@@ -701,8 +739,9 @@ pub mod redis_tls;
 /// Pluggable error reporting: catch handler panics and route panics + 5xx
 /// responses to configured [`ErrorReporter`](reporting::ErrorReporter)s.
 ///
-/// Enabled by the `reporting` Cargo feature (on by default).
-#[cfg(feature = "reporting")]
+/// Enabled by the `error-reporting` Cargo feature (on by default). The
+/// `reporting` feature adds failure capture, the `capsule` module.
+#[cfg(feature = "error-reporting")]
 pub mod reporting;
 pub mod scheduler;
 pub mod security;
@@ -739,27 +778,35 @@ pub mod time_zone;
 pub mod user_agent;
 
 pub mod events;
+#[cfg(feature = "experiments")]
 pub mod experiments;
+#[cfg(feature = "feature-flags")]
 pub mod feature_flags;
 pub mod form;
+#[cfg(feature = "gdpr")]
 pub mod gdpr;
 // A plain comment, not a doc comment, for the same reason `classify` carries
 // one: an outer `///` here is merged with the module's `//!` docs and the whole
 // block then resolves its intra-doc links in *this* scope. The module
 // documents itself.
+#[cfg(feature = "graph")]
 pub mod graph;
 pub mod job;
 pub mod job_tracking;
 /// Safe, method-aware link helpers: [`links::link_to`] anchors and
 /// [`links::button_to`] CSRF-protected action buttons.
 pub mod links;
+#[cfg(feature = "nested-form")]
 pub mod nested_form;
 pub mod payload_version;
+pub(crate) mod ppm;
 #[cfg(feature = "repl")]
 pub mod repl;
+#[cfg(feature = "runtime-config")]
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+#[cfg(feature = "slo")]
 pub mod slo;
 
 // ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
@@ -950,16 +997,22 @@ pub mod stories;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
-/// Active search and autocomplete form primitives with htmx integration.
+/// Widget packs: the plugin seam for widgets (issue #3400).
 ///
-/// See [`widgets`] for the full API including [`widgets::active_search`],
-/// [`widgets::autocomplete_input`], [`widgets::data_table`],
-/// [`widgets::property_list`], and their configuration types.
+/// See [`widget_pack`] for the widget contract and
+/// [`widget_pack::WidgetPack`].
+#[cfg(feature = "maud")]
+pub mod widget_pack;
+/// Server-rendered widgets: layout, navigation, feedback and data display,
+/// plus the opt-in search, social, workflow and chart families.
+///
+/// See [`widgets`] for the full API and the feature of each family.
 pub mod widgets;
 /// First-class multi-step form wizards with session-backed state and per-step validation.
 ///
 /// See [`wizard`] for the full API including [`wizard::WizardContext`] and
 /// [`wizard::wizard_progress`].
+#[cfg(feature = "wizard")]
 pub mod wizard;
 /// Changeset type carrying submitted values + per-field errors.
 pub use form::Changeset;
@@ -967,9 +1020,10 @@ pub use form::Changeset;
 pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
-#[cfg(feature = "maud")]
+#[cfg(all(feature = "maud", feature = "nested-form"))]
 pub use nested_form::{InputsForOptions, RowScope, inputs_for, nested_row_fragment};
 /// Nested (`has_many`) form binding: parent + one child collection.
+#[cfg(feature = "nested-form")]
 pub use nested_form::{
     NestedChangeset, NestedChangesetForm, NestedChild, NestedRow, decode_nested_urlencoded,
 };
@@ -981,8 +1035,32 @@ pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
 pub mod webhook_outbound;
+/// Project tagged routes as `WebMCP` tools for the agent in the user's
+/// browser. Enable with the Cargo feature `webmcp` (it implies `mcp`).
+#[cfg(feature = "webmcp")]
+pub mod webmcp;
 #[cfg(feature = "ws")]
 pub mod ws;
+
+/// Keep the items only when the `postgres` feature is on (#2605).
+///
+/// Generated code that names a Postgres type uses this. Semver-exempt.
+#[cfg(feature = "postgres")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __if_postgres {
+    ($($item:tt)*) => {
+        $($item)*
+    };
+}
+
+/// See the `postgres` variant. Without `postgres`, drop the items.
+#[cfg(not(feature = "postgres"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __if_postgres {
+    ($($item:tt)*) => {};
+}
 
 /// Private runtime helpers for code generated by Autumn proc macros.
 ///
@@ -1669,6 +1747,9 @@ pub use autumn_macros::ws;
 
 /// Declare a typed domain event. See [`mod@events`] module.
 pub use autumn_macros::event;
+/// Check a function that reads an `#[event]` payload, such as an outbox
+/// topic handler. See [`mod@events`] module.
+pub use autumn_macros::event_consumer;
 /// Declare an on-demand background job. See [`mod@job`] module.
 pub use autumn_macros::job;
 /// Declare an event listener. See [`mod@events`] module.
@@ -1697,13 +1778,13 @@ pub use auth::{
     list_api_tokens, rotate_api_token,
 };
 
-/// Postgres-backed API token store (requires `db` feature).
+/// Postgres-backed API token store (requires the `postgres` feature).
 ///
 /// Production replacement for [`auth::InMemoryApiTokenStore`]. Hashes tokens
 /// at rest and persists them across restarts. Use with [`API_TOKEN_MIGRATIONS`]
 /// for dev/test startup checks; `autumn migrate` applies the token-table
 /// framework migration in production.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub use auth::DbApiTokenStore;
 
 /// Embedded Diesel migrations for the `api_tokens` table (requires `db` feature).
@@ -1917,6 +1998,7 @@ pub use autumn_macros::agent_operable;
 ///     html! { h1 { "Beta!" } }
 /// }
 /// ```
+#[cfg(feature = "feature-flags")]
 pub use autumn_macros::feature_flag;
 
 /// Enforce a record-level [`Policy`](crate::authorization::Policy)
@@ -2420,7 +2502,7 @@ pub mod test;
 mod test_html;
 /// Saturating time/duration arithmetic shared by the request-path modules.
 pub(crate) mod time_math;
-pub use config::ProcessRole;
+pub use config::{Capability, ProcessRole, Role, RoleCapabilities, RoleName, RolePreset};
 pub use state::AppState;
 
 #[cfg(test)]
@@ -2432,5 +2514,27 @@ mod tests {
         let builder = app::app();
         // Just verify it compiles and can accept routes
         let _builder = builder.routes(vec![]);
+    }
+
+    /// `PgFlagStore`, `PgExperimentStore` and `PgConfigStore` are a
+    /// documented clone class (see each struct's doc) that advertises the
+    /// same 1 s snapshot TTL. Nothing shares this constant, so a change to
+    /// one that forgets its siblings would otherwise drift silently.
+    #[cfg(all(
+        feature = "postgres",
+        feature = "feature-flags",
+        feature = "experiments",
+        feature = "runtime-config"
+    ))]
+    #[test]
+    fn pg_store_cache_ttl_matches_across_clone_class_siblings() {
+        assert_eq!(
+            feature_flags::pg::PgFlagStore::DEFAULT_CACHE_TTL,
+            experiments::pg::PgExperimentStore::DEFAULT_CACHE_TTL,
+        );
+        assert_eq!(
+            feature_flags::pg::PgFlagStore::DEFAULT_CACHE_TTL,
+            runtime_config::pg::PgConfigStore::DEFAULT_CACHE_TTL,
+        );
     }
 }

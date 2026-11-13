@@ -22,7 +22,7 @@ Or add the dependency by hand:
 
 ```toml
 [dependencies]
-autumn-billing = "0.8.0"
+autumn-billing = "0.10.0"
 ```
 
 ## Mount
@@ -182,13 +182,14 @@ event applied to the row. Every missing piece denies.
 
 | Method | Path | Auth | Response |
 | --- | --- | --- | --- |
-| POST | `/billing/checkout` | session | `303` to checkout, or JSON `{ "url", "id" }` with `Accept: application/json`. `404` unknown plan, `409` live subscription exists. |
+| POST | `/billing/checkout` | session | `303` to checkout, or JSON `{ "url", "id" }` with `Accept: application/json`. `404` unknown plan, `409` live subscription exists, or a checkout for the user is in progress. |
 | POST | `/billing/portal` | session | `303` to the portal, or JSON `{ "url", "id" }`. `404` when the user has no customer. |
 | GET | `/billing/subscription` | session | JSON `{subscription, plan, entitled}` from the mirror. |
-| POST | `/billing/webhook` | Stripe signature | JSON `{accepted, outcome, event_id}`. |
+| POST | `/billing/webhook` | Stripe signature | JSON `{accepted, outcome, event_id}`. `503` while another delivery of the event is being applied: the provider retries. |
 
 `checkout` takes `{"plan": "pro"}` as JSON or `plan=pro` as a form. Redirect
-URLs come from the config only.
+URLs come from the config only. Each process runs one checkout per user at a
+time. Replicas do not share this limit.
 
 ## Dunning
 
@@ -213,7 +214,10 @@ let billing = BillingConfig::from_env()
 ```
 
 After a restart the plugin re-arms every pending row from the store. No
-retry is lost. A retry whose provider call fails in transport keeps its
+retry is lost. The re-arm is the background task `billing.dunning_rearm`. It
+runs on the roles that drain the `billing` queue (`combined`, `worker`), not
+on `web`. Set `capabilities = { "billing.dunning" = false }` on a named role to
+turn it off there. A retry whose provider call fails in transport keeps its
 attempt number and runs again 15 minutes later; a row left `running` by a
 crashed process is reclaimed after 10 minutes.
 

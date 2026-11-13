@@ -97,7 +97,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       # Only comments from users with admin, write or maintain permission count.
       # The job asks GitHub for the permission. It does not use author_association.
       # Each comment goes to its own file, so one comment cannot change another.
@@ -140,6 +140,10 @@ jobs:
           AUTUMN_POSTURE_ACK: ${{ inputs.posture_ack }}
           AUTUMN_POSTURE_ACK_DIR: ${{ github.event_name == 'pull_request' && format('{0}/acks', runner.temp) || '' }}
         run: ./scripts/check-posture-gate.sh
+      # The golden diff in docs/guide/posture-gate.md: the gate must block a
+      # widened copy of reddit-clone's manifest, and print the same report.
+      - name: Check the reddit-clone posture demo
+        run: ./scripts/check-posture-demo.sh
 
   # ---------------------------------------------------------------------------
   # 0b. Benchmark harness structure gate
@@ -175,7 +179,7 @@ jobs:
           df -h
 
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       # Docker is preinstalled on ubuntu-latest runners, so the testcontainer
@@ -224,6 +228,85 @@ jobs:
           cargo test -p autumn-web --features system-tests \
             --test integration_tests system_test_api -- --include-ignored
 
+      # WebMCP in a real browser (#2619): the default CSP, route and form
+      # tools, and htmx swaps. `webmcp` is not a default feature, so the step
+      # above does not compile `webmcp_browser`. A filter that matches
+      # nothing exits 0, so check the count.
+      - name: Run the WebMCP browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features "system-tests,webmcp" \
+            --test integration_tests webmcp_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/webmcp-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/webmcp-browser.log" \
+            || { echo "::error::no WebMCP browser tests ran"; exit 1; }
+
+      # Widget keyboard core in a real browser (#3397): APG keys for tabs,
+      # combobox and menu button, the no-JS fallback and the default CSP.
+      # A filter that matches nothing exits 0, so check the count.
+      - name: Run the widget keyboard browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_keyboard_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-keyboard-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-keyboard-browser.log" \
+            || { echo "::error::no widget keyboard browser tests ran"; exit 1; }
+
+      # Toast behaviour in a real browser (#3399): pause, close, focus and
+      # the top layer. A filter that matches nothing exits 0, so check the
+      # count.
+      - name: Run the toast browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_toast_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-toast-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-toast-browser.log" \
+            || { echo "::error::no toast browser tests ran"; exit 1; }
+
+      # Direct upload controller in a real browser (#3411).
+      - name: Run the direct upload suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features "system-tests,storage" \
+            --test integration_tests widgets_direct_upload_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-direct-upload-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-direct-upload-browser.log" \
+            || { echo "::error::no direct upload browser tests ran"; exit 1; }
+
+      # Popover and dropdown menu in a real browser (#3402).
+      - name: Run the popover browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_popover_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-popover-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-popover-browser.log" \
+            || { echo "::error::no popover browser tests ran"; exit 1; }
+
+      # Drawer and modal in a real browser (#3403).
+      - name: Run the drawer browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_drawer_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-drawer-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-drawer-browser.log" \
+            || { echo "::error::no drawer browser tests ran"; exit 1; }
+
   # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------
@@ -246,7 +329,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       - name: Verify every publishable crate can be packaged
         run: ./scripts/check-publish-dry-run.sh
 
@@ -262,7 +345,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rust-docs
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       - name: Build docs (all features, no broken links)
         run: ./scripts/check-docs.sh
 
@@ -278,24 +361,24 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # Pinned toolchain for cargo-semver-checks — must stay in sync with
-      # AUTUMN_SEMVER_RUST_VERSION's default in scripts/check-semver.sh
-      # (1.94.1: aws-smithy MSRV floor; 1.96.0 ICEs — see script comment).
-      - uses: dtolnay/rust-toolchain@1.94.1
-      - uses: Swatinem/rust-cache@v2
+      # Pinned toolchain for cargo-semver-checks: the MSRV. Keep in sync with
+      # AUTUMN_SEMVER_RUST_VERSION's default in scripts/check-semver.sh.
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/kache
       # protoc is required by telemetry-otlp (prost/tonic) in the broadened
       # feature set check-semver.sh enables; it is not in the standard
       # ubuntu-latest image. Mirrors feature-combinations.yml's install so the
       # semver gate does not fail the rustdoc/dependency build for that feature.
       - name: Install protoc (required for telemetry-otlp)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+        # GitHub Releases, not apt: the runner's Ubuntu mirror can fail DNS.
+        uses: taiki-e/install-action@v2.89.0
+        with:
+          tool: protoc
       - name: Install cargo-semver-checks
         # Pin @v2 and pass the tool explicitly. The bare @cargo-semver-checks tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.28
+        uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-semver-checks
       - name: Check public API SemVer compatibility
@@ -345,14 +428,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
-      # install-action skips its verified download when the pinned version is
-      # already there — the auditor this gate trusts must come from the pin,
-      # not from a cache entry.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-      - uses: taiki-e/install-action@v2.87.28
+      # kache caches compiler outputs only, never $CARGO_HOME/bin. That matters
+      # here: install-action skips its verified download when the pinned
+      # version is already there, and the auditor this gate trusts must come
+      # from the pin, not from a cache entry.
+      - uses: ./.github/actions/kache
+      - uses: taiki-e/install-action@v2.89.0
         with:
           tool: cargo-deny@0.20.2
       - name: Dependency advisory gate
@@ -392,7 +473,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       - name: Generate and verify the workspace SBOM
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -474,7 +555,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
 
       - name: Create smoke project
         run: |
@@ -561,7 +642,7 @@ jobs:
       # `--verify` regenerates from THIS checkout and diffs component by
       # component; `--expect-version` pins it to the tag being released.
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/kache
       - name: Re-verify the downloaded SBOM against the tagged source
         env:
           RELEASE_TAG: ${{ github.ref_name }}

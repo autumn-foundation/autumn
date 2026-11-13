@@ -67,17 +67,50 @@ html! {
 }
 ```
 
-### `required_text_input`
+`password_input_with` has these options for a password (issue #3412). See
+[Forms](forms.md#passwords-and-one-time-codes).
+
+- `reveal()` adds a toggle button with `aria-pressed`. Its label does not
+  change, so a screen reader announces one control with a state. The button
+  is `hidden` until the script runs, so a user never finds a button that does
+  nothing.
+- `strength_hint()` adds a polite live region, linked by `aria-describedby`.
+  It speaks only when the level changes. The region is in the accessibility
+  tree before the first level, and each label names its subject
+  ("Strength: weak").
+- `current_password()` and `new_password()` set `autocomplete`, so a password
+  manager fills the field (WCAG 3.3.8).
+
+### `otp_input`
+
+One `<input autocomplete="one-time-code" inputmode="numeric">` over a row of
+`aria-hidden` boxes (issue #3412). A screen reader finds one field with one
+label, not one field for each digit. SMS autofill and paste fill the whole
+code.
+
+### `required_text_input` and the other `required_*` helpers
 
 Like `text_input` but adds both the HTML `required` attribute and
 `aria-required="true"` so assistive technology announces the field as
-mandatory.
+mandatory. The label also shows a `*` marker with `aria-hidden="true"`, so a
+screen reader does not say "required" two times. Each control has a
+`required_*` helper, for example `required_password_input`,
+`required_textarea_input` and `required_checkbox_input`.
 
 ```rust
 html! {
     (required_text_input(&changeset, "email", "Email address"))
 }
 ```
+
+### Hints and attributes: the `*_with` helpers
+
+Each helper has a `*_with` variant that takes `&FieldOptions`. A hint renders
+between the label and the control with `id="{field}-hint"`, and
+`aria-describedby` names it before the error. `FieldOptions` has no setter for
+`id`, `name` or `aria-*`, so the links between the label, hint, error and
+control stay correct. See the
+[forms guide](./forms.md#hints-attributes-and-required-state-fieldoptions).
 
 ### `textarea_input`
 
@@ -164,8 +197,9 @@ struct EventForm {
 
 ### `select_input`
 
-Renders a labelled `<select>` from `(value, label)` option pairs, marking the
-option matching the changeset's current value as `selected`. This is the
+Renders a labelled `<select>` from `(value, label)` option pairs. It marks
+the first option that matches the changeset's current value as `selected`.
+This is the
 control closed-set fields (enums, references) target.
 
 ```rust
@@ -174,6 +208,36 @@ html! {
     (select_input(&changeset, "status", "Status", &statuses))
 }
 ```
+
+`grouped_select_input` adds `<optgroup>` elements, and
+`FieldOptions::multiple()` adds `multiple` (issue #3409). See
+[Forms](forms.md#select-groups-multiple-and-style).
+
+- The control stays a native `<select>`. The browser gives each group
+  label to assistive technology. The browser supplies the keyboard support.
+- `FieldOptions::styled_select()` changes only CSS (`appearance:
+  base-select`). The element and its role do not change. The browser keeps
+  the keyboard support: the arrow keys open the picker, Enter chooses an
+  option and Escape closes the picker. With no browser support, the native
+  control shows.
+
+### Native inputs and choice groups
+
+`switch_input`, `range_input`, `radio_group`, `checkbox_group`,
+`segmented_control`, `email_input`, `tel_input`, `url_input`, `time_input`,
+`month_input`, `color_input` and `hidden_input` use native controls (issue
+#3405). See [Forms](forms.md#native-inputs).
+
+- A switch is `<input type="checkbox" role="switch">`. A screen reader says
+  "on" or "off".
+- A radio group, a checkbox group and a segmented control are a `<fieldset>`
+  with a `<legend>`. The hint and error links (`aria-describedby`,
+  `aria-invalid`) go on the `<fieldset>`.
+- A radio gets `required`, not `aria-required`: ARIA does not allow
+  `aria-required` on a radio.
+- A segmented radio is visually hidden, but it stays in the Tab order. The
+  arrow keys move the selection, and the label shows the focus ring.
+- A hidden input has no label. It is not visible and not announced.
 
 ### `skip_link`
 
@@ -317,6 +381,8 @@ Perform this manual checklist before shipping any new page or component:
 - [ ] htmx-powered interactions do not silently replace content — the live
       region announces the change
 - [ ] No keyboard trap: pressing Escape or Tab always allows leaving a widget
+- [ ] Tabs, menus and listboxes use the APG arrow keys. See the
+      [keyboard core](keyboard.md).
 - [ ] Images have meaningful `alt` text; purely decorative images use `alt=""`
 - [ ] All form fields have a visible `<label>` (not just `placeholder`)
 
@@ -529,12 +595,22 @@ least one. A visible group name renders `<fieldset><legend>`; `.aria_label(..)` 
 `.labelled_by(..)` render a `<div>` instead. Both carry `role="radiogroup"` —
 `<fieldset>` alone maps to role `group`, which does not support `aria-required`.
 Each choice gets an `id` that pairs it with its own `<label for=…>`, derived
-from the group name and the choice value. A `-` inside either is doubled, so
-group `a-b` choice `c` and group `a` choice `b-c` cannot collide. The same group
+from the group name and the choice value. Each byte other than a
+letter, digit or `_` is written `--HH` (upper-case hex), so two groups never
+give the same id: `plan-type` gives `plan--2Dtype-…`. The second choice with the
+same value ends in `--n1`. The third ends in `--n2`. The same group
 rendered repeatedly — one per table row — shares its form name by design, so
-`.id_prefix(..)` supplies the discriminator. `aria-invalid` and any `hx-*` attributes
+`.id_prefix(..)` supplies the discriminator. An id is also a valid CSS selector,
+so `hx-target="#…"` and `querySelector` work on it. If the first part of the
+id, after any leading `_`, does not start with a letter, the id gets one more
+`_` at the start (`1plan` gives `_1plan-…`, `_1plan` gives `__1plan-…`). `aria-invalid` and any `hx-*` attributes
 land on each `<input>`, where assistive technology reads validity and htmx reads
 a value; `aria-describedby` and `aria-required` stay on the group.
+
+`Select::option(value, label)` takes the pair, but `RadioGroup::option(..)` takes
+a built `RadioOption`. The difference is on purpose: `RadioGroup::new` takes its
+first choice as a `RadioOption`, and `.option(..)` takes the same type, so a
+choice is built the same way in both places.
 
 `Link::new` takes the visible link text as a required argument (an icon-only
 link routes its name to `aria-label` via `Link::icon`), and `MenuItem::new`
@@ -558,14 +634,25 @@ let _ = Link::new("/about");
 //        — a menu item must carry an accessible name
 let _ = MenuItem::new();
 
-// error: no method named `render` found for `TextField<NoLabel>`
+// error[E0599]: no method named `render` found for struct `TextField<State>` in the current scope
+//        method not found in `TextField<NoLabel>`
 //        — an unlabeled field cannot be turned into markup
 let _ = TextField::new("email").render();
 
-// error: no method named `render` found for `RadioGroup<NoLabel>`
+// error[E0599]: no method named `render` found for struct `RadioGroup<State>` in the current scope
+//        method not found in `RadioGroup<NoLabel>`
 //        — a radio group with no group name cannot be turned into markup
 let _ = RadioGroup::new("speed", RadioOption::new("standard", "Standard")).render();
 ```
+
+These are the errors of the compile-fail fixtures
+`autumn/tests/compile-fail/a11y_img_missing_alt.rs`,
+`autumn/tests/compile-fail/a11y_link_missing_text.rs`,
+`autumn/tests/compile-fail/a11y_menuitem_missing_name.rs`,
+`autumn/tests/compile-fail/a11y_textfield_unlabeled.rs` and
+`autumn/tests/compile-fail/a11y_radiogroup_unlabeled.rs`. The test
+`a11y_guide_matches_the_real_diagnostics` fails when this page and the goldens
+do not agree.
 
 **Fix** — supply the accessible name / attach a label:
 
@@ -587,7 +674,17 @@ with `.label(..)`, `.aria_label(..)`, or `.labelled_by(..)` transitions it to
 literally unrepresentable as markup.
 
 What this proves at compile time: the *presence* of an accessible name on every
-image, button, and text field. What still belongs to runtime/authoring review:
+image, button, and text field. The types do not prove that the name holds
+text: `Img::new(src, "")` or `.aria_label("")` compiles, and gives an element
+with no name. Every entry point that takes a name has a `debug_assert!`, so an
+empty or blank name panics at the call site in a debug build. A release build
+renders the name as it is. For an image that carries no information, use
+`Img::decorative(src)`. A name from data can be blank, so give it a fallback.
+`autumn_web::a11y::is_blank(text)` uses the same rule as the check (white
+space and zero-width characters). The generated select-options loader uses it,
+and puts the row id in place of a blank label.
+
+What still belongs to runtime/authoring review:
 whether that name is *meaningful* (a helpful `alt`, not `"image"`), plus page
 structure, contrast, and focus order — the checklist and audit tooling above
 cover those.
@@ -637,20 +734,78 @@ in a shared partial names the routes that reach it:
 ```
 
 The walk is as conservative as the scanner. A call is followed only when the
-called name is defined **exactly once** across the scan — two functions sharing
+called name is defined **exactly once** in the scope that the call can see — two functions sharing
 a name cannot be told apart from tokens, and guessing would blame a route that
-never renders the markup. A bare `name()` resolves only to a free item — a nested `fn` is visible just
-inside its own block, and an associated `fn` is reached through a receiver or a
-type-qualified path — so neither is a target. Four more call shapes are skipped
-outright: a method call
-(`page.sidebar()`), a type-qualified associated call (`Widget::new()` — Rust
-names types in `UpperCamelCase`, so `views::sidebar()` still resolves), a
-function passed by name rather than called (`.map(render_row)`), and a name
-bound inside the function — a parameter, a local, a closure argument — which
-shadows any free function that shares it. `#[cfg(test)]`
-items are skipped, and the `path` is the path **as declared**: mount-time
-prefixes (a `scope`, a nested router) are applied at runtime and are not
-resolved here.
+never renders the markup. A bare `name()` resolves first to a helper `fn` that
+the caller declares at the top of its body, then to one in each enclosing body,
+then to a free item. A nested `fn` in an inner block, and an associated `fn`
+(reached through a receiver or a type-qualified path), are never a target. The
+scan does not track blocks, so a helper in an inner block makes its name
+resolve to nothing in the whole function.
+
+These call shapes are followed:
+
+- `sidebar()` and `views::sidebar()`. A path always names a free item, so a
+  local helper or a local binding of the same name does not shadow it.
+- A turbofish: `sidebar::<Html>()`.
+- A function passed by name: `rows.map(render_row)`, `.map(views::render_row)`.
+
+These are skipped: a method call (`page.sidebar()`), a type-qualified call
+(`Widget::new()`, `.map(Widget::render)` — Rust names types in
+`UpperCamelCase`), a path into a primitive type or the standard library
+(`str::trim`, `std::mem::drop`), and a name bound inside the function — a parameter, a local,
+a closure argument, a `for` or match-arm pattern — which shadows any free
+function that shares it. `#[cfg(test)]` items are skipped, and the `path` is the
+path **as declared**: mount-time prefixes (a `scope`, a nested router) are
+applied at runtime and are not resolved here.
+
+An item, statement, match arm or field under `#[cfg(…)]` counts only when the
+predicate is true for the enabled features. A `#[cfg_attr(…, cfg(…))]` counts
+when its condition is true. A gated handler is not a route. A gated helper is
+not a target. The scan does not follow a gated call.
+
+The scan parses each file with `syn`, so a gated node ends where the Rust
+grammar ends it. It also applies these rules:
+
+- It reads a macro body as Rust when the body parses as Rust.
+- A `#![cfg(…)]` that is off takes out its file, module, function or block.
+- A `mod name;` under a `cfg` that is off takes out the module files.
+- In `cfg_if!`, it keeps only the branch that builds.
+
+The scan solves the features as `cargo build --workspace` solves them. It reads
+`[features] default` from the nearest `Cargo.toml`.
+
+- `--features a,b` turns on each name in each crate that declares it.
+  `views/a` names one crate.
+- `--all-features` turns on every feature. As in Cargo, an optional
+  dependency that a `dep:` entry names is not a feature.
+- `--no-default-features` turns off the default set.
+
+A crate also turns on what it asks for in a path dependency of the same
+workspace:
+
+- the `features` list of the dependency,
+- the default features, unless `default-features = false`,
+- the `views/a` and `views?/a` entries of its enabled features.
+
+A `[workspace.dependencies]` entry and a `[patch]` entry with a path count
+too. A target table counts when its `cfg` or its triple matches the host. A
+target `cfg` that the scan cannot decide does not count. Each workspace is
+solved alone. Resolver 1 also counts dev and build dependencies.
+
+A predicate that the scan cannot decide (`target_env = "gnu"`) keeps the item.
+A file with no package manifest also keeps it. A finding inside a gated item
+or statement that is off has no route. The features change only the route
+attribution. They do not change the findings or the exit code. A `--features`
+name that no crate declares gets a warning on stderr.
+
+Known limits:
+
+- When `syn` cannot parse a file, the scan reads its tokens. It also reads
+  the tokens of a macro body that is not Rust. The token reader finds the end
+  of a gated node by heuristics.
+- A crate outside the scan root does not turn on features in the scan.
+- The scan does not follow a `mod` with a `#[path]` attribute.
 
 Attribution is therefore a lower bound. `status: "pass"` means no finding was
 attributed to that route, not that the page is proven clean — read it alongside
@@ -673,6 +828,9 @@ autumn a11y verify --format json
 
 # Fail on any finding (Moderate and above), mirroring `i18n check --strict`
 autumn a11y verify --strict
+
+# Read the `admin` feature as on for `#[cfg(feature = "admin")]` calls
+autumn a11y verify --features admin
 ```
 
 ### `--format json` (conformance manifest)

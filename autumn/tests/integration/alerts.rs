@@ -57,7 +57,7 @@ fn settings_with_prefix_sensitive(prefix: &str, actuator_sensitive: bool) -> Ale
     // `sensitive = false` fallback is covered explicitly by
     // `sensitive_false_alerts_point_at_mounted_endpoint`.
     AlerterSettings {
-        dedup_window: std::time::Duration::from_secs(900),
+        dedup_window: std::time::Duration::from_mins(15),
         health_grace: std::time::Duration::from_secs(60),
         error_rate_threshold: 0.05,
         error_rate_min_requests: 20,
@@ -165,7 +165,7 @@ async fn distinct_ids_of_same_job_dedup_to_one_bounded_alert() {
     assert!(alerts[0].title.contains("job-1"));
 }
 
-/// Finding 2: an alert's `where_to_look` must honor the configured `[actuator]
+/// An alert's `where_to_look` must honor the configured `[actuator]
 /// prefix`. With a custom prefix, the emitted alert points operators at the real
 /// actuator endpoint (`/_ops/jobs`) instead of a hard-coded `/actuator/jobs`
 /// that would 404. The default-prefix case is covered by
@@ -339,7 +339,7 @@ async fn repeated_condition_is_deduplicated_then_recovers() {
     assert_eq!(alerts[0].dedup_key, alerts[1].dedup_key);
 }
 
-/// Finding 2 (recovery): a scheduled task that fails, then succeeds, delivers a
+/// Recovery: a scheduled task that fails, then succeeds, delivers a
 /// recovery notice; and a subsequent failure within the dedup window alerts
 /// again rather than being suppressed as if still failing. Proves the scheduler
 /// success arms clear the `scheduled_task_failure:{task}` dedup key.
@@ -405,7 +405,7 @@ async fn scheduled_task_recovery_without_prior_failure_is_silent() {
     );
 }
 
-/// Finding 3: alert webhooks are ALWAYS signed, so a webhook destination with no
+/// Alert webhooks are ALWAYS signed, so a webhook destination with no
 /// signing secret must NOT register a webhook channel — sending unsigned would be
 /// rejected by receivers following the documented verification. With the webhook
 /// as the only destination, `install_from_config` installs no alerter at all.

@@ -1,12 +1,17 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
+
+/// The workspace MSRV: `rust-version` in the root `Cargo.toml`. Generated
+/// projects pin this toolchain.
+pub(crate) const MSRV: &str = env!("CARGO_PKG_RUST_VERSION");
 
 mod a11y;
 mod aeo;
 mod agents;
 mod alert;
 mod assets;
+mod boundaries;
 mod build;
 mod built_artifact;
 mod cache_audit;
@@ -18,6 +23,7 @@ mod check;
 mod cold_start_driver;
 mod config;
 mod console;
+mod contracts;
 mod credentials;
 mod data;
 mod data_capsule;
@@ -31,6 +37,7 @@ mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
 mod edge;
+mod edge_bundle;
 mod edge_scan;
 mod experiments;
 mod export;
@@ -58,6 +65,7 @@ mod plugin_sandbox;
 mod posture;
 mod process;
 mod release;
+mod release_roles;
 mod replay;
 mod retention;
 mod routes;
@@ -487,6 +495,45 @@ pub struct GraphArgs {
     release: bool,
 }
 
+/// Arguments for `autumn graph check-boundaries` (issue #3549).
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct CheckBoundariesArgs {
+    /// The file that declares the boundaries.
+    #[arg(long, value_name = "PATH", default_value = "boundaries.toml")]
+    config: String,
+    /// Check this committed graph instead of building the app.
+    #[arg(long, value_name = "PATH")]
+    graph: Option<String>,
+    /// The baseline of known violations. Overrides `baseline` in the config.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<String>,
+    /// Write the current violations to the baseline and exit 0.
+    #[arg(long, conflicts_with = "json")]
+    update_baseline: bool,
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable).
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Inspect the release binary rather than the debug one.
+    #[arg(long)]
+    release: bool,
+}
+
 /// Subcommands for `autumn graph`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum GraphSubcommands {
@@ -506,6 +553,8 @@ pub enum GraphSubcommands {
         #[command(flatten)]
         args: GraphArgs,
     },
+    /// Fail when code in one boundary reaches a table another boundary owns.
+    CheckBoundaries(CheckBoundariesArgs),
 }
 
 /// Arguments for `autumn openapi export`.
@@ -560,6 +609,149 @@ pub struct OpenApiExportArgs {
 pub enum OpenApiSubcommands {
     /// Emit the app's `OpenAPI` 3.1 document without booting it.
     Export(OpenApiExportArgs),
+}
+
+/// The crates and features the wire-contract pass checks.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+pub struct ContractsPassArgs {
+    /// Check only this package (repeatable). The default is the workspace.
+    #[arg(long = "package", short = 'p', value_name = "PACKAGE")]
+    package: Vec<String>,
+    /// Extra Cargo features (comma- or space-separated; repeatable).
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build with `--all-features`.
+    #[arg(long)]
+    all_features: bool,
+    /// Build with `--no-default-features`.
+    #[arg(long)]
+    no_default_features: bool,
+}
+
+impl ContractsPassArgs {
+    fn into_pass(self) -> contracts::PassOptions {
+        contracts::PassOptions {
+            packages: self.package,
+            features: routes::CargoFeatures {
+                features: self.features,
+                all: self.all_features,
+                no_default: self.no_default_features,
+            },
+        }
+    }
+}
+
+/// The schema options of `autumn contracts export`: `--proto` or `--avro`.
+// Each bool is one CLI flag.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[command(group(clap::ArgGroup::new("schema").args(["proto", "avro"])))]
+pub struct ContractsSchemaArgs {
+    /// Write protobuf schemas to `--out <DIR>` instead of the bundle.
+    #[arg(long, requires = "out")]
+    proto: bool,
+    /// The lock file of protobuf field numbers. Commit it. The default is
+    /// `proto.lock` beside the `--out` directory.
+    #[arg(long, value_name = "PATH", requires = "proto")]
+    lock: Option<PathBuf>,
+    /// Write nothing. Exit 1 when the lock or a schema file would change.
+    #[arg(long, requires = "schema")]
+    check: bool,
+    /// Add `google.api.http` options to each rpc.
+    #[arg(long, requires = "proto")]
+    http_annotations: bool,
+    /// Map a `date-time` string to `google.protobuf.Timestamp`.
+    #[arg(long, requires = "proto")]
+    well_known_types: bool,
+    /// Write Avro schemas (`.avsc`) to `--out <DIR>`: one per event topic.
+    #[arg(
+        long,
+        requires = "out",
+        conflicts_with_all = ["proto", "lock", "http_annotations", "well_known_types"]
+    )]
+    avro: bool,
+    /// With `--avro`, also write the request and response body of each
+    /// endpoint.
+    #[arg(long, requires = "avro")]
+    endpoints: bool,
+}
+
+impl ContractsSchemaArgs {
+    fn into_proto(self) -> Option<contracts::ProtoArgs> {
+        self.proto.then_some(contracts::ProtoArgs {
+            lock: self.lock,
+            check: self.check,
+            options: contracts::proto::ProtoOptions {
+                http_annotations: self.http_annotations,
+                well_known_types: self.well_known_types,
+            },
+        })
+    }
+
+    const fn to_avro(&self) -> Option<contracts::AvroArgs> {
+        if !self.avro {
+            return None;
+        }
+        Some(contracts::AvroArgs {
+            check: self.check,
+            options: contracts::avro::AvroOptions {
+                endpoints: self.endpoints,
+            },
+        })
+    }
+}
+
+/// Subcommands for `autumn contracts`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum ContractsSubcommands {
+    /// Write the wire-contract bundle of the current build.
+    ///
+    /// Runs a dedicated `cargo check` pass, so a cached build cannot leave a
+    /// descriptor out. The bundle is sorted JSON. Two exports of the same
+    /// source give the same bytes. Store it with each release.
+    ///
+    /// With `--proto`, write protobuf schemas for consumers outside the
+    /// workspace instead: one file per service, one per crate for events,
+    /// and a `buf.yaml`. The lock file keeps each field number.
+    ///
+    /// With `--avro`, write one Avro schema per event topic instead.
+    /// `--endpoints` adds the request and response bodies.
+    Export {
+        /// Write the bundle to this file. The default is stdout. With
+        /// `--proto` or `--avro`, write the schema files to this directory.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Use this bundle file, or join the descriptors in this directory.
+        /// No build runs, and there is no dependency graph.
+        #[arg(long, value_name = "BUNDLE|DIR")]
+        from: Option<PathBuf>,
+        #[command(flatten)]
+        proto: ContractsSchemaArgs,
+        #[command(flatten)]
+        pass: ContractsPassArgs,
+    },
+    /// Compare the current build with a deployed release.
+    ///
+    /// Checks both deploy windows: new callees with deployed callers, and new
+    /// callers with deployed callees. Exit 0: safe in the declared order.
+    /// Exit 1: not safe. Exit 3: safe only in the order the report names.
+    /// Exit 4: the check could not run.
+    Check {
+        /// The deployed release: a bundle file, an http(s) URL, or a git ref.
+        #[arg(long, value_name = "BUNDLE|URL|GIT-REF")]
+        against: String,
+        /// Use this bundle for the current build. The default runs the pass.
+        #[arg(long, value_name = "PATH")]
+        current: Option<PathBuf>,
+        /// The deploy order you plan. `any` needs both windows to be safe.
+        #[arg(long, value_enum, default_value_t = contracts::compat::Order::Any)]
+        order: contracts::compat::Order,
+        /// Accept a plain `http://` URL for `--against`.
+        #[arg(long)]
+        allow_http: bool,
+        #[command(flatten)]
+        pass: ContractsPassArgs,
+    },
 }
 
 /// Subcommands for `autumn aeo`.
@@ -641,6 +833,21 @@ pub enum A11ySubcommands {
         /// fails, consistent with `autumn i18n check --strict`.
         #[arg(long)]
         strict: bool,
+        /// Cargo features to turn on, in addition to the default features. A
+        /// name is on in each crate that declares it. `pkg/feat` names one
+        /// crate. Repeat the flag or give a comma-separated list. An item or a
+        /// call under a `#[cfg(feature = "…")]` that is off does not attribute
+        /// a route. Features change only the route attribution, not the
+        /// findings or the exit code.
+        #[arg(long, value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Turn on every feature that the manifest declares, and the implicit
+        /// feature of each optional dependency that no `dep:` entry names.
+        #[arg(long)]
+        all_features: bool,
+        /// Do not turn on the `[features] default` set.
+        #[arg(long)]
+        no_default_features: bool,
     },
 }
 
@@ -1110,6 +1317,56 @@ pub enum EdgeCommands {
         #[arg(long)]
         quiet: bool,
     },
+    /// Write a deployable edge bundle for a web-standard runtime (ADR-0024).
+    ///
+    /// The bundle is the capsule, Autumn's JavaScript edge host and an entry
+    /// module for the platform. It needs no vendor SDK. The platform's own
+    /// CLI deploys it. The capsule serves each GET/HEAD it can; every other
+    /// request goes to the origin unchanged.
+    ///
+    /// Every bundle rewrites the capsule, the host and the entry. The
+    /// platform config (`wrangler.toml`) is written once and then kept, so
+    /// a KV namespace id or a route added to it survives.
+    ///
+    /// # Examples
+    ///
+    ///   autumn build
+    ///   autumn edge bundle --target cloudflare --origin https://origin.example.com
+    ///   cd edge/cloudflare && npx wrangler deploy
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Bundle {
+        /// The platform to bundle for.
+        #[arg(long, value_enum, default_value = "cloudflare")]
+        target: edge_bundle::BundleTarget,
+        /// The capsule that `autumn build` wrote.
+        #[arg(
+            long,
+            value_name = "WASM",
+            default_value = "target/wasm32-wasip1/release/edge-capsule.wasm"
+        )]
+        capsule: String,
+        /// The origin base URL. Required for a new bundle; it goes into the
+        /// platform config, which later bundles keep.
+        #[arg(long, value_name = "URL")]
+        origin: Option<String>,
+        /// The directory to write.
+        #[arg(long, value_name = "DIR", default_value = "edge/cloudflare")]
+        out: String,
+        /// The Worker name for a new config. Defaults to `<package>-edge`.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Also set this header on each edge response. Repeat it.
+        #[arg(long = "response-header", value_name = "NAME: VALUE")]
+        response_headers: Vec<String>,
+        /// The origin path the Worker reads the static security headers
+        /// from, once per isolate.
+        #[arg(long, value_name = "PATH", default_value = "/")]
+        probe_path: String,
+        /// Do not read the origin's static headers.
+        #[arg(long)]
+        no_probe: bool,
+    },
     /// Measure time to first byte at the edge node and at the origin.
     ///
     /// Sends the same GETs to both, compares the bytes of each pair, and
@@ -1329,15 +1586,17 @@ enum Commands {
         #[arg(short, long)]
         package: Option<String>,
         /// Process role: web serves HTTP only, worker runs jobs+scheduler only,
-        /// combined (default) does both.
-        #[arg(long, value_enum)]
-        role: Option<ServeRole>,
+        /// combined (default) does both. A `[roles.<name>]` preset name is
+        /// accepted too; the app checks that it is declared.
+        #[arg(long, value_parser = parse_serve_role)]
+        role: Option<String>,
         /// Pin this process to a subset of job queues (issue #1623). Repeatable
         /// and comma-separated: `--pin critical,default` or `--pin critical
         /// --pin default`. A pinned process never claims jobs from queues
         /// outside the subset, on every backend. Forwarded to the app binary as
         /// `AUTUMN_JOBS__PIN`; omit it to let the app read `[jobs] pin` from its
-        /// own config (the default: drain every configured queue).
+        /// own config (the default: drain every configured queue). The `pin`
+        /// of a `[roles.<name>]` preset replaces it.
         #[arg(long, value_delimiter = ',', value_name = "QUEUE")]
         pin: Vec<String>,
     },
@@ -1561,19 +1820,25 @@ enum Commands {
     },
     /// Shard operations (e.g. moving a tenant's data between shards)
     Shard(ShardCommands),
-    /// Operate a `SQLite` database fleet: list, migrate, back up, delete, restore.
+    /// Operate a `SQLite` database fleet: list, migrate, back up, import, delete,
+    /// restore, query the lake.
     ///
-    /// Reads `[database.fleet]` from the app config. `restore` also reads
-    /// `[replication]`. Run it from the app directory: the fleet root must
-    /// exist. Works when the app is stopped and when it runs. Needs the
-    /// `sqlite` build of the CLI.
+    /// Reads `[database.fleet]` from the app config. `delete`, `import`,
+    /// `restore` and `lake` also read `[replication]`. Run it from the app
+    /// directory: the fleet root must exist, except for `lake`, which reads
+    /// object storage and the control database (or the markers only, with
+    /// `--markers-only`). Works when the app is stopped and when it runs.
+    /// Needs the `sqlite` build of the CLI.
     ///
     /// # Examples
     ///
     ///   autumn fleet list --open
     ///   autumn fleet migrate --concurrency 4
     ///   autumn fleet backup tenant:acme /backups/acme.db
+    ///   autumn fleet import tenant:acme /backups/acme.db
     ///   autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+    ///   autumn fleet restore tenant:acme --from /backups/acme.db --force
+    ///   autumn fleet lake report.sql --out report.csv
     #[command(subcommand, verbatim_doc_comment)]
     Fleet(FleetCommands),
     /// Live monitoring dashboard for a running Autumn application
@@ -2392,6 +2657,20 @@ enum Commands {
     ///   autumn openapi export --check openapi.json --strict
     #[command(subcommand, verbatim_doc_comment)]
     Openapi(OpenApiSubcommands),
+    /// Publish and check wire contracts across releases.
+    ///
+    /// `export` writes the bundle of the current build. `check` compares the
+    /// current build with a deployed bundle, in both deploy windows, and names
+    /// the safe deploy order when only one exists.
+    ///
+    /// # Examples
+    ///
+    ///   autumn contracts export --out target/contracts.json
+    ///   autumn contracts check --against deployed.json
+    ///   autumn contracts check --against origin/main
+    ///   autumn contracts check --against deployed.json --order callee-first
+    #[command(subcommand, verbatim_doc_comment)]
+    Contracts(ContractsSubcommands),
     /// Emit the classified-data flow manifest (#1654).
     ///
     /// Compiles the app and reads back the manifest the framework assembles from
@@ -2464,8 +2743,10 @@ enum Commands {
         #[arg(long = "target", value_name = "PATH")]
         targets: Vec<String>,
         /// Seed for the request profile, so a calibration is replayable.
+        /// At most 9223372036854775807: the contract is TOML, and that is its
+        /// largest integer.
         /// [default: 1733; with --check, the committed contract's own seed]
-        #[arg(long, value_name = "SEED")]
+        #[arg(long, value_name = "SEED", value_parser = clap::value_parser!(u64).range(..=i64::MAX.cast_unsigned()))]
         seed: Option<u64>,
         /// Concurrency ladder to walk (comma-separated).
         /// [default: 1,2,4,8,16,32,64; with --check, the committed ladder]
@@ -2892,6 +3173,8 @@ enum DbCommands {
     /// Refuses to run outside the `dev`/`test` profile without `--force`, the
     /// same guard as `autumn db drop`.
     ///
+    /// Works on Postgres and `SQLite` targets. `--sample` is Postgres-only.
+    ///
     /// # Examples
     ///
     ///   # Refresh staging from a production backup:
@@ -2958,7 +3241,7 @@ enum DbCommands {
     /// sticky experiment assignments, webhook replay markers, sessions, audit
     /// archives. This reports every one of them: the retention window in
     /// effect, which setting produced it, how it is enforced, and how many
-    /// rows are eligible for purge right now.
+    /// rows are eligible for purge right now. Sweeps run on Postgres and `SQLite`.
     ///
     /// Windows are declared in the `[retention]` section of `autumn.toml` and
     /// are enforced automatically on a recurring in-process sweep — this
@@ -3034,6 +3317,32 @@ enum DbCommands {
     ///   autumn db replica status
     #[command(subcommand, verbatim_doc_comment)]
     Replica(ReplicaCommands),
+    /// Print or apply the database grants of each boundary role.
+    ///
+    /// Reads `boundaries.toml` and the live catalog. A boundary with a
+    /// `role` gets its own tables and its `may_read` / `may_write`
+    /// exceptions. Every other privilege of that role on a table, sequence
+    /// or schema is revoked. All statements run in one transaction.
+    ///
+    /// Examples:
+    ///   autumn db grants              # print the SQL
+    ///   autumn db grants --apply      # run it, after `autumn migrate`
+    ///   autumn db grants --json       # the plan, per role
+    #[command(verbatim_doc_comment)]
+    Grants {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The boundary config.
+        #[arg(long, value_name = "PATH", default_value = "boundaries.toml")]
+        config: std::path::PathBuf,
+        /// Run the statements against the database.
+        #[arg(long)]
+        apply: bool,
+        /// Print the plan as JSON instead of SQL.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands for `autumn db offsite` (issue #1619).
@@ -3137,10 +3446,11 @@ impl DbCommands {
             | Self::Scrub { .. }
             | Self::Retention { .. }
             | Self::Offsite(_)
-            | Self::Replica(_) => {
+            | Self::Replica(_)
+            | Self::Grants { .. } => {
                 unreachable!(
-                    "db pull/backup/restore/scrub/retention/offsite/replica are dispatched \
-                     before into_command"
+                    "db pull/backup/restore/scrub/retention/offsite/replica/grants are \
+                     dispatched before into_command"
                 )
             }
         }
@@ -3219,27 +3529,14 @@ fn normalize_pin(pin: &[String]) -> Option<Vec<String>> {
     })
 }
 
-/// Process role selector for `autumn serve --role`.
-///
-/// Mirrors `autumn_web::config::ProcessRole`: `web` serves HTTP only, `worker`
-/// runs job workers + the cron scheduler only, and `combined` (the default)
-/// does both. The chosen role is forwarded to the app binary via `AUTUMN_ROLE`.
-#[derive(Clone, Copy, ValueEnum)]
-enum ServeRole {
-    Combined,
-    Web,
-    Worker,
-}
-
-impl ServeRole {
-    /// Stable lowercase identifier forwarded to the app via `AUTUMN_ROLE`.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Combined => "combined",
-            Self::Web => "web",
-            Self::Worker => "worker",
-        }
-    }
+/// Parse `autumn serve --role`: a built-in role or a `[roles.<name>]` preset
+/// name (#3543). Returns the canonical name, which is forwarded to the app
+/// binary via `AUTUMN_ROLE`. The app checks that a preset is declared.
+fn parse_serve_role(value: &str) -> Result<String, String> {
+    value
+        .parse::<autumn_web::config::RoleName>()
+        .map(|name| name.as_str().to_owned())
+        .map_err(|err| err.to_string())
 }
 
 /// Subcommands for `autumn migrate`.
@@ -3422,12 +3719,14 @@ enum FleetCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Apply pending migrations from `migrations/` to every database.
+    /// Apply pending migrations from `migrations/` and `migrations-shards/`
+    /// to every database.
     ///
     /// Each database also gets the framework tables a fleet database gets at
-    /// boot. Plugin migrations are not applied: run the app once with
-    /// `AUTUMN_MIGRATE=1` for them. A failure on one database does not stop the
-    /// others. The command exits non-zero when one or more fail.
+    /// boot. `migrations-control/` is for the control database only, so it
+    /// is not applied. Plugin migrations are not applied: run the app once
+    /// with `AUTUMN_MIGRATE=1` for them. A failure on one database does not
+    /// stop the others. The command exits non-zero when one or more fail.
     Migrate {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
@@ -3453,9 +3752,28 @@ enum FleetCommands {
         #[arg(value_name = "DEST")]
         dest: std::path::PathBuf,
     },
+    /// Copy a database file into the fleet as KEY, for example a backup.
+    ///
+    /// Copies SOURCE with `VACUUM INTO`, checks its integrity and identity row,
+    /// applies `migrations/` and the framework tables, then publishes it.
+    /// Refused when KEY already has a file, and with
+    /// `[database.fleet.ownership]` on. SOURCE does not change.
+    Import {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The database: `tenant:<id>` or `slot:<nnnnn>`.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// The file to copy in.
+        #[arg(value_name = "SOURCE")]
+        source: std::path::PathBuf,
+    },
     /// Remove one database file and its sidecars.
     ///
-    /// Refused when another process has the file open.
+    /// With `[replication]` on, also remove its replica, or keep it for
+    /// `database.fleet.replica_retention_after_delete`. Refused when another
+    /// process has the file open.
     Delete {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
@@ -3467,11 +3785,13 @@ enum FleetCommands {
         #[arg(long)]
         force: bool,
     },
-    /// Rebuild one database from its `[replication]` replica.
+    /// Rebuild one database from its `[replication]` replica, or replace it
+    /// with a local file.
     ///
-    /// Verifies the chain before it replaces the file, as
-    /// `autumn db replica restore` does. Refused when another process has the
-    /// file open.
+    /// From the replica, it verifies the chain before it replaces the file,
+    /// as `autumn db replica restore` does. With `--from`, it replaces the
+    /// file with a local backup, and replication is not needed. Refused when
+    /// another process has the file open.
     Restore {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
@@ -3480,11 +3800,73 @@ enum FleetCommands {
         #[arg(value_name = "KEY")]
         key: String,
         /// Restore to this RFC 3339 instant instead of the latest state.
-        #[arg(long, value_name = "RFC3339")]
+        #[arg(long, value_name = "RFC3339", conflicts_with = "from")]
         timestamp: Option<String>,
+        /// Restore from this local file (a `fleet backup`) instead of the
+        /// replica. Replication is not needed. The command applies pending
+        /// migrations to the copy.
+        #[arg(long, value_name = "FILE")]
+        from: Option<std::path::PathBuf>,
+        /// With `--from`: accept a backup of another key, and write this key
+        /// into its identity row.
+        #[arg(long, requires = "from")]
+        allow_rekey: bool,
+        /// With `--from`: restore a deleted key. This purges the replica of
+        /// the deleted database and drops its tombstone.
+        #[arg(long, requires = "from")]
+        clear_tombstone: bool,
         /// Confirm the replacement. Required on every profile.
         #[arg(long)]
         force: bool,
+    },
+    /// Run one SQL query over the replicas of every tenant (the lake).
+    ///
+    /// Restores each live tenant from `[replication]` into a private scratch
+    /// directory, copies its tables into one `SQLite` file with an
+    /// `_autumn_tenant` column, and runs `SQL_FILE` on it. Writes CSV: NULL is
+    /// empty, a blob is hex. Deleted tenants are skipped: their tombstone rows
+    /// come from the control database. It never opens the fleet root, so it
+    /// runs on a host with no volume.
+    Lake {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// A file with one SELECT, WITH or VALUES statement. `-` reads stdin.
+        #[arg(value_name = "SQL_FILE")]
+        sql: std::path::PathBuf,
+        /// Write the CSV to this file instead of stdout. It must not exist.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        /// Also keep the lake as a `SQLite` file. It must not exist. It holds
+        /// the rows of every tenant.
+        #[arg(long, value_name = "FILE")]
+        keep: Option<std::path::PathBuf>,
+        /// Restore each tenant to its newest state at or before this RFC 3339
+        /// instant. Each tenant is consistent on its own; tenants are not
+        /// taken at one common instant.
+        #[arg(long, value_name = "RFC3339")]
+        timestamp: Option<String>,
+        /// The number of tenants to restore at the same time. Each one needs
+        /// scratch space for a restored file.
+        #[arg(long, value_name = "N", default_value_t = 4,
+              value_parser = clap::value_parser!(u16).range(1..))]
+        concurrency: u16,
+        /// Load only this table. Repeat for more.
+        #[arg(long = "table", value_name = "TABLE")]
+        tables: Vec<String>,
+        /// Make the scratch directory under DIR (default: the system
+        /// temporary directory). It must exist and not be under the fleet root.
+        #[arg(long, value_name = "DIR")]
+        scratch: Option<std::path::PathBuf>,
+        /// Skip a tenant whose restore fails, and report it. By default it
+        /// fails the command.
+        #[arg(long)]
+        skip_failed: bool,
+        /// Read deleted tenants from the tombstone markers in object storage
+        /// only, and do not open the control database. A delete whose marker
+        /// is not written yet is then not seen.
+        #[arg(long)]
+        markers_only: bool,
     },
 }
 
@@ -3513,6 +3895,15 @@ impl FleetCommands {
             Self::Backup { profile, key, dest } => {
                 fleet::FleetCommand::Backup { profile, key, dest }
             }
+            Self::Import {
+                profile,
+                key,
+                source,
+            } => fleet::FleetCommand::Import {
+                profile,
+                key,
+                source,
+            },
             Self::Delete {
                 profile,
                 key,
@@ -3526,12 +3917,41 @@ impl FleetCommands {
                 profile,
                 key,
                 timestamp,
+                from,
+                allow_rekey,
+                clear_tombstone,
                 force,
             } => fleet::FleetCommand::Restore {
                 profile,
                 key,
                 timestamp,
+                from,
+                allow_rekey,
+                clear_tombstone,
                 force,
+            },
+            Self::Lake {
+                profile,
+                sql,
+                out,
+                keep,
+                timestamp,
+                concurrency,
+                tables,
+                scratch,
+                skip_failed,
+                markers_only,
+            } => fleet::FleetCommand::Lake {
+                profile,
+                sql,
+                out,
+                keep,
+                timestamp,
+                concurrency: usize::from(concurrency),
+                tables,
+                scratch,
+                skip_failed,
+                markers_only,
             },
         }
     }
@@ -4145,8 +4565,9 @@ enum ReleaseCommands {
     ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
     ///                                   connector, opt-in Memorystore Redis).
     /// --target kubernetes             : also emits a Helm chart (deploy/helm/) and a
-    ///                                   Kustomize base (deploy/kustomize/base/) with
-    ///                                   /startup, /live and /ready probes, a `preStop`
+    ///                                   Kustomize base (deploy/kustomize/base/). Each
+    ///                                   role gets its own workload (see --roles). Both
+    ///                                   have /startup, /live and /ready probes, a `preStop`
     ///                                   hook, a grace period longer than the drain
     ///                                   window, a `PodDisruptionBudget`, and opt-in
     ///                                   Argo Rollouts or Flagger canaries.
@@ -4158,13 +4579,19 @@ enum ReleaseCommands {
         /// aws-ecs | gcp-cloud-run | kubernetes (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
-        /// Scaffold a separate worker-role service in the generated
-        /// docker-compose.yml (opt-in split topology). The `app` service runs
-        /// the web role and a new `worker` service runs jobs+scheduler, both on
-        /// the shared `postgres` jobs backend. Only affects `--target
-        /// docker-compose`; the default output is a single combined service.
+        /// Scaffold a split topology. For `--target docker-compose`: the `app`
+        /// service runs the web role and a new `worker` service runs jobs and
+        /// the scheduler, both on the shared `postgres` jobs backend. For
+        /// `--target kubernetes` and `--target fly`: a `web` and a `worker`
+        /// workload. The default output is one combined service.
         #[arg(long)]
         split_workers: bool,
+        /// The roles that get a workload. Only for `--target kubernetes` and
+        /// `--target fly`. Each is a built-in role or a `[roles.<name>]`
+        /// preset in autumn.toml. Default: `combined`. With presets or
+        /// `--split-workers`: `web`, `worker`, then each preset.
+        #[arg(long, value_name = "ROLE", value_delimiter = ',')]
+        roles: Vec<String>,
     },
 }
 
@@ -5241,7 +5668,7 @@ fn run_command(command: Commands) {
                 profile: None,
                 // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
                 // the child pick its default (combined) or read its own env.
-                role: role.map(|r| r.as_str().to_owned()),
+                role,
                 // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3).
                 pin: normalize_pin(&pin),
             };
@@ -5384,6 +5811,17 @@ fn run_command(command: Commands) {
                 db::backup::run_offsite_list(profile.as_deref());
             }
             DbCommands::Replica(cmd) => db::replica::run(&cmd.into_command()),
+            DbCommands::Grants {
+                profile,
+                config,
+                apply,
+                json,
+            } => db::grants::run(&db::grants::GrantsArgs {
+                profile,
+                config,
+                apply,
+                json,
+            }),
             other => {
                 let (command, profile) = other.into_command();
                 db::run(&command, profile.as_deref());
@@ -5605,6 +6043,25 @@ fn run_command(command: Commands) {
                 trusted_proxies: &trusted_proxies,
                 quiet,
             }),
+            EdgeCommands::Bundle {
+                target,
+                capsule,
+                origin,
+                out,
+                name,
+                response_headers,
+                probe_path,
+                no_probe,
+            } => edge_bundle::run(&edge_bundle::BundleOptions {
+                target,
+                capsule: &capsule,
+                origin: origin.as_deref(),
+                out: &out,
+                name: name.as_deref(),
+                response_headers: &response_headers,
+                probe_path: &probe_path,
+                no_probe,
+            }),
             EdgeCommands::Ttfb {
                 edge: edge_url,
                 origin,
@@ -5783,26 +6240,34 @@ fn run_command(command: Commands) {
                 release: args.release,
             });
         }
-        Commands::Graph(command) => {
-            let (query, args) = match command {
-                GraphSubcommands::Show(args) => (graph::Query::Show, args),
-                GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
-                GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
-            };
-            let features = routes::CargoFeatures {
-                features: args.features,
-                all: args.all_features,
-                no_default: args.no_default_features,
-            };
-            graph::run(&graph::GraphOptions {
-                query,
-                package: args.package.as_deref(),
-                bin: args.bin.as_deref(),
-                manifest: args.manifest.as_deref(),
-                json: args.json,
-                check: args.check.as_deref(),
-                features,
-                release: args.release,
+        Commands::Graph(command) => run_graph(command),
+        Commands::Contracts(ContractsSubcommands::Export {
+            out,
+            from,
+            proto,
+            pass,
+        }) => {
+            contracts::run_export(&contracts::ExportOptions {
+                out,
+                from,
+                pass: pass.into_pass(),
+                avro: proto.to_avro(),
+                proto: proto.into_proto(),
+            });
+        }
+        Commands::Contracts(ContractsSubcommands::Check {
+            against,
+            current,
+            order,
+            allow_http,
+            pass,
+        }) => {
+            contracts::run_check(&contracts::CheckOptions {
+                against,
+                current,
+                order,
+                allow_http,
+                pass: pass.into_pass(),
             });
         }
         Commands::DataFlow(args) => {
@@ -6067,6 +6532,9 @@ fn run_command(command: Commands) {
                 path,
                 format,
                 strict,
+                features,
+                all_features,
+                no_default_features,
             } => {
                 let format = match format.as_str() {
                     "json" => a11y::OutputFormat::Json,
@@ -6078,9 +6546,14 @@ fn run_command(command: Commands) {
                         std::process::exit(2);
                     }
                 };
-                let code = a11y::run_in(
+                let code = a11y::run_in_with(
                     std::path::Path::new(&path),
                     a11y::A11yVerifyOptions { format, strict },
+                    &routes::CargoFeatures {
+                        features,
+                        all: all_features,
+                        no_default: no_default_features,
+                    },
                 );
                 std::process::exit(code);
             }
@@ -6546,10 +7019,10 @@ fn run_plugin_check_command(
         std::process::exit(1);
     });
 
-    let mut sensitive_routes: Vec<plugin_check::SensitiveRouteDecl> = Vec::new();
+    let mut sensitive_routes: Vec<plugin_check::SensitiveRoute> = Vec::new();
     for arg in sensitive_route_args {
         if let Some((path, desc)) = arg.split_once(':') {
-            sensitive_routes.push(plugin_check::SensitiveRouteDecl {
+            sensitive_routes.push(plugin_check::SensitiveRoute {
                 path_pattern: path.to_owned(),
                 auth_mechanism: desc.to_owned(),
             });
@@ -6690,6 +7163,7 @@ fn run_release_command(cmd: ReleaseCommands) {
             force,
             target,
             split_workers,
+            roles,
         } => {
             let t = target.as_deref().map_or(release::Target::Default, |s| {
                 s.parse().unwrap_or_else(|e| {
@@ -6701,6 +7175,7 @@ fn run_release_command(cmd: ReleaseCommands) {
                 force,
                 target: t,
                 split_workers,
+                roles,
             });
         }
     }
@@ -6819,13 +7294,27 @@ fn apply_plan(
     flags: generate::Flags,
     mode: ApplyMode,
 ) {
-    let result = plan.and_then(|p| match mode {
-        ApplyMode::Generate => p.execute(flags),
-        ApplyMode::Destroy => p.revert(flags),
-    });
+    let result = plan.and_then(|p| run_plan(p, flags, mode));
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Execute or revert `plan`, as the sole resource of this invocation.
+///
+/// Each `generate`/`destroy` process applies one plan, so the claim is true
+/// here. It lets `destroy` sweep files the templates no longer name (issue
+/// #2557).
+fn run_plan(
+    mut plan: generate::emit::Plan,
+    flags: generate::Flags,
+    mode: ApplyMode,
+) -> Result<(), generate::GenerateError> {
+    plan.claim_sole_resource();
+    match mode {
+        ApplyMode::Generate => plan.execute(flags),
+        ApplyMode::Destroy => plan.revert(flags),
     }
 }
 
@@ -7120,10 +7609,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                     |url| generate::tauri::plan_tauri_thin_client(&project_root, url),
                 )
             });
-            let result = plan.and_then(|p| match mode {
-                ApplyMode::Generate => p.execute(flags),
-                ApplyMode::Destroy => p.revert(flags),
-            });
+            let result = plan.and_then(|p| run_plan(p, flags, mode));
             match result {
                 Ok(()) => {
                     if mode == ApplyMode::Generate && !dry_run {
@@ -7164,10 +7650,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             };
             let plan =
                 guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root, opts));
-            let result = plan.and_then(|p| match mode {
-                ApplyMode::Generate => p.execute(flags),
-                ApplyMode::Destroy => p.revert(flags),
-            });
+            let result = plan.and_then(|p| run_plan(p, flags, mode));
             match result {
                 Ok(()) => {
                     if mode == ApplyMode::Generate && !dry_run {
@@ -7433,10 +7916,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 plan_flags,
             ) {
                 Ok(plugin_plan) => {
-                    let result = match mode {
-                        ApplyMode::Generate => plugin_plan.plan.execute(flags),
-                        ApplyMode::Destroy => plugin_plan.plan.revert(flags),
-                    };
+                    let result = run_plan(plugin_plan.plan, flags, mode);
                     match result {
                         Ok(()) => {
                             if mode == ApplyMode::Generate && !dry_run {
@@ -7484,6 +7964,50 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             }
         }
     }
+}
+
+/// Run one `autumn graph` subcommand.
+fn run_graph(command: GraphSubcommands) {
+    let (query, args) = match command {
+        GraphSubcommands::Show(args) => (graph::Query::Show, args),
+        GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
+        GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
+        GraphSubcommands::CheckBoundaries(args) => {
+            boundaries::run(&boundaries::CheckBoundariesOptions {
+                config: &args.config,
+                graph: args.graph.as_deref(),
+                baseline: args.baseline.as_deref(),
+                update_baseline: args.update_baseline,
+                json: args.json,
+                build: graph::BuildTarget {
+                    package: args.package.as_deref(),
+                    bin: args.bin.as_deref(),
+                    features: routes::CargoFeatures {
+                        features: args.features,
+                        all: args.all_features,
+                        no_default: args.no_default_features,
+                    },
+                    release: args.release,
+                },
+            });
+            return;
+        }
+    };
+    let features = routes::CargoFeatures {
+        features: args.features,
+        all: args.all_features,
+        no_default: args.no_default_features,
+    };
+    graph::run(&graph::GraphOptions {
+        query,
+        package: args.package.as_deref(),
+        bin: args.bin.as_deref(),
+        manifest: args.manifest.as_deref(),
+        json: args.json,
+        check: args.check.as_deref(),
+        features,
+        release: args.release,
+    });
 }
 
 #[cfg(test)]
@@ -7555,11 +8079,89 @@ mod tests {
                 profile: None,
                 key: "slot:00042".to_owned(),
                 timestamp: Some("2026-10-01T12:00:00Z".to_owned()),
+                from: None,
+                allow_rekey: false,
+                clear_tombstone: false,
                 force: false
+            }
+        );
+        assert_eq!(
+            fleet_command(&[
+                "lake",
+                "q.sql",
+                "--out",
+                "q.csv",
+                "--table",
+                "notes",
+                "--table",
+                "orders",
+                "--markers-only"
+            ]),
+            FleetCommand::Lake {
+                profile: None,
+                sql: std::path::PathBuf::from("q.sql"),
+                out: Some(std::path::PathBuf::from("q.csv")),
+                keep: None,
+                timestamp: None,
+                concurrency: 4,
+                tables: vec!["notes".to_owned(), "orders".to_owned()],
+                scratch: None,
+                skip_failed: false,
+                markers_only: true
             }
         );
         // Zero would migrate nothing at all.
         assert!(Cli::try_parse_from(["autumn", "fleet", "migrate", "--concurrency", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["autumn", "fleet", "lake", "q.sql", "--concurrency", "0"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fleet_restore_from_a_file_parses() {
+        use fleet::FleetCommand;
+        assert_eq!(
+            fleet_command(&[
+                "restore",
+                "tenant:acme",
+                "--from",
+                "/backups/acme.db",
+                "--allow-rekey",
+                "--clear-tombstone",
+                "--force"
+            ]),
+            FleetCommand::Restore {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                timestamp: None,
+                from: Some(std::path::PathBuf::from("/backups/acme.db")),
+                allow_rekey: true,
+                clear_tombstone: true,
+                force: true
+            }
+        );
+        // A file restore has no point in time.
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "fleet",
+                "restore",
+                "tenant:acme",
+                "--from",
+                "a.db",
+                "--timestamp",
+                "2026-10-01T12:00:00Z"
+            ])
+            .is_err()
+        );
+        // The file options need a file.
+        for flag in ["--allow-rekey", "--clear-tombstone"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "fleet", "restore", "tenant:acme", flag]).is_err(),
+                "{flag}"
+            );
+        }
     }
 
     #[test]
@@ -8084,6 +8686,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_edge_bundle_defaults() {
+        let cli =
+            Cli::try_parse_from(["autumn", "edge", "bundle", "--origin", "https://o.example"])
+                .unwrap();
+        match cli.command {
+            Commands::Edge {
+                command:
+                    EdgeCommands::Bundle {
+                        target,
+                        capsule,
+                        origin,
+                        out,
+                        name,
+                        response_headers,
+                        probe_path,
+                        no_probe,
+                    },
+            } => {
+                assert_eq!(target, edge_bundle::BundleTarget::Cloudflare);
+                assert_eq!(capsule, "target/wasm32-wasip1/release/edge-capsule.wasm");
+                assert_eq!(origin.as_deref(), Some("https://o.example"));
+                assert_eq!(out, "edge/cloudflare");
+                assert_eq!(name, None);
+                assert!(response_headers.is_empty());
+                assert_eq!(probe_path, "/");
+                assert!(!no_probe);
+            }
+            _ => panic!("expected edge bundle"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "edge", "bundle", "--target", "lambda"]).is_err(),
+            "an unknown target is a usage error"
+        );
+    }
+
+    #[test]
     fn parse_edge_ttfb() {
         let cli = Cli::try_parse_from([
             "autumn", "edge", "ttfb", "--edge", "http://e", "--origin", "http://o", "--path", "/a",
@@ -8402,6 +9040,31 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// #3543: `--role` takes a `[roles.<name>]` preset name. The app checks
+    /// that the name is declared. The CLI checks only the name grammar.
+    #[test]
+    fn serve_role_accepts_a_named_role() {
+        for (given, forwarded) in [
+            ("critical", "critical"),
+            ("Worker", "worker"),
+            ("jobs", "worker"),
+        ] {
+            let cli = Cli::try_parse_from(["autumn", "serve", "--role", given]).unwrap();
+            match cli.command {
+                Commands::Serve { role, .. } => {
+                    assert_eq!(role.as_deref(), Some(forwarded), "{given}");
+                }
+                _ => panic!("expected Serve command"),
+            }
+        }
+        for bad in ["a b", "", "1st"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "serve", "--role", bad]).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     /// Issue #1623, AC3: a worker-role process must be pinnable to a subset of
@@ -9119,6 +9782,48 @@ mod tests {
         assert!(force);
         assert_eq!(shard.as_deref(), Some("east"));
         assert!(!offsite);
+    }
+
+    #[test]
+    fn parse_db_grants() {
+        let cli = Cli::try_parse_from(["autumn", "db", "grants"]).unwrap();
+        let Commands::Db(DbCommands::Grants {
+            profile,
+            config,
+            apply,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected db grants");
+        };
+        assert_eq!(profile, None);
+        assert_eq!(config, std::path::PathBuf::from("boundaries.toml"));
+        assert!(!apply && !json);
+
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "grants",
+            "--apply",
+            "--json",
+            "--profile",
+            "prod",
+            "--config",
+            "crm/boundaries.toml",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Grants {
+            profile,
+            config,
+            apply,
+            json,
+        }) = cli.command
+        else {
+            panic!("expected db grants");
+        };
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(config, std::path::PathBuf::from("crm/boundaries.toml"));
+        assert!(apply && json);
     }
 
     #[test]
@@ -10010,6 +10715,147 @@ mod tests {
     }
 
     #[test]
+    fn parse_contracts_export_defaults_to_the_workspace_and_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "contracts", "export"]).expect("parses");
+        match cli.command {
+            Commands::Contracts(ContractsSubcommands::Export {
+                out,
+                from,
+                proto,
+                pass,
+            }) => {
+                assert!(out.is_none());
+                assert!(from.is_none(), "the default runs the pass");
+                assert!(pass.package.is_empty());
+                assert!(
+                    proto.into_proto().is_none(),
+                    "the default writes the bundle"
+                );
+            }
+            _ => panic!("expected contracts export"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_export_proto_with_its_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "export",
+            "--proto",
+            "--out",
+            "contracts/proto",
+            "--check",
+            "--http-annotations",
+            "--well-known-types",
+        ])
+        .expect("parses");
+        let Commands::Contracts(ContractsSubcommands::Export { proto, .. }) = cli.command else {
+            panic!("expected contracts export");
+        };
+        let proto = proto.into_proto().expect("proto");
+        assert_eq!(proto.lock, None, "the default is beside `--out`");
+        assert_eq!(
+            contracts::default_lock(std::path::Path::new("contracts/proto")),
+            PathBuf::from("contracts/proto.lock")
+        );
+        assert!(proto.check);
+        assert!(proto.options.http_annotations && proto.options.well_known_types);
+    }
+
+    #[test]
+    fn parse_contracts_export_avro_with_its_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "export",
+            "--avro",
+            "--out",
+            "contracts/avro",
+            "--endpoints",
+            "--check",
+        ])
+        .expect("parses");
+        let Commands::Contracts(ContractsSubcommands::Export { proto, out, .. }) = cli.command
+        else {
+            panic!("expected contracts export");
+        };
+        assert_eq!(out, Some(PathBuf::from("contracts/avro")));
+        let avro = proto.to_avro().expect("avro");
+        assert!(avro.check && avro.options.endpoints);
+        assert!(proto.into_proto().is_none(), "avro is not proto");
+    }
+
+    #[test]
+    fn parse_contracts_export_avro_needs_out_and_refuses_proto_options() {
+        for args in [
+            &["--avro"][..],
+            &["--avro", "--proto", "--out", "x"],
+            &["--endpoints", "--out", "x"],
+            &["--avro", "--lock", "x.lock", "--out", "x"],
+            &["--avro", "--http-annotations", "--out", "x"],
+            &["--check", "--out", "x"],
+        ] {
+            let mut argv = vec!["autumn", "contracts", "export"];
+            argv.extend(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn parse_contracts_export_proto_needs_out_and_its_options_need_proto() {
+        assert!(Cli::try_parse_from(["autumn", "contracts", "export", "--proto"]).is_err());
+        for flag in ["--check", "--http-annotations", "--well-known-types"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "contracts", "export", flag]).is_err(),
+                "{flag} without --proto"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "contracts", "export", "--lock", "x.lock"]).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_contracts_check_with_order_and_packages() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "check",
+            "--against",
+            "deployed.json",
+            "--order",
+            "caller-first",
+            "-p",
+            "mesh-catalog",
+            "-p",
+            "mesh-storefront",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Contracts(ContractsSubcommands::Check {
+                against,
+                current,
+                order,
+                allow_http,
+                pass,
+            }) => {
+                assert!(!allow_http, "https only by default");
+                assert_eq!(against, "deployed.json");
+                assert!(current.is_none());
+                assert_eq!(order, contracts::compat::Order::CallerFirst);
+                assert_eq!(pass.package, ["mesh-catalog", "mesh-storefront"]);
+            }
+            _ => panic!("expected contracts check"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_check_needs_against() {
+        assert!(Cli::try_parse_from(["autumn", "contracts", "check"]).is_err());
+    }
+
+    #[test]
     fn parse_openapi_export_out_and_strict() {
         let cli = Cli::try_parse_from([
             "autumn",
@@ -10336,8 +11182,11 @@ mod tests {
                     ref path,
                     ref format,
                     strict: false,
+                    ref features,
+                    all_features: false,
+                    no_default_features: false,
                 }
-            } if path == "." && format == "text"
+            } if path == "." && format == "text" && features.is_empty()
         ));
     }
 
@@ -10360,8 +11209,48 @@ mod tests {
                     ref path,
                     ref format,
                     strict: true,
+                    ref features,
+                    all_features: false,
+                    no_default_features: false,
                 }
-            } if path == "./crates/web" && format == "json"
+            } if path == "./crates/web" && format == "json" && features.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parse_a11y_verify_features() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "a11y",
+            "verify",
+            "--features",
+            "admin,db",
+            "--features",
+            "billing",
+            "--all-features",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::A11y {
+                action: A11ySubcommands::Verify {
+                    ref features,
+                    all_features: true,
+                    no_default_features: false,
+                    ..
+                }
+            } if features == &["admin,db".to_owned(), "billing".to_owned()]
+        ));
+        let cli =
+            Cli::try_parse_from(["autumn", "a11y", "verify", "--no-default-features"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::A11y {
+                action: A11ySubcommands::Verify {
+                    no_default_features: true,
+                    ..
+                }
+            }
         ));
     }
 
@@ -10471,6 +11360,35 @@ mod tests {
             panic!("expected release init");
         };
         assert!(!split_workers, "split_workers must default to false");
+    }
+
+    #[test]
+    fn parse_release_init_with_roles() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "release",
+            "init",
+            "--target",
+            "kubernetes",
+            "--roles",
+            "web,worker",
+            "--roles",
+            "critical",
+        ])
+        .unwrap();
+        let Commands::Release(ReleaseCommands::Init { roles, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(roles, ["web", "worker", "critical"]);
+    }
+
+    #[test]
+    fn parse_release_init_roles_default_empty() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { roles, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert!(roles.is_empty());
     }
 
     #[test]
@@ -12227,6 +13145,23 @@ mod tests {
         assert_eq!(warmup_ms, None);
         assert!((tolerance_rps - capacity::DEFAULT_RPS_TOLERANCE).abs() < f64::EPSILON);
         assert!((tolerance_p99 - capacity::DEFAULT_P99_TOLERANCE).abs() < f64::EPSILON);
+    }
+
+    /// The contract is TOML, and a TOML integer is a signed 64-bit number.
+    #[test]
+    fn parse_calibrate_refuses_a_seed_above_the_toml_integer_range() {
+        let largest = i64::MAX.to_string();
+        let cli = Cli::try_parse_from(["autumn", "calibrate", "--seed", &largest]).unwrap();
+        let Commands::Calibrate { seed, .. } = cli.command else {
+            panic!("expected Calibrate");
+        };
+        assert_eq!(seed, Some(u64::try_from(i64::MAX).unwrap()));
+
+        let too_large = (u64::try_from(i64::MAX).unwrap() + 1).to_string();
+        let Err(err) = Cli::try_parse_from(["autumn", "calibrate", "--seed", &too_large]) else {
+            panic!("a seed above the range must not parse");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

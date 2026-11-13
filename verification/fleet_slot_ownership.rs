@@ -4,7 +4,9 @@ verus! {
 
 // Model of the slot-ownership table of a SQLite fleet (issue #3233). Each spec
 // fn names the decision it models in `autumn/src/db/fleet_ownership.rs`
-// (`OwnershipTable`).
+// (`OwnershipTable`). `may_open` models the epoch stamp of an open
+// (`stamp_epoch` in `autumn/src/db/fleet/sqlite.rs`), which runs as one
+// transaction.
 //
 // The model shows one slot. A claim of a range changes every slot in the range
 // in the same way, so one slot is enough. `last` is the global epoch counter:
@@ -317,6 +319,83 @@ pub proof fn fenced_replicator_stops(old_epoch: nat, new_epoch: nat)
     requires old_epoch < new_epoch
     ensures !may_ship(old_epoch, new_epoch)
 {}
+
+/// Shipping is its own step: core checks the fence before each put of every
+/// ship mode (`ShipFence::check` in `autumn/src/replication/fence.rs`).
+/// `known` is the newest epoch this host saw. `newest` is the newest epoch
+/// marker at the destination.
+pub open spec fn may_put(mine: nat, known: nat, newest: nat) -> bool {
+    known <= mine && may_ship(mine, newest)
+}
+
+/// A put that the fence admits is a ship that `may_ship` admits.
+pub proof fn admitted_put_may_ship(mine: nat, known: nat, newest: nat)
+    requires may_put(mine, known, newest)
+    ensures may_ship(mine, newest)
+{}
+
+/// After a new owner writes its epoch marker, each put of the old owner is
+/// refused. A newer epoch this host saw refuses it too.
+pub proof fn fenced_put_is_refused(old_epoch: nat, new_epoch: nat, known: nat)
+    requires old_epoch < new_epoch
+    ensures
+        !may_put(old_epoch, known, new_epoch),
+        !may_put(old_epoch, new_epoch, 0),
+{}
+
+/// A grant can put until a newer grant: the fence never stops the current
+/// owner.
+pub proof fn grant_may_put(s: State, op: Op, known: nat, newest: nat)
+    requires
+        inv(s),
+        grants(s, op),
+        known <= s.last,
+        newest <= s.last,
+    ensures may_put(apply(s, op).slot.epoch, known, newest)
+{
+    grant_is_above_the_counter(s, op);
+}
+
+// ---- Open of a database file ----
+
+/// `FleetEngine::open`: an open under `epoch` accepts a file stamped at or
+/// below `epoch`. It refuses a file stamped above it. The check and the
+/// write are one atomic step.
+pub open spec fn may_open(stamp: nat, epoch: nat) -> bool {
+    stamp <= epoch
+}
+
+/// The stamp after an accepted open. It never goes down.
+pub open spec fn stamp_after_open(stamp: nat, epoch: nat) -> nat {
+    if stamp < epoch { epoch } else { stamp }
+}
+
+/// After the new owner opens the file, the old owner cannot open it.
+pub proof fn stale_owner_cannot_open(stamp: nat, old_epoch: nat, new_epoch: nat)
+    requires
+        old_epoch < new_epoch,
+        may_open(stamp, new_epoch),
+    ensures
+        stamp_after_open(stamp, new_epoch) == new_epoch,
+        !may_open(stamp_after_open(stamp, new_epoch), old_epoch),
+{}
+
+/// The current owner can open the file again with the same epoch.
+pub proof fn owner_can_open_again(stamp: nat, epoch: nat)
+    requires may_open(stamp, epoch)
+    ensures may_open(stamp_after_open(stamp, epoch), epoch)
+{}
+
+/// A grant from the table is never below a stamp the table issued.
+pub proof fn grant_can_open(s: State, op: Op, stamp: nat)
+    requires
+        inv(s),
+        grants(s, op),
+        stamp <= s.last,
+    ensures may_open(stamp, apply(s, op).slot.epoch)
+{
+    grant_is_above_the_counter(s, op);
+}
 
 fn main() {}
 

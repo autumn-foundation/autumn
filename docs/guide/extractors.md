@@ -67,13 +67,12 @@ how to decode structured query strings, and how to write your own.
 | `SeoMeta` | the route's `seo(...)` declaration, as a builder |
 | `Negotiate` | the client's preferred response format |
 
-Most of these are infallible: `Session`, `Consent`, `Flash`, and `CurrentPath`
-cannot reject a request, so taking one is never a way to turn a caller away.
-The exception is `CsrfToken`, and its failure is a **misconfiguration** rather
-than a bad request — it returns 500 when `CsrfLayer` is not enabled, because a
-handler asking for a token in an app that mints none is a setup bug, not
-something a client did. Take `Option<CsrfToken>` (infallible) on a route that
-must still render when CSRF is off.
+These are infallible: `Session`, `Consent`, `Flash`, `CurrentPath` and
+`CsrfToken` cannot reject a request, so taking one is never a way to turn a
+caller away. With CSRF off (`security.csrf.enabled = false`, the dev default),
+`CsrfToken` is empty and nothing checks it. To know whether CSRF is on, take
+`Option<CsrfToken>`: it is `None` with CSRF off. `CsrfLayer` does the check,
+not the extractor.
 
 ### Client identity behind a proxy
 
@@ -277,11 +276,17 @@ sees a nested object and reports a decode error naming the fix: type the field
 as a nested struct, or as `HashMap<String, serde_json::Value>` to accept either
 shape.
 
-### Bodies are unchanged
+### Bodies use other rules
 
-This is the **query string only**. `Form<T>` and
-`NestedChangesetForm` still decode request *bodies* through `serde_urlencoded`
-and the nested-row parser respectively. See [nested forms](./nested-forms.md).
+This is the **query string only**. Bodies have their own rules:
+
+- `Form<T>` decodes through `serde_urlencoded`. A repeated key on a struct
+  field is an error.
+- `ChangesetForm<T>`, `NestedChangesetForm` and
+  `autumn_web::form::from_urlencoded` put a repeated key into a `Vec<T>`
+  field. Brackets stay part of the key. See
+  [forms](./forms.md#multi-value-fields) and
+  [nested forms](./nested-forms.md).
 
 ### Why MCP tools care
 

@@ -1,0 +1,37 @@
+# Bolt profile: autumn-web/collab_edit
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+             441   13.6%  _int_free
+             403   12.4%  _int_malloc
+             348   10.7%  <core::hash::sip::Hasher as core::hash::Hasher>::write
+             319    9.8%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one
+             303    9.3%  malloc
+             217    6.7%  free
+             176    5.4%  <autumn_web::collab::text::CollabText>::mint
+             165    5.1%  <alloc::string::String as core::clone::Clone>::clone
+             115    3.5%  <autumn_web::collab::text::CollabText>::integrate
+             113    3.5%  __memcpy_avx_unaligned_erms
+             111    3.4%  <autumn_web::collab::text::CollabText>::try_integrate
+              91    2.8%  <hashbrown::map::HashMap>::insert
+              90    2.8%  collab_edit::main
+              63    1.9%  __rustc::__rdl_alloc
+              55    1.7%  <hashbrown::raw::RawTable>::reserve_rehash
+              52    1.6%  <autumn_web::collab::text::CollabText>::insert_after
+              35    1.1%  core::ptr::drop_glue
+              30    0.9%  core::str::count::char_count_general_case
+              22    0.7%  <core::str::iter::Chars as core::iter::traits::iterator::Iterator>::try_fold
+              20    0.6%  <autumn_web::collab::text::CollabText>::apply_ref
+              19    0.6%  __memcmp_avx2_movbe
+              16    0.5%  <alloc::string::String as core::iter::traits::collect::FromIterator>::from_iter
+              12    0.4%  alloc_perturb
+               7    0.2%  __rustc::__rdl_dealloc
+               7    0.2%  __rustc::__rust_alloc
+               7    0.2%  __rustc::__rust_no_alloc_shim_is_unstable_v2
+               7    0.2%  __rustc::__rust_dealloc
+               4    0.1%  <autumn_web::collab::text::CollabText>::len
+               2    0.1%  __memset_avx2_unaligned_erms
+
+           3,252  100.0%  TOTAL

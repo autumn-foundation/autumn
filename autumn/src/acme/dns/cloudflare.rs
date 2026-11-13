@@ -208,8 +208,13 @@ fn urlencode(value: &str) -> String {
 
 /// Suffixes of `fqdn` that could be its Cloudflare zone, most specific first.
 ///
-/// The `_acme-challenge` label itself is dropped, and a bare TLD is not offered
-/// as a zone candidate.
+/// The `_acme-challenge` label itself is kept on the leading candidate (see
+/// the function body for why), and a bare TLD is never offered as a zone
+/// candidate.
+///
+/// Byte-for-byte shared with [`route53`](super::route53)'s copy of the same
+/// ACME DNS-01 zone-discovery rule (issue #1620) — `zone_candidates_match_cloudflare`
+/// in `route53.rs` fails the build if the two drift.
 fn zone_candidates(fqdn: &str) -> Vec<String> {
     // The `_acme-challenge` label is NOT stripped: delegating
     // `_acme-challenge.example.com` to a zone of its own (so an ACME client

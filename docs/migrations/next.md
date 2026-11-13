@@ -78,87 +78,6 @@ full commit-level picture.
 
 ## Breaking changes
 
-### Commentable: the runtime helpers take `soft_delete: Option<bool>`
-
-**Why:** a model can have a `soft_delete` repository and a plain one. The
-helpers did not know the calling repository. Thus they returned `404` for a
-soft-deleted parent through both (#2284). The caller now gives the fact.
-
-This affects only direct calls to the `autumn_web::commentable` functions. The
-generated `{Model}Comments` methods (`repo.add_comment(...)` and so on) do not
-change. The generic router does not change.
-
-**Before (`0.8`):**
-
-```rust
-use autumn_web::commentable::comment_thread;
-
-let thread = comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None).await?;
-```
-
-**After (next release):**
-
-```rust
-use autumn_web::commentable::comment_thread;
-
-// `None`: the old behavior. Hide the parent if any repository soft-deletes.
-// `Some(true)` / `Some(false)`: your repository's own `soft_delete` setting.
-let thread =
-    comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None, None).await?;
-```
-
-Do the same for `add_comment`, `delete_comment` and
-`recompute_comment_count`: add `None` as the last argument.
-
-**Automation:** `manual` — the new argument depends on the calling
-repository. A codemod cannot know that repository.
-
-### Notifications and push: tables get a `tenant_id` column
-
-**Why:** both tables keyed rows on the bare user id. With `[tenancy]` on, two
-tenants can use the same id. Then they shared one feed and one set of devices
-(#2337). Each row now has a tenant. The framework fills it from the tenant it
-resolved for the request. It never reads it from the request body.
-
-The built-in stores query the new column. An old table gives an error that names
-`tenant_id`. Add the column and the index. Existing rows get `''`, the "no
-tenant" value. An app without tenancy needs nothing else.
-
-**Before (`0.8`):** no `tenant_id` column.
-
-**After (next release):**
-
-```sql
-ALTER TABLE notifications ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
-CREATE INDEX idx_notifications_tenant_recipient
-    ON notifications (tenant_id, recipient_id);
-
-ALTER TABLE push_subscriptions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
-CREATE INDEX idx_push_subscriptions_tenant_principal
-    ON push_subscriptions (tenant_id, principal_id);
-```
-
-If tenancy is on, existing rows must get their real tenant. No tenant can see a row
-that keeps `''`. Set it in the same migration. Use your own rule. For example,
-join to your users table:
-
-```sql
-UPDATE notifications n SET tenant_id = u.tenant_id
-FROM users u WHERE u.id = n.recipient_id;
-```
-
-Two more changes apply when tenancy is on:
-
-- `Notifications::topic(id)` returns `notifications:{tenant}:{id}` inside a
-  tenant scope. Publishers and subscribers must run in the same scope.
-- A job or script that has no request must call the stores inside
-  `autumn_web::tenancy::with_tenant`. Without a tenant, the store uses `''`.
-
-A custom `NotificationStore` or `PushSubscriptionStore` must scope its queries
-by the same tenant.
-
-**Automation:** `manual` — the backfill rule depends on your data.
-
 Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
 care about.
@@ -190,1411 +109,786 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
-### Jobs: `JobInfo` has a new `timeout` field
+### Database: `DatabaseConfig` has a `roles` field
 
-**Why:** A job can now set the longest time one run may take (issue #3051).
-`JobInfo` carries it as `timeout: Option<Duration>`.
+**Why:** each boundary can connect as its own Postgres role (issue #3550).
+`[database.roles.<boundary>]` sets the connection of that role.
 
-**Before (`0.8`):**
-
-```rust
-let info = JobInfo {
-    name: "export".to_string(),
-    max_attempts: 3,
-    initial_backoff_ms: 250,
-    queue: "default".to_string(),
-    uniqueness: None,
-    concurrency: None,
-    version: 1,
-    handler: export_handler,
-};
-```
-
-**After (`0.9`):**
-
-```rust
-let info = JobInfo {
-    name: "export".to_string(),
-    max_attempts: 3,
-    initial_backoff_ms: 250,
-    queue: "default".to_string(),
-    uniqueness: None,
-    concurrency: None,
-    version: 1,
-    timeout: None, // or Some(Duration::from_secs(30))
-    handler: export_handler,
-};
-```
-
-Code that uses `#[job]` or `JobInfo::new` does not change. `JobConfig` also
-has a new `default_timeout_ms` field: see the struct-literal note in the next
-section.
-
-**Automation:** `manual` — add `timeout: None` to each hand-written `JobInfo`
-literal. `#[job]` and `JobInfo::new` set it.
-
-### Schema: `ForeignKey` has `on_delete` and `on_update` fields
-
-**Why:** `#[references]` can now set a referential action (issue #1975). The
-IR `autumn_schema_core::ForeignKey` carries it as
-`on_delete` / `on_update: Option<ForeignKeyAction>`. `None` is `NO ACTION`.
-
-**Before (`0.8`):**
-
-```rust
-let fk = ForeignKey {
-    table: "users".to_string(),
-    column: "id".to_string(),
-};
-```
-
-**After (`0.9`):**
-
-```rust
-let fk = ForeignKey::new("users", "id")
-    .with_on_delete(Some(ForeignKeyAction::Cascade)); // or no call for NO ACTION
-```
-
-A struct literal also works with `on_delete: None, on_update: None`.
-
-A snapshot (`.autumn/schema-snapshot.json`) with an action is written as
-`snapshot_version` 2. An older `autumn` CLI refuses that file. Upgrade the
-CLI on each machine and CI job that reads the snapshot. A snapshot without an
-action stays at version 1. A snapshot from `autumn schema pull` before this
-release has no actions: run `autumn schema pull` again to record them.
-
-**Automation:** `manual` — use `ForeignKey::new`, or add the two fields to
-each `ForeignKey` literal.
-
-### Config: `AutumnConfig` gains a `cost` field
-
-**Why:** Per-request cost records and cost-aware deferral (issue #1720) need
-their own `[cost]` section. `AutumnConfig` has public fields and is not
-`#[non_exhaustive]`, so a new field breaks a struct literal. `Default` and
-`..AutumnConfig::default()` keep working.
+**You are affected only if your code builds a `DatabaseConfig` with a struct
+literal and no `..Default::default()`.** TOML and `AUTUMN_*` config need no
+change: an empty `roles` keeps one role.
 
 **Before (`{X.Y}`):**
 
 ```rust
-use autumn_web::config::AutumnConfig;
-
-let config = AutumnConfig {
-    server: my_server_config,
-    // …every other field spelled out…
-};
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-use autumn_web::config::AutumnConfig;
-
-let config = AutumnConfig {
-    server: my_server_config,
-    ..AutumnConfig::default()
-};
-```
-
-The new field is `pub cost: CostConfig`. Its default turns everything off, so an
-app that does not set `[cost]` behaves as before. `CostConfig` is
-`#[non_exhaustive]`: set its fields on a default value.
-
-**Automation:** `manual` — a codemod cannot know which fields a struct literal
-means to leave at their defaults.
-
-### Routes: `ScopedGroup` and `RouteInfo` gain a `layer_guarded` field
-
-**Why:** `AppBuilder::scoped_guarded` (issue #2468) declares that a layer guards
-a route group. The route listing must record that claim. `ScopedGroup` and
-`RouteInfo` have public fields and are not `#[non_exhaustive]`, so a new field
-breaks a struct literal that names every field.
-
-**Before (`{X.Y}`):**
-
-```rust
-let info = RouteInfo { method, path, /* …every other field… */ };
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-let info = RouteInfo { method, path, ..RouteInfo::default() };
-```
-
-`ScopedGroup` has no `Default`. Add `layer_guarded: false` to each literal. Most
-apps use `AppBuilder::scoped`, and need no change.
-
-**Automation:** `manual` — a codemod cannot know which fields a literal means to
-leave at their defaults.
-
-### Config: `AutumnConfig` gains a `fault_injection` field
-
-**Why:** Staging fault injection (issue #3071) needs its own
-`[fault_injection]` section. `AutumnConfig` is not `#[non_exhaustive]`, so a
-new field breaks a struct literal. `Default` and `..AutumnConfig::default()`
-keep working.
-
-**Before (`{X.Y}`):**
-
-```rust
-use autumn_web::config::AutumnConfig;
-
-let config = AutumnConfig {
-    server: my_server_config,
-    // …every other field spelled out…
-};
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-use autumn_web::config::AutumnConfig;
-
-let config = AutumnConfig {
-    server: my_server_config,
-    ..AutumnConfig::default()
-};
-```
-
-The new field is `pub fault_injection: FaultInjectionConfig`. The default is
-off, so an app with no `[fault_injection]` section does not change.
-`FaultInjectionConfig` is `#[non_exhaustive]`: set its fields on a default
-value.
-
-`capsule::schema::HttpErrorKind` (feature `reporting`) has a new variant,
-`FaultInjected`. An exhaustive `match` on it needs a new arm.
-
-**Automation:** `manual` — a codemod cannot know which fields a struct literal
-leaves at their defaults.
-
-### Admission: `Route`, `ServerConfig` and `HttpClientConfig` have new fields
-
-**Why:** Adaptive admission control (issue #3068) adds a route criticality,
-`[server.admission]` and `[http.client.adaptive_throttle]`. These structs have
-public fields and are not `#[non_exhaustive]`, so a struct literal does not
-compile. The route macros set `criticality` for you.
-
-**Before (`{X.Y}`):**
-
-```rust,ignore
-let route = autumn_web::Route {
-    // …
-    timeout: autumn_web::RouteTimeout::Inherit,
-    seo: Default::default(),
-};
-let client = autumn_web::config::HttpClientConfig {
-    timeout_secs: 10,
-    max_retries: 1,
-    max_retry_after_secs: 10,
-    max_backoff_ms: 20_000,
-    base_urls: Default::default(),
-};
-```
-
-**After (`{(X+1).0}`):**
-
-```rust,ignore
-let route = autumn_web::Route {
-    // …
-    timeout: autumn_web::RouteTimeout::Inherit,
-    criticality: autumn_web::Criticality::Default,
-    seo: Default::default(),
-};
-let client = autumn_web::config::HttpClientConfig {
-    timeout_secs: 10,
-    max_retries: 1,
-    ..Default::default()
-};
-```
-
-The new fields are `Route::criticality`, `ServerConfig::admission` and
-`HttpClientConfig::adaptive_throttle`. Their defaults change nothing: static
-admission, no throttle, and `default` criticality.
-
-`capsule::schema::HttpErrorKind` (feature `reporting`) has a new variant,
-`ThrottledLocally`. An exhaustive `match` on it needs a new arm.
-
-**Automation:** `manual` — add the field, or use `..Default::default()` where
-the struct has a default.
-
-### HTTP client: `retries(n)` no longer retries `POST` and `PATCH`
-
-**Why:** `.retries(n)` also turned on retries for non-idempotent methods. A
-request for more retries could then send a `POST` two times with no
-`Idempotency-Key` (issue #3054).
-
-**Before (`0.8`):**
-
-```rust
-// Retried the POST up to 2 times.
-client.post(url).retries(2).send().await?;
-```
-
-**After (`0.9`):**
-
-```rust
-// Retries the POST up to 2 times. Sends an `Idempotency-Key` header
-// (the same value on each attempt) if the request has none.
-client.post(url).retries(2).retry_non_idempotent().send().await?;
-```
-
-If you build a `RetryPolicy`, `HttpClientConfig` or `JobConfig` with a
-struct literal, add the new fields (`max_backoff`, `max_backoff_ms`, and on
-`JobConfig` also `default_timeout_ms`), or end the literal with
-`..Default::default()`.
-
-**Automation:** `manual` — the fix adds a call only where you want `POST` or
-`PATCH` retried. A codemod cannot know which calls are safe to repeat.
-
-### Scheduler: the Postgres backend needs the `autumn_scheduler_ticks` table
-
-**Why:** The advisory lock freed a tick when the leader finished, so a late
-replica ran the tick again (issue #3052). A row in a table keeps the tick
-claimed.
-
-**Before (`{X.Y}`):** `scheduler.backend = "postgres"` needed no table. Each
-tick held one pool connection while it ran.
-
-```toml
-[scheduler]
-backend = "postgres"
-```
-
-**After (`{(X+1).0}`):** the same config. On first use the runtime creates
-`autumn_scheduler_ticks`. If the app's database role cannot run
-`CREATE TABLE`, apply the DDL before you deploy. Then grant `SELECT`,
-`INSERT`, `DELETE` on the table and `USAGE` on its sequence:
-
-```rust
-// The DDL to apply:
-let ddl = autumn_web::scheduler::PG_TICK_TABLE_DDL;
-```
-
-Three behaviour changes come with it:
-
-- A row stays for the task's period plus `scheduler.lease_ttl_secs`. The
-  period is the fixed delay, or the time to the next cron occurrence.
-- **Rolling upgrade.** A new replica does not claim a tick while an old
-  replica holds its advisory lock for that tick. But an old replica that
-  reaches a tick after a new replica finished it runs the tick again, as old
-  replicas did before. To prevent this, stop the old scheduler replicas
-  before the new ones start (for example, deploy the `worker` role with a
-  recreate strategy).
-- A leader that crashes mid-tick does not free the tick. The next tick runs.
-- `PostgresAdvisorySchedulerCoordinator` is a deprecated alias of
-  `PostgresTickSchedulerCoordinator`.
-
-**Automation:** `manual` - it is a database privilege change, and no code
-rewrite applies.
-
-### Idempotency: `IdempotencyStore` is async
-
-**Why:** The Redis store called `block_in_place` on each operation. That
-panics on a current-thread runtime and holds a Tokio worker while Redis is
-slow (issue #3061).
-
-**Before (`{X.Y}`):**
-
-```rust
-impl IdempotencyStore for MyStore {
-    fn get(&self, key: &str) -> Option<IdempotencyEntry> { /* ... */ }
-    fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {}
-    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool { /* ... */ }
-    fn unlock(&self, key: &str) {}
+DatabaseConfig {
+    url: Some(url),
+    // ...every other field...
+    fleet: None,
 }
 ```
 
 **After (`{(X+1).0}`):**
 
 ```rust
-impl IdempotencyStore for MyStore {
-    fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
-        Box::pin(async move { /* ... */ })
-    }
-    fn set<'a>(
-        &'a self,
-        key: &'a str,
-        owner: &'a str,
-        record: IdempotencyRecord,
-        body_hash: Vec<u8>,
-        ttl: Duration,
-    ) -> IdempotencyFuture<'a, bool> {
-        Box::pin(async move { /* ... */ })
-    }
-    fn try_lock<'a>(&'a self, key: &'a str, owner: &'a str, ttl: Duration) -> IdempotencyFuture<'a, bool> {
-        Box::pin(async move { /* ... */ })
-    }
-    fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
-        Box::pin(async move { /* ... */ })
-    }
-    fn renew_lock<'a>(&'a self, key: &'a str, owner: &'a str, ttl: Duration) -> IdempotencyFuture<'a, bool> {
-        Box::pin(async move { /* ... */ })
-    }
+DatabaseConfig {
+    url: Some(url),
+    // ...every other field...
+    fleet: None,
+    roles: std::collections::BTreeMap::new(),
 }
 ```
 
-- Return an error from the backend. Do not log it and return a default: the
-  middleware fails closed on each error.
-- `try_get`, `try_set`, `try_lock_owned` and `unlock_owned` are removed. Put
-  their bodies in `get`, `set`, `try_lock` and `unlock`.
-- `unlock` must release the lock only when `owner` holds it.
-- `set` takes the lock `owner`. It must write nothing while another owner
-  holds a live lock on the key, or has stored a response for it that has not
-  expired: a request that outlived its lock must not replace the newer
-  request's response. Store the owner with the response to check this.
-- `set` returns `true` when it stored the response and `false` when another
-  owner fenced it out. The middleware and submit tokens treat `false` as a
-  failed write: `503`, with the key held until its in-flight TTL.
-- `renew_lock` is new and optional. It runs `owner`'s lock for `ttl` from now,
-  only while `owner` holds it. The middleware and submit tokens call it when
-  the work between taking the lock and running the handler used more than a
-  tenth of the in-flight TTL. Without it, the default returns `false`, and
-  such a request gets `409` instead of running the handler on a lock that
-  may have lapsed.
-- A direct call to a store method needs `.await`.
-
-**Automation:** `manual` - each method needs a new body and a new return
-type; no codemod can write them.
-
-### Idempotency: the in-flight lock expires after 60 s
-
-**Why:** When the record write failed after the handler, the key stayed
-locked for the in-flight TTL. That was 24 h. Retries got `409` for a day
-(issue #3061).
-
-**Before (`{X.Y}`):** `in_flight_ttl_secs = 86400`. `IdempotencyLayer::new`
-used the response TTL for the lock.
-
-**After (`{(X+1).0}`):** `in_flight_ttl_secs = 60`, for config and for
-`IdempotencyLayer::new`. The response TTL (`ttl_secs`) does not change.
-
-If a mutating request can run longer than 60 s, set the TTL above it:
-
-```toml
-[idempotency]
-in_flight_ttl_secs = 300
-```
-
-Otherwise a retry can run while the first request still runs. The database
-store with `IdempotencyTx::commit` stops the second commit. The memory and
-Redis stores do not.
-
-**Automation:** `manual` - it is a configuration default.
-
-### Metrics: `autumn_http_request_duration_seconds` is now a histogram
-
-**Why:** You cannot add summaries from different replicas (issue #3064). A
-histogram gives fleet p99 and SLO error ratios.
-
-**Before (`{X.Y}`):** the family was a summary with quantile lines.
-
-```promql
-autumn_http_request_duration_seconds{version="canary",quantile="0.99"}
-```
-
-**After (`{(X+1).0}`):** the family is a histogram with `method`, `route`
-and `status_class` labels. Compute a quantile from the buckets:
-
-```promql
-histogram_quantile(0.99,
-  sum by (le, version) (rate(autumn_http_request_duration_seconds_bucket[5m])))
-```
-
-The old quantile lines stay, deprecated, under a new name:
-`autumn_http_request_duration_quantiles_seconds`. For a quick fix, rename
-the family in your queries, alerts and canary gates. A later release removes
-the summary.
-
-**Automation:** `manual` - the change is in PromQL queries and dashboards,
-not in Rust code.
-
-### Telemetry: `TelemetryConfig` and `OtlpTraceRuntime` have a new field
-
-**Why:** The OTLP sampler takes a ratio now (issue #3064).
-
-**Before (`{X.Y}`):** a struct literal listed every field.
-
-```rust
-let telemetry = TelemetryConfig { enabled: true, /* every field */ strict: false };
-```
-
-**After (`{(X+1).0}`):** add `sample_ratio`, or fill the rest from
-`Default`.
-
-```rust
-let telemetry = TelemetryConfig { enabled: true, ..TelemetryConfig::default() };
-```
-
-`OtlpTraceRuntime` has a new `sample_ratio: SampleRatio` field too.
-
-**Automation:** `manual` - a codemod cannot pick the ratio for you.
-
-### WebSockets: `ws::WebSocket` and `ws::WebSocketUpgrade` are Autumn types
-
-**Why:** axum's socket sends no close frame when a message is too large, and
-it has no connection cap, ping or idle timer. The Autumn types apply the
-`[realtime]` limits (issue #3065).
-
-**Before (`{X.Y}`):** `autumn_web::ws::WebSocket` and
-`autumn_web::ws::WebSocketUpgrade` were re-exports of the axum types.
-
-```rust
-fn takes_axum(socket: axum::extract::ws::WebSocket) { /* ... */ }
-takes_axum(socket); // `socket` from a `#[ws]` handler
-```
-
-**After (`{(X+1).0}`):** they are Autumn wrappers. `recv`, `send`,
-`protocol`, `Stream`, `Sink` and `split()` work as before. A `#[ws]` handler
-(the `ws` feature) does not change. Code that needs the axum type calls
-`into_parts()` and keeps the returned `ConnectionHold` for the life of the
-socket. That socket has no `[realtime]` limits.
-
-Other changes on `WebSocketUpgrade`:
-
-- It has no type parameter, and no `on_failed_upgrade`,
-  `requested_protocols` or `set_selected_protocol`. Use `into_parts()`.
-- Its rejection type is `axum::response::Response`, not
-  `WebSocketUpgradeRejection`.
-- It extracts only where `AppState: FromRef<S>`. A plain `Router<()>`
-  needs axum's own `WebSocketUpgrade`.
-
-```rust
-let (socket, hold) = socket.into_parts();
-takes_axum(socket); // keep `hold` until the socket closes
-drop(hold);
-```
-
-**Automation:** `manual`. Only code that gives the socket to an API that uses
-the axum type must change. Decide if that socket keeps the limits.
-
-### Query budgets: an associated function handed the handle is reported (#2316)
-
-**Why:** `Post::published(&mut db)` and `ReportBuilder::build(&mut db)` have
-the same shape, so the analysis cannot tell a one-query finder from a helper
-that loops. It counted both as 1 query, and a helper could hide an N+1.
-
-This affects you only if a `#[query_budget(N)]` function gives a database or
-repository handle to `Type::f(…)`. The build fails with "`f` is handed the
-database handle". Put `#[query_cost(N)]` on the statement. An awaited
-constructor of a handle type (`PgPostRepository::new(&mut db).await`) is
-reported the same way.
-
-**Before (`{X.Y}`):**
-
-```rust
-#[query_budget(1)]
-async fn index(mut db: Db) -> AutumnResult<Markup> {
-    let posts = Post::published(&mut db).await?;
-    Ok(render(&posts))
-}
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-#[query_budget(1)]
-async fn index(mut db: Db) -> AutumnResult<Markup> {
-    #[query_cost(1)]
-    let posts = Post::published(&mut db).await?;
-    Ok(render(&posts))
-}
-```
-
-**Automation:** `manual` — the cost of each helper is a fact only its author
-knows, so no codemod can write the `N` in `#[query_cost(N)]`.
-
-### Query budgets: a method that borrows a container of handles is reported (#2316)
-
-**Why:** Rust looks for a `self` method before a `&self` method, and for a
-`&self` method before a `&mut self` method. So an application trait method
-`len(self)` on `Vec<PgPostRepository>` runs in place of `Vec::len`, and it
-can query. The analysis has no type information to rule that out.
-
-This affects you only if a `#[query_budget(N)]` function calls a method that
-borrows a `Vec`, `Option`, `Result`, map or set of a handle type
-(`repos.len()`, `repos.push(repo)`, `repos.iter()`, `maybe.as_ref()`). The
-build fails with "`len` is called on a container of database handles". Read
-the container with an index, a pattern, a `for` loop or a method that takes
-`self`, or put `#[query_cost(N)]` on the statement.
-
-**Before (`{X.Y}`):**
-
-```rust
-#[query_budget(1)]
-async fn first(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
-    let n = repos.len();
-    let Some(repo) = repos.first() else { return Ok(0) };
-    Ok(n + repo.find_all().await?.len())
-}
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-#[query_budget(1)]
-async fn first(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
-    #[query_cost(0)]
-    let n: usize = repos.len();
-    let [repo, ..] = &repos[..] else { return Ok(0) };
-    Ok(n + repo.find_all().await?.len())
-}
-```
-
-What a borrowing method gives may hold handles, so give its binding a type
-made only of standard and primitive types (`let n: usize`). Without it, a
-later use of `n` is reported too.
-
-**Automation:** `manual` — the fix depends on what the call reads, and no
-codemod can choose between an index, a pattern and `#[query_cost(N)]`.
+**Automation:** `manual` — add `roles: BTreeMap::new()`, or end the literal
+with `..Default::default()`. A codemod cannot know which ending the app wants.
 
 ---
 
-### Config: the `prod` profile enables `strict_config` and new protections
+### Graph: `NodeKind`, `GraphNode` and `Completeness` have new members
 
-**Why:** The `prod` profile shipped with its protections off. A misspelled
-timeout key took the default in silence. A slow database caused readiness to
-flap across the fleet, instead of an early `503` (issue #3057).
+**Why:** role-aware background tasks (issue #3545) appear in the
+architecture graph. `NodeKind` has a new variant `BackgroundTask`. `GraphNode`
+has a new field `background`. `Completeness` has a new field
+`background_tasks`. `NodeKind` and `GraphNode` are not `#[non_exhaustive]`.
 
-**Before (`{X.Y}`):** with `AUTUMN_PROFILE=prod`, this booted, and
-`statement_timeout` stayed unset:
+**You are affected only if your code matches on `NodeKind` with no wildcard
+arm, or builds a `GraphNode { .. }` or `Completeness { .. }` literal.**
 
-```toml
-[database]
-statment_timeout = "5s"   # misspelled
+**Before (`{X.Y}`):**
+
+```rust,ignore
+match node.kind {
+    NodeKind::Job | NodeKind::ScheduledTask | NodeKind::OneOffTask => "job",
+    // …
+}
+let node = GraphNode { /* … */ job: None };
 ```
 
-**After (`{(X+1).0}`):** the same file stops the boot with "Strict config
-check failed. Unknown keys in configuration". Correct the key, or turn the
-check off:
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+match node.kind {
+    NodeKind::Job | NodeKind::ScheduledTask | NodeKind::OneOffTask => "job",
+    NodeKind::BackgroundTask => "background task",
+    // …
+}
+let node = GraphNode { /* … */ job: None, background: None };
+```
+
+`Completeness` derives `Default`. Use `..Default::default()` in a literal.
+
+**Automation:** `manual` — a new arm needs a label that only the caller can
+choose.
+
+---
+
+### Fleet: `DatabaseFleetConfig` and `FleetStats` have new fields
+
+**Why:** a fleet has a memory budget next to `max_open` (issue #3642,
+ADR 0040). `DatabaseFleetConfig` has a new field `max_resident_bytes`.
+`FleetStats` has the new fields `resident_bytes` and `max_resident_bytes`,
+and is now `#[non_exhaustive]`.
+
+**You are affected only if your code builds a `DatabaseFleetConfig` with a
+struct literal and no `..` spread, or builds a `FleetStats`.** TOML and
+`AUTUMN_*` config need no change: the default `0` means no budget.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    // ...every other field...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    max_resident_bytes: 0,
+    // ...every other field...
+}
+```
+
+**Automation:** `manual` — add `max_resident_bytes: 0`. A codemod cannot
+know the budget the app wants. Only the fleet builds a `FleetStats`: read it
+from `DatabaseFleet::stats`.
+
+---
+
+### Fleet: `max_open_policy` adds a field and an error
+
+**Why:** an app can make `max_open` a hard limit (issue #3538).
+`DatabaseFleetConfig` has a new field `max_open_policy`. `FleetError` has a
+new variant `AtCapacity` (`503`). `FleetStats` has the new fields `peak_open`,
+`over_cap_opens_total` and `refused_total`.
+
+**You are affected only if your code builds a `DatabaseFleetConfig` with a
+struct literal and no `..` spread, or matches `FleetError` without a
+wildcard arm.** TOML and `AUTUMN_*` config need no change: the default
+`"soft"` keeps the old behavior.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    // ...every other field...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    max_open_policy: FleetMaxOpenPolicy::Soft,
+    // ...every other field...
+}
+```
+
+**Automation:** `manual` — add `max_open_policy: FleetMaxOpenPolicy::Soft`,
+and a `FleetError::AtCapacity { .. }` arm (it answers `503`).
+
+---
+
+### Fleet: `ShipMode::Continuous` carries a shipper
+
+**Why:** core ships the databases of every engine and checks the fence
+before each write
+(ADR 0040 §5). `ShipMode` has a new mode, `Generations { every }`.
+`Continuous` carries the shipper that core drives, an `Arc<dyn
+ContinuousShipper>`. So `ShipMode` is no longer `Copy`, `PartialEq` or `Eq`.
+`ContinuousShipper` is sealed: only `SqliteEngine` uses `Continuous`.
+
+**You are affected only if your code matches or compares a `ShipMode`, or
+your engine returned `ShipMode::Continuous`.** An engine plugin that returned
+`ShipMode::Rebuild` needs no change. An engine that returned
+`ShipMode::Continuous` must return `ShipMode::Generations { every }`. Core
+does not let a plugin give a continuous shipper.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+if engine.ship_mode() == ShipMode::Continuous {
+    // ...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+if matches!(engine.ship_mode(), ShipMode::Continuous(_)) {
+    // ...
+}
+```
+
+`DatabaseFleet::install_replication` now works for any engine, and its
+signature does not change. `FleetStats` has the new fields `ship_mode` and
+`rpo_secs`; it is `#[non_exhaustive]`, so a read needs no change.
+
+**Automation:** `manual` — a codemod cannot know which comparison the code
+wants.
+
+---
+
+### Database: `DatabaseConfig` and `DatabaseFleetConfig` have `mmap_size` and `cache_size_kib`
+
+**Why:** an app can turn on SQLite memory-mapped reads and a larger page
+cache. Both fields are `0` (off) by default. See
+[Memory-mapped reads](../guide/sqlite-in-production.md#memory-mapped-reads-and-the-page-cache).
+
+**You are affected only if your code builds a `DatabaseConfig` with a struct
+literal and no `..Default::default()`, or builds a `DatabaseFleetConfig` with
+a struct literal.** TOML and `AUTUMN_*` config need no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    // ...every other field...
+    replication_workers: 4,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    // ...every other field...
+    replication_workers: 4,
+    mmap_size: 0,
+    cache_size_kib: 0,
+}
+```
+
+Add the same two fields to a `DatabaseConfig` literal, or end it with
+`..Default::default()`.
+
+**Automation:** `manual` — `0` keeps the old behavior, but a codemod cannot
+know if the app wants a different value.
+
+### Deploy: `DeployConfig` has a `groups` field
+
+**Why:** `[[deploy.groups]]` puts a role on a group of fleet hosts. The
+field is empty by default. See
+[Per-group roles](../guide/fleet-deploys.md#per-group-roles).
+
+**You are affected only if your code builds a `DeployConfig` with a struct
+literal and no `..Default::default()`.** TOML and `AUTUMN_*` config need no
+change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DeployConfig {
+    host: Some("10.0.0.1".to_owned()),
+    // ...every other field...
+    bake: DeployBakeConfig::default(),
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DeployConfig {
+    host: Some("10.0.0.1".to_owned()),
+    // ...every other field...
+    bake: DeployBakeConfig::default(),
+    groups: Vec::new(),
+}
+```
+
+**Automation:** `manual` — an empty list keeps the old behavior.
+
+### Release: regenerated Kubernetes output has one workload per role
+
+**Why:** `autumn release init --target kubernetes` now writes one workload per
+role. See [One workload per role](../guide/kubernetes.md#one-workload-per-role).
+
+**You are affected only if you run `autumn release init --target kubernetes
+--force` again over an earlier output.** Files you do not regenerate keep
+working.
+
+- Object names change from `<name>` to `<name>-<role>`, for example
+  `shop-combined`. An upgrade replaces the Deployment and the Service. Point
+  an Ingress or a `flagger.ingressRef` outside the chart at the new Service.
+- The Helm value `replicaCount` moved to `roles.<name>.replicaCount`. The
+  chart refuses to render when a values file still sets `replicaCount`. Move
+  the value:
+
+  ```yaml
+  # Before
+  replicaCount: 5
+  # After
+  roles:
+    combined:
+      replicaCount: 5
+  ```
+
+- The Kustomize `deployment.yaml`, `service.yaml` and `pdb.yaml` moved from
+  `base/` to `components/<role>/`. Change the target names in your overlay
+  patches, for example `shop` to `shop-combined`.
+
+**Automation:** `manual` — the generator cannot see your overlays and values
+files.
+
+---
+
+### Events: `#[event]` derives `WireShape` and refuses what it cannot read
+
+**Why:** an event payload is a wire contract between a producer and its
+consumers. `#[event]` now records the payload's shape, so a `#[listener]`
+that reads a field the event does not send fails the build.
+
+**You are affected only if an `#[event]` type is generic, an enum, a tuple
+struct, uses `#[serde(flatten)]`, `#[serde(transparent)]`, `#[serde(into)]`,
+`#[serde(from)]`, `#[serde(try_from)]`, `#[serde(tag)]`, a split `rename`, or
+also has `#[derive(WireShape)]`.** Other events need no change. Their topic
+does not change.
+
+**You are also affected if a `#[listener]` reads a field with
+`#[serde(skip_serializing)]` or `#[serde(skip_deserializing)]`.** That read
+never got the value. The build now fails at the read. Stop reading the
+field, or remove the skip.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[event]
+struct PageLoaded {
+    #[serde(flatten)]
+    counts: BTreeMap<String, i64>,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[event(opaque)]
+struct PageLoaded {
+    #[serde(flatten)]
+    counts: BTreeMap<String, i64>,
+}
+```
+
+An `#[event]` that also derives `WireShape` drops the derive: `#[event]`
+implements it now.
+
+**Automation:** `manual` — `opaque` turns the check off. A codemod cannot know
+if the app wants that, or a payload the check can read.
+
+---
+
+### Wire contracts: the export refuses a field type it cannot compare
+
+**Why:** `autumn contracts check` compared a nested type by its name only, so
+a change inside it was not seen. The export now puts each nested
+`WireShape` type in the bundle. A field type with no descriptor cannot be
+compared, so the export stops rather than approve it by name.
+
+**You are affected only if you run `autumn contracts export` or
+`autumn contracts check`, and a `WireShape` or `#[event]` field has a type
+that is not a `WireShape` type and not a known leaf.** Known leaves are
+primitives, `String`, standard containers, `serde_json::Value`, `Uuid`,
+`chrono` and `time` types, `Decimal`, `Url`, and similar. An enum field is
+the usual case. The build does not change.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    pub id: String,
+    pub status: Status,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    pub id: String,
+    #[wire(opaque)]
+    pub status: Status,
+}
+```
+
+`#[wire(opaque)]` compares the field by its type name, as before. For a
+struct, derive `WireShape` on it instead, so the check compares its fields.
+
+The export also writes bundle format 3. An older CLI refuses it. Upgrade the
+CLI on every job that reads the bundle. This CLI still reads formats 1 and 2.
+
+A bare type name that two reachable crates define now stops the export.
+Write the full path in the handler signature, for example
+`Json<shared::Item>` or `Json<crate::dto::Item>`.
+
+Type descriptor files now hold the module in their name. Delete
+`target/autumn-contracts` once after the upgrade, so an old file does not
+change a build message.
+
+**Automation:** `manual` — only the app knows if a type should get a shape
+or stay opaque.
+
+---
+
+### Wire contracts: bundle format 4
+
+**Why:** each field now records its wire type, the JSON form serde writes.
+The check compares it, so a new JSON form with the same Rust type is
+reported. An older CLI would not compare wire types, so it refuses the new
+format.
+
+**You are affected only if a job reads a bundle from
+`autumn contracts export` with an older CLI.** The build does not change.
+
+**Before (`{X.Y}`):**
+
+```bash
+autumn contracts check --against deployed.json  # CLI {X.Y}, bundle format 3
+```
+
+**After (`{(X+1).0}`):**
+
+```bash
+autumn contracts check --against deployed.json  # CLI {(X+1).0}, bundle format 4
+```
+
+Upgrade the CLI on every job that reads the bundle. This CLI reads formats
+1 to 4. When one of the two bundles is format 3 or older, the check
+does not compare wire types.
+
+**Automation:** `manual` — upgrade the CLI in each job.
+
+---
+
+### State: `AppState` getters are no longer `const fn`
+
+**Why:** `AppState` holds its fields behind one `Arc`, so a clone is one
+reference count (issue #3168). A `const fn` cannot read through an `Arc`.
+These getters lost `const`: `pool`, `replica_pool`, `shards`, `metrics`,
+`log_levels`, `task_registry`, `job_registry`, `config_props`,
+`metrics_source_registry`, `health_indicator_registry`, `probes`,
+`policy_registry`, `forbidden_response`, `with_forbidden_response`, `role`,
+`capabilities`, `channels`, `presence` and `collab`.
+
+**You are affected only if your code calls one of them from a `const fn`.**
+No `AppState` value can exist in a const context, so such a call cannot run.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+const fn metrics_of(state: &AppState) -> &MetricsCollector {
+    state.metrics()
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+fn metrics_of(state: &AppState) -> &MetricsCollector {
+    state.metrics()
+}
+```
+
+**Automation:** `manual` — remove `const` from the caller.
+
+---
+
+### Outbox: `OutboxConfig` has `destinations` and `inbox` fields
+
+**Why:** the relay can send a topic to another service, and an app can take
+messages from another service (issue #3553). `[outbox.destinations.<name>]`
+and `[outbox.inbox]` set this.
+
+**You are affected only if your code builds an `OutboxConfig` with a struct
+literal and no `..` spread.** TOML and `AUTUMN_*` config need no change: no
+destination and a disabled inbox keep the old behavior.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+OutboxConfig {
+    enabled: true,
+    // ...every other field...
+    retention_ms: 604_800_000,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+OutboxConfig {
+    enabled: true,
+    // ...every other field...
+    retention_ms: 604_800_000,
+    destinations: std::collections::BTreeMap::new(),
+    inbox: OutboxInboxConfig::default(),
+}
+```
+
+`TestApp::with_outbox` is no longer `const fn`. No `TestApp` value can exist
+in a const context, so no call changes.
+
+**Automation:** `manual` — add the two fields, or end the literal with
+`..OutboxConfig::default()`. A codemod cannot know which ending the app
+wants.
+
+### Metrics: `MetricsSnapshot` has a `db_connection_holds` field and is non-exhaustive
+
+**Why:** the `Db` extractor recorded its connection hold time as a query,
+under `db_queries["<route> SELECT"]` (issue #3579). The hold now has its own
+map, `db_connection_holds`, keyed by the route. See
+[Metrics: the `"<route> SELECT"` key is deprecated](#metrics-the-route-select-key-is-deprecated).
+
+`MetricsSnapshot` is now `#[non_exhaustive]`, so a later field does not
+break your code.
+
+**You are affected only if your code builds a `MetricsSnapshot` with a
+struct literal, or destructures one without `..`.** Code that reads
+`/actuator/metrics` or calls `MetricsCollector::snapshot` needs no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+MetricsSnapshot {
+    http,
+    idempotency,
+    db_queries,
+    read_your_writes_pins_total: 0,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+// A literal does not compile. Get the snapshot from the collector.
+let snapshot = state.metrics().snapshot();
+// A destructure ends with `..`.
+let MetricsSnapshot { db_queries, db_connection_holds, .. } = snapshot;
+```
+
+**Automation:** `manual` — a test that builds a snapshot by hand must record
+into a `MetricsCollector` and call `snapshot()`. A codemod cannot write those
+samples.
+
+### Graph: `CrateGraph` has a `bins` field and is non-exhaustive
+
+**Why:** a boundary package now also covers its renamed `[[bin]]` targets
+(issue #3599). `CrateGraph::bins` holds the binary names of each package.
+
+`CrateGraph` is now `#[non_exhaustive]`, so a later field does not break your
+code.
+
+**You are affected only if your code builds a `CrateGraph` with a struct
+literal, or destructures one without `..`.** `autumn graph check-boundaries`
+and `boundaries.toml` need no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let crates = CrateGraph { deps, libs };
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let mut crates = CrateGraph::default();
+crates.deps = deps;
+crates.libs = libs;
+// A destructure ends with `..`.
+let CrateGraph { deps, libs, .. } = crates;
+```
+
+**Automation:** `manual` — start from `CrateGraph::default()` and set the
+fields.
+
+---
+
+### Features: the `cluster` module is optional
+
+**Why:** `autumn_web::cluster` was 3% of the code that `autumn-web` compiles, in
+every app (issue #2795, ADR 0045). It now has the `cluster` feature. The
+feature is in `default`, so a default build does not change.
+
+**You are affected only if your app sets `default-features = false` and uses
+`autumn_web::cluster` or `[cluster] enabled = true`.** The compiler reports
+``error[E0432]: unresolved import `autumn_web::cluster` ``. Without the
+feature, `[cluster]` still parses, and `enabled = true` fails boot with a
+validation error.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "cluster"] }
+```
+
+**Automation:** `manual` — a codemod cannot know if the app uses the
+cluster. Add the feature only if it does.
+
+---
+
+### Features: failure capture needs `reporting`
+
+**Why:** the `reporting` feature had two parts: the panic-catch layer and
+failure capture (issue #2795, ADR 0046). The panic-catch layer now has its
+own feature, `error-reporting`. `reporting` turns it on and adds failure
+capture, so a manifest that names `reporting` builds the same code as
+before. Both are in `default`.
+
+**You are affected only if your app sets `default-features = false`, does not
+name `reporting`, and sets `[failure_capture] enabled = true`.** Before,
+that build did not know the section and wrote no capsule. Now the section
+parses, and boot fails with a validation error that names the feature.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):** add `"reporting"`, or set
+`failure_capture.enabled = false`.
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "reporting"] }
+```
+
+An app that wants the panic-catch layer and no failure capture names
+`"error-reporting"`.
+
+**Automation:** `manual` — a codemod cannot know if the app wants failure
+capture.
+
+---
+
+### Features: `plugin-conformance`, `runtime-config` and `axum-ws`
+
+**Why:** each app compiled the plugin conformance harness, the runtime-config
+store and axum's WebSocket code, used or not (issue #2795, ADR 0049). Each
+now has a feature. The three features are in `default`, so a default build
+does not change.
+
+**You are affected only if your app or plugin sets `default-features = false`
+and uses one of these:**
+
+| You use | The compiler reports | Add |
+|---------|----------------------|-----|
+| `autumn_web::plugin_conformance` | ``unresolved import `autumn_web::plugin_conformance` `` | `plugin-conformance` |
+| `autumn_web::runtime_config`, `CostSignal::sync_from` | ``could not find `runtime_config` in `autumn_web` `` | `runtime-config` |
+| axum's `extract::ws` or `extract::WebSocketUpgrade`, through `autumn_web::reexports::axum` or your own `axum` dependency | ``could not find `ws` in `extract` ``, or ``no `WebSocketUpgrade` in `axum::extract` `` | `axum-ws` |
+
+`ws` turns `axum-ws` on, so an app that names `ws` does not change. An app
+that turns `ws` on in its own `axum` dependency does not change. An app
+that has its own `axum` dependency without `ws` adds `axum-ws` here, or
+`ws` there: before, `autumn-web` turned `ws` on for it.
+Without `runtime-config`, the cost signal does not follow the runtime-config
+key. Set it from code with `CostSignal::set`.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):** add only the features that the app uses.
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "plugin-conformance", "runtime-config", "axum-ws"] }
+```
+
+**Automation:** `manual` — a codemod cannot know which of the three the app
+uses.
+
+---
+
+### Config: a section is a table, not an array
+
+**Why:** the config reader compiled code that reads each config struct from
+an array, by field position (issue #2795, ADR 0049). No guide shows that
+form. The reader now reads a struct from a table only, and `autumn-web`
+compiles less code.
+
+**You are affected only if `autumn.toml` gives the fields of a section as an
+array.** Boot fails with
+``invalid type: sequence, expected struct ServerConfig`` and the key,
+``in `server` ``. An array of tables (`[[database.shards]]`) and an array
+value (`allowed_origins = ["https://a.example"]`) do not change.
+
+**Before (`{X.Y}`):**
+
+```toml
+server = [8080, "0.0.0.0"]
+```
+
+**After (`{(X+1).0}`):**
 
 ```toml
 [server]
-strict_config = false     # or AUTUMN_SERVER__STRICT_CONFIG=false
+port = 8080
+host = "0.0.0.0"
 ```
 
-The `prod` profile also changes these defaults. Each has a one-line opt-out:
-
-| Default in `prod` | Opt-out |
-| --- | --- |
-| Load shedding at primary pool size × 32, at least 256 | `server.max_concurrent_requests = 0` |
-| `database.statement_timeout = "30s"` | `statement_timeout = "0s"` |
-| `database.idle_in_transaction_timeout = "60s"` | `idle_in_transaction_timeout = "0s"` |
-
-Every profile also gets a migration `lock_timeout` of `5s` with `5` jittered
-retries, in each transactional migration. Opt out with
-`database.migration_lock_timeout = "0s"`. The `autumn migrate` CLI passes the
-timeout to `diesel` in `PGOPTIONS`. Run migrations against Postgres directly,
-not through a transaction pooler.
-
-A long report query that runs inside a request now stops at `30s`. Give that
-route a `StatementTimeout` extension, or raise the global value.
-
-**Automation:** `manual` — this is a configuration and behaviour change, and no
-code rewrite applies.
-
-### Capacity: `AdmissionLimit` is `#[non_exhaustive]` and has a new variant
-
-**Why:** The `prod` profile default ceiling needs its own source
-(`AdmissionLimit::ProfileDefault`, issue #3057).
-
-**Before (`{X.Y}`):**
-
-```rust
-match limit {
-    AdmissionLimit::Configured(n) | AdmissionLimit::Contract(n) => Some(n),
-    AdmissionLimit::Unlimited => None,
-}
-```
-
-**After (`{(X+1).0}`):** use `limit.limit()`, or add a wildcard arm:
-
-```rust
-let ceiling: Option<usize> = limit.limit();
-```
-
-**Automation:** `manual` — a new enum variant needs a new match arm, and no
-safe rewrite can choose its body.
-
-### Config: `HealthConfig` gains four public fields
-
-**Why:** `/ready` now pings the primary database. The new fields set the
-ping cache, the ping time limit, and which pings gate `/ready` (issue #3059).
-
-**Before (`{X.Y}`):** a struct literal listed every field.
-
-```rust
-let health = autumn_web::config::HealthConfig {
-    enabled: true,
-    path: "/health".into(),
-    live_path: "/live".into(),
-    ready_path: "/ready".into(),
-    startup_path: "/startup".into(),
-    detailed: false,
-};
-```
-
-**After (`{(X+1).0}`):** add `..HealthConfig::default()`. It sets
-`cache_ttl_ms = 1000`, `ping_timeout_ms = 2000`, `db_readiness = true` and
-`redis_readiness = false`.
-
-```rust
-let health = autumn_web::config::HealthConfig {
-    detailed: false,
-    ..autumn_web::config::HealthConfig::default()
-};
-```
-
-**Automation:** `manual` - the fix adds a struct update expression, and no
-codemod rewrites struct literals.
-
-### Config: `TenancyConfig`, `JobConfig` and `JobPostgresConfig` have new fields
-
-**Why:** per-tenant bulkheads, tenant job lanes and shard-local jobs (issue
-#3072). `TenancyConfig` gains `max_concurrent_requests` and
-`max_db_connections`. `JobConfig` gains `tenants`. `JobPostgresConfig` gains
-`shard_local`.
-
-**Before (`{X.Y}`):** a struct literal listed every field.
-
-```rust
-let postgres = autumn_web::config::JobPostgresConfig {
-    visibility_timeout_ms: 30_000,
-};
-```
-
-**After (`{(X+1).0}`):** add `..Default::default()`. Every new field is off
-by default (`0` or `false`).
-
-```rust
-let postgres = autumn_web::config::JobPostgresConfig {
-    visibility_timeout_ms: 30_000,
-    ..autumn_web::config::JobPostgresConfig::default()
-};
-```
-
-**Automation:** `manual` - the fix adds a struct update expression, and no
-codemod rewrites struct literals.
-
-### Tenancy: `TenantPropagatingBody` has a `db_bulkhead` field
-
-**Why:** a database checkout while a streaming body is polled counts against
-`tenancy.max_db_connections` (issue #3072).
-
-**Before (`{X.Y}`):**
-
-```rust
-let body = TenantPropagatingBody {
-    inner,
-    tenant_id,
-    handle: None,
-};
-```
-
-**After (`{(X+1).0}`):** add `db_bulkhead: None`.
-
-```rust
-let body = TenantPropagatingBody {
-    inner,
-    tenant_id,
-    handle: None,
-    db_bulkhead: None,
-};
-```
-
-**Automation:** `manual` - no codemod rewrites struct literals.
-
-### Probes: `/ready` pings the primary database
-
-**Why:** pool saturation made a busy replica unready, and an idle pool made a
-dead database look ready (issue #3059).
-
-**Before (`{X.Y}`):** `/ready`, `/health` and the `db` component of
-`/actuator/health` failed when the pool had no free connection and a request
-waited. They did not connect to the primary.
-
-**After (`{(X+1).0}`):** they send `SELECT 1` to the primary on one dedicated
-connection. A failed ping, or one slower than `health.ping_timeout_ms`, gives
-`503`. A busy pool does not. Do these checks:
-
-- Add one connection per replica to your Postgres `max_connections` budget.
-- Keep `health.ping_timeout_ms` below the probe timeout of your platform (for
-  Kubernetes, `timeoutSeconds`).
-- To keep a replica in rotation when the primary fails, set
-  `health.db_readiness = false`.
-- The generated Dockerfile `HEALTHCHECK` probes `/health`. It now fails when
-  the primary is down. ECS and Docker Swarm replace an unhealthy container. On
-  those platforms, set `AUTUMN_HEALTHCHECK_URL=http://localhost:3000/live`.
-- A test that changes a health indicator and reads `/actuator/health` again
-  in less than 1 s can read the cached result. Set `health.cache_ttl_ms = 0`
-  in the test config.
-
-**Automation:** `manual` - it is a runtime behaviour change, and no code
-rewrite applies.
-
-### Resilience: `CircuitBreakerPolicy` and `CircuitBreakerPolicyConfig` have slow-call fields
-
-**Why:** The breaker opened on failures only. A dependency that became slow
-but did not fail did not open it (issue #3060).
-
-**Before (`{X.Y}`):**
-
-```rust
-let policy = CircuitBreakerPolicy {
-    failure_ratio_threshold: 0.5,
-    sample_window: Duration::from_secs(10),
-    minimum_sample_count: 10,
-    open_duration: Duration::from_secs(60),
-    half_open_trial_count: 3,
-};
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-let policy = CircuitBreakerPolicy {
-    failure_ratio_threshold: 0.5,
-    sample_window: Duration::from_secs(10),
-    minimum_sample_count: 10,
-    open_duration: Duration::from_secs(60),
-    half_open_trial_count: 3,
-    ..CircuitBreakerPolicy::default()
-};
-```
-
-The defaults are a 60 s slow-call threshold, a slow-call rate threshold of
-`1.0`, and `CancelledCallOutcome::Slow`. Set `slow_call_duration_threshold:
-None` to keep the old behaviour.
-
-A struct literal of `autumn_web::config::CircuitBreakerPolicyConfig` needs
-`..Default::default()` for the same reason.
-
-**Automation:** `manual` - each struct literal needs a value for the new
-fields, and the choice changes when the breaker opens.
-
-### Media: `MediaPlugin` installs only the primitives you enable
-
-**Why:** The docs said both primitives are off by default, but `build`
-installed storage, the encode jobs and the retention sweep for every plugin.
-`with_broadcast()` did nothing. Issue #1974.
-
-**Before (`{X.Y}`):**
-
-```rust
-// Storage, encode jobs and the retention sweep installed.
-autumn_web::app().plugin(MediaPlugin::new().config(media).recordings_root("recordings"))
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-// Enable the primitive you use. Broadcast also installs MediaMtxClient and MediaUrls.
-autumn_web::app().plugin(
-    MediaPlugin::new()
-        .config(media)
-        .with_broadcast()
-        .recordings_root("recordings"),
-)
-```
-
-With no primitive, the plugin installs no routes, extensions or jobs, and logs
-a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
-`media` queue have no handler, and the retention sweep does not start.
-
-**Automation:** `manual` — this is a runtime behavior change. The code still
-compiles, so a codemod cannot know which primitive your app uses.
-
-### Media: `RoomStore::heartbeat` and `RoomStore::roster` take a `session_max` limit
-
-**Why:** A heartbeat renewed the room token with no limit, and a roster poll
-accepted a token of any age. So a captured token stayed valid for as long as
-someone used it. Now neither works past `joined_at + session_max`. Issue #1974.
-
-**Before (`{X.Y}`):**
-
-```rust,ignore
-fn heartbeat<'a>(
-    &'a self,
-    namespace: &'a str,
-    room_id: &'a str,
-    participant_id: &'a str,
-    token: &'a str,
-    token_ttl: Duration,
-) -> RoomStoreFuture<'a, DateTime<Utc>>;
-```
-
-**After (`{(X+1).0}`):**
-
-```rust,ignore
-fn heartbeat<'a>(
-    &'a self,
-    namespace: &'a str,
-    room_id: &'a str,
-    participant_id: &'a str,
-    token: &'a str,
-    token_ttl: Duration,
-    session_max: Duration,
-) -> RoomStoreFuture<'a, DateTime<Utc>>;
-```
-
-`roster` gains the same last argument:
-`fn roster<'a>(&'a self, namespace: &'a str, room_id: &'a str, auth_token: &'a str, session_max: Duration)`.
-
-In an out-of-tree store, compute the new expiry with
-`autumn_media_plugin::renewed_expiry(joined_at, now, token_ttl, session_max)`.
-When it returns `None`, return `RoomError::RoomNotFound` and change nothing. In
-`roster`, refuse a matching member when `now >= joined_at + session_max`, and
-do not refresh its `last_seen_at`.
-
-`MediaConfig` also has two new public fields, `room_session_max_seconds`
-(default `43200`) and `room_rate_limit_per_minute` (default `0`, off). A
-struct literal that lists every field must add them, or use
-`..MediaConfig::default()`. With rooms enabled, boot fails when
-`room_session_max_seconds` is less than `room_token_ttl_seconds`.
-
-A client that stays in a room for more than 12 hours now gets `404` from
-heartbeat and roster. It must leave, then join again. To keep longer sessions,
-set a larger `room_session_max_seconds`.
-
-**Automation:** `manual` — a codemod cannot write your store's renewal logic.
-
-### Feature flags: `PgFlagStore::get` errors before the first load
-
-**Why:** `get` connected to the database on the request thread, and a store
-error turned every flag off (issue #3063). Now `get` reads an in-memory
-snapshot and never connects on a Tokio worker.
-
-**Before (`{X.Y}`):** `get` on a new store read the database. A read error
-looked like an absent flag to code that used `.ok().flatten()`:
-
-```rust
-let store = PgFlagStore::new(url);
-if store.get("beta").ok().flatten().is_none() {
-    store.disable("beta", Some("init")).ok(); // also ran on a read error
-}
-```
-
-**After (`{(X+1).0}`):** on a Tokio runtime, `get` returns an error until the
-first load ends. Load first, and seed only on `Ok(None)`:
-
-```rust
-let store = PgFlagStore::new(url);
-store.refresh()?; // blocks: call it at startup
-if matches!(store.get("beta"), Ok(None)) {
-    store.disable("beta", Some("init"))?;
-}
-```
-
-An app that registers the store with `with_flag_store` needs no change: the
-app loads the store at startup. `with_cache_ttl(url, Duration::ZERO)` now
-means "refresh at each read", not "read the database at each read".
-
-**Automation:** `manual` - it is a behaviour change, and no code rewrite
-applies.
-
-### Agent authority: the analyser refuses more handler shapes
-
-**Why:** The `#[agent_operable]` analyser let some handler shapes through
-with no proof (issue #2451). It now refuses them. Each refusal names the call
-site and the `#[agent_effect(...)]` that resolves it.
-
-**Before (`{X.Y}`):** these compiled. A module-level `use tokio::time::sleep;`
-made a bare `sleep` look inert, a binding named `session` or `cache` was
-trusted by name, and an opaque macro with no handle in its tokens passed:
-
-```rust
-#[agent_operable(grant = RefundDrafter)]
-async fn drafts(session: Session, d: Duration) -> R {
-    sleep(d).await;
-    session.refresh().await?;
-    schedule!();
-    Ok(())
-}
-```
-
-**After (`{(X+1).0}`):** write the `tokio` path, type the parameter, and
-declare the opaque macro:
-
-```rust
-#[agent_operable(grant = RefundDrafter)]
-async fn drafts(session: Session, d: Duration) -> R {
-    tokio::time::sleep(d).await;
-    session.refresh().await?; // `Session` is the type that makes it inert
-    #[agent_effect(jobs(NotifyFinance), reason = "schedule! enqueues it")]
-    schedule!();
-    Ok(())
-}
-```
-
-Other new refusals: an awaited callee that is not a path, an unread future
-held in a tuple, block or pattern, a `diesel::` write whose table is not
-`<table>::table`, and any macro in expression position that is not a plain
-value macro (`format!`, `vec!`, `json!`). `tx.commit()` is inert only on a
-transaction from `db.begin()` or a `tx` callback.
-
-**Automation:** `manual` - each refusal needs a choice that only the author
-can make.
-
-### Config: `HttpClientConfig` and `RequestTimeoutsConfig` get new fields
-
-**Why:** Deadline propagation and the retry budget (issue #3058) need
-settings. Neither struct is `#[non_exhaustive]`, so a struct literal stops
-compiling.
-
-**Before (`{X.Y}`):**
-
-```rust,ignore
-let client = autumn_web::config::HttpClientConfig {
-    timeout_secs: 10,
-    max_retries: 1,
-    max_retry_after_secs: 10,
-    base_urls: std::collections::HashMap::new(),
-};
-```
-
-**After (`{(X+1).0}`):**
-
-```rust,ignore
-let client = autumn_web::config::HttpClientConfig {
-    timeout_secs: 10,
-    max_retries: 1,
-    ..autumn_web::config::HttpClientConfig::default()
-};
-```
-
-Do the same for `RequestTimeoutsConfig`, which gets `accept_deadline_header`.
-
-**Automation:** `manual` - the fix is a `..Default::default()` tail, which no
-codemod adds.
-
----
-
-### Ledger: raw-SQL framework writes to a ledgered table are refused (#2319)
-
-**Why:** a counter-cache update or a `delete_all` / `nullify` cascade runs raw
-SQL. On a ledgered table it changed rows and recorded no revision, so the
-ledger disagreed with the table.
-
-**Before (`{X.Y}`):** the write ran. `ledger_verify` later reported
-`LiveStateMismatch`:
-
-```rust
-#[repository(Post, soft_delete, ledgered = true)]
-pub trait PostRepository {}
-// Comment has #[belongs_to(Post, counter_cache)]: each comment bumped posts.comment_count.
-```
-
-**After (`{(X+1).0}`):** the write fails with `LedgerError::OutOfBandWrite`
-(HTTP 409). Remove the counter cache, or the `dependent(...)` clause. For a
-cascade, use `on_delete = destroy`: a ledgered child records a revision.
-
-**Automation:** `manual` - it is a behaviour change, and no code rewrite
-applies.
-
----
-
-### Ledger: more writes to a ledgered table are refused (#2319)
-
-**Why:** these framework paths write raw SQL and record no revision, so the
-ledger did not match the table. A NULL tenant made a chain that no read could
-reach. A tenant move split a chain in two.
-
-**Before (`{X.Y}`):** each of these compiled and ran:
-
-```rust
-#[repository(Post, soft_delete, ledgered = true)]
-pub trait PostRepository {
-    fn delete_by_title(title: String) -> ();   // bulk delete, no revision
-}
-// `Note` is `tenant_scoped` and ledgered, with `tenant_id: Option<String>`.
-// `Post` is `#[votable]`; `react()` updated `posts.vote_score`.
-```
-
-**After (`{(X+1).0}`):**
-
-| Path | Result |
-|------|--------|
-| `#[votable]` `react()` on a ledgered target or edge table | `OutOfBandWrite` (HTTP 409) |
-| `add_comment` / `delete_comment` into a ledgered comments table | `OutOfBandWrite` |
-| `add_*` / `remove_*` / `set_*` into a ledgered `has_many(through)` join table | `OutOfBandWrite` |
-| A capsule import into a ledgered table | `DataCapsuleError::InvalidInput` |
-| A write from an unledgered repository on a ledgered table, including `with_lock`, `find_or_create_by_*` and a `destroy` cascade through it | `OutOfBandWrite` |
-| A model factory `create()` into a ledgered table | Panic |
-| An update that changes a ledgered record's `tenant_id` | `TenantChange` (HTTP 409) |
-| A derived `delete_by_*` on a ledgered repository | Compile error |
-| `Option<String>` tenant column on a ledgered `tenant_scoped` repository | Compile error |
-
-To fix: find the records, then call `delete_by_id` or `delete_many`. Make the
-tenant field `String` and the column `NOT NULL`. Write through the ledgered
-repository. Or stop ledgering the table.
-
-**Automation:** `manual` - each fix depends on the app's data model.
-
----
-
-### Shadow: `ShadowStats` gains `comparisons_abandoned`
-
-**Why:** the mirror deadline now covers the comparison. A comparison that does
-not finish is counted apart from a match, a divergence and a skip (issue #2333).
-
-**Before (`{X.Y}`):** a struct literal listed every field.
-
-```rust
-let stats = autumn_web::shadow::ShadowStats {
-    mirrored: 0,
-    compared: 0,
-    // ... every other field ...
-    primary_incomplete: 0,
-};
-```
-
-**After (`{(X+1).0}`):** add `..ShadowStats::default()`. An exhaustive
-destructuring pattern needs `..` or the new field.
-
-```rust
-let stats = autumn_web::shadow::ShadowStats {
-    mirrored: 1,
-    ..autumn_web::shadow::ShadowStats::default()
-};
-```
-
-**Automation:** `manual` - the fix adds a struct update expression, and no
-codemod rewrites struct literals.
-
-### Capsules: new `CacheEffect` and `EffectSeam` variants, new `JobEffect` and `CapsuleEffects` fields
-
-**Why:** issue #2351 adds cache removals and random-draw widths to the capsule
-seam. It also records the deadline of an `enqueue_at` call when the deadline
-is already past, and the HTTP status of a failed enqueue. These types (feature `reporting`) are public and are not
-`#[non_exhaustive]`.
-
-**Before (`{X.Y}`):**
-
-```rust
-use autumn_web::capsule::{CacheEffect, JobEffect};
-
-fn key(effect: &CacheEffect) -> &str {
-    match effect {
-        CacheEffect::Get { key, .. } | CacheEffect::Insert { key, .. } => key,
-    }
-}
-
-let job = JobEffect {
-    name: "send_receipt".to_owned(),
-    payload: serde_json::json!({}),
-    delay_secs: None,
-    due_at: None,
-    error: None,
-};
-```
-
-**After (`{(X+1).0}`):** match the new variants, or call `CacheEffect::key`.
-Add `..JobEffect::default()` to a struct literal.
-
-```rust
-use autumn_web::capsule::{CacheEffect, JobEffect};
-
-fn key(effect: &CacheEffect) -> &str {
-    effect.key()
-}
-
-let job = JobEffect {
-    name: "send_receipt".to_owned(),
-    payload: serde_json::json!({}),
-    ..JobEffect::default()
-};
-```
-
-The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespace`,
-`CacheEffect::Clear`, `EffectSeam::Random`, `EffectSeam::Detached` and
-`MailErrorKind::NoDurableQueueInProduction`. An exhaustive `match` on
-`EffectSeam` or `MailErrorKind` needs a new arm.
-
-`CapsuleEffects` has a new field `state_cache`. A struct literal of
-`CapsuleEffects` needs `..CapsuleEffects::default()`.
-
-`CAPSULE_FORMAT_VERSION` is now 4. An older build refuses a version 4 capsule
-with a version mismatch. This build reads a version 3 capsule and replays it
-with the version 3 rules, so a committed corpus keeps its verdicts. Re-record
-a capsule to get the new checks.
-
-**Automation:** `manual` - a codemod cannot know what a new match arm must do.
-
----
-
-### MCP: `ApiDoc` gains a `mcp_task` field
-
-**Why:** MCP task tools (`#[api_doc(mcp, task)]`) need a flag on the route
-metadata. `ApiDoc` has public fields and is not `#[non_exhaustive]`, so a new
-field breaks a struct literal. The route macros set the field for you.
-
-**Before (`{X.Y}`):**
-
-```rust
-use autumn_web::openapi::ApiDoc;
-
-let doc = ApiDoc {
-    method: "GET",
-    path: "/api/report",
-    // …every other field spelled out…
-};
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-use autumn_web::openapi::ApiDoc;
-
-let doc = ApiDoc {
-    method: "GET",
-    path: "/api/report",
-    ..ApiDoc::default()
-};
-```
-
-The new field is `pub mcp_task: bool`. It is `false` by default, so a route
-that does not opt in behaves as before.
-
-**Automation:** `manual` — a codemod cannot know which fields a struct literal
-means to leave at their defaults.
-
-### MCP: `ApiDoc` gains a `mcp_core` field
-
-**Why:** a core MCP tool (`#[api_doc(mcp, core)]`) needs a flag on the route
-metadata. A new public field breaks a struct literal, as for `mcp_task`. The
-route macros set the field for you.
-
-**Before (`{X.Y}`):**
-
-```rust
-use autumn_web::openapi::ApiDoc;
-
-let doc = ApiDoc {
-    method: "GET",
-    path: "/api/todos",
-    // …every other field spelled out…
-};
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-use autumn_web::openapi::ApiDoc;
-
-let doc = ApiDoc {
-    method: "GET",
-    path: "/api/todos",
-    ..ApiDoc::default()
-};
-```
-
-The new field is `pub mcp_core: bool`. It is `false` by default, so a route
-that does not set it behaves as before.
-
-**Automation:** `manual` — a codemod cannot know which fields a struct literal
-means to leave at their defaults.
-
-### `StaticRouteMeta` has a `content_type` field
-
-**Why:** `#[static_get]` now takes `content_type = "..."` (#2403). The macro
-passes the value in this field.
-
-This affects only code that builds `StaticRouteMeta { .. }` by hand. Routes
-declared with `#[static_get]` do not change.
-
-**Before (`0.8`):**
-
-```rust
-let meta = StaticRouteMeta { path: "/a", name: "a", revalidate: None, params_fn: None, seo };
-```
-
-**After (next release):**
-
-```rust
-let meta = StaticRouteMeta { path: "/a", name: "a", revalidate: None, params_fn: None, seo, content_type: None };
-```
-
-**Automation:** `manual` — add `content_type: None` to each literal.
-
-### Data flow: manifest rows have a crate version in `model_path`
-
-**Why:** Two incompatible versions of one crate can link into one binary. They
-had the same `model_path`, so `autumn data-flow` merged their rows (issue
-#2375).
-
-**Before (`{X.Y}`):**
-
-```json
-"model_path": "shop::models::customer::Customer"
-```
-
-**After (`{(X+1).0}`):** the path has the compatible version of the defining
-crate. This is the major version. For a crate before 1.0 it is `0.minor`. For a
-crate before 0.1 it is `0.0.patch`. A prerelease is the full version. Other patch releases do not change it.
-
-```json
-"model_path": "shop::models::customer@2::Customer"
-```
-
-Make the manifest again. Commit it:
-
-```sh
-autumn data-flow --manifest data-flow-manifest.json
-```
-
-Until you do, `autumn data-flow --check` reports drift for each row. The
-`model` name is not changed. The report shows the full path only when two rows
-have the same `model` name.
-
-The path changes again when the major version of your own crate changes (or the
-minor version, before 1.0). Make the manifest again after such a release.
-
-**Automation:** `manual` - make the manifest again with the command above.
-
-### Repository: dependent cascades probe first and `delete_many` hooks parents first
-
-**Why:** A dependent cascade must fire no hook when a `restrict` blocks it, and
-`delete_by_id` and `delete_many` must fire hooks in one order (issue #2427).
-The public `DependentAction` enum gains a hidden `Probe` variant, and
-`RuntimeDependentSpec` gains a `probe` field.
-
-**Before (`0.8`):**
-
-- A `restrict` below a `destroy` leg could answer 409 after earlier hooks fired.
-- `delete_many` fired child hooks before the parents' `before_delete`.
-
-**After (`0.9`):**
-
-- Every `restrict` in the tree is probed before any hook fires.
-- `delete_many` fires every parent's `before_delete` first, as `delete_by_id` does.
-- The probe reads each `destroy` child set once more, and locks its rows.
-
-Most apps need no change. Two cases need work:
-
-- A `before_delete` hook that relied on a child hook firing first. Move that
-  logic to the child hook.
-- Code that matches `DependentAction` exhaustively, or builds a
-  `RuntimeDependentSpec` by hand. Add a wildcard arm, and set `probe: None`.
-  Both types are framework plumbing.
-
-**Automation:** `manual` — a hook-order dependency needs a human decision.
-
-### Cache coherence: `MutationDescriptor` and `Mutation` have new fields (#2364)
-
-**Why:** The cache audit must see the writes a nested `dependent(...)` cascade
-makes below its direct child. A repository names only its own children, so each
-cascade write now names the child repository it runs. The audit follows those
-links.
-
-**Before (`0.8`):**
-
-- `MutationDescriptor` had no `cascades_into` field.
-- `Mutation` had no `cascades_into` or `cascade_recurses` field.
-- A root delete registered a write for the direct child model only.
-
-**After (`0.9`):**
-
-- A root delete registers a write for each model below it in a chain of
-  `destroy` cascades. `nullify` and `delete_all` stop the chain.
-- The root repository must declare an edge for each such model. An app that
-  had no edge for a grandchild read now fails `autumn cache audit`.
-
-Most apps need no change. Two cases need work:
-
-- A cached read of a grandchild model that the audit now flags. Add
-  `invalidates(...)` to the root repository, or `acknowledge_stale = "reason"`.
-- Code that builds `MutationDescriptor` or `Mutation` by hand. Set
-  `cascades_into: None` on both, and `cascade_recurses: false` on `Mutation`.
-  The `#[repository]` macro does this for you.
-
-**Automation:** `manual` — a flagged read needs a human decision.
-
-### Idempotency: `RouteIdempotency` has an `Off` variant
-
-**Why:** A route can now opt out of `.idempotent()` with
-`#[post("/x", idempotent = false)]`, for a route that dedupes by its own key
-(a durable workflow route, say). The macro records that as
-`RouteIdempotency::Off`. `RouteIdempotency` is not `#[non_exhaustive]`, so a
-new variant breaks an exhaustive `match`.
-
-**Before (`{X.Y}`):**
-
-```rust
-match route.idempotency {
-    RouteIdempotency::Direct => "fail closed",
-    RouteIdempotency::ReplayThroughInner => "replay",
-}
-```
-
-**After (`{(X+1).0}`):**
-
-```rust
-match route.idempotency {
-    RouteIdempotency::Direct => "fail closed",
-    RouteIdempotency::ReplayThroughInner => "replay",
-    RouteIdempotency::Off => "not cached",
-}
-```
-
-Code that only builds a `Route` with `Direct` or `ReplayThroughInner`, or
-that tests with `matches!`, needs no change.
-
-**Automation:** `manual` — a new enum variant needs a new match arm, and no
-safe rewrite can choose its body.
-
-### Idempotency: bearer-token requests get their own cache slot
-
-**Why:** A request with no cookie-backed session used to compute a storage key
-with no principal in it, so two token clients that sent the same
-`Idempotency-Key` and body to a route shared one cached response. The key now
-carries the principal `RequireApiToken` verified, or a SHA-256 digest of the
-raw `Authorization` header when the route checks the token itself. See
-[the idempotency guide](../guide/idempotency.md#bearer-token-clients).
-
-**Before (`{X.Y}`):**
-
-- Client B with client A's key and body was served A's stored response.
-- A retry with the `Authorization` header changed or dropped replayed.
-- `RequireApiToken` on `AppBuilder::layer` forced fail-closed replay app-wide:
-  every cache hit, a same-client retry included, answered `409`.
-
-**After (`{(X+1).0}`):**
-
-- Each bearer client replays only its own response.
-- A retry with a different raw `Authorization` header (on a route without
-  `RequireApiToken`) runs the handler again.
-- `RequireApiToken` registered directly with `AppBuilder::layer` or
-  `static_gate` no longer forces fail-closed replay: a retry replays. A
-  `ServiceBuilder` stack around it still fails closed.
-
-Most apps need no change. Two cases need a look:
-
-- A request in flight across the upgrade that carries `Authorization` and no
-  session gets a new key, so its retry runs the handler once more. Session-only
-  apps keep byte-identical keys.
-- A client that refreshes its token between retries, on a route that checks the
-  token in the handler, now runs the handler again. Mount `RequireApiToken` with
-  `AppBuilder::layer` to key on the principal instead of the token.
-
-**Automation:** `manual` — whether a retry may run twice is the app's call.
+**Automation:** `manual` — give each field its name.
 
 ## Plugin authors
+
+**Required whenever this release changes the declared stable plugin surface**
+(`autumn_web::plugin_contract::PLUGIN_SURFACES`) — `scripts/check-plugin-surface.sh`
+fails a surface change that leaves this section empty or unwritten. Delete the
+section entirely when the plugin surface did not change.
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /
 `autumn-*-plugin` crate, not to an application author. See
 [`docs/plugins.md`](../plugins.md#the-plugin-api-contract) for the tiers.
 
-- **Stable surface changed:** none.
-- **Experimental surface changed:** none.
-- **New stable surface:** none.
+- **Stable surface changed:** {the API, what changed, and the replacement — or
+  "none". Every entry here is a `**Breaking:**` change in the changelog and
+  needs its own section under *Breaking changes* above.}
+- **Experimental surface changed:** {the API and what changed — or "none".
+  Experimental surface may change in any release, so this is a courtesy, not a
+  promise. Plugins that declared it with `uses_experimental` are the audience.}
+- **New stable surface (background tasks, #3545):**
+  `AppBuilder::background_task`, `AppBuilder::background`,
+  `AppBuilder::plugin_capability` and the `background` module
+  (`BackgroundTask`, `PluginCapability`, `BackgroundCapability`,
+  `Role::runs_plugin`). Move a loop that you `tokio::spawn` in `on_startup`
+  to `background_task`, so that `AUTUMN_ROLE=web` does not run it. A plugin
+  switch such as `worker_enabled` becomes `BackgroundTask::explicit`. A loop
+  in `on_startup` that you do not move behaves as before. See
+  [Background work in a plugin](../guide/extensibility.md#background-work-in-a-plugin)
+  and [Background tasks for plugins and apps](../guide/jobs.md#background-tasks-for-plugins-and-apps).
+- **In-repo plugins on background tasks (#3546):** `autumn-media-plugin`
+  and `autumn-billing` start no loop from `on_startup` now. The reference
+  plugin shows the pattern: one-time setup in `on_startup`, the loop in
+  `background_task`. A test in `xtask` (`plugin_spawns`) fails on a spawn
+  that an `on_startup` or `state_initializer` argument of a plugin crate
+  reaches. `spawn_room_reaper_loop` and `spawn_retention_sweep_loop` are
+  deprecated. Call `run_room_reaper` or `run_retention_sweep` from a
+  `background_task`.
+- **New experimental surface (fleet engines, #3642):** `db::fleet_engine`
+  (the `FleetEngine` trait and `DatabaseFleet::with_engine`) and
+  `plugin_conformance::fleet` (`FleetFixture`, `run_fleet_conformance`).
+  Declare them with `uses_experimental`. An engine plugin implements
+  `FleetEngine` and runs the kit in its own CI. `DatabaseFleet`,
+  `FleetDatabase`, `FleetLifecycle` and `BackgroundOpen` take a parameter
+  `E: FleetEngine`. With `sqlite`, `E` defaults to `SqliteEngine`, so
+  `SQLite` code needs no change. A handler of another engine reads
+  `FleetDatabase::handle`. See [ADR 0040](../adr/0040-fleet-engine-seams.md).
+- **New experimental surface (fleet extractors):** the `fleet` module
+  (`resolve`, `resolve_key`, `FleetLease`, `fleet_of`, `ownership_store`) and
+  `AppBuilder::fleet_ownership_store`. Declare them with
+  `uses_experimental`. An engine plugin writes its own extractor over
+  `fleet::resolve::<E>` and puts its `DatabaseFleet<E>` in the app state with
+  `insert_extension`. A sidecar hook ships through
+  `FleetDatabase::sidecar_replica`. A `SlotOwnershipStore` gets a default
+  `ensure_schema`, so an existing store needs no change. See
+  [Writing a fleet extractor](../guide/sqlite-fleet.md#writing-a-fleet-extractor).
+- **New stable surface (conformance, #2828):**
+  `plugin_conformance::run_route_checks` and `RouteSource::from_wire`.
+  `autumn plugin-check --plugin-name <your-plugin>` calls
+  `run_route_checks`, so your conformance test and the CLI give the same
+  result for the same routes.
+- **Stable surface behavior (conformance, #2828):** `run_conformance` with a
+  contract uses the contract's `registered_as` when no route carries the
+  config name and a route carries `registered_as`. Routes under more than one name of the
+  plugin fail `route-attribution`. No signature changes. A test that passed
+  its crate name while the routes carry `Plugin::name()` now passes. Some
+  CLI diagnostic text changes; do not match on it.
+- **Stable surface behind a feature (conformance, #2795):**
+  `plugin_conformance` has the `plugin-conformance` feature. The feature is
+  in `default`. A plugin that depends on `autumn-web` with
+  `default-features = false` and runs the harness in its tests names the
+  feature. No signature changes.
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
   lockstep with the framework) and re-run
-  `autumn plugin-check --plugin-name <your-plugin>`. A range that excludes the
-  host makes `AppBuilder::plugin` panic at registration unless
-  `AUTUMN_PLUGIN_CONTRACT=warn` demotes it. The examples in the `Plugin::contract`
-  and `plugin_contract` rustdoc and the reference plugin's note name the series
-  under development; copy the shape, not the literal.
+  `autumn plugin-check --plugin-name <your-plugin>`. The examples in the
+  `Plugin::contract` and `plugin_contract` rustdoc now name `"0.10"`, the
+  series 0.10.0 opened; copy the shape, not the literal.
 
 ## Compiler error cheat sheet
 
@@ -1605,73 +899,54 @@ single most valuable section of the guide — keep it factual and short.
 |---------------------------|------------------|-----|
 | `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
-| `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`, `default_timeout_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
-| `error[E0063]: missing field \`timeout\`` | a `JobInfo` literal | add `timeout: None` |
-| `error[E0063]: missing field \`content_type\`` | a `StaticRouteMeta` literal | add `content_type: None` |
-| `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
 
 ## Configuration changes
 
-- `idempotency.in_flight_ttl_secs` defaults to `60`, not `86400`. See
-  [Idempotency: the in-flight lock expires after 60 s](#idempotency-the-in-flight-lock-expires-after-60-s).
-- `idempotency.backend` accepts `"database"`.
+- New key `[database.fleet] max_resident_bytes` (default `0`, no budget),
+  and its variable `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES`.
+
+- New tables `[outbox.destinations.<name>]` (`url`, `signing_secret`,
+  `topics`) and `[outbox.inbox]` (`enabled`, `signing_secret`,
+  `previous_signing_secrets`, `timestamp_tolerance_secs`, `max_body_bytes`).
+  A `signing_secret` of the form `"${NAME}"` reads the variable `NAME`.
 
 - `autumn.toml` keys that were renamed, removed, or have new defaults.
 - New `AUTUMN_*` environment variables.
 - Default profile changes.
 
-Issue #3058:
-
-- The `prod` profile sets `server.shutdown_timeout_secs = 35` (was 30): the
-  30 s request timeout plus 5 s. Add 5 s to your orchestrator grace period.
-- New keys: `[http.client.retry_budget]` (on by default),
-  `http.client.send_deadline_header` (default `true`) and
-  `server.timeouts.accept_deadline_header` (default `false`,
-  `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER`).
-
 If nothing changed, delete this section.
 
-- New: `[http.client] max_backoff_ms` (default `20000`). The cap on the
-  HTTP client's retry backoff.
-- New: `[jobs] max_backoff_ms` and `AUTUMN_JOBS__MAX_BACKOFF_MS` (default
-  `3600000`, 1 h). The cap on job retry backoff for every backend.
-- New key `telemetry.sample_ratio` (`AUTUMN_TELEMETRY__SAMPLE_RATIO`),
-  default `1.0`. See [Overload signals](../guide/observability/overload-signals.md).
-- New: `[jobs] default_timeout_ms` and `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS`
-  (default `0`, no limit). The longest one run of a job without
-  `#[job(timeout)]` may take (issue #3051).
-- **Resilience (issue #3060):** new keys `slow_call_duration_threshold_ms`
-  (default `60000`, `0` turns detection off), `slow_call_rate_threshold`
-  (default `1.0`) and `cancelled_call_outcome` (default `"slow"`) under
-  `[resilience.circuit_breaker.defaults]` and host overrides. The env
-  variables are `AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS`,
-  `..._SLOW_CALL_RATE_THRESHOLD` and `..._CANCELLED_CALL_OUTCOME`.
-
-### `prod` profile: connection and WebSocket limits (issue #3065)
-
-The `prod` profile now sets these values. Other profiles set none of them.
-
-```toml
-[server.http]
-header_read_timeout_ms = 10_000
-keep_alive_timeout_ms = 75_000
-max_header_bytes = 65_536
-http2_max_concurrent_streams = 100
-max_connections = 10_000
-
-[realtime]
-max_message_bytes = 1_048_576
-ping_interval_ms = 30_000
-idle_timeout_ms = 120_000
-```
-
-An HTTP/1 request head over 64 KiB now gets `431`. The HTTP/2 header list
-limit goes up from 16 KiB to 64 KiB. A WebSocket message over 1 MiB now
-closes the socket with code `1009`. To turn off a timeout or a connection cap,
-set it to `0`. `max_header_bytes` and `http2_max_concurrent_streams` cannot
-be turned off. To allow larger messages or heads, set a larger value.
-
 ## Behavior changes
+
+- **Fleet:** an open under an ownership epoch refuses a database that
+  records a newer epoch (`FleetError::NewerEpoch`, `421`). Before, the open
+  served it. The check, the stamp and the write are one transaction. Only
+  a host that lost its slot to a newer owner sees this. A control database
+  made again from nothing restarts its epochs: re-import each database
+  (`DatabaseFleet::import` drops the old stamp).
+- **Fleet:** `/actuator/health` `db:fleet` details now include
+  `resident_bytes` and `max_resident_bytes`.
+- **Fleet:** the fleet core is in every `db` build, Postgres too. The `db`
+  feature now pulls in `fd-lock`, which the `sqlite` feature pulled in
+  before. No new crate.
+- **Graph:** `autumn graph check-boundaries` checks the nodes of a renamed
+  `[[bin]]` target in the boundary of its package (#3599). New violations
+  can show. Fix them, or run with `--update-baseline`.
+- **Config:** a type error in `autumn.toml` now names the full key, for
+  example ``in `server.port` ``. Before, `AutumnConfig::load` showed a line
+  of the merged config, which is not a file you wrote. `load_from` errors
+  also give the key, not the line. A syntax error keeps its line. A message
+  parser that read the `TOML parse error at line` prefix of a type error
+  must read the key instead.
+- **Capacity:** a value of the wrong type in `capacity.lock` now names the
+  key, for example ``in `envelope.admission_limit` ``. Before, the error
+  showed the line. A syntax error keeps its line.
+- **Capacity:** a `capacity.lock` with an integer above 9223372036854775807
+  does not load (`u64 value was too large`). That is the largest TOML
+  integer. Only `seed` can be that large, and only from an explicit
+  `autumn calibrate --seed`. Run `autumn calibrate` again with a smaller
+  seed. `--seed` now refuses a larger value, and `autumn calibrate` does not
+  write one.
 
 Changes that still compile but behave differently at runtime. Examples:
 
@@ -1679,72 +954,62 @@ Changes that still compile but behave differently at runtime. Examples:
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
 
-- A trusted proxy can now set the request id. When
-  `[security.trusted_proxies]` trusts the peer and the peer sends a UUID in
-  `X-Request-Id`, the app keeps it. Before, the app always made a new id.
-- `http_client` sends the current request's id as `x-request-id`. A header
-  that you set on the request builder wins.
-- A metric `method` label shows `_other` for a non-standard HTTP method. The
-  `/actuator/metrics` JSON route keys change too: `PROPFIND /x` is now
-  `_other /x`.
-- To stop `http_client` from sending the request id to a host, call
-  `.without_request_id()` on the request builder.
-
-Issue #3058:
-
-- The outbound `Client` retries less. A retry must fit the request deadline,
-  and the retry budget limits retries to a host that fails all the time.
-  Set `[http.client.retry_budget] enabled = false` to keep the old count.
-- The outbound `Client` sends `x-autumn-deadline-ms` to every host when a
-  request deadline is set. Set `http.client.send_deadline_header = false` to
-  stop it.
-- A timeout `503` has a `Retry-After` header of 1-3 s.
-
 If nothing changed, delete this section.
 
-- **Jobs: a hung handler keeps its claim (#3051).** Durable workers renew each
-  claim while the job runs. Before, a hung handler lost its claim after the
-  visibility timeout, and a second worker ran the job again. Now the claim
-  stays until the process stops. Set `#[job(timeout = "...")]` or
-  `jobs.default_timeout_ms` on a job that can hang.
-- **Jobs: Redis claim deadlines use the Redis server clock (#3051).** During a
-  rolling deploy, an old worker still compares deadlines to its own clock. An
-  old worker whose clock runs ahead of Redis can requeue a live job. Keep
-  worker clocks in sync (NTP) during the deploy.
-- Retries use full jitter (issue #3054). The delay before retry `n` is a
-  random value in `[0, min(cap, base * 2^n)]`. Before, the HTTP client and the
-  `postgres`, `redis` and `sqlite` job backends used the exact value
-  `base * 2^n`, and the `local` backend used `[base/2, base]`. A test that
-  expects an exact retry time must allow the range.
-- The HTTP client now obeys `Retry-After` on a `503`, as on a `429`. The wait
-  is `backoff + min(hint, 5 s)`. Before, a `429` waited the full hint (up to
-  `max_retry_after`, default 10 s) plus the backoff. A `429` with
-  `Retry-After: 10` now retries after about 5 s. Against a strict rate
-  limiter, raise `max_retries` or handle the `429` yourself.
-- A `POST` or `PATCH` with `.retries(n)` and no `.retry_non_idempotent()`
-  now makes one attempt. This compiles with no warning, so search your code
-  for `.post(` and `.patch(` calls that use `.retries(`.
-- **Resilience (issue #3060):** a circuit breaker opens when all calls in
-  its window take 60 s or more. A call dropped at or after the slow-call
-  threshold counts as slow. Before, it counted as nothing. To keep the old
-  behaviour, set `slow_call_duration_threshold_ms = 0`.
-- **Resilience (issue #3060):** a breaker keeps its counts in 10 time
-  buckets. A call leaves the window after 9/10 to 10/10 of
-  `sample_window_secs`. Before, it left after exactly `sample_window_secs`.
-- **Commentable (#2284):** a model can have a `soft_delete` repository and a
-  plain one. Through the plain repository, the `{Model}Comments` helpers now
-  accept a soft-deleted parent. Before, they returned `404`. Through the
-  `soft_delete` repository and through the router, a soft-deleted parent is
-  still `404`.
-- **Media (#3104):** a room join with a `display_name` longer than 64
-  characters is a `400` (`RoomError::DisplayNameTooLong`). Before, the store
-  kept a name of any length. `RoomService::join` applies the limit, so a custom
-  handler that calls it gets the same error. A direct `RoomStore::join_room`
-  call does not check the limit.
-- **Media (#2864, #2407):** on `room_store_backend = "db"`, a join that races
-  the last leave or the reaper for the same room can now get `404`. Before,
-  it got `200` and then lost its seat. Handle it as you handle a room that is
-  gone.
+- **Media and billing loops follow the role (#3546).** The `db` room reaper
+  and the recording retention sweep do not run on `web`. The `memory` room
+  reaper runs on `combined` and `web`, not on `worker`. The dunning re-arm
+  runs on `combined` and `worker`, not on `web`. A fleet of only `web`
+  replicas needs a `worker`, or `MediaPlugin::room_reaper_on_every_role()`
+  and `MediaPlugin::retention_on_every_role()`. See
+  [Media: background tasks and roles](../guide/media.md#background-tasks-and-roles).
+
+### Comments: the comment router shows one page (#3325)
+
+`commentable::router` reads one page of a thread, not the whole thread. A
+page holds up to 50 top-level comments and all their replies. After a post,
+the response shows the page that holds the new comment.
+
+What to do:
+
+1. On a host page that renders a thread, call `comment_thread_page` (not
+   `comment_thread`), and pass the page to the widget with
+   `.page(page.after, page.next)`.
+2. Read `?after=<id>` from the host page's query string, and pass it to
+   `comment_thread_page`.
+3. Use the same page size on the host page and in
+   `CommentsConfig::page_size`. Else a no-JS post can return to a page that
+   does not show the new comment.
+4. Index the comments table: `(commentable_type, commentable_id, created_at,
+   id) WHERE parent_id IS NULL AND deleted_at IS NULL`, and `parent_id`.
+
+### Metrics: the `"<route> SELECT"` key is deprecated
+
+`db_queries["<route> SELECT"]` from the `Db` extractor is not a query. It is
+the time a request held its connection, from checkout to release. It includes
+all statements and all other work in the hold, for example a fan-out. A route
+that only writes also shows it.
+
+This release records each hold in two places:
+
+| Key | Status |
+| --- | --- |
+| `db_queries["POST /census SELECT"]` | Deprecated for holds. The next release stops the `Db` extractor writing it. |
+| `db_connection_holds["POST /census"]` | New. Use this one. |
+
+`run_instrumented` also records a real `SELECT` under `"<route> SELECT"`.
+In this release, that key can mix holds and statements. After the next
+release, it holds only statements.
+
+What to do:
+
+1. Move each dashboard and alert that reads `db_queries["<route> SELECT"]`
+   for the hold to `db_connection_holds["<route>"]`. The new key has no
+   verb. A `Db` from a shard adds the shard, for example
+   `"GET /notes shard=shard0"`.
+2. Read statement times from `db_queries`. They come only from
+   `autumn_web::db::run_instrumented`. If the app does not call it,
+   `db_queries` is empty after the next release.
 
 ## Deprecations retained from `{X.Y}`
 
@@ -1788,9 +1053,6 @@ commands with expected output, not "make sure everything works". Required by
 3. `autumn doctor --strict` — no findings.
 4. {one step per breaking change: the observable behaviour that proves the fix
    was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
-5. Commentable (#2284): soft-delete a parent row. Call `comment_thread` on it
-   through a plain repository of the model. Make sure that it returns the
-   thread, not `404`.
 
 ### Guide-only upgrade walkthrough
 

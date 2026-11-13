@@ -30,6 +30,38 @@ mod tabs_tests {
     }
 
     #[test]
+    fn tablist_binds_keyboard_core() {
+        // Issue #3397: the runtime gives the strip APG arrow keys.
+        let panels = [
+            ("a", "A", html! { p { "a" } }),
+            ("b", "B", html! { p { "b" } }),
+        ];
+        let html = tabs("t", None, &panels).into_string();
+        assert!(html.contains("data-autumn-tabs"), "{html}");
+        let at = html.find(r#"role="tablist""#).expect("tablist");
+        let start = html[..at].rfind('<').expect("tag start");
+        let end = at + html[at..].find('>').expect("tag end");
+        let list = &html[start..end];
+        assert!(list.contains("data-autumn-roving"), "{html}");
+        assert!(
+            list.contains(r#"data-autumn-orientation="horizontal""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn tabs_keep_href_fragments_for_no_js() {
+        let panels = [
+            ("a", "A", html! { p { "a" } }),
+            ("b", "B", html! { p { "b" } }),
+        ];
+        let html = tabs("t", None, &panels).into_string();
+        assert!(html.contains(r##"href="#a""##), "{html}");
+        assert!(html.contains(r##"href="#b""##), "{html}");
+        assert!(!html.contains("<script"), "{html}");
+    }
+
+    #[test]
     fn renders_tablist_role() {
         let panels = [("overview", "Overview", html! { p { "a" } })];
         let html = tabs("post-tabs", None, &panels).into_string();

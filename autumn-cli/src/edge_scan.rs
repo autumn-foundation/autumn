@@ -169,6 +169,7 @@ const ROUTE_ATTRS: &[&str] = &[
 const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("Db", "a database"),
     ("LazyDb", "a database"),
+    ("BoundaryDb", "a database"),
     ("IdempotencyTx", "a database"),
     ("Session", "a session"),
     ("Flash", "a session"),
@@ -176,6 +177,7 @@ const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("CsrfTokenHeader", "a session"),
     ("CsrfFormField", "a session"),
     ("Consent", "a session"),
+    ("Theme", "cookies"),
     ("Auth", "auth state"),
     ("ApiToken", "auth state"),
     ("RequestPrincipal", "auth state"),
@@ -1052,7 +1054,7 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
 /// is resolved; anything else (an OS-family shorthand like `windows`/`unix`,
 /// a key this table does not list, or a predicate this scan cannot parse) is
 /// treated as NOT applying. That is the opposite
-/// default from function-level `#[cfg(...)]` evaluation ([`eval_cfg_attr`],
+/// default from function-level `#[cfg(...)]` evaluation ([`eval_cfg_meta`],
 /// which stays conservative by assuming *true*): crediting an inapplicable
 /// target here produces a phantom route, not a merely missed one, so
 /// "cannot resolve" must mean "does not match."
@@ -1337,7 +1339,8 @@ impl TargetCfgPredicate {
 /// every other heuristic in this module, resolving path globs and
 /// `exclude` is out of scope for a textual scan; the (rare) cost of that is
 /// treating an unrelated ancestor's `[workspace]` as this project's own.
-fn resolver_v1_is_in_effect(project_root: &Path, table: Option<&toml::Table>) -> bool {
+#[must_use]
+pub fn resolver_v1_is_in_effect(project_root: &Path, table: Option<&toml::Table>) -> bool {
     if let Some(t) = table
         && t.contains_key("workspace")
     {
@@ -1453,6 +1456,13 @@ fn root_package_edition_implies_resolver_v1(
 /// accepted "best-effort, not a build system" trade-off as everywhere else
 /// in this module.
 fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> {
+    find_governing_workspace(project_root).map(|(_, table)| table)
+}
+
+/// [`find_ancestor_workspace_manifest`], with the root directory of the
+/// workspace.
+#[must_use]
+pub fn find_governing_workspace(project_root: &Path) -> Option<(PathBuf, toml::Table)> {
     let mut dir = project_root.parent();
     while let Some(candidate) = dir {
         if let Ok(content) = std::fs::read_to_string(candidate.join("Cargo.toml"))
@@ -1489,7 +1499,7 @@ fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> 
                 !any_glob_matches(&exclude_patterns, &rel, true)
             });
             if governed {
-                return Some(table);
+                return Some((candidate.to_path_buf(), table));
             }
         }
         dir = candidate.parent();
@@ -1619,7 +1629,7 @@ fn is_optional_dependency(table: &toml::Table, name: &str, resolver_v1: bool) ->
 /// such a manifest's real build compiles it out (Codex review on #2739,
 /// round 13, P2).
 #[must_use]
-fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &str) -> bool {
+pub fn implicit_feature_is_suppressed(features_table: Option<&toml::Table>, pkg: &str) -> bool {
     let needle = format!("dep:{pkg}");
     features_table.is_some_and(|features| {
         features.values().any(|entries| {
@@ -1716,10 +1726,24 @@ fn enabled_features_from_manifest(manifest: &str, requested: &[&str]) -> BTreeSe
 /// `resolver_v1` (see [`resolver_v1_is_in_effect`]) is forwarded to
 /// [`is_optional_dependency`] for the strong-dependency-feature check below.
 #[must_use]
-fn enabled_features_from_manifest_for_resolver(
+pub fn enabled_features_from_manifest_for_resolver(
     manifest: &str,
     requested: &[&str],
     resolver_v1: bool,
+) -> BTreeSet<String> {
+    enabled_features_with_defaults(manifest, requested, resolver_v1, true)
+}
+
+/// [`enabled_features_from_manifest_for_resolver`], with `seed_default`
+/// false for `--no-default-features`: the `default` set is then on only when
+/// `requested` names it. Its definition stays, so `--features default`
+/// still turns its members on, as Cargo does.
+#[must_use]
+pub fn enabled_features_with_defaults(
+    manifest: &str,
+    requested: &[&str],
+    resolver_v1: bool,
+    seed_default: bool,
 ) -> BTreeSet<String> {
     let mut enabled = BTreeSet::new();
     let table = toml::from_str::<toml::Table>(manifest).ok();
@@ -1747,7 +1771,7 @@ fn enabled_features_from_manifest_for_resolver(
         .and_then(|features| features.get("default"))
         .and_then(toml::Value::as_array);
     let mut queue: Vec<String> = Vec::new();
-    if let Some(members) = default_members {
+    if let Some(members) = default_members.filter(|_| seed_default) {
         queue.push("default".to_owned());
         queue.extend(
             members
@@ -2815,7 +2839,7 @@ fn attr_name(attr: &syn::Attribute) -> Option<String> {
 /// `#[edge]` marker arrived this way was invisible to the scan entirely:
 /// not merely excluded, but never even considered a candidate `EdgeFn` no
 /// matter how the build was configured (Codex review on #2739, round 27,
-/// P1). Conservative in the same direction as [`eval_cfg_attr`]: only a
+/// P1). Conservative in the same direction as [`eval_cfg_meta`]: only a
 /// condition that DEFINITELY resolves false drops the payload's names — an
 /// unparseable condition (`target_os`, ...) still lets them through, since
 /// wrongly hiding a real `#[edge]` marker is the dangerous direction here.
@@ -2841,7 +2865,7 @@ fn attr_names_including_cfg_attr(
 
 /// Parses a `cfg_attr(condition, meta1, meta2, ...)` meta list's tokens into
 /// the condition's resolution — `None` for "unresolvable", the same
-/// convention [`eval_cfg_attr`] uses for a plain `#[cfg(...)]` — and its
+/// convention [`eval_cfg_meta`] uses for a plain `#[cfg(...)]` — and its
 /// meta list (empty if the part after the condition fails to parse as one).
 /// `None` overall means the tokens aren't shaped like a `cfg_attr` payload
 /// at all (no top-level `,`).
@@ -3302,17 +3326,18 @@ impl CfgPredicate {
     }
 }
 
-/// Try to fully resolve one `#[cfg(...)]` attribute against `default_features`.
+/// Try to fully resolve the body of one `#[cfg(...)]` attribute against
+/// `default_features`.
 ///
 /// `None` means "stay conservative": a non-`cfg` attribute, a predicate this
 /// scan does not parse (`target_os`, ...), or one with trailing tokens it does
-/// not understand. A caller treats `None` the same as `Some(true)` — kept in
-/// the scan — so only `Some(false)` ever excludes a function.
-fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> Option<bool> {
-    if !attr.path().is_ident("cfg") {
+/// not understand. A caller treats `None` the same as `Some(true)`: only
+/// `Some(false)` ever excludes an item.
+pub fn eval_cfg_meta(meta: &syn::Meta, default_features: &BTreeSet<String>) -> Option<bool> {
+    if !meta.path().is_ident("cfg") {
         return None;
     }
-    let syn::Meta::List(list) = &attr.meta else {
+    let syn::Meta::List(list) = meta else {
         return None;
     };
     syn::parse2::<CfgPredicate>(list.tokens.clone())
@@ -3321,11 +3346,11 @@ fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> 
 }
 
 /// Whether `attr`, on its own, excludes whatever it's attached to: either a
-/// literal `#[cfg(...)]` that [`eval_cfg_attr`] resolves as definitely
+/// literal `#[cfg(...)]` that [`eval_cfg_meta`] resolves as definitely
 /// false, or an active `#[cfg_attr(condition, cfg(inner), ...)]` whose
 /// injected `cfg(...)` [`cfg_attr_injects_a_false_cfg`] resolves as
 /// definitely false the same way. Every AST-level cfg-exclusion check in
-/// this module should go through this rather than `eval_cfg_attr` alone —
+/// this module should go through this rather than `eval_cfg_meta` alone —
 /// `mod`-level exclusion checks (inline-module discovery in [`scan_items`]
 /// and out-of-line discovery in [`collect_out_of_line_mods`]) previously
 /// only checked the literal form, so `#[cfg_attr(feature = "outer",
@@ -3337,13 +3362,20 @@ fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> 
 /// #2739, round 33, P2; [`edge_fn`]'s own version of this check, added in
 /// round 29, was the only one already correct).
 fn attr_cfg_excludes(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> bool {
-    if eval_cfg_attr(attr, default_features) == Some(false) {
+    meta_cfg_excludes(&attr.meta, default_features)
+}
+
+/// [`attr_cfg_excludes`] on the body of an attribute (`cfg(…)` or
+/// `cfg_attr(…)`). `autumn a11y verify` reads tokens, not a `syn` AST, so it
+/// calls this directly.
+pub fn meta_cfg_excludes(meta: &syn::Meta, default_features: &BTreeSet<String>) -> bool {
+    if eval_cfg_meta(meta, default_features) == Some(false) {
         return true;
     }
-    let syn::Meta::List(list) = &attr.meta else {
+    let syn::Meta::List(list) = meta else {
         return false;
     };
-    attr.path().is_ident("cfg_attr") && cfg_attr_injects_a_false_cfg(list, default_features)
+    meta.path().is_ident("cfg_attr") && cfg_attr_injects_a_false_cfg(list, default_features)
 }
 
 /// Find every `edge_routes![...]` invocation in a token stream and record the
@@ -4460,7 +4492,7 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
 
 /// Whether the tokens immediately preceding `trees[item_index]` form one or
 /// more attributes (`#[...]`), at least one of which is a `#[cfg(...)]` that
-/// [`eval_cfg_attr`]'s own predicate grammar resolves as definitely false —
+/// [`eval_cfg_meta`]'s own predicate grammar resolves as definitely false —
 /// the token-level counterpart [`collect_registrations`] needs since it
 /// walks a raw `TokenStream`, never a `syn::Attribute` list.
 fn preceding_cfg_excludes(
@@ -4493,7 +4525,7 @@ fn preceding_cfg_excludes(
 /// Whether `group` — the bracketed contents of one `#[...]` attribute — is a
 /// `cfg(...)` whose predicate resolves as definitely false, using the same
 /// grammar and safe-direction fallback (unparseable stays *true*, i.e. not
-/// excluded) as [`eval_cfg_attr`] — or an active `#[cfg_attr(condition,
+/// excluded) as [`eval_cfg_meta`] — or an active `#[cfg_attr(condition,
 /// cfg(inner), ...)]` whose injected `cfg(...)` resolves as definitely
 /// false the same way [`cfg_attr_injects_a_false_cfg`] does at the
 /// `syn::Attribute` level. Every other cfg-check in [`collect_registrations`]
@@ -4706,7 +4738,7 @@ mod tests {
 
     /// An unresolvable `cfg_attr` condition (a key this scan's `CfgPredicate`
     /// grammar does not parse) stays conservative — the same "unresolvable
-    /// stays visible" direction `eval_cfg_attr` already uses for a plain
+    /// stays visible" direction `eval_cfg_meta` already uses for a plain
     /// `#[cfg(...)]` — since wrongly hiding a real `#[edge]` marker is the
     /// dangerous direction here, not wrongly keeping one.
     #[test]
@@ -10149,6 +10181,8 @@ mod tests {
         let mut files = Vec::new();
         collect_rs_files(&src, &mut files);
         let mut missing = BTreeSet::new();
+        let mut parsed_files = Vec::new();
+        let mut test_files = BTreeSet::new();
         for file in files {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
@@ -10156,7 +10190,14 @@ mod tests {
             let Ok(parsed) = syn::parse_file(&text) else {
                 continue;
             };
-            collect_extractor_impls(&parsed.items, &mut missing);
+            collect_test_module_files(&file, &parsed.items, &mut test_files);
+            parsed_files.push((file, parsed));
+        }
+        for (file, parsed) in &parsed_files {
+            // The file of a `#[cfg(test)] mod name;` is test code too.
+            if !test_files.contains(file) {
+                collect_extractor_impls(&parsed.items, &mut missing);
+            }
         }
         missing.retain(|name: &String| {
             !EDGE_SAFE_NAMES.contains(&name.as_str())
@@ -10189,19 +10230,67 @@ mod tests {
                     }
                 }
                 syn::Item::Mod(item_mod) => {
-                    let test_only = item_mod.attrs.iter().any(|attr| match &attr.meta {
-                        syn::Meta::List(list) => {
-                            list.path.is_ident("cfg") && list.tokens.to_string().contains("test")
-                        }
-                        _ => false,
-                    });
-                    if let (false, Some((_, inner))) = (test_only, &item_mod.content) {
+                    if let (false, Some((_, inner))) =
+                        (is_test_only(&item_mod.attrs), &item_mod.content)
+                    {
                         collect_extractor_impls(inner, out);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Whether `attrs` hold a `cfg` that names `test`.
+    fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| match &attr.meta {
+            syn::Meta::List(list) => {
+                list.path.is_ident("cfg") && list.tokens.to_string().contains("test")
+            }
+            _ => false,
+        })
+    }
+
+    /// The files of the `#[cfg(test)] mod name;` declarations in `file`:
+    /// `name.rs` and `name/mod.rs` next to it, or under its own directory.
+    fn collect_test_module_files(file: &Path, items: &[syn::Item], out: &mut BTreeSet<PathBuf>) {
+        let (Some(parent), Some(stem)) = (file.parent(), file.file_stem()) else {
+            return;
+        };
+        let base = if ["mod", "lib", "main"].iter().any(|own| stem == *own) {
+            parent.to_path_buf()
+        } else {
+            parent.join(stem)
+        };
+        for item in items {
+            if let syn::Item::Mod(item_mod) = item
+                && item_mod.content.is_none()
+                && is_test_only(&item_mod.attrs)
+            {
+                let name = item_mod.ident.to_string();
+                out.insert(base.join(format!("{name}.rs")));
+                out.insert(base.join(&name).join("mod.rs"));
+            }
+        }
+    }
+
+    /// A test module in its own file is test code: its extractors are not
+    /// the framework's.
+    #[test]
+    fn an_out_of_line_test_module_is_skipped() {
+        let parent: syn::File = syn::parse_quote! {
+            #[cfg(test)]
+            mod tests;
+            mod real;
+        };
+        let mut files = BTreeSet::new();
+        collect_test_module_files(Path::new("src/fleet.rs"), &parent.items, &mut files);
+        assert!(files.contains(Path::new("src/fleet/tests.rs")));
+        assert!(files.contains(Path::new("src/fleet/tests/mod.rs")));
+        assert!(!files.iter().any(|file| file.ends_with("real.rs")));
+        let mut root = BTreeSet::new();
+        collect_test_module_files(Path::new("src/lib.rs"), &parent.items, &mut root);
+        assert!(root.contains(Path::new("src/tests.rs")));
     }
 
     #[test]

@@ -73,6 +73,14 @@ async fn contract_suite_on_postgres() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_ties_are_reported_once_on_postgres() {
+    let (pool, _container) = setup().await;
+    let store = std::sync::Arc::new(DbBillingStore::new(pool));
+    store_contract::subscription_concurrent_ties_are_reported_once(store).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker (testcontainers)"]
 async fn migrations_are_idempotent_and_revertible() {
     let (url, _container) = start_postgres().await;
     migrate(&url).await;

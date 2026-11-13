@@ -1,9 +1,9 @@
-//! Ledger regression harness for `dunning::rearm_pending`
+//! Ledger regression harness for `dunning::rearm_pending_now`
 //! (`autumn-billing/src/dunning.rs`), the step every app-process restart
 //! takes to re-queue dunning retries that were still open when the process
 //! last stopped — "a restart re-arms from the store" (module doc comment).
 //!
-//! `rearm_pending` loads every open (`Pending`/`Running`) row with one
+//! `rearm_pending_now` loads every open (`Pending`/`Running`) row with one
 //! query, through `BillingStore::open_dunning()`. This one query is
 //! correct: it is the one place in the code that must read every open row,
 //! system-wide. It is not the over-broad read the 09-11 `close_dunning_for`
@@ -13,9 +13,9 @@
 //! Issue #2748 found the defect on the write side: `dunning::rearm_rows`
 //! used to call `JobClient::enqueue_due` once per open row, and await each
 //! call before starting the next. N open rows cost N sequential
-//! `INSERT INTO autumn_jobs` round trips. Production `rearm_pending` spawns
-//! this work (`tokio::runtime::Handle::spawn`) rather than awaiting it, so
-//! it never delayed `ProbeState::mark_startup_complete()` — but each row's
+//! `INSERT INTO autumn_jobs` round trips. In production the background task
+//! `dunning::REARM_TASK` runs this work after startup, so it never delayed
+//! `ProbeState::mark_startup_complete()` — but each row's
 //! insert still had to wait its turn, so a large backlog took longer to
 //! finish re-arming after a restart, right when a payment-provider outage
 //! makes that backlog largest.
@@ -36,10 +36,9 @@
 //! `INSERT INTO autumn_jobs` statement, not one per row.
 //!
 //! Exercises the real production path: `dunning::rearm_pending_now` is the
-//! exact body `dunning::rearm_pending` (the private startup-hook entry point
-//! `BillingPlugin::build` calls) spawns — factored out and exposed `pub`
-//! specifically so this harness can await its completion deterministically
-//! instead of racing a spawned task, the same reason
+//! exact body of the background task `dunning::REARM_TASK` that
+//! `BillingPlugin::build` registers. It is `pub` so this harness can await
+//! its completion deterministically instead of racing the task, the same reason
 //! `autumn_web::test::drain_ready_repository_commit_hooks` exposes the
 //! repository-commit-hooks drain loop for its own Ledger harness
 //! (`repository_commit_hooks_claim_ack_profile.rs`).

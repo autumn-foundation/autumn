@@ -56,12 +56,15 @@ profile in `Cargo.toml`, for your app and for its dependencies:
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
-debug = "line-tables-only"
+debug = false
 ```
 
-`line-tables-only` keeps file and line in backtraces. It removes variable
-inspection in a debugger. To get full debug info back, set `debug = true` in
-both tables.
+`line-tables-only` keeps file and line in backtraces for your app. It removes
+variable inspection in a debugger. Dependencies build with no debug info: the
+first build is faster, and a backtrace frame in a dependency shows the
+function name with no file and line. To get those back, set
+`debug = "line-tables-only"` in the second table. To get full debug info
+back, set `debug = true` in both tables.
 
 The second is the linker's own remedy, in `.cargo/config.toml`. It applies to
 Windows MSVC targets only:
@@ -176,8 +179,8 @@ tiers by command name and flags the platform-specific prerequisites:
                      autumn serve --daemon / stop / status / restart, ...
                      Tier 2 (WSL2), run these from a WSL2 shell — autumn deploy
                      up / rollback / status / maintenance, ... Prerequisites:
-                     autumn generate auth --passkeys needs OpenSSL via vcpkg
-                     with VCPKG_ROOT set ... Policy: docs/guide/platform-support.md
+                     autumn deploy up / scripts/*.sh needs WSL2 (Tier 2) ...
+                     Policy: docs/guide/platform-support.md
 ```
 
 It **passes**, it does not warn — Windows is a supported development platform
@@ -189,9 +192,8 @@ check passes too, noting simply that every journey is native.
 
 ### Windows prerequisites
 
-- **`autumn generate auth --passkeys`** needs OpenSSL. On Windows install it
-  through `vcpkg` and set `VCPKG_ROOT` so the build can find it — see
-  [the generators guide](./generators.md).
+- **`autumn generate auth --passkeys`** needs no native library. Its
+  `webauthn-rs` dependency uses pure-Rust crypto since 0.6.
 - **`autumn serve install-service` / `uninstall-service`** need an elevated
   (Administrator) shell, like any Windows service registration. `autumn doctor`'s
   `daemon_service` check says so when the shell you are in cannot register one —

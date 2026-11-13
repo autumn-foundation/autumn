@@ -146,6 +146,55 @@ async fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
     assert!(apex.render().contains('A'));
 }
 
+/// #2643: an apex under a multi-label public suffix gets A/AAAA records.
+#[tokio::test]
+async fn multi_label_suffix_apexes_get_address_records() {
+    let registry = registry();
+    for hostname in ["clientco.co.uk", "customer.com.au", "tenant.co.jp"] {
+        let domain = registry.register(hostname, "tenant-a", NOW).await.unwrap();
+        let instructions = DnsInstructions::for_domain(&domain, &ingress()).unwrap();
+        match &instructions.routing {
+            RoutingRecord::Address { name, ipv4, .. } => {
+                assert_eq!(name, hostname);
+                assert_eq!(ipv4, &["203.0.113.10".to_owned()]);
+            }
+            other @ RoutingRecord::Cname { .. } => {
+                panic!("{hostname}: expected address records, got {other:?}")
+            }
+        }
+    }
+
+    let sub = registry
+        .register("app.clientco.co.uk", "tenant-a", NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        DnsInstructions::for_domain(&sub, &ingress())
+            .unwrap()
+            .routing,
+        RoutingRecord::Cname { .. }
+    ));
+}
+
+/// #2643: with no ingress addresses, a multi-label apex gets the same error
+/// as a two-label apex, not a CNAME it cannot publish.
+#[tokio::test]
+async fn multi_label_suffix_apex_without_addresses_names_the_missing_keys() {
+    let hostname_only = ExpectedIngress {
+        hostname: Some("ingress.myapp.com".to_owned()),
+        ..ExpectedIngress::default()
+    };
+    let registry = registry();
+    for hostname in ["clientco.com", "clientco.co.uk"] {
+        let domain = registry.register(hostname, "tenant-a", NOW).await.unwrap();
+        let err = DnsInstructions::for_domain(&domain, &hostname_only).unwrap_err();
+        assert!(
+            err.contains("ingress_ipv4") && err.contains("ingress_ipv6"),
+            "{hostname}: {err}"
+        );
+    }
+}
+
 // ── #2642: ownership proof by TXT token ──────────────────────────────────
 
 /// Both shapes render the TXT record that carries the registration's token,
@@ -948,6 +997,102 @@ mod sni {
         assert!(resolver.certificate_for("app.clientco.com").is_none());
     }
 
+    /// A source whose load is overtaken by a renewal: the renewal lands while
+    /// the stale pair is still being read.
+    #[derive(Debug)]
+    struct OvertakenByRenewal {
+        registry: Arc<CustomDomainRegistry>,
+        cache: Arc<CustomDomainCertCache>,
+        /// Whether the renewal is also cached (and not evicted again).
+        renewal_cached: bool,
+    }
+
+    impl autumn_web::custom_domain::SniCertSource for OvertakenByRenewal {
+        fn load(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            let stale = key(CERT_PEM, KEY_PEM);
+            let not_after =
+                autumn_web::tls::leaf_not_after_from_pem(RENEWED_CERT_PEM.as_bytes()).unwrap();
+            futures::executor::block_on(self.registry.record_active(hostname, NOW, not_after))
+                .unwrap();
+            if self.renewal_cached {
+                self.cache
+                    .insert(hostname, key(RENEWED_CERT_PEM, RENEWED_KEY_PEM));
+            }
+            Some(stale)
+        }
+    }
+
+    async fn active_registry() -> Arc<CustomDomainRegistry> {
+        let registry = super::hydrate(CustomDomainRegistry::new(
+            Arc::new(MemoryCustomDomainStore::new()),
+            10,
+        ));
+        registry
+            .register("app.clientco.com", "tenant-a", NOW)
+            .await
+            .unwrap();
+        registry
+            .record_active("app.clientco.com", NOW, NOW + 86_400)
+            .await
+            .unwrap();
+        registry
+    }
+
+    fn resolver_over(
+        registry: &Arc<CustomDomainRegistry>,
+        cache: &Arc<CustomDomainCertCache>,
+        renewal_cached: bool,
+    ) -> SniCertResolver {
+        let base = Arc::new(autumn_web::tls::ReloadableCertResolver::new(key(
+            CERT_PEM, KEY_PEM,
+        )));
+        SniCertResolver::new(
+            base,
+            vec!["myapp.com".to_owned()],
+            Arc::clone(registry),
+            Arc::clone(cache),
+        )
+        .with_source(Arc::new(OvertakenByRenewal {
+            registry: Arc::clone(registry),
+            cache: Arc::clone(cache),
+            renewal_cached,
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_cache_miss_load_cannot_publish_the_older_pair_over_a_renewal() {
+        let registry = active_registry().await;
+        let cache = Arc::new(CustomDomainCertCache::new(4));
+        let resolver = resolver_over(&registry, &cache, true);
+
+        let served = resolver.certificate_for("app.clientco.com").unwrap();
+
+        let renewed = key(RENEWED_CERT_PEM, RENEWED_KEY_PEM);
+        assert_eq!(
+            cache.get("app.clientco.com").unwrap().cert[0],
+            renewed.cert[0],
+            "the cache must keep the renewed pair"
+        );
+        assert_eq!(served.cert[0], renewed.cert[0], "and serve it");
+    }
+
+    #[tokio::test]
+    async fn a_load_older_than_the_recorded_certificate_is_not_cached() {
+        // The renewal was cached and then evicted before the stale load
+        // published, so the cache has nothing to compare against. The record
+        // still says the loaded pair is out of date.
+        let registry = active_registry().await;
+        let cache = Arc::new(CustomDomainCertCache::new(4));
+        let resolver = resolver_over(&registry, &cache, false);
+
+        assert!(resolver.certificate_for("app.clientco.com").is_some());
+
+        assert!(
+            cache.get("app.clientco.com").is_none(),
+            "a pair older than the record must not be cached"
+        );
+    }
+
     #[test]
     fn the_certificate_cache_is_bounded_and_evicts_oldest_first() {
         let cache = CustomDomainCertCache::new(2);
@@ -1738,4 +1883,150 @@ async fn a_token_upgrade_that_fails_to_persist_stays_in_the_verification_pass() 
         .map(|d| d.hostname)
         .collect();
     assert_eq!(hosts, vec!["verified.clientco.com".to_owned()]);
+}
+
+// ── Partial hydration (#2654) ────────────────────────────────────────────
+
+/// A store with tenant A's record on disk, A's file truncated, and B's intact.
+async fn store_with_one_corrupt_record() -> (tempfile::TempDir, Arc<FsCustomDomainStore>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsCustomDomainStore::new(dir.path()));
+    let writer = hydrate(CustomDomainRegistry::new(store.clone(), 10));
+    writer
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    writer
+        .register("ok.clientco.com", "tenant-ok", NOW)
+        .await
+        .unwrap();
+    let bad = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|s| s.contains("app.clientco.com")))
+        .unwrap();
+    std::fs::write(&bad, b"{\"hostname\": \"app.cli").unwrap();
+    let name = bad.display().to_string();
+    (dir, store, name)
+}
+
+#[tokio::test]
+async fn a_partial_load_refuses_register_and_names_the_file() {
+    let (_dir, store, bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store.clone(), 10);
+    assert_eq!(registry.load().await.unwrap(), 1);
+
+    let err = registry
+        .register("app.clientco.com", "tenant-evil", NOW)
+        .await
+        .expect_err("a registry that skipped a record must not accept a registration");
+    let RegisterError::Incomplete { files } = &err else {
+        panic!("expected Incomplete, got {err:?}");
+    };
+    assert_eq!(files, std::slice::from_ref(&bad));
+    assert!(err.to_string().contains(&bad), "{err}");
+    // A's corrupt file was not overwritten.
+    assert_eq!(std::fs::read(&bad).unwrap(), b"{\"hostname\": \"app.cli");
+}
+
+#[tokio::test]
+async fn a_partial_load_still_serves_the_records_that_loaded() {
+    let (_dir, store, _bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+
+    assert!(registry.get("ok.clientco.com").is_some());
+    // Renewal and status changes for a loaded record still write.
+    registry
+        .record_verified("ok.clientco.com", NOW + 1)
+        .await
+        .unwrap();
+    // Re-registering a loaded hostname for its own tenant is a read, not a claim.
+    assert!(
+        registry
+            .register("ok.clientco.com", "tenant-ok", NOW + 2)
+            .await
+            .is_ok(),
+        "an idempotent re-register of a loaded record is safe"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_load_is_unaffected_and_a_reload_clears_the_refusal() {
+    let (_dir, store, bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+    assert!(!registry.is_complete());
+    assert_eq!(registry.skipped_records(), vec![bad.clone()]);
+
+    // The operator deletes the bad file; the next load is complete.
+    std::fs::remove_file(&bad).unwrap();
+    registry.load().await.unwrap();
+    assert!(registry.is_complete());
+    assert!(registry.skipped_records().is_empty());
+    registry
+        .register("new.clientco.com", "tenant-b", NOW)
+        .await
+        .expect("a complete load accepts registrations");
+}
+
+#[tokio::test]
+async fn a_partial_load_names_every_skipped_file() {
+    let (dir, store, bad) = store_with_one_corrupt_record().await;
+    let second = dir.path().join("second.json");
+    std::fs::write(&second, b"{").unwrap();
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+    let mut want = vec![bad, second.display().to_string()];
+    want.sort();
+    let mut got = registry.skipped_records();
+    got.sort();
+    assert_eq!(got, want);
+}
+
+#[tokio::test]
+async fn load_without_migration_also_reports_skipped_files() {
+    let (_dir, store, bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load_without_migration().await.unwrap();
+    assert_eq!(registry.skipped_records(), vec![bad]);
+    assert!(matches!(
+        registry.register("x.clientco.com", "t", NOW).await,
+        Err(RegisterError::Incomplete { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_partial_load_keeps_a_loaded_hostname_taken_by_its_tenant() {
+    let (_dir, store, _bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+    let err = registry
+        .register("ok.clientco.com", "tenant-evil", NOW)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RegisterError::Incomplete { .. }), "{err:?}");
+    assert_eq!(registry.get("ok.clientco.com").unwrap().tenant, "tenant-ok");
+}
+
+#[tokio::test]
+async fn a_partial_load_never_deletes_the_file_of_an_unloaded_hostname() {
+    let (_dir, store, bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+
+    assert!(!registry.remove("app.clientco.com").await.unwrap());
+    assert!(
+        !registry
+            .remove_if("app.clientco.com", |_| true)
+            .await
+            .unwrap()
+    );
+    assert!(std::path::Path::new(&bad).exists(), "the only copy stays");
+}
+
+#[tokio::test]
+async fn the_default_load_report_skips_nothing() {
+    let report = MemoryCustomDomainStore::new().load_report().await.unwrap();
+    assert!(report.records.is_empty() && report.skipped.is_empty());
 }

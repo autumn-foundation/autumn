@@ -21,9 +21,10 @@ use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_co
 use autumn_macros_support::cascade::{CASCADE_LEVELS, CascadeLeg, any_const, cascade_level};
 use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
 use autumn_macros_support::schema::{
-    apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
-    field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
-    field_serde_serialize_rename, has_attr, is_option_type, schema_property_name, serde_bare_word,
+    SerdeSide, apply_serde_rename_all_rule, emit_request_schema_fn_body, emit_schema_fn_body_full,
+    emit_schema_fn_body_named, field_has_skip_serializing_if, field_is_collaborative,
+    field_is_translatable, field_serde_serialize_rename, has_attr, has_serde_default,
+    is_option_type, schema_property_name, serde_bare_word, serde_rename_all_rule_for,
     serde_rename_all_serialize_rule, serde_valued_key, type_name_str,
 };
 
@@ -41,10 +42,14 @@ struct ModelArgs {
     /// `#[model(managed)]`. Captured but intentionally unused by codegen.
     #[allow(dead_code)]
     managed: bool,
+    /// `schema = "<name>"`: the Postgres schema of the table. Tooling only.
+    /// The `table!` module keeps its bare name.
+    #[allow(dead_code)]
+    schema: Option<String>,
 }
 
-/// Process `#[model]`, `#[model(table = "...")]`, and `#[model(managed)]`
-/// attribute arguments.
+/// Process `#[model]`, `#[model(table = "...")]`, `#[model(schema = "...")]`,
+/// and `#[model(managed)]` attribute arguments.
 fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
     let mut args = ModelArgs::default();
     if attr.is_empty() {
@@ -67,9 +72,24 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
             }
             args.managed = true;
             Ok(())
+        } else if meta.path.is_ident("schema") {
+            let value: LitStr = meta.value()?.parse()?;
+            let name = value.value();
+            if name == "managed" {
+                // Legacy spelling of the bare `managed` marker.
+                args.managed = true;
+            } else if autumn_schema_core::is_valid_schema_name(&name) {
+                args.schema = Some(name);
+            } else {
+                return Err(syn::Error::new(
+                    value.span(),
+                    "`schema` must be a plain lower-case identifier that Postgres does not reserve, such as `schema = \"marketing\"`",
+                ));
+            }
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported `#[model(...)]` argument; expected `table = \"...\"` or `managed`",
+                "unsupported `#[model(...)]` argument; expected `table = \"...\"`, `schema = \"...\"` or `managed`",
             ))
         }
     })
@@ -357,6 +377,10 @@ struct Association {
     /// runtime [`AutumnCounterCaches`] impl `#[model]` emits, which the child's
     /// generated repository consults to keep `{parent}.{child}_count` current.
     counter_cache: Option<CounterCacheDecl>,
+    /// `references = "<column>"` on a `#[belongs_to]` (#3033): the parent
+    /// column the foreign key stores. `None` means `"id"`. The preload loader,
+    /// counter cache and derivations on this leg all use it.
+    references: Option<String>,
 }
 
 /// The join-table half of a many-to-many `has_many(..., through = ...)`
@@ -772,6 +796,7 @@ fn parse_assoc_attr(
         counter_cache,
         counter_cache_tenant,
         parent_pk,
+        references,
     ) = attr.parse_args_with(|input: ParseStream| {
         let target: syn::Ident = input.parse()?;
         let mut explicit_fk: Option<String> = None;
@@ -789,6 +814,7 @@ fn parse_assoc_attr(
         // `parent_pk` rides along with its span like `counter_cache_tenant`:
         // a later cross-key rejection points its caret at the offending key.
         let mut parent_pk: Option<(String, proc_macro2::Span)> = None;
+        let mut references: Option<String> = None;
         // Zero or more trailing `, key = value` pairs (`fk`, `name`,
         // `through`, `target_fk`, `helper`), any order — plus `counter_cache`,
         // the one key that is also legal as a bare flag.
@@ -832,6 +858,16 @@ fn parse_assoc_attr(
                 // that addresses the parent by key.
                 check_column_ident(&key, "parent_pk", &value)?;
                 parent_pk = Some((value, key.span()));
+            } else if key == "references" {
+                if kind != AssocKind::BelongsTo {
+                    return Err(syn::Error::new_spanned(
+                        &key,
+                        "`references = <column>` names the parent key a \
+                         foreign key stores, so it is only valid on `belongs_to`",
+                    ));
+                }
+                check_column_ident(&key, "references", &value)?;
+                references = Some(value);
             } else if key == "fk" {
                 explicit_fk = Some(value);
             } else if key == "name" {
@@ -851,9 +887,9 @@ fn parse_assoc_attr(
                          `through = <join_table>`, `target_fk = <column>`, \
                          `helper = <singular>`, `counter_cache` / \
                          `counter_cache = <column>`, \
-                         `counter_cache_tenant = <column>`, or \
-                         `parent_pk = <column>` in association \
-                         attribute",
+                         `counter_cache_tenant = <column>`, \
+                         `parent_pk = <column>`, or `references = <column>` \
+                         in association attribute",
                 ));
             }
         }
@@ -868,6 +904,7 @@ fn parse_assoc_attr(
             counter_cache,
             counter_cache_tenant,
             parent_pk,
+            references,
         ))
     })?;
 
@@ -903,6 +940,27 @@ fn parse_assoc_attr(
             ));
         }
         (None, None, None) => None,
+    };
+
+    // `references` is the one source of truth for the parent key: a counter
+    // cache inherits it, and a conflicting `parent_pk` is rejected.
+    let counter_cache = match (counter_cache, references.as_deref()) {
+        (Some(decl), Some(refs)) => match decl.parent_pk.as_deref() {
+            Some(pk) if pk != refs => {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`parent_pk = \"{pk}\"` conflicts with `references = \
+                         \"{refs}\"` on the same association: name the key once"
+                    ),
+                ));
+            }
+            _ => Some(CounterCacheDecl {
+                parent_pk: Some(refs.to_owned()),
+                ..decl
+            }),
+        },
+        (decl, _) => decl,
     };
 
     if let Some(decl) = counter_cache.as_ref()
@@ -996,6 +1054,13 @@ fn parse_assoc_attr(
         through,
         dependent: dependent.map(|(action, _span)| action),
         helper: explicit_helper,
+        // A counter cache's `parent_pk` names the same parent key, so the
+        // loader reads one value whichever spelling the author chose.
+        references: references.or_else(|| {
+            counter_cache
+                .as_ref()
+                .and_then(|decl| decl.parent_pk.clone())
+        }),
         counter_cache,
     })
 }
@@ -1497,6 +1562,38 @@ fn derivation_fk(
         return Ok(assoc.fk.clone());
     }
     Ok(format!("{}_id", pascal_to_snake(&decl.target.to_string())))
+}
+
+/// The parent key column a `#[derivation]` addresses: its own `parent_pk`,
+/// else the `references` of the `#[belongs_to]` leg it counts through. Naming
+/// both with different values is an error.
+fn derivation_parent_pk(
+    decl: &DerivationDecl,
+    assocs: &[Association],
+    fk: &str,
+) -> syn::Result<Option<String>> {
+    let inherited = assocs
+        .iter()
+        .find(|a| {
+            a.kind == AssocKind::BelongsTo
+                && a.target == decl.target
+                && a.through.is_none()
+                && a.fk == fk
+        })
+        .and_then(|a| a.references.as_deref());
+    match (decl.parent_pk.as_deref(), inherited) {
+        (Some(pk), Some(refs)) if pk != refs => Err(syn::Error::new(
+            decl.span,
+            format!(
+                "`parent_pk = \"{pk}\"` conflicts with `references = \"{refs}\"` \
+                 on the `#[belongs_to({})]` it counts through (`parent_pk` on its \
+                 `counter_cache` counts as `references`): name the key once",
+                decl.target
+            ),
+        )),
+        (Some(pk), _) => Ok(Some(pk.to_owned())),
+        (None, inherited) => Ok(inherited.map(ToOwned::to_owned)),
+    }
 }
 
 /// Reject a `#[derivation]` that maintains a `(parent table, column)` pair
@@ -2332,8 +2429,8 @@ fn emit_dependent_models(model_ident: &syn::Ident, deps: &[&Association]) -> Tok
 ///
 /// The parent's table is convention-derived from the target type
 /// (`Post` → `posts`), the same assumption the preload codegen already makes for
-/// `belongs_to`; the parent's primary key is assumed to be `id`, matching the
-/// dependent-cascade specs. `fk_of` is emitted as a plain `fn` item per leg,
+/// `belongs_to`; the parent's primary key is `id` unless the leg sets
+/// `references` or `parent_pk`. The dependent-cascade specs assume `id`. `fk_of` is emitted as a plain `fn` item per leg,
 /// which doubles as the type guard: a foreign-key field that is not `i64` /
 /// `Option<i64>` fails to coerce to `fn(&Model) -> Option<i64>`.
 // One resolution + validation arm per spec field (column, tenant column, the
@@ -2682,7 +2779,9 @@ fn emit_counter_caches_impl(
         // a derivation maintaining it would rewrite the parent's identity on
         // the first qualifying mutation. Compared against the EFFECTIVE key: an
         // override moves the forbidden column with it (#2662).
-        let effective_parent_pk = decl.parent_pk.as_deref().unwrap_or("id");
+        let pk_leg_fk = derivation_fk(model_ident, decl, assocs)?;
+        let derived_pk = derivation_parent_pk(decl, assocs, &pk_leg_fk)?;
+        let effective_parent_pk = derived_pk.as_deref().unwrap_or("id");
         if column == effective_parent_pk {
             return Err(syn::Error::new(
                 decl.span,
@@ -3025,7 +3124,9 @@ fn emit_counter_caches_impl(
         // The parent's physical primary-key column (#2662): the explicit
         // `parent_pk = "<column>"` override, else the `"id"` default — the
         // same visibility story as `parent_table`'s override above.
-        let parent_pk = decl.parent_pk.as_deref().unwrap_or("id");
+        let pk_leg_fk = derivation_fk(model_ident, decl, assocs)?;
+        let derived_pk = derivation_parent_pk(decl, assocs, &pk_leg_fk)?;
+        let parent_pk = derived_pk.as_deref().unwrap_or("id");
         derivation_items.push(quote! {
             /// The parent type is otherwise never named in the expansion: the
             /// parent table is a string and the maintenance is SQL. This makes
@@ -3133,6 +3234,7 @@ fn emit_counter_caches_impl(
 fn emit_association_items(
     model_ident: &syn::Ident,
     table_ident: &syn::Ident,
+    pk_field: &syn::Ident,
     vis: &syn::Visibility,
     assocs: &[Association],
 ) -> TokenStream {
@@ -3224,7 +3326,10 @@ fn emit_association_items(
                         (quote! { __r.#fk_ident }, quote! { #target_table::id })
                     }
                     // has_one: fk is on the *target*, points at this model's id.
-                    _ => (quote! { __r.id }, quote! { #target_table::#fk_ident }),
+                    _ => (
+                        quote! { __r.#pk_field },
+                        quote! { #target_table::#fk_ident },
+                    ),
                 };
                 // For has_one the lookup map keys on the target's fk column; for
                 // belongs_to it keys on the target's id.
@@ -3234,20 +3339,16 @@ fn emit_association_items(
                     quote! { __child.#fk_ident }
                 };
 
-                // A belongs_to whose counter cache names the parent's key with
-                // `parent_pk = "<column>"` (#2662): the parent is not keyed on
+                // A belongs_to that names the parent's key with
+                // `references = "<column>"` (#3033, or via its counter cache's
+                // `parent_pk`, #2662): the parent is not keyed on
                 // `id`, so neither `<parent>::id` nor `__child.id` exists. Filter
                 // on the named column and select it alongside each row, so the
                 // loader never needs the parent's Rust field name (which the
                 // child cannot see). Without the override the block below is
                 // emitted unchanged.
                 let overridden_pk = (assoc.kind == AssocKind::BelongsTo)
-                    .then(|| {
-                        assoc
-                            .counter_cache
-                            .as_ref()
-                            .and_then(|decl| decl.parent_pk.as_deref())
-                    })
+                    .then_some(assoc.references.as_deref())
                     .flatten()
                     .filter(|pk| *pk != "id")
                     .map(column_ident);
@@ -3369,7 +3470,7 @@ fn emit_association_items(
                 loader_blocks.push(quote! {
                     if let ::core::option::Option::Some(__child_spec) = &spec.#name_ident {
                         let mut __keys: ::std::vec::Vec<i64> =
-                            records.iter().map(|__r| __r.id).collect();
+                            records.iter().map(|__r| __r.#pk_field).collect();
                         __keys.sort_unstable();
                         __keys.dedup();
                         let __rows: ::std::vec::Vec<#target> = #target_table::table
@@ -3406,7 +3507,7 @@ fn emit_association_items(
                             }
                         }
                         for __r in records.iter_mut() {
-                            let __v: #stored_ty = __groups.remove(&__r.id).unwrap_or_default();
+                            let __v: #stored_ty = __groups.remove(&__r.#pk_field).unwrap_or_default();
                             __r.associations_mut().insert::<#stored_ty>(#key, __v);
                         }
                     }
@@ -3504,7 +3605,7 @@ fn emit_association_items(
                             #[allow(unused_imports)]
                             use ::autumn_web::reexports::diesel::query_dsl::JoinOnDsl as _;
                             let mut __keys: ::std::vec::Vec<i64> =
-                                records.iter().map(|__r| __r.id).collect();
+                                records.iter().map(|__r| __r.#pk_field).collect();
                             __keys.sort_unstable();
                             __keys.dedup();
                             let __pairs: ::std::vec::Vec<(i64, #target)> =
@@ -3583,7 +3684,7 @@ fn emit_association_items(
                                 }
                             }
                             for __r in records.iter_mut() {
-                                let __v: #stored_ty = __groups.get(&__r.id).cloned().unwrap_or_default();
+                                let __v: #stored_ty = __groups.get(&__r.#pk_field).cloned().unwrap_or_default();
                                 __r.associations_mut().insert::<#stored_ty>(#key, __v);
                             }
                         }
@@ -6070,6 +6171,13 @@ fn diesel_column_name(field: &syn::Field) -> Option<String> {
     found
 }
 
+/// The model's `#[id]` field. With none, callers keep the historical `id`.
+fn primary_key_field<'a>(
+    fields: impl IntoIterator<Item = &'a syn::Field>,
+) -> Option<&'a syn::Field> {
+    fields.into_iter().find(|f| has_attr(f, "id"))
+}
+
 /// A Rust identifier for a SQL column name: the plain identifier, or the raw
 /// form (`r#type`) when the name is a Rust keyword, so a column recovered as an
 /// unrawed string can be spliced back into a `diesel::table!` or path.
@@ -6100,6 +6208,12 @@ fn physical_pk_column(pk_field: Option<&syn::Field>) -> String {
             diesel_column_name(field).or_else(|| field.ident.as_ref().map(unraw_ident))
         })
         .unwrap_or_else(|| "id".to_owned())
+}
+
+/// The table column of a field: its `#[diesel(column_name)]`, else its
+/// (unrawed) Rust name.
+fn physical_column(field: &syn::Field) -> String {
+    physical_pk_column(Some(field))
 }
 
 /// Build the `impl` block a model's `#[translatable]` fields contribute:
@@ -6958,6 +7072,13 @@ fn fake_expr_core(
         }
         "NaiveDateTime" => Some(quote! { ::autumn_web::fake::recent_datetime().naive_utc() }),
         "NaiveDate" => Some(quote! { ::autumn_web::fake::recent_datetime().date_naive() }),
+        // Issue #3405: a scaffold `time` column. Whole seconds, so the edit
+        // form shows the stored value without a fraction.
+        "NaiveTime" => Some(quote! {{
+            let __autumn_time = ::autumn_web::fake::recent_datetime().time();
+            ::autumn_web::reexports::chrono::Timelike::with_nanosecond(&__autumn_time, 0)
+                .unwrap_or(__autumn_time)
+        }}),
         _ => None,
     }
 }
@@ -7124,6 +7245,8 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
         },
         "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
         "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
+        // `<input type="time">` posts `HH:MM`, which chrono reads (#3405).
+        "NaiveTime" => quote! { ::autumn_web::form::FieldControl::Time },
         // `<input type="datetime-local">` posts an offsetless wall-clock value, so only
         // zone parameters with a sound interpretation of that shape get the picker:
         // `Utc` and the server's `Local`, each wired to a matching tolerant deserializer
@@ -7147,6 +7270,16 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
         // via `.override_field(...)` where a richer control is known.
         _ => quote! { ::autumn_web::form::FieldControl::Text },
     }
+}
+
+/// Wrap a schema-building block so every `Decimal` property also admits a
+/// JSON number (#3427).
+fn widen_decimals_tokens(body: &TokenStream) -> TokenStream {
+    quote! {{
+        let mut __autumn_schema = { #body };
+        ::autumn_web::openapi::widen_decimal_request_properties(&mut __autumn_schema);
+        __autumn_schema
+    }}
 }
 
 /// For a `NewX` field whose column `form_for` renders as an HTML
@@ -7768,7 +7901,9 @@ fn emit_state_machine_on_conn(
         })
         .collect();
 
+    // The method takes `AsyncPgConnection`, so it needs `postgres` (#2605).
     quote! {
+        ::autumn_web::__if_postgres! {
         impl #model_name {
             /// Validates a `{field}` transition and, for the fired edge, runs
             /// its declared effects on `conn` (issue #1973): first a sync
@@ -7789,6 +7924,7 @@ fn emit_state_machine_on_conn(
                 }
                 ::core::result::Result::Ok(__new_state)
             }
+        }
         }
     }
 }
@@ -7991,7 +8127,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(assocs) => assocs,
         Err(err) => return err.to_compile_error(),
     };
-    let association_items = emit_association_items(name, &table_ident, vis, &associations);
+    let pk_rust_field = primary_key_field(fields.named.iter())
+        .and_then(|f| f.ident.clone())
+        .unwrap_or_else(|| format_ident!("id"));
+    let association_items =
+        emit_association_items(name, &table_ident, &pk_rust_field, vis, &associations);
     let dependents_impl = emit_dependents_impl(name, &associations);
 
     // `#[derivation(Parent, column = "...", ...)]` (#1769). Parsed here beside
@@ -8046,6 +8186,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let tables = graph_relation_tables.iter().map(String::as_str);
         quote! { &[#(#tables),*] }
     };
+    let graph_crate_version = autumn_macros_support::graph::crate_version();
 
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
@@ -8485,6 +8626,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .first()
             .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
     };
+
+    // The physical key column, resolved once. Generated SQL addresses the
+    // key through this ident, never through a hard-coded `id` (#3033).
+    let pk_column_ident = column_ident(&physical_pk_column(primary_key_field(
+        all_fields.iter().copied(),
+    )));
 
     // Collect state machine specs from all fields (RED → GREEN: declarative SM
     // support). Emitted here — after the primary key is resolved — so an
@@ -9753,7 +9900,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if upsert_columns.is_empty() {
         upsert_columns.push(quote! {
-            #table_ident::id.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::id))
+            #table_ident::#pk_column_ident.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::#pk_column_ident))
         });
     }
 
@@ -9780,8 +9927,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     if upsert_types.is_empty() {
         upsert_types.push(quote! {
             ::autumn_web::reexports::diesel::dsl::Eq<
-                #table_ident::id,
-                ::autumn_web::reexports::diesel::upsert::Excluded<#table_ident::id>
+                #table_ident::#pk_column_ident,
+                ::autumn_web::reexports::diesel::upsert::Excluded<#table_ident::#pk_column_ident>
             >
         });
     }
@@ -9864,7 +10011,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let build_stmt = quote! {
             let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                 .values(__autumn_row)
-                .on_conflict(#table_ident::id)
+                .on_conflict(#table_ident::#pk_column_ident)
                 .do_update()
                 .set(Self::__autumn_upsert_set())
                 // #2854: explicit column list — never rely on physical column
@@ -10497,12 +10644,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // it just cannot be `required`, because a response that trips the predicate
     // omits it and a strict client would reject that response.
     //
-    // Sound HERE and only here, because this schema describes a RESPONSE: the
-    // generated repository API takes `New*` / `Update*` as its request bodies,
-    // never the query struct. `#[derive(OpenApiSchema)]` has no such guarantee
-    // — the same type may be a `Json<T>` request — so it refuses the shape
-    // instead, since `skip_serializing_if` governs serialization alone and
-    // serde still rejects a request that omits the field.
+    // Sound because this schema describes a RESPONSE only. A request body of
+    // the model type uses the request schema below (#2607).
+    // `#[derive(OpenApiSchema)]` has one schema for both directions, so it
+    // refuses the shape instead: serde still rejects a request that omits the
+    // field.
     let query_struct_schema_body = emit_schema_fn_body_full(
         &serializable_field_refs,
         false,
@@ -10566,6 +10712,123 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     name: stringify!(#name),
                     identity: ::autumn_web::openapi::type_name_of::<#name>,
                     schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+                }
+            }
+        }
+    };
+
+    // #2607: a custom route can take `Json<Model>`. That request includes the
+    // fields the read schema skips (`#[private]`, hidden `#[encrypted]`,
+    // `#[classified]`), and `skip_serializing_if` does not make a field
+    // optional in it. Submit the request schema as an override. The spec
+    // builder makes one component when the two schemas are equal.
+    //
+    // A deserialize-side adapter makes the field types wrong for a request.
+    // An `alias` adds a second accepted name. Then the override has no schema,
+    // and the request is the placeholder. `#[derive(OpenApiSchema)]` refuses
+    // the same attributes.
+    let request_field_refs: Vec<&&Field> = all_field_refs
+        .iter()
+        .filter(|f| serde_bare_word(&f.attrs, &["skip", "skip_deserializing"]).is_none())
+        .copied()
+        .collect();
+    let request_reshaped = serde_bare_word(outer_attrs, &["transparent"]).is_some()
+        || serde_valued_key(outer_attrs, &["from", "try_from", "tag"]).is_some()
+        || request_field_refs.iter().any(|f| {
+            serde_bare_word(&f.attrs, &["flatten"]).is_some()
+                || serde_valued_key(&f.attrs, &["with", "deserialize_with", "alias"]).is_some()
+        });
+    let request_schema_descriptor = if request_reshaped {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Request,
+                    schema: ::core::option::Option::None,
+                }
+            }
+        }
+    } else {
+        let request_rename_all_rule =
+            serde_rename_all_rule_for(outer_attrs, SerdeSide::Deserialize);
+        let container_default = has_serde_default(outer_attrs);
+        let request_schema_body = emit_request_schema_fn_body(
+            &request_field_refs,
+            request_rename_all_rule.as_deref(),
+            &|f: &Field| container_default || has_serde_default(&f.attrs),
+        );
+        // `deny_unknown_fields` rejects every key not in the schema.
+        let request_schema_body =
+            if serde_bare_word(outer_attrs, &["deny_unknown_fields"]).is_some() {
+                quote! {{
+                    let mut __autumn_request = { #request_schema_body };
+                    if let ::core::option::Option::Some(__autumn_object) =
+                        __autumn_request.as_object_mut()
+                    {
+                        __autumn_object.insert(
+                            "additionalProperties".to_owned(),
+                            ::autumn_web::reexports::serde_json::json!(false),
+                        );
+                    }
+                    __autumn_request
+                }}
+            } else {
+                request_schema_body
+            };
+        quote! {
+            impl #name {
+                #[doc(hidden)]
+                pub fn __autumn_openapi_request_schema()
+                    -> ::autumn_web::reexports::serde_json::Value
+                {
+                    #request_schema_body
+                }
+            }
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Request,
+                    schema: ::core::option::Option::Some(#name::__autumn_openapi_request_schema),
+                }
+            }
+        }
+    };
+
+    // #2607: `NewModel` skips a classified field on serialize. Thus a response
+    // does not have it, but its one schema requires it. Submit a response
+    // schema without those fields. With no classified field, submit nothing.
+    let new_response_hidden: Vec<String> = fields_for_new
+        .iter()
+        .filter(|f| field_is_classified(f))
+        .filter_map(|f| f.ident.as_ref().map(unraw_ident))
+        .collect();
+    let new_response_schema_descriptor = if new_response_hidden.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            impl #new_name {
+                #[doc(hidden)]
+                pub fn __autumn_openapi_response_schema()
+                    -> ::autumn_web::reexports::serde_json::Value
+                {
+                    let mut __schema =
+                        <#new_name as ::autumn_web::openapi::OpenApiSchema>::schema();
+                    ::autumn_web::openapi::remove_schema_properties(
+                        &mut __schema,
+                        &[#(#new_response_hidden),*],
+                    );
+                    __schema
+                }
+            }
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#new_name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Response,
+                    schema: ::core::option::Option::Some(
+                        #new_name::__autumn_openapi_response_schema
+                    ),
                 }
             }
         }
@@ -10681,6 +10944,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let extra: &[&&Field] = lock_version_field.as_slice();
         emit_schema_fn_body_named(&fields_for_new, true, extra, None, &|_| false, true, true)
     };
+    // `Decimal` writes a string but reads a string or a number (#3427). The
+    // request schemas name both; the read schema is not touched. The helper
+    // acts only on a property equal to the decimal schema, so no type test
+    // is needed here.
+    let new_struct_schema_body = widen_decimals_tokens(&new_struct_schema_body);
+    let update_struct_schema_body = widen_decimals_tokens(&update_struct_schema_body);
     let commit_hook_serialize_fields: Vec<TokenStream> = all_fields
         .iter()
         .map(|f| {
@@ -10993,27 +11262,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #lookup_key => ::core::option::Option::Some(#expr), }
         })
         .collect();
-    // #2634: gate the `New*` `Normalize` impl on the insert struct actually
-    // having `#[normalize]` columns. With no columns the `Yes` arm of the
-    // repository autoref probe (`SpezNormalizeManyYes`) would win and clone
-    // the whole batch to run an empty `normalize()` — a guaranteed no-op.
-    // Omitting the impl lets the probe's `No` arm win, so `save` /
-    // `save_many` / `save_many_skip_invalid` / `find_or_create_by_*` pay no
-    // clone for unnormalized models. The read-model impl stays unconditional:
-    // it is `&mut self` in place (no clone involved) and user code may call
-    // `.normalize()` on it directly, so removing it would be a compile break.
-    // `NormalizedModel` stays unconditional too: derived finders call
-    // `normalize_lookup` for every model and rely on the `None` arm.
-    let normalize_new_impl = if normalize_new_stmts.is_empty() {
-        quote! {}
+    // #2692: emit `impl Normalize` for every `New*`, so a `T: Normalize`
+    // bound accepts it. If the `New*` has no `#[normalize]` columns, the impl
+    // does nothing. Then also emit `NormalizeNoop`, so the repository probe
+    // skips the clone (#2634). The read-model impl and `NormalizedModel` are
+    // unconditional.
+    let normalize_new_noop = if normalize_new_stmts.is_empty() {
+        quote! { impl ::autumn_web::normalize::NormalizeNoop for #new_name {} }
     } else {
-        quote! {
-            impl ::autumn_web::normalize::Normalize for #new_name {
-                fn normalize(&mut self) {
-                    #(#normalize_new_stmts)*
-                }
+        quote! {}
+    };
+    let normalize_new_impl = quote! {
+        impl ::autumn_web::normalize::Normalize for #new_name {
+            fn normalize(&mut self) {
+                #(#normalize_new_stmts)*
             }
         }
+        #normalize_new_noop
     };
     let normalize_impls = quote! {
         #normalize_new_impl
@@ -11087,6 +11352,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         let raw = ident.to_string();
         let col = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
+        // The table column: `#[diesel(column_name)]` when renamed (#3033).
+        let col_ident = column_ident(&physical_column(field));
         let is_option = option_inner_type(&field.ty).is_some();
         let base_ty = option_inner_type(&field.ty).unwrap_or(&field.ty);
         let Some(last) = ty_last_ident(base_ty) else {
@@ -11121,14 +11388,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // No redundant `ORDER BY id, id`, and no tie-break when the
                 // model has no single primary key.
                 (true, _) | (_, None) => quote! {},
-                (false, Some(pk)) => quote! { .then_order_by(#table_ident::#pk.desc()) },
+                (false, Some(_)) => {
+                    quote! { .then_order_by(#table_ident::#pk_column_ident.desc()) }
+                }
             };
             list_sort_arms.push(quote! {
                 ::core::option::Option::Some(#col) => match __dir {
                     ::autumn_web::pagination::SortDir::Asc =>
-                        __q.order(#table_ident::#ident.asc()) #tie_break,
+                        __q.order(#table_ident::#col_ident.asc()) #tie_break,
                     ::autumn_web::pagination::SortDir::Desc =>
-                        __q.order(#table_ident::#ident.desc()) #tie_break,
+                        __q.order(#table_ident::#col_ident.desc()) #tie_break,
                 },
             });
         }
@@ -11137,14 +11406,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if !is_option {
             match last.as_str() {
                 "String" => list_filter_arms.push(quote! {
-                    #col => { __q = __q.filter(#table_ident::#ident.eq(__val.to_owned())); }
+                    #col => { __q = __q.filter(#table_ident::#col_ident.eq(__val.to_owned())); }
                 }),
                 "i16" | "i32" | "i64" | "bool" => {
                     let parse_ty = format_ident!("{last}");
                     list_filter_arms.push(quote! {
                         #col => {
                             if let ::core::result::Result::Ok(__v) = __val.parse::<#parse_ty>() {
-                                __q = __q.filter(#table_ident::#ident.eq(__v));
+                                __q = __q.filter(#table_ident::#col_ident.eq(__v));
                             }
                         }
                     });
@@ -11155,7 +11424,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     let list_default_order = list_pk.map_or_else(
         || quote! { __q },
-        |pk| quote! { __q.order(#table_ident::#pk.desc()) },
+        |_| quote! { __q.order(#table_ident::#pk_column_ident.desc()) },
     );
     let list_filter_body = if list_filter_arms.is_empty() {
         quote! { let _ = &__query; __q }
@@ -11395,7 +11664,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             // `serialize_as`, which only implements `Insertable` for owned
                             // values. `to_vec()` also works for plain models.
                             .values(chunk.to_vec())
-                            .on_conflict(#table_ident::id)
+                            .on_conflict(#table_ident::#pk_column_ident)
                             .do_update()
                             .set(Self::__autumn_upsert_set())
                             // #2854: explicit column list — never rely on physical
@@ -11451,12 +11720,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl ::autumn_web::repository::AutumnUpsertSetExt for #name {
             type UpsertSet = ::autumn_web::reexports::diesel::dsl::Eq<
-                #table_ident::id,
-                #table_ident::id,
+                #table_ident::#pk_column_ident,
+                #table_ident::#pk_column_ident,
             >;
             fn __autumn_upsert_set() -> Self::UpsertSet {
                 use ::autumn_web::reexports::diesel::ExpressionMethods as _;
-                #table_ident::id.eq(#table_ident::id)
+                #table_ident::#pk_column_ident.eq(#table_ident::#pk_column_ident)
             }
         }
 
@@ -11677,6 +11946,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 table: #table_name,
                 relations: #graph_relations,
                 module_path: ::core::module_path!(),
+                crate_version: #graph_crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
             }
@@ -11805,6 +12075,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // in every generated client — even though the real schema was compiled
         // in all along.
         #query_schema_descriptor
+        #request_schema_descriptor
+        #new_response_schema_descriptor
 
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::openapi::DerivedSchemaDescriptor {
@@ -11980,6 +12252,20 @@ mod tests {
             .to_string();
         assert!(!untyped.contains("decimal_with"), "{untyped}");
         assert!(untyped.contains("decimal ()"), "{untyped}");
+    }
+
+    #[test]
+    fn naive_time_fake_expr_takes_the_time_of_a_recent_datetime() {
+        let ident: syn::Ident = syn::parse_quote!(opens);
+        for ty in [
+            syn::parse_quote!(chrono::NaiveTime),
+            syn::parse_quote!(Option<chrono::NaiveTime>),
+        ] {
+            let expr = fake_expr_for_field(&ident, &ty, None)
+                .expect("NaiveTime should infer a fake expr")
+                .to_string();
+            assert!(expr.contains("recent_datetime () . time ()"), "{expr}");
+        }
     }
 
     #[test]
@@ -13027,6 +13313,301 @@ mod tests {
         assert!(
             generated.contains("cannot maintain `posts.post_uuid`"),
             "the overridden parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    fn expand(attrs: TokenStream, item: TokenStream) -> String {
+        model_macro(attrs, item).to_string()
+    }
+
+    /// #3033: a renamed `#[id]` field keys upserts and parent-side loaders.
+    #[test]
+    fn renamed_id_field_keys_upsert_and_loaders() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_many(Comment)]
+                pub struct Post {
+                    #[id]
+                    pub post_uuid: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: post_uuid)"),
+            "upsert must conflict on the key column: {generated}"
+        );
+        assert!(
+            generated.contains("__r . post_uuid"),
+            "the loader must read the key field: {generated}"
+        );
+        assert!(
+            !generated.contains("posts :: id") && !generated.contains("__r . id"),
+            "no hard-coded `id` may remain: {generated}"
+        );
+    }
+
+    /// #3033: a renamed column on an `id` field keys SQL by the column.
+    #[test]
+    fn renamed_id_column_keys_upsert() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    #[id]
+                    #[diesel(column_name = post_uuid)]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: post_uuid)"),
+            "upsert must conflict on the column: {generated}"
+        );
+        assert!(
+            !generated.contains("posts :: id"),
+            "no hard-coded `id` column may remain: {generated}"
+        );
+    }
+
+    /// #3033: `references` steers the `belongs_to` loader.
+    #[test]
+    fn references_steers_the_belongs_to_loader() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "post_uuid")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("posts :: post_uuid . eq_any"),
+            "the loader must filter on the referenced column: {generated}"
+        );
+        assert!(
+            !generated.contains("__child . id"),
+            "the loader must not read the parent's `id` field: {generated}"
+        );
+    }
+
+    /// #3033: `references` is the counter cache's default parent key.
+    #[test]
+    fn references_is_the_counter_cache_parent_key() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "post_uuid", counter_cache)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("parent_pk : \"post_uuid\""),
+            "the counter cache must address the referenced key: {generated}"
+        );
+    }
+
+    /// #3033: a derivation inherits `references` from its leg.
+    #[test]
+    fn derivation_inherits_references() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "post_uuid")]
+                #[derivation(Post, column = "total", transform = count)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("parent_pk : \"post_uuid\""),
+            "the derivation must address the referenced key: {generated}"
+        );
+    }
+
+    #[test]
+    fn references_conflicting_with_parent_pk_is_rejected() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "a", counter_cache, parent_pk = "b")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("conflicts with `references"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_parent_pk_conflicting_with_references_is_rejected() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "a")]
+                #[derivation(Post, column = "total", parent_pk = "b")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("conflicts with `references"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn references_is_only_valid_on_belongs_to() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_many(Comment, references = "a")]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("only valid on `belongs_to`"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_parent_pk_still_steers_the_loader() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache, parent_pk = "post_uuid")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("posts :: post_uuid . eq_any"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn id_keyed_model_expansion_is_unchanged() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_many(Comment)]
+                #[has_one(Profile)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: id)"),
+            "{generated}"
+        );
+        assert!(generated.contains("__r . id"), "{generated}");
+    }
+
+    #[test]
+    fn no_id_attribute_keeps_the_historical_id_key() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    pub author_id: i64,
+                    pub id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: id)"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn raw_ident_key_is_spliced_raw() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_many(Comment)]
+                pub struct Post {
+                    #[id]
+                    pub r#type: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: r#type)"),
+            "{generated}"
+        );
+        assert!(generated.contains("__r . r#type"), "{generated}");
+    }
+
+    #[test]
+    fn has_one_and_through_loaders_read_the_key_field() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_one(Profile)]
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub post_uuid: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.matches("__r . post_uuid").count() >= 4,
+            "{generated}"
+        );
+        assert!(!generated.contains("__r . id"), "{generated}");
+    }
+
+    #[test]
+    fn renamed_column_keys_list_sort() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    #[id]
+                    #[diesel(column_name = post_uuid)]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("order (posts :: post_uuid . desc ())"),
+            "{generated}"
         );
     }
 
@@ -17712,12 +18293,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_impl_for_new_is_gated_on_normalize_columns() {
-        // #2634: a model with no `#[normalize]` columns must not get
-        // `impl Normalize for New*` — otherwise the repository probe's `Yes`
-        // arm always wins and `save_many` clones a batch whose normalization
-        // is a guaranteed no-op. The read-model impl and `NormalizedModel`
-        // stay unconditional (public API surface and the finder `None` arm).
+    fn normalize_impl_for_new_is_unconditional_and_noop_is_marked() {
+        // #2692: every `New*` implements `Normalize`, so a `T: Normalize`
+        // bound accepts it. With no `#[normalize]` columns the impl is a
+        // no-op, and the `NormalizeNoop` marker tells the repository probe to
+        // skip the clone (#2634).
         let output = model_macro(
             TokenStream::new(),
             quote! {
@@ -17730,8 +18310,12 @@ mod tests {
         );
         let generated = output.to_string();
         assert!(
-            !generated.contains("normalize :: Normalize for NewUser"),
-            "must NOT generate `impl Normalize for NewUser` with no normalize columns: {generated}"
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark the no-op `NewUser` impl with `NormalizeNoop`: {generated}"
         );
         assert!(
             generated.contains("normalize :: Normalize for User"),
@@ -17740,6 +18324,65 @@ mod tests {
         assert!(
             generated.contains("normalize :: NormalizedModel for User"),
             "must keep `impl NormalizedModel for User`: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_noop_marker_is_absent_when_new_has_normalize_columns() {
+        // #2692: the marker skips normalization on insert. A `New*` with a
+        // `#[normalize]` column must not get it.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            !generated.contains("NormalizeNoop"),
+            "must not mark a normalizing `NewUser` as no-op: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_noop_marker_when_normalize_column_is_not_in_new() {
+        // #2692: a `#[default]` column is not in `NewUser`. `NewUser` has
+        // nothing to normalize, so it gets the marker. `User` still
+        // normalizes the column.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[default]
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark `NewUser` as no-op: {generated}"
+        );
+        let user_impl = generated
+            .split("normalize :: Normalize for User")
+            .nth(1)
+            .expect("must generate `impl Normalize for User`");
+        let user_body = user_impl.split("impl").next().unwrap_or_default();
+        assert!(
+            user_body.contains("normalize :: trim"),
+            "`User` must still trim the column: {user_body}"
         );
     }
 
@@ -18317,6 +18960,40 @@ mod tests {
             err.to_string().contains("`managed` takes no value"),
             "unexpected message: {err}"
         );
+    }
+
+    #[test]
+    fn model_schema_arg_names_a_postgres_schema() {
+        let args = parse_attr_args(quote! { table = "campaigns", schema = "marketing" })
+            .expect("`schema` must parse");
+        assert_eq!(args.schema.as_deref(), Some("marketing"));
+        assert!(!args.managed);
+    }
+
+    #[test]
+    fn model_schema_managed_stays_the_adoption_marker() {
+        let args = parse_attr_args(quote! { schema = "managed" }).expect("legacy form parses");
+        assert!(args.managed);
+        assert!(args.schema.is_none());
+    }
+
+    #[test]
+    fn model_schema_must_be_a_plain_identifier() {
+        for bad in ["", "Mar keting", "a.b", "1abc", "a\"b", "order"] {
+            let err = parse_attr_args(quote! { schema = #bad })
+                .expect_err("a non-identifier schema must error");
+            assert!(
+                err.to_string().contains("`schema` must be"),
+                "unexpected message for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_schema_does_not_change_the_table_ident() {
+        // The `table!` module keeps its bare name; the schema is tooling-only.
+        let args = parse_attr_args(quote! { schema = "marketing" }).expect("parses");
+        assert!(args.table.is_none());
     }
 
     #[test]
@@ -19281,6 +19958,56 @@ mod tests {
     }
 
     #[test]
+    fn state_machine_on_conn_method_needs_the_postgres_feature() {
+        // The method takes `AsyncPgConnection`. A SQLite-only app has no such
+        // type, so the method compiles only with `postgres` (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let gate = generated
+            .find(":: autumn_web :: __if_postgres !")
+            .expect("the `_on_conn` impl must sit in `__if_postgres!`");
+        let method = generated
+            .find("transition_status_to_on_conn")
+            .expect("the `_on_conn` method must be emitted");
+        assert!(gate < method, "{generated}");
+    }
+
+    #[test]
+    fn id_only_model_upsert_uses_the_backend_neutral_excluded() {
+        // `diesel::pg` does not exist in a SQLite-only build (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Tag {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("pg :: upsert :: excluded"),
+            "an id-only model must not name `diesel::pg`: {generated}"
+        );
+        assert!(
+            generated.contains("diesel :: upsert :: excluded"),
+            "{generated}"
+        );
+    }
+
+    #[test]
     fn state_machine_on_commit_enqueues_the_borrowed_effect_payload() {
         // The enqueued args are only serialized, so the effect is built as the
         // borrowed `TransitionEffectRef` twin (same JSON as `TransitionEffect`):
@@ -20105,6 +20832,18 @@ mod tests {
         // A bare alias hides the zone from the derive — no picker either.
         let bare = control(syn::parse_quote!(DateTime));
         assert!(bare.contains("FieldControl :: Text"), "{bare}");
+    }
+
+    /// Issue #3405: a `NaiveTime` column renders the native time input.
+    #[test]
+    fn form_control_tokens_maps_naive_time_to_a_time_input() {
+        for ty in [
+            syn::parse_quote!(chrono::NaiveTime),
+            syn::parse_quote!(NaiveTime),
+        ] {
+            let control = form_control_tokens(&ty, false).to_string();
+            assert!(control.contains("FieldControl :: Time"), "{control}");
+        }
     }
 
     /// The deserializer wiring must stay in lockstep with the control choice

@@ -44,7 +44,7 @@ argument is the parent model type. Every other key follows in any order.
 | `filter` | none | the predicate deciding which child rows contribute |
 | `fk` | the one `#[belongs_to]` leg to that parent, else `{snake(Parent)}_id` | the child column naming the parent. Required when two legs point at one parent |
 | `parent_table` | inferred from the parent type (`Post` gives `posts`) | the parent's table, for a parent that overrides its own |
-| `parent_pk` | `id` | the parent's physical primary-key column, for a parent whose `#[id]` field is not named `id` (or is renamed with `#[diesel(column_name)]`). The maintenance SQL interpolates it into `WHERE <parent>.<parent_pk> = ...`, so the default breaks loudly at runtime against a differently-keyed parent |
+| `parent_pk` | the `references` of the `belongs_to` leg, else `id` | the parent's physical primary-key column, for a parent whose `#[id]` field is not named `id` (or is renamed with `#[diesel(column_name)]`). The maintenance SQL interpolates it into `WHERE <parent>.<parent_pk> = ...`, so without `parent_pk` or `references` on the `belongs_to` leg, the default breaks loudly at runtime against a differently-keyed parent |
 | `tenant` | none | tenant-discriminator column, as `counter_cache_tenant`. Must name an integer or `String` field of the child (or an `Option` of one), not renamed with `#[diesel(column_name)]`. A child moved to another tenant takes its contribution off the old parent under the old tenant and onto the new parent under the new one |
 | `name` | `{parent_table}.{column}` | the registry name, used by the state table and the actuator. Non-empty, at most 128 bytes, no control characters, and not under the framework's reserved `parked::` prefix |
 
@@ -426,10 +426,14 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   parent's deltas are ordered so no running sum leaves the span of zero and
   their total), but a parent already sitting at `i64::MIN` or `i64::MAX` that
   receives weights of the same magnitude can still refuse an intermediate
-  value, and SQLite's integer `SUM` raises `integer overflow` when a
-  scan's running total leaves `i64` even if the final aggregate fits. A
-  summed column whose values approach 2^63 is outside what a derivation is
-  for; keep weights small enough that any partial sum of them fits.
+  value. The set-based paths (backfill, `recompute`, drift, bulk delete) do
+  not depend on row order. A running total outside `i64` is not an error if
+  the total is in range. A bulk delete lands when the parent's new value is
+  in range, even if the deleted rows' sum is not. On SQLite, this is true
+  for fewer than 2^31 child rows per parent. A total outside `i64` is an error on every path and on
+  both backends. A summed column whose values approach 2^63 is outside what
+  a derivation is for; keep each parent's value far from `i64::MIN` and
+  `i64::MAX`.
 - **No configuration keys.** Reconciliation and the boot backfill are automatic
   and use the default `BackfillOptions`. Call `run_backfill` to pace a large
   repair by hand.

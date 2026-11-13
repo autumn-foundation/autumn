@@ -653,11 +653,12 @@ async fn settle_after_reconcile_closed_the_row_is_a_no_op() {
     run_retry_handler(&h.client, &invoice.id).await.unwrap();
     assert_eq!(h.provider.retry_calls(), 1);
     assert_eq!(store.calls("settle_dunning"), 1);
-    // The reconcile decision wins: no recovery written, no notification.
+    // The reconcile decision wins the row. The provider took the payment,
+    // so the mirror shows it paid. The job sends no notification.
     assert_eq!(row_on(h.store.as_ref()).await.state, DunningState::Canceled);
     assert_eq!(
         invoice_on(h.store.as_ref()).await.status,
-        InvoiceStatus::Open
+        InvoiceStatus::Paid
     );
     assert_eq!(
         notification_kinds(&h.client, RECIPIENT).await,
@@ -840,4 +841,298 @@ async fn second_process_does_not_double_retry() {
     perform_ok(&app_a).await;
     perform_ok(&app_b).await;
     assert_eq!(provider.retry_calls(), 1);
+}
+
+/// One retry after 1 hour. The first declined retry exhausts dunning.
+fn single_retry() -> BillingConfig {
+    support::config()
+        .dunning(DunningPolicy::standard().with_retry_delays(vec![Duration::from_secs(3600)]))
+}
+
+async fn single_retry_harness_dyn(store: Arc<dyn BillingStore>) -> DynHarness {
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    let h = harness_dyn(single_retry(), store, provider, clocked);
+    seed_failed_invoice(&h.client, h.store.as_ref()).await;
+    h
+}
+
+async fn sub_status_on(store: &dyn BillingStore) -> SubscriptionStatus {
+    store
+        .subscription_by_provider_id(&ProviderId::new("sub_1"))
+        .await
+        .unwrap()
+        .expect("subscription mirrored")
+        .status
+}
+
+#[tokio::test]
+async fn exhaustion_status_failure_stays_retryable() {
+    let store = FailingStore::wrap(MemoryBillingStore::shared());
+    let h = single_retry_harness_dyn(store.clone()).await;
+    store.fail_on(
+        "set_subscription_status",
+        store.calls("set_subscription_status") + 1,
+    );
+    h.client.advance_clock(Duration::from_secs(3601));
+    let report = h.client.perform_enqueued_jobs().await;
+    assert_eq!(report.failures().len(), 1, "{report:?}");
+    // The row is open again at the same attempt.
+    let restored = row_on(h.store.as_ref()).await;
+    assert_eq!(restored.state, DunningState::Pending);
+    assert_eq!(
+        sub_status_on(h.store.as_ref()).await,
+        SubscriptionStatus::Active
+    );
+    assert_eq!(h.provider.cancel_calls(), 0);
+    // The next run finishes the mirror write and the provider cancel.
+    let invoice = invoice_on(h.store.as_ref()).await;
+    run_retry_handler(&h.client, &invoice.id).await.unwrap();
+    assert_eq!(
+        row_on(h.store.as_ref()).await.state,
+        DunningState::Exhausted
+    );
+    assert_eq!(
+        sub_status_on(h.store.as_ref()).await,
+        SubscriptionStatus::Unpaid
+    );
+    assert_eq!(h.provider.cancel_calls(), 1);
+}
+
+#[tokio::test]
+async fn recovery_during_exhaustion_does_not_leave_unpaid() {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let h = single_retry_harness_dyn(store.clone()).await;
+    h.client.advance_clock(Duration::from_secs(3601));
+    // A payment-recovered event settles the row after the mirror write and
+    // before the exhaustion settle.
+    let backing = inner.clone();
+    let mut recovered = row_on(h.store.as_ref()).await;
+    recovered.state = DunningState::Recovered;
+    recovered.updated_at = at(3601);
+    store.before(
+        "settle_dunning",
+        store.calls("settle_dunning") + 1,
+        Box::new(move || {
+            let backing = backing.clone();
+            let recovered = recovered.clone();
+            Box::pin(async move {
+                backing.upsert_dunning(recovered).await.unwrap();
+            })
+        }),
+    );
+    let invoice = invoice_on(h.store.as_ref()).await;
+    run_retry_handler(&h.client, &invoice.id).await.unwrap();
+    assert_eq!(
+        row_on(h.store.as_ref()).await.state,
+        DunningState::Recovered
+    );
+    assert_eq!(
+        sub_status_on(h.store.as_ref()).await,
+        SubscriptionStatus::Active
+    );
+    assert_eq!(h.provider.cancel_calls(), 0);
+}
+
+#[tokio::test]
+async fn recovery_upsert_failure_stays_retryable() {
+    let store = FailingStore::wrap(MemoryBillingStore::shared());
+    let h = dunning_harness_dyn(store.clone()).await;
+    store.fail_on("upsert_invoice", store.calls("upsert_invoice") + 1);
+    h.client.advance_clock(Duration::from_secs(3601));
+    h.provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
+    let invoice = invoice_on(h.store.as_ref()).await;
+    assert!(run_retry_handler(&h.client, &invoice.id).await.is_err());
+    assert_eq!(row_on(h.store.as_ref()).await.state, DunningState::Pending);
+    assert_eq!(
+        invoice_on(h.store.as_ref()).await.status,
+        InvoiceStatus::Open
+    );
+    // The provider now reports the invoice as paid. The next run records it.
+    h.provider
+        .script_retry(Ok(PaymentAttemptOutcome::AlreadyPaid));
+    run_retry_handler(&h.client, &invoice.id).await.unwrap();
+    assert_eq!(
+        row_on(h.store.as_ref()).await.state,
+        DunningState::Recovered
+    );
+    assert_eq!(
+        invoice_on(h.store.as_ref()).await.status,
+        InvoiceStatus::Paid
+    );
+}
+
+// ── Re-arm placement by role ──────────────────────────────────────────────
+
+/// `clocked` on `role`, with the sensitive actuator endpoints.
+fn on_role(role: &'static str) -> impl FnOnce(TestApp) -> TestApp {
+    on_role_with(role, "")
+}
+
+/// [`on_role`] with `extra` config, for example a `[roles.<name>]` preset.
+fn on_role_with(role: &'static str, extra: &'static str) -> impl FnOnce(TestApp) -> TestApp {
+    move |app| {
+        let parsed: autumn_web::config::AutumnConfig =
+            toml::from_str(extra).expect("extra config parses");
+        let mut config = support::autumn_config(&support::config());
+        config.roles = parsed.roles;
+        config.jobs.pin = parsed.jobs.pin;
+        config.role = role.parse().expect("role name");
+        config.actuator.sensitive = true;
+        clocked(app.config(config))
+    }
+}
+
+/// The `/actuator/tasks` entry of the re-arm task.
+async fn rearm_task(client: &TestClient) -> serde_json::Value {
+    let body: serde_json::Value = client
+        .get("/actuator/tasks")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    body["background_tasks"][autumn_billing::dunning::REARM_TASK].clone()
+}
+
+/// The retry jobs queued for `invoice_id`.
+fn retries_for(client: &TestClient, invoice_id: &str) -> usize {
+    client
+        .enqueued_jobs()
+        .iter()
+        .filter(|j| j.name == RETRY_JOB_NAME && j.payload["invoice_id"] == invoice_id)
+        .count()
+}
+
+/// One open dunning row on a store that no process re-arms yet.
+async fn open_row() -> (Arc<MemoryBillingStore>, Arc<FakeProvider>, String) {
+    let store = MemoryBillingStore::shared();
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    let app = dunning_harness(support::config(), store.clone(), provider.clone()).await;
+    let invoice_id = invoice(&app).await.id;
+    drop(app);
+    (store, provider, invoice_id)
+}
+
+#[tokio::test]
+async fn a_web_replica_does_not_rearm_open_rows() {
+    let (store, provider, invoice_id) = open_row().await;
+    let web = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        store,
+        provider,
+        on_role("web"),
+    );
+    let task = rearm_task(&web.client).await;
+    assert_eq!(task["capability"], "billing.dunning", "{task}");
+    assert_eq!(task["queues"], serde_json::json!(["billing"]), "{task}");
+    assert_eq!(task["roles"], serde_json::json!(["combined", "worker"]));
+    assert_eq!(task["runs_here"], false, "{task}");
+    assert_eq!(task["status"], "not_placed", "{task}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        retries_for(&web.client, &invoice_id),
+        0,
+        "web re-armed a row"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_rearms_open_rows() {
+    let (store, provider, invoice_id) = open_row().await;
+    let worker = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        store,
+        provider.clone(),
+        on_role("worker"),
+    );
+    wait_until(support::RESTART_TIMEOUT, || async {
+        retries_for(&worker.client, &invoice_id) == 1
+    })
+    .await;
+    // The task stays placed after the re-arm, so the boot logs no early exit.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let task = rearm_task(&worker.client).await;
+    assert_eq!(task["runs_here"], true, "{task}");
+    assert_eq!(task["status"], "running", "{task}");
+    assert_eq!(provider.retry_calls(), 0, "re-arm schedules, never retries");
+}
+
+#[tokio::test]
+async fn a_second_rearm_of_a_pending_row_queues_no_second_retry() {
+    let (store, provider, invoice_id) = open_row().await;
+    let app = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        store,
+        provider,
+        on_role("worker"),
+    );
+    wait_until(support::RESTART_TIMEOUT, || async {
+        retries_for(&app.client, &invoice_id) == 1
+    })
+    .await;
+    let deduplicated = || {
+        app.client
+            .state()
+            .job_registry()
+            .snapshot()
+            .get(RETRY_JOB_NAME)
+            .map_or(0, |status| status.total_deduplicated)
+    };
+    let before = deduplicated();
+    let service = autumn_billing::BillingService::require(app.client.state()).expect("service");
+    for _ in 0..2 {
+        assert_eq!(
+            autumn_billing::dunning::rearm_pending_now(app.client.state(), &service).await,
+            1,
+            "the row is re-armed"
+        );
+    }
+    // The recorder sees each attempt. The job runtime keeps one row: the
+    // retry job is unique per invoice while it is pending.
+    assert_eq!(retries_for(&app.client, &invoice_id), 3);
+    assert_eq!(deduplicated() - before, 2, "a second retry was queued");
+}
+
+#[tokio::test]
+async fn a_named_role_turns_the_rearm_off() {
+    let (store, provider, invoice_id) = open_row().await;
+    let quiet = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        store,
+        provider,
+        on_role_with(
+            "quiet",
+            "[roles.quiet]\nbase = \"worker\"\ncapabilities = { \"billing.dunning\" = false }\n",
+        ),
+    );
+    let task = rearm_task(&quiet.client).await;
+    assert_eq!(task["status"], "not_placed", "{task}");
+    assert_eq!(
+        retries_for(&quiet.client, &invoice_id),
+        0,
+        "a quiet worker re-armed"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_pinned_away_from_the_billing_queue_does_not_rearm() {
+    let (store, provider, invoice_id) = open_row().await;
+    let pinned = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        store,
+        provider,
+        on_role_with("worker", "[jobs]\npin = [\"critical\"]\n"),
+    );
+    let task = rearm_task(&pinned.client).await;
+    assert_eq!(task["status"], "not_placed", "{task}");
+    assert_eq!(
+        retries_for(&pinned.client, &invoice_id),
+        0,
+        "a pinned worker re-armed"
+    );
 }

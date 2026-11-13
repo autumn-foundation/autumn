@@ -165,6 +165,11 @@ impl SecurityDump {
         if config.mail.should_mount_unsubscribe_endpoint() {
             exempt_paths.push(crate::mail::UNSUBSCRIBE_PATH.to_owned());
         }
+        // The outbox inbox endpoint is exempt at runtime too.
+        #[cfg(feature = "db")]
+        if config.outbox.serves_inbox() {
+            exempt_paths.push(crate::outbox::INBOX_PATH.to_owned());
+        }
         exempt_paths.sort();
         exempt_paths.dedup();
 
@@ -295,16 +300,25 @@ impl Serialize for RouteSource {
     }
 }
 
-impl<'de> Deserialize<'de> for RouteSource {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Ok(if s == "framework" {
+impl RouteSource {
+    /// Reads the dump form that [`Display`](std::fmt::Display) writes:
+    /// `framework` and `plugin:<name>`. Any other string is `User`.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Self {
+        if s == "framework" {
             Self::Framework
         } else if let Some(name) = s.strip_prefix("plugin:") {
             Self::Plugin(name.to_owned())
         } else {
             Self::User
-        })
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RouteSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&s))
     }
 }
 
@@ -414,6 +428,11 @@ pub struct RouteInfo {
     /// dimensions of the routes manifest carry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools: Vec<String>,
+    /// The route group (#3544). A `[roles.<name>] mount` list selects routes
+    /// by group. `None` for a framework route or a plugin asset: every role
+    /// that serves HTTP serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// `skip_serializing_if` helper: elide `false` booleans from JSON output.
@@ -623,6 +642,10 @@ fn pools_of(
 /// # Errors
 ///
 /// Returns `RouterBuildError::UnregisteredApiVersion` if a route's version is not registered.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one field initialiser per `RouteInfo` field, for top-level and scoped routes"
+)]
 pub fn collect_route_infos(
     routes: &[Route],
     route_sources: &[RouteSource],
@@ -696,6 +719,7 @@ pub fn collect_route_infos(
             agent_grant: agent_grant_of(&route.api_doc),
             resource_shape: ResourceShape::from_pools(&pools),
             pools,
+            group: Some(route.group_name().to_owned()),
         });
     }
 
@@ -727,6 +751,7 @@ pub fn collect_route_infos(
                 agent_grant: agent_grant_of(&route.api_doc),
                 resource_shape: ResourceShape::from_pools(&pools),
                 pools,
+                group: Some(route.group_name().to_owned()),
             });
         }
     }
@@ -828,6 +853,8 @@ pub(crate) fn append_framework_routes_with_env(
             crate::htmx::HTMX_CSRF_JS_PATH => "htmx_csrf",
             crate::htmx::IDIOMORPH_JS_PATH => "idiomorph",
             crate::htmx::HTMX_SSE_JS_PATH => "htmx_sse",
+            #[cfg(feature = "webmcp")]
+            crate::webmcp::SHIM_PATH => "webmcp",
             _ => "autumn_widgets",
         };
         infos.push(RouteInfo::framework_get(
@@ -888,26 +915,29 @@ pub(crate) fn append_framework_routes_with_env(
         }
     }
 
+    // The outbox inbox endpoint, under the same predicate as the mount.
+    #[cfg(feature = "db")]
+    if config.outbox.serves_inbox() {
+        infos.push(RouteInfo::framework_route(
+            "POST",
+            crate::outbox::INBOX_PATH.to_owned(),
+            "outbox_inbox",
+        ));
+    }
+
     // Widget story gallery routes (#1526), listed iff the resolved config
     // enables them (same gating condition as the router mount).
     #[cfg(feature = "maud")]
     if config.stories.enabled {
+        // The demo backends come from the gallery's own list, so this
+        // listing matches the mounted routes (#3408).
         for (path, handler) in [
             (crate::stories::STORIES_PATH, "story_gallery_index"),
             ("/_stories/{slug}", "story_gallery_story"),
-            // Live demo backends for the Active search / Autocomplete /
-            // Infinite feed stories (review follow-up — route-dump
-            // consumers couldn't see these three without an entry here).
-            ("/_stories/demo/search", "story_gallery_demo_search"),
-            (
-                "/_stories/demo/tags/search",
-                "story_gallery_demo_tag_search",
-            ),
-            (
-                "/_stories/demo/posts/feed",
-                "story_gallery_demo_infinite_feed",
-            ),
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::stories::demo_routes())
+        {
             infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
     }
@@ -928,6 +958,7 @@ pub(crate) fn append_framework_routes_with_env(
     // `GET /_autumn/jobs/{token}` when `jobs.tracking.route_enabled` (default
     // true), gated identically to the router mount. List it so the manifest
     // reflects the mounted route.
+    #[cfg(feature = "job-tracking")]
     if config.jobs.tracking.route_enabled {
         infos.push(RouteInfo::framework_get(
             crate::job_tracking::JOB_STATUS_ROUTE_PATH.to_owned(),
@@ -1094,6 +1125,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -1116,6 +1148,29 @@ mod tests {
         assert_eq!(infos[0].handler, "list_posts");
         assert_eq!(infos[0].source, RouteSource::User);
         assert!(infos[0].middleware.is_empty());
+    }
+
+    /// The listing carries the route group (#3544): `app` by default, the
+    /// route's own group otherwise, in a scoped group too.
+    #[test]
+    fn collect_route_infos_sets_the_route_group() {
+        let routes = vec![
+            make_route(Method::GET, "/posts", "list_posts"),
+            make_route(Method::GET, "/landing", "landing").in_group("marketing"),
+        ];
+        let scoped = vec![ScopedGroup {
+            prefix: "/m".to_owned(),
+            routes: vec![make_route(Method::GET, "/promo", "promo").in_group("marketing")],
+            source: RouteSource::User,
+            layer_guarded: false,
+            apply_layer: Box::new(|router| router),
+        }];
+        let infos = collect_route_infos(&routes, &[], &scoped, &[]).unwrap();
+        let groups: Vec<Option<&str>> = infos.iter().map(|i| i.group.as_deref()).collect();
+        assert_eq!(
+            groups,
+            vec![Some("app"), Some("marketing"), Some("marketing")]
+        );
     }
 
     #[test]
@@ -1874,6 +1929,20 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    /// `from_wire` reads the dump form, the same as `Deserialize` (#2828).
+    #[test]
+    fn route_source_from_wire_reads_the_dump_form() {
+        for source in [
+            RouteSource::User,
+            RouteSource::Framework,
+            RouteSource::Plugin("admin".to_owned()),
+            RouteSource::Plugin(String::new()),
+        ] {
+            assert_eq!(RouteSource::from_wire(&source.to_string()), source);
+        }
+        assert_eq!(RouteSource::from_wire("something-else"), RouteSource::User);
+    }
+
     // ── append_framework_routes ────────────────────────────────────────────
 
     #[test]
@@ -2132,11 +2201,7 @@ mod tests {
         // stories' live demo backends must be listed too, or route-dump
         // consumers can't see them and the OpenAPI/MCP collision preflight
         // (`collect_framework_get_paths` in router.rs) can't reserve them.
-        for demo_path in [
-            "/_stories/demo/search",
-            "/_stories/demo/tags/search",
-            "/_stories/demo/posts/feed",
-        ] {
+        for (demo_path, _) in crate::stories::demo_routes() {
             assert!(
                 paths.contains(&demo_path),
                 "enabled stories must list the demo route {demo_path}: {paths:?}"
@@ -2536,6 +2601,44 @@ mod tests {
                 .any(|p| p == crate::mail::UNSUBSCRIBE_PATH),
             "unmounted unsubscribe path must not be exempt: {:?}",
             plain_dump.csrf.exempt_paths
+        );
+    }
+
+    /// The outbox inbox endpoint is listed and CSRF-exempt only when the app
+    /// serves it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn outbox_inbox_route_is_listed_and_exempt_when_served() {
+        let mut config = AutumnConfig::default();
+        config.outbox.enabled = true;
+        config.outbox.inbox.enabled = true;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(
+            infos.iter().any(|i| i.method == "POST"
+                && i.path == crate::outbox::INBOX_PATH
+                && i.classification == RouteClassification::Framework),
+            "{infos:?}"
+        );
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            dump.csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::outbox::INBOX_PATH)
+        );
+
+        config.outbox.inbox.enabled = false;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(!infos.iter().any(|i| i.path == crate::outbox::INBOX_PATH));
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            !dump
+                .csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::outbox::INBOX_PATH)
         );
     }
 

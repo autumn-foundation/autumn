@@ -1,6 +1,5 @@
 use super::*;
 use autumn_web::slo::{SliKind, SloConfig};
-use serde::Deserialize as _;
 
 fn config(
     name: &str,
@@ -217,12 +216,12 @@ fn burn_thresholds_are_exact_for_99_9() {
 #[test]
 fn rule_files_are_valid_yaml_with_three_alerts_per_slo() {
     let generated = fixture();
-    let rules: serde_yaml::Value =
-        serde_yaml::from_str(file(&generated, "prometheus-rules.yaml")).expect("yaml");
-    let groups = rules["groups"].as_sequence().expect("groups");
+    let rules: serde_json::Value =
+        serde_saphyr::from_str(file(&generated, "prometheus-rules.yaml")).expect("yaml");
+    let groups = rules["groups"].as_array().expect("groups");
     assert_eq!(groups.len(), 4);
     for group in groups {
-        let rules = group["rules"].as_sequence().expect("rules");
+        let rules = group["rules"].as_array().expect("rules");
         let alerts = rules.iter().filter(|r| r.get("alert").is_some()).count();
         let records = rules.iter().filter(|r| r.get("record").is_some()).count();
         assert_eq!(alerts, BURN_WINDOWS.len());
@@ -233,8 +232,8 @@ fn rule_files_are_valid_yaml_with_three_alerts_per_slo() {
             assert_eq!(rule["labels"]["job"], "shop", "{rule:?}");
         }
     }
-    let crd: serde_yaml::Value =
-        serde_yaml::from_str(file(&generated, "prometheus-rule.yaml")).expect("yaml");
+    let crd: serde_json::Value =
+        serde_saphyr::from_str(file(&generated, "prometheus-rule.yaml")).expect("yaml");
     assert_eq!(crd["kind"], "PrometheusRule");
     assert_eq!(crd["spec"]["groups"], rules["groups"]);
 }
@@ -249,8 +248,8 @@ fn rule_labels_go_on_the_prometheus_rule_object_only() {
         "example.com/team=payments".to_owned(),
     ];
     let generated = generate(&slos, &options).expect("generate");
-    let crd: serde_yaml::Value =
-        serde_yaml::from_str(file(&generated, "prometheus-rule.yaml")).expect("yaml");
+    let crd: serde_json::Value =
+        serde_saphyr::from_str(file(&generated, "prometheus-rule.yaml")).expect("yaml");
     let labels = &crd["metadata"]["labels"];
     assert_eq!(labels["release"], "kube-prometheus-stack");
     assert_eq!(labels["example.com/team"], "payments");
@@ -390,11 +389,11 @@ fn long_app_names_get_distinct_dashboard_uids() {
 #[test]
 fn argo_queries_select_the_canary_and_divide_by_the_budget() {
     let generated = fixture();
-    let argo: serde_yaml::Value =
-        serde_yaml::from_str(file(&generated, "argo-analysis-template.yaml")).expect("yaml");
+    let argo: serde_json::Value =
+        serde_saphyr::from_str(file(&generated, "argo-analysis-template.yaml")).expect("yaml");
     assert_eq!(argo["kind"], "AnalysisTemplate");
     assert_eq!(argo["metadata"]["name"], "shop-slo");
-    let metrics = argo["spec"]["metrics"].as_sequence().expect("metrics");
+    let metrics = argo["spec"]["metrics"].as_array().expect("metrics");
     assert_eq!(metrics.len(), 4);
     let query = metrics[0]["provider"]["prometheus"]["query"]
         .as_str()
@@ -417,10 +416,9 @@ fn argo_queries_select_the_canary_and_divide_by_the_budget() {
 #[test]
 fn flagger_has_one_template_per_slo_and_the_helm_values_name_them() {
     let generated = fixture();
-    let docs: Vec<serde_yaml::Value> =
-        serde_yaml::Deserializer::from_str(file(&generated, "flagger-metric-templates.yaml"))
-            .map(|d| serde_yaml::Value::deserialize(d).expect("yaml"))
-            .collect();
+    let docs: Vec<serde_json::Value> =
+        serde_saphyr::from_multiple(file(&generated, "flagger-metric-templates.yaml"))
+            .expect("yaml");
     let names: Vec<_> = docs
         .iter()
         .map(|d| d["metadata"]["name"].as_str().expect("name").to_owned())
@@ -439,12 +437,12 @@ fn flagger_has_one_template_per_slo_and_the_helm_values_name_them() {
         assert!(query.contains("[5m]"), "{query}");
         assert!(query.contains("pod=~\"{{ target }}-"), "{query}");
     }
-    let values: serde_yaml::Value =
-        serde_yaml::from_str(file(&generated, "helm-values.yaml")).expect("yaml");
+    let values: serde_json::Value =
+        serde_saphyr::from_str(file(&generated, "helm-values.yaml")).expect("yaml");
     assert_eq!(values["analysis"]["templateName"], "shop-slo");
     assert_eq!(values["analysis"]["maxBurnRate"], 14.4);
     let templates: Vec<_> = values["analysis"]["metricTemplates"]
-        .as_sequence()
+        .as_array()
         .expect("list")
         .iter()
         .map(|v| v.as_str().expect("name").to_owned())

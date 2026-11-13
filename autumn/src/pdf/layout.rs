@@ -1977,7 +1977,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             pages: Vec::new(),
             ops: Vec::new(),
@@ -4018,15 +4018,11 @@ mod tests {
         // the whole remaining suffix on every iteration — O(n) per node,
         // O(n^2) overall for n flat top-level siblings, even nowhere near
         // the depth cap. (Codex review on PR #2810.)
-        let html = "<span>x</span>".repeat(20_000);
-        let start = std::time::Instant::now();
-        let pages = render_pages(&html);
+        let make = |k: usize| "<span>x</span>".repeat(k);
+        let pages = crate::pdf::linear::assert_linear("render_pages", 20_000, make, |html| {
+            render_pages(html)
+        });
         assert!(!pages.is_empty());
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "render_pages took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -4041,15 +4037,10 @@ mod tests {
         // length), instead of O(chain length) total. (Codex review on PR
         // #2810.)
         let n = 200_000;
-        let html = format!("{}{}", "<span>".repeat(n), "</span>".repeat(n));
-        let start = std::time::Instant::now();
-        let pages = render_pages(&html);
+        let make = |k: usize| format!("{}{}", "<span>".repeat(k), "</span>".repeat(k));
+        let pages =
+            crate::pdf::linear::assert_linear("render_pages", n, make, |html| render_pages(html));
         assert!(!pages.is_empty());
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
-            "render_pages took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -4063,20 +4054,17 @@ mod tests {
         // shape the single-child test doesn't cover. (Codex review on PR
         // #2810.)
         let n = 200_000;
-        let html = format!(
-            "{}{}{}",
-            "<span><i></i>".repeat(n),
-            "x",
-            "</span>".repeat(n)
-        );
-        let start = std::time::Instant::now();
-        let pages = render_pages(&html);
+        let make = |k: usize| {
+            format!(
+                "{}{}{}",
+                "<span><i></i>".repeat(k),
+                "x",
+                "</span>".repeat(k)
+            )
+        };
+        let pages =
+            crate::pdf::linear::assert_linear("render_pages", n, make, |html| render_pages(html));
         assert!(!pages.is_empty());
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
-            "render_pages took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]
@@ -4093,20 +4081,17 @@ mod tests {
         // fix already made a single resolve() itself cheap. (Codex review
         // on PR #2810.)
         let n = 20_000;
-        let html = format!(
-            "{}A{}B{}",
-            "<span>".repeat(MAX_DEPTH as usize),
-            "<span></span>".repeat(n),
-            "</span>".repeat(MAX_DEPTH as usize)
-        );
-        let start = std::time::Instant::now();
-        let pages = render_pages(&html);
+        let make = |k: usize| {
+            format!(
+                "{}A{}B{}",
+                "<span>".repeat(MAX_DEPTH as usize),
+                "<span></span>".repeat(k),
+                "</span>".repeat(MAX_DEPTH as usize)
+            )
+        };
+        let pages =
+            crate::pdf::linear::assert_linear("render_pages", n, make, |html| render_pages(html));
         assert!(!pages.is_empty());
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "render_pages took {:?} — looks quadratic again",
-            start.elapsed()
-        );
     }
 
     #[test]

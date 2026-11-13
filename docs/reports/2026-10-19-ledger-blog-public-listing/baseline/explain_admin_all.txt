@@ -1,0 +1,17 @@
+                                                        QUERY PLAN                                                         
+---------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=14294.22..14544.25 rows=100009 width=63) (actual time=55.171..72.318 rows=100009 loops=1)
+   Output: id, title, slug, body, published, created_at, updated_at
+   Sort Key: posts.created_at DESC
+   Sort Method: external merge  Disk: 7960kB
+   Buffers: shared hit=1229, temp read=995 written=997
+   ->  Seq Scan on public.posts  (cost=0.00..2226.09 rows=100009 width=63) (actual time=0.018..12.818 rows=100009 loops=1)
+         Output: id, title, slug, body, published, created_at, updated_at
+         Buffers: shared hit=1226
+ Query Identifier: -8149089867726874252
+ Planning:
+   Buffers: shared hit=164
+ Planning Time: 0.504 ms
+ Execution Time: 78.512 ms
+(13 rows)
+

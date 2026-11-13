@@ -72,6 +72,9 @@ pub struct SiteFacts {
     /// `true` when CSRF protection checks a `POST` to the MCP endpoint: a
     /// `WebMCP` call then needs the page's token, read-only or not.
     pub csrf_required: bool,
+    /// Tool names the `WebMCP` projection (`mount_webmcp`) registers. The
+    /// AEO script skips them, so no name is registered twice.
+    pub webmcp_projected: Vec<String>,
     /// The Web Bot Auth key, when configured.
     pub web_bot_auth: Option<super::web_bot_auth::WebBotAuthKey>,
     /// UCP and ACP documents.

@@ -49,6 +49,10 @@ fn compile_fail_tests() {
     // or "sheddable" is a compile error, not a silent `default`.
     t.compile_fail("tests/compile-fail/route_criticality_invalid.rs");
 
+    // Route `group` (#3544): a blank group is a compile error, not the
+    // default group.
+    t.compile_fail("tests/compile-fail/route_group_blank.rs");
+
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");
@@ -250,6 +254,8 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_managed_with_args.rs");
     #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_schema_bad_name.rs");
+    #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_unique_with_args.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
@@ -360,6 +366,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_radiogroup_unlabeled.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_radiooption_missing_label.rs");
+    // Field wrapper v2 (#3395): `FieldOptions` has no label setter, so a field
+    // with options and no label still does not build.
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/form_field_unlabeled.rs");
 }
 
 /// The `state_migration!` fixtures get their own `TestCases` for the same
@@ -608,6 +618,24 @@ fn compile_fail_wire_contract_tests() {
     t.compile_fail("tests/compile-fail/wire_shape_rejects_transparent.rs");
     t.compile_fail("tests/compile-fail/wire_shape_rejects_container_rewrites.rs");
     t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_unknown_wire_type.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_tag_clash.rs");
+}
+
+/// Event contracts: a consumer that reads a field the event does not send
+/// fails the build at the read, and names the event and the field.
+#[test]
+fn compile_fail_event_contract_tests() {
+    let t = trybuild::TestCases::new();
+
+    t.compile_fail("tests/compile-fail/event_listener_reads_missing_field.rs");
+    t.compile_fail("tests/compile-fail/event_listener_reads_unsent_field.rs");
+    // `OutboxMessage` is behind `db`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/event_consumer_reads_unsent_field.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/event_consumer_payload_not_found.rs");
+    t.compile_fail("tests/compile-fail/event_rejects_flatten.rs");
 }
 
 // Split into `_a` / `_b` halves so CI can run them as two parallel trybuild
@@ -698,6 +726,10 @@ fn compile_pass_tests_a() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_schema_markers.rs");
 
+    // `#[model(schema = "...")]` is accepted and changes no codegen.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_schema_arg.rs");
+
     // Model field enum (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_field_enum.rs");
@@ -722,6 +754,10 @@ fn compile_pass_tests_a() {
     // #2662: the `parent_pk` override reaches the preload loader.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_counter_cache_parent_pk.rs");
+
+    // #3033: a `#[model]` keyed on a column other than `id`.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_non_id_pk.rs");
 
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]
@@ -932,6 +968,76 @@ fn query_budget_guide_matches_the_real_diagnostics() {
         assert!(
             root.join(fixture).exists(),
             "guide references a fixture that does not exist: {fixture}"
+        );
+    }
+}
+
+/// The compile-fail fixtures that `docs/guide/accessibility.md` quotes in its
+/// "Red build" block (#2666).
+const A11Y_GUIDE_FIXTURES: [&str; 5] = [
+    "a11y_img_missing_alt",
+    "a11y_link_missing_text",
+    "a11y_menuitem_missing_name",
+    "a11y_textfield_unlabeled",
+    "a11y_radiogroup_unlabeled",
+];
+
+/// The accessibility guide quotes the errors of an inaccessible primitive. Each
+/// quote must be the error rustc prints (#2666). Pins the guide against the
+/// trybuild goldens, and against the fixtures it names.
+#[test]
+fn a11y_guide_matches_the_real_diagnostics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let guide = std::fs::read_to_string(root.join("docs/guide/accessibility.md"))
+        .expect("docs/guide/accessibility.md exists");
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let guide_flat = collapse(&guide);
+    // Two fixtures can share one error line, so the guide quotes it once per
+    // fixture.
+    let mut quotes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for fixture in A11Y_GUIDE_FIXTURES {
+        let path = format!("autumn/tests/compile-fail/{fixture}.rs");
+        assert!(guide.contains(&path), "the guide does not name {path}");
+        assert!(
+            root.join(&path).exists(),
+            "the guide names a missing fixture: {path}"
+        );
+
+        let golden = std::fs::read_to_string(
+            root.join(format!("autumn/tests/compile-fail/{fixture}.stderr")),
+        )
+        .unwrap_or_else(|_| panic!("{fixture} has a golden"));
+        let header = golden
+            .lines()
+            .find(|line| line.starts_with("error"))
+            .unwrap_or_else(|| panic!("{fixture}'s golden opens with an error"));
+        *quotes.entry(collapse(header)).or_default() += 1;
+        assert!(
+            guide_flat.contains(&collapse(header)),
+            "docs/guide/accessibility.md has drifted from {fixture}.\n\n\
+             expected the guide to contain:\n{header}\n\n\
+             Regenerate with TRYBUILD=overwrite and copy the message into the guide."
+        );
+        // For E0599, the error line shows the generic type `State`. The label
+        // line shows the typestate (`NoLabel`). Check both lines.
+        if let Some(at) = golden.find("method not found in `") {
+            let label = golden[at..].lines().next().expect("label line");
+            assert!(
+                guide_flat.contains(&collapse(label)),
+                "docs/guide/accessibility.md is missing {fixture}'s label:\n{label}\n\n\
+                 Regenerate with TRYBUILD=overwrite and copy the label into the guide."
+            );
+        }
+    }
+    for (header, fixtures) in quotes {
+        let found = guide_flat.matches(&header).count();
+        assert!(
+            found >= fixtures,
+            "docs/guide/accessibility.md quotes `{header}` {found} times, \
+             but {fixtures} fixtures emit it"
         );
     }
 }

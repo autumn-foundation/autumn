@@ -30,7 +30,7 @@ js-sys = "0.3"
 # gloo-render: a thin, leak-free wrapper over requestAnimationFrame whose
 # `AnimationFrame` handle cancels the callback on drop — cleaner than hand-rolling
 # a self-rescheduling `Closure`.
-gloo-render = "0.2"
+gloo-render = "0.3"
 
 [dependencies.web-sys]
 version = "0.3"

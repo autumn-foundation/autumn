@@ -44,7 +44,7 @@ const EXIT_FAIL: i32 = 1;
 const EXIT_ERROR: i32 = 2;
 
 /// `name: value` as a header pair the gateway accepts.
-fn parse_response_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
+pub fn parse_response_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
     let (name, value) = raw
         .split_once(':')
         .ok_or_else(|| format!("`{raw}` is not `name: value`"))?;

@@ -107,7 +107,8 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 /// nothing wipes, so the parts are fed to the MAC directly. The prefix is a
 /// constant, so the split adds no ambiguity.
 fn hmac_sha256_parts(key: &[u8], first: &[u8], second: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(first);
     mac.update(second);
     mac.finalize().into_bytes().into()
@@ -299,7 +300,7 @@ impl RootKey {
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).expect("OS RNG failed");
+        getrandom::fill(&mut bytes).expect("OS RNG failed");
         Self { bytes }
     }
 
@@ -354,11 +355,11 @@ impl RootKey {
         seal_key.zeroize();
 
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce).expect("OS RNG failed");
+        getrandom::fill(&mut nonce).expect("OS RNG failed");
 
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                <&Nonce<_>>::from(&nonce),
                 Payload {
                     msg: plaintext.as_bytes(),
                     aad: &ctx.aad(),
@@ -398,9 +399,10 @@ impl RootKey {
         let cipher = Aes256Gcm::new(&seal_key.into());
         seal_key.zeroize();
 
+        let nonce = <&Nonce<_>>::try_from(nonce).map_err(|_| ConfidentialError::UnsealFailed)?;
         let plaintext = cipher
             .decrypt(
-                Nonce::from_slice(nonce),
+                nonce,
                 Payload {
                     msg: ciphertext,
                     aad: &ctx.aad(),
@@ -649,7 +651,7 @@ impl BlindIndex {
 impl Default for BlindIndex {
     fn default() -> Self {
         let mut bytes = [0u8; TOKEN_BYTES];
-        getrandom::getrandom(&mut bytes).expect("OS RNG failed");
+        getrandom::fill(&mut bytes).expect("OS RNG failed");
         Self(hex::encode(bytes))
     }
 }

@@ -41,15 +41,15 @@ fn decrypt_as_the_browser_would(body: &[u8]) -> Vec<u8> {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes128Gcm, Key, Nonce};
     use hmac::{Hmac, Mac};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use sha2::Sha256;
 
     fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
         type H = Hmac<Sha256>;
-        let mut extract = <H as Mac>::new_from_slice(salt).expect("any key length");
+        let mut extract = <H as KeyInit>::new_from_slice(salt).expect("any key length");
         extract.update(ikm);
         let prk = extract.finalize().into_bytes();
-        let mut expand = <H as Mac>::new_from_slice(&prk).expect("any key length");
+        let mut expand = <H as KeyInit>::new_from_slice(&prk).expect("any key length");
         expand.update(info);
         expand.update(&[1_u8]);
         let mut okm = expand.finalize().into_bytes().to_vec();
@@ -68,7 +68,7 @@ fn decrypt_as_the_browser_would(body: &[u8]) -> Vec<u8> {
     let as_key = p256::PublicKey::from_sec1_bytes(as_public).expect("as public key parses");
     let shared = p256::ecdh::diffie_hellman(ua_private.to_nonzero_scalar(), as_key.as_affine());
 
-    let ua_public_point = ua_private.public_key().to_encoded_point(false);
+    let ua_public_point = ua_private.public_key().to_sec1_point(false);
     let mut key_info = Vec::new();
     key_info.extend_from_slice(b"WebPush: info\0");
     key_info.extend_from_slice(ua_public_point.as_bytes());
@@ -79,15 +79,16 @@ fn decrypt_as_the_browser_would(body: &[u8]) -> Vec<u8> {
     let cek = hkdf(salt, &ikm, b"Content-Encoding: aes128gcm\0", 16);
     let nonce = hkdf(salt, &ikm, b"Content-Encoding: nonce\0", 12);
 
-    let mut plaintext = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&cek))
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: ciphertext,
-                aad: b"",
-            },
-        )
-        .expect("the browser must be able to decrypt what the framework sent");
+    let mut plaintext =
+        Aes128Gcm::new(<&Key<Aes128Gcm>>::try_from(cek.as_slice()).expect("16-byte key"))
+            .decrypt(
+                <&Nonce<_>>::try_from(nonce.as_slice()).expect("12-byte nonce"),
+                Payload {
+                    msg: ciphertext,
+                    aad: b"",
+                },
+            )
+            .expect("the browser must be able to decrypt what the framework sent");
     assert_eq!(
         plaintext.pop(),
         Some(0x02),

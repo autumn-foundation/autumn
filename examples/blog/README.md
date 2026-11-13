@@ -24,7 +24,7 @@ htmx, embedded migrations, and the new hybrid-rendering pipeline.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - PostgreSQL (via Docker Compose below)
 - Tailwind CSS binary (downloaded by `autumn setup`)
 

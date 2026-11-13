@@ -1,0 +1,55 @@
+== subscription '1'
+ id | status | consecutive_failures 
+----+--------+----------------------
+ 1  | active |                    0
+(1 row)
+
+                                                              QUERY PLAN                                                              
+--------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_webhook_subscriptions (actual rows=0 loops=1)
+   Buffers: shared hit=1 read=1
+   ->  Index Scan using autumn_webhook_subscriptions_pkey on public.autumn_webhook_subscriptions (actual rows=0 loops=1)
+         Output: CASE WHEN (status = 'failed'::text) THEN 'active'::text ELSE status END, 0, ctid
+         Index Cond: (autumn_webhook_subscriptions.id = '1'::text)
+         Filter: ((autumn_webhook_subscriptions.consecutive_failures <> 0) OR (autumn_webhook_subscriptions.status = 'failed'::text))
+         Rows Removed by Filter: 1
+         Buffers: shared hit=1 read=1
+ Query Identifier: 2762722529068419710
+ Planning:
+   Buffers: shared hit=6
+ Planning Time: 0.078 ms
+ Execution Time: 0.062 ms
+(13 rows)
+
+ wrote_a_row_version 
+---------------------
+ f
+(1 row)
+
+== subscription '7'
+ id | status | consecutive_failures 
+----+--------+----------------------
+ 7  | active |                    3
+(1 row)
+
+                                                              QUERY PLAN                                                              
+--------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_webhook_subscriptions (actual rows=0 loops=1)
+   Buffers: shared hit=4
+   ->  Index Scan using autumn_webhook_subscriptions_pkey on public.autumn_webhook_subscriptions (actual rows=1 loops=1)
+         Output: CASE WHEN (status = 'failed'::text) THEN 'active'::text ELSE status END, 0, ctid
+         Index Cond: (autumn_webhook_subscriptions.id = '7'::text)
+         Filter: ((autumn_webhook_subscriptions.consecutive_failures <> 0) OR (autumn_webhook_subscriptions.status = 'failed'::text))
+         Buffers: shared hit=2
+ Query Identifier: 2762722529068419710
+ Planning:
+   Buffers: shared hit=6
+ Planning Time: 0.068 ms
+ Execution Time: 0.108 ms
+(12 rows)
+
+ wrote_a_row_version 
+---------------------
+ t
+(1 row)
+

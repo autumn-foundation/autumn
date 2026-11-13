@@ -114,10 +114,13 @@ const FAILURE_SQL: &str = "UPDATE autumn_webhook_subscriptions \
          status = CASE WHEN consecutive_failures + 1 >= $1 THEN 'failed' ELSE status END \
      WHERE id = $2 AND status = 'active'";
 
+/// Every successful delivery runs this. The last condition skips a row it
+/// would leave unchanged, so a healthy subscription is not rewritten and
+/// its row is not locked until the delivery's transaction commits.
 const REACTIVATE_SQL: &str = "UPDATE autumn_webhook_subscriptions \
      SET consecutive_failures = 0, \
          status = CASE WHEN status = 'failed' THEN 'active' ELSE status END \
-     WHERE id = $1";
+     WHERE id = $1 AND (consecutive_failures <> 0 OR status = 'failed')";
 
 fn sql(pg: &str) -> String {
     crate::backend_select! {
@@ -299,16 +302,22 @@ impl SqlOutboundWebhookStore {
             .map_err(|error| db_error("schema", &error))
     }
 
-    /// Delete delivery logs older than `cutoff`, except DLQ logs. Returns the
-    /// number of deleted rows. Nothing calls it for you: the table grows
-    /// until you call it.
+    /// Delete delivered (2xx) logs older than `cutoff`. Returns the number of
+    /// deleted rows. Nothing calls it for you: the table grows until you call
+    /// it.
+    ///
+    /// It keeps every other log. A pending or retrying delivery job reads its
+    /// log, so a queue backlog older than `cutoff` must not lose it. DLQ logs
+    /// stay for replay. Logs of deliveries skipped for a disabled or failed
+    /// subscription also stay: delete them yourself if you need to.
     ///
     /// # Errors
     ///
     /// Returns an error when the delete fails.
     pub async fn purge_deliveries_before(&self, cutoff: DateTime<Utc>) -> AutumnResult<usize> {
         diesel::sql_query(sql(
-            "DELETE FROM autumn_webhook_deliveries WHERE logged_at < $1 AND NOT is_dlq",
+            "DELETE FROM autumn_webhook_deliveries WHERE logged_at < $1 AND NOT is_dlq \
+             AND response_status BETWEEN 200 AND 299",
         ))
         .bind::<BigInt, _>(cutoff.timestamp_millis())
         .execute(&mut self.conn().await?)

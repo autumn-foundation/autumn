@@ -491,7 +491,7 @@ pub fn write_mpp_spec(
     apply_mpp(&mut value, &config.aeo.paid_routes);
     let json = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.json"), json)?;
-    let yaml = serde_yaml::to_string(&value).map_err(std::io::Error::other)?;
+    let yaml = serde_saphyr::to_string(&value).map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.yaml"), yaml)
 }
 

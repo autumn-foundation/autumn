@@ -65,7 +65,7 @@ const fn feature_gated_roots() -> [(bool, &'static str); 6] {
         // non-feature-gated root present in every build, so it always appears in
         // the schema and needs no gating exclusion.
         (cfg!(feature = "http-client"), "http"),
-        (cfg!(feature = "reporting"), "reporting"),
+        (cfg!(feature = "error-reporting"), "reporting"),
         (cfg!(feature = "maud"), "stories"),
     ]
 }

@@ -14,6 +14,7 @@ use super::layout::nav_auth_content;
 /// The static `/about` page fires `hx-get="/_partials/nav-auth"` on load so
 /// that logged-in users see their username instead of the anonymous buttons.
 /// Returns `nav_auth_content` (no htmx trigger) so the swap doesn't loop.
+#[public]
 #[get("/_partials/nav-auth")]
 pub async fn nav_auth(session: Session) -> AutumnResult<Markup> {
     let username: Option<String> = session.get("username").await;

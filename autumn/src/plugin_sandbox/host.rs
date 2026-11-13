@@ -70,7 +70,7 @@ use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 use super::artifact::SandboxArtifact;
 use super::manifest::{ResourceLimits, SandboxManifest};
 use super::wire::{
-    GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_line, to_exact_line, to_line,
+    GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_guest_line, to_exact_line, to_line,
 };
 
 /// The WASI module name every import in the shim lives under.
@@ -422,6 +422,26 @@ const CAPABILITY_EVENT_BYTES: usize =
 /// generous fuel budget would otherwise get its quota's worth of host work for
 /// the cost of writing a few hundred bytes to stdout.
 const CAPABILITY_CALL_FUEL: u64 = 2_000;
+
+/// Fuel a guest keeps after a call's reply is priced, so it can write its
+/// answer.
+///
+/// The host reserves it before dispatching: a call whose reply the budget could
+/// pay for but whose guest could not then finish would commit and then end the
+/// request as `FuelExhausted`. A call that commits also keeps
+/// [`GUEST_READ_FUEL_PER_BYTE`] to read its reply.
+const FINISH_ALLOWANCE_FUEL: u64 = 100_000;
+
+/// Fuel per reply byte that a guest keeps to read the reply of a call that
+/// commits (#2523).
+///
+/// Measured: a Rust guest that reads the line and parses it with `serde_json`
+/// spent 6 fuel per byte on plain text, 77 on escaped NULs and 106 on escaped
+/// quotes. A JSON body is escape-heavy, so the rate covers the worst case.
+///
+/// Only for a call that commits. A read that fails changed nothing, so the
+/// host does not refuse it for this fuel.
+const GUEST_READ_FUEL_PER_BYTE: u64 = 128;
 
 /// Refuse a request whose body is over the manifest's declared ceiling.
 ///
@@ -1098,7 +1118,14 @@ pub struct SandboxOutcome {
     pub activity: Vec<crate::plugin_sandbox::capability::CapabilityEvent>,
     /// Capability calls this request made that the bounded ledger could not
     /// hold, so `activity` is a floor rather than a count.
+    ///
+    /// Has no times. Ingest [`dropped_calls`](Self::dropped_calls) instead.
     pub dropped_activity: u64,
+    /// The same calls, with when they occurred. `None` when none was dropped.
+    ///
+    /// Give it to
+    /// [`PluginActivityLog::ingest_dropped_calls`](crate::plugin_sandbox::PluginActivityLog::ingest_dropped_calls).
+    pub dropped_calls: Option<crate::plugin_sandbox::capability::DroppedCalls>,
 }
 
 impl SandboxOutcome {
@@ -1117,6 +1144,7 @@ impl SandboxOutcome {
             stderr: String::new(),
             activity: Vec::new(),
             dropped_activity: 0,
+            dropped_calls: None,
         }
     }
 }
@@ -1145,7 +1173,14 @@ pub struct SandboxRenderOutcome {
     /// Every capability call the hook made.
     pub activity: Vec<crate::plugin_sandbox::capability::CapabilityEvent>,
     /// Calls the bounded ledger could not hold.
+    ///
+    /// Has no times. Ingest [`dropped_calls`](Self::dropped_calls) instead.
     pub dropped_events: u64,
+    /// The same calls, with when they occurred. `None` when none was dropped.
+    ///
+    /// Give it to
+    /// [`PluginActivityLog::ingest_dropped_calls`](crate::plugin_sandbox::PluginActivityLog::ingest_dropped_calls).
+    pub dropped_calls: Option<crate::plugin_sandbox::capability::DroppedCalls>,
 }
 
 // ── The host ─────────────────────────────────────────────────────────────
@@ -1173,6 +1208,9 @@ pub struct SandboxHost {
     /// is only ever the binding constraint on a direct caller, which is the
     /// one it exists for.
     permits: Semaphore,
+    /// The sealed digest of the whole artifact, when this host came from one.
+    /// Stamped on every job the plugin enqueues.
+    artifact_sha256: Option<String>,
     /// The paths this plugin declared, as the router matches them.
     ///
     /// Built once here because a redirect may only name a route the plugin
@@ -1250,7 +1288,15 @@ impl SandboxHost {
     /// Returns [`SandboxLoadError`] if the module does not compile, imports
     /// something the sandbox does not provide, or exports no `_start`.
     pub fn load(artifact: &SandboxArtifact) -> Result<Self, SandboxLoadError> {
-        Self::from_module(artifact.manifest().clone(), artifact.module())
+        // The whole container's digest, kept here so a direct `run` stamps jobs
+        // with it too, not only a host built through `SandboxedPlugin`.
+        let digest = artifact
+            .artifact_digest()
+            .map_err(|err| SandboxLoadError::InvalidManifest(err.to_string()))?;
+        Ok(
+            Self::from_module(artifact.manifest().clone(), artifact.module())?
+                .with_artifact_sha256(digest),
+        )
     }
 
     /// Compile a module against a manifest.
@@ -1375,6 +1421,7 @@ impl SandboxHost {
             engine,
             module,
             permits: Semaphore::new(manifest.limits.max_concurrency),
+            artifact_sha256: None,
             instantiation_fuel: instantiation,
             owned_routes: super::wire::OwnedRoutes::from_routes(
                 manifest
@@ -1384,6 +1431,13 @@ impl SandboxHost {
             ),
             manifest,
         })
+    }
+
+    /// Record the sealed digest of the artifact this host came from.
+    #[must_use]
+    pub(super) fn with_artifact_sha256(mut self, digest: String) -> Self {
+        self.artifact_sha256 = Some(digest);
+        self
     }
 
     /// The manifest this host enforces.
@@ -1527,6 +1581,7 @@ impl SandboxHost {
             stderr: String::new(),
             activity: Vec::new(),
             dropped_events: 0,
+            dropped_calls: None,
         };
 
         // Checked here rather than left to the guest: a plugin that was not
@@ -1597,6 +1652,7 @@ impl SandboxHost {
                 let peak_memory_bytes = record_limiter_refusals(&mut state, limits);
                 let activity = state.runtime.take_events();
                 let dropped_events = state.runtime.dropped_events();
+                let dropped_calls = state.runtime.dropped_calls();
                 let max_bytes = state.runtime.quotas().render_bytes as usize;
                 let fragment = match result {
                     Ok(GuestAnswer::Fragment(nodes)) => {
@@ -1620,6 +1676,7 @@ impl SandboxHost {
                     stderr,
                     activity,
                     dropped_events,
+                    dropped_calls,
                 }
             }
         }
@@ -1708,7 +1765,12 @@ impl SandboxHost {
             limits,
             line.as_bytes(),
             exchange,
-            crate::plugin_sandbox::capability::CapabilityRuntime::new(&self.manifest, services),
+            crate::plugin_sandbox::capability::CapabilityRuntime::new(&self.manifest, services)
+                .with_artifact_sha256(
+                    self.artifact_sha256
+                        .clone()
+                        .unwrap_or_else(|| self.manifest.sha256.clone()),
+                ),
         );
         state.stdin = VecDeque::from(line.into_bytes());
 
@@ -1845,6 +1907,7 @@ fn finish(
 
     let activity = state.runtime.take_events();
     let dropped_activity = state.runtime.dropped_events();
+    let dropped_calls = state.runtime.dropped_calls();
     let result = match result {
         Ok(GuestAnswer::Fragment(_)) => Err(SandboxFailure::MalformedFrame(
             "a request is answered with a `response` frame, not a `fragment`".to_owned(),
@@ -1912,6 +1975,7 @@ fn finish(
         stderr,
         activity,
         dropped_activity,
+        dropped_calls,
     }
 }
 
@@ -2563,6 +2627,10 @@ fn table_section_shape(
 }
 
 fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
+    // Binary Wasm only: `\0asm` and version 1. Text or another version would
+    // walk as noise and give counts that bound nothing.
+    wasm.get(..8)
+        .filter(|header| *header == b"\0asm\x01\0\0\0")?;
     let mut cursor = 8usize; // magic + version
     let mut sections = 0usize;
     let mut memory_count = 0usize;
@@ -3065,6 +3133,8 @@ struct HostState {
     /// only what the capability channel added, and only while it is still
     /// there: `take_stdin` gives it back as the guest reads.
     queued_replies: usize,
+    /// Whether a call that commits has reached its backend.
+    committed: bool,
     /// Everything the guest reached for and did not get.
     denials: Vec<CapabilityDenial>,
     /// Request-seeded PRNG state, so `random_get` is deterministic without
@@ -3116,6 +3186,7 @@ impl HostState {
             pending_charge: 0,
             pending_calls: VecDeque::new(),
             queued_replies: 0,
+            committed: false,
             denials: Vec::new(),
             random_state: Self::seed_from(frame),
             limiter: MemoryLimiter {
@@ -3170,7 +3241,7 @@ impl HostState {
             // overwriting a good first one.
             return;
         }
-        self.answer = Some(match from_line::<GuestFrame>(line) {
+        self.answer = Some(match from_guest_line(line) {
             Ok(GuestFrame::Call(call)) => {
                 // Queued, not serviced: the fixed charge is the shim's to take
                 // first. See `pending_calls`.
@@ -3203,8 +3274,40 @@ impl HostState {
     /// can get wrong comes back as a denial it can read. The two exits that do
     /// end the request are the host's own encoder failing, and a guest that has
     /// stopped reading its replies — see [`MAX_QUEUED_REPLY_BYTES`].
-    fn service(&mut self, call: &super::capability::CapabilityCall) {
-        let result = self.runtime.dispatch(call);
+    fn service(&mut self, call: &super::capability::CapabilityCall, fuel_left: u64) {
+        // The room the reply must fit, decided *before* the call runs. A reply
+        // cannot be measured until its call has committed, and a request that
+        // fails over a committed write is retried by the caller. So a call is
+        // dispatched only when the worst-case reply fits the unread-reply queue
+        // and the fuel left covers pricing it plus a fixed finishing allowance
+        // for the guest. A call that commits also keeps the fuel to read that
+        // reply (#2523). A call that does not fit is answered with a denial the
+        // guest can read, and nothing runs.
+        let queue_room = MAX_QUEUED_REPLY_BYTES.saturating_sub(self.queued_replies);
+        // A quarter of the budget at most, so a small budget still serves calls.
+        let allowance = FINISH_ALLOWANCE_FUEL.min(self.limits.fuel / 4);
+        // After a write has run, any call can still fail the request, so every
+        // call keeps the read fuel. The guest must read its unread replies too.
+        let keep_read = self.committed || call.commits();
+        let unread = u64::try_from(self.queued_replies).unwrap_or(u64::MAX);
+        let fuel_covers = |reserve: usize| {
+            let reserve = u64::try_from(reserve).unwrap_or(u64::MAX);
+            let read = if keep_read {
+                reserve
+                    .saturating_add(unread)
+                    .saturating_mul(GUEST_READ_FUEL_PER_BYTE)
+            } else {
+                0
+            };
+            fuel_left
+                >= allowance
+                    .saturating_add(read)
+                    .saturating_add(reserve.div_ceil(BYTES_PER_FUEL))
+        };
+        let result = self.runtime.dispatch_checked(call, queue_room, fuel_covers);
+        if call.commits() && reached_backend(&result) {
+            self.committed = true;
+        }
         let line = match to_line(&HostFrame::CallResult(result)) {
             Ok(line) => line,
             Err(err) => {
@@ -3242,11 +3345,11 @@ impl HostState {
     /// Returns `false` when the queue is empty. The caller charges
     /// [`CAPABILITY_CALL_FUEL`] before each `true` step, which is the whole
     /// point of the queue: see [`pending_calls`](Self::pending_calls).
-    fn service_next(&mut self) -> bool {
+    fn service_next(&mut self, fuel_left: u64) -> bool {
         let Some(call) = self.pending_calls.pop_front() else {
             return false;
         };
-        self.service(&call);
+        self.service(&call, fuel_left);
         true
     }
 
@@ -3750,6 +3853,23 @@ fn instantiation_fuel(
         .saturating_add(1)
 }
 
+/// Whether `result` comes from a call that reached its backend.
+///
+/// A denial that comes before dispatch did not. A backend error may have: an
+/// outbound request can fail after the upstream got it.
+const fn reached_backend(result: &super::capability::CallResult) -> bool {
+    !matches!(
+        result.denial(),
+        Some(
+            super::capability::DenialReason::CapabilityNotGranted
+                | super::capability::DenialReason::NotInGrant
+                | super::capability::DenialReason::QuotaExceeded
+                | super::capability::DenialReason::Malformed
+                | super::capability::DenialReason::Unavailable
+        )
+    )
+}
+
 /// Charge the guest's fuel budget for `bytes` of host-side work.
 ///
 /// Returns the `OutOfFuel` trap when the budget cannot cover it, so a guest
@@ -3893,6 +4013,17 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
         )
         .map_err(engine_error)?;
 
+    // Clone class: `wasi-fd_write-fuel-metering`. This `fd_write`'s fuel
+    // accounting — per-iovec `charge_units`, the `HOST_IO_CHUNK_BYTES`-chunked
+    // copy, and the extra per-byte `charge_units` for fd 1 because the stdout
+    // line parser inspects every byte — mirrors
+    // `autumn_edge::host::fd_write`'s. The two copies have already missed a
+    // fix on each other once: this fix, `fix(plugin-sandbox): charge stdout
+    // parsing per byte (#3300)`, landed 2026-10-14, and the identical gap in
+    // the edge copy — charging the bulk copy but not the per-byte
+    // stdout-parse cost — wasn't caught there until `fix(autumn-edge): meter
+    // fd_write, fd_read and random_get in fuel (#3503)` landed 15 days later,
+    // 2026-10-29. If you change the fuel formula in one, check the other.
     linker
         .func_wrap(
             WASI,
@@ -4019,7 +4150,8 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                                     && caller.data().answer.is_none()
                                 {
                                     charge_units(&mut caller, CAPABILITY_CALL_FUEL)?;
-                                    let _ = caller.data_mut().service_next();
+                                    let fuel_left = caller.get_fuel()?;
+                                    let _ = caller.data_mut().service_next(fuel_left);
                                     // Saturating, because this charge follows a
                                     // call that has already run: see
                                     // `charge_units_saturating`. The pre-charge
@@ -4419,6 +4551,55 @@ path = "/hello/greet"
 
     fn host(wat: &str) -> SandboxHost {
         try_host(wat).expect("the fixture loads")
+    }
+
+    /// The load-time shape walk reads binary Wasm only. Text must not reach
+    /// the compiler, because the walk cannot bound what it describes.
+    #[test]
+    fn only_binary_wasm_with_the_magic_header_loads() {
+        let text = guests::HELLO.as_bytes();
+        let binary = wat::parse_str(guests::HELLO).expect("the fixture is valid WAT");
+        let mut bad_version = binary.clone();
+        bad_version[4] = 2;
+        for (bytes, what) in [(text, "WAT text"), (&bad_version[..], "an unknown version")] {
+            assert!(
+                matches!(
+                    SandboxHost::from_module(manifest_with(ResourceLimits::default()), bytes),
+                    Err(SandboxLoadError::Wasm(_))
+                ),
+                "from_module must refuse {what}"
+            );
+            assert!(
+                matches!(
+                    SandboxHost::imports_of(bytes),
+                    Err(SandboxLoadError::Wasm(_))
+                ),
+                "imports_of must refuse {what}"
+            );
+        }
+        assert!(
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &binary).is_ok()
+        );
+        // Eight bytes of text walk as zero sections. The walk must still
+        // refuse them, so they never reach the compiler.
+        assert!(module_shape(b"(module)").is_none());
+        assert!(
+            matches!(
+                SandboxHost::imports_of(b"(module)"),
+                Err(SandboxLoadError::Wasm(_))
+            ),
+            "imports_of must refuse WAT text that walks as an empty module"
+        );
+        // wasmi 0.40 has no memory64, so it refuses a 64-bit memory at compile.
+        // This fails if a wasmi raise turns memory64 on.
+        let memory64 = wat::parse_str("(module (memory i64 1))").expect("valid WAT");
+        assert!(
+            matches!(
+                SandboxHost::imports_of(&memory64),
+                Err(SandboxLoadError::Wasm(_))
+            ),
+            "imports_of must refuse a memory64 module"
+        );
     }
 
     fn request(method: &str, path: &str) -> SandboxRequest {
@@ -7966,6 +8147,246 @@ path = "/hello/greet"
         assert!(
             imports.contains(&"wasi_snapshot_preview1::fd_read".to_owned()),
             "{imports:?}"
+        );
+    }
+
+    // ── Reply room is reserved before a call commits (issue #2523) ───
+
+    fn outbound_state(
+        queued: usize,
+    ) -> (
+        HostState,
+        std::sync::Arc<crate::plugin_sandbox::RecordingHttp>,
+    ) {
+        let limits = ResourceLimits::default();
+        let manifest = crate::plugin_sandbox::manifest::SandboxManifest::parse(&format!(
+            r#"
+name = "hello"
+version = "0.1.0"
+wire_version = 1
+prefix = "/hello"
+capabilities = ["http-request", "http-outbound", "kv"]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "/hello/greet"
+
+[grants]
+hosts = ["api.example.com"]
+"#,
+            digest = "a".repeat(64)
+        ))
+        .expect("valid manifest");
+        let http = crate::plugin_sandbox::RecordingHttp::new();
+        let services = crate::plugin_sandbox::CapabilityServices {
+            http: Some(std::sync::Arc::clone(&http)
+                as std::sync::Arc<dyn crate::plugin_sandbox::OutboundHttp>),
+            kv: Some(crate::plugin_sandbox::MemoryKvStore::new()
+                as std::sync::Arc<dyn crate::plugin_sandbox::KvStore>),
+            ..crate::plugin_sandbox::CapabilityServices::none()
+        };
+        let mut state = HostState::new(
+            "hello".to_owned(),
+            limits,
+            b"",
+            Exchange::Request,
+            crate::plugin_sandbox::capability::CapabilityRuntime::new(&manifest, services),
+        );
+        state.queued_replies = queued;
+        (state, http)
+    }
+
+    fn post() -> crate::plugin_sandbox::CapabilityCall {
+        crate::plugin_sandbox::CapabilityCall::HttpFetch {
+            id: 1,
+            method: "POST".to_owned(),
+            url: "https://api.example.com/orders".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_call_is_not_committed_when_its_reply_could_not_be_queued() {
+        // One MiB queue, nearly full of unread replies: a POST could commit and
+        // then fail the request on its own reply.
+        let (mut state, http) = outbound_state(MAX_QUEUED_REPLY_BYTES - 1024);
+        state.service(&post(), u64::MAX);
+        assert!(http.seen().is_empty(), "the POST left the host");
+        assert!(state.answer.is_none(), "the request must go on");
+        let queued =
+            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned();
+        assert!(queued.contains("quota-exceeded"), "{queued}");
+    }
+
+    #[test]
+    fn a_call_is_not_committed_when_the_fuel_could_not_pay_for_its_reply() {
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), 1_000);
+        assert!(http.seen().is_empty(), "the POST left the host");
+        assert!(state.answer.is_none(), "the request must go on");
+    }
+
+    #[test]
+    fn a_call_with_room_and_fuel_is_dispatched() {
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), u64::MAX);
+        assert_eq!(http.seen().len(), 1);
+    }
+    /// Fuel to price `call`'s worst-case reply and write the answer.
+    fn priced(call: &crate::plugin_sandbox::CapabilityCall) -> u64 {
+        let allowance = FINISH_ALLOWANCE_FUEL.min(ResourceLimits::default().fuel / 4);
+        allowance + (call.reply_reserve() as u64).div_ceil(BYTES_PER_FUEL)
+    }
+
+    fn get_call() -> crate::plugin_sandbox::CapabilityCall {
+        crate::plugin_sandbox::CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_fuel_edge_for_a_write_includes_the_guest_s_read() {
+        // #2523. Fuel to price the reply is not fuel to read it. A
+        // POST that commits and then runs out of fuel in the guest fails, and a
+        // retry sends it again.
+        let need = priced(&post()) + post().reply_reserve() as u64 * GUEST_READ_FUEL_PER_BYTE;
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), priced(&post()));
+        assert!(http.seen().is_empty(), "the guest could not read the reply");
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), need - 1);
+        assert!(http.seen().is_empty(), "one unit short must not dispatch");
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), need);
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn the_fuel_edge_for_a_read_is_its_price() {
+        // A read that fails commits nothing, so it keeps no fuel to be read.
+        let (mut state, http) = outbound_state(0);
+        state.service(&get_call(), priced(&get_call()) - 1);
+        assert!(http.seen().is_empty(), "one unit short must not dispatch");
+        let (mut state, http) = outbound_state(0);
+        state.service(&get_call(), priced(&get_call()));
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    /// What the host queued for the guest, as text.
+    fn queued_text(state: &HostState) -> String {
+        String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned()
+    }
+
+    /// Fuel to price `call`, write the answer, and read `unread` bytes plus the
+    /// reply.
+    fn with_read(call: &crate::plugin_sandbox::CapabilityCall, unread: usize) -> u64 {
+        priced(call) + (call.reply_reserve() + unread) as u64 * GUEST_READ_FUEL_PER_BYTE
+    }
+
+    #[test]
+    fn a_fuel_refusal_and_a_queue_refusal_say_different_things() {
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), priced(&post()));
+        assert!(http.seen().is_empty());
+        assert!(state.answer.is_none(), "the request must go on");
+        let text = queued_text(&state);
+        assert!(text.contains("quota-exceeded"), "{text}");
+        assert!(text.contains("increase `fuel`"), "{text}");
+        assert!(!text.contains("pending replies"), "{text}");
+
+        let (mut state, _) = outbound_state(MAX_QUEUED_REPLY_BYTES - 1024);
+        state.service(&post(), u64::MAX);
+        let text = queued_text(&state);
+        assert!(text.contains("pending replies"), "{text}");
+        assert!(!text.contains("fuel"), "{text}");
+    }
+
+    #[test]
+    fn a_write_keeps_fuel_to_read_the_replies_not_yet_read() {
+        let unread = 10_000;
+        let (mut state, http) = outbound_state(unread);
+        state.service(&post(), with_read(&post(), unread) - 1);
+        assert!(http.seen().is_empty(), "one unit short must not dispatch");
+        let (mut state, http) = outbound_state(unread);
+        state.service(&post(), with_read(&post(), unread));
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn a_read_after_a_write_keeps_fuel_to_read_its_reply() {
+        // The write has run. A read that then fails the request makes a retry
+        // do the write again.
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), u64::MAX);
+        assert_eq!(http.seen().len(), 1);
+        state.service(
+            &get_call(),
+            with_read(&get_call(), state.queued_replies) - 1,
+        );
+        assert_eq!(http.seen().len(), 1, "one unit short must not dispatch");
+        state.service(&get_call(), with_read(&get_call(), state.queued_replies));
+        assert_eq!(http.seen().len(), 2);
+    }
+
+    #[test]
+    fn a_write_refused_before_it_runs_does_not_make_reads_keep_fuel() {
+        let (mut state, http) = outbound_state(0);
+        state.service(&post(), priced(&post()));
+        assert!(http.seen().is_empty());
+        state.service(&get_call(), priced(&get_call()));
+        assert_eq!(http.seen().len(), 1);
+    }
+
+    #[test]
+    fn the_fuel_edge_for_a_kv_write_is_about_0_6_million() {
+        let set = crate::plugin_sandbox::CapabilityCall::KvSet {
+            id: 1,
+            key: "cart".to_owned(),
+            value: crate::plugin_sandbox::PluginValue::Text("one".to_owned()),
+        };
+        // The guide quotes this number.
+        assert_eq!(with_read(&set, 0), 624_352);
+        let (mut state, _) = outbound_state(0);
+        state.service(&set, with_read(&set, 0) - 1);
+        assert!(queued_text(&state).contains("increase `fuel`"));
+        let (mut state, _) = outbound_state(0);
+        state.service(&set, with_read(&set, 0));
+        let text = queued_text(&state);
+        assert!(text.contains(r#""status":"ok""#), "{text}");
+    }
+
+    #[test]
+    fn a_get_is_denied_not_failed_when_the_fuel_cannot_price_its_reply() {
+        let read = || crate::plugin_sandbox::CapabilityCall::HttpFetch {
+            id: 1,
+            method: "GET".to_owned(),
+            url: "https://api.example.com/".to_owned(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let queued = |state: &HostState| {
+            String::from_utf8_lossy(&state.stdin.iter().copied().collect::<Vec<_>>()).into_owned()
+        };
+        let (mut state, _) = outbound_state(0);
+        state.service(&read(), 10);
+        assert!(state.answer.is_none(), "the request must go on");
+        assert!(
+            queued(&state).contains("quota-exceeded"),
+            "{}",
+            queued(&state)
+        );
+        let (mut state, _) = outbound_state(0);
+        state.service(&read(), 1_000_000);
+        assert!(
+            !queued(&state).contains("quota-exceeded"),
+            "{}",
+            queued(&state)
         );
     }
 }

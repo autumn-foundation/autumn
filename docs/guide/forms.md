@@ -115,19 +115,268 @@ helpers do not cover, read the state yourself:
 
 The free functions in `autumn_web::form` cover the rest of the control types:
 `password_input`, `textarea_input`, `checkbox_input`, `number_input`,
-`date_input`, `datetime_input`, and `select_input`.
+`date_input`, `datetime_input`, and `select_input`. The native inputs below
+add the switch, the slider, the groups and more types.
 
-A `required_*` variant — one that adds the HTML5 constraint attributes for you —
-exists for **some but not all** of them:
+Each control has a `required_*` variant. It adds `required`,
+`aria-required="true"` and a visual `*` marker in the label. The marker has
+`aria-hidden="true"`, so a screen reader says "required" one time only. Tell
+sighted users what `*` means, for example with "* required" above the form.
+`required_*` writes only the client-side signal. The model rule
+`#[validate(presence)]` rejects a blank submission.
 
-| Has a `required_*` variant | Does not |
+### Hints, attributes and required state: `FieldOptions`
+
+Each helper also has a `*_with` variant that takes `&FieldOptions`. The label
+stays a positional argument, so a field with no label does not compile.
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, text_input_with};
+
+text_input_with(&changeset, "email", "Email", &FieldOptions::new()
+    .hint("We never share your address.")
+    .required()
+    .autocomplete("email")
+    .placeholder("you@example.com")
+    .data("test-id", "signup-email")
+    .hx("indicator", "#spinner"))
+```
+
+- `hint` renders `<p id="email-hint" class="autumn-field__hint">` between the
+  label and the control (after the label for a checkbox). `aria-describedby`
+  names the hint first, then the error.
+- The typed attributes (`placeholder`, `autocomplete`, `inputmode`, `pattern`,
+  `minlength`, `maxlength`, `min`, `max`, `disabled`, `readonly`, `multiple`)
+  render only on controls that use them.
+- `data` and `hx` add `data-*` and `hx-*` attributes. There is no setter for
+  `id`, `name`, `class` or `aria-*`: the helper owns them. The htmx helpers also
+  keep their own `hx-post`, `hx-params` and the other `hx-*` names they set.
+  If you set one name two times, the last value applies.
+- The browser does not submit the value of a `disabled` control.
+
+| Helper | With options |
 |---|---|
-| `text_input`, `number_input`, `date_input`, `datetime_input`, `select_input`, `rich_text_area` | `password_input`, `textarea_input`, `checkbox_input` |
+| `text_input` | `text_input_with` |
+| `text_input_htmx_with_token_field` | `text_input_htmx_with` |
+| `password_input` | `password_input_with` |
+| `textarea_input` | `textarea_input_with` |
+| `checkbox_input` | `checkbox_input_with` |
+| `number_input` | `number_input_with` |
+| `date_input` | `date_input_with` |
+| `datetime_input` | `datetime_input_with` |
+| `select_input` | `select_input_with` |
+| `grouped_select_input` | `grouped_select_input_with` |
+| `rich_text_area_with_labels` | `rich_text_area_with` |
+| `rich_text_area_htmx_with_token_field_with_labels` | `rich_text_area_htmx_with` |
+| `switch_input`, `range_input`, `radio_group`, `checkbox_group`, `segmented_control` | `*_with` |
+| `email_input`, `tel_input`, `url_input`, `time_input`, `month_input`, `color_input` | `*_with` |
+| `hidden_input` | `hidden_input_with` |
+| `otp_input` | `otp_input_with` |
 
-For the three without one, set the attribute yourself in the markup. Server-side
-validation is unaffected either way: `required_*` only writes the client-side
-hint, and `#[validate(presence)]` on the model is what actually rejects a blank
-submission.
+The `*_with` htmx helpers take the submit-token field name. Pass
+`"_submit_token"` for the default. A nested-form `RowScope` has
+`text_input_with`, `number_input_with` and `textarea_input_with`.
+
+The Autumn stylesheet marks a field invalid with `:user-invalid`, so the
+browser's own check shows only after the user changes the field or submits.
+Server errors use the `autumn-field__input--invalid` class.
+
+### Native inputs
+
+These helpers use native HTML controls, so they work with JavaScript off
+(issue #3405). Each one has the wrapper, the hint, the errors and the
+passthrough above.
+
+| Helper | Control | Bind to | `required_*` |
+|---|---|---|---|
+| `switch_input` | `<input type="checkbox" role="switch">` | `#[serde(default)] bool` | yes |
+| `range_input(…, step)` | `<input type="range">` | a number | no |
+| `radio_group(…, choices)` | radios in a `<fieldset>` | a `String` or an enum | yes |
+| `checkbox_group(…, choices)` | boxes in a `<fieldset>` | `#[serde(default)] Vec<String>` | no |
+| `segmented_control(…, choices)` | radios that look like buttons | a `String` or an enum | yes |
+| `email_input`, `tel_input`, `url_input` | `type="email"`, `"tel"`, `"url"` | `String` | yes |
+| `time_input` | `type="time"` | `chrono::NaiveTime` | yes |
+| `month_input` | `type="month"` | `String` (`YYYY-MM`) | yes |
+| `color_input` | `type="color"` | `String` (`#rrggbb`) | no |
+| `hidden_input(changeset, field)` | `type="hidden"` | any | no |
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, checkbox_group_with, radio_group, switch_input};
+
+(switch_input(&changeset, "alerts", "Email alerts"))
+(radio_group(&changeset, "plan", "Plan", &[("free", "Free"), ("pro", "Pro")]))
+(checkbox_group_with(&changeset, "topics", "Topics",
+    &[("rust", "Rust"), ("web", "Web")],
+    &FieldOptions::new().hint("Choose one or more.")))
+```
+
+- A group is a `<fieldset>` with a `<legend>`. The hint and error links go on
+  the `<fieldset>`. The first input has `id="{field}"`, so an error summary
+  link moves focus to the group. The other inputs have `id="{field}-{index}"`.
+- A checkbox group posts one `topics=…` pair for each checked box, and no key
+  when no box is checked. `Changeset::field_values` checks the boxes again
+  after a 422.
+- `required` on a box means "check this box". So a required checkbox group
+  shows the marker only. Validate "one or more" on the server, for example
+  with `#[validate(length(min = 1))]`.
+- A radio has no `aria-required`, because ARIA does not allow it. `required` on
+  each radio makes the group required.
+- A slider, a color and a hidden input always have a value. They ignore
+  `required`.
+- The time value shows as `HH:MM`, or with seconds and `step="1"` when the
+  seconds are not zero. The month value shows as `YYYY-MM`, also from a date.
+  The color value shows as a lowercase `#rrggbb`. Any other color is not
+  shown.
+- A hidden input has no label, no wrapper and no error block. Show its errors
+  with the error summary.
+
+`form_for` takes the same controls: `FieldControl::Switch`, `Range { step }`,
+`Radio { options }`, `CheckboxGroup { options }`, `Segmented { options }`,
+`Email`, `Tel`, `Url`, `Time`, `Month`, `Color` and `Hidden`. A `#[model]`
+`NaiveTime` column gets `Time`. A non-null column does not make a switch, a
+slider, a color, a hidden input or a checkbox group required.
+
+The "Native inputs" and "Choice controls" stories show each control.
+
+  `minlength`, `maxlength`, `min`, `max`, `disabled`, `readonly`, `multiple`)
+  render only on controls that use them.
+
+### Passwords and one-time codes
+
+A password field and a one-time code (OTP) field need more than a plain input
+(issue #3412). Both are in core, and the auth generator uses both.
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, OtpFormat, otp_input_with, password_input_with,
+    required_otp_input};
+
+(password_input_with(&changeset, "password", "Password", &FieldOptions::new()
+    .required()
+    .new_password()
+    .minlength(12)
+    .reveal()
+    .strength_hint()))
+(required_otp_input(&changeset, "code", "Authenticator code"))
+(otp_input_with(&changeset, "backup", "Backup code",
+    OtpFormat::digits(8).group(4), &FieldOptions::new()))
+```
+
+Password options (other controls ignore them):
+
+- `current_password()` and `new_password()` set `autocomplete`. Use the first
+  on a sign-in form. Use the second on a signup or a change form, so a
+  password manager can suggest a password.
+- `reveal()` adds a "Show password" button with `aria-pressed`. The button has
+  `hidden` until `autumn-widgets.js` shows it. A submit, a page hide and an
+  htmx history snapshot hide the password again. `reveal_label(text)` sets
+  the button text.
+- `strength_hint()` adds `<p id="{field}-strength" aria-live="polite">` and
+  puts its id in `aria-describedby`. The script writes "Strength: weak",
+  "fair", "good" or "strong" from the length and the character kinds. The
+  text changes only when the level changes. `strength_labels([..; 4])` sets
+  the four labels. Name the subject in each label: a screen reader reads the
+  label alone. It is a hint, not a policy: it does not know common
+  passwords. Check the password on the server.
+- A revealable password has `spellcheck="false"` and `autocapitalize="off"`,
+  so a cloud spellcheck does not read the revealed text.
+
+The OTP field is one `<input type="text" autocomplete="one-time-code"
+inputmode="numeric">`. CSS draws a box for each digit behind it. One real
+input keeps SMS autofill and paste working, and a screen reader finds one
+field.
+
+- `OtpFormat::digits(n)` sets the length, 4 to 10. The default is 6.
+- `pattern="[0-9]{n}"` checks the code on submit, also without JavaScript.
+  `maxlength="{n}"` keeps a page with no JavaScript from showing more digits
+  than boxes.
+- The script removes that `maxlength`. It keeps only the digits of a paste,
+  an autofill or an IME entry, up to the length. A paste of `123-456` gives
+  `123456`. Full-width digits (`１２３`) become ASCII digits.
+- `.group(g)` shows `1234 5678`. `g` is 2 to 5 and less than `n`. The group
+  needs the script. It changes `pattern`, shows the separator boxes, and
+  removes the spaces from the form data and from an htmx request, so the
+  server gets the digits only. Strip whitespace on the server too. A
+  `pattern` option turns the group off, so your pattern checks the code.
+- The value is never rendered: a code is used one time.
+- An `autocomplete`, `inputmode`, `pattern` or `maxlength` option replaces
+  the default. `placeholder` and `minlength` pass through.
+- On a narrow screen the boxes get smaller, so the page does not scroll
+  sideways.
+- Do not use it for a recovery code with letters. The generated
+  `/login/verify` page keeps a text input for that reason.
+
+`form_for` takes `FieldControl::Otp(OtpFormat)`. The "Sign-in inputs" story
+shows each option.
+
+### Select: groups, multiple and style
+
+`select_input` renders a native `<select>` (issue #3409). The browser
+supplies the keyboard behaviour and the accessibility tree. There is no
+JavaScript.
+
+| Item | Use |
+|---|---|
+| `grouped_select_input(…, choices, groups)` | Top-level `choices`, then one `<optgroup>` for each `(label, options)` group |
+| `FieldOptions::multiple()` | `<select multiple>`. Bind to a `#[serde(default)] Vec<T>` |
+| `FieldOptions::styled_select()` | The `autumn-select` class: `appearance: base-select` where the browser supports it |
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, grouped_select_input_with, select_input_with};
+
+(grouped_select_input_with(&changeset, "city", "City",
+    &[("", "Choose a city")],
+    &[
+        ("France", &[("paris", "Paris"), ("lyon", "Lyon")]),
+        ("Japan", &[("tokyo", "Tokyo")]),
+    ],
+    &FieldOptions::new().required().styled_select()))
+(select_input_with(&changeset, "tags", "Tags",
+    &[("rust", "Rust"), ("web", "Web")],
+    &FieldOptions::new().multiple()))
+```
+
+- A single select marks the first option whose value is the field value.
+  It marks one option only, also when two options have that value.
+- A multiple select reads `Changeset::field_values`. It marks each option
+  whose value is in the list. Thus the chosen options show again after a
+  422. The browser posts one `tags=…` pair for each chosen option. It posts
+  no key when no option is chosen.
+- `required` on a multiple select means "choose one or more". Also validate
+  on the server, for example with `#[validate(length(min = 1))]`.
+- A multiple select on a `String` field gets a 422 when the user chooses two
+  options. Bind it to a `Vec<T>`.
+- Autumn also writes `multiple` on a file input. Read the files with
+  `ChangesetForm::files(field)`. Other controls ignore `multiple`.
+- `styled_select` is opt-in. Chrome 135+ and Safari 27 support
+  `appearance: base-select`. They draw the select and its picker from the
+  design tokens, in the light and the dark scheme. Other browsers keep the
+  native control with the field style. A multiple select keeps the native
+  list box in all browsers.
+- In a styled select, the arrow keys, Enter and Space open the picker.
+  The arrow keys move in the picker. Enter chooses an option. Escape closes
+  the picker.
+
+`form_for` takes `FieldControl::GroupedSelect { options, groups }`. For a
+multiple select:
+
+1. Use `.override_field(name, FieldControl::Select { options })`, or
+   `GroupedSelect`.
+2. Set `.field_options(name, FieldOptions::new().multiple())`.
+
+The model `required` flag does not make a multiple select required, because
+a `Vec` can be empty.
+
+The "Select" story shows the styled select, the native fallback, a grouped
+select and a multiple select.
+
+### The error summary
+
+`autumn_web::widgets::error_summary(&changeset)` lists every error at the top of
+the form. Each entry links to `#field`, the `id` of the control. The summary has
+`tabindex="-1"` and `autofocus`, so focus moves to it when a submit fails, with
+no JavaScript. A form-level error (key `__all__`) has no link. Put one summary
+on a page, with no other `autofocus` element. Do not return it from an
+inline-validation response: it takes focus while the user types.
 
 ### Rendering a whole form in one call
 
@@ -135,17 +384,43 @@ A `#[model]` implements `FormModel`, so `form_for` can derive one control per
 editable column:
 
 ```rust,ignore
-use autumn_web::form::form_for;
+use autumn_web::form::{FieldOptions, form_for};
 
 form_for(&changeset, "/posts", "post")
     .csrf(csrf.token())
     .exclude("author_id")
     .override_label("body", "Post text")
+    .field_options("title", FieldOptions::new().hint("Keep it short."))
     .render()
 ```
 
+Use `.field_options(field, FieldOptions)` to give one field a hint, attributes
+or the required state. A checkbox and a password become required only from
+`FieldOptions`: a non-null `bool` column does not mean "must be checked", and
+the browser never fills a password field again on an edit form.
+
 This is what the scaffold generator emits. Reach for the individual helpers when
 the form's layout matters; reach for `form_for` when it does not.
+
+### Controls from a widget pack
+
+A widget pack (for example a date picker) gives a `FieldRenderer`. Bind it
+to one field in two ways:
+
+```rust,ignore
+use autumn_web::form::{FieldControl, FieldOptions, custom_input_with};
+
+// With a changeset:
+custom_input_with(&changeset, "due", "Due", &DatePicker, &FieldOptions::new())
+
+// With form_for:
+form_for(&changeset, "/tasks", "post")
+    .override_field("due", FieldControl::custom(DatePicker))
+    .render()
+```
+
+The control gets the same wrapper, label, hint, errors and passthrough as a
+core control. See [Widget Packs](widget-packs.md#bind-a-form-input).
 
 ---
 
@@ -162,9 +437,11 @@ validation error, the handler decides what to render, and the user gets their
 input back. This is the right choice for every server-rendered HTML form.
 
 **It can still reject a body it cannot decode.** `decode_form_body` returns 415
-for the wrong `Content-Type` and 400 when a field will not deserialize into its
-declared type — before the handler runs, so there is nothing to re-render with.
-The round-trip covers *invalid* values, not *unparseable* ones.
+for the wrong `Content-Type`, 400 when a field will not deserialize into its
+declared type, and 422 when a single-value field arrives more than once (see
+[multi-value fields](#multi-value-fields)) — before the handler runs, so there
+is nothing to re-render with. The round-trip covers *invalid* values, not
+*unparseable* ones.
 
 That distinction has a practical consequence: **type a form field as the string
 the browser actually submits, and convert after validation.** A field typed
@@ -779,6 +1056,69 @@ screen-reader user hears the error when focus lands on the field. The
 
 ---
 
+## Multi-value fields
+
+A checkbox group, a `<select multiple>` and a tag input send one key more than
+once: `tags=rust&tags=web`. Give the field a sequence type. Each value becomes
+one element:
+
+```rust,ignore
+#[derive(Deserialize, Serialize, Validate)]
+struct PostForm {
+    title: String,
+    #[serde(default)]          // no box checked → empty list
+    tags: Vec<String>,
+    #[serde(default)]
+    reviewer_ids: HashSet<i64>,
+    labels: Option<Vec<String>>, // absent → None
+}
+```
+
+`ChangesetForm<T>`, `NestedChangesetForm` and the multipart path all use these
+rules. So does `autumn_web::form::from_urlencoded`, for a handler that reads
+`Bytes`:
+
+| Body | Field | Result |
+|---|---|---|
+| `tags=a&tags=b` | `Vec<String>` | `["a", "b"]` |
+| `tags=a` | `Vec<String>` | `["a"]` |
+| (no `tags` key) | `#[serde(default)] Vec<String>` | `[]` |
+| (no `labels` key) | `Option<Vec<String>>` | `None` |
+| `q=a%20b&q=c+d` | `Vec<String>` | `["a b", "c d"]` |
+| `ids=1&ids=&ids=3` | `Vec<i64>` | `[1, 3]` — a blank element of a typed list is dropped |
+| `q=&q=x` | `Vec<String>` | `["", "x"]` — a blank string stays |
+| `ids=1&ids=x` | `Vec<i64>` | 400 |
+| `name=a&name=b` | `String` | **422** |
+
+**A repeated key on a single-value field is a 422.** The decoder does not
+select the first value or the last value. Two layers can select different
+values (a proxy log and the handler, for example). That causes
+parameter-pollution bugs. The message names the field, so a field that must be
+a `Vec` is easy to find. Single-value fields that arrive once decode as before.
+
+Notes:
+
+- Brackets are part of the key. `ids[]=1` does not fill `ids`. Use
+  `#[serde(alias = "ids[]")]` to accept both spellings. Do not send both in one
+  body.
+- `bool` also accepts `on`, the value a checkbox with no `value` attribute
+  sends.
+- A blank numeric or `bool` `Option` (`page=`) is `None`. A
+  `#[serde(default = "...")]` on that field does not apply to a blank value.
+- A fixed-size array (`[i64; 2]`) and a newtype around a `Vec` take one value.
+  Use a plain `Vec`.
+- `Changeset::field_values("tags")` returns every element as a string, to
+  re-render the checked boxes or the selected options. In a
+  [nested form](./nested-forms.md) row, `row.values("tags")` returns every
+  submitted value of that subfield. `row.value("tags")` returns only the last
+  one.
+- `field_from_urlencoded` reads one raw value for a preview. It is lenient and
+  returns the first value.
+- `Form<T>` still uses `serde_urlencoded`. It rejects a repeated key on a
+  struct field.
+
+---
+
 ## Multi-row and multi-step forms
 
 - **Repeated rows** — a `has_many` edited inline, with add/remove — are their own
@@ -796,23 +1136,47 @@ screen-reader user hears the error when focus lands on the field. The
 per-file size caps — before your handler sees a byte. See
 [storage](./storage.md) for where the bytes then go.
 
-**`ChangesetForm` and file uploads do not compose.** It does decode
-`multipart/form-data` bodies when the `multipart` feature is on, but
-`decode_multipart` **skips file fields while consuming the stream** — so the
-upload is silently discarded, and a second `Multipart` extractor cannot recover
-it, because the body is already gone. A handler taking `ChangesetForm<T>` on a
-form that contains a file input validates the text fields correctly and loses
-the file with no error at all.
+**`ChangesetForm` keeps file parts**, so one form can take a file upload and
+its text fields together. On a `multipart/form-data` body (the
+`multipart` feature), the text fields decode into `T` as usual. Each file part
+goes to the form, not to `T`:
 
-So pick one per route:
+```rust,ignore
+#[post("/profile")]
+async fn update(mut form: ChangesetForm<ProfileForm>) -> impl IntoResponse {
+    if form.file("avatar").is_none() {
+        form.changeset.add_error("avatar", "Choose a picture");
+    }
+    let files = form.take_files(); // take them before `into_valid` consumes the form
+    match form.into_valid() {
+        Ok(profile) => { /* store `files`, save `profile` */ }
+        Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, render(&form)).into_response(),
+    }
+}
+```
 
-| The route needs | Use |
+| Method | Returns |
 |---|---|
-| validated text fields, re-rendered on failure | `ChangesetForm<T>` — and no file inputs on that form |
-| a file upload | `Multipart`, validating the text fields yourself |
+| `form.file("avatar")` | the first file part named `avatar` |
+| `form.files("photos")` | every file part named `photos` (`<input type="file" multiple>`) |
+| `form.take_files()` | all file parts, moved out of the form |
 
-If you need both, split them: take the upload on its own route or its own
-request, and keep the changeset form for the fields that have to round-trip.
+Each `FormFile` has `field()`, `file_name()`, `content_type()` (from the
+client), `sniffed_content_type()` (from the bytes, when a MIME policy is set)
+and `bytes()`.
+
+Rules:
+
+- The `security.upload` policy applies: the MIME allowlist (400), the per-file
+  cap (413), and the request cap. The per-file cap also applies to each text
+  part. A route that sets a smaller `DefaultBodyLimit` keeps it.
+- The form holds each file in memory. The per-file cap and the request cap
+  limit that memory. For a file larger than you want in memory, use
+  `Multipart` and stream it to storage on its own route.
+- An empty optional file input (no file chosen) is not a file. `file(..)`
+  returns `None`.
+- A browser cannot fill a file input again. When you re-render after an error,
+  the user must choose the file again.
 
 ---
 

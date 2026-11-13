@@ -313,15 +313,15 @@ impl diesel::connection::Instrumentation for GateInstrumentation {
 /// # Errors
 ///
 /// Returns the error of [`tokio::runtime::Builder::build`].
-pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+pub fn runtime() -> std::io::Result<SimRuntime> {
     let gate = Arc::new(Gate::default());
-    // The thread that builds the runtime runs it (`#[sim_test]` does both).
-    // The park hook sets it again, in case another thread runs it.
-    RUNS.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&gate)));
+    // A sim built on this thread before `block_on` finds the gate. `block_on`
+    // installs it again, in case another thread runs the runtime.
+    install(&gate);
     let on_start = Arc::clone(&gate);
     let on_unpark = Arc::clone(&gate);
-    let on_park = gate;
-    tokio::runtime::Builder::new_current_thread()
+    let on_park = Arc::clone(&gate);
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
         .max_blocking_threads(1)
@@ -331,19 +331,59 @@ pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
             GATE.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&on_start)));
         })
         .on_thread_park(move || {
-            RUNS.with(|cell| {
-                let mut cell = cell.borrow_mut();
-                if !cell
-                    .as_ref()
-                    .is_some_and(|gate| Arc::ptr_eq(gate, &on_park))
-                {
-                    *cell = Some(Arc::clone(&on_park));
-                }
-            });
+            install(&on_park);
             on_park.on_park();
         })
         .on_thread_unpark(move || on_unpark.on_unpark())
-        .build()
+        .build()?;
+    Ok(SimRuntime { runtime, gate })
+}
+
+/// Make `gate` the gate of the sim runtime this thread runs.
+fn install(gate: &Arc<Gate>) {
+    RUNS.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if !cell.as_ref().is_some_and(|held| Arc::ptr_eq(held, gate)) {
+            *cell = Some(Arc::clone(gate));
+        }
+    });
+}
+
+/// The runtime [`runtime`] builds.
+///
+/// It derefs to [`tokio::runtime::Runtime`]. Its [`block_on`](Self::block_on) installs the gate before the first poll,
+/// on whichever thread runs it. Use it, not `handle().block_on`.
+pub struct SimRuntime {
+    runtime: tokio::runtime::Runtime,
+    gate: Arc<Gate>,
+}
+
+impl SimRuntime {
+    /// Like [`tokio::runtime::Runtime::block_on`]. A sim built in `future`
+    /// finds the gate at once, also when this thread did not build the
+    /// runtime.
+    pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        install(&self.gate);
+        self.runtime.block_on(future)
+    }
+
+    /// Like [`tokio::runtime::Runtime::shutdown_timeout`].
+    pub fn shutdown_timeout(self, duration: Duration) {
+        self.runtime.shutdown_timeout(duration);
+    }
+
+    /// Like [`tokio::runtime::Runtime::shutdown_background`].
+    pub fn shutdown_background(self) {
+        self.runtime.shutdown_background();
+    }
+}
+
+impl std::ops::Deref for SimRuntime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +523,63 @@ mod tests {
             drop(sim);
             assert_eq!(super::live_sims(), 0);
         });
+    }
+
+    /// A runtime built on one thread and run on another still seats a sim
+    /// built in the async body, before the first park.
+    #[test]
+    fn sim_gate_seats_a_sim_when_the_runtime_runs_on_another_thread() {
+        let rt = runtime().unwrap();
+        let seats = std::thread::spawn(move || {
+            rt.block_on(async {
+                let sim = crate::sim::Sim::from_seed(1);
+                sim.anchor();
+                super::live_sims()
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seats, 1);
+    }
+
+    /// After the move, gated work still waits for a park.
+    #[test]
+    fn sim_gate_gates_work_when_the_runtime_runs_on_another_thread() {
+        let rt = runtime().unwrap();
+        let order = std::thread::spawn(move || {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&order);
+            rt.block_on(async move {
+                let sim = crate::sim::Sim::from_seed(1);
+                sim.anchor();
+                let log = Arc::clone(&seen);
+                let blocking = crate::time::spawn_blocking(move || {
+                    let _gate = Scope::enter();
+                    log.lock().unwrap().push("blocking");
+                });
+                for _ in 0..3 {
+                    seen.lock().unwrap().push("local");
+                    tokio::task::yield_now().await;
+                }
+                blocking.await.unwrap();
+            });
+            order.lock().unwrap().clone()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(order, ["local", "local", "local", "blocking"]);
+    }
+
+    /// `SimRuntime` still gives the `Runtime` methods, and it shuts down.
+    #[test]
+    fn sim_gate_runtime_derefs_and_shuts_down() {
+        let rt = runtime().unwrap();
+        let out = rt.handle().block_on(async { 7 });
+        assert_eq!(out, 7);
+        let task = rt.spawn(async { 1 });
+        assert_eq!(rt.block_on(task).unwrap(), 1);
+        rt.shutdown_timeout(std::time::Duration::from_millis(10));
+        runtime().unwrap().shutdown_background();
     }
 
     #[test]

@@ -80,7 +80,9 @@ pub use protocol::{
     PushRequest, PushResponse, RemoteRow, Version,
 };
 pub use resolver::{ConflictResolver, LwwResolver, Resolution};
-pub use server::{MemorySyncBackend, PgSyncBackend, SyncBackend, SyncScope};
+#[cfg(feature = "postgres")]
+pub use server::PgSyncBackend;
+pub use server::{MemorySyncBackend, SyncBackend, SyncScope};
 pub use store::SyncStore;
 
 /// Errors produced by the sync store, engine, and server backends.

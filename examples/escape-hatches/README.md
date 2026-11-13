@@ -38,7 +38,7 @@ and why. Do not add a hatch that the app does not need.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - PostgreSQL. Or Docker: `docker compose up -d` in this folder starts one on
   `localhost:5432` that matches `autumn.toml`.
 

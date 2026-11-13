@@ -17,6 +17,7 @@ After: `Function Scan unnest` → `Nested Loop` → per queue `Index Scan idx_au
 ## 🔧 Change
 `pg_claim_sql()` only: `unnest($2) WITH ORDINALITY` cross-joined to a `LATERAL` per-queue `ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED`, outer `ORDER BY ord, run_at LIMIT 1`. Binds unchanged. No migration, no new index, no new lock level.
 Trade-off: each probe locks its queue head, so the claim can briefly lock the head of a lower-priority queue it then discards (released at statement end). A concurrent claim just skips that row for that instant.
+Follow-up (#3182): the outer sort is now `ORDER BY q.ord` only. Each probe returns one row at most, so the claim picks the same row as before. `WITH ORDINALITY` output is sorted on `ord`, so Postgres does not sort and stops at the first queue that has a row. The claim now locks only the row it claims. `pg_multi_queue_claim_does_not_lock_lower_queue_heads` and `pg_multi_queue_claim_cost_stays_flat_as_the_backlog_grows` in `autumn/src/job.rs` guard the lock and the plan.
 
 ## 📊 Measurement
 Single claim, `EXPLAIN (ANALYZE, BUFFERS)`, shared hit+read:

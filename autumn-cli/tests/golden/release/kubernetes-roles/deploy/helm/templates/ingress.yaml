@@ -1,0 +1,43 @@
+{{- range $name, $role := .Values.roles }}
+{{- $ctx := dict "root" $ "name" $name "role" $role }}
+{{- /* Only a role that serves HTTP gets an Ingress. */}}
+{{- if and $role.enabled $role.servesHttp (dig "ingress" "enabled" false $role) }}
+{{- if not $role.ingress.hosts }}
+{{- fail (printf "set roles.%s.ingress.hosts, or turn the Ingress off" $name) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "app.roleName" $ctx }}
+  labels:
+    {{- include "app.roleLabels" $ctx | nindent 4 }}
+  {{- with $role.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $role.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with $role.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $role.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range (.paths | default (list (dict "path" "/"))) }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ include "app.roleName" $ctx }}
+                port:
+                  name: http
+          {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

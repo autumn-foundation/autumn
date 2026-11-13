@@ -5,7 +5,7 @@
 #
 # WHY THIS EXISTS: the corpus already gates the four things a reader copies off
 # a page and the one thing they cannot copy at all.
-# `scripts/check-docs-links.sh` gates its *links* (a 404),
+# `xtask/src/docs/links.rs` gates its *links* (a 404),
 # `scripts/check-docs-cli.sh` its *commands* (`unrecognized subcommand`),
 # `scripts/check-docs-config.sh` the `AUTUMN_*` variables they SET (a silent
 # no-op), `scripts/check-docs-toml.sh` the `autumn.toml` keys they WRITE
@@ -1144,7 +1144,7 @@ class Surface:
 # `.claude/skills/` is a SECOND skill tree, not a copy of `skills/`: the agent
 # machinery loads a `SKILL.md` there by name, which is why
 # `check-docs-orphans.sh` seeds both trees as reader entry surfaces and why
-# `check-docs-routes.sh` reads both for `/actuator/…` paths. `run-autumn` lives
+# `xtask/src/docs/routes.rs` reads both for `/actuator/…` paths. `run-autumn` lives
 # only here, and its SKILL.md is copy-and-run text end to end — `autumn seed
 # --package`, `autumn routes --bin`, `AUTUMN_SERVER__PORT`,
 # `AUTUMN_DATABASE__URL`, `-p autumn-web`. It already carries
@@ -1167,7 +1167,7 @@ def reader_facing(path):
 
 # `readme = "…"` in a crate manifest names that crate's crates.io landing page.
 # It is reader-facing by PUBLICATION rather than by where it sits in the tree,
-# which is why a directory-shaped rule cannot reach it — `check-docs-routes.sh`
+# which is why a directory-shaped rule cannot reach it — `xtask/src/docs/routes.rs`
 # reads the manifests for exactly this reason, and its argument carries here
 # unchanged: these pages carry `autumn_web::…` paths and `AUTUMN_*` variables
 # the same way they carry `/actuator/…` URLs.

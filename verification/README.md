@@ -33,6 +33,19 @@ scripts/verify-verus.sh                          # uses `verus` on PATH
 VERUS_BIN=/path/to/verus scripts/verify-verus.sh
 ```
 
+## Protobuf field numbers
+
+`proto_field_numbers.rs` models how `autumn contracts export --proto` gives
+field numbers (`autumn-cli/src/contracts/proto/lock.rs`). Verify it with:
+
+```sh
+verus verification/proto_field_numbers.rs
+```
+
+It proves three rules. Each new number is a valid field number. New numbers
+are distinct and above every used number. A new name does not change the
+number of another name.
+
 ## Lease-lock fencing
 
 `lease_fencing.rs` models the `autumn_lease_locks` statements in
@@ -45,6 +58,51 @@ verus verification/lease_fencing.rs
 It proves that tokens are unique and strictly increasing per lock name, and
 that a stale write is rejected. It does not prove that holders never overlap;
 the fencing token makes overlap safe.
+
+## Choice item ids
+
+`choice_item_id.rs` models the ids of a radio group, a checkbox group and a
+segmented control (`push_choice_items` in `autumn/src/form.rs`, issue #3405).
+Verify it with:
+
+```sh
+verus verification/choice_item_id.rs
+```
+
+The first item has the field id. Item 1 and up has `{field}-{index}`. It
+proves that two items never share an id, and that an item id is never a
+hint, error, wrapper, label or nested-subfield id, or a plain field id. The
+proptest `choice_item_ids_never_collide` checks the rendered markup.
+
+## One-time code format
+
+`otp_format.rs` models `OtpFormat` in `autumn/src/form.rs` (issue #3412).
+Verify it with:
+
+```sh
+verus verification/otp_format.rs
+```
+
+It proves that the digit count is 4 to 10, that a kept group splits the
+code, and that the cell count fits and is at most 14. It also proves that the
+grouped `pattern` from `autumn-widgets.js` has one group more than the
+separator cells. The proptests `otp_format_stays_in_bounds` and
+`otp_markup_matches_the_format` check the runtime.
+
+## Select marks
+
+`select_marks.rs` models which `<option>` a select marks `selected`
+(`push_select_options` in `autumn/src/form.rs`, issue #3409). Verify it
+with:
+
+```sh
+verus verification/select_marks.rs
+```
+
+It proves that a single select marks at most one option, and one option
+when a value matches. A match in an earlier group stops a mark in a later
+group. A multiple select marks each match, and a mark is always a match.
+The proptest `select_marks_follow_the_spec` checks the rendered markup.
 
 ## Fleet slot ownership
 
@@ -66,11 +124,135 @@ It proves these properties:
   epoch it held.
 - A restore never selects a generation of an older epoch, and a fenced
   replicator stops.
+- Shipping is its own step. When `may_put` admits a put, `may_ship` admits
+  it too. After a newer epoch marker, or a newer epoch this host saw, each
+  put of the old owner is refused. After a new grant, the new owner can put.
+- An open refuses a file stamped by a newer owner. After the new owner opens
+  the file, the old owner cannot open it. The owner can open it again, and a
+  new grant can open any file the table stamped (`may_open`).
 
 It does not prove that two hosts never serve at once. That depends on the
 clock bound in the guide. The epoch makes a late write of the old owner
 harmless to the replicas. The proptest `the_table_keeps_its_invariants`
 checks the same rules on the runtime table.
+
+## Fleet sidecar scope
+
+`fleet_sidecar_scope.rs` models the replica scope of a fleet sidecar engine
+(`ScopedDestination` in `autumn/src/replication/destination.rs` and
+`sidecar_root` in `autumn/src/db/fleet.rs`). Verify it with:
+
+```sh
+verus verification/fleet_sidecar_scope.rs
+```
+
+It proves these properties:
+
+- A key the scope admits is under the database's replica prefix, so a purge
+  of the database also removes it.
+- A key the scope of engine `e` admits is not under `<prefix>/<r>/` and is
+  not `<prefix>/<r>`, for any other name `r` with no `/`. So a sidecar
+  cannot write the primary's `generations`, `epochs` or `tombstone`.
+- A sidecar key of one tenant is not under the prefix of another tenant.
+
+The unit tests in `destination.rs` and `db/fleet/engine_tests.rs` check the
+same rules on the runtime.
+
+## Fleet generations
+
+`fleet_generations.rs` models generation shipping (`ShipMode::Generations`
+in `autumn/src/db/fleet_engine.rs`, the shipper in
+`autumn/src/db/fleet/generations.rs`, and the fence in
+`autumn/src/replication/fence.rs`). Verify it with:
+
+```sh
+verus verification/fleet_generations.rs
+```
+
+It proves these properties:
+
+- The fence does not depend on the ship mode. A newer epoch at the
+  destination, a newer epoch this host saw, or a retired database refuses
+  each put. The current owner can put. `Rebuild` puts nothing.
+- A file whose hash the previous generation holds is not shipped again.
+  Each file of a new generation is shipped now or held already.
+- A holder is the new generation or a holder of the previous one, and it is
+  never newer than the generation that names it.
+- A prune keeps the newest generations and each holder that their
+  manifests name. So a restore of a kept generation finds every file.
+- A restore takes the greatest (epoch, time). The tombstone rules are the
+  rules of `fleet_replica_tombstones.rs`: after a delete, a restore is
+  refused. A purge at or after the newest generation removes every holder,
+  and keeps a newer database of the same key.
+
+The unit tests in `generations.rs` and `db/fleet/generations_tests.rs`, the
+kit checks `fleet-fenced-ship` and `fleet-unchanged-files`, and the takeover
+test in `tests/sqlite_fleet/generations.rs` check the runtime. The TLA+ spec
+needs no change. A list and a put are still two steps. So the witness
+`StaleGenerationLandsLate` still holds. The (epoch, time) order is still
+necessary.
+
+## Fleet replica tombstones
+
+`fleet_replica_tombstones.rs` models the replica tombstones of a SQLite fleet
+(the rules in `autumn/src/db/fleet_tombstones.rs`, issue #3235). Verify it
+with:
+
+```sh
+verus verification/fleet_replica_tombstones.rs
+```
+
+It proves these properties:
+
+- A tombstone row blocks `restore_missing`. A marker blocks each generation
+  that is not newer than the delete. A newer generation restores.
+- A failed purge keeps the row, waits before the next try, and the wait is
+  capped.
+- Only a purge, a restore that worked, an allowed re-create that purged, a
+  refused delete of its own pending row, or a confirmed row next to a live
+  file (`Stale`) drops the row. A second delete of a missing file keeps the
+  row. A delete of a present file resets a stale row.
+- A confirm never makes a row: after a re-create or a restore took the
+  key, no cutoff covers the new database.
+- Two deletes at once: the one that found no file keeps the pending row of
+  the one that removed the file. Without the path lock, the second delete
+  can drop that row (issue #3516).
+- A create on demand never drops a pending row, and never runs before the
+  retention ends. Only `provision` ends the window early (issue #3516).
+- A row is never due before the retention ends, and a pending row is never
+  due. The cutoff is at or after both the removal and the newest generation.
+- A purge never deletes a generation newer than the cutoff. With no newer
+  generation, it deletes everything.
+
+The proptest `the_rules_keep_the_model_properties` checks the same rules on
+the runtime functions.
+
+## Replica bound
+
+`replicated_through.rs` models the bound `replicated_through` of one
+replicator (`Replicator::tick_inner` and `settled_tail` in
+`autumn/src/replication/engine.rs`, and `ReplicationStatus` in
+`autumn/src/replication/status.rs`). Verify it with:
+
+```sh
+verus verification/replicated_through.rs
+```
+
+It proves these properties:
+
+- Each commit at or before the bound is in the replica. This holds at the
+  start and after every step: a commit, an upload, a tick, a new
+  generation, a new epoch and a fence.
+- A tick reads the clock before it measures the tail. It stamps one step
+  below that reading. It drops a bound at or above the reading.
+- In one generation, a tick never moves the bound back. A tick with an
+  unshipped commit does not advance it.
+- A fenced replica claims nothing. Only a new epoch ends the fence.
+- The old order (measure, then read the clock) can cover a commit that is
+  not shipped, even one step below the reading.
+
+The property test `a_restore_holds_every_write_at_or_before_the_bound` in
+`autumn/tests/integration/sqlite_replicated_through.rs` checks the runtime.
 
 ## Billing plan gate
 
@@ -172,6 +354,25 @@ entries for tenant ids from requests.
 relay. Its `ceiling_ms` uses the runtime's shift and saturating multiply, and
 Verus proves that it equals `min(cap, base * 2^retry)`. It also proves that
 the ceiling never decreases, and that no jitter overflows.
+
+## Radio choice ids
+
+`radio_choice_id.rs` models `selector_safe` in `autumn/src/a11y.rs`
+(issue #2666). Verify it with:
+
+```sh
+verus verification/radio_choice_id.rs
+```
+
+It proves that the first part of a choice id starts with a letter or `_`, so
+`#id` is a valid CSS selector. It also proves that two different parts never
+give the same result, so the rule adds no collision of its own. It does not
+prove that the joined id is unique. These tests check that:
+`no_two_groups_share_a_choice_id` (exhaustive) and
+`groups_never_share_a_choice_id` (property test). The proptests
+`every_choice_id_is_a_css_identifier`, `the_selector_safe_rule_is_injective`
+and `an_escaped_part_never_meets_its_underscored_twin` check the runtime
+against the same rules.
 
 ## Kani proofs
 
@@ -299,3 +500,133 @@ autumn-protocol-models` runs `tests/tla_checks.rs`, with no Java: it fails
 when a Stateright seeded bug has no line in `checks.txt`, or when a spec has
 no correct or seeded check. When a protocol changes, change its Stateright
 model and its TLA+ spec in the same PR.
+
+## Form decode retry
+
+`form_decode.rs` models one step of the retry loop in
+`decode_pairs_dropping_blank_optional_fields` (`autumn/src/form.rs`, issue
+#3394, ADR 0022). Verify it with:
+
+```sh
+verus verification/form_decode.rs
+```
+
+It proves these properties:
+
+- A repeated key on a single-value field always stops the loop (a 422). The
+  loop never removes one copy and accepts the other.
+- A field retry removes exactly one pair, and that pair is blank. The other
+  pairs stay in order.
+- A sequence retry removes the blank pairs of one key. Every other pair stays.
+- Each retry makes the input shorter, so the loop stops.
+
+The unit tests and the proptest in `form.rs` check the runtime index choice.
+
+## Fleet lake
+
+`fleet_lake.rs` models the fleet lake (`autumn/src/db/fleet_lake.rs`, issue
+#3236, ADR 0032). Verify it with:
+
+```sh
+verus verification/fleet_lake.rs
+```
+
+It proves these properties:
+
+- A tombstone row, or a marker that covers the generation, keeps a tenant
+  out of the lake. A tenant with no replica stays out too.
+- When the replicas are caught up, the lake row count equals the row count
+  of the live databases on the volume. This is the AC test.
+- The total does not depend on the order in which tenants are loaded.
+- A file in a fresh scratch directory is never under the fleet root when the
+  scratch parent is not under it.
+- A `LakeSink` that keeps its lake between loads holds the same rows as a
+  new lake, when it holds the right rows for each state and no member
+  fails. The model assumes that core asks `has` only for an included
+  member, and that the sink drops each member it did not get. Then a
+  deleted member adds no rows.
+
+It does not model the restore, the schema union or the query. Tests cover
+them.
+
+## Role presets
+
+`role_presets.rs` models `RolePreset::capabilities` and the capability
+checks of `RolePreset::validate` in `autumn/src/config.rs` (issue #3543, ADR
+0035). It does not model the name, `pin` and `workers` checks.
+Verify it with:
+
+```sh
+verus verification/role_presets.rs
+```
+
+It proves that a preset never runs a capability that its base does not run,
+that the base decides `serves_http`, that a preset with no overrides is its
+base, and that a valid preset gets each override it sets. The exhaustive
+test `preset_capabilities_match_the_model` in `autumn/src/config.rs` checks
+the runtime against the same rules.
+
+
+## Route groups
+
+`route_groups.rs` models the `mount` rules of `RolePreset` and `Role`, the
+route filter and the fleet drift check (issue #3544, ADR 0036). A group is an
+integer. Verify it with:
+
+```sh
+verus verification/route_groups.rs
+```
+
+It proves that a role without `mount` mounts every group, that a role with no
+HTTP mounts no group, that a valid `mount` list is exact, that a framework
+route is served on every HTTP role, and that a group another fleet role mounts
+is not drift. The test `mount_matches_the_model` in `autumn/src/config.rs`
+checks the runtime against the same rules.
+
+## Role manifests
+
+`role_manifests.rs` models the role set of `autumn release init` and the
+`[[deploy.groups]]` checks (issue #3547, ADR 0043). A role name is an
+integer. Verify it with:
+
+```sh
+verus verification/role_manifests.rs
+```
+
+It proves that each role in the default set is declared and has a unique
+name, that every role gets a workload and only an HTTP role gets a Service,
+that a fleet host never gets two roles, and that a fleet that passes
+preflight on a local jobs backend runs only `combined`. The test
+`manifest_roles_match_the_model` in `autumn-cli/src/release_roles.rs` checks
+the runtime against the same rules.
+
+## Background tasks
+
+`background_tasks.rs` models `background::place` in
+`autumn/src/background.rs`: whether a process starts a background task
+(issue #3545, ADR 0039). The role facts are two booleans for the task
+capability: the base runs it, and the role runs it. Verify it with:
+
+```sh
+verus verification/background_tasks.rs
+```
+
+It proves that a task with no explicit switch runs only where the base runs
+its capability, that an explicit switch wins, that a task with no override
+follows its capability, that a valid plugin override gets its value, and that
+a task with queues runs only where the role runs job workers and its pin
+admits one of the queues. The test
+`place_matches_the_model` in `autumn/src/background.rs` checks the runtime
+against the same rules.
+
+## Avro integer widths
+
+`avro_integer_width.rs` models how `autumn contracts export --avro` maps a
+Rust integer to an Avro `int` or `long`
+(`autumn-cli/src/contracts/avro/mod.rs`). It proves that the mapping never
+narrows, gives the smallest type, and refuses only when no Avro integer holds
+the range. Verify it with:
+
+```sh
+verus verification/avro_integer_width.rs
+```

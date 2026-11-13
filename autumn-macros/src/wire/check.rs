@@ -145,6 +145,7 @@ mod tests {
             ty: "String".to_owned(),
             required,
             aliases: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -161,12 +162,14 @@ mod tests {
                 path: "/items".to_owned(),
                 request_type: "NewItem".to_owned(),
                 response_type: "Item".to_owned(),
+                ..EndpointDescriptor::default()
             },
             request: WireTypeDescriptor {
                 name: "NewItem".to_owned(),
                 serialized: vec![field("name", true), field("price_cents", true)],
                 deserialized: vec![field("name", true), field("price_cents", true)],
                 closed: false,
+                ..Default::default()
             },
             response: WireTypeDescriptor {
                 name: "Item".to_owned(),
@@ -181,6 +184,7 @@ mod tests {
                     field("price_cents", true),
                 ],
                 closed: false,
+                ..Default::default()
             },
         }
     }

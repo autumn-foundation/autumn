@@ -56,7 +56,8 @@ const DEFAULT_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Default in-flight lock TTL. It applies only after a crash, a cancelled
 /// request, or a failed record write. It is separate from the response TTL.
-pub const DEFAULT_IN_FLIGHT_TTL: Duration = Duration::from_secs(60);
+pub const DEFAULT_IN_FLIGHT_TTL: Duration =
+    Duration::from_secs(crate::config::DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS);
 
 const fn is_mutating_method(method: &Method) -> bool {
     matches!(
@@ -76,17 +77,6 @@ fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
-}
-
 fn principal_scope_digest(session_id: Option<&str>) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"authorization:");
@@ -94,7 +84,7 @@ fn principal_scope_digest(session_id: Option<&str>) -> String {
     if let Some(session_id) = session_id {
         hasher.update(session_id.as_bytes());
     }
-    hex_lower(hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
@@ -199,7 +189,7 @@ fn bearer_scope_for_parts(parts: &axum::http::request::Parts) -> Option<BearerSc
         return Some(BearerScope::Verified(principal.0.clone()));
     }
     let header = parts.headers.get(axum::http::header::AUTHORIZATION)?;
-    Some(BearerScope::Header(hex_lower(sha2::Sha256::digest(
+    Some(BearerScope::Header(hex::encode(sha2::Sha256::digest(
         header.as_bytes(),
     ))))
 }
@@ -264,7 +254,7 @@ fn build_storage_key(
         push_storage_key_component(&mut hasher, "tenant", tenant.as_bytes());
     }
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
-    format!("v2:{}", hex_lower(hasher.finalize()))
+    format!("v2:{}", hex::encode(hasher.finalize()))
 }
 
 async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
@@ -543,7 +533,7 @@ pub trait IdempotencyStore: std::any::Any + Send + Sync {
 
     /// The response retention for [`IdempotencyLayer::new`]. Default: 24 hours.
     fn default_ttl(&self) -> Duration {
-        Duration::from_secs(86_400)
+        Duration::from_hours(24)
     }
 }
 
@@ -824,7 +814,7 @@ impl StoredEntry {
                 metadata: entry.metadata,
             },
             body_hash: entry.body_hash,
-            expires_at: saturating_deadline(Duration::from_secs(86_400)),
+            expires_at: saturating_deadline(Duration::from_hours(24)),
         })
     }
 }
@@ -1161,7 +1151,9 @@ where
 {
     type Response = Response<Body>;
     type Error = std::convert::Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    /// The replay response, or the inner future. No box (issue #2830).
+    type Future =
+        futures::future::Either<std::future::Ready<Result<Self::Response, Self::Error>>, S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -1169,19 +1161,11 @@ where
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         if let Some(replay) = req.extensions_mut().remove::<IdempotencyReplayResponse>() {
-            return Box::pin(async move { Ok(replay.into_response()) });
+            return futures::future::Either::Left(std::future::ready(Ok(replay.into_response())));
         }
-
-        // The overwhelming majority of requests carry no replay marker (only
-        // the capsule replay driver ever sets one), so this runs for nearly
-        // every request through this layer. Nothing here needs `self.inner`
-        // cloned into an owned value first: `self.inner.call(req)` can be
-        // boxed directly instead of cloning `self.inner` (a
-        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
-        // impl allocates a fresh box) purely to move the clone into an
-        // `async move` block that immediately `.await`s it and does nothing
-        // else.
-        Box::pin(self.inner.call(req))
+        // Almost no request has a replay marker. Only the capsule replay
+        // driver sets one.
+        futures::future::Either::Right(self.inner.call(req))
     }
 }
 
@@ -1674,6 +1658,15 @@ impl DeferredIdempotencyCommit {
             state.lock.hold_until_ttl();
         }
     }
+}
+
+/// `true` when `response` has a deferred commit that the session layer must
+/// finalize.
+pub(crate) fn has_deferred_session_commit(response: &Response<Body>) -> bool {
+    response
+        .extensions()
+        .get::<DeferredIdempotencyCommit>()
+        .is_some()
 }
 
 /// Take the deferred commit and return the future that stores the record with
@@ -2836,17 +2829,6 @@ mod tests {
         crate::session::Session::new_for_test(session_id.to_owned(), data)
     }
 
-    fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().fold(
-            String::with_capacity(bytes.as_ref().len() * 2),
-            |mut out, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{byte:02x}");
-                out
-            },
-        )
-    }
-
     fn expected_principal_digest(session_id: Option<&str>) -> String {
         use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
@@ -2855,7 +2837,7 @@ mod tests {
         if let Some(session_id) = session_id {
             hasher.update(session_id.as_bytes());
         }
-        hex_lower(hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     fn expected_storage_key(
@@ -2872,7 +2854,7 @@ mod tests {
         push_storage_key_component(&mut hasher, "scope-header-count", b"0");
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
-        format!("v2:{}", hex_lower(hasher.finalize()))
+        format!("v2:{}", hex::encode(hasher.finalize()))
     }
 
     /// The key a request with a raw `Authorization` header and no session
@@ -2885,7 +2867,7 @@ mod tests {
     ) -> String {
         use sha2::Digest as _;
         let principal = expected_principal_digest(None);
-        let digest = hex_lower(sha2::Sha256::digest(authorization.as_bytes()));
+        let digest = hex::encode(sha2::Sha256::digest(authorization.as_bytes()));
         let mut hasher = sha2::Sha256::new();
         push_storage_key_component(&mut hasher, "method", method.as_bytes());
         push_storage_key_component(&mut hasher, "target", path.as_bytes());
@@ -2893,12 +2875,12 @@ mod tests {
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "authorization", digest.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
-        format!("v2:{}", hex_lower(hasher.finalize()))
+        format!("v2:{}", hex::encode(hasher.finalize()))
     }
 
     fn header_scope(authorization: &str) -> BearerScope {
         use sha2::Digest as _;
-        BearerScope::Header(hex_lower(sha2::Sha256::digest(authorization.as_bytes())))
+        BearerScope::Header(hex::encode(sha2::Sha256::digest(authorization.as_bytes())))
     }
 
     /// Two token clients with no session must not share a cache slot. Before
@@ -3901,5 +3883,20 @@ mod tests {
             .expect("infallible");
         assert_eq!(retry.status(), StatusCode::CONFLICT);
         assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Characterization for the Echo clone class: `build_storage_key` and
+    /// `principal_scope_digest` render their digests through this file's own
+    /// `hex_lower`, one of six byte-identical copies across the crate (this
+    /// file's test module carries a seventh, test-local copy). Pinned before
+    /// every copy is replaced by the `hex` crate (already a dependency,
+    /// already used this way in ~20 other places in this crate) at its call
+    /// site.
+    #[test]
+    fn build_storage_key_is_pinned_hex() {
+        assert_eq!(
+            build_storage_key("pay-once", "POST", "/payments", None, None, None),
+            "v2:e776147e12affe592b79542ee766f4171dc7b7a7e50cf234424fc32fa0b3d1ce",
+        );
     }
 }

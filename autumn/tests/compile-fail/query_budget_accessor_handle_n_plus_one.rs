@@ -11,7 +11,7 @@
 //! handle set from the signature. If this still fails to build, the walker's
 //! accessor-call check (`HANDLE_ACCESSORS` — `db`, `repo`, `repository`,
 //! `pool`, `conn`, `connection`) is receiver-type-agnostic, exactly as
-//! `autumn-macros/src/query_budget.rs`'s `expr_is_handle` reads.
+//! `autumn-macros-support/src/query_budget.rs`'s `expr_is_handle` reads.
 
 use autumn_web::query_budget;
 

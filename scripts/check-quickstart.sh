@@ -372,7 +372,7 @@ phase_install() {
   step_summary "Installs the README-pinned \`autumn-cli\` from crates.io (or the \`cli-version\` dispatch input) and runs the README quickstart verbatim."
   step_summary "This validates the published crates against the README at this commit — it does **not** exercise the pushed code (the workspace \`[patch.crates-io]\` override means no other CI job sees what a new user installs)."
   step_summary ""
-  step_summary "Toolchain: \`$(rustc --version 2>/dev/null | head -n 1 || echo unknown)\` — the \`stable\` leg is the canonical funnel metric; the MSRV leg guards the README's documented \`Rust 1.88.0+\` floor."
+  step_summary "Toolchain: \`$(rustc --version 2>/dev/null | head -n 1 || echo unknown)\` — the \`stable\` leg is the canonical funnel metric; the MSRV leg guards the README's documented \`Rust $(awk -F'"' '/^rust-version/ {print $2; exit}' "$repo_root/Cargo.toml" 2>/dev/null || echo '<MSRV>')+\` floor."
   step_summary ""
   step_summary "| Phase | Result | Duration | Notes |"
   step_summary "|---|---|---|---|"

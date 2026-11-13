@@ -11,11 +11,19 @@ readme = "../README.md"
 keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
+[features]
+# The `#[query_budget]` and `#[agent_operable]` analysers. Only `autumn-macros`
+# turns this on. `autumn-cli` links this crate for `wire` alone. Cargo resolves
+# host and target features apart, so that copy compiles without the analysers.
+analysers = []
+
 [dependencies]
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
 proc-macro-crate.workspace = true
+# The wire descriptor types. The macros write them as JSON; the CLI reads them.
+serde = { workspace = true }
 
 [lints]
 workspace = true
@@ -24,3 +32,4 @@ workspace = true
 # Pinned to match the exact version every other crate in this workspace
 # already depends on (autumn, autumn-cli), so Cargo resolves one shared copy.
 temp-env = "0.3.6"
+serde_json = { workspace = true }

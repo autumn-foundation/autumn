@@ -1,0 +1,11 @@
+                                 q                                 | buffers 
+-------------------------------------------------------------------+---------
+ select count(id) from posts where published                       |    1226
+ select sum(length(body)) from posts where published               |    1226
+ select sum(length(substr(body,$1,$2))) from posts where published |  381254
+ select sum(octet_length(body)) from posts where published         |    1226
+(4 rows)
+
+SQL_ASCII
+x|
+pglz

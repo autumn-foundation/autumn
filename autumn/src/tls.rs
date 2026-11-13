@@ -1185,6 +1185,14 @@ pub fn leaf_not_after_from_pem(chain_pem: &[u8]) -> Result<i64, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The `notAfter` (Unix seconds) of a DER-encoded leaf certificate, if it
+/// parses.
+pub(crate) fn leaf_not_after_from_der(leaf_der: &[u8]) -> Option<i64> {
+    leaf_validity_unix(Path::new("<memory>"), &CertificateDer::from(leaf_der))
+        .ok()
+        .map(|(_, not_after)| not_after)
+}
+
 /// Wall-clock seconds since the epoch — the reference instant certificate
 /// validity is judged against, and the one deliberate real-time read in this
 /// module.

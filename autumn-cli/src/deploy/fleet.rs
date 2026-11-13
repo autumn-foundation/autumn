@@ -226,7 +226,8 @@ pub(crate) fn plan_fleet(
 /// `unit` and `slots` are that host's own. The driver builds one of these per host
 /// and hands it straight to [`host_ops`].
 pub(crate) struct HostOpsInput<'a, P: ProxyController> {
-    /// This host's resolved config (differs from its siblings only in `host`).
+    /// This host's resolved config (differs from its siblings only in `host` and
+    /// its group `role`).
     pub(crate) cfg: &'a ResolvedDeployConfig,
     /// The proxy controller (per-host kamal-proxy, not a fleet load balancer).
     pub(crate) proxy: &'a P,
@@ -322,6 +323,26 @@ pub(crate) fn fleet_plan_lines(hosts: &[String]) -> Vec<String> {
          every host, not a host named here."
             .to_owned(),
     );
+    lines
+}
+
+/// The `deploy plan` role section: each host and its `[[deploy.groups]]`
+/// role. Empty when no host has a group role.
+pub(crate) fn fleet_role_lines(hosts: &[super::ResolvedDeployConfig]) -> Vec<String> {
+    if hosts.iter().all(|h| h.role.is_none()) {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        "Roles (`[[deploy.groups]]`; each env file sets AUTUMN_ROLE):".to_owned(),
+    ];
+    for host in hosts {
+        lines.push(format!(
+            "  {}: {}",
+            host.host.as_deref().unwrap_or("?"),
+            host.role.as_deref().unwrap_or("the role in autumn.toml")
+        ));
+    }
     lines
 }
 
@@ -2842,7 +2863,7 @@ mod tests {
 
     #[test]
     fn the_rollout_header_drops_the_skip_clause_for_a_one_host_plan() {
-        // #1621 review finding 4. A `--only`-narrowed repair reaches this renderer
+        // #1621. A `--only`-narrowed repair reaches this renderer
         // with a ONE-host plan (`single` is false whenever the config declares more
         // than one host), so nobody is left to "skip it": `skipped.join(", ")` is
         // empty and the sentence used to render as "…fleet-wide;  skip it)" — a
@@ -2907,7 +2928,7 @@ mod tests {
 
     #[test]
     fn the_completion_line_is_honest_about_a_narrowed_run() {
-        // #1621 review finding 2. `--only` narrows the plan, the outcomes AND the
+        // #1621. `--only` narrows the plan, the outcomes AND the
         // state table, so `total` is the SELECTED count: "all 1 hosts serving R2"
         // on a 3-host config reads as a full-fleet success while web-a/web-c are
         // still on the previous release. The closing line must say it was narrowed

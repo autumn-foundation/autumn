@@ -26,3 +26,28 @@ pub use std::sync::{
     Mutex, MutexGuard,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+
+/// `try_update` for loom's atomics. loom 0.7 has only `fetch_update`, which
+/// does the same thing. The std and Shuttle atomics have `try_update`.
+#[cfg(all(loom_models, not(shuttle_models)))]
+pub trait TryUpdate<T> {
+    /// Apply `f` to the value in one atomic step. See `fetch_update`.
+    fn try_update(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        f: impl FnMut(T) -> Option<T>,
+    ) -> Result<T, T>;
+}
+
+#[cfg(all(loom_models, not(shuttle_models)))]
+impl TryUpdate<u64> for AtomicU64 {
+    fn try_update(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        f: impl FnMut(u64) -> Option<u64>,
+    ) -> Result<u64, u64> {
+        self.fetch_update(set_order, fetch_order, f)
+    }
+}

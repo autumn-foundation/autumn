@@ -25,8 +25,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web        = { version = "0.8", features = ["redis"] }
-autumn-cache-redis = "0.8"
+autumn-web        = { version = "0.10", features = ["redis"] }
+autumn-cache-redis = "0.10"
 ```
 
 ## Quick Start

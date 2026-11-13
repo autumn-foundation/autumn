@@ -129,16 +129,19 @@ pub fn normalize_hostname(raw: &str) -> Result<String, String> {
     Ok(host)
 }
 
-/// Is `hostname` an apex (registrable) name, which cannot carry a CNAME?
+/// Returns true if `hostname` is the top name of a DNS zone. Such a name
+/// cannot have a CNAME.
 ///
-/// Approximated as "exactly two labels". A public-suffix list would be exact
-/// (`co.uk` needs three), but the cost of being wrong is only which record type
-/// the instructions suggest — and [`grade_dns_verification`] accepts either
-/// shape, so a tenant who follows a CNAME suggestion on a three-label apex and
-/// gets a DNS-provider error can still use A/AAAA and verify.
+/// Uses the Public Suffix List (ICANN and private sections), so
+/// `clientco.co.uk` is an apex (#2643, ADR 0026). A public suffix itself is
+/// also an apex. A TLD that is not on the list uses the two-label rule.
+///
+/// This function does not find a delegated sub-zone. [`grade_dns_verification`]
+/// accepts A/AAAA records too, so such a tenant can still verify.
 #[must_use]
 pub fn is_apex(hostname: &str) -> bool {
-    hostname.split('.').filter(|l| !l.is_empty()).count() <= 2
+    let host = hostname.trim_end_matches('.').to_ascii_lowercase();
+    psl::domain(host.as_bytes()).is_none_or(|domain| domain.as_bytes() == host.as_bytes())
 }
 
 // ── Tenant-facing DNS instructions ───────────────────────────────────────
@@ -314,7 +317,7 @@ pub fn verification_record_name(hostname: &str) -> String {
 fn mint_verification_token() -> io::Result<String> {
     use std::fmt::Write as _;
     let mut bytes = [0_u8; 16];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|e| io::Error::other(format!("the OS random source failed: {e}")))?;
     let mut out = String::with_capacity(32);
     for byte in bytes {
@@ -667,6 +670,16 @@ impl CustomDomain {
 
 // ── Persistence ──────────────────────────────────────────────────────────
 
+/// The result of reading a store: the records that loaded, and the ones that
+/// did not.
+#[derive(Debug, Default)]
+pub struct StoreLoad {
+    /// Records that decoded.
+    pub records: Vec<CustomDomain>,
+    /// Where each record that did not decode is kept (a file path).
+    pub skipped: Vec<String>,
+}
+
 /// Durable storage for the domain registry.
 ///
 /// Records must survive a restart: a lost registry silently stops routing
@@ -674,17 +687,96 @@ impl CustomDomain {
 pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
     /// Every stored record. Called once at boot to hydrate the index.
     fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>>;
+
+    /// Every record that loads, and the records that do not.
+    ///
+    /// A store that skips records MUST override this. The default trusts
+    /// [`load_all`](Self::load_all) and reports nothing skipped. A store that
+    /// wraps another store MUST forward this method.
+    fn load_report(&self) -> StoreFuture<'_, io::Result<StoreLoad>> {
+        let all = self.load_all();
+        Box::pin(async move {
+            Ok(StoreLoad {
+                records: all.await?,
+                skipped: Vec::new(),
+            })
+        })
+    }
     /// Insert or replace one record.
     fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, io::Result<()>>;
     /// Delete one record. Deleting an absent record succeeds.
     fn delete<'a>(&'a self, hostname: &'a str) -> StoreFuture<'a, io::Result<()>>;
+
+    /// The global attempt ledger: the instant of each recent ACME order.
+    ///
+    /// The ledger needs no domain record. An order for an offboarded domain
+    /// still counts after a restart. Called once at boot.
+    ///
+    /// Override this, [`append_attempt`](Self::append_attempt) and
+    /// [`merge_attempts`](Self::merge_attempts) together or not at all. The
+    /// defaults keep nothing, so offboarded orders are lost on restart. A
+    /// ledger is for one process. Replicas do not share it.
+    fn load_attempts(&self) -> StoreFuture<'_, io::Result<Vec<i64>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Add an order at `at_unix` to the ledger. Drop entries that are not in
+    /// the global window ending at `at_unix`. The default does nothing.
+    fn append_attempt(&self, at_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        let _ = at_unix;
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Add orders that the ledger lacks. Used at boot to copy orders from the
+    /// domain records, so an upgrade loses none. The ledger keeps the larger
+    /// count at each instant. Entries outside the global window that ends at
+    /// `now_unix` are dropped. The default does nothing.
+    fn merge_attempts(&self, attempts: Vec<i64>, now_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        let _ = (attempts, now_unix);
+        Box::pin(async { Ok(()) })
+    }
 }
+
+/// Keep the entries in the global window that ends at `now_unix`.
+/// An entry in the future is a clock error. Drop it, or it never expires.
+fn prune_ledger(ledger: &mut Vec<i64>, now_unix: i64) {
+    let cutoff = now_unix.saturating_sub(GLOBAL_WINDOW_SECS);
+    ledger.retain(|at| *at > cutoff && *at <= now_unix);
+}
+
+/// Raise the count at each instant in `ledger` to its count in `extra`.
+/// Prune first. Return whether the ledger changed.
+fn merge_into_ledger(ledger: &mut Vec<i64>, extra: &[i64], now_unix: i64) -> bool {
+    let before = ledger.len();
+    prune_ledger(ledger, now_unix);
+    let mut changed = ledger.len() != before;
+    let mut want: HashMap<i64, usize> = HashMap::new();
+    for at in extra {
+        *want.entry(*at).or_default() += 1;
+    }
+    let mut have: HashMap<i64, usize> = HashMap::new();
+    for at in ledger.iter() {
+        *have.entry(*at).or_default() += 1;
+    }
+    for (at, n) in want {
+        let missing = n.saturating_sub(have.get(&at).copied().unwrap_or(0));
+        if missing > 0 && at > now_unix.saturating_sub(GLOBAL_WINDOW_SECS) && at <= now_unix {
+            ledger.extend(std::iter::repeat_n(at, missing));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Ledger file name. Its extension is not `json`, so `load_all` skips it.
+const LEDGER_FILE: &str = "attempts.ledger";
 
 /// In-memory [`CustomDomainStore`], for tests and for a deployment that
 /// re-registers its domains from the app's own database at boot.
 #[derive(Debug, Default)]
 pub struct MemoryCustomDomainStore {
     records: RwLock<HashMap<String, CustomDomain>>,
+    ledger: RwLock<Vec<i64>>,
 }
 
 impl MemoryCustomDomainStore {
@@ -720,6 +812,27 @@ impl CustomDomainStore for MemoryCustomDomainStore {
             Ok(())
         })
     }
+
+    fn load_attempts(&self) -> StoreFuture<'_, io::Result<Vec<i64>>> {
+        Box::pin(async move { Ok(read_lock(&self.ledger).clone()) })
+    }
+
+    fn merge_attempts(&self, attempts: Vec<i64>, now_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        Box::pin(async move {
+            merge_into_ledger(&mut write_lock(&self.ledger), &attempts, now_unix);
+            Ok(())
+        })
+    }
+
+    fn append_attempt(&self, at_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        Box::pin(async move {
+            let mut ledger = write_lock(&self.ledger);
+            prune_ledger(&mut ledger, at_unix);
+            ledger.push(at_unix);
+            drop(ledger);
+            Ok(())
+        })
+    }
 }
 
 /// Filesystem [`CustomDomainStore`]: one `0600` JSON file per domain under a
@@ -731,13 +844,18 @@ impl CustomDomainStore for MemoryCustomDomainStore {
 #[derive(Debug, Clone)]
 pub struct FsCustomDomainStore {
     dir: PathBuf,
+    /// Serialises ledger read-modify-write cycles.
+    ledger_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FsCustomDomainStore {
     /// A store rooted at `dir`.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            ledger_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// The file holding `hostname`'s record.
@@ -763,13 +881,18 @@ fn file_stem(hostname: &str) -> String {
 
 impl CustomDomainStore for FsCustomDomainStore {
     fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>> {
+        let report = self.load_report();
+        Box::pin(async move { Ok(report.await?.records) })
+    }
+
+    fn load_report(&self) -> StoreFuture<'_, io::Result<StoreLoad>> {
         Box::pin(async move {
             let mut entries = match tokio::fs::read_dir(&self.dir).await {
                 Ok(entries) => entries,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StoreLoad::default()),
                 Err(e) => return Err(e),
             };
-            let mut out = Vec::new();
+            let mut out = StoreLoad::default();
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 if path.extension().is_none_or(|ext| ext != "json") {
@@ -777,14 +900,18 @@ impl CustomDomainStore for FsCustomDomainStore {
                 }
                 let bytes = tokio::fs::read(&path).await?;
                 match serde_json::from_slice::<CustomDomain>(&bytes) {
-                    Ok(domain) => out.push(domain),
-                    // A corrupt record must not stop the other 999 domains from
-                    // being served; it is logged and skipped, and the app can
-                    // re-register the hostname to repair it.
-                    Err(e) => tracing::warn!(
-                        path = %path.display(),
-                        "skipping unreadable custom-domain record: {e}"
-                    ),
+                    Ok(domain) => out.records.push(domain),
+                    // One corrupt record must not stop the other 999 domains
+                    // from serving. The caller learns of it, and the registry
+                    // then refuses new registrations (#2654).
+                    Err(e) => {
+                        tracing::error!(
+                            path = %path.display(),
+                            "custom-domain record will not load: {e}; restore or delete the file, \
+                             then restart"
+                        );
+                        out.skipped.push(path.display().to_string());
+                    }
                 }
             }
             Ok(out)
@@ -813,6 +940,71 @@ impl CustomDomainStore for FsCustomDomainStore {
                 Err(e) => Err(e),
             }
         })
+    }
+
+    fn load_attempts(&self) -> StoreFuture<'_, io::Result<Vec<i64>>> {
+        Box::pin(async move { read_ledger(&self.dir.join(LEDGER_FILE)).await })
+    }
+
+    fn append_attempt(&self, at_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        self.update_ledger(move |ledger| {
+            prune_ledger(ledger, at_unix);
+            ledger.push(at_unix);
+            true
+        })
+    }
+
+    fn merge_attempts(&self, attempts: Vec<i64>, now_unix: i64) -> StoreFuture<'_, io::Result<()>> {
+        self.update_ledger(move |ledger| merge_into_ledger(ledger, &attempts, now_unix))
+    }
+}
+
+impl FsCustomDomainStore {
+    /// Read the ledger, change it, and write it back if `change` says so.
+    /// One lock covers the whole cycle.
+    fn update_ledger(
+        &self,
+        change: impl FnOnce(&mut Vec<i64>) -> bool + Send + 'static,
+    ) -> StoreFuture<'_, io::Result<()>> {
+        let dir = self.dir.clone();
+        let path = self.dir.join(LEDGER_FILE);
+        let lock = Arc::clone(&self.ledger_lock);
+        Box::pin(async move {
+            let _guard = lock.lock().await;
+            let (mut ledger, corrupt) = read_ledger_checked(&path).await?;
+            if corrupt {
+                // Keep the bad file for the operator. Do not erase it.
+                let _ = tokio::fs::rename(&path, path.with_extension("ledger.corrupt")).await;
+            }
+            if !change(&mut ledger) {
+                return Ok(());
+            }
+            let bytes = serde_json::to_vec(&ledger)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            crate::fs_atomic::blocking(move || {
+                crate::fs_atomic::ensure_owner_only_dir(&dir)?;
+                crate::fs_atomic::write_owner_only(&path, &bytes)
+            })
+            .await
+        })
+    }
+}
+
+/// Read the ledger file. A missing or corrupt file reads as empty.
+async fn read_ledger(path: &std::path::Path) -> io::Result<Vec<i64>> {
+    let (ledger, corrupt) = read_ledger_checked(path).await?;
+    if corrupt {
+        tracing::warn!(path = %path.display(), "ignoring an unreadable attempt ledger");
+    }
+    Ok(ledger)
+}
+
+/// Read the ledger file. Also say whether the file was corrupt.
+async fn read_ledger_checked(path: &std::path::Path) -> io::Result<(Vec<i64>, bool)> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).map_or((Vec::new(), true), |l| (l, false))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Vec::new(), false)),
+        Err(e) => Err(e),
     }
 }
 
@@ -843,6 +1035,12 @@ pub enum RegisterError {
     /// The registry has not hydrated from its store, so it cannot tell whether
     /// another tenant already owns the hostname.
     NotReady,
+    /// The load skipped records it could not decode, so a hostname may belong
+    /// to a tenant whose record is among them.
+    Incomplete {
+        /// The files that did not load.
+        files: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for RegisterError {
@@ -867,6 +1065,13 @@ impl std::fmt::Display for RegisterError {
                 f,
                 "the custom-domain registry has not loaded, so a hostname cannot be connected \
                  without risking another tenant's record; check the server log for the load error"
+            ),
+            Self::Incomplete { files } => write!(
+                f,
+                "{} custom-domain record(s) will not load ({}), so a hostname cannot be connected \
+                 without risking another tenant's record; restore or delete them, then restart",
+                files.len(),
+                files.join(", ")
             ),
         }
     }
@@ -895,7 +1100,14 @@ pub struct CustomDomainRegistry {
     ///
     /// Keyed by hostname rather than global so a slow write for one tenant
     /// cannot stall every other tenant's.
+    ///
+    /// [`with_hostname`](Self::with_hostname) lends the gate to a caller, so
+    /// the certificate store and cache writes for the hostname join the
+    /// registry write in one critical section.
     writes: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held shared by each [`with_hostname`](Self::with_hostname) section.
+    /// Held alone by [`exclusive`](Self::exclusive).
+    sections: tokio::sync::RwLock<()>,
     max_domains: usize,
     /// Hostnames and wildcard patterns no tenant may claim.
     reserved: Vec<String>,
@@ -906,6 +1118,9 @@ pub struct CustomDomainRegistry {
     /// hydrate: that index knows nothing, and every tenant certificate would
     /// read as an orphan.
     hydrated: std::sync::atomic::AtomicBool,
+    /// Files the last load could not decode. While any exist, the index is
+    /// partial: it serves what loaded but does not accept new registrations.
+    skipped: RwLock<Vec<String>>,
 }
 
 impl CustomDomainRegistry {
@@ -916,9 +1131,11 @@ impl CustomDomainRegistry {
             store,
             index: RwLock::new(HashMap::new()),
             writes: tokio::sync::Mutex::new(HashMap::new()),
+            sections: tokio::sync::RwLock::new(()),
             max_domains,
             reserved: Vec::new(),
             hydrated: std::sync::atomic::AtomicBool::new(false),
+            skipped: RwLock::new(Vec::new()),
         }
     }
 
@@ -989,6 +1206,27 @@ impl CustomDomainRegistry {
         self.hydrated.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Whether `host` is loaded and belongs to `tenant`.
+    fn owned_by(&self, host: &str, tenant: &str) -> bool {
+        read_lock(&self.index)
+            .get(host)
+            .is_some_and(|d| d.tenant == tenant)
+    }
+
+    /// Whether the last load read every stored record.
+    ///
+    /// `false` before a load, and after a load that skipped a record.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.is_hydrated() && read_lock(&self.skipped).is_empty()
+    }
+
+    /// The files the last load could not decode.
+    #[must_use]
+    pub fn skipped_records(&self) -> Vec<String> {
+        read_lock(&self.skipped).clone()
+    }
+
     /// Replace the index with `records`, skipping reserved names. Returns how
     /// many loaded and which ones [need a token](CustomDomain::needs_verification_token).
     ///
@@ -1036,8 +1274,9 @@ impl CustomDomainRegistry {
     ///
     /// Propagates the store's read error.
     pub async fn load(&self) -> io::Result<usize> {
-        let records = self.store.load_all().await?;
-        let (loaded, legacy) = self.hydrate_index(records);
+        let report = self.store.load_report().await?;
+        *write_lock(&self.skipped) = report.skipped;
+        let (loaded, legacy) = self.hydrate_index(report.records);
         self.hydrated
             .store(true, std::sync::atomic::Ordering::Release);
         // A record stored before ownership tokens, and not yet serving, has
@@ -1070,8 +1309,9 @@ impl CustomDomainRegistry {
     ///
     /// Propagates the store's read error.
     pub async fn load_without_migration(&self) -> io::Result<usize> {
-        let records = self.store.load_all().await?;
-        let (loaded, _legacy) = self.hydrate_index(records);
+        let report = self.store.load_report().await?;
+        *write_lock(&self.skipped) = report.skipped;
+        let (loaded, _legacy) = self.hydrate_index(report.records);
         self.hydrated
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(loaded)
@@ -1079,6 +1319,9 @@ impl CustomDomainRegistry {
 
     /// Read every record straight from the store, bypassing the in-memory
     /// index.
+    ///
+    /// This read hides records that do not decode. Use
+    /// [`skipped_records`](Self::skipped_records) to see them.
     ///
     /// The index is only as fresh as this process's own writes. Another
     /// process sharing the store — a serving app while a one-shot
@@ -1091,6 +1334,33 @@ impl CustomDomainRegistry {
     /// Propagates the store's read error.
     pub async fn stored_records(&self) -> io::Result<Vec<CustomDomain>> {
         self.store.load_all().await
+    }
+
+    /// Every order in the store's global attempt ledger.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's read error.
+    pub async fn load_global_attempts(&self) -> io::Result<Vec<i64>> {
+        self.store.load_attempts().await
+    }
+
+    /// Copy orders into the store's global attempt ledger if it lacks them.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn merge_global_attempts(&self, attempts: Vec<i64>, now_unix: i64) -> io::Result<()> {
+        self.store.merge_attempts(attempts, now_unix).await
+    }
+
+    /// Add an order at `now_unix` to the store's global attempt ledger.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_global_attempt(&self, now_unix: i64) -> io::Result<()> {
+        self.store.append_attempt(now_unix).await
     }
 
     /// Give a record stored before ownership tokens a token, and send it back
@@ -1166,6 +1436,13 @@ impl CustomDomainRegistry {
         // for a load that succeeded.
         if !self.is_hydrated() {
             return Err(RegisterError::NotReady);
+        }
+        // A record that did not load may own this hostname. A save would
+        // overwrite its file. A loaded hostname of the same tenant is safe:
+        // it writes only its own file.
+        let skipped = self.skipped_records();
+        if !skipped.is_empty() && !self.owned_by(&host, tenant) {
+            return Err(RegisterError::Incomplete { files: skipped });
         }
 
         // Refuse a full registry BEFORE creating this hostname's write gate.
@@ -1250,6 +1527,53 @@ impl CustomDomainRegistry {
     /// per-call.
     const fn gate_high_water(&self) -> usize {
         self.max_domains.saturating_add(64)
+    }
+
+    /// Run `section` while holding `hostname`'s write gate.
+    ///
+    /// The gate covers registry writes. Use this to add the certificate store
+    /// and cache writes to the same critical section. Inside `section`, write
+    /// to the registry through the [`Gated`] handle.
+    ///
+    /// Returns `None`, without running `section`, for an unusable hostname.
+    ///
+    /// # Deadlocks
+    ///
+    /// A gate is not re-entrant. Inside `section`, do not call a method of this
+    /// registry that takes a gate (`register`, `remove`, `record_*`, or
+    /// another `with_hostname`). Use the [`Gated`] handle. Never hold two
+    /// sections at once: two tasks that take two hostnames in opposite order
+    /// deadlock. Do not wait on a CA or a network in `section`: it blocks
+    /// every writer for this hostname.
+    pub async fn with_hostname<T>(
+        &self,
+        hostname: &str,
+        section: impl AsyncFnOnce(&Gated<'_>) -> T,
+    ) -> Option<T> {
+        let host = normalize_hostname(hostname).ok()?;
+        // Lock order: `sections`, then the hostname gate. The gate-map lock is
+        // released before the gate is awaited.
+        let _shared = self.sections.read().await;
+        let gate = self.write_gate(&host).await;
+        let _write = gate.lock().await;
+        let gated = Gated {
+            registry: self,
+            host,
+        };
+        Some(section(&gated).await)
+    }
+
+    /// Run `section` while no [`with_hostname`](Self::with_hostname) section
+    /// runs, and none starts.
+    ///
+    /// For work that cannot name its hostname up front. The orphan prune finds
+    /// certificates by hashed id, so it cannot take the right gate.
+    /// Keep `section` short: every certificate write waits for it.
+    ///
+    /// Do not call `with_hostname` inside `section`.
+    pub async fn exclusive<T>(&self, section: impl AsyncFnOnce() -> T) -> T {
+        let _all = self.sections.write().await;
+        section().await
     }
 
     /// The record for `hostname` (normalising the lookup key), if registered.
@@ -1518,22 +1842,14 @@ impl CustomDomainRegistry {
     ) -> io::Result<bool> {
         self.mutate_if(
             hostname,
-            |d| tenant.is_none_or(|t| d.tenant == t && Self::is_orderable_state(d.status)),
-            |d| {
-                d.status = DomainStatus::Active;
-                if d.verified_at_unix.is_none() {
-                    d.verified_at_unix = Some(now_unix);
-                }
-                if d.activated_at_unix.is_none() {
-                    d.activated_at_unix = Some(now_unix);
-                }
-                d.cert_not_after_unix = Some(cert_not_after_unix);
-                d.failure_reason = None;
-                d.consecutive_failures = 0;
-                d.next_attempt_unix = None;
-            },
+            |d| Self::may_activate(d, tenant),
+            |d| apply_active_mutation(d, now_unix, cert_not_after_unix),
         )
         .await
+    }
+
+    fn may_activate(d: &CustomDomain, tenant: Option<&str>) -> bool {
+        tenant.is_none_or(|t| d.tenant == t && Self::is_orderable_state(d.status))
     }
 
     /// Record a failure with the reason to show and how long to wait.
@@ -1554,6 +1870,34 @@ impl CustomDomainRegistry {
         self.fail(hostname, |_| true, now_unix, reason, backoff_secs)
             .await
             .map(|_| ())
+    }
+
+    /// Record a failed verification, only while `tenant` still owns the
+    /// hostname and the record carries `token`. Returns whether it applied.
+    ///
+    /// Unlike [`record_failure_for_registration`](Self::record_failure_for_registration),
+    /// it accepts a `PendingDns` record: that is the state a verification runs in.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_verification_failure_for(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+        reason: impl Into<String>,
+        backoff_secs: i64,
+    ) -> io::Result<bool> {
+        self.fail(
+            hostname,
+            |d| d.tenant == tenant && d.verification_token.as_deref() == token,
+            now_unix,
+            reason,
+            backoff_secs,
+        )
+        .await
     }
 
     /// [`record_failure`](Self::record_failure), but only while `tenant` still
@@ -1771,11 +2115,29 @@ impl CustomDomainRegistry {
         // at the next restart.
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
-        if !read_lock(&self.index).get(&host).is_none_or(guard) {
+        self.remove_if_locked(&host, guard).await
+    }
+
+    /// [`remove_if`](Self::remove_if) for a caller that holds `host`'s gate.
+    async fn remove_if_locked(
+        &self,
+        host: &str,
+        guard: impl FnOnce(&CustomDomain) -> bool,
+    ) -> io::Result<bool> {
+        let (known, allowed) = {
+            let index = read_lock(&self.index);
+            (index.contains_key(host), index.get(host).is_none_or(guard))
+        };
+        if !allowed {
             return Ok(false);
         }
-        self.store.delete(&host).await?;
-        Ok(write_lock(&self.index).remove(&host).is_some())
+        // An unknown host may own a record that did not load. Its file is the
+        // only copy, so a delete would erase it (#2654).
+        if !known && !read_lock(&self.skipped).is_empty() {
+            return Ok(false);
+        }
+        self.store.delete(host).await?;
+        Ok(write_lock(&self.index).remove(host).is_some())
     }
 
     /// Offboard every domain a tenant owns. Returns how many were removed.
@@ -1853,6 +2215,16 @@ impl CustomDomainRegistry {
         };
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
+        self.mutate_if_locked(&host, guard, f).await
+    }
+
+    /// [`mutate_if`](Self::mutate_if) for a caller that holds `host`'s gate.
+    async fn mutate_if_locked(
+        &self,
+        host: &str,
+        guard: impl FnOnce(&CustomDomain) -> bool,
+        f: impl FnOnce(&mut CustomDomain),
+    ) -> io::Result<bool> {
         // Apply to a COPY, persist, and only then publish. Mutating the live
         // index first left a state the store had rejected routing and serving
         // anyway: `record_active` reported failure while the domain went on
@@ -1860,7 +2232,7 @@ impl CustomDomainRegistry {
         // restart with nothing to explain either half. Every writer for this
         // hostname holds this same gate, so nothing can change the record
         // between the copy and the publish.
-        let Some(current) = read_lock(&self.index).get(&host).cloned() else {
+        let Some(current) = read_lock(&self.index).get(host).cloned() else {
             return Ok(false);
         };
         if !guard(&current) {
@@ -1873,7 +2245,7 @@ impl CustomDomainRegistry {
         // An offboard cannot interleave under the gate, but the index is the
         // routing table: if the record is gone, leave it gone rather than
         // resurrecting a hostname nothing owns.
-        Ok(index.get_mut(&host).is_some_and(|slot| {
+        Ok(index.get_mut(host).is_some_and(|slot| {
             *slot = updated;
             true
         }))
@@ -1881,6 +2253,74 @@ impl CustomDomainRegistry {
 }
 
 // ── Issuance budget ──────────────────────────────────────────────────────
+
+/// The write half of [`CustomDomainRegistry::record_active_for`].
+fn apply_active_mutation(d: &mut CustomDomain, now_unix: i64, cert_not_after_unix: i64) {
+    d.status = DomainStatus::Active;
+    if d.verified_at_unix.is_none() {
+        d.verified_at_unix = Some(now_unix);
+    }
+    if d.activated_at_unix.is_none() {
+        d.activated_at_unix = Some(now_unix);
+    }
+    d.cert_not_after_unix = Some(cert_not_after_unix);
+    d.failure_reason = None;
+    d.consecutive_failures = 0;
+    d.next_attempt_unix = None;
+}
+
+/// A hostname's write gate, held by [`CustomDomainRegistry::with_hostname`].
+///
+/// Its methods are the registry writes that assume the gate is already held.
+#[derive(Debug)]
+pub struct Gated<'a> {
+    registry: &'a CustomDomainRegistry,
+    host: String,
+}
+
+impl Gated<'_> {
+    /// The normalised hostname this gate guards.
+    #[must_use]
+    pub fn hostname(&self) -> &str {
+        &self.host
+    }
+
+    /// The record for this hostname, if registered.
+    #[must_use]
+    pub fn get(&self) -> Option<CustomDomain> {
+        read_lock(&self.registry.index).get(&self.host).cloned()
+    }
+
+    /// [`CustomDomainRegistry::remove_if`] without taking the gate again.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's delete error.
+    pub async fn remove_if(&self, guard: impl FnOnce(&CustomDomain) -> bool) -> io::Result<bool> {
+        self.registry.remove_if_locked(&self.host, guard).await
+    }
+
+    /// [`CustomDomainRegistry::record_active_for`] without taking the gate
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_active_for(
+        &self,
+        tenant: &str,
+        now_unix: i64,
+        cert_not_after_unix: i64,
+    ) -> io::Result<bool> {
+        self.registry
+            .mutate_if_locked(
+                &self.host,
+                |d| CustomDomainRegistry::may_activate(d, Some(tenant)),
+                |d| apply_active_mutation(d, now_unix, cert_not_after_unix),
+            )
+            .await
+    }
+}
 
 /// The promotion half of [`CustomDomainRegistry::record_verified`]: shared by
 /// the unconditional variant and the registration-guarded
@@ -2006,6 +2446,23 @@ pub struct IssuanceLimiter {
     attempts: RwLock<Attempts>,
 }
 
+/// How much of each issuance budget is spent at one instant.
+///
+/// Lets an operator tell "throttled" from "broken".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetUsage {
+    /// Orders placed in the last hour, across all domains.
+    pub global_used: usize,
+    /// The hourly cap.
+    pub global_limit: u32,
+    /// Seconds until the global budget gains room. `None` while it has room.
+    pub global_retry_after_secs: Option<i64>,
+    /// The per-domain daily cap.
+    pub per_domain_limit: u32,
+    /// Domains that spent the daily cap, sorted.
+    pub domains_at_limit: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 struct Attempts {
     /// Attempt timestamps per domain, within the per-domain window.
@@ -2090,6 +2547,33 @@ impl IssuanceLimiter {
         IssuanceDecision::Allow
     }
 
+    /// The spent share of each budget at `now_unix`.
+    #[must_use]
+    pub fn usage(&self, now_unix: i64) -> BudgetUsage {
+        let attempts = read_lock(&self.attempts);
+        let global = within(&attempts.global, now_unix, GLOBAL_WINDOW_SECS);
+        let mut domains_at_limit: Vec<String> = attempts
+            .per_domain
+            .iter()
+            .filter(|(_, hits)| {
+                within(hits, now_unix, PER_DOMAIN_WINDOW_SECS).len()
+                    >= self.per_domain_per_day as usize
+            })
+            .map(|(host, _)| host.clone())
+            .collect();
+        drop(attempts);
+        domains_at_limit.sort();
+        let full = global.len() >= self.global_per_hour as usize;
+        BudgetUsage {
+            global_used: global.len(),
+            global_limit: self.global_per_hour,
+            global_retry_after_secs: full
+                .then(|| retry_after(&global, now_unix, GLOBAL_WINDOW_SECS)),
+            per_domain_limit: self.per_domain_per_day,
+            domains_at_limit,
+        }
+    }
+
     /// Record that an order was placed for `hostname`.
     pub fn record_attempt(&self, hostname: &str, now_unix: i64) {
         let mut attempts = write_lock(&self.attempts);
@@ -2132,6 +2616,35 @@ impl IssuanceLimiter {
         drop(state);
     }
 
+    /// Seed the global window from the persisted attempt ledger.
+    ///
+    /// The ledger holds orders for offboarded domains too. No domain record
+    /// shows those. The ledger also repeats orders that [`Self::hydrate`]
+    /// already added. So this raises the count at each instant to the ledger
+    /// count and no higher. Call it after `hydrate`. A second call changes
+    /// nothing. It ignores entries outside the window that ends at `now_unix`.
+    pub fn hydrate_global(&self, attempts: impl IntoIterator<Item = i64>, now_unix: i64) {
+        let oldest = now_unix.saturating_sub(GLOBAL_WINDOW_SECS);
+        let mut persisted: HashMap<i64, usize> = HashMap::new();
+        for at in attempts {
+            if at > oldest && at <= now_unix {
+                *persisted.entry(at).or_default() += 1;
+            }
+        }
+        let mut state = write_lock(&self.attempts);
+        let mut have: HashMap<i64, usize> = HashMap::new();
+        for at in &state.global {
+            *have.entry(*at).or_default() += 1;
+        }
+        for (at, want) in persisted {
+            let known = have.get(&at).copied().unwrap_or(0);
+            state
+                .global
+                .extend(std::iter::repeat_n(at, want.saturating_sub(known)));
+        }
+        drop(state);
+    }
+
     /// Drop a domain's attempt history — called when it is offboarded, so a
     /// re-registration of the same hostname is not charged for the old one.
     pub fn forget(&self, hostname: &str) {
@@ -2147,9 +2660,9 @@ fn within(hits: &[i64], now_unix: i64, window: i64) -> Vec<i64> {
 
 /// Seconds until the oldest hit in `hits` leaves `window`.
 fn retry_after(hits: &[i64], now_unix: i64, window: i64) -> i64 {
-    hits.iter()
-        .min()
-        .map_or(0, |oldest| (*oldest + window - now_unix).max(1))
+    hits.iter().min().map_or(0, |oldest| {
+        (oldest.saturating_add(window) - now_unix).max(1)
+    })
 }
 
 // ── Issuance seam ────────────────────────────────────────────────────────
@@ -2277,6 +2790,7 @@ impl DomainVerifier for SystemDomainVerifier {
 #[derive(Debug)]
 pub struct CustomDomainHealthIndicator {
     registry: Arc<CustomDomainRegistry>,
+    limiter: Option<Arc<IssuanceLimiter>>,
     now_unix: fn() -> i64,
 }
 
@@ -2284,7 +2798,18 @@ impl CustomDomainHealthIndicator {
     /// An indicator over `registry`.
     #[must_use]
     pub fn new(registry: Arc<CustomDomainRegistry>) -> Self {
-        Self { registry, now_unix }
+        Self {
+            registry,
+            limiter: None,
+            now_unix,
+        }
+    }
+
+    /// Also report how much of the issuance budget is spent.
+    #[must_use]
+    pub fn with_limiter(mut self, limiter: Arc<IssuanceLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
     }
 
     /// Grade the registry at `now_unix` (pure; used by `check` and tests).
@@ -2319,6 +2844,20 @@ impl CustomDomainHealthIndicator {
         }
         if !expired.is_empty() {
             details.insert("expired".to_owned(), serde_json::json!(expired));
+        }
+        // A spent budget is throttling, not an outage: it never changes status.
+        if let Some(limiter) = &self.limiter {
+            let u = limiter.usage(now_unix);
+            details.insert(
+                "issuance_budget".to_owned(),
+                serde_json::json!({
+                    "global_used": u.global_used,
+                    "global_limit": u.global_limit,
+                    "global_retry_after_secs": u.global_retry_after_secs,
+                    "per_domain_limit": u.per_domain_limit,
+                    "domains_at_limit": u.domains_at_limit,
+                }),
+            );
         }
 
         HealthCheckOutput {
@@ -2434,6 +2973,11 @@ mod sni {
         inner: RwLock<CacheInner>,
     }
 
+    /// The `notAfter` of a certificate's leaf, if it parses.
+    fn leaf_not_after(key: &CertifiedKey) -> Option<i64> {
+        crate::tls::leaf_not_after_from_der(key.cert.first()?.as_ref())
+    }
+
     #[derive(Debug, Default)]
     struct CacheInner {
         certs: HashMap<String, Arc<CertifiedKey>>,
@@ -2468,6 +3012,33 @@ mod sni {
                 }
             }
             drop(inner);
+        }
+
+        /// Cache `key` for `hostname` unless the resident certificate expires
+        /// later. Returns whether `key` was stored.
+        ///
+        /// Use this for a load that holds no gate (the handshake path). A
+        /// renewal can cache a new pair during that load. This check stops the
+        /// old pair from replacing it. The check and the insert are one step.
+        pub fn insert_if_not_older(&self, hostname: &str, key: Arc<CertifiedKey>) -> bool {
+            let mut inner = write_lock(&self.inner);
+            if let Some(resident) = inner.certs.get(hostname)
+                && let (Some(resident), Some(incoming)) =
+                    (leaf_not_after(resident), leaf_not_after(&key))
+                && resident > incoming
+            {
+                return false;
+            }
+            if inner.certs.insert(hostname.to_owned(), key).is_none() {
+                inner.order.push_back(hostname.to_owned());
+            }
+            while inner.order.len() > self.capacity {
+                if let Some(oldest) = inner.order.pop_front() {
+                    inner.certs.remove(&oldest);
+                }
+            }
+            drop(inner);
+            true
         }
 
         /// Drop `hostname`'s certificate — called on offboarding, so a removed
@@ -2583,8 +3154,23 @@ mod sni {
                 return Some(cached);
             }
             let loaded = self.source.as_ref()?.load(&name)?;
-            self.cache.insert(&name, Arc::clone(&loaded));
-            Some(loaded)
+            // An offboard may have landed during the load. Do not cache or
+            // serve a pair for a hostname that is no longer servable.
+            if !self.registry.is_servable(&name) {
+                return None;
+            }
+            // This load holds no gate. A renewal may land during it. The
+            // record then has the new `notAfter`. A pair that expires sooner is
+            // stale: serve it once, do not cache it.
+            let recorded = self.registry.get(&name).and_then(|d| d.cert_not_after_unix);
+            let stale = recorded
+                .zip(leaf_not_after(&loaded))
+                .is_some_and(|(recorded, loaded_until)| loaded_until < recorded);
+            if !stale && self.cache.insert_if_not_older(&name, Arc::clone(&loaded)) {
+                return Some(loaded);
+            }
+            // A newer pair is resident: serve that one.
+            self.cache.get(&name).or(Some(loaded))
         }
 
         /// Does the operator's own certificate cover `name`?
@@ -2673,6 +3259,191 @@ mod kani_proofs {
 mod tests {
     use super::*;
 
+    async fn hydrated(max: usize) -> Arc<CustomDomainRegistry> {
+        let registry = Arc::new(CustomDomainRegistry::new(
+            Arc::new(MemoryCustomDomainStore::new()),
+            max,
+        ));
+        registry.load().await.unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn a_section_holds_its_hostname_but_not_the_others() {
+        let registry = hydrated(10).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let held = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .with_hostname("a.clientco.com", async |_| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await
+            }
+        });
+        entered_rx.await.unwrap();
+
+        // Another hostname is free.
+        registry
+            .register("b.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        // The held hostname is not.
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            registry.register("a.clientco.com", "tenant-a", 0),
+        )
+        .await;
+        assert!(blocked.is_err(), "a write must wait for the section");
+
+        release_tx.send(()).unwrap();
+        held.await.unwrap();
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_section_for_an_unusable_hostname_does_not_run() {
+        let registry = hydrated(10).await;
+        assert!(
+            registry
+                .with_hostname("not a host", async |_| unreachable!())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gated_handle_writes_without_retaking_the_gate() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let seen = registry
+            .with_hostname("A.ClientCo.com.", async |gate| {
+                assert_eq!(gate.hostname(), "a.clientco.com");
+                // A record still `PendingDns` is not orderable.
+                assert!(!gate.record_active_for("tenant-a", 1, 9).await.unwrap());
+                assert!(!gate.record_active_for("tenant-b", 1, 9).await.unwrap());
+                assert!(!gate.remove_if(|_| false).await.unwrap());
+                assert!(gate.remove_if(|d| d.tenant == "tenant-a").await.unwrap());
+                gate.get()
+            })
+            .await
+            .unwrap();
+        assert!(seen.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_section_excludes_hostname_sections_in_both_directions() {
+        let registry = hydrated(10).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let exclusive = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .exclusive(async || {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await;
+            }
+        });
+        entered_rx.await.unwrap();
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            registry.with_hostname("a.clientco.com", async |_| ()),
+        )
+        .await;
+        assert!(
+            waiting.is_err(),
+            "a section must wait for the exclusive one"
+        );
+        release_tx.send(()).unwrap();
+        exclusive.await.unwrap();
+
+        // And the reverse: a running section holds the exclusive one back.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let section = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .with_hostname("a.clientco.com", async |_| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await;
+            }
+        });
+        entered_rx.await.unwrap();
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            registry.exclusive(async || ()),
+        )
+        .await;
+        assert!(waiting.is_err(), "the exclusive section must wait");
+        release_tx.send(()).unwrap();
+        section.await.unwrap();
+    }
+
+    /// No lock-ordering hazard: sections over many hostnames, registrations,
+    /// offboards and exclusive sections, all at once on several threads, with
+    /// the gate map churning past its high-water mark, finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_sections_and_writes_never_deadlock() {
+        let registry = hydrated(8).await;
+        let mut tasks = Vec::new();
+        for worker in 0..8_usize {
+            let registry = Arc::clone(&registry);
+            tasks.push(tokio::spawn(async move {
+                for round in 0..60_usize {
+                    let host = format!("h{}.clientco.com", (worker + round) % 12);
+                    match round % 4 {
+                        0 => {
+                            let _ = registry.register(&host, "tenant-a", 0).await;
+                        }
+                        1 => {
+                            registry
+                                .with_hostname(&host, async |gate| {
+                                    tokio::task::yield_now().await;
+                                    let _ = gate.record_active_for("tenant-a", 1, 9).await;
+                                    gate.get()
+                                })
+                                .await;
+                        }
+                        2 => {
+                            registry
+                                .with_hostname(&host, async |gate| {
+                                    let _ = gate.remove_if(|_| true).await;
+                                })
+                                .await;
+                        }
+                        _ => {
+                            registry
+                                .exclusive(async || tokio::task::yield_now().await)
+                                .await;
+                        }
+                    }
+                }
+            }));
+        }
+        let all = futures::future::join_all(tasks);
+        let results = tokio::time::timeout(std::time::Duration::from_secs(30), all)
+            .await
+            .expect("deadlock: mixed sections did not finish");
+        for result in results {
+            result.unwrap();
+        }
+    }
+
     /// The write-gate map must stay bounded: every hostname ever gated used to
     /// keep an entry for the life of the process, and two paths made that
     /// unbounded rather than merely bounded by the registry — a refused
@@ -2724,6 +3495,35 @@ mod tests {
         assert!(is_apex("clientco.com"));
         assert!(!is_apex("app.clientco.com"));
         assert!(!is_apex("a.b.clientco.com"));
+    }
+
+    /// #2643: an apex under a multi-label public suffix has three labels.
+    #[test]
+    fn apex_detection_uses_the_public_suffix_list() {
+        for apex in ["clientco.co.uk", "customer.com.au", "tenant.co.jp"] {
+            assert!(is_apex(apex), "{apex} is an apex");
+            let sub = format!("app.{apex}");
+            assert!(!is_apex(&sub), "{sub} is a subdomain");
+        }
+        // Wildcard rule `*.ck` and its exception `!www.ck`.
+        assert!(is_apex("foo.bar.ck"));
+        assert!(is_apex("www.ck"));
+        assert!(!is_apex("app.www.ck"));
+        // A private-section suffix delegates a zone too.
+        assert!(is_apex("clientco.eu.org"));
+        // An unlisted TLD keeps the two-label rule.
+        assert!(is_apex("clientco.internal"));
+        assert!(!is_apex("app.clientco.internal"));
+        // A public suffix is itself the top of a zone.
+        assert!(is_apex("co.uk"));
+    }
+
+    /// The lookup ignores case and a trailing dot.
+    #[test]
+    fn apex_detection_ignores_case_and_a_trailing_dot() {
+        assert!(is_apex("ClientCo.CO.UK"));
+        assert!(is_apex("clientco.co.uk."));
+        assert!(!is_apex("APP.ClientCo.co.uk"));
     }
 
     #[test]
@@ -2788,6 +3588,149 @@ mod tests {
         assert!(store.load_all().await.unwrap().is_empty());
         // Deleting again is not an error.
         store.delete("app.clientco.com").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_memory_ledger_keeps_recent_attempts_and_prunes_old_ones() {
+        let store = MemoryCustomDomainStore::new();
+        store.append_attempt(1000).await.unwrap();
+        store.append_attempt(1000).await.unwrap();
+        // The next write is past the global window: the first two go.
+        let later = 1000 + GLOBAL_WINDOW_SECS + 1;
+        store.append_attempt(later).await.unwrap();
+        assert_eq!(store.load_attempts().await.unwrap(), vec![later]);
+    }
+
+    #[tokio::test]
+    async fn the_filesystem_ledger_survives_a_new_store_and_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        assert!(store.load_attempts().await.unwrap().is_empty());
+        store.append_attempt(1000).await.unwrap();
+        store.append_attempt(1000).await.unwrap();
+
+        let reopened = FsCustomDomainStore::new(dir.path());
+        assert_eq!(reopened.load_attempts().await.unwrap(), vec![1000, 1000]);
+
+        let later = 1000 + GLOBAL_WINDOW_SECS + 1;
+        reopened.append_attempt(later).await.unwrap();
+        assert_eq!(reopened.load_attempts().await.unwrap(), vec![later]);
+    }
+
+    #[tokio::test]
+    async fn the_ledger_file_is_not_read_as_a_domain_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        store.append_attempt(1000).await.unwrap();
+        assert!(store.load_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_filesystem_ledger_reads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        store.append_attempt(1000).await.unwrap();
+        std::fs::write(dir.path().join(LEDGER_FILE), b"not json").unwrap();
+        assert!(store.load_attempts().await.unwrap().is_empty());
+        // The next write repairs it and keeps the bad file.
+        store.append_attempt(2000).await.unwrap();
+        assert!(dir.path().join("attempts.ledger.corrupt").exists());
+        assert_eq!(store.load_attempts().await.unwrap(), vec![2000]);
+    }
+
+    #[test]
+    fn hydrating_the_global_ledger_is_idempotent_and_never_double_counts() {
+        let limiter = IssuanceLimiter::new(5, 2, 300, 3600);
+        // One order is already known from a domain record.
+        limiter.hydrate([("a.test".to_owned(), 1000)], 1100);
+        // The ledger lists that order again, and one for an offboarded domain.
+        limiter.hydrate_global([1000, 1010], 1100);
+        limiter.hydrate_global([1000, 1010], 1100);
+        assert!(matches!(
+            limiter.check("c.test", 1100),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+        // Exactly two hits: one expires, one stays.
+        assert_eq!(
+            limiter.check("c.test", 1000 + GLOBAL_WINDOW_SECS + 1),
+            IssuanceDecision::Allow
+        );
+    }
+
+    #[test]
+    fn hydrating_the_global_ledger_ignores_future_attempts() {
+        let limiter = IssuanceLimiter::new(5, 1, 300, 3600);
+        limiter.hydrate_global([i64::MAX, 2000], 1000);
+        assert_eq!(limiter.check("a.test", 1000), IssuanceDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn a_future_ledger_entry_is_dropped_on_the_next_write() {
+        let store = MemoryCustomDomainStore::new();
+        store.append_attempt(5000).await.unwrap();
+        store.append_attempt(1000).await.unwrap();
+        assert_eq!(store.load_attempts().await.unwrap(), vec![1000]);
+    }
+
+    #[tokio::test]
+    async fn merging_adds_only_missing_in_window_orders_in_both_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = FsCustomDomainStore::new(dir.path());
+        let mem = MemoryCustomDomainStore::new();
+        let now = 5000;
+        let old = now - GLOBAL_WINDOW_SECS - 1;
+        for store in [&fs as &dyn CustomDomainStore, &mem] {
+            store.append_attempt(4000).await.unwrap();
+            // 4000 is known. 4500 is new. `old` and a future instant are ignored.
+            store
+                .merge_attempts(vec![4000, 4500, old, now + 9], now)
+                .await
+                .unwrap();
+            store.merge_attempts(vec![4000, 4500], now).await.unwrap();
+            let mut got = store.load_attempts().await.unwrap();
+            got.sort_unstable();
+            assert_eq!(got, vec![4000, 4500]);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_filesystem_appends_lose_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsCustomDomainStore::new(dir.path()));
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move { store.append_attempt(1000).await.unwrap() })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(store.load_attempts().await.unwrap().len(), 16);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_filesystem_ledger_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        store.append_attempt(1000).await.unwrap();
+        let mode = std::fs::metadata(dir.path().join(LEDGER_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn hydrating_the_global_ledger_ignores_attempts_outside_the_window() {
+        let limiter = IssuanceLimiter::new(5, 1, 300, 3600);
+        limiter.hydrate_global([1000], 1000 + GLOBAL_WINDOW_SECS + 1);
+        assert_eq!(
+            limiter.check("a.test", 1000 + GLOBAL_WINDOW_SECS + 1),
+            IssuanceDecision::Allow
+        );
     }
 
     #[tokio::test]
@@ -2907,6 +3850,68 @@ mod tests {
     }
 
     #[test]
+    fn usage_counts_only_attempts_inside_each_window() {
+        let limiter = IssuanceLimiter::new(2, 3, 300, 3600);
+        limiter.record_attempt("a.test", 1000);
+        limiter.record_attempt("a.test", 1100);
+        limiter.record_attempt("b.test", 1200);
+        let usage = limiter.usage(1300);
+        assert_eq!(usage.global_used, 3);
+        assert_eq!(usage.global_limit, 3);
+        assert_eq!(
+            usage.global_retry_after_secs,
+            Some(1000 + GLOBAL_WINDOW_SECS - 1300)
+        );
+        assert_eq!(usage.per_domain_limit, 2);
+        assert_eq!(usage.domains_at_limit, vec!["a.test".to_owned()]);
+        // After the hour, the global window is empty. The day window is not.
+        let later = limiter.usage(1200 + GLOBAL_WINDOW_SECS);
+        assert_eq!(later.global_used, 0);
+        assert_eq!(later.global_retry_after_secs, None);
+        assert_eq!(later.domains_at_limit, vec!["a.test".to_owned()]);
+    }
+
+    #[test]
+    fn usage_drops_a_domain_exactly_one_day_after_its_attempt() {
+        let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
+        limiter.record_attempt("a.test", 1000);
+        let last_inside = limiter.usage(1000 + PER_DOMAIN_WINDOW_SECS - 1);
+        assert_eq!(last_inside.domains_at_limit, vec!["a.test".to_owned()]);
+        let first_outside = limiter.usage(1000 + PER_DOMAIN_WINDOW_SECS);
+        assert!(first_outside.domains_at_limit.is_empty());
+    }
+
+    #[test]
+    fn usage_forgets_an_offboarded_domain_but_keeps_its_global_orders() {
+        let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
+        limiter.record_attempt("a.test", 1000);
+        limiter.forget("a.test");
+        let usage = limiter.usage(1100);
+        assert!(usage.domains_at_limit.is_empty());
+        assert_eq!(usage.global_used, 1);
+    }
+
+    #[test]
+    fn usage_lists_domains_at_the_limit_in_sorted_order() {
+        let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
+        for host in ["c.test", "a.test", "b.test"] {
+            limiter.record_attempt(host, 1000);
+        }
+        assert_eq!(
+            limiter.usage(1100).domains_at_limit,
+            ["a.test", "b.test", "c.test"]
+        );
+    }
+
+    #[test]
+    fn usage_of_an_unused_limiter_is_empty() {
+        let usage = IssuanceLimiter::new(2, 3, 300, 3600).usage(1000);
+        assert_eq!(usage.global_used, 0);
+        assert_eq!(usage.global_retry_after_secs, None);
+        assert!(usage.domains_at_limit.is_empty());
+    }
+
+    #[test]
     fn a_spent_budget_reports_when_it_rolls() {
         let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
         limiter.record_attempt("a.test", 1000);
@@ -2973,6 +3978,76 @@ mod tests {
             "cert_not_after_unix":null,"consecutive_failures":0,"next_attempt_unix":null}"#;
         let record: CustomDomain = serde_json::from_str(old).unwrap();
         assert!(record.issuance_attempts_unix.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_verification_failure_lands_on_a_pending_registration() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let token = registry.get("a.clientco.com").unwrap().verification_token;
+
+        let applied = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-a",
+                token.as_deref(),
+                100,
+                "the DNS lookup timed out",
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(applied);
+        let record = registry.get("a.clientco.com").unwrap();
+        assert_eq!(record.status, DomainStatus::PendingDns);
+        assert_eq!(
+            record.failure_reason.as_deref(),
+            Some("the DNS lookup timed out")
+        );
+        assert_eq!(record.consecutive_failures, 1);
+        assert_eq!(record.next_attempt_unix, Some(400));
+    }
+
+    #[tokio::test]
+    async fn a_verification_failure_spares_another_tenant_or_registration() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let token = registry.get("a.clientco.com").unwrap().verification_token;
+
+        let wrong_tenant = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-b",
+                token.as_deref(),
+                100,
+                "stale",
+                300,
+            )
+            .await
+            .unwrap();
+        let wrong_token = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-a",
+                Some("another-registration"),
+                100,
+                "stale",
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(!wrong_tenant && !wrong_token);
+        let record = registry.get("a.clientco.com").unwrap();
+        assert!(record.failure_reason.is_none());
+        assert_eq!(record.consecutive_failures, 0);
     }
 
     #[test]

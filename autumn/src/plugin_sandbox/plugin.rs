@@ -296,11 +296,12 @@ impl SandboxedPlugin {
     /// Returns [`SandboxPluginError::Load`] if the module does not compile or
     /// imports something the sandbox does not provide.
     pub fn from_artifact(artifact: &SandboxArtifact) -> Result<Self, SandboxPluginError> {
-        let mut plugin = Self::new(SandboxHost::load(artifact)?);
         // The whole container, not just the module: the grant an operator
         // reviewed is in the manifest, and the module digest does not move when
         // that does. See `SandboxArtifact::artifact_digest`.
-        plugin.artifact_sha256 = Some(artifact.artifact_digest()?);
+        let digest = artifact.artifact_digest()?;
+        let mut plugin = Self::new(SandboxHost::load(artifact)?);
+        plugin.artifact_sha256 = Some(digest);
         Ok(plugin)
     }
 
@@ -435,7 +436,9 @@ impl SandboxedPlugin {
             // blocking task runs on, and recording after the `.await` lost the
             // whole record of what the hook did.
             ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
-            ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_events);
+            if let Some(dropped) = outcome.dropped_calls {
+                ingest_log.ingest_dropped_calls(&ingest_plugin, dropped);
+            }
             drop(permit);
             drop(slot_permit);
             outcome
@@ -726,7 +729,9 @@ async fn serve_inner(
     let outcome = crate::time::spawn_blocking(move || {
         let outcome = host.run_with(&request, services);
         ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
-        ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_activity);
+        if let Some(dropped) = outcome.dropped_calls {
+            ingest_log.ingest_dropped_calls(&ingest_plugin, dropped);
+        }
         drop(slot);
         (outcome, permit)
     })
@@ -1816,6 +1821,7 @@ sha256 = "{digest}"
         assert_eq!(sandboxed[1].method, "HEAD");
     }
 
+    #[cfg(feature = "plugin-conformance")]
     #[test]
     fn a_mounted_sandboxed_plugin_passes_the_conformance_checks() {
         let builder = crate::app::app().plugin(hello_plugin());

@@ -68,7 +68,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 
@@ -329,7 +329,7 @@ fn mac_hex(mac: &Hmac<Sha256>, message: &[u8]) -> String {
 }
 
 fn keyed_mac(key: &[u8]) -> Hmac<Sha256> {
-    <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length")
+    <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length")
 }
 
 impl ResolvedSigningKeys {
@@ -348,6 +348,23 @@ impl ResolvedSigningKeys {
     /// HMAC-SHA256 of `message` under the current key, hex-encoded.
     pub fn sign(&self, message: &[u8]) -> String {
         mac_hex(&self.current_mac, message)
+    }
+
+    /// Returns `true` when one of `hex_sigs` is a valid HMAC-SHA256 of
+    /// `message` under any key. It computes one MAC per key, whatever the
+    /// number of candidates. All comparisons are constant-time.
+    pub fn verify_any(&self, message: &[u8], hex_sigs: &[&str]) -> bool {
+        let expected: Vec<String> = std::iter::once(&self.current_mac)
+            .chain(&self.previous_macs)
+            .map(|mac| mac_hex(mac, message))
+            .collect();
+        let mut matched = false;
+        for candidate in hex_sigs {
+            for mac in &expected {
+                matched |= ct_eq_str(mac, candidate);
+            }
+        }
+        matched
     }
 
     /// Returns `true` when `hex_sig` is a valid HMAC-SHA256 of `message` under
@@ -929,6 +946,7 @@ impl SubmitTokenConfig {
         self.backend.unwrap_or(idempotency_backend)
     }
 
+    #[cfg(feature = "idempotency")]
     /// Decide the production safety action for the resolved consumed-token
     /// backend.
     ///
@@ -974,6 +992,7 @@ impl SubmitTokenConfig {
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Production safety decision for the resolved submit-token consumed-token
 /// backend. Produced by [`SubmitTokenConfig::production_memory_guard`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1563,11 +1582,11 @@ pub fn default_content_security_policy() -> String {
         .to_owned()
 }
 
-fn default_csrf_header() -> String {
+pub(super) fn default_csrf_header() -> String {
     "X-CSRF-Token".to_owned()
 }
 
-fn default_csrf_field() -> String {
+pub(super) fn default_csrf_field() -> String {
     "_csrf".to_owned()
 }
 
@@ -1614,6 +1633,16 @@ mod tests {
     use crate::config::IdempotencyBackend;
 
     // ── submit-token backend resolution (Finding D: inherit idempotency) ─────
+
+    #[test]
+    fn verify_any_matches_one_of_many_candidates_under_any_key() {
+        let keys = ResolvedSigningKeys::new(b"new".to_vec(), vec![b"old".to_vec()]);
+        let old = hmac_sha256_hex(b"old", b"msg");
+        assert!(keys.verify_any(b"msg", &["00", &old]));
+        assert!(keys.verify_any(b"msg", &[&keys.sign(b"msg")]));
+        assert!(!keys.verify_any(b"msg", &["00", "zz"]));
+        assert!(!keys.verify_any(b"msg", &[]));
+    }
 
     #[test]
     fn submit_token_backend_defaults_to_none_and_inherits_idempotency() {

@@ -812,6 +812,30 @@ the shipped binary carries envelopes nobody reviewed. `--release`,
 `--features`, `--all-features` and `--no-default-features` all select the
 binary being inspected.
 
+### WebMCP tools
+
+A [WebMCP](webmcp.md) tool runs in the session of the user, in the browser.
+The manifest lists it apart from the `/mcp` tools:
+
+- `exposure: "webmcp-tool"` on an action whose route is a WebMCP tool and
+  not an MCP tool. A route on both surfaces stays `"mcp-tool"`.
+- `route.webmcp_tool: true` on each route that is a WebMCP tool.
+- `ungoverned_webmcp_tools` for each WebMCP tool with no envelope.
+
+`--check` fails on an ungoverned WebMCP write, as it does for `/mcp`. The
+JSON omits each new field when it is empty, so an app with no WebMCP tool
+keeps its committed manifest.
+
+A WebMCP call is a plain request from the page. It does not go through the
+`/mcp` dispatcher. So the runtime does not apply the grant `rate` cap to it,
+and it writes no agent audit record. The audit-sink gate above counts only
+`mcp-tool` rows. A WebMCP tool behind a grant that is not `reversible` asks
+the user before each call. That prompt is the human check. Use `/mcp` for a
+tool that needs the rate cap or the audit record.
+
+Form tools (`webmcp::form_tool`) are not in the manifest. They exist only in
+the page.
+
 ---
 
 ## The audit record

@@ -91,6 +91,8 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   connection acquired lazily — long after the database was resolved — never
   finds its pool closed. The sweeper re-checks `max_open` at least once per grace
   window, so a burst of opens does not stay over the cap.
+  `max_open_policy = "wait"` or `"refuse"` makes the cap hard for request
+  opens (#3538). An open at the cap waits for a close, or answers `503`.
 - A new database is built in a private staging file beside its path —
   identity row and every migration — and published with a hard link, which
   refuses an existing target. A database is therefore absent or complete,
@@ -163,8 +165,12 @@ movement. Each fleet database ships its WAL to object storage under
 `fleet/<name>/`, through the same engine and the same `[replication]`
 destination as the control database:
 
-- the fleet replicator ticks one `Replicator` per **open** database on one
-  thread;
+- the fleet replicator ticks one `Replicator` per **open** database. One
+  thread starts a pass every sync interval. `replication_workers` threads
+  (default 4) ship the databases of a pass at the same time, the database
+  that shipped longest ago first. One thread for all databases did not keep
+  the RPO: with 150 to 230 busy databases per host, a pass took several
+  seconds (Murmuration, 2026-10);
 - a database it replicates runs with `wal_autocheckpoint = 0`, and only its
   replicator checkpoints. Fleet pools never inherit the process latch that
   disables auto-checkpointing for the control database, so a fleet that does
@@ -254,7 +260,17 @@ databases that nobody asks for:
   nothing, the database waits 1 s, then twice as long each time, up to
   5 min. New work of the same kind ends the wait. A visit that made
   progress and left work moves the database behind the others that are
-  due, so busy databases take turns. A worker runs its first pass when it
+  due, so busy databases take turns. A pass reads the due rows of the open
+  databases and the 256 rows due first, and puts them in one order: by due
+  time, then by age. When both are the same, an open database goes first,
+  because its visit opens no file. A new row is due at the time of its mark.
+  A row with no backoff is due on every clock, so clock skew between hosts
+  changes only its place. Half of each pass goes first to the open
+  databases, so a backfill of the whole fleet does not stop their outbox.
+  The rest goes in that order to all databases. A pass takes no more closed
+  databases than the fleet has room for, and no database of another host.
+  A closed database therefore waits only behind the rows that were due
+  before it (issue 3350). A worker runs its first pass when it
   starts, before it waits for the interval. The index stores this wait, so a stuck database never hides the
   others. `/actuator/health` reports `fleet:sweeper`: the backlog
   (databases), the oldest pending age, and the counts of the last pass.
@@ -312,15 +328,16 @@ and the replication path both check it.
   generations by (epoch, time). The sweep never removes a generation without
   `snapshot.json` that is newer than the floor (an upload in progress). A
   replicator with no epoch records the newest epoch at the destination, so
-  turning ownership off does not order new generations below old ones. The
-  replicator lists `<root>/epochs/` at each new generation and every 60 s. A
-  newer epoch stops it (`ReplicationError::Fenced`), and the host loses the
-  range. A replica with no markers is epoch 0, so old replicas restore as
+  turning ownership off does not order new generations below old ones. Core
+  lists `<root>/epochs/` before each put to the replica (ADR 0040, "Notes
+  from step 3"). A newer epoch refuses the put and stops the replicator
+  (`ReplicationError::Fenced`), and the host loses the range. A replica with no markers is epoch 0, so old replicas restore as
   before.
 - **One replicator per database (#3230).** The epoch is the election token
   across hosts: only the owner of the current epoch opens the database. An
-  old replicator can still ship for up to 60 s, into its old epoch's
-  generation; the restore order makes that harmless. The lock file still
+  old replicator can still land one put that was in flight when the newer
+  marker landed, into its old epoch's generation; the restore order makes
+  that harmless. The lock file still
   elects one process inside the host. A parked replicator that reopens under
   a new epoch starts a new generation.
 
@@ -333,6 +350,76 @@ database, a local SQLite file, so it fences the processes of one host only.
 Hosts on different machines need a `SlotOwnershipStore` on a store they all
 reach.
 
+### 8. Replica lifecycle: delete, tombstones, restore check (issue #3235)
+
+A replica that outlives its database breaks two things. A "delete my data"
+request leaves every snapshot and segment behind. And `restore_missing`
+brings a deleted tenant back on its next open. Litestream has the same gap.
+
+- **Delete.** With replication installed, `delete` writes a pending
+  tombstone row (`_autumn_fleet_tombstones`) on the control database before
+  any file goes. If the row cannot be written, the delete fails. Then a crash
+  after the removal cannot leave a replica that nothing blocks. The delete
+  checks the file, writes the row and removes the file under the path lock
+  (issue #3516). So a second delete in another process sees no file after
+  the removal, and it cannot reset or drop the row of the first delete. When
+  the file is present, an existing row is stale, and the delete resets it. When the
+  file is missing, an existing row is an older or a concurrent delete's,
+  and it stays. A delete that removed nothing drops only the pending row
+  that it wrote (each pending row names its delete).
+- **Confirm.** After the removal, the delete confirms its own pending row.
+  `deleted_at` is the purge cutoff: the later of the app clock and the
+  newest generation in the replica. The retention runs from the confirm. If
+  the generations cannot be read, the row stays pending, and the retry task
+  confirms it later. The confirm never inserts a row: when
+  the row is gone, a re-create or a restore took the key, and nothing is
+  purged. Then the delete writes `<prefix>/tombstone` (a marker for hosts
+  that do not share the control database). With no retention, it purges the
+  replica. A failed purge does not roll back the local delete. The row
+  keeps the failure and a backoff (`min(1 h, 5 s × 2^attempts)`).
+- **Purge.** List `<prefix>/` (with the slash: `acme` is not a prefix of
+  `acme2`). Delete each object of a generation created at or before the
+  cutoff. Delete the other objects (epoch markers) only when no newer
+  generation exists, and delete the marker last, so a partial purge stays
+  blocked. A newer generation is a new database with the same key; it keeps
+  its data.
+- **No resurrection.** `restore_missing` restores nothing for a key with a
+  row. On another host, the marker refuses each generation that is not newer
+  than `deleted_at`. An explicit `restore` takes the row under the purge
+  turn, restores, and drops the marker. If the restore fails, the row goes
+  back.
+- **Re-create.** During the retention, a create on demand answers `410`, so
+  a stale client cannot end the undo window. A pending row also gives `410`
+  (issue #3516). Its delete has no cutoff yet, so its retention has not
+  started. Only `provision` ends the window early. With `restore_missing`, a host
+  with its own control database reads the retention from the marker. `provision`, and any create
+  after the retention, purges the old replica first and drops the row, or
+  fails with `503`. So a later purge never removes the new database's data,
+  and after a volume loss `restore_missing` restores the new database.
+- **Retry.** The maintenance task pages through every row each minute. It
+  rewrites a marker that failed. It purges a due row only when the file is
+  not on disk and this host owns the slot. A confirmed row next to a live
+  file is stale (a restore or a re-create drops the row first): the task
+  drops it. A pending row whose file is gone is confirmed only when it is
+  older than 10 minutes, so a delete in progress keeps it. A pending row
+  whose file is still there and that is older than 10 minutes is dropped.
+  One purge runs at a time in a process.
+- **Late ticks.** A tick that began before a close skips a replica that is
+  no longer the active one, a tick skips a released replica, and the purge
+  waits for a tick in flight. So nothing ships into the prefix after the
+  cutoff.
+- **Retention.** `replica_retention_after_delete` keeps the replica for undo.
+  Until it ends, `restore` brings the database back.
+- **Restore check.** Every `[replication] verify_interval_secs`, each
+  worker-role process restores `restore_check_sample` random databases into
+  scratch files under the reserved directory. The restore checks the
+  segment chain and `PRAGMA integrity_check`; the check adds the identity
+  row. A failure is tried once more. A failure turns `replication:fleet`
+  `Down`. The indicator stays `Down` until a check passes.
+
+The rules are pure functions in `db/fleet_tombstones.rs`. The model and its
+proofs are in `verification/fleet_replica_tombstones.rs`.
+
 ## Consequences
 
 ### Positive
@@ -343,7 +430,10 @@ reach.
 - Existing sharded app code runs unchanged; a Postgres-sharded app and a
   SQLite-fleet app share handlers and repositories.
 - Bounded resources: `max_open × pool_size` connections, about
-  `max_open × (2 × pool_size + 1)` file descriptors.
+  `max_open × (2 × pool_size + 1)` file descriptors, when the fleet is not
+  busy. With `max_open_policy = "soft"` (the default), a burst can open more
+  than `max_open` databases: the limit is soft (see
+  `database.fleet.min_residency` and ADR 0031).
 - Metrics stay bounded: a fleet database's metric and route label is
   `shard=fleet`; its name goes on spans and logs only.
 
@@ -365,8 +455,11 @@ reach.
 - A replicated database pays one base snapshot per open/close cycle, because
   the replicator's generation state lives in memory. Size `max_open` so hot
   tenants stay open.
-- Replicas are not deleted with their database (Litestream has the same
-  gap). Lifecycle hooks can, and roadmap item 4 will.
+- A delete with replication needs the control database: the tombstone row
+  comes first. A create of a recently deleted key needs object storage: the
+  old replica is purged first.
+- The restore check downloads `restore_check_sample` databases per process
+  per interval.
 - On Windows, deleting or restoring an existing database fails: SQLite opens
   files without delete sharing, so the guard connection blocks the unlink.
   Tracked in issue 3227.
@@ -380,11 +473,10 @@ reach.
    ([#3233](https://github.com/autumn-foundation/autumn/issues/3233)).
 3. **Fleet sweeper.** Done: see section 6
    ([#3234](https://github.com/autumn-foundation/autumn/issues/3234)).
-4. **Replica lifecycle.** Delete a database's replica with it; verify
-   restores by sampling.
-5. **Query the lake.** Cross-tenant analytics over the replicas in object
-   storage (snapshots plus WAL segments), in the spirit of Athena / DuckDB
-   over S3, instead of opening every file on a production volume.
+4. **Replica lifecycle.** Done: see section 8
+   ([#3235](https://github.com/autumn-foundation/autumn/issues/3235)).
+5. **Query the lake.** Done: see [ADR 0032](0032-fleet-lake-query.md)
+   ([#3236](https://github.com/autumn-foundation/autumn/issues/3236)).
 
 ## Alternatives considered
 
@@ -409,11 +501,19 @@ reach.
 - `autumn-cli/tests/integration/fleet_cli.rs`: each `autumn fleet` subcommand
   against a temporary fleet root; `restore` from a local replica.
 - `autumn/src/db/fleet_sweeper.rs` tests: index marks and clears, marks from
-  a connection, two fleets in one process.
+  a connection, two fleets in one process, the pass order (issue 3350).
 - `autumn/tests/sqlite_fleet_sweeper.rs`: an outbox row relayed after its
   database closes, hooks drained without a request, a derivation added in a
   migration backfilled in a closed tenant, `max_open` and leases respected,
-  the `fleet:sweeper` health indicator.
+  the `fleet:sweeper` health indicator, a closed database not held back by
+  busy open ones, and a full fleet that still relays its open ones
+  (issue 3350).
+- `autumn/src/db/fleet_tombstones.rs` tests: the rules and a proptest of the
+  model's properties; the store; delete purges the replica and keeps its
+  neighbour; a failing destination leaves a tombstone that the retry purges;
+  `restore_missing` does not resurrect a tombstoned key, on this host or
+  another; retention; re-create; the generation cutoff; the restore check
+  finds a corrupt replica.
 - `autumn/src/db/fleet_ownership.rs` tests: the state machine (claim, renew,
   lapse, release, re-shape) and a proptest of its invariants; two hosts
   racing a claim on one store; the open path's `421`; an old owner closed

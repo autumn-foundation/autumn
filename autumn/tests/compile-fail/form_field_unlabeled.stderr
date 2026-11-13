@@ -1,0 +1,15 @@
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+  --> tests/compile-fail/form_field_unlabeled.rs:10:19
+   |
+10 |     let _markup = text_input_with(&changeset, "email", &options);
+   |                   ^^^^^^^^^^^^^^^                      -------- argument #3 of type `&str` is missing
+   |
+note: function defined here
+  --> src/form.rs
+   |
+   | pub fn text_input_with<T: Serialize>(
+   |        ^^^^^^^^^^^^^^^
+help: provide the argument
+   |
+10 |     let _markup = text_input_with(&changeset, "email", /* &str */, &options);
+   |                                                        +++++++++++

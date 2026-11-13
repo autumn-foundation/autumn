@@ -334,14 +334,12 @@ fn tailwind_bin_name() -> &'static str {
 /// every candidate below is tried rather than picking just one:
 ///
 /// - `CARGO_TARGET_DIR`, when the *user* set it as an env var (not via
-///   `.cargo/config.toml`), is inherited directly into this process's
-///   environment and matches `cargo metadata` exactly, triple or not — EXCEPT
-///   when it is a *relative* path and the generated crate is a workspace
-///   member: Cargo then still resolves it against the workspace root, but
-///   runs this build script with the member directory as CWD, so re-joining
-///   the raw env var here would resolve against the wrong base. It is tried
-///   first because it is the more direct answer when it applies, but it is
-///   never the ONLY candidate for exactly that reason.
+///   `.cargo/config.toml`), is inherited into this process. It matches
+///   `cargo metadata` exactly, triple or not. Use it only when it is
+///   ABSOLUTE. Cargo resolves a relative value against the workspace
+///   root, but runs this script in the member directory. Joining it here
+///   can find a stale member-local binary (issue #3108). So skip it. The
+///   `OUT_DIR` candidates below cover that case.
 /// - `OUT_DIR` is always absolute and already resolved by Cargo itself
 ///   (`<target_dir>[/<triple>]/<profile>/build/<pkg>/out`), so its ancestors
 ///   are tried unconditionally as well, not only when `CARGO_TARGET_DIR` is
@@ -352,7 +350,12 @@ fn candidate_target_dirs() -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(std::path::PathBuf::from(dir));
+        let dir = std::path::PathBuf::from(dir);
+        // A relative path resolves against the workspace root, but this
+        // script runs in the member dir. Skip it; `OUT_DIR` covers it.
+        if dir.is_absolute() {
+            candidates.push(dir);
+        }
     }
 
     if let Ok(out_dir) = std::env::var("OUT_DIR") {

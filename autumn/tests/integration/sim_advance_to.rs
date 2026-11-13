@@ -91,8 +91,6 @@ async fn advance_to_across_spring_forward_resolves_utc(mut sim: Sim) {
 async fn timer_inside_crossed_dst_window_fires_in_virtual_time(mut sim: Sim) {
     sim.build(TestApp::new().routes(routes![now_route]));
 
-    let wall_start = Instant::now();
-
     // Target: 04:00 EDT on the spring-forward day = 08:00 UTC. The epoch is
     // 2020-01-01T00:00:00Z, so the crossed window is ~67 days long and includes
     // the 02:00→03:00 local jump.
@@ -122,9 +120,13 @@ async fn timer_inside_crossed_dst_window_fires_in_virtual_time(mut sim: Sim) {
         "the in-window timer must not fire before time advances"
     );
 
-    // Cross the DST boundary by advancing to the zoned target.
+    // Cross the DST boundary by advancing to the zoned target. The wall clock
+    // covers only this advance: the first request below pays the app's
+    // one-time warm-up, which is not part of the virtual-time budget.
+    let wall_start = Instant::now();
     sim.advance_to(&target_local).await;
     sim.run_to_idle().await;
+    let wall_elapsed = wall_start.elapsed();
 
     assert!(
         fired.load(Ordering::SeqCst),
@@ -140,7 +142,6 @@ async fn timer_inside_crossed_dst_window_fires_in_virtual_time(mut sim: Sim) {
     );
 
     // The multi-month virtual advance took essentially no real time.
-    let wall_elapsed = wall_start.elapsed();
     assert!(
         wall_elapsed < Duration::from_secs(1),
         "expected near-zero wall time for a virtual DST-crossing advance, but {wall_elapsed:?} elapsed"

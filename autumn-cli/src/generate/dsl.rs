@@ -4,6 +4,7 @@
 //! `published:Option<bool>` into a structured [`Field`] that knows both its
 //! Rust type (for the `#[model]` struct) and its SQL type (for the migration).
 
+use autumn_schema_core::{Backend, IdKind};
 use autumn_web::config::DatabaseBackend;
 
 use super::GenerateError;
@@ -62,6 +63,40 @@ pub struct FieldConstraints {
     /// nullable, and never combined with `{encrypted}`, `:unique`, or a state
     /// machine. `false` for an ordinary monolingual column.
     pub translatable: bool,
+    /// The form control of a `phone` or `color` column (issue #3405). The
+    /// column is a plain `String`. Only the form changes. Not a constraint:
+    /// [`Self::is_empty`] ignores it.
+    pub widget: Option<StringWidget>,
+}
+
+/// The form control a `String` column renders with, from the DSL kind
+/// (issue #3405).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringWidget {
+    /// `phone` (alias `tel`): `<input type="tel">`.
+    Tel,
+    /// `color`: `<input type="color">`, a `#rrggbb` value.
+    Color,
+}
+
+impl StringWidget {
+    /// The DSL token.
+    #[must_use]
+    pub const fn dsl_token(self) -> &'static str {
+        match self {
+            Self::Tel => "phone",
+            Self::Color => "color",
+        }
+    }
+
+    /// The `autumn_web::form::FieldControl` variant the form uses.
+    #[must_use]
+    pub const fn field_control(self) -> &'static str {
+        match self {
+            Self::Tel => "Tel",
+            Self::Color => "Color",
+        }
+    }
 }
 
 impl FieldConstraints {
@@ -478,6 +513,9 @@ pub enum FieldKind {
     NaiveDateTime,
     /// `DateTime` — `TIMESTAMPTZ`.
     DateTime,
+    /// `time` (alias `NaiveTime`) — `chrono::NaiveTime`, `TIME` (issue
+    /// #3405). The form renders `<input type="time">`.
+    Time,
     /// `Vec<u8>` / `Bytea` — `BYTEA`.
     Bytea,
     /// `Blob` stored as `JSONB` — a file attachment with direct-upload support.
@@ -609,6 +647,7 @@ impl FieldKind {
             Self::Uuid => "uuid::Uuid",
             Self::NaiveDateTime => "chrono::NaiveDateTime",
             Self::DateTime => "chrono::DateTime<chrono::Utc>",
+            Self::Time => "chrono::NaiveTime",
             Self::Bytea => "Vec<u8>",
             Self::Attachment => "autumn_web::storage::Blob",
             Self::Json => "serde_json::Value",
@@ -651,6 +690,7 @@ impl FieldKind {
             Self::Uuid => "Uuid",
             Self::NaiveDateTime => "Timestamp",
             Self::DateTime => "Timestamptz",
+            Self::Time => "Time",
             Self::Bytea => "Bytea",
             Self::Attachment | Self::Json => "Jsonb",
             Self::Decimal { .. } => "Numeric",
@@ -670,6 +710,7 @@ impl FieldKind {
             Self::Uuid => "UUID",
             Self::NaiveDateTime => "TIMESTAMP",
             Self::DateTime => "TIMESTAMPTZ",
+            Self::Time => "TIME",
             Self::Bytea => "BYTEA",
             Self::Attachment | Self::Json => "JSONB",
             Self::Decimal { .. } => "NUMERIC",
@@ -714,7 +755,7 @@ impl FieldKind {
             | Self::Bool => "INTEGER",
             Self::F32 | Self::F64 => "REAL",
             Self::Uuid => "TEXT",
-            Self::NaiveDateTime | Self::DateTime => "TEXT",
+            Self::NaiveDateTime | Self::DateTime | Self::Time => "TEXT",
             Self::Bytea => "BLOB",
             Self::Attachment | Self::Json => "TEXT",
             Self::Decimal { .. } => "TEXT",
@@ -793,6 +834,8 @@ impl FieldKind {
             // `DateTime<Utc>` -> `TimestamptzSqlite` (diesel's sqlite+chrono
             // conversion, available via the app's `autumn-web` sqlite feature).
             Self::DateTime => "TimestamptzSqlite",
+            // `NaiveTime` -> core `Time` (diesel's sqlite+chrono conversion).
+            Self::Time => "Time",
             Self::Bytea => "Binary",
             Self::Attachment => "Text",
             // Diesel's own `Json` sql-type — NOT `Text` (no built-in
@@ -851,6 +894,7 @@ impl FieldKind {
             | Self::Uuid
             | Self::NaiveDateTime
             | Self::DateTime
+            | Self::Time
             | Self::Bytea
             | Self::Attachment
             | Self::Json
@@ -891,6 +935,7 @@ impl FieldKind {
             Self::Uuid => "Uuid",
             Self::NaiveDateTime => "NaiveDateTime",
             Self::DateTime => "DateTime",
+            Self::Time => "time",
             Self::Bytea => "Bytea",
             Self::Attachment => "Attachment",
             Self::Json => "json",
@@ -1014,6 +1059,19 @@ impl IdType {
         }
     }
 
+    /// Rust type for the `#[id]` struct field on the target `backend`.
+    /// `SQLite` renders a UUID key as the `TEXT`-backed `SqliteUuid` newtype.
+    #[must_use]
+    pub const fn rust_type_for(self, backend: DatabaseBackend) -> &'static str {
+        match backend {
+            DatabaseBackend::Postgres => self.rust_type(),
+            DatabaseBackend::Sqlite => match self {
+                Self::BigSerial => IdKind::BigSerial.rust_type_for(Backend::Sqlite),
+                Self::Uuid => IdKind::Uuid.rust_type_for(Backend::Sqlite),
+            },
+        }
+    }
+
     /// Diesel `table!` schema type token.
     #[must_use]
     pub const fn schema_type(self) -> &'static str {
@@ -1037,15 +1095,17 @@ impl IdType {
     ///
     /// - `BigSerial` -> `INTEGER PRIMARY KEY AUTOINCREMENT` — an alias of the
     ///   `rowid` that never reuses a freed value (`SQLite` has no `BIGSERIAL`).
-    /// - `Uuid` -> `TEXT PRIMARY KEY` — `SQLite` has no `uuid` type nor a
-    ///   `gen_random_uuid()` default, so the application supplies the id.
+    /// - `Uuid` -> `TEXT PRIMARY KEY NOT NULL DEFAULT (<v4 expression>)` —
+    ///   `SQLite` has no `uuid` type nor `gen_random_uuid()`, so the default is a
+    ///   `randomblob` expression. The database generates the id, as on Postgres,
+    ///   and the column rejects `NULL`.
     #[must_use]
     pub const fn pk_sql_for(self, backend: DatabaseBackend) -> &'static str {
         match backend {
             DatabaseBackend::Postgres => self.pk_sql(),
             DatabaseBackend::Sqlite => match self {
                 Self::BigSerial => "INTEGER PRIMARY KEY AUTOINCREMENT",
-                Self::Uuid => "TEXT PRIMARY KEY",
+                Self::Uuid => IdKind::Uuid.pk_sql(Backend::Sqlite),
             },
         }
     }
@@ -1111,8 +1171,9 @@ impl IdType {
 
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
-    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
+    Uuid, NaiveDateTime, DateTime, time, Vec<u8>, Bytea, Attachment, json (alias jsonb), \
+    references, phone (alias tel), color, money, enum{a,b,…}, decimal{precision,scale}, \
+    slug{from:col}, position (optionally \
     position{scope:col}), commentable, Option<…>, :unique, String{encrypted}, \
     String{encrypted:deterministic}, String{translatable}";
 
@@ -1122,13 +1183,15 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 /// complement is every kind, so this mirrors [`SUPPORTED_TYPES`]; it is still
 /// the message a future unconvertible kind would be reported against.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
-    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, json (alias jsonb), references, \
-    enum{a,b,…}, decimal{precision,scale}, slug{from:col}, position (optionally \
+    Uuid, NaiveDateTime, DateTime, time, Vec<u8>, Bytea, Attachment, json (alias jsonb), \
+    references, phone (alias tel), color, money, enum{a,b,…}, decimal{precision,scale}, \
+    slug{from:col}, position (optionally \
     position{scope:col}), commentable, Option<…>, :unique";
 
-/// The Rust type a `Uuid` field renders as on `SQLite` — `autumn-web`'s
-/// `TEXT`-backed newtype (issue #1924). See [`FieldKind::rust_type_for`].
-pub const SQLITE_UUID_RUST_TYPE: &str = "autumn_web::db::sqlite_types::SqliteUuid";
+/// The Rust type a `Uuid` field renders as on `SQLite` (`autumn-web`'s
+/// `TEXT`-backed newtype, issue #1924), and the SQL that builds a v4 UUID there
+/// (issue #2555). See [`FieldKind::rust_type_for`] and [`IdType::pk_sql_for`].
+pub use autumn_schema_core::{SQLITE_UUID_RUST_TYPE, SQLITE_UUID_V4_SQL};
 
 /// The Rust type a `decimal{p,s}` field renders as on `SQLite` — `autumn-web`'s
 /// `TEXT`-backed newtype (issue #1924). See [`FieldKind::rust_type_for`].
@@ -1137,7 +1200,7 @@ pub const SQLITE_DECIMAL_RUST_TYPE: &str = "autumn_web::db::sqlite_types::Sqlite
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
 pub const SQL_SUPPORTED_TYPES: &str = "text, varchar, bpchar (-> String), int4 (-> i32), \
-    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, bytea";
+    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, time, bytea";
 
 /// Inverse of [`FieldKind::sql_type`] / [`FieldKind::schema_type`]: map a
 /// Postgres `udt_name` (the concrete catalog type identifier such as `int4`,
@@ -1171,6 +1234,7 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
         "uuid" => Some(FieldKind::Uuid),
         "timestamp" => Some(FieldKind::NaiveDateTime),
         "timestamptz" => Some(FieldKind::DateTime),
+        "time" => Some(FieldKind::Time),
         "bytea" => Some(FieldKind::Bytea),
         // `jsonb` is intentionally unsupported: although the DSL maps
         // `Attachment` -> `JSONB`, the inverse is ambiguous. A brownfield
@@ -1345,6 +1409,42 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
                  constraints go in a trailing `{{…}}` block (e.g. 'title:String{{min=3,max=120}}')",
                 bad.trim()
             ),
+        });
+    }
+
+    // phone / color (issue #3405): a `String` column with its own form
+    // control. They take no `{…}` block: use `String{…}` for constraints.
+    if let Some((widget, nullable)) = parse_string_widget(base_ty) {
+        // A color input always posts a value, so a form cannot keep NULL.
+        if widget == StringWidget::Color && nullable {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: "`color` cannot be `Option<…>`: a color input always posts a value, \
+                         so the form cannot keep NULL. Use `Option<String>` for an optional color"
+                    .to_owned(),
+            });
+        }
+        if modifier_body.is_some() || state_machine.is_some() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: format!(
+                    "`{}` takes no `{{…}}` modifier and no `:states(…)`; use `String{{…}}` \
+                     for a constrained text column",
+                    widget.dsl_token()
+                ),
+            });
+        }
+        return Ok(Field {
+            name: name.to_owned(),
+            kind: FieldKind::String,
+            nullable,
+            variants: Vec::new(),
+            unique,
+            constraints: FieldConstraints {
+                widget: Some(widget),
+                ..FieldConstraints::default()
+            },
+            state_machine: None,
         });
     }
 
@@ -2271,7 +2371,7 @@ fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
 /// than `rust_decimal` can hold would compile and migrate cleanly, then fail
 /// at runtime the first time a value actually needing that extra precision
 /// is deserialized into the generated `#[model]` field.
-const MAX_DECIMAL_PRECISION: u32 = 28;
+pub const MAX_DECIMAL_PRECISION: u32 = 28;
 
 /// Parse a `decimal` (optionally `Option<decimal>`) type token, with an
 /// optional `{precision,scale}` modifier (`decimal{10,2}`). Accepts both
@@ -2298,6 +2398,18 @@ fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
     // future refactor) — see the shell-brace-expansion hint below, which
     // depends on `body` ending exactly at `}` with no trailing whitespace.
     let body = body.trim();
+
+    // money (issue #3405): an exact `NUMERIC(12,2)`, the same column as a
+    // bare `decimal`. Use `decimal{p,s}` for another precision or scale.
+    if matches!(body, "money" | "Money") {
+        return Ok(Some((12, 2, nullable)));
+    }
+    if body.starts_with("money{") || body.starts_with("Money{") {
+        return Err(format!(
+            "`money` takes no modifier; use decimal{{precision,scale}} for another \
+             precision or scale, e.g. 'price:decimal{{19,4}}'. Supported: {SUPPORTED_TYPES}"
+        ));
+    }
 
     let Some(rest) = body
         .strip_prefix("decimal")
@@ -2637,6 +2749,8 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         "Uuid" => Some(FieldKind::Uuid),
         "NaiveDateTime" => Some(FieldKind::NaiveDateTime),
         "DateTime" => Some(FieldKind::DateTime),
+        // time (issue #3405): a time of day, `chrono::NaiveTime`.
+        "time" | "Time" | "NaiveTime" => Some(FieldKind::Time),
         "Bytea" => Some(FieldKind::Bytea),
         // Attachment / attachment: file-attachment blob stored as JSONB.
         // Accept both casing variants so `cover_image:Attachment` and
@@ -2675,6 +2789,17 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
             })
         }
     }
+}
+
+/// A `phone`/`tel`/`color` DSL type, bare or in `Option<…>` (issue #3405).
+fn parse_string_widget(ty: &str) -> Option<(StringWidget, bool)> {
+    let (inner, nullable) = strip_wrapper(ty, "Option").map_or((ty, false), |t| (t.trim(), true));
+    let widget = match inner {
+        "phone" | "Phone" | "tel" | "Tel" => StringWidget::Tel,
+        "color" | "Color" => StringWidget::Color,
+        _ => return None,
+    };
+    Some((widget, nullable))
 }
 
 fn strip_wrapper<'a>(ty: &'a str, wrapper: &str) -> Option<&'a str> {
@@ -3056,7 +3181,19 @@ mod tests {
         );
         assert_eq!(
             IdType::Uuid.pk_sql_for(DatabaseBackend::Sqlite),
-            "TEXT PRIMARY KEY"
+            format!("TEXT PRIMARY KEY NOT NULL DEFAULT ({SQLITE_UUID_V4_SQL})")
+        );
+        assert_eq!(
+            IdType::Uuid.rust_type_for(DatabaseBackend::Sqlite),
+            SQLITE_UUID_RUST_TYPE
+        );
+        assert_eq!(
+            IdType::Uuid.rust_type_for(DatabaseBackend::Postgres),
+            "uuid::Uuid"
+        );
+        assert_eq!(
+            IdType::BigSerial.rust_type_for(DatabaseBackend::Sqlite),
+            "i64"
         );
         // Postgres primary keys stay byte-for-byte identical.
         assert_eq!(
@@ -3106,9 +3243,10 @@ mod tests {
 
     #[test]
     fn unknown_type_rejected() {
-        let err = parse_field("price:Money").unwrap_err();
+        // `money` is a kind since #3405, so the example is `Currency`.
+        let err = parse_field("price:Currency").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Money"));
+        assert!(msg.contains("Currency"));
         assert!(msg.contains("Supported:"));
     }
 
@@ -3634,6 +3772,107 @@ mod tests {
     #[test]
     fn json_dsl_token_is_json() {
         assert_eq!(FieldKind::Json.dsl_token(), "json");
+    }
+
+    // ── Native control kinds (issue #3405) ──────────────────────────────
+
+    #[test]
+    fn time_kind_is_a_naive_time_column_on_both_backends() {
+        for token in ["opens:time", "opens:Time", "opens:NaiveTime"] {
+            let f = parse_field(token).unwrap();
+            assert_eq!(f.kind, FieldKind::Time, "{token}");
+            assert!(!f.nullable, "{token}");
+        }
+        let f = parse_field("opens:time").unwrap();
+        assert_eq!(f.rust_type(), "chrono::NaiveTime");
+        assert_eq!(f.schema_type(), "Time");
+        assert_eq!(f.sql_column_type_for(DatabaseBackend::Postgres), "TIME");
+        assert_eq!(f.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
+        assert_eq!(f.schema_type_for(DatabaseBackend::Sqlite), "Time");
+        assert!(FieldKind::Time.sqlite_has_diesel_conversion());
+        assert_eq!(FieldKind::Time.dsl_token(), "time");
+
+        let f = parse_field("closes:Option<time>").unwrap();
+        assert_eq!(f.kind, FieldKind::Time);
+        assert!(f.nullable);
+        assert_eq!(f.rust_type(), "Option<chrono::NaiveTime>");
+        assert_eq!(sql_type_to_field_kind("time"), Some(FieldKind::Time));
+    }
+
+    #[test]
+    fn phone_and_color_are_string_columns_with_a_widget() {
+        for (token, widget) in [
+            ("mobile:phone", StringWidget::Tel),
+            ("mobile:Phone", StringWidget::Tel),
+            ("mobile:tel", StringWidget::Tel),
+            ("accent:color", StringWidget::Color),
+            ("accent:Color", StringWidget::Color),
+        ] {
+            let f = parse_field(token).unwrap();
+            assert_eq!(f.kind, FieldKind::String, "{token}");
+            assert_eq!(f.constraints.widget, Some(widget), "{token}");
+            assert_eq!(f.rust_type(), "String", "{token}");
+            assert_eq!(f.sql_column_type_for(DatabaseBackend::Postgres), "TEXT");
+            // A widget is not a constraint: no `#[validate]` rule.
+            assert!(f.constraints.is_empty(), "{token}");
+            assert!(f.validation_attrs().is_empty(), "{token}");
+        }
+        let f = parse_field("fax:Option<phone>").unwrap();
+        assert!(f.nullable);
+        assert_eq!(f.constraints.widget, Some(StringWidget::Tel));
+        assert_eq!(f.rust_type(), "Option<String>");
+        let f = parse_field("mobile:phone:unique").unwrap();
+        assert!(f.unique);
+        // A color input always posts a value, so the column cannot be NULL.
+        let err = parse_field("accent:Option<color>").unwrap_err().to_string();
+        assert!(err.contains("Option<String>"), "{err}");
+    }
+
+    #[test]
+    fn phone_and_color_reject_modifier_blocks() {
+        for token in [
+            "mobile:phone{max=20}",
+            "accent:color{min=7}",
+            "mobile:phone:states(a -> b)",
+        ] {
+            let err = parse_field(token).unwrap_err().to_string();
+            assert!(err.contains("takes no"), "{token}: {err}");
+        }
+    }
+
+    #[test]
+    fn money_is_a_decimal_12_2_alias() {
+        for token in ["price:money", "price:Money"] {
+            let f = parse_field(token).unwrap();
+            assert_eq!(
+                f.kind,
+                FieldKind::Decimal {
+                    precision: 12,
+                    scale: 2
+                },
+                "{token}"
+            );
+            assert_eq!(
+                f.sql_column_type_for(DatabaseBackend::Postgres),
+                "NUMERIC(12,2)"
+            );
+        }
+        let f = parse_field("tip:Option<money>").unwrap();
+        assert!(f.nullable);
+        let err = parse_field("price:money{10,2}").unwrap_err().to_string();
+        assert!(err.contains("decimal{precision,scale}"), "{err}");
+        // A typo is an unknown type, not a `money` modifier error.
+        let err = parse_field("price:moneys").unwrap_err().to_string();
+        assert!(err.contains("unsupported type 'moneys'"), "{err}");
+    }
+
+    #[test]
+    fn native_control_kinds_appear_in_supported_types() {
+        for kind in ["time", "phone", "tel", "color", "money"] {
+            assert!(SUPPORTED_TYPES.contains(kind), "{kind}");
+            assert!(SQLITE_SUPPORTED_KINDS.contains(kind), "{kind}");
+        }
+        assert!(SQL_SUPPORTED_TYPES.contains(", time,"));
     }
 
     #[test]

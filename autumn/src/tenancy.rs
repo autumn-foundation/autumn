@@ -6,6 +6,7 @@ use axum::{
 };
 use http_body::Body as HttpBody;
 use pin_project_lite::pin_project;
+#[cfg(feature = "jwt")]
 use secrecy::ExposeSecret;
 use std::future::Future;
 use std::pin::Pin;
@@ -39,11 +40,13 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
             .ok_or_else(|| {
                 crate::AutumnError::service_unavailable_msg("Config is not available")
             })?;
+        #[cfg(feature = "custom-domains")]
         let domains =
             state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
-        let tenant_id = extract_tenant_from_parts_with_domains(
+        let tenant_id = extract_tenant_impl(
             parts,
             &config,
+            #[cfg(feature = "custom-domains")]
             domains.as_deref().map(AsRef::as_ref),
         )
         .await?;
@@ -90,7 +93,13 @@ pub async fn extract_tenant_from_parts(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {
-    extract_tenant_from_parts_with_domains(parts, config, None).await
+    extract_tenant_impl(
+        parts,
+        config,
+        #[cfg(feature = "custom-domains")]
+        None,
+    )
+    .await
 }
 
 /// [`extract_tenant_from_parts`], plus the custom-domain registry (#1635).
@@ -113,10 +122,19 @@ pub async fn extract_tenant_from_parts(
 ///
 /// Returns the same rejection as [`extract_tenant_from_parts`] when the
 /// configured source cannot resolve a tenant.
+#[cfg(feature = "custom-domains")]
 pub async fn extract_tenant_from_parts_with_domains(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
     domains: Option<&crate::custom_domain::CustomDomainRegistry>,
+) -> Result<String, crate::AutumnError> {
+    extract_tenant_impl(parts, config, domains).await
+}
+
+async fn extract_tenant_impl(
+    parts: &mut axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+    #[cfg(feature = "custom-domains")] domains: Option<&crate::custom_domain::CustomDomainRegistry>,
 ) -> Result<String, crate::AutumnError> {
     let replayed = replayed_tenant();
     match &replayed {
@@ -138,6 +156,7 @@ pub async fn extract_tenant_from_parts_with_domains(
     // credential the client cannot forge, and letting a connected `Host`
     // outrank it would let any authenticated user reach another tenant's data
     // by setting one header.
+    #[cfg(feature = "custom-domains")]
     if config.tenancy.enabled
         && config.tenancy.source == "subdomain"
         && let Some(registry) = domains
@@ -417,6 +436,14 @@ async fn extract_tenant_from_parts_inner(
             }
             Ok(tenant)
         }
+        // Fail closed: without `jsonwebtoken` the token cannot be verified,
+        // and an unverified claim must never pick the tenant. `run` refuses
+        // this config at boot; this arm covers a router built without `run`.
+        #[cfg(not(feature = "jwt"))]
+        "jwt" => Err(crate::AutumnError::internal_server_error_msg(
+            crate::config::JWT_FEATURE_MISSING,
+        )),
+        #[cfg(feature = "jwt")]
         "jwt" => {
             let auth_header = parts
                 .headers
@@ -704,32 +731,38 @@ pub async fn tenancy_middleware(
         return next.run(Request::from_parts(parts, body)).await;
     }
 
+    #[cfg(feature = "custom-domains")]
     let domains = crate::custom_domain::CustomDomainRegistry::from_state(&state);
-    let tenant_id =
-        match extract_tenant_from_parts_with_domains(&mut parts, &config, domains.as_deref()).await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                // For browser logins, bounce a missing/unauthenticated tenant to the
-                // configured login page instead of returning a raw 401. Only do this
-                // for clients that accept HTML (navigating browsers): API clients
-                // (e.g. `Accept: application/json`) expect the 401 so their error
-                // handling isn't broken by a 303 to a login page. Other error classes
-                // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
-                // are not masked as login redirects.
-                if e.status() == axum::http::StatusCode::UNAUTHORIZED
-                    && let Some(target) = &config.tenancy.login_redirect
-                    && parts
-                        .headers
-                        .get(axum::http::header::ACCEPT)
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|accept| accept.contains("text/html"))
-                {
-                    return axum::response::Redirect::to(target).into_response();
-                }
-                return e.into_response();
+    let tenant_id = match extract_tenant_impl(
+        &mut parts,
+        &config,
+        #[cfg(feature = "custom-domains")]
+        domains.as_deref(),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            // For browser logins, bounce a missing/unauthenticated tenant to the
+            // configured login page instead of returning a raw 401. Only do this
+            // for clients that accept HTML (navigating browsers): API clients
+            // (e.g. `Accept: application/json`) expect the 401 so their error
+            // handling isn't broken by a 303 to a login page. Other error classes
+            // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
+            // are not masked as login redirects.
+            if e.status() == axum::http::StatusCode::UNAUTHORIZED
+                && let Some(target) = &config.tenancy.login_redirect
+                && parts
+                    .headers
+                    .get(axum::http::header::ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|accept| accept.contains("text/html"))
+            {
+                return axum::response::Redirect::to(target).into_response();
             }
-        };
+            return e.into_response();
+        }
+    };
 
     // Tag the request-scoped log context (#1169) so every subsequent event
     // automatically carries the resolved tenant id.
@@ -1144,6 +1177,15 @@ mod tests {
         let config = subdomain_config();
         let mut parts = make_parts("tenant1.example.com");
         let result = extract_tenant_from_parts(&mut parts, &config).await;
+        assert_eq!(result.unwrap(), "tenant1");
+    }
+
+    #[cfg(feature = "custom-domains")]
+    #[tokio::test]
+    async fn the_domain_aware_entry_point_matches_the_plain_one_without_a_registry() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let result = extract_tenant_from_parts_with_domains(&mut parts, &config, None).await;
         assert_eq!(result.unwrap(), "tenant1");
     }
 

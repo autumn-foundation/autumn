@@ -33,7 +33,6 @@ use diesel_migrations::FileBasedMigrations;
 use serde::Serialize;
 
 use super::diff::{DiffOptions, MigrationPlan, SchemaChange, diff_schema};
-use super::introspect::introspect_postgres;
 #[cfg(feature = "sqlite")]
 use super::introspect::introspect_sqlite;
 use super::parse::{ParsedSchema, parse_models_path};
@@ -446,9 +445,13 @@ fn gather_db_facts(
     };
     let backend = local.detected_backend;
     match backend {
-        Backend::Postgres => gather_db_facts_with(project_root, &url, backend, introspect_postgres),
+        Backend::Postgres => gather_db_facts_with(project_root, &url, backend, |u, schemas| {
+            super::introspect::introspect_postgres_in(u, schemas)
+        }),
         #[cfg(feature = "sqlite")]
-        Backend::Sqlite => gather_db_facts_with(project_root, &url, backend, introspect_sqlite),
+        Backend::Sqlite => {
+            gather_db_facts_with(project_root, &url, backend, |u, _| introspect_sqlite(u))
+        }
         // On a default (Postgres-only) build the SQLite arm is not compiled, so a
         // SQLite backend is skipped rather than failing doctor — introspection is
         // Postgres-only on this build.
@@ -475,7 +478,7 @@ fn gather_db_facts_with(
     project_root: &Path,
     url: &str,
     backend: Backend,
-    introspect: impl Fn(&str) -> Result<Vec<Table>, super::introspect::IntrospectError>,
+    introspect: impl Fn(&str, &[String]) -> Result<Vec<Table>, super::introspect::IntrospectError>,
 ) -> (DbSchemaState, UnmanagedState) {
     let snapshot = load_snapshot(&project_root.join(SNAPSHOT_DEFAULT_PATH)).ok();
     let (models, models_error) = match super::existing_models_path(project_root)
@@ -491,7 +494,14 @@ fn gather_db_facts_with(
             models_error.unwrap_or(UnmanagedState::NoUnmanaged),
         );
     }
-    let read = introspect(url).map_err(|e| e.to_string()); // credential-safe
+    // Read the schemas that the snapshot and the models name.
+    let schemas = super::table_schemas(
+        snapshot
+            .iter()
+            .flat_map(|s| s.tables.iter())
+            .chain(models.iter().flat_map(|m| m.tables.iter())),
+    );
+    let read = introspect(url, &schemas).map_err(|e| e.to_string()); // credential-safe
     let schema = match (&snapshot, &read) {
         (None, _) => DbSchemaState::SnapshotMissing,
         (Some(_), Err(e)) => DbSchemaState::Unreachable(e.clone()),
@@ -1096,7 +1106,7 @@ mod tests {
         assert!(finish(&checks).is_ok());
     }
 
-    /// Finding 3 (#2036): the SELECTED profile's backend must flow into the
+    /// #2036: the SELECTED profile's backend must flow into the
     /// checks. When `gather_local_facts` resolves the requested profile's backend
     /// to Sqlite (from its database URL), a Sqlite-tagged snapshot must NOT trip a
     /// false `provider-lock` ERROR — even though the ambient project default is
@@ -1183,7 +1193,7 @@ mod tests {
         assert_eq!(snap.status, Status::Error, "{snap:?}");
     }
 
-    /// Finding 1 (connectivity false-positive): a MISSING migrations dir must not
+    /// Connectivity false-positive: a MISSING migrations dir must not
     /// short-circuit `probe_pending` to `Reachable(empty)` — with a configured URL
     /// the probe must still attempt a connection, so an offline/misconfigured
     /// database surfaces as `Unreachable` (a WARN) rather than a false "database is
@@ -1673,7 +1683,7 @@ mod tests {
         let unmanaged = POST_MODEL.replace("model(managed)", "model");
         let root = scaffold(&unmanaged, None);
         let (schema, models) =
-            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
+            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_, _| {
                 Ok(Vec::new())
             });
         assert_eq!(schema, DbSchemaState::SnapshotMissing);
@@ -1687,14 +1697,14 @@ mod tests {
 
         let root = scaffold(&unmanaged, Some(&posts_snapshot("Postgres")));
         let (schema, models) =
-            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
+            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_, _| {
                 Ok(vec![db_posts()])
             });
         assert_eq!(schema, DbSchemaState::Clean);
         assert_eq!(models, UnmanagedState::Checked(UnmanagedDrift::default()));
 
         let (schema, models) =
-            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
+            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_, _| {
                 Err(crate::schema::introspect::IntrospectError::Query(
                     "refused".to_owned(),
                 ))
@@ -1711,7 +1721,7 @@ mod tests {
         // No snapshot and no unmanaged model: no connection at all.
         let root = scaffold(POST_MODEL, None);
         let (schema, models) =
-            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
+            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_, _| {
                 panic!("must not connect")
             });
         assert_eq!(schema, DbSchemaState::SnapshotMissing);
@@ -1779,7 +1789,7 @@ mod tests {
         let unmanaged = POST_MODEL.replace("model(managed)", "model");
         let root = scaffold(&unmanaged, None);
         let (schema, _) =
-            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
+            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_, _| {
                 Err(crate::schema::introspect::IntrospectError::Query(
                     "refused".to_owned(),
                 ))
@@ -1789,7 +1799,7 @@ mod tests {
         // Models that do not parse are a WARN, not an OK.
         let root = scaffold("pub struct {", Some(&posts_snapshot("Postgres")));
         let (_, models) =
-            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
+            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_, _| {
                 Ok(vec![db_posts()])
             });
         assert!(

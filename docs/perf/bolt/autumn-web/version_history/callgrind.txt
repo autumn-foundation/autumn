@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/version_history
+# unit: whole process
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+     463,298,880   20.4%  _int_free
+     304,210,907   13.4%  malloc
+     213,932,240    9.4%  free
+     209,187,000    9.2%  <alloc::string::String as core::clone::Clone>::clone
+     128,474,873    5.7%  _int_malloc
+     116,800,730    5.1%  <alloc::collections::btree::map::IntoIter>::dying_next
+     113,643,000    5.0%  autumn_web::version_history::compute_diff
+     105,737,430    4.7%  core::ptr::drop_glue
+     100,786,000    4.4%  <core::iter::adapters::map::Map as core::iter::traits::iterator::Iterator>::next
+      99,520,000    4.4%  <alloc::collections::btree::map::BTreeMap as core::clone::Clone>::clone::clone_subtree
+      86,095,469    3.8%  __memcpy_avx_unaligned_erms
+      62,109,315    2.7%  __rustc::__rdl_alloc
+      56,238,659    2.5%  __memcmp_avx2_movbe
+      44,800,280    2.0%  <<alloc::collections::btree::node::Handle>::drop_key_val::Dropper as core::ops::drop::Drop>::drop
+      39,767,000    1.7%  <alloc::collections::btree::map::Iter as core::iter::traits::iterator::Iterator>::next
+      35,742,000    1.6%  <alloc::vec::Vec as alloc::vec::spec_from_iter_nested::SpecFromIterNested>::from_iter
+      26,202,000    1.2%  <alloc::vec::Vec as core::ops::drop::Drop>::drop
+      13,446,000    0.6%  <serde_json::value::Value as core::cmp::PartialEq>::eq
+       6,901,035    0.3%  __rustc::__rust_alloc
+       6,901,035    0.3%  __rustc::__rust_no_alloc_shim_is_unstable_v2
+       6,901,034    0.3%  __rustc::__rdl_dealloc
+       6,901,034    0.3%  __rustc::__rust_dealloc
+       6,800,000    0.3%  version_history::main::{closure#0}
+       3,760,000    0.2%  version_history::main::{closure#2}
+       3,760,000    0.2%  version_history::main::{closure#4}
+       3,240,195    0.1%  <alloc::raw_vec::RawVecInner>::finish_grow
+       2,511,000    0.1%  autumn_web::version_history::compute_insert_changes
+       2,480,000    0.1%  autumn_web::version_history::compute_delete_changes
+       1,944,042    0.1%  <alloc::raw_vec::RawVec>::grow_one
+       1,006,736    0.0%  version_history::main
+
+   2,273,525,240  100.0%  TOTAL

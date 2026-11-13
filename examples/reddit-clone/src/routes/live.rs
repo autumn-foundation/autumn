@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 /// a new post or comment is created anywhere on the site. The
 /// pre-upgrade function captures `AppState` for channel access;
 /// the returned closure owns the live socket.
+#[public]
 #[ws("/ws/feed")]
 pub async fn live_feed(state: AppState) -> impl WsHandler {
     let channels = state.channels().clone();
@@ -53,6 +54,7 @@ pub async fn live_feed(state: AppState) -> impl WsHandler {
 /// Operators can poll this endpoint to see which wake path the process is
 /// currently using, whether reconnect attempts are happening, and whether the
 /// relay has recently replayed durable events.
+#[public]
 #[get("/api/live/relay/health")]
 pub async fn live_feed_health(
     State(state): State<AppState>,
@@ -70,6 +72,7 @@ pub async fn live_feed_health(
 ///
 /// Clients connect to `/ws/r/{slug}` and receive JSON notifications
 /// for posts and comments in that community only.
+#[public]
 #[ws("/ws/r/{slug}")]
 pub async fn subreddit_feed(
     slug: autumn_web::extract::Path<String>,
@@ -113,6 +116,7 @@ pub async fn subreddit_feed(
 /// ```bash
 /// curl http://localhost:3000/api/r/rust/viewers
 /// ```
+#[public]
 #[get("/api/r/{slug}/viewers")]
 pub async fn subreddit_viewers(
     presence: Presence,
@@ -128,6 +132,7 @@ pub async fn subreddit_viewers(
 ///
 /// Connect by adding `hx-ext="sse" sse-connect="/r/{slug}/viewers/stream"`
 /// to a container element and `sse-swap="viewer-count"` on the badge.
+#[public]
 #[get("/r/{slug}/viewers/stream")]
 pub async fn subreddit_viewer_stream(
     State(state): State<AppState>,
@@ -205,6 +210,7 @@ pub async fn subreddit_viewer_stream(
 /// </ul>
 /// ```
 /// Each arriving fragment patches the matching `#post-{id}` element in place.
+#[public]
 #[get("/posts/stream")]
 pub async fn posts_stream(
     State(state): State<AppState>,
@@ -213,6 +219,7 @@ pub async fn posts_stream(
 }
 
 /// SSE endpoint for subreddit-specific post OOB updates.
+#[public]
 #[get("/r/{slug}/posts/stream")]
 pub async fn subreddit_posts_stream(
     State(state): State<AppState>,

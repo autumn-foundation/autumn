@@ -42,7 +42,7 @@
 use std::fmt::Write as _;
 
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike as _, Timelike as _, Utc};
 use http::header::CONTENT_TYPE;
 
 use crate::etag::{ETag, fresh_when, hash_etag};
@@ -274,7 +274,7 @@ impl Feed {
             &self.self_link,
             "\" rel=\"self\" type=\"application/atom+xml\"/>\n",
         );
-        writeln!(s, "  <updated>{}</updated>", rfc3339(updated)).unwrap();
+        push_rfc3339(&mut s, "  <updated>", updated, "</updated>\n");
         // Atom requires a feed-level author unless every entry has one; default
         // to the feed title so the feed is always valid.
         let author = self.author.as_deref().unwrap_or(&self.title);
@@ -287,9 +287,9 @@ impl Feed {
             push_escaped(&mut s, "    <id>", &e.id, "</id>\n");
             push_escaped(&mut s, "    <link href=\"", &e.link, "\"/>\n");
             let entry_updated = e.updated.or(e.published).unwrap_or(updated);
-            writeln!(s, "    <updated>{}</updated>", rfc3339(entry_updated)).unwrap();
+            push_rfc3339(&mut s, "    <updated>", entry_updated, "</updated>\n");
             if let Some(published) = e.published {
-                writeln!(s, "    <published>{}</published>", rfc3339(published)).unwrap();
+                push_rfc3339(&mut s, "    <published>", published, "</published>\n");
             }
             if let Some(summary) = &e.summary {
                 push_escaped(&mut s, "    <summary>", summary, "</summary>\n");
@@ -431,7 +431,40 @@ fn clamp_rfc2822(dt: DateTime<Utc>) -> DateTime<Utc> {
     dt.clamp(RFC2822_MIN, DATE_MAX)
 }
 
+/// Append `prefix`, `dt` as `YYYY-MM-DDTHH:MM:SSZ`, then `suffix`. The date is
+/// clamped to years 0000–9999, so every field has a fixed width and is written
+/// straight into `out` without going through `core::fmt`.
+fn push_rfc3339(out: &mut String, prefix: &str, dt: DateTime<Utc>, suffix: &str) {
+    // The naive UTC value skips the offset arithmetic every `DateTime` accessor repeats.
+    let dt = dt.clamp(RFC3339_MIN, DATE_MAX).naive_utc();
+    let year = dt.year().unsigned_abs();
+    let mut buf = *b"0000-00-00T00:00:00Z";
+    let two = |buf: &mut [u8; 20], at: usize, v: u32| {
+        // `v` is at most 99, so both digits fit a `u8`.
+        buf[at] = b'0' + u8::try_from(v / 10).unwrap_or(0);
+        buf[at + 1] = b'0' + u8::try_from(v % 10).unwrap_or(0);
+    };
+    two(&mut buf, 0, year / 100);
+    two(&mut buf, 2, year % 100);
+    two(&mut buf, 5, dt.month());
+    two(&mut buf, 8, dt.day());
+    two(&mut buf, 11, dt.hour());
+    two(&mut buf, 14, dt.minute());
+    // A leap second is `:59` with a nanosecond field of a full second or more.
+    two(
+        &mut buf,
+        17,
+        dt.second() + u32::from(dt.nanosecond() >= 1_000_000_000),
+    );
+    out.push_str(prefix);
+    out.push_str(std::str::from_utf8(&buf).expect("ASCII digits"));
+    out.push_str(suffix);
+}
+
+/// Chrono's own formatting of the same value (test oracle).
+#[cfg(test)]
 fn rfc3339(dt: DateTime<Utc>) -> String {
+    use chrono::SecondsFormat;
     dt.clamp(RFC3339_MIN, DATE_MAX)
         .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
@@ -453,10 +486,7 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// one memcpy and no allocation of its own.
 fn escape_into(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && !NEEDS_ATTENTION[bytes[i] as usize] {
-        i += 1;
-    }
+    let mut i = skip_clean(bytes, 0);
     if i == bytes.len() {
         out.push_str(s);
         return;
@@ -467,7 +497,7 @@ fn escape_into(out: &mut String, s: &str) {
     let mut run_start = 0;
     while i < bytes.len() {
         if !NEEDS_ATTENTION[bytes[i] as usize] {
-            i += 1;
+            i = skip_clean(bytes, i + 1);
             continue;
         }
         let (replacement, len) = match bytes[i] {
@@ -489,6 +519,38 @@ fn escape_into(out: &mut String, s: &str) {
         run_start = i;
     }
     out.push_str(&s[run_start..]);
+}
+
+/// Index of the first byte at or after `from` that [`NEEDS_ATTENTION`] flags
+/// (`bytes.len()` if none). Whole 16-byte blocks are rejected with branchless
+/// compares that vectorize on baseline SSE2; the block test is conservative
+/// (it flags every byte below `0x20`, tab/newline/CR included), so a flagged
+/// block just falls through to the exact per-byte table scan.
+fn skip_clean(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while let Some(block) = bytes.get(i..i + 16) {
+        // Accumulating into a `u8` (not a `bool`) is what lets LLVM vectorize
+        // the loop. `b | 1 == 0x27` matches `&`/`'`, `b | 2 == 0x3E` matches `<`/`>`;
+        // both are exact for the two characters they name and may over-flag
+        // others, which only sends the block to the exact table scan below.
+        let mut flagged = 0u8;
+        for &b in block {
+            // Non-short-circuit `|` on purpose: branch-free is what vectorizes.
+            #[allow(clippy::needless_bitwise_bool)]
+            let hit = (b < 0x20) | (b | 1 == 0x27) | (b | 2 == 0x3E) | (b == b'"') | (b == 0xEF);
+            flagged |= u8::from(hit);
+        }
+        if flagged != 0
+            && let Some(off) = block.iter().position(|&b| NEEDS_ATTENTION[b as usize])
+        {
+            return i + off;
+        }
+        i += 16;
+    }
+    while i < bytes.len() && !NEEDS_ATTENTION[bytes[i] as usize] {
+        i += 1;
+    }
+    i
 }
 
 /// Append `prefix`, the escaped `text`, then `suffix` to `out`. Escaping in
@@ -569,6 +631,36 @@ mod proptests {
     }
 
     #[test]
+    fn escape_agrees_with_the_oracle_across_block_boundaries() {
+        // Specials at every offset around the 16-byte block size, plus tab /
+        // newline (flagged by the block test, clean per the table).
+        for len in 0..40 {
+            for special in [
+                '&', '<', '>', '"', '\'', '\u{1}', '\t', '\n', '\u{FFFE}', 'é',
+            ] {
+                for at in 0..len {
+                    let mut chars: Vec<char> = vec!['a'; len];
+                    chars[at] = special;
+                    let input: String = chars.into_iter().collect();
+                    let expected: String = input
+                        .chars()
+                        .filter(|&c| is_xml_char(c))
+                        .map(|c| match c {
+                            '&' => "&amp;".to_owned(),
+                            '<' => "&lt;".to_owned(),
+                            '>' => "&gt;".to_owned(),
+                            '"' => "&quot;".to_owned(),
+                            '\'' => "&apos;".to_owned(),
+                            c => c.to_string(),
+                        })
+                        .collect();
+                    assert_eq!(escape(&input), expected, "{input:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn escape_takes_the_fast_path_on_clean_ascii() {
         let clean = "Named futures and readable stack traces";
         assert_eq!(escape(clean), clean);
@@ -595,6 +687,37 @@ mod proptests {
         // U+FFFE is dropped by `is_xml_char`; the fast path must route any
         // non-ASCII input to the full per-char path so this still happens.
         assert_eq!(escape("café\u{FFFE}!"), "café!");
+    }
+
+    #[test]
+    fn push_rfc3339_matches_chrono() {
+        let mut secs = vec![
+            i64::MIN / 1000,
+            -62_167_219_201,
+            -62_167_219_200,
+            -1,
+            0,
+            951_782_399,
+            253_402_300_799,
+            253_402_300_800,
+        ];
+        secs.extend((0..2000).map(|i| -70_000_000_000 + i * 160_000_000));
+        for t in secs {
+            let Some(dt) = DateTime::from_timestamp(t, 0) else {
+                continue;
+            };
+            let mut out = String::new();
+            push_rfc3339(&mut out, "<a>", dt, "</a>\n");
+            assert_eq!(out, format!("<a>{}</a>\n", rfc3339(dt)), "t={t}");
+        }
+        let leap = Utc
+            .with_ymd_and_hms(2016, 12, 31, 23, 59, 59)
+            .unwrap()
+            .with_nanosecond(1_500_000_000)
+            .unwrap();
+        let mut out = String::new();
+        push_rfc3339(&mut out, "", leap, "");
+        assert_eq!(out, rfc3339(leap));
     }
 
     proptest! {

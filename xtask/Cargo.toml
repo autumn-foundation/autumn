@@ -1,0 +1,35 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+description = "Maintainer task runner for the Autumn workspace: `cargo xtask`. Never published."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Keep this list short: default features, or the smallest feature set that
+# covers the use. xtask is a workspace member, so whatever features it turns on are unified into every
+# `cargo build --workspace`. It must never depend on autumn-web, diesel or sqlx.
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# The docs gates' patterns. Already in the build through other crates.
+regex = "1"
+# Process and file helpers: `sh` (command builder, `$CARGO`) and `fs`
+# (contextual file errors, temp dirs). Only these two modules: `sh` adds no
+# dependency and `fs` adds `tempfile`, already in the build.
+# 0.3.1 for `CommandBuilder::status()`, which passes a script's exit code through.
+smop = { version = "0.3.1", default-features = false, features = ["sh", "fs"] }
+# The guide-index gate folds reference labels with full Unicode case folding
+# (`unicase`) and drops format characters by category
+# (`unicode-general-category`). Neither has dependencies, and both are
+# already in the build.
+unicase = "2.10"
+unicode-general-category = "1.1"
+# The actuator-path gate reads every crate's `readme` from its `Cargo.toml`.
+# Parsing into a `Table` only: no writer. `Table` and `Value` sit behind
+# `serde`, which adds `serde_core`; no derive.
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
+
+[lints]
+workspace = true

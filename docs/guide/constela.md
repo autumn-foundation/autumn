@@ -142,7 +142,21 @@ host page instead. A cross-document fragment (`/other#section`) is left alone;
 it points at ids this render did not write.
 
 Association inside the fragment keeps working; collision with the host page
-becomes impossible. If a page embeds more
+becomes impossible.
+
+An id must be unique in one render. If two elements get the same id, the
+render fails with `constela.duplicate`. This occurs when you use a component
+with a literal `id` two times. Validation also rejects an element with a
+literal `id` in a loop body. Give each use its own id: pass a different param
+value to each use, or set `"index": "i"` on the `each` and build the id with
+`concat`. The renderer does not rename ids. A renamed id changes when the
+document changes. Then the host page cannot find `#c-email`.
+
+An id must be one token, so a value with whitespace fails with
+`constela.eval`. `true` and `""` name no element, so the attribute is
+omitted, as for `false` and `null`.
+
+If a page embeds more
 than one document, give each its own prefix:
 
 ```rust
@@ -341,6 +355,27 @@ budget spans the body **and** every portal together, and it also caps what a
 single expression may *build* — `concat`, `array`, `obj` and string `+` assemble
 a finished value inside the evaluator before any of it reaches the output
 buffer, so bounding only the output would leave the allocation unbounded.
+
+Fuel bounds the **work** of a render. It is 320 units for each node that
+`max_nodes` allows: 16 000 000 by default. One unit pays for one node, one
+expression, or 64 bytes that a comparison, a string index, a path lookup, a
+`markdown` source or a list update reads. Nested loops multiply, and a
+comparison of two large values is one node, so the other bounds do not see
+either. A render that spends all its fuel fails with `constela.render_limit`.
+A dispatch uses the default. Paths are built only when a diagnostic is made,
+so a long name costs nothing until then.
+
+The same 4 MiB also bounds what one render *keeps*: each value an expression
+builds or copies, route metadata, handler payloads, portal targets and
+rendered ids. A dispatch always uses 4 MiB. A read that only shows a string
+does not copy it, and does not charge the budget. A copy costs about its JSON
+size, for example `set t = state(blob)`. A number or a list shown as text
+costs the text it makes. The module `constela::budget` holds this one
+budget. Each new path that keeps bytes must charge it (issue #2626).
+
+Two more bounds apply at validation. A portal `target` is at most 256 bytes. A
+failed validation reports at most 256 faults (`MAX_DIAGNOSTICS`), and then one
+`constela.limit` diagnostic. Fix these and validate again to see the rest.
 
 `max_depth` caps the shape of state as well as the depth of the view. Every
 state mutation is checked, not only `setPath`: state persists between

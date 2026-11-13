@@ -85,6 +85,10 @@
 //! accepts `id` or `created_at`; without an explicit `sort=` the feed returns
 //! newest-first. Unknown filters and sort keys are ignored, matching the
 //! repository `list()` contract.
+//!
+//! The migration from `autumn generate notifications` indexes the default
+//! order and the unread rows. The `created_at` order has no index by default.
+//! See the "Indexes" section of `docs/guide/notifications.md`.
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -813,7 +817,7 @@ mod db_store {
         if message.contains("tenant_id") && message.contains("column") {
             return NotificationStoreError::new(format!(
                 "query failed: {e}. The `notifications` table has no `tenant_id` column — \
-                 see docs/migrations/next.md"
+                 see docs/migrations/0.9.0.md"
             ));
         }
         if message.contains("does not exist") || message.contains("no such table") {

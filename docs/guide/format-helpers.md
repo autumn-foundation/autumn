@@ -18,6 +18,7 @@ no extra imports are needed beyond the usual `use autumn_web::prelude::*;`.
 | `number_to_currency(price)` | `$1,234.50` |
 | `CurrencyOptions::new().symbol("€")...format(price)` | `€1.234,50` |
 | `number_with_delimiter(count)` | `1,234,567` |
+| `number_to_human_size(bytes)` | `1.5 KB` / `3 MB` |
 | `pluralize(count, "comment")` | `1 comment` / `2 comments` |
 | `pluralize_with(count, "octopus", "octopi")` | `1 octopus` / `2 octopi` |
 | `truncate(text, 30)` | `The quick brown fox jumps ov…` |
@@ -80,6 +81,9 @@ let opts = CurrencyOptions::new()
 let price: Decimal = "1234.5".parse().unwrap();
 assert_eq!(opts.format(price).into_string(), "€1.234,50");
 ```
+
+`precision` accepts up to 28 places, the most a `Decimal` can hold. A larger
+value is treated as 28.
 
 ## Pluralize and truncate escape hatches
 

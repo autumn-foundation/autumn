@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/throttle_check
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+          19,691   19.6%  __memcpy_avx_unaligned_erms
+           7,878    7.8%  _int_free
+           6,470    6.4%  core::ptr::drop_glue
+           6,209    6.2%  _int_malloc
+           5,994    6.0%  malloc
+           4,123    4.1%  free
+           2,805    2.8%  <autumn_web::state::AppState as core::clone::Clone>::clone
+           1,972    2.0%  <tower::util::map_future::MapFuture as tower::util::boxed_clone_sync::CloneService>::clone_box
+           1,747    1.7%  autumn_web::aeo::negotiate::split_unquoted
+           1,420    1.4%  <core::iter::adapters::map::Map as core::iter::traits::iterator::Iterator>::next
+           1,269    1.3%  <tokio::task::task_local::TaskLocalFuture as core::future::future::Future>::poll
+           1,209    1.2%  malloc_consolidate
+           1,197    1.2%  __rustc::__rdl_alloc
+           1,064    1.1%  <http::header::map::HeaderMap>::try_insert2
+             990    1.0%  <hashbrown::map::HashMap>::insert
+             939    0.9%  <core::hash::sip::Hasher as core::hash::Hasher>::write
+             910    0.9%  <tokio::task::task_local::LocalKey>::sync_scope
+             808    0.8%  http::header::map::hash_elem_using
+             791    0.8%  <alloc::raw_vec::RawVecInner>::finish_grow
+             787    0.8%  <tower::util::either::Either as core::clone::Clone>::clone
+             781    0.8%  unlink_chunk.isra.0
+             701    0.7%  <hashbrown::raw::RawTable>::reserve_rehash
+             698    0.7%  <alloc::string::String as core::fmt::Write>::write_str
+             679    0.7%  <throttle_check::throttled as axum::handler::Handler>::call::{closure#0}
+             663    0.7%  <autumn_web::test::RequestBuilder>::send::{closure#0}
+             618    0.6%  <autumn_web::middleware::access_log::AccessLogService as tower_service::Service>::call
+             614    0.6%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one
+             590    0.6%  <autumn_web::session::SessionService as core::clone::Clone>::clone
+             576    0.6%  <alloc::vec::Vec as core::clone::Clone>::clone
+             490    0.5%  <autumn_web::router::TrustedHostService as core::clone::Clone>::clone
+
+         100,551  100.0%  TOTAL

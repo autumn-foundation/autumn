@@ -812,7 +812,7 @@ mod db_store {
         if message.contains("tenant_id") && message.contains("column") {
             return PushError::Store(format!(
                 "query failed: {e}. The `{PUSH_SUBSCRIPTIONS_TABLE}` table has no `tenant_id` \
-                 column — see docs/migrations/next.md"
+                 column — see docs/migrations/0.9.0.md"
             ));
         }
         if message.contains("does not exist") || message.contains("no such table") {
@@ -1048,6 +1048,40 @@ mod db_store {
             let usable = usable_subscriptions("1", rows);
             assert_eq!(usable.len(), 1);
             assert_eq!(usable[0].endpoint(), "https://push.example.com/ok");
+        }
+
+        fn store_message(sql_error: &str) -> String {
+            let error = diesel::result::Error::QueryBuilderError(sql_error.into());
+            match store_err(&error) {
+                PushError::Store(message) => message,
+                other => panic!("expected PushError::Store, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_table_without_tenant_id_points_at_the_migration_guide() {
+            let message = store_message(r#"column "tenant_id" does not exist"#);
+            assert!(message.contains("has no `tenant_id` column"), "{message}");
+            assert!(message.contains("docs/migrations/0.9.0.md"), "{message}");
+            assert!(
+                !message.contains("autumn generate pwa"),
+                "the table exists, so scaffolding it again is the wrong advice: {message}"
+            );
+        }
+
+        #[test]
+        fn a_missing_table_points_at_the_scaffold() {
+            let message = store_message(r#"relation "push_subscriptions" does not exist"#);
+            assert!(message.contains("table is missing"), "{message}");
+            assert!(message.contains("autumn generate pwa"), "{message}");
+        }
+
+        #[test]
+        fn any_other_error_is_passed_through() {
+            assert_eq!(
+                store_message("connection reset"),
+                "query failed: connection reset"
+            );
         }
 
         #[test]

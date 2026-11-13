@@ -200,7 +200,7 @@ async fn schema_migrate_applies_generated_migration_and_leaves_snapshot_untouche
     );
     assert_no_secret_leak(&doc_out, &doc_err);
 
-    // 6. Finding 1 (#2036): introduce a NEW, ungenerated model change (add `body`)
+    // 6. #2036: introduce a NEW, ungenerated model change (add `body`)
     //    WITHOUT generating/applying a migration for it, then run `schema migrate`
     //    again. With nothing pending to apply it is a no-op, and MUST leave the
     //    snapshot untouched — migrate no longer touches the snapshot at all.

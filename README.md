@@ -3,7 +3,7 @@
 [![CI](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/autumn-foundation/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/autumn-foundation/autumn)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust: 1.97.0+](https://img.shields.io/badge/rust-1.97.0%2B-orange.svg)](https://www.rust-lang.org)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn)
 
 > Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
@@ -21,6 +21,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Configuration and profiles** - defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
 - **Database ergonomics** - async Postgres primary/replica pools, `Db` extractor for the primary/write role, `#[model]`, `#[repository]`, hooks, and embedded migrations
 - **HTML stack** - Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
+- **Widgets** - server-rendered, CSP-safe widgets. Core widgets need `maud`; the search, social, workflow and chart families are default-on features (`widgets-search`, `widgets-social`, `widgets-workflow`, `widgets-charts`), so a lean app compiles only what it uses (see [widget styling](docs/guide/widget-styling.md#widget-families))
 - **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
 - **Background work** - `#[scheduled]` tasks, `#[job]` handlers, one-off `#[task]` scripts via `autumn task`, and runtime task visibility at `/actuator/tasks`
 - **Companion workflows** - [Autumn Harvest](docs/autumn-workflow-architecture.md) is the separate durable workflow engine for multi-step orchestration when `#[scheduled]` or `#[job]` is not enough
@@ -33,7 +34,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.8.0 --locked
+cargo install autumn-cli --version 0.10.0 --locked
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -82,7 +83,7 @@ Prefer a manual download? Grab the tarball plus its `.sha256`:
 - Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-<target>.tar.gz`
 - Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.8.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.10.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
 
 ### Install a prebuilt binary (Windows)
 
@@ -248,6 +249,8 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [**Guide index — every guide page, grouped by task**](docs/guide/index.md) — the
   full table of contents for `docs/guide/`; the list below is a selection of
   highlights, not the whole guide
+- [**What's new in 0.10.0**](docs/releases/0.10.0.md) — a walkthrough of the release: module and widget-family features, named role presets and route groups mounted per role, design tokens v2 with dark mode and a keyboard core, new widgets and widget packs, and SQLite fleet replica deletes and lake queries
+- [**What's new in 0.9.0**](docs/releases/0.9.0.md) — a walkthrough of the release: load shedding, retry budgets and deadlines on by default, adaptive admission control, a transactional outbox and fenced leases, SQLite fleets with one database per tenant, and MCP Tasks
 - [**What's new in 0.8.0**](docs/releases/0.8.0.md) — a walkthrough of the release: simulated networks and build-time query budgets, SQLite as a full backend, `Money` and ledgered data, mTLS and DNS-01 certificates, shadow deploys, and capability-sandboxed plugins
 - [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
@@ -292,7 +295,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Logging: levels, format & PII](docs/guide/logging-pii.md)
 - [Failure Capsules](docs/guide/failure-capsules.md) — `[failure_capture]` records a failing request, its database traffic and its clock reads as one replayable file; `autumn replay` re-runs it offline
 - [Edge Capsules](docs/guide/edge.md) — `#[edge]` compiles read-path routes into a portable `wasm32-wasip1` artifact a CDN can run, byte-identical to the origin and falling back to it for anything the edge cannot serve (experimental)
-- [Wire Contracts](docs/guide/wire-contracts.md) — `#[endpoint]` turns a typed handler into a contract, `wire_client!` generates the caller's typed client from it, and `#[contract_checked]` fails the caller's build at the call site when a request or response field the caller actually reads or sets stops matching — including the two breaks the type checker cannot see, a new required field behind `..Default::default()` and a serde-skipped field (experimental)
+- [Wire Contracts](docs/guide/wire-contracts.md) — `#[endpoint]` turns a typed handler into a contract, `wire_client!` generates the caller's typed client from it, and `#[contract_checked]` fails the caller's build at the call site when a request or response field the caller actually reads or sets stops matching — including the two breaks the type checker cannot see, a new required field behind `..Default::default()` and a serde-skipped field. `#[event]` consumers get the same check (experimental)
 - [Sandboxed Plugins](docs/guide/sandboxed-plugins.md) — install an unaudited third-party plugin as a capability-sandboxed `wasm32-wasip1` artifact: one declared prefix, no filesystem/network/env/database, hard CPU and memory ceilings, and a trap that is a 5xx on its own prefix instead of a dead process (experimental)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [Autumn Harvest](docs/autumn-workflow-architecture.md) — when to reach for the companion durable workflow engine, and where it lives
@@ -323,7 +326,7 @@ Until `1.0.0`, Autumn is in its `0.x` series — see the
 
 ## Requirements
 
-- Rust 1.88.0+ (edition 2024)
+- Rust 1.97.0+ (edition 2024)
 - PostgreSQL for database-backed apps
 
 Autumn can still run without a database if you omit the `[database]` section.
@@ -347,4 +350,8 @@ how to run the Tier 2 commands under WSL2.
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

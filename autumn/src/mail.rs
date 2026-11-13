@@ -1499,7 +1499,7 @@ pub mod unsubscribe {
         reason = "infallible: HMAC accepts any key length"
     )]
     fn derive_key(signing_key: &[u8]) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(signing_key)
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(signing_key)
             .expect("HMAC accepts any key length");
         mac.update(KEY_CONTEXT);
         let bytes = mac.finalize().into_bytes();
@@ -1539,10 +1539,10 @@ pub mod unsubscribe {
         let key = derive_key(&keys.current);
         let cipher = Aes256Gcm::new_from_slice(&key).expect("derived key is always 32 bytes");
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce_bytes).expect("OS RNG failed");
+        getrandom::fill(&mut nonce_bytes).expect("OS RNG failed");
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                <&Nonce<_>>::from(&nonce_bytes),
                 plaintext(subscriber, list_id, expiry_unix).as_bytes(),
             )
             .expect("AES-GCM encryption cannot fail for valid inputs");
@@ -1576,7 +1576,8 @@ pub mod unsubscribe {
         if blob[0] != TOKEN_VERSION {
             return Err(TokenError::Malformed);
         }
-        let nonce = Nonce::from_slice(&blob[1..=NONCE_LEN]);
+        let nonce =
+            <&Nonce<_>>::try_from(&blob[1..=NONCE_LEN]).map_err(|_| TokenError::Malformed)?;
         let ciphertext = &blob[1 + NONCE_LEN..];
         // Try the current key first, then any rotation-grace `previous` keys. A
         // wrong key (or any tampering) fails AES-GCM authentication.
@@ -4297,7 +4298,7 @@ fn unsubscribe_error_html(detail: &str) -> String {
 ///
 /// [`InMemorySuppressionStore`] is the zero-config default (process-local,
 /// lost on restart — perfect for a single instance, tests, and review apps).
-/// [`PgSuppressionStore`](suppression::PgSuppressionStore) (feature `db`) persists to a `mail_suppressions`
+/// [`PgSuppressionStore`](suppression::PgSuppressionStore) (feature `postgres`) persists to a `mail_suppressions`
 /// table for multi-instance deploys, mirroring the memory/durable split used
 /// by sessions and jobs. That table is **not** auto-created — provision it
 /// yourself (see [`PgSuppressionStore`](suppression::PgSuppressionStore)).
@@ -4578,10 +4579,10 @@ pub mod suppression {
         Ok(())
     }
 
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pub use pg::PgSuppressionStore;
 
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     mod pg {
         use std::future::Future;
         use std::pin::Pin;
@@ -4733,12 +4734,21 @@ pub mod db_suppression {
 
     use super::{MailError, SuppressionStore};
 
+    // The column type follows the runtime backend.
+    // Postgres uses TIMESTAMPTZ. SQLite uses TEXT.
+    // `Timestamptz` has no SQLite impl.
+    // The `postgres` feature can be on when SQLite is the runtime.
+    #[cfg(not(feature = "sqlite"))]
+    type UnsubscribedAt = diesel::sql_types::Timestamptz;
+    #[cfg(feature = "sqlite")]
+    type UnsubscribedAt = diesel::sql_types::TimestamptzSqlite;
+
     diesel::table! {
         mail_unsubscribes (id) {
             id -> Int8,
             subscriber -> Text,
             list_id -> Text,
-            unsubscribed_at -> Timestamptz,
+            unsubscribed_at -> crate::mail::db_suppression::UnsubscribedAt,
         }
     }
 
@@ -4749,10 +4759,11 @@ pub mod db_suppression {
         list_id: &'a str,
     }
 
-    /// Postgres-backed suppression list keyed by `(subscriber, list_id)`.
+    /// Suppression list keyed by `(subscriber, list_id)`.
     ///
-    /// Backed by the `mail_unsubscribes` table provisioned by the migration that
-    /// `autumn generate mailer --list-unsubscribe` writes into the app.
+    /// It uses the runtime database backend (Postgres or `SQLite`). It stores
+    /// rows in the `mail_unsubscribes` table. `autumn generate mailer
+    /// --list-unsubscribe` writes the migration for that table.
     #[derive(Clone)]
     pub struct DbSuppressionStore {
         pool: Pool<crate::db::RuntimeConnection>,
@@ -4883,6 +4894,70 @@ pub mod db_suppression {
                     })?;
                 Ok(())
             })
+        }
+    }
+
+    // These tests run the SQLite DDL from `generate mailer --list-unsubscribe`.
+    // Keep `DDL` the same as the generator output.
+    #[cfg(all(test, feature = "sqlite"))]
+    mod sqlite_tests {
+        use super::*;
+        use chrono::{DateTime, Utc};
+        use diesel_async::SimpleAsyncConnection;
+
+        const DDL: &str = "CREATE TABLE mail_unsubscribes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subscriber TEXT NOT NULL,
+            list_id TEXT NOT NULL,
+            unsubscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (subscriber, list_id)
+        );";
+
+        async fn store() -> (DbSuppressionStore, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let url = format!("sqlite://{}", dir.path().join("mail.db").display());
+            let config = crate::config::DatabaseConfig {
+                url: Some(url),
+                ..Default::default()
+            };
+            let pool = crate::db::create_pool(&config)
+                .expect("pool builds")
+                .expect("url is set");
+            let mut conn = pool.get().await.expect("connection");
+            conn.batch_execute(DDL).await.expect("DDL runs");
+            drop(conn);
+            (DbSuppressionStore::new(pool), dir)
+        }
+
+        #[tokio::test]
+        async fn suppress_round_trips_on_sqlite() {
+            let (store, _dir) = store().await;
+            assert!(!store.is_suppressed("a@x.test", "news").await.unwrap());
+            store.suppress("a@x.test", "news").await.unwrap();
+            store.suppress("a@x.test", "news").await.unwrap();
+            assert!(store.is_suppressed("a@x.test", "news").await.unwrap());
+            assert!(!store.is_suppressed("a@x.test", "other").await.unwrap());
+            let hits = store
+                .is_suppressed_many(&["a@x.test", "b@x.test"], "news")
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert!(hits.contains("a@x.test"));
+        }
+
+        #[tokio::test]
+        async fn unsubscribed_at_is_readable_on_sqlite() {
+            let (store, _dir) = store().await;
+            store.suppress("a@x.test", "news").await.unwrap();
+            let mut conn = store.pool.get().await.expect("connection");
+            let at: Vec<DateTime<Utc>> = mail_unsubscribes::table
+                .select(mail_unsubscribes::unsubscribed_at)
+                .load(&mut conn)
+                .await
+                .expect("typed read of unsubscribed_at");
+            assert_eq!(at.len(), 1);
+            let age = Utc::now() - at[0];
+            assert!(age.num_seconds().abs() < 60, "default is not recent: {age}");
         }
     }
 }
@@ -5571,7 +5646,7 @@ mod tests {
         use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
         hasher.update(bytes);
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// Extracts the random `multipart/mixed` boundary rendered by

@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "CreateItemResponse",
+  "namespace": "autumn.catalog",
+  "doc": "endpoint: catalog.create_item, POST /items, response body",
+  "autumn.endpoint": "catalog.create_item",
+  "fields": [
+    { "name": "id", "type": "string" },
+    { "name": "price_cents", "type": "long" }
+  ]
+}

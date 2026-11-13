@@ -402,48 +402,66 @@ pub async fn wizard_progress_steps(
 
 /// Render an accessible step-progress indicator as Maud [`Markup`].
 ///
-/// Emits a `<nav>` with `role="list"` and per-step `<li>` items.  The
-/// current step gets `aria-current="step"`.
+/// Reads the step states from the session, then calls
+/// [`wizard_progress_from_steps`].
 ///
 /// ```html
-/// <nav aria-label="Checkout progress">
-///   <ol role="list" class="wizard-progress">
-///     <li class="wizard-step wizard-step--completed">…Shipping…</li>
-///     <li class="wizard-step wizard-step--current" aria-current="step">…Payment…</li>
-///     <li class="wizard-step wizard-step--upcoming">…Review…</li>
+/// <nav aria-label="Progress">
+///   <ol role="list" class="autumn-wizard-progress">
+///     <li class="autumn-wizard-step autumn-wizard-step--completed">…Shipping…</li>
+///     <li class="autumn-wizard-step autumn-wizard-step--current" aria-current="step">…Payment…</li>
+///     <li class="autumn-wizard-step autumn-wizard-step--upcoming">…Review…</li>
 ///   </ol>
 /// </nav>
 /// ```
 #[cfg(feature = "maud")]
 pub async fn wizard_progress(ctx: &WizardContext, current_step: &str) -> Markup {
-    let steps = wizard_progress_steps(ctx, current_step).await;
+    wizard_progress_from_steps(&wizard_progress_steps(ctx, current_step).await)
+}
+
+/// Render the step-progress indicator from steps you already have.
+///
+/// This function is not async. [`wizard_progress`] calls it. Use it when
+/// the step states do not come from a session, for example in a story or a
+/// test.
+///
+/// Emits a `<nav>` that holds an `<ol role="list">`, with one `<li>` for
+/// each step. The step in [`StepState::Current`] gets
+/// `aria-current="step"`. The summary shows "Step N of M". N is the
+/// position of the current step. If no step is current, N is 1.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn wizard_progress_from_steps(steps: &[WizardProgressStep]) -> Markup {
     let total = steps.len();
-    let current_number = ctx.step_number(current_step).unwrap_or(1);
+    let current_number = steps
+        .iter()
+        .position(|step| step.state == StepState::Current)
+        .map_or(1, |i| i + 1);
 
     html! {
         nav aria-label="Progress" {
-            ol role="list" class="wizard-progress" {
+            ol role="list" class="autumn-wizard-progress" {
                 @for (i, step) in steps.iter().enumerate() {
                     @let step_num = i + 1;
                     @let class = match step.state {
-                        StepState::Completed => "wizard-step wizard-step--completed",
-                        StepState::Current   => "wizard-step wizard-step--current",
-                        StepState::Upcoming  => "wizard-step wizard-step--upcoming",
+                        StepState::Completed => "autumn-wizard-step autumn-wizard-step--completed",
+                        StepState::Current   => "autumn-wizard-step autumn-wizard-step--current",
+                        StepState::Upcoming  => "autumn-wizard-step autumn-wizard-step--upcoming",
                     };
                     @if step.state == StepState::Current {
                         li class=(class) aria-current="step" {
-                            span class="wizard-step__number" { (step_num) }
-                            span class="wizard-step__label" { (step.label) }
+                            span class="autumn-wizard-step__number" { (step_num) }
+                            span class="autumn-wizard-step__label" { (step.label) }
                         }
                     } @else {
                         li class=(class) {
-                            span class="wizard-step__number" { (step_num) }
-                            span class="wizard-step__label" { (step.label) }
+                            span class="autumn-wizard-step__number" { (step_num) }
+                            span class="autumn-wizard-step__label" { (step.label) }
                         }
                     }
                 }
             }
-            p class="wizard-progress__summary" aria-live="polite" {
+            p class="autumn-wizard-progress__summary" aria-live="polite" {
                 "Step " (current_number) " of " (total)
             }
         }
@@ -1077,8 +1095,61 @@ mod tests {
             .unwrap();
         let markup = wizard_progress(&wizard, "payment").await;
         let html = markup.into_string();
-        assert!(html.contains("wizard-step--completed"));
-        assert!(html.contains("wizard-step--current"));
-        assert!(html.contains("wizard-step--upcoming"));
+        assert!(html.contains(r#"class="autumn-wizard-progress""#), "{html}");
+        assert!(html.contains("autumn-wizard-step autumn-wizard-step--completed"));
+        assert!(html.contains("autumn-wizard-step autumn-wizard-step--current"));
+        assert!(html.contains("autumn-wizard-step autumn-wizard-step--upcoming"));
+        assert!(
+            html.contains(r#"class="autumn-wizard-step__number""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"class="wizard-"#), "{html}");
+    }
+
+    // ── wizard_progress_from_steps (#3398) ───────────────────────────────
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn wizard_progress_from_steps_matches_wizard_progress() {
+        let wizard = make_wizard(make_session());
+        for current in ["shipping", "payment", "review", "unknown"] {
+            let steps = wizard_progress_steps(&wizard, current).await;
+            assert_eq!(
+                wizard_progress_from_steps(&steps).into_string(),
+                wizard_progress(&wizard, current).await.into_string(),
+                "current step {current}"
+            );
+        }
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn wizard_progress_from_steps_renders_fixed_steps() {
+        let step = |name: &str, state| WizardProgressStep {
+            name: name.into(),
+            label: title_case(name),
+            state,
+        };
+        let html = wizard_progress_from_steps(&[
+            step("shipping", StepState::Completed),
+            step("payment", StepState::Current),
+            step("review", StepState::Upcoming),
+        ])
+        .into_string();
+        assert!(html.contains(r#"aria-current="step""#), "{html}");
+        assert!(html.contains("Step 2 of 3"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn wizard_progress_from_steps_with_no_current_step_marks_none() {
+        let step = WizardProgressStep {
+            name: "shipping".into(),
+            label: "Shipping".into(),
+            state: StepState::Upcoming,
+        };
+        let html = wizard_progress_from_steps(&[step]).into_string();
+        assert!(!html.contains("aria-current"), "{html}");
+        assert!(html.contains("Step 1 of 1"), "{html}");
     }
 }

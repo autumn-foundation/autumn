@@ -25,7 +25,7 @@ const CI_FILTERS: [&str; 3] = [
     "job::tests::pg::pg_cancel_classification_uses_the_database_clock_not_the_app_clock",
 ];
 
-fn workspace_root() -> PathBuf {
+pub(super) fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
@@ -39,7 +39,7 @@ fn workspace_root() -> PathBuf {
 /// 4-space-per-level indent) its own `mod pg {` / closing `}` lines sit at
 /// exactly 4 spaces, and everything inside sits at 8+. Bounding on that
 /// avoids matching a same-named function some other module might define.
-fn pg_tests_module(source: &str) -> String {
+pub(super) fn pg_tests_module(source: &str) -> String {
     let open = "\n    mod pg {\n";
     let start = source
         .find(open)

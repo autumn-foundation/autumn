@@ -32,7 +32,7 @@ async fn main() {
 Enable the feature in your `Cargo.toml`:
 
 ```toml
-autumn-web = { version = "0.8", features = ["ws"] }
+autumn-web = { version = "0.10", features = ["ws"] }
 ```
 
 ## The two-function pattern
@@ -181,7 +181,8 @@ axum socket, call `into_parts()`. It returns the axum socket and a
 `into_inner()` drops the hold.
 
 A handler on axum's own `WebSocketUpgrade` (for example in a router you add
-with `merge_router`) has no `[realtime]` limits. Over HTTP/2, add the
+with `merge_router`) has no `[realtime]` limits. The `axum-ws` Cargo feature
+compiles that extractor. It is in `default`, and `ws` turns it on. Over HTTP/2, add the
 `autumn_web::http_server::KeepTunnel` extractor and keep it for the life of
 the socket. Without it, `keep_alive_timeout_ms` closes the connection while
 the socket is open.

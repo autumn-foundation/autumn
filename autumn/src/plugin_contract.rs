@@ -41,7 +41,7 @@
 //!         Some(
 //!             PluginContract::new(env!("CARGO_PKG_NAME"))
 //!                 .plugin_version(env!("CARGO_PKG_VERSION"))
-//!                 .autumn_web("0.8"),
+//!                 .autumn_web("0.10"),
 //!         )
 //!     }
 //!
@@ -127,6 +127,16 @@ pub struct PluginSurface {
 /// suite enforces both the ordering and the absence of duplicates.
 pub const PLUGIN_SURFACES: &[PluginSurface] = &[
     PluginSurface {
+        name: "AppBuilder::background",
+        tier: SurfaceTier::Stable,
+        note: "Register a `BackgroundTask`: the full form of `background_task`, with queues and an explicit switch.",
+    },
+    PluginSurface {
+        name: "AppBuilder::background_task",
+        tier: SurfaceTier::Stable,
+        note: "Register a loop that runs until shutdown. The framework starts it only on the roles that run its capability.",
+    },
+    PluginSurface {
         name: "AppBuilder::config_section",
         tier: SurfaceTier::Stable,
         note: "Declare a plugin-owned top-level config root so `server.strict_config` treats it as known-and-opaque.",
@@ -140,6 +150,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "AppBuilder::error_pages",
         tier: SurfaceTier::Stable,
         note: "Replace the rendered error pages — a tier-1 subsystem seam (requires the `maud` feature). The plugin crate needs its own `maud` dependency: `html!` expands to absolute `::maud::` paths, which no re-export can satisfy.",
+    },
+    PluginSurface {
+        name: "AppBuilder::fleet_ownership_store",
+        tier: SurfaceTier::Experimental,
+        note: "Keep fleet slot ownership in a plugin's `SlotOwnershipStore` (requires the `db` feature). Experimental while the fleet seams land (ADR 0040).",
     },
     PluginSurface {
         name: "AppBuilder::merge",
@@ -172,6 +187,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Serve a `PluginAssets` bundle of files compiled into the plugin crate under `/static/_plugins/<namespace>/`, at content-hashed `immutable` URLs with SRI hashes, and declare its routes. Build the bundle with `plugin_assets!` (requires the `embed-assets` feature) or `PluginAssets::from_files`.",
     },
     PluginSurface {
+        name: "AppBuilder::plugin_capability",
+        tier: SurfaceTier::Stable,
+        note: "Declare a plugin capability that no background task uses, so a `[roles.<name>] capabilities` key can name it.",
+    },
+    PluginSurface {
         name: "AppBuilder::plugin_contracts",
         tier: SurfaceTier::Stable,
         note: "Read the contracts declared by the plugins mounted on a builder — what the route dump and `autumn plugin-check` are built on.",
@@ -190,6 +210,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "AppBuilder::routes",
         tier: SurfaceTier::Stable,
         note: "Register typed routes from `routes![]`. Plugin routes registered this way are attributed automatically.",
+    },
+    PluginSurface {
+        name: "AppBuilder::widget_pack",
+        tier: SurfaceTier::Stable,
+        note: "Install a `WidgetPack`: serve its `PluginAssets` bundle and add its stories and asset links to the story gallery (requires the `maud` feature).",
     },
     PluginSurface {
         name: "AppBuilder::with_config_loader",
@@ -217,6 +242,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Replace the tier-1 session store.",
     },
     PluginSurface {
+        name: "AppBuilder::with_story_gallery",
+        tier: SurfaceTier::Stable,
+        note: "Add stories to the `/_stories` gallery. Each call adds; a plugin starts from `StoryGallery::new` (requires the `maud` feature).",
+    },
+    PluginSurface {
         name: "AppBuilder::with_telemetry_provider",
         tier: SurfaceTier::Stable,
         note: "Replace the tier-1 telemetry provider.",
@@ -242,14 +272,39 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790).",
     },
     PluginSurface {
+        name: "background",
+        tier: SurfaceTier::Stable,
+        note: "`BackgroundTask`, `PluginCapability`, `BackgroundCapability` and `Role::runs_plugin`: role-aware background work.",
+    },
+    PluginSurface {
         name: "db::Pool",
         tier: SurfaceTier::Stable,
         note: "The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature).",
     },
     PluginSurface {
+        name: "db::fleet_engine",
+        tier: SurfaceTier::Experimental,
+        note: "`FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. `install_replication` and `ShipMode::Generations` need the `sqlite` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040).",
+    },
+    PluginSurface {
+        name: "fleet",
+        tier: SurfaceTier::Experimental,
+        note: "`resolve`, `resolve_key`, `FleetLease`, `fleet_of` and `ownership_store`: the request path an engine plugin's fleet extractor calls. Also `FleetDatabase::sidecar_replica` and `replication::ScopedDestination` for a sidecar engine (requires the `db` feature). Experimental while the fleet seams land (ADR 0040).",
+    },
+    PluginSurface {
+        name: "form::FieldRenderer",
+        tier: SurfaceTier::Stable,
+        note: "Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature).",
+    },
+    PluginSurface {
         name: "plugin_conformance",
         tier: SurfaceTier::Stable,
-        note: "The library-level conformance harness plugin authors run in their own test suite.",
+        note: "The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack (requires the `plugin-conformance` feature, on by default).",
+    },
+    PluginSurface {
+        name: "plugin_conformance::fleet",
+        tier: SurfaceTier::Experimental,
+        note: "`run_fleet_conformance` and `FleetFixture`: the conformance kit of a fleet engine (requires the `db` feature). Experimental: checks may change in any release with the engine trait.",
     },
     PluginSurface {
         name: "plugin_contract",
@@ -260,6 +315,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "route_listing::RouteInfo",
         tier: SurfaceTier::Stable,
         note: "The route manifest type the conformance harness and `autumn routes --format json` share.",
+    },
+    PluginSurface {
+        name: "widget_pack",
+        tier: SurfaceTier::Stable,
+        note: "The widget contract and `WidgetPack`: render, passthrough, tokens, `autumn-<pack>-*` classes, keyboard core, CSP, stories (requires the `maud` feature).",
     },
 ];
 

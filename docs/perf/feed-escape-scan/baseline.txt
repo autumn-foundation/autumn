@@ -1,0 +1,11 @@
+Workload: autumn/benches/feed_render.rs (30-entry Atom feed, escape_into on titles/ids/links/summaries)
+Tool: valgrind --tool=callgrind ... feed_render --iterations 1000   (1050 renders incl. 50 warm-up)
+Command:
+  cargo build --release -p autumn-web --bench feed_render
+  valgrind --tool=callgrind --callgrind-out-file=cg.out "$BIN" --iterations 1000
+
+Total Ir:                          208,077,632
+autumn_web::feed::push_escaped     82,419,750 self (39.61%)   [escape_into inlined]
+push_escaped inclusive             90,818,275 (43.65%)
+chrono write_rfc3339               16,973,250 (8.16%)
+malloc/free/memcpy (libc)          ~ 25%

@@ -338,7 +338,8 @@ would the GET and the host discards the body for you.
 | `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — the module's data and element segments, which every request re-instantiates, and the request frame itself, which is cloned and base64-expanded into the guest's stdin — at 64 bytes per unit. Each byte the guest writes to stdout also costs one unit, because the host parses it | 504 on the plugin's prefix |
 | `memory_bytes` | one instance's linear memory | the guest's `memory.grow` fails; usually a trap, then 502 |
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
-| `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
+| `max_response_bytes` | the frame accepted back. It also limits each frame the guest writes. The host refuses at load a manifest when a call frame is larger than `2 × max_response_bytes + 4096`. The frame is `outbound_request_bytes` × 6, `kv_value_bytes`, or a full row (`db`, `jobs`), plus 4096 | 502 for an oversized frame; 504 for one that never ends |
+| frame shape | the host counts the containers and commas of each guest frame before it parses the frame. It refuses a frame with more than 65,536, or nesting deeper than 32 levels. No legal frame comes near either | 502 |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
 | shared guest pool | guests that run at once in the whole process, all plugins together. Default 128. Set it with `plugin_sandbox::set_guest_slots` before you build any plugin, to at most a quarter of `max_blocking_threads` | 503 with `Retry-After`. It can refuse a request that `max_concurrency` allows. The first request to arrive gets the slot, so keep each `max_concurrency` well under the limit |
 | `request_body_timeout_ms` | how long a request may take to send its body | 408, and the permit goes back |
@@ -543,6 +544,21 @@ appended to the guest's stdin; the `id` is the guest's to choose and is echoed
 back. **Read each answer before making the next call**: a guest that writes calls
 and never reads them fills a bounded queue and the request is ended.
 
+**A write keeps fuel to read its answer.** A call that changes state —
+`kv-set`, `kv-delete`, `db-insert`, `db-update`, `db-delete`, `job-enqueue`, or
+an outbound call that is not `GET` or `HEAD` — runs only when the fuel left can
+also read its largest reply and the replies not yet read, at 128 units per byte.
+If it cannot, the call comes back `quota-exceeded` and nothing changes. This
+stops a known failure: the write occurs, the guest uses all its fuel to read the
+reply, the request fails, and a retry does the write again.
+
+With the default `fuel` (200 million) and `outbound_response_bytes`, an outbound
+write needs about 74 million units. A plugin with less `fuel` left cannot make
+one. A smaller `outbound_response_bytes` needs less: 4096 needs about 10
+million. A KV, DB or job write needs about 0.6 million. After a write has run,
+every later call keeps this fuel too. Before that, a read does not keep it,
+because a read that fails changes nothing.
+
 A `call_result` carries one of six value kinds: `done` (a write or delete),
 `value` (from `kv-get`, with a `found` flag so a stored `null` is not a miss),
 `row-id` (from `db-insert`), `rows` (from `db-get` and `db-query`), `http`, and
@@ -577,7 +593,8 @@ A refusal comes back as a `call_result` the guest can read, not as a trap. A
 plugin that hits a ceiling should degrade — render the panel without the live
 number — and its author needs to see *which* rule refused:
 `capability-not-granted`, `not-in-grant`, `quota-exceeded`, `malformed`,
-`unavailable` or `backend-error`.
+`unavailable`, `backend-error`, `response-too-large` or `result-rejected`.
+The last two mean the call ran. Do not retry it.
 
 ### Why cross-tenant access is unspellable
 
@@ -587,7 +604,7 @@ The guest names a **logical** thing; the host derives the physical one:
 | --- | --- |
 | `key: "cart"` | `plugin-kv:<plugin>:<tenant>:cart`, every segment escaped |
 | `table: "orders"` | `plugin_<escaped plugin>__orders`, filtered by the active tenant |
-| `job_type: "reindex"` | a `PluginJob` stamped with this plugin and this tenant |
+| `job_type: "reindex"` | a `PluginJob` stamped with this plugin, this tenant and this artifact's sha256 |
 
 The plugin half is hex-escaped rather than tidied, so
 `autumn-plugin-shop` owning `orders` is `plugin_autumn_2dplugin_2dshop__orders` —
@@ -771,10 +788,11 @@ Rules:
   `localhost` and `127.0.0.1` cannot appear in `[grants].hosts` and a plugin
   cannot be pointed at a local upstream in development. IP-range (SSRF) guarding
   for the app-level client is #1627's.
-- The `jobs` capability **enqueues**; nothing in this slice runs the result. The
-  record carries the enqueuing plugin and tenant, so a runner built on it cannot
-  widen the grant — but there is no wire frame for delivering a job back into a
-  guest, and adding one is a later slice.
+- The `jobs` capability **enqueues**. Nothing in this slice runs the job. The
+  record carries the plugin, the tenant and the artifact sha256. A runner must
+  refuse a job when its sha256 is not the installed artifact's. Drain the queue
+  before an upgrade. No wire frame sends a job back to a guest. A later slice
+  adds one.
 - The shipped `PluginStore`, `JobSink` and `OutboundHttp` implementations are
   in-process: `MemoryPluginStore` and `MemoryJobSink` are bounded — the job
   queue holds `DEFAULT_JOB_DEPTH` and there is no unbounded spelling, because

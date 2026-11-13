@@ -688,6 +688,7 @@ static OUTBOUND_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// its real `reqwest` client — and must not let it reach anything the capsule
 /// did not record. There is deliberately no way to unset it: a process that has
 /// started replaying a capsule never goes back to serving traffic.
+#[cfg_attr(not(feature = "reporting"), allow(dead_code))]
 pub(crate) fn block_outbound_for_replay() {
     OUTBOUND_BLOCKED.store(true, Ordering::SeqCst);
 }
@@ -1348,10 +1349,10 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the underlying TLS backend cannot be initialised (should not
-    /// happen with the default `rustls-tls` feature).
+    /// happen with the framework `ring` config).
     #[must_use]
     pub fn with_timeout(timeout: Duration) -> Self {
-        let inner = reqwest::ClientBuilder::new()
+        let inner = crate::reqwest_tls::client_builder()
             .timeout(timeout)
             .redirect(pooled_redirect_policy())
             .build()
@@ -1384,7 +1385,7 @@ impl Client {
     ///
     /// Panics if the underlying TLS backend cannot be initialised.
     pub(crate) fn build_inner(config: &crate::config::HttpClientConfig) -> reqwest::Client {
-        reqwest::ClientBuilder::new()
+        crate::reqwest_tls::client_builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .redirect(pooled_redirect_policy())
             .build()
@@ -1452,7 +1453,7 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the underlying TLS backend cannot be initialised (should not
-    /// happen with the default `rustls-tls` feature).
+    /// happen with the framework `ring` config).
     #[must_use]
     pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
         let mut client = Self::from_config_with_inner(Self::build_inner(config), config);
@@ -2269,6 +2270,8 @@ impl RequestBuilder {
                 },
             );
         }
+        // Only capsule replay (`reporting`) sets the block.
+        #[cfg(feature = "reporting")]
         if outbound_blocked_for_replay() {
             return Err(ClientError::BlockedDuringReplay(
                 self.method.to_string(),
@@ -3891,7 +3894,7 @@ fn build_oneshot_client(
     policy: reqwest::redirect::Policy,
     timeout: Duration,
 ) -> Result<reqwest::Client, ClientError> {
-    let mut builder = reqwest::ClientBuilder::new()
+    let mut builder = crate::reqwest_tls::client_builder()
         .timeout(timeout)
         .redirect(policy);
     if let Some((host, addrs)) = resolve
@@ -8979,7 +8982,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_backoff_past_the_hop_deadline_returns_the_response() {
-            let (url, _hits) = counting(Some(502), &[]).await;
+            let (url, hits) = counting(Some(502), &[]).await;
             let policy = RetryPolicy {
                 max_retries: 20,
                 ..RetryPolicy::default()
@@ -8996,7 +8999,12 @@ mod tests {
                 &HeaderMap::new(),
                 None,
                 &policy,
-                &crate::entropy::SeededEntropy::new(1),
+                // A fixed draw gives the backoffs 97, 199, 400 and 400 ms. The
+                // fourth passes the 1 s deadline, and the last retry starts
+                // with about 300 ms left. A random draw can start a last retry
+                // with only `MIN_ATTEMPT` left, and a Windows timer can use
+                // all of it.
+                &FixedDraw(400),
                 false,
                 Some(crate::time::ambient_instant() + Duration::from_secs(1)),
                 false,
@@ -9011,6 +9019,8 @@ mod tests {
                 Some(502),
                 "the last response, not a deadline error"
             );
+            // The warm-up request, the first attempt and at least one retry.
+            assert!(hits.load(Ordering::SeqCst) >= 3, "no retry ran");
         }
 
         #[tokio::test]

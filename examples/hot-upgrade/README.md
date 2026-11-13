@@ -16,7 +16,7 @@ The narrative is [`docs/guide/hot-upgrades.md`](../../docs/guide/hot-upgrades.md
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - Linux or another Unix (the handoff is `SIGUSR2` + a file-descriptor pass)
 - No database, no configuration file
 
