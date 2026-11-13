@@ -36,7 +36,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::normalize_profile_name;
+use crate::config::{from_table, normalize_profile_name};
 
 /// Schema version of the `capacity.lock` document.
 ///
@@ -474,17 +474,22 @@ impl CapacityContract {
     /// # Errors
     ///
     /// [`CapacityError::Parse`] when the document is not a well-formed
-    /// contract, or [`CapacityError::UnsupportedVersion`] when it was written
-    /// by a newer autumn.
+    /// contract: a syntax error names the line, and a value of the wrong
+    /// type names the key path. [`CapacityError::UnsupportedVersion`] when it
+    /// was written by a newer autumn.
     pub fn parse(toml_src: &str) -> Result<Self, CapacityError> {
-        let probe: VersionProbe = toml::from_str(toml_src)?;
+        // The text is parsed one time, into a raw table. The two reads below
+        // use the config deserializer, so this module compiles no second
+        // TOML reader for its types.
+        let table = toml::from_str::<toml::Table>(toml_src)?;
+        let probe: VersionProbe = from_table(table.clone())?;
         if probe.version > CONTRACT_VERSION {
             return Err(CapacityError::UnsupportedVersion {
                 found: probe.version,
                 supported: CONTRACT_VERSION,
             });
         }
-        Ok(toml::from_str(toml_src)?)
+        Ok(from_table(table)?)
     }
 
     /// Read and parse a contract from disk.
