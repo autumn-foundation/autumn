@@ -837,27 +837,26 @@ impl ExperimentStore for InMemoryExperimentStore {
     fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError> {
         let mut inner = self.inner.write().unwrap();
 
-        if !assignment.is_override {
-            if let Some(group) = inner
+        if !assignment.is_override
+            && let Some(group) = inner
                 .experiments
                 .get(&assignment.experiment)
                 .and_then(|c| c.exclusion_group.as_ref())
-            {
-                for (exp_name, exp_config) in &inner.experiments {
-                    if exp_name == &assignment.experiment {
-                        continue;
-                    }
-                    if exp_config.exclusion_group.as_ref() == Some(group)
-                        && inner
-                            .assignments
-                            .contains_key(
-                                &(exp_name.as_str(), assignment.actor.as_str()) as &dyn PairKey
-                            )
-                    {
-                        return Err(ExperimentStoreError::Backend(format!(
-                            "ExcludedByGroup:{group}"
-                        )));
-                    }
+        {
+            for (exp_name, exp_config) in &inner.experiments {
+                if exp_name == &assignment.experiment {
+                    continue;
+                }
+                if exp_config.exclusion_group.as_ref() == Some(group)
+                    && inner
+                        .assignments
+                        .contains_key(
+                            &(exp_name.as_str(), assignment.actor.as_str()) as &dyn PairKey
+                        )
+                {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "ExcludedByGroup:{group}"
+                    )));
                 }
             }
         }
