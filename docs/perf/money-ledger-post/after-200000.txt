@@ -1,0 +1,553 @@
+fixture: 200000 transactions, 8000 wallets + 500 sellers + 4 house accounts, workload: 400 ledger::post calls
+posted: 360, replayed: 40, refused: 0
+app statements (no BEGIN/COMMIT/FK): 1584 (3.96/op); all top-level statements: 3337 (8.34/op); buffers: 40831 (102.1/op); statement wal_bytes: 758461 (1896/op); wal lsn delta: 784520 bytes; nested buffers (already in their parent): 10757
+
+--- by buffers (toplevel 1 = issued by the app, 0 = trigger/FK) ---
+top  calls buffers   %buf      hit   read   rows  temp wal_bytes  query
+  1    287   12286  30.1%    12215     71    574     0    299578  INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP), ($6, $7, $8, $9, $10, CURRENT_TIMESTAMP) RETURNING seq, account_id, amount_minor, currency
+  0    360    6875  16.8%     6875      0    953     0     72220  UPDATE _autumn_money_accounts AS a SET balance_minor = CASE WHEN a.balance_minor::NUMERIC + d.delta BETWEEN $1 AND $2 THEN (a.balance_minor::NUMERIC + d.delta)::BIGINT END FROM ( SELECT account_id, SUM(amount_minor) AS delta FROM _autumn_money_new_postings GROUP BY account_id ) AS d WHERE a.id = d.account_id
+  1     12    6022  14.7%     6017      5     12     0         0  SELECT account_id, CAST(COALESCE(SUM(amount_minor / $2), $3) AS BIGINT) AS hi, CAST(COALESCE(SUM(amount_minor % $4), $5) AS BIGINT) AS lo FROM _autumn_money_postings WHERE account_id IN ($1) GROUP BY account_id
+  1     40    5996  14.7%     5988      8    280     0    142912  INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP), ($6, $7, $8, $9, $10, CURRENT_TIMESTAMP), ($11, $12, $13, $14, $15, CURRENT_TIMESTAMP), ($16, $17, $18, $19, $20, CURRENT_TIMESTAMP), ($21, $22, $23, $24, $25, CURRENT_TIMESTAMP), ($26, $27, $28, $29, $30, CURRENT_TIMESTAMP), ($31, $32, $33, $34, $35, CURRENT_TIMESTAMP) RETURNING seq, account_id, amount_minor, currency
+  1    953    4765  11.7%     4765      0    953     0     19440  SELECT $2 FROM ONLY "public"."_autumn_money_transactions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+  1    360    3991   9.8%     3990      1    360     0    154536  INSERT INTO _autumn_money_transactions (id, idempotency_key, request_hash, currency, memo, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) ON CONFLICT (idempotency_key) DO NOTHING RETURNING id, idempotency_key, request_hash, currency, memo, CAST(posted_at AS TEXT) AS posted_at
+  0    953    3882   9.5%     3882      0    953     0         0  SELECT $2 FROM ONLY "public"."_autumn_money_accounts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+  1    314    2564   6.3%     2564      0    628     0     52000  SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2) ORDER BY id FOR UPDATE
+  1     33    2097   5.1%     2093      4     99     0     54732  INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP), ($6, $7, $8, $9, $10, CURRENT_TIMESTAMP), ($11, $12, $13, $14, $15, CURRENT_TIMESTAMP) RETURNING seq, account_id, amount_minor, currency
+  1    400    1240   3.0%     1237      3     40     0         0  SELECT id, idempotency_key, request_hash, currency, memo, CAST(posted_at AS TEXT) AS posted_at FROM _autumn_money_transactions WHERE idempotency_key = $1
+  1     40    1106   2.7%     1106      0    280     0     24612  SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3, $4, $5, $6, $7) ORDER BY id FOR UPDATE
+  1     46     493   1.2%      493      0    138     0      9083  SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3) ORDER BY id FOR UPDATE
+  1     40     161   0.4%      161      0     93     0         0  SELECT account_id, amount_minor, currency FROM _autumn_money_postings WHERE transaction_id = $1 ORDER BY seq
+  1     12     110   0.3%      110      0     12     0      1568  UPDATE _autumn_money_accounts SET balance_minor = $1 WHERE id = $2 AND balance_minor IS NULL
+  1    400       0   0.0%        0      0      0     0         0  BEGIN
+  1    400       0   0.0%        0      0      0     0         0  COMMIT
+
+--- app statements by calls ---
+   953  28.6%  SELECT $2 FROM ONLY "public"."_autumn_money_transactions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+   400  12.0%  BEGIN
+   400  12.0%  COMMIT
+   400  12.0%  SELECT id, idempotency_key, request_hash, currency, memo, CAST(posted_at AS TEXT) AS posted_at FROM _autumn_money_transactions WHERE idempotency_key = $1
+   360  10.8%  INSERT INTO _autumn_money_transactions (id, idempotency_key, request_hash, currency, memo, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) ON CONFLICT (idempotency_key) DO NOTHING RETURNING id, idempotency_key, request_hash, currency, memo, CAST(posted_at AS TEXT) AS posted_at
+   314   9.4%  SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2) ORDER BY id FOR UPDATE
+   287   8.6%  INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP), ($6, $7, $8, $9, $10, CURRENT_TIMESTAMP) RETURNING seq, account_id, amount_minor, currency
+    46   1.4%  SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3) ORDER BY id FOR UPDATE
+    40   1.2%  INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP), ($6, $7, $8, $9, $10, CURRENT_TIMESTAMP), ($11, $12, $13, $14, $15, CURRENT_TIMESTAMP), ($16, $17, $18, $19, $20, CURRENT_TIMESTAMP), ($21, $22, $23, $24, $25, CURRENT_TIMESTAMP), ($26, $27, $28, $29, $30, CURRENT_TIMESTAMP), ($31, $32, $33, $34, $35, CURRENT_TIMESTAMP) RETURNING seq, account_id, amount_minor, currency
+    40   1.2%  SELECT account_id, amount_minor, currency FROM _autumn_money_postings WHERE transaction_id = $1 ORDER BY seq
+    40   1.2%  SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3, $4, $5, $6, $7) ORDER BY id FOR UPDATE
+    33   1.0%  INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP), ($6, $7, $8, $9, $10, CURRENT_TIMESTAMP), ($11, $12, $13, $14, $15, CURRENT_TIMESTAMP) RETURNING seq, account_id, amount_minor, currency
+    12   0.4%  SELECT account_id, CAST(COALESCE(SUM(amount_minor / $2), $3) AS BIGINT) AS hi, CAST(COALESCE(SUM(amount_minor % $4), $5) AS BIGINT) AS lo FROM _autumn_money_postings WHERE account_id IN ($1) GROUP BY account_id
+    12   0.4%  UPDATE _autumn_money_accounts SET balance_minor = $1 WHERE id = $2 AND balance_minor IS NULL
+
+--- pg_stat_user_tables (cumulative, fixture included) ---
+_autumn_money_accounts       seq_scan=4 seq_tup_read=25512 idx_scan=422142 live=8504 dead=148
+_autumn_money_postings       seq_scan=3 seq_tup_read=0 idx_scan=37 live=420689 dead=0
+_autumn_money_transactions   seq_scan=2 seq_tup_read=0 idx_scan=421243 live=200263 dead=0
+
+=== EXPLAIN lock accounts (7-line split) ===
+SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ('house:fees', 'seller:0113', 'seller:0214', 'seller:0315', 'seller:0416', 'seller:0017', 'user:000001') ORDER BY id FOR UPDATE
+LockRows  (cost=0.29..38.77 rows=7 width=31) (actual time=0.020..0.076 rows=7 loops=1)
+  Output: id, currency, allow_negative, balance_minor, ctid
+  Buffers: shared hit=34
+  WAL: records=11 bytes=616
+  ->  Index Scan using _autumn_money_accounts_pkey on public._autumn_money_accounts  (cost=0.29..38.70 rows=7 width=31) (actual time=0.014..0.065 rows=7 loops=1)
+        Output: id, currency, allow_negative, balance_minor, ctid
+        Index Cond: (_autumn_money_accounts.id = ANY ('{house:fees,seller:0113,seller:0214,seller:0315,seller:0416,seller:0017,user:000001}'::text[]))
+        Buffers: shared hit=27
+        WAL: records=4 bytes=238
+Query Identifier: 1281773231577094224
+Planning Time: 0.045 ms
+Execution Time: 0.089 ms
+
+=== EXPLAIN transaction by key ===
+SELECT id, idempotency_key, request_hash, currency, memo, CAST(posted_at AS TEXT) AS posted_at FROM _autumn_money_transactions WHERE idempotency_key = 'op:16'
+Index Scan using _autumn_money_transactions_idempotency_key_key on public._autumn_money_transactions  (cost=0.42..8.44 rows=1 width=121) (actual time=0.015..0.016 rows=1 loops=1)
+  Output: id, idempotency_key, request_hash, currency, memo, (posted_at)::text
+  Index Cond: (_autumn_money_transactions.idempotency_key = 'op:16'::text)
+  Buffers: shared hit=4
+Query Identifier: -8205425340885378868
+Planning Time: 0.042 ms
+Execution Time: 0.026 ms
+
+=== EXPLAIN postings of a transaction ===
+SELECT account_id, amount_minor, currency FROM _autumn_money_postings WHERE transaction_id = '8d5c8c5b-d018-4ebd-94b3-dc0e2130542f' ORDER BY seq
+Index Scan using _autumn_money_postings_transaction_id_seq_key on public._autumn_money_postings  (cost=0.42..12.46 rows=2 width=32) (actual time=0.015..0.018 rows=7 loops=1)
+  Output: account_id, amount_minor, currency, seq
+  Index Cond: (_autumn_money_postings.transaction_id = '8d5c8c5b-d018-4ebd-94b3-dc0e2130542f'::text)
+  Buffers: shared hit=4
+Query Identifier: 7161023666816771024
+Planning Time: 0.077 ms
+Execution Time: 0.030 ms
+
+=== EXPLAIN sum postings of a NULL-balance hot wallet ===
+SELECT account_id, CAST(COALESCE(SUM(amount_minor / 1000000000), 0) AS BIGINT) AS hi, CAST(COALESCE(SUM(amount_minor % 1000000000), 0) AS BIGINT) AS lo FROM _autumn_money_postings WHERE account_id IN ('user:000002') GROUP BY account_id
+GroupAggregate  (cost=31.89..4906.91 rows=1 width=28) (actual time=4.098..4.099 rows=1 loops=1)
+  Output: account_id, (COALESCE(sum((amount_minor / 1000000000)), '0'::numeric))::bigint, (COALESCE(sum((amount_minor % '1000000000'::bigint)), '0'::numeric))::bigint
+  Buffers: shared hit=1992 read=1
+  ->  Bitmap Heap Scan on public._autumn_money_postings  (cost=31.89..4881.77 rows=2512 width=20) (actual time=0.617..3.547 rows=2603 loops=1)
+        Output: id, transaction_id, seq, account_id, amount_minor, currency, posted_at
+        Recheck Cond: (_autumn_money_postings.account_id = 'user:000002'::text)
+        Heap Blocks: exact=1988
+        Buffers: shared hit=1992 read=1
+        ->  Bitmap Index Scan on _autumn_money_postings_account_idx  (cost=0.00..31.26 rows=2512 width=0) (actual time=0.295..0.295 rows=2603 loops=1)
+              Index Cond: (_autumn_money_postings.account_id = 'user:000002'::text)
+              Buffers: shared hit=4 read=1
+Query Identifier: 1586140251567155679
+Planning Time: 0.071 ms
+Execution Time: 4.122 ms
+
+=== EXPLAIN insert 7 postings (fires the balance trigger) ===
+INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ('explain', 0, 'user:000003', -100, 'USD', CURRENT_TIMESTAMP), ('explain', 1, 'seller:0001', 10, 'USD', CURRENT_TIMESTAMP), ('explain', 2, 'seller:0002', 10, 'USD', CURRENT_TIMESTAMP), ('explain', 3, 'seller:0003', 10, 'USD', CURRENT_TIMESTAMP), ('explain', 4, 'seller:0004', 10, 'USD', CURRENT_TIMESTAMP), ('explain', 5, 'seller:0005', 10, 'USD', CURRENT_TIMESTAMP), ('explain', 6, 'house:fees', 50, 'USD', CURRENT_TIMESTAMP)
+Insert on public._autumn_money_postings  (cost=0.00..0.11 rows=0 width=0) (actual time=0.105..0.105 rows=0 loops=1)
+  Buffers: shared hit=62 read=1 dirtied=1
+  WAL: records=28 bytes=2289
+  ->  Values Scan on "*VALUES*"  (cost=0.00..0.11 rows=7 width=128) (actual time=0.006..0.015 rows=7 loops=1)
+        Output: nextval('_autumn_money_postings_id_seq'::regclass), "*VALUES*".column1, "*VALUES*".column2, "*VALUES*".column3, "*VALUES*".column4, "*VALUES*".column5, "*VALUES*".column6
+        Buffers: shared hit=7
+Query Identifier: 5079346472003146332
+Planning Time: 0.037 ms
+Trigger RI_ConstraintTrigger_c_16988 for constraint _autumn_money_postings_account_id_fkey: time=0.087 calls=7
+Trigger _autumn_money_postings_balance: time=0.126 calls=1
+Execution Time: 0.336 ms
+
+--- returned outcomes ---
+op:0 USD [top-up 0] +user:000001=10000 -house:cash=10000
+op:1 USD [top-up 1] +user:000627=10500 -house:cash=10500
+op:2 USD [top-up 2] +user:005011=11000 -house:cash=11000
+op:3 USD [top-up 3] +user:000183=11500 -house:cash=11500
+op:4 USD [top-up 4] +user:002878=12000 -house:cash=12000
+op:5 USD [top-up 5] +user:000022=12500 -house:cash=12500
+op:6 USD [top-up 6] +user:001457=13000 -house:cash=13000
+op:7 USD [top-up 7] +user:007871=13500 -house:cash=13500
+op:8 USD [top-up 8] +user:000603=14000 -house:cash=14000
+op:9 USD [top-up 9] +user:004917=14500 -house:cash=14500
+op:10 USD [top-up 10] +user:000172=15000 -house:cash=15000
+op:11 USD [] -user:002813=775 +house:revenue=775
+op:12 USD [purchase 12] -user:000020=800 +house:revenue=750 +house:fees=50
+op:13 USD [] -user:001416=825 +house:revenue=825
+op:14 USD [] -user:007743=850 +house:revenue=850
+op:15 USD [purchase 15] -user:000580=875 +house:revenue=825 +house:fees=50
+op:16 USD [split 16] -user:004823=4550 +seller:0113=900 +seller:0214=900 +seller:0315=900 +seller:0416=900 +seller:0017=900 +house:fees=50
+op:17 USD [split 17] -user:000162=4675 +seller:0120=925 +seller:0221=925 +seller:0322=925 +seller:0423=925 +seller:0024=925 +house:fees=50
+op:11 USD [] -user:002813=775 +house:revenue=775
+op:12 USD [purchase 12] -user:000020=800 +house:revenue=750 +house:fees=50
+op:20 USD [top-up 20] +user:001375=20000 -house:cash=20000
+op:21 USD [top-up 21] +user:007617=20500 -house:cash=20500
+op:22 USD [top-up 22] +user:000558=21000 -house:cash=21000
+op:23 USD [top-up 23] +user:004731=21500 -house:cash=21500
+op:24 USD [top-up 24] +user:000153=22000 -house:cash=22000
+op:25 USD [top-up 25] +user:002685=22500 -house:cash=22500
+op:26 USD [top-up 26] +user:000015=23000 -house:cash=23000
+op:27 USD [top-up 27] +user:001335=23500 -house:cash=23500
+op:28 USD [top-up 28] +user:007492=24000 -house:cash=24000
+op:29 USD [top-up 29] +user:000536=24500 -house:cash=24500
+op:30 USD [top-up 30] +user:004640=25000 -house:cash=25000
+op:31 USD [] -user:000144=1275 +house:revenue=1275
+op:32 USD [] -user:002623=1300 +house:revenue=1300
+op:33 USD [purchase 33] -user:000013=1325 +house:revenue=1275 +house:fees=50
+op:34 USD [] -user:001296=1350 +house:revenue=1350
+op:35 USD [] -user:007368=1375 +house:revenue=1375
+op:36 USD [split 36] -user:000515=7050 +seller:0253=1400 +seller:0354=1400 +seller:0455=1400 +seller:0056=1400 +seller:0157=1400 +house:fees=50
+op:37 USD [split 37] -user:004550=2550 +seller:0260=500 +seller:0361=500 +seller:0462=500 +seller:0063=500 +seller:0164=500 +house:fees=50
+op:31 USD [] -user:000144=1275 +house:revenue=1275
+op:32 USD [] -user:002623=1300 +house:revenue=1300
+op:40 USD [top-up 40] +user:000012=11500 -house:cash=11500
+op:41 USD [top-up 41] +user:001258=12000 -house:cash=12000
+op:42 USD [top-up 42] +user:007246=12500 -house:cash=12500
+op:43 USD [top-up 43] +user:000495=13000 -house:cash=13000
+op:44 USD [top-up 44] +user:004462=13500 -house:cash=13500
+op:45 USD [top-up 45] +user:000127=14000 -house:cash=14000
+op:46 USD [top-up 46] +user:002502=14500 -house:cash=14500
+op:47 USD [top-up 47] +user:000010=15000 -house:cash=15000
+op:48 USD [top-up 48] +user:001221=15500 -house:cash=15500
+op:49 USD [top-up 49] +user:007125=16000 -house:cash=16000
+op:50 USD [top-up 50] +user:000475=16500 -house:cash=16500
+op:51 USD [purchase 51] -user:004374=850 +house:revenue=800 +house:fees=50
+op:52 USD [] -user:000119=875 +house:revenue=875
+op:53 USD [] -user:002442=900 +house:revenue=900
+op:54 USD [purchase 54] -user:000009=925 +house:revenue=875 +house:fees=50
+op:55 USD [] -user:001184=950 +house:revenue=950
+op:56 USD [split 56] -user:007005=4925 +seller:0393=975 +seller:0494=975 +seller:0095=975 +seller:0196=975 +seller:0297=975 +house:fees=50
+op:57 USD [split 57] -user:000455=5050 +seller:0400=1000 +seller:0001=1000 +seller:0102=1000 +seller:0203=1000 +seller:0304=1000 +house:fees=50
+op:51 USD [purchase 51] -user:004374=850 +house:revenue=800 +house:fees=50
+op:52 USD [] -user:000119=875 +house:revenue=875
+op:60 USD [top-up 60] +user:002384=21500 -house:cash=21500
+op:61 USD [top-up 61] +user:000008=22000 -house:cash=22000
+op:62 USD [top-up 62] +user:001148=22500 -house:cash=22500
+op:63 USD [top-up 63] +user:006887=23000 -house:cash=23000
+op:64 USD [top-up 64] +user:000436=23500 -house:cash=23500
+op:65 USD [top-up 65] +user:004203=24000 -house:cash=24000
+op:66 USD [top-up 66] +user:000104=24500 -house:cash=24500
+op:67 USD [top-up 67] +user:002326=25000 -house:cash=25000
+op:68 USD [top-up 68] +user:000006=25500 -house:cash=25500
+op:69 USD [top-up 69] +user:001113=26000 -house:cash=26000
+op:70 USD [top-up 70] +user:006770=26500 -house:cash=26500
+op:71 USD [] -user:000418=1350 +house:revenue=1350
+op:72 USD [purchase 72] -user:004119=1375 +house:revenue=1325 +house:fees=50
+op:73 USD [] -user:000097=1400 +house:revenue=1400
+op:74 USD [] -user:002270=500 +house:revenue=500
+op:75 USD [purchase 75] -user:000005=525 +house:revenue=475 +house:fees=50
+op:76 USD [split 76] -user:001078=2800 +seller:0033=550 +seller:0134=550 +seller:0235=550 +seller:0336=550 +seller:0437=550 +house:fees=50
+op:77 USD [split 77] -user:006654=2925 +seller:0040=575 +seller:0141=575 +seller:0242=575 +seller:0343=575 +seller:0444=575 +house:fees=50
+op:71 USD [] -user:000418=1350 +house:revenue=1350
+op:72 USD [purchase 72] -user:004119=1375 +house:revenue=1325 +house:fees=50
+op:80 USD [top-up 80] +user:000090=13000 -house:cash=13000
+op:81 USD [top-up 81] +user:002214=13500 -house:cash=13500
+op:82 USD [top-up 82] +user:000005=14000 -house:cash=14000
+op:83 USD [top-up 83] +user:001044=14500 -house:cash=14500
+op:84 USD [top-up 84] +user:006540=15000 -house:cash=15000
+op:85 USD [top-up 85] +user:000383=15500 -house:cash=15500
+op:86 USD [top-up 86] +user:003954=16000 -house:cash=16000
+op:87 USD [top-up 87] +user:000084=16500 -house:cash=16500
+op:88 USD [top-up 88] +user:002159=17000 -house:cash=17000
+op:89 USD [top-up 89] +user:000004=17500 -house:cash=17500
+op:90 USD [top-up 90] +user:001011=18000 -house:cash=18000
+op:91 USD [] -user:006427=925 +house:revenue=925
+op:92 USD [] -user:000366=950 +house:revenue=950
+op:93 USD [purchase 93] -user:003873=975 +house:revenue=925 +house:fees=50
+op:94 USD [] -user:000078=1000 +house:revenue=1000
+op:95 USD [] -user:002105=1025 +house:revenue=1025
+op:96 USD [split 96] -user:000003=5300 +seller:0173=1050 +seller:0274=1050 +seller:0375=1050 +seller:0476=1050 +seller:0077=1050 +house:fees=50
+op:97 USD [split 97] -user:000979=5425 +seller:0180=1075 +seller:0281=1075 +seller:0382=1075 +seller:0483=1075 +seller:0084=1075 +house:fees=50
+op:91 USD [] -user:006427=925 +house:revenue=925
+op:92 USD [] -user:000366=950 +house:revenue=950
+op:100 USD [top-up 100] +user:003794=23000 -house:cash=23000
+op:101 USD [top-up 101] +user:000072=23500 -house:cash=23500
+op:102 USD [top-up 102] +user:002052=24000 -house:cash=24000
+op:103 USD [top-up 103] +user:000003=24500 -house:cash=24500
+op:104 USD [top-up 104] +user:000947=25000 -house:cash=25000
+op:105 USD [top-up 105] +user:006205=25500 -house:cash=25500
+op:106 USD [top-up 106] +user:000333=26000 -house:cash=26000
+op:107 USD [top-up 107] +user:003715=26500 -house:cash=26500
+op:108 USD [top-up 108] +user:000067=27000 -house:cash=27000
+op:109 USD [top-up 109] +user:002000=27500 -house:cash=27500
+op:110 USD [top-up 110] +user:000002=28000 -house:cash=28000
+op:111 USD [purchase 111] -user:000916=500 +house:revenue=450 +house:fees=50
+op:112 USD [] -user:006096=525 +house:revenue=525
+op:113 USD [] -user:000318=550 +house:revenue=550
+op:114 USD [purchase 114] -user:003638=575 +house:revenue=525 +house:fees=50
+op:115 USD [] -user:000061=600 +house:revenue=600
+op:116 USD [split 116] -user:001949=3175 +seller:0313=625 +seller:0414=625 +seller:0015=625 +seller:0116=625 +seller:0217=625 +house:fees=50
+op:117 USD [split 117] -user:000002=3300 +seller:0320=650 +seller:0421=650 +seller:0022=650 +seller:0123=650 +seller:0224=650 +house:fees=50
+op:111 USD [purchase 111] -user:000916=500 +house:revenue=450 +house:fees=50
+op:112 USD [] -user:006096=525 +house:revenue=525
+op:120 USD [top-up 120] +user:000303=14500 -house:cash=14500
+op:121 USD [top-up 121] +user:003561=15000 -house:cash=15000
+op:122 USD [top-up 122] +user:000057=15500 -house:cash=15500
+op:123 USD [top-up 123] +user:001899=16000 -house:cash=16000
+op:124 USD [top-up 124] +user:000001=16500 -house:cash=16500
+op:125 USD [top-up 125] +user:000856=17000 -house:cash=17000
+op:126 USD [top-up 126] +user:005881=17500 -house:cash=17500
+op:127 USD [top-up 127] +user:000289=18000 -house:cash=18000
+op:128 USD [top-up 128] +user:003486=18500 -house:cash=18500
+op:129 USD [top-up 129] +user:000052=19000 -house:cash=19000
+op:130 USD [top-up 130] +user:001850=19500 -house:cash=19500
+op:131 USD [] -user:000001=1000 +house:revenue=1000
+op:132 USD [purchase 132] -user:000827=1025 +house:revenue=975 +house:fees=50
+op:133 USD [] -user:005776=1050 +house:revenue=1050
+op:134 USD [] -user:000275=1075 +house:revenue=1075
+op:135 USD [purchase 135] -user:003412=1100 +house:revenue=1050 +house:fees=50
+op:136 USD [split 136] -user:000048=5675 +seller:0453=1125 +seller:0054=1125 +seller:0155=1125 +seller:0256=1125 +seller:0357=1125 +house:fees=50
+op:137 USD [split 137] -user:001801=5800 +seller:0460=1150 +seller:0061=1150 +seller:0162=1150 +seller:0263=1150 +seller:0364=1150 +house:fees=50
+op:131 USD [] -user:000001=1000 +house:revenue=1000
+op:132 USD [purchase 132] -user:000827=1025 +house:revenue=975 +house:fees=50
+op:140 USD [top-up 140] +user:005672=24500 -house:cash=24500
+op:141 USD [top-up 141] +user:000261=25000 -house:cash=25000
+op:142 USD [top-up 142] +user:003339=25500 -house:cash=25500
+op:143 USD [top-up 143] +user:000043=26000 -house:cash=26000
+op:144 USD [top-up 144] +user:001753=26500 -house:cash=26500
+op:145 USD [top-up 145] +user:000001=27000 -house:cash=27000
+op:146 USD [top-up 146] +user:000771=27500 -house:cash=27500
+op:147 USD [top-up 147] +user:005570=28000 -house:cash=28000
+op:148 USD [top-up 148] +user:000248=10000 -house:cash=10000
+op:149 USD [top-up 149] +user:003267=10500 -house:cash=10500
+op:150 USD [top-up 150] +user:000040=11000 -house:cash=11000
+op:151 USD [] -user:001707=575 +house:revenue=575
+op:152 USD [] -user:000001=600 +house:revenue=600
+op:153 USD [purchase 153] -user:000744=625 +house:revenue=575 +house:fees=50
+op:154 USD [] -user:005468=650 +house:revenue=650
+op:155 USD [] -user:000236=675 +house:revenue=675
+op:156 USD [split 156] -user:003196=3550 +seller:0093=700 +seller:0194=700 +seller:0295=700 +seller:0396=700 +seller:0497=700 +house:fees=50
+op:157 USD [split 157] -user:000036=3675 +seller:0100=725 +seller:0201=725 +seller:0302=725 +seller:0403=725 +seller:0004=725 +house:fees=50
+op:151 USD [] -user:001707=575 +house:revenue=575
+op:152 USD [] -user:000001=600 +house:revenue=600
+op:160 USD [top-up 160] +user:000718=16000 -house:cash=16000
+op:161 USD [top-up 161] +user:005368=16500 -house:cash=16500
+op:162 USD [top-up 162] +user:000224=17000 -house:cash=17000
+op:163 USD [top-up 163] +user:003126=17500 -house:cash=17500
+op:164 USD [top-up 164] +user:000033=18000 -house:cash=18000
+op:165 USD [top-up 165] +user:001615=18500 -house:cash=18500
+op:166 USD [top-up 166] +user:000001=19000 -house:cash=19000
+op:167 USD [top-up 167] +user:000692=19500 -house:cash=19500
+op:168 USD [top-up 168] +user:005269=20000 -house:cash=20000
+op:169 USD [top-up 169] +user:000212=20500 -house:cash=20500
+op:170 USD [top-up 170] +user:003057=21000 -house:cash=21000
+op:171 USD [purchase 171] -user:000029=1075 +house:revenue=1025 +house:fees=50
+op:172 USD [] -user:001571=1100 +house:revenue=1100
+op:173 USD [] -user:000001=1125 +house:revenue=1125
+op:174 USD [purchase 174] -user:000667=1150 +house:revenue=1100 +house:fees=50
+op:175 USD [] -user:005171=1175 +house:revenue=1175
+op:176 USD [split 176] -user:000200=6050 +seller:0233=1200 +seller:0334=1200 +seller:0435=1200 +seller:0036=1200 +seller:0137=1200 +house:fees=50
+op:177 USD [split 177] -user:002989=6175 +seller:0240=1225 +seller:0341=1225 +seller:0442=1225 +seller:0043=1225 +seller:0144=1225 +house:fees=50
+op:171 USD [purchase 171] -user:000029=1075 +house:revenue=1025 +house:fees=50
+op:172 USD [] -user:001571=1100 +house:revenue=1100
+op:180 USD [top-up 180] +user:000001=26000 -house:cash=26000
+op:181 USD [top-up 181] +user:000643=26500 -house:cash=26500
+op:182 USD [top-up 182] +user:005074=27000 -house:cash=27000
+op:183 USD [top-up 183] +user:000190=27500 -house:cash=27500
+op:184 USD [top-up 184] +user:002922=28000 -house:cash=28000
+op:185 USD [top-up 185] +user:000024=10000 -house:cash=10000
+op:186 USD [top-up 186] +user:001485=10500 -house:cash=10500
+op:187 USD [top-up 187] +user:007957=11000 -house:cash=11000
+op:188 USD [top-up 188] +user:000619=11500 -house:cash=11500
+op:189 USD [top-up 189] +user:004979=12000 -house:cash=12000
+op:190 USD [top-up 190] +user:000179=12500 -house:cash=12500
+op:191 USD [] -user:002856=650 +house:revenue=650
+op:192 USD [purchase 192] -user:000021=675 +house:revenue=625 +house:fees=50
+op:193 USD [] -user:001443=700 +house:revenue=700
+op:194 USD [] -user:007828=725 +house:revenue=725
+op:195 USD [purchase 195] -user:000596=750 +house:revenue=700 +house:fees=50
+op:196 USD [split 196] -user:004885=3925 +seller:0373=775 +seller:0474=775 +seller:0075=775 +seller:0176=775 +seller:0277=775 +house:fees=50
+op:197 USD [split 197] -user:000169=4050 +seller:0380=800 +seller:0481=800 +seller:0082=800 +seller:0183=800 +seller:0284=800 +house:fees=50
+op:191 USD [] -user:002856=650 +house:revenue=650
+op:192 USD [purchase 192] -user:000021=675 +house:revenue=625 +house:fees=50
+op:200 USD [top-up 200] +user:001402=17500 -house:cash=17500
+op:201 USD [top-up 201] +user:007701=18000 -house:cash=18000
+op:202 USD [top-up 202] +user:000573=18500 -house:cash=18500
+op:203 USD [top-up 203] +user:004792=19000 -house:cash=19000
+op:204 USD [top-up 204] +user:000159=19500 -house:cash=19500
+op:205 USD [top-up 205] +user:002727=20000 -house:cash=20000
+op:206 USD [top-up 206] +user:000017=20500 -house:cash=20500
+op:207 USD [top-up 207] +user:001362=21000 -house:cash=21000
+op:208 USD [top-up 208] +user:007574=21500 -house:cash=21500
+op:209 USD [top-up 209] +user:000551=22000 -house:cash=22000
+op:210 USD [top-up 210] +user:004700=22500 -house:cash=22500
+op:211 USD [] -user:000150=1150 +house:revenue=1150
+op:212 USD [] -user:002664=1175 +house:revenue=1175
+op:213 USD [purchase 213] -user:000015=1200 +house:revenue=1150 +house:fees=50
+op:214 USD [] -user:001322=1225 +house:revenue=1225
+op:215 USD [] -user:007450=1250 +house:revenue=1250
+op:216 USD [split 216] -user:000529=6425 +seller:0013=1275 +seller:0114=1275 +seller:0215=1275 +seller:0316=1275 +seller:0417=1275 +house:fees=50
+op:217 USD [split 217] -user:004610=6550 +seller:0020=1300 +seller:0121=1300 +seller:0222=1300 +seller:0323=1300 +seller:0424=1300 +house:fees=50
+op:211 USD [] -user:000150=1150 +house:revenue=1150
+op:212 USD [] -user:002664=1175 +house:revenue=1175
+op:220 USD [top-up 220] +user:000013=27500 -house:cash=27500
+op:221 USD [top-up 221] +user:001283=28000 -house:cash=28000
+op:222 USD [top-up 222] +user:007327=10000 -house:cash=10000
+op:223 USD [top-up 223] +user:000508=10500 -house:cash=10500
+op:224 USD [top-up 224] +user:004520=11000 -house:cash=11000
+op:225 USD [top-up 225] +user:000132=11500 -house:cash=11500
+op:226 USD [top-up 226] +user:002541=12000 -house:cash=12000
+op:227 USD [top-up 227] +user:000011=12500 -house:cash=12500
+op:228 USD [top-up 228] +user:001245=13000 -house:cash=13000
+op:229 USD [top-up 229] +user:007205=13500 -house:cash=13500
+op:230 USD [top-up 230] +user:000488=14000 -house:cash=14000
+op:231 USD [purchase 231] -user:004432=725 +house:revenue=675 +house:fees=50
+op:232 USD [] -user:000124=750 +house:revenue=750
+op:233 USD [] -user:002481=775 +house:revenue=775
+op:234 USD [purchase 234] -user:000010=800 +house:revenue=750 +house:fees=50
+op:235 USD [] -user:001208=825 +house:revenue=825
+op:236 USD [split 236] -user:007084=4300 +seller:0153=850 +seller:0254=850 +seller:0355=850 +seller:0456=850 +seller:0057=850 +house:fees=50
+op:237 USD [split 237] -user:000468=4425 +seller:0160=875 +seller:0261=875 +seller:0362=875 +seller:0463=875 +seller:0064=875 +house:fees=50
+op:231 USD [purchase 231] -user:004432=725 +house:revenue=675 +house:fees=50
+op:232 USD [] -user:000124=750 +house:revenue=750
+op:240 USD [top-up 240] +user:002422=19000 -house:cash=19000
+op:241 USD [top-up 241] +user:000008=19500 -house:cash=19500
+op:242 USD [top-up 242] +user:001172=20000 -house:cash=20000
+op:243 USD [top-up 243] +user:006965=20500 -house:cash=20500
+op:244 USD [top-up 244] +user:000449=21000 -house:cash=21000
+op:245 USD [top-up 245] +user:004259=21500 -house:cash=21500
+op:246 USD [top-up 246] +user:000109=22000 -house:cash=22000
+op:247 USD [top-up 247] +user:002364=22500 -house:cash=22500
+op:248 USD [top-up 248] +user:000007=23000 -house:cash=23000
+op:249 USD [top-up 249] +user:001136=23500 -house:cash=23500
+op:250 USD [top-up 250] +user:006847=24000 -house:cash=24000
+op:251 USD [] -user:000430=1225 +house:revenue=1225
+op:252 USD [purchase 252] -user:004174=1250 +house:revenue=1200 +house:fees=50
+op:253 USD [] -user:000101=1275 +house:revenue=1275
+op:254 USD [] -user:002307=1300 +house:revenue=1300
+op:255 USD [purchase 255] -user:000006=1325 +house:revenue=1275 +house:fees=50
+op:256 USD [split 256] -user:001101=6800 +seller:0293=1350 +seller:0394=1350 +seller:0495=1350 +seller:0096=1350 +seller:0197=1350 +house:fees=50
+op:257 USD [split 257] -user:006731=6925 +seller:0300=1375 +seller:0401=1375 +seller:0002=1375 +seller:0103=1375 +seller:0204=1375 +house:fees=50
+op:251 USD [] -user:000430=1225 +house:revenue=1225
+op:252 USD [purchase 252] -user:004174=1250 +house:revenue=1200 +house:fees=50
+op:260 USD [top-up 260] +user:000095=10500 -house:cash=10500
+op:261 USD [top-up 261] +user:002251=11000 -house:cash=11000
+op:262 USD [top-up 262] +user:000005=11500 -house:cash=11500
+op:263 USD [top-up 263] +user:001067=12000 -house:cash=12000
+op:264 USD [top-up 264] +user:006615=12500 -house:cash=12500
+op:265 USD [top-up 265] +user:000394=13000 -house:cash=13000
+op:266 USD [top-up 266] +user:004008=13500 -house:cash=13500
+op:267 USD [top-up 267] +user:000088=14000 -house:cash=14000
+op:268 USD [top-up 268] +user:002195=14500 -house:cash=14500
+op:269 USD [top-up 269] +user:000004=15000 -house:cash=15000
+op:270 USD [top-up 270] +user:001033=15500 -house:cash=15500
+op:271 USD [] -user:006502=800 +house:revenue=800
+op:272 USD [] -user:000377=825 +house:revenue=825
+op:273 USD [purchase 273] -user:003927=850 +house:revenue=800 +house:fees=50
+op:274 USD [] -user:000082=875 +house:revenue=875
+op:275 USD [] -user:002141=900 +house:revenue=900
+op:276 USD [split 276] -user:000004=4675 +seller:0433=925 +seller:0034=925 +seller:0135=925 +seller:0236=925 +seller:0337=925 +house:fees=50
+op:277 USD [split 277] -user:001000=4800 +seller:0440=950 +seller:0041=950 +seller:0142=950 +seller:0243=950 +seller:0344=950 +house:fees=50
+op:271 USD [] -user:006502=800 +house:revenue=800
+op:272 USD [] -user:000377=825 +house:revenue=825
+op:280 USD [top-up 280] +user:003846=20500 -house:cash=20500
+op:281 USD [top-up 281] +user:000076=21000 -house:cash=21000
+op:282 USD [top-up 282] +user:002087=21500 -house:cash=21500
+op:283 USD [top-up 283] +user:000003=22000 -house:cash=22000
+op:284 USD [top-up 284] +user:000968=22500 -house:cash=22500
+op:285 USD [top-up 285] +user:006278=23000 -house:cash=23000
+op:286 USD [top-up 286] +user:000344=23500 -house:cash=23500
+op:287 USD [top-up 287] +user:003767=24000 -house:cash=24000
+op:288 USD [top-up 288] +user:000070=24500 -house:cash=24500
+op:289 USD [top-up 289] +user:002035=25000 -house:cash=25000
+op:290 USD [top-up 290] +user:000002=25500 -house:cash=25500
+op:291 USD [purchase 291] -user:000937=1300 +house:revenue=1250 +house:fees=50
+op:292 USD [] -user:006168=1325 +house:revenue=1325
+op:293 USD [] -user:000328=1350 +house:revenue=1350
+op:294 USD [purchase 294] -user:003689=1375 +house:revenue=1325 +house:fees=50
+op:295 USD [] -user:000065=1400 +house:revenue=1400
+op:296 USD [split 296] -user:001983=2550 +seller:0073=500 +seller:0174=500 +seller:0275=500 +seller:0376=500 +seller:0477=500 +house:fees=50
+op:297 USD [split 297] -user:000002=2675 +seller:0080=525 +seller:0181=525 +seller:0282=525 +seller:0383=525 +seller:0484=525 +house:fees=50
+op:291 USD [purchase 291] -user:000937=1300 +house:revenue=1250 +house:fees=50
+op:292 USD [] -user:006168=1325 +house:revenue=1325
+op:300 USD [top-up 300] +user:000313=12000 -house:cash=12000
+op:301 USD [top-up 301] +user:003612=12500 -house:cash=12500
+op:302 USD [top-up 302] +user:000060=13000 -house:cash=13000
+op:303 USD [top-up 303] +user:001932=13500 -house:cash=13500
+op:304 USD [top-up 304] +user:000002=14000 -house:cash=14000
+op:305 USD [top-up 305] +user:000876=14500 -house:cash=14500
+op:306 USD [top-up 306] +user:005952=15000 -house:cash=15000
+op:307 USD [top-up 307] +user:000298=15500 -house:cash=15500
+op:308 USD [top-up 308] +user:003536=16000 -house:cash=16000
+op:309 USD [top-up 309] +user:000055=16500 -house:cash=16500
+op:310 USD [top-up 310] +user:001882=17000 -house:cash=17000
+op:311 USD [] -user:000001=875 +house:revenue=875
+op:312 USD [purchase 312] -user:000846=900 +house:revenue=850 +house:fees=50
+op:313 USD [] -user:005846=925 +house:revenue=925
+op:314 USD [] -user:000284=950 +house:revenue=950
+op:315 USD [purchase 315] -user:003461=975 +house:revenue=925 +house:fees=50
+op:316 USD [split 316] -user:000050=5050 +seller:0213=1000 +seller:0314=1000 +seller:0415=1000 +seller:0016=1000 +seller:0117=1000 +house:fees=50
+op:317 USD [split 317] -user:001833=5175 +seller:0220=1025 +seller:0321=1025 +seller:0422=1025 +seller:0023=1025 +seller:0124=1025 +house:fees=50
+op:311 USD [] -user:000001=875 +house:revenue=875
+op:312 USD [purchase 312] -user:000846=900 +house:revenue=850 +house:fees=50
+op:320 USD [top-up 320] +user:005741=22000 -house:cash=22000
+op:321 USD [top-up 321] +user:000270=22500 -house:cash=22500
+op:322 USD [top-up 322] +user:003387=23000 -house:cash=23000
+op:323 USD [top-up 323] +user:000046=23500 -house:cash=23500
+op:324 USD [top-up 324] +user:001785=24000 -house:cash=24000
+op:325 USD [top-up 325] +user:000001=24500 -house:cash=24500
+op:326 USD [top-up 326] +user:000790=25000 -house:cash=25000
+op:327 USD [top-up 327] +user:005637=25500 -house:cash=25500
+op:328 USD [top-up 328] +user:000257=26000 -house:cash=26000
+op:329 USD [top-up 329] +user:003314=26500 -house:cash=26500
+op:330 USD [top-up 330] +user:000042=27000 -house:cash=27000
+op:331 USD [] -user:001738=1375 +house:revenue=1375
+op:332 USD [] -user:000001=1400 +house:revenue=1400
+op:333 USD [purchase 333] -user:000762=500 +house:revenue=450 +house:fees=50
+op:334 USD [] -user:005535=525 +house:revenue=525
+op:335 USD [] -user:000244=550 +house:revenue=550
+op:336 USD [split 336] -user:003243=2925 +seller:0353=575 +seller:0454=575 +seller:0055=575 +seller:0156=575 +seller:0257=575 +house:fees=50
+op:337 USD [split 337] -user:000038=3050 +seller:0360=600 +seller:0461=600 +seller:0062=600 +seller:0163=600 +seller:0264=600 +house:fees=50
+op:331 USD [] -user:001738=1375 +house:revenue=1375
+op:332 USD [] -user:000001=1400 +house:revenue=1400
+op:340 USD [top-up 340] +user:000735=13500 -house:cash=13500
+op:341 USD [top-up 341] +user:005434=14000 -house:cash=14000
+op:342 USD [top-up 342] +user:000232=14500 -house:cash=14500
+op:343 USD [top-up 343] +user:003172=15000 -house:cash=15000
+op:344 USD [top-up 344] +user:000035=15500 -house:cash=15500
+op:345 USD [top-up 345] +user:001645=16000 -house:cash=16000
+op:346 USD [top-up 346] +user:000001=16500 -house:cash=16500
+op:347 USD [top-up 347] +user:000709=17000 -house:cash=17000
+op:348 USD [top-up 348] +user:005334=17500 -house:cash=17500
+op:349 USD [top-up 349] +user:000220=18000 -house:cash=18000
+op:350 USD [top-up 350] +user:003102=18500 -house:cash=18500
+op:351 USD [purchase 351] -user:000031=950 +house:revenue=900 +house:fees=50
+op:352 USD [] -user:001600=975 +house:revenue=975
+op:353 USD [] -user:000001=1000 +house:revenue=1000
+op:354 USD [purchase 354] -user:000684=1025 +house:revenue=975 +house:fees=50
+op:355 USD [] -user:005236=1050 +house:revenue=1050
+op:356 USD [split 356] -user:000208=5425 +seller:0493=1075 +seller:0094=1075 +seller:0195=1075 +seller:0296=1075 +seller:0397=1075 +house:fees=50
+op:357 USD [split 357] -user:003034=5550 +seller:0500=1100 +seller:0101=1100 +seller:0202=1100 +seller:0303=1100 +seller:0404=1100 +house:fees=50
+op:351 USD [purchase 351] -user:000031=950 +house:revenue=900 +house:fees=50
+op:352 USD [] -user:001600=975 +house:revenue=975
+op:360 USD [top-up 360] +user:000001=23500 -house:cash=23500
+op:361 USD [top-up 361] +user:000659=24000 -house:cash=24000
+op:362 USD [top-up 362] +user:005138=24500 -house:cash=24500
+op:363 USD [top-up 363] +user:000197=25000 -house:cash=25000
+op:364 USD [top-up 364] +user:002966=25500 -house:cash=25500
+op:365 USD [top-up 365] +user:000025=26000 -house:cash=26000
+op:366 USD [top-up 366] +user:001513=26500 -house:cash=26500
+op:367 USD [top-up 367] +user:000001=27000 -house:cash=27000
+op:368 USD [top-up 368] +user:000635=27500 -house:cash=27500
+op:369 USD [top-up 369] +user:005042=28000 -house:cash=28000
+op:370 USD [top-up 370] +user:000186=10000 -house:cash=10000
+op:371 USD [] -user:002900=525 +house:revenue=525
+op:372 USD [purchase 372] -user:000023=550 +house:revenue=500 +house:fees=50
+op:373 USD [] -user:001471=575 +house:revenue=575
+op:374 USD [] -user:007913=600 +house:revenue=600
+op:375 USD [purchase 375] -user:000611=625 +house:revenue=575 +house:fees=50
+op:376 USD [split 376] -user:004947=3300 +seller:0133=650 +seller:0234=650 +seller:0335=650 +seller:0436=650 +seller:0037=650 +house:fees=50
+op:377 USD [split 377] -user:000176=3425 +seller:0140=675 +seller:0241=675 +seller:0342=675 +seller:0443=675 +seller:0044=675 +house:fees=50
+op:371 USD [] -user:002900=525 +house:revenue=525
+op:372 USD [purchase 372] -user:000023=550 +house:revenue=500 +house:fees=50
+op:380 USD [top-up 380] +user:001429=15000 -house:cash=15000
+op:381 USD [top-up 381] +user:007785=15500 -house:cash=15500
+op:382 USD [top-up 382] +user:000588=16000 -house:cash=16000
+op:383 USD [top-up 383] +user:004853=16500 -house:cash=16500
+op:384 USD [top-up 384] +user:000166=17000 -house:cash=17000
+op:385 USD [top-up 385] +user:002770=17500 -house:cash=17500
+op:386 USD [top-up 386] +user:000018=18000 -house:cash=18000
+op:387 USD [top-up 387] +user:001388=18500 -house:cash=18500
+op:388 USD [top-up 388] +user:007658=19000 -house:cash=19000
+op:389 USD [top-up 389] +user:000565=19500 -house:cash=19500
+op:390 USD [top-up 390] +user:004761=20000 -house:cash=20000
+op:391 USD [] -user:000156=1025 +house:revenue=1025
+op:392 USD [] -user:002706=1050 +house:revenue=1050
+op:393 USD [purchase 393] -user:000016=1075 +house:revenue=1025 +house:fees=50
+op:394 USD [] -user:001348=1100 +house:revenue=1100
+op:395 USD [] -user:007532=1125 +house:revenue=1125
+op:396 USD [split 396] -user:000543=5800 +seller:0273=1150 +seller:0374=1150 +seller:0475=1150 +seller:0076=1150 +seller:0177=1150 +house:fees=50
+op:397 USD [split 397] -user:004670=5925 +seller:0280=1175 +seller:0381=1175 +seller:0482=1175 +seller:0083=1175 +seller:0184=1175 +house:fees=50
+op:391 USD [] -user:000156=1025 +house:revenue=1025
+op:392 USD [] -user:002706=1050 +house:revenue=1050
+
+--- books dump: 8864 lines, sha256 b80bbce88fbd4bc6 ---
+op:0 USD [top-up 0] 0:user:000001=10000 1:house:cash=-10000
+op:1 USD [top-up 1] 0:user:000627=10500 1:house:cash=-10500
+op:10 USD [top-up 10] 0:user:000172=15000 1:house:cash=-15000
+op:100 USD [top-up 100] 0:user:003794=23000 1:house:cash=-23000
+op:101 USD [top-up 101] 0:user:000072=23500 1:house:cash=-23500
+op:102 USD [top-up 102] 0:user:002052=24000 1:house:cash=-24000
+op:103 USD [top-up 103] 0:user:000003=24500 1:house:cash=-24500
+op:104 USD [top-up 104] 0:user:000947=25000 1:house:cash=-25000
+op:105 USD [top-up 105] 0:user:006205=25500 1:house:cash=-25500
+op:106 USD [top-up 106] 0:user:000333=26000 1:house:cash=-26000
+op:107 USD [top-up 107] 0:user:003715=26500 1:house:cash=-26500
+op:108 USD [top-up 108] 0:user:000067=27000 1:house:cash=-27000
+op:109 USD [top-up 109] 0:user:002000=27500 1:house:cash=-27500
+op:11 USD [] 0:user:002813=-775 1:house:revenue=775
+op:110 USD [top-up 110] 0:user:000002=28000 1:house:cash=-28000
+op:111 USD [purchase 111] 0:user:000916=-500 1:house:revenue=450 2:house:fees=50
+op:112 USD [] 0:user:006096=-525 1:house:revenue=525
+op:113 USD [] 0:user:000318=-550 1:house:revenue=550
+op:114 USD [purchase 114] 0:user:003638=-575 1:house:revenue=525 2:house:fees=50
+op:115 USD [] 0:user:000061=-600 1:house:revenue=600
+op:116 USD [split 116] 0:user:001949=-3175 1:seller:0313=625 2:seller:0414=625 3:seller:0015=625 4:seller:0116=625 5:seller:0217=625 6:house:fees=50
+op:117 USD [split 117] 0:user:000002=-3300 1:seller:0320=650 2:seller:0421=650 3:seller:0022=650 4:seller:0123=650 5:seller:0224=650 6:house:fees=50
+op:12 USD [purchase 12] 0:user:000020=-800 1:house:revenue=750 2:house:fees=50
+op:120 USD [top-up 120] 0:user:000303=14500 1:house:cash=-14500
+op:121 USD [top-up 121] 0:user:003561=15000 1:house:cash=-15000
+op:122 USD [top-up 122] 0:user:000057=15500 1:house:cash=-15500
+op:123 USD [top-up 123] 0:user:001899=16000 1:house:cash=-16000
+op:124 USD [top-up 124] 0:user:000001=16500 1:house:cash=-16500
+op:125 USD [top-up 125] 0:user:000856=17000 1:house:cash=-17000
+op:126 USD [top-up 126] 0:user:005881=17500 1:house:cash=-17500
+op:127 USD [top-up 127] 0:user:000289=18000 1:house:cash=-18000
+op:128 USD [top-up 128] 0:user:003486=18500 1:house:cash=-18500
+op:129 USD [top-up 129] 0:user:000052=19000 1:house:cash=-19000
+op:13 USD [] 0:user:001416=-825 1:house:revenue=825
+op:130 USD [top-up 130] 0:user:001850=19500 1:house:cash=-19500
+op:131 USD [] 0:user:000001=-1000 1:house:revenue=1000
+op:132 USD [purchase 132] 0:user:000827=-1025 1:house:revenue=975 2:house:fees=50
+op:133 USD [] 0:user:005776=-1050 1:house:revenue=1050
+op:134 USD [] 0:user:000275=-1075 1:house:revenue=1075
+op:135 USD [purchase 135] 0:user:003412=-1100 1:house:revenue=1050 2:house:fees=50
