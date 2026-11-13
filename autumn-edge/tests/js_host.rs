@@ -815,9 +815,14 @@ fn the_js_gateway_suite_passes() {
         String::from_utf8_lossy(&output.stderr)
     );
     // A filter or a path mistake that runs nothing must not read as a pass.
+    // Node 22 prints TAP when stdout is not a terminal (`# pass 25`); later
+    // releases print the spec reporter there too (`ℹ pass 25`).
     assert!(
-        stdout.lines().any(|line| line.trim_start().starts_with("# pass")
-            && !line.trim_end().ends_with(" 0")),
+        stdout.lines().any(|line| {
+            let line = line.trim_start();
+            (line.starts_with("# pass ") || line.starts_with("ℹ pass "))
+                && !line.trim_end().ends_with(" 0")
+        }),
         "the JS gateway suite ran no tests:\n{stdout}"
     );
 }
