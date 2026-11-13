@@ -1,0 +1,11 @@
+      indexrelname       | idx_scan | idx_tup_read | size  
+-------------------------+----------+--------------+-------
+ idx_votes_comment_id    |        0 |            0 | 18 MB
+ idx_votes_post_id       |        0 |            0 | 40 MB
+ idx_votes_post_id_value |        5 |     14956535 | 90 MB
+ idx_votes_user_id       |        0 |            0 | 22 MB
+ votes_pkey              |        0 |            0 | 64 MB
+ votes_unique_comment    |        0 |            0 | 23 MB
+ votes_unique_post       |        0 |            0 | 90 MB
+(7 rows)
+
