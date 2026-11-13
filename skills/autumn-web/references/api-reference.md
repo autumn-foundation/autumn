@@ -423,7 +423,7 @@ Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `cursor_key_type =` attr keys), bulk `save_many` / `save_many_skip_invalid` /
 `update_many` / `delete_many` / `upsert_many` (compile error on hooked repos),
 `with_lock`, `on_primary()`. Attr keys: `api =`, `policy =`,
-`scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
+`scope =`, `primary_reads`, `boundary =`, `soft_delete`, `tenant_scoped`, `hooks =`,
 `mcp` / `mcp = "read"`.
 
 **(0.6.0)**: `preload(records, spec)` (declarative associations);
@@ -1207,6 +1207,8 @@ in **Typed accessible primitives** above.)
 | `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required` (not on a checkbox: check "one or more" on the server), `aria-invalid`, passthrough. |
 | `widget_pack::element(tag, attrs, &FieldOptions, body)` | Root of a non-input widget with the app `data-*`/`hx-*` passthrough. |
 | `plugin_conformance::run_conformance(&ConformanceConfig::new(name).contract(c).no_routes(), &routes)` | For a plugin that mounts no routes (cache, background runtime): no route under the config name or the contract's `plugin`/`registered_as` skips `route-attribution`; such a route fails it. Take the contract from `builder.plugin_contracts()` (it carries `registered_as`); without that, every plugin route fails. Do not set a `prefix` with it. Library counterpart of `autumn plugin-check --no-routes`. |
+| `plugin_conformance::run_route_checks(&config, &routes)` | The route checks of `run_conformance` (all but `experimental-surface`). With a contract, if no route carries the config name and a route carries `registered_as`, the checks use `registered_as`. `autumn plugin-check` calls it on its route dump, so the CLI and the library give the same results, except that `--no-routes` needs `registered_as` to skip (#2828). |
+| `RouteSource::from_wire("plugin:<name>")` | Reads the route-dump source string: `framework`, `plugin:<name>`, else `User`. |
 | `plugin_conformance::widgets::run_widget_conformance(&pack)` | Static: `widget-pack-name`, `widget-stories`, `widget-class-names`, `widget-markup-csp`, `widget-tokens`, `widget-scripts`. |
 | `plugin_conformance::widgets::browser::run_widget_browser_conformance(&pack, axe_src).await` | Feature `system-tests`: `widget-axe` (light + dark), `widget-console`, `widget-keyboard`. |
 | `Page::axe_violations(axe_src)` / `SystemTest::plugin_assets(&ASSETS)` | Shared axe check; serve a bundle in a system test. |
@@ -1363,8 +1365,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
 
 - `autumn_web::cluster` — zero-dependency two-node clustering: authenticated
   TCP gossip membership plus one shared primitive, an eventually consistent
-  cluster-wide grow-only counter. Always compiled (no cargo feature); inert
-  unless `[cluster] enabled = true`. Not leader election, not mutual
+  cluster-wide grow-only counter. Needs the `cluster` feature (in `default`;
+  #2795). Inert unless `[cluster] enabled = true`. Without the feature,
+  `[cluster]` parses and `enabled = true` fails boot. Not leader election, not mutual
   exclusion, not durable — for run-once work use `Lock` above.
 - Handle: `state.extension::<ClusterHandle>() -> Option<Arc<ClusterHandle>>`
   (`None` when disabled). `ClusterHandle::{node_id() -> &str, local_addr() ->
@@ -1682,7 +1685,7 @@ See `docs/guide/system-tests.md`.
 
 ```toml
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "error-reporting"]
 ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]
@@ -1721,7 +1724,8 @@ storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
 seed = ["db"]
 system-info = []
-reporting = []
+error-reporting = []            # panic catch + ErrorReporter (in `default`)
+reporting = ["error-reporting"]  # adds failure capture and `autumn replay` (in `default`)
 webauthn = ["dep:webauthn-rs"]
 csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
@@ -1808,7 +1812,6 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["tra
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
-tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
 validator = { version = "0.21", features = ["derive"] }
 bcrypt = "0.19"

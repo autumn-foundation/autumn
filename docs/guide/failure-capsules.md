@@ -152,6 +152,11 @@ max_capsule_bytes = 1048576       # default: 1048576 (1 MiB)
 max_capsules = 50                 # default: 50
 ```
 
+Capture needs the `reporting` Cargo feature, which is in `default`. In a
+build without it, `enabled = true` fails boot. The no-DB daemon starter
+(`autumn new --daemon`) names `error-reporting` only: add `"reporting"` to
+its `autumn-web` features before you turn capture on.
+
 - **`enabled`** arms the whole feature: the capture layer, the recording
   database pool, and the recording clock. Off, none of it is installed and there
   is nothing to pay for.

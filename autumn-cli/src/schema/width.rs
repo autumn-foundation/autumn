@@ -339,10 +339,16 @@ fn tokenize(sql: &str) -> Vec<Tok> {
                     i += 1;
                 }
             }
-        } else if c == '\'' {
-            // `''` is an escaped quote inside the literal.
-            i += 1;
+        } else if c == '\'' || ((c == 'e' || c == 'E') && next == Some('\'')) {
+            // `''` is a quote inside the string. In `E'…'`, `\` also escapes
+            // the next character. In a standard string, `\` is plain text.
+            let backslash_escapes = c != '\'';
+            i += if backslash_escapes { 2 } else { 1 };
             while i < chars.len() {
+                if backslash_escapes && chars[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
                 if chars[i] == '\'' {
                     if chars.get(i + 1) == Some(&'\'') {
                         i += 2;
@@ -786,15 +792,40 @@ fn collect_table_macros(items: &[syn::Item], out: &mut Vec<MacroTable>) {
     }
 }
 
+/// True when `src` has `word`, then `next`. Whitespace and comments may sit
+/// between them. A `!` that starts `!=` does not count.
+///
+/// Rust allows `table !` and `model (`, so a plain substring test misses them.
+fn mentions_macro(src: &str, word: &str, next: char) -> bool {
+    src.match_indices(word).any(|(at, _)| {
+        let rest = skip_trivia(&src[at + word.len()..]);
+        rest.starts_with(next) && !(next == '!' && rest.starts_with("!="))
+    })
+}
+
+/// `s` without leading whitespace and Rust comments.
+fn skip_trivia(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("//") {
+            s = rest.find('\n').map_or("", |n| &rest[n..]);
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.find("*/").map_or("", |n| &rest[n + 2..]);
+        } else {
+            return s;
+        }
+    }
+}
+
 /// The widths one `.rs` file declares: its `table!` blocks and its `#[model]`
 /// structs. A file that is not valid Rust yields nothing (rustc reports it).
 #[must_use]
 pub fn rust_source_widths(path: &Path, src: &str) -> Vec<TableWidth> {
     let mut out = Vec::new();
-    let mentions_table = src.contains("table!");
+    let mentions_table = mentions_macro(src, "table", '!');
     // `#[model]`, `#[model(…)]`, `#[autumn_web::model]`: cheap text filter so
     // only a file that can hold a model pays for a parse.
-    let mentions_model = src.contains("model]") || src.contains("model(");
+    let mentions_model = mentions_macro(src, "model", ']') || mentions_macro(src, "model", '(');
     if !mentions_table && !mentions_model {
         return out;
     }
@@ -1679,6 +1710,80 @@ mod tests {
             .expect("model width");
         assert_eq!(model.table, "wides");
         assert_eq!(model.columns, 34);
+    }
+
+    #[test]
+    fn escape_string_backslash_quote_stays_inside_the_literal() {
+        let cols: Vec<String> = (0..33)
+            .map(|i| {
+                if i == 5 {
+                    "c5 TEXT DEFAULT E'it\\'s'".to_owned()
+                } else {
+                    format!("c{i} TEXT")
+                }
+            })
+            .collect();
+        let first = format!("CREATE TABLE t ({});", cols.join(", "));
+        let w = widths(&[first.as_str(), wide_create("next", 2).as_str()]);
+        assert_eq!(w.get("t"), Some(&33));
+        assert_eq!(w.get("next"), Some(&2));
+    }
+
+    #[test]
+    fn escape_string_escaped_backslash_then_close() {
+        let w = widths(&[
+            "CREATE TABLE t (a TEXT DEFAULT e'a\\\\', b TEXT DEFAULT 'x');",
+            "CREATE TABLE next (x TEXT);",
+        ]);
+        assert_eq!(w.get("t"), Some(&2));
+        assert_eq!(w.get("next"), Some(&1));
+    }
+
+    #[test]
+    fn standard_string_backslash_is_literal() {
+        let w = widths(&[
+            "CREATE TABLE t (a TEXT DEFAULT 'C:\\', b TEXT);",
+            "CREATE TABLE next (x TEXT);",
+        ]);
+        assert_eq!(w.get("t"), Some(&2));
+        assert_eq!(w.get("next"), Some(&1));
+    }
+
+    #[test]
+    fn spaced_table_macro_is_found() {
+        let cols: Vec<String> = (0..33).map(|i| format!("c{i} -> Int4,")).collect();
+        let src = format!("diesel::table ! {{ t (c0) {{ {} }} }}", cols.join(" "));
+        let found = rust_source_widths(Path::new("schema.rs"), &src);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].source, WidthSource::TableMacro);
+        assert_eq!(found[0].columns, 33);
+    }
+
+    #[test]
+    fn spaced_model_attribute_is_found() {
+        let fields: Vec<String> = (0..32).map(|i| format!("pub f{i}: String,")).collect();
+        let src = format!(
+            "#[model (table = \"t\")]\npub struct Wide {{\n#[id]\npub id: i64,\n{}\n}}",
+            fields.join("\n")
+        );
+        let found = rust_source_widths(Path::new("models.rs"), &src);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].source, WidthSource::Model);
+        assert_eq!(found[0].columns, 33);
+    }
+
+    #[test]
+    fn unterminated_escape_string_does_not_panic() {
+        assert!(widths(&["CREATE TABLE t (a TEXT DEFAULT E'abc\\"]).is_empty());
+        assert!(widths(&["CREATE TABLE t (a TEXT DEFAULT e'"]).is_empty());
+    }
+
+    #[test]
+    fn macro_filter_skips_comments_and_not_equals() {
+        assert!(mentions_macro("table /* c */ ! {", "table", '!'));
+        assert!(mentions_macro("table // c\n! {", "table", '!'));
+        assert!(mentions_macro("#[model ]", "model", ']'));
+        assert!(!mentions_macro("if table != x", "table", '!'));
     }
 
     #[test]

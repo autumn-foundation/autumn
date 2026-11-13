@@ -219,6 +219,14 @@ the other shapes the macro cannot read.
 To publish a payload that `WireShape` refuses, write `#[event(opaque)]`. An
 opaque event has no shape. Its consumers are not checked.
 
+A field whose type has no `WireShape` and is not a known leaf, such as an
+enum, stops `autumn contracts export`. Mark the field `#[wire(opaque)]`. The
+check then compares it by type name only.
+
+Each payload field records its JSON form. `#[wire(type = …)]` names the form
+of a field that the macro cannot read. See
+[Wire types](wire-contracts.md#wire-types).
+
 ### Checked consumers
 
 A `#[listener]` reads fields off its event. Each field it reads must be one

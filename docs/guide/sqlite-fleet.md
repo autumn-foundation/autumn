@@ -33,6 +33,7 @@ mode = "tenant"                 # or "slot"
 root = "/var/lib/app/fleet"     # on the host's local volume
 # path = "{bucket}/{tenant}.db" # default for mode = "tenant"
 max_open = 256                  # soft limit on open databases (LRU past this)
+# max_open_policy = "soft"    # "wait" or "refuse" make max_open a hard limit
 # max_resident_bytes = 0        # soft memory budget; 0 is off (LRU past this)
 # min_residency = "2s"          # LRU does not close a database used this recently
 pool_size = 2                   # connections per open database
@@ -134,6 +135,7 @@ paths. For analytics, [query the lake](#query-the-lake) instead.
 
 When a handler holds a `Db` past `database.slow_query_threshold`, Autumn
 logs `database connection held past slow_query_threshold` with `held_ms`.
+`/actuator/metrics` records each hold in `db_connection_holds["<route>"]`.
 The time covers all work in the hold, not one statement. For a fan-out, take
 `LazyDb`. Call `checkout()` after the fan-out.
 
@@ -162,6 +164,8 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | `fleet.each(n, f)` | run `f` on every database, `n` at a time |
 | `fleet.migrate_all(n)` | migrate every database, report failures per database |
 | `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
+| `fleet.replicated_through(&key)` | the instant up to which every commit is in the replica. See [Know when a write is in the replica](#know-when-a-write-is-in-the-replica) |
+| `fleet.wait_replicated(&key, at, timeout)` | wait until every commit at or before `at` is in the replica |
 | `fleet.restore_from_file(&key, &src, opts)` | replace (or create) the database with a local backup; no replication needed. See [Restore a backup in place](#restore-a-backup-in-place) |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
 
@@ -443,6 +447,34 @@ them.
   12 seconds after the burst.
 - A lower `min_residency` keeps the count nearer to `max_open` during a burst.
   A request can then reopen a database that it used a moment before.
+- `max_open_policy` sets what an open does when the fleet is full:
+  - `"soft"` (default): open anyway, as above.
+  - `"wait"`: wait for a free slot, for at most `database.connect_timeout_secs`.
+    Then answer `503`. Keep `min_residency` below that timeout. Boot warns
+    when it is not.
+  - `"refuse"`: answer `503` with `Retry-After` at once when no idle database
+    can close. If one can close, wait for that close, for at most
+    `database.connect_timeout_secs`.
+
+  With `"wait"` or `"refuse"`, the count of open and closing databases never
+  passes `max_open`. The fleet databases then hold at most
+  `max_open × (2 × pool_size + 1)` file descriptors. Replicas, the control
+  database and sockets use more.
+- The fleet does not close a database that is in use or was used within
+  `min_residency`. With `"wait"` or `"refuse"`, a burst of new keys gets `503`
+  until that time ends. Set `min_residency` low (for example `"250ms"`). Set
+  `max_open` for the hot set. `Retry-After` is `min_residency` rounded up to
+  whole seconds (from 1 to 30).
+- The cap counts a request for any key, also one that does not exist. Check
+  the tenant id before you open its database. With `"wait"`, set a request
+  limit too: a parked request holds its task for the whole timeout.
+- `max_open_policy` does not apply to `max_resident_bytes`. The memory budget
+  stays soft.
+- `/actuator/health` shows `peak_open`, `over_cap_opens_total` and
+  `refused_total`. `peak_open` is the most databases open and closing together
+  since boot. `over_cap_opens_total` counts opens that passed `max_open`.
+  `refused_total` counts opens answered `503`. When `peak_open` is above
+  `max_open`, size `ulimit -n` for `peak_open`.
 - `max_resident_bytes` is a soft memory budget, with the same rules as
   `max_open`. The `SQLite` engine counts about 2 MB of page cache for each
   open connection. Above the budget, the least recently used idle database
@@ -454,9 +486,11 @@ them.
   processes on one volume create the same database, both end up on one file.
 - Budget: `pool_size` connections and about `2 × pool_size + 1` file
   descriptors (database and `-wal` per connection, one `-shm`) per open
-  database. Size the open-file limit (`ulimit -n`) for the peak open count
-  under a burst, not for `max_open`. The default limit on macOS is 256: 594
-  open databases go past it.
+  database. With `max_open_policy = "soft"`, size the open-file limit
+  (`ulimit -n`) for the peak open count under a burst, not for `max_open`.
+  The default limit on macOS is 256: 594 open databases go past it, and the
+  burst fails with "too many open files". Use `"wait"` or `"refuse"` to bound
+  the count: `max_open × (2 × pool_size + 1)` descriptors.
 - When connections reach `database.max_connections_warn_threshold`
   (default 100), the boot warning gives the open files at `max_open`. The
   formula is `2 × connections + databases`. It counts the control database.
@@ -582,6 +616,67 @@ Many busy databases in one process make a pass long. Monitor these values in
 Usually another process on the same root holds their lock. A database that
 closes and opens again during a pass can show as `unowned` for some
 milliseconds. The next pass claims it.
+
+### Know when a write is in the replica
+
+A commit is on the local disk at once. It is in the replica only after a
+pass ships it. A takeover restores from the replica. So "committed" and
+"survives a takeover" are not the same.
+
+`fleet.replicated_through(&key)` gives an instant. Every transaction
+committed to that database at or before that instant is in the replica.
+Read the commit time from the app clock after the commit returns. The fleet
+uses this clock. Compare the commit time with the instant.
+
+Use it for a write that spans two databases. For example, a row moves from
+`src` to `dst`: upsert it into `dst`, then delete it from `src`. If the
+delete ships and the upsert does not, a takeover loses the row. So delete
+only after the upsert is in the replica:
+
+```rust,ignore
+upsert(&dst_db, &row).await?;
+let committed_at = state.clock().now();
+fleet
+    .wait_replicated(&dst, committed_at, Duration::from_secs(5))
+    .await?;
+delete(&src_db, row.id).await?;
+```
+
+`replicated_through` is `None` when:
+
+- no tick proved the replica caught up since the current generation or
+  epoch started;
+- another process replicates the database;
+- the lease of this host on the slot lapsed, or a newer owner fenced the
+  replica;
+- the clock is below the bound: the clock stepped back;
+- the database never opened in this process, or a delete or a restore
+  replaced it.
+
+`wait_replicated` returns when the bound covers the commit time. It fails
+with:
+
+- `NotReplicating`: no replicator for the database ran in this process.
+  This includes `rebuild` mode and a fleet with no replication.
+- `Fenced`: a newer owner fenced the replica.
+- `TimedOut`: in all other cases, when the time is over. The write is not
+  lost. It is not known yet. Keep the source row. Try again later.
+
+Rules:
+
+- The bound assumes a clock that does not step back. If the clock steps
+  back, the bound follows it back.
+- In one generation the bound never moves back.
+- A closed database keeps its last bound for an hour, or until it opens
+  again. A database that still ships its backlog after the close
+  (`closing`) gives a bound until it ships all of it. The bound is local to
+  this process: a delete or a restore in another process does not clear it.
+- A clock step back that is shorter than one sync interval can escape the
+  check. Keep the host clock in sync without steps (slew it).
+- In `generations` mode the bound is the instant before the last ship that
+  worked.
+- The bound does not change `worst_lag_seconds`. Use the lag for alerts.
+  Use the bound for a decision about one write.
 
 ### Deleting a database's replica
 
@@ -806,7 +901,7 @@ the [cell router](cell-isolation.md).
 | Lease length | A lease never ends earlier than an older call set it. If you make `lease_secs` shorter, the new length applies when the old lease ends. |
 | Local lease | A host that cannot renew stops serving `2/3 × lease_secs` after it sent its last renew. This is before the lease in the table ends. |
 | Replicas | Each generation records its epoch. A restore selects the newest epoch, then the newest time. Before each write to the replica, core reads the epochs at the destination: one list for each put. If it finds a newer epoch, the write is refused, the replicator stops, and the host loses the range. |
-| Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped. The next owner can then claim them at once. In all other cases, the leases end on their own. |
+| Shutdown | The host closes its databases. Then the last process on the volume releases the ranges, if nothing is left unshipped: no parked WAL replicator, and no closed database whose last generation did not ship. The next owner can then claim them at once. In all other cases, the leases end on their own. |
 
 The ownership table is `_autumn_fleet_slot_owners` on the control database.
 All hosts of the fleet must use the same table. The control database is a
@@ -849,6 +944,10 @@ one store: the release of one fleet ends the lease of the other.
    fail-back (step 5) replaces those files with the replica, so they do not
    come back. A planned move (step 2) loses nothing: the old host ships
    everything before it releases the ranges.
+   A takeover can lose one half of a write that spans two databases. To
+   prevent this, write the second half only after the first half is in the
+   replica. Make the second half safe to repeat. See
+   [Know when a write is in the replica](#know-when-a-write-is-in-the-replica).
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a
@@ -1058,6 +1157,17 @@ A generation of `Generations` mode is these objects:
 - **Epoch marker.** A new owner writes its epoch marker when it opens the
   database, before its first generation. From then on, each write of the
   old owner is refused.
+- **Close.** The last generation ships at close. If that ship fails, or
+  the shutdown cutoff passed, core keeps the database as unshipped work.
+  A close after a lapse of this host's lease keeps it too. The
+  replication loop (`FleetReplication::spawn_loop`) tries the ship again
+  on each pass. The shutdown flush tries it within its budget. A ship
+  that works drops it. A delete, a restore or a newer epoch also drops
+  it. Then nothing ships for it. A delete or a restore that fails keeps
+  it. While the database is open, the loop does not try it: a ship of the
+  open database drops it. During the snapshot of a retry, opens wait.
+  Until it ships, `release_ownership` lets the ranges lapse. The
+  `replication:fleet` health details name it in `unshipped`.
 - **Snapshot shape.** A snapshot is one database: one file, or one
   directory of files. Core refuses two paths that are the same.
 - **Operators.** `DatabaseFleet::ship_now(key)` ships an open database now.

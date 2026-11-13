@@ -1104,6 +1104,7 @@ fn find_model_attr(attrs: &[syn::Attribute]) -> Option<&syn::Attribute> {
 struct ModelArgs {
     table: Option<String>,
     managed: bool,
+    schema: Option<String>,
 }
 
 /// Parse the recognized `#[model(...)]` arguments (`table = "..."`, `managed`,
@@ -1129,9 +1130,15 @@ fn parse_model_args(attr: &syn::Attribute) -> ModelArgs {
         } else if meta.path.is_ident("schema")
             && let Ok(value) = meta.value()
             && let Ok(lit) = value.parse::<syn::LitStr>()
-            && lit.value() == "managed"
         {
-            args.managed = true;
+            // `"managed"` is the legacy adoption marker, not a schema.
+            let name = lit.value();
+            if name == "managed" {
+                args.managed = true;
+            } else if autumn_schema_core::is_valid_schema_name(&name) && name != "public" {
+                // `public` is the default schema.
+                args.schema = Some(name);
+            }
         } else if meta.input.peek(syn::token::Paren) {
             // Unknown nested list `key(...)` — consume it so parsing can
             // continue to the next comma-separated argument.
@@ -1384,6 +1391,7 @@ fn build_table(
 
     let mut table = Table::new(table_name.clone(), backend);
     table.managed = args.managed;
+    table.schema = args.schema;
 
     // (1) A synthesized reserved `id` PK leads the column list (BigSerial
     // convention: an `Int64` PK with no explicit default).
@@ -2057,6 +2065,66 @@ mod tests {
         "#,
         );
         assert!(!unmarked.managed, "unmarked model defaults to unmanaged");
+    }
+
+    #[test]
+    fn model_schema_arg_sets_the_table_schema() {
+        let t = parse_one(
+            r#"
+            #[model(managed, table = "campaigns", schema = "marketing")]
+            pub struct Campaign {
+                #[id]
+                pub id: i64,
+                pub name: String,
+            }
+        "#,
+        );
+        assert_eq!(t.schema.as_deref(), Some("marketing"));
+        assert_eq!(t.name, "campaigns");
+        assert!(t.managed);
+    }
+
+    #[test]
+    fn model_without_schema_has_none() {
+        let t = parse_one(
+            r#"
+            #[model(managed)]
+            pub struct Campaign {
+                #[id]
+                pub id: i64,
+            }
+        "#,
+        );
+        assert_eq!(t.schema, None);
+    }
+
+    #[test]
+    fn model_schema_managed_is_not_a_schema_name() {
+        let t = parse_one(
+            r#"
+            #[model(schema = "managed")]
+            pub struct Campaign {
+                #[id]
+                pub id: i64,
+            }
+        "#,
+        );
+        assert!(t.managed);
+        assert_eq!(t.schema, None);
+    }
+
+    #[test]
+    fn model_with_an_unsafe_schema_name_keeps_none() {
+        let t = parse_one(
+            r#"
+            #[model(managed, schema = "a.b")]
+            pub struct Campaign {
+                #[id]
+                pub id: i64,
+            }
+        "#,
+        );
+        assert_eq!(t.schema, None);
     }
 
     #[test]

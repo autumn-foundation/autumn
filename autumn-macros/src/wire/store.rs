@@ -22,7 +22,8 @@ use quote::quote;
 
 use crate::wire::ir::{
     CallerDescriptor, ClientDescriptor, EndpointDescriptor, EventDescriptor, ListenerDescriptor,
-    ResolvedEndpoint, TypeDescriptor, WireTypeDescriptor,
+    NO_BODY, Resolved, ResolvedEndpoint, RoutesDescriptor, Scope, TypeDescriptor,
+    WireTypeDescriptor, module_of_file, resolve_type,
 };
 
 /// The environment variable that names the contract directory.
@@ -118,6 +119,46 @@ pub fn write_type(dir: &Path, descriptor: &TypeDescriptor) -> Result<(), String>
     write_json(dir, &descriptor.artifact_file_name(), descriptor)
 }
 
+/// Write one `routes![…]` marker. `key` keeps two calls in one crate apart.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn write_routes(dir: &Path, descriptor: &RoutesDescriptor, key: &str) -> Result<(), String> {
+    write_json(dir, &descriptor.artifact_file_name(key), descriptor)
+}
+
+/// The module of the source file that `span` is in, or `""` when the
+/// compiler does not say. See [`module_of_file`].
+#[must_use]
+pub fn source_module(span: proc_macro2::Span) -> String {
+    // A `proc_macro::Span` exists only inside a macro call, not in a unit
+    // test.
+    if !proc_macro::is_available() {
+        return String::new();
+    }
+    let (Some(file), Some(manifest)) = (
+        span.unwrap().local_file(),
+        std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
+    ) else {
+        return String::new();
+    };
+    // rustc runs in the workspace root, and cargo gives it a member's files
+    // relative to that root.
+    let file = if file.is_relative() {
+        std::env::current_dir().map_or_else(|_| file.clone(), |cwd| cwd.join(&file))
+    } else {
+        file
+    };
+    let module = module_of_file(&file, &manifest);
+    if module.is_empty() {
+        let (Ok(file), Ok(manifest)) = (file.canonicalize(), manifest.canonicalize()) else {
+            return module;
+        };
+        return module_of_file(&file, &manifest);
+    }
+    module
+}
+
 /// Write one client's descriptor.
 ///
 /// # Errors
@@ -190,7 +231,7 @@ fn write_json<T: serde::Serialize>(dir: &Path, file_name: &str, value: &T) -> Re
 /// `autumn contracts export` sets `AUTUMN_CONTRACT_STRICT`: a lost descriptor
 /// there makes a smaller bundle, and a smaller bundle can pass a check that
 /// must fail. A normal build keeps writes best effort.
-fn strict() -> bool {
+pub fn strict() -> bool {
     std::env::var_os("AUTUMN_CONTRACT_STRICT").is_some_and(|v| !v.is_empty())
 }
 
@@ -227,21 +268,29 @@ pub fn find_by_ident(dir: &Path, endpoint_ident: &str) -> Vec<ResolvedEndpoint> 
 
 /// Join an endpoint with the type shapes it references.
 ///
-/// A type defined in the endpoint's own crate wins; otherwise any crate's
-/// type of that name is used, so a DTO shared through a third crate still
-/// resolves. An unresolvable name yields an empty shape, which suppresses
-/// enrichment rather than inventing a contract.
+/// The paths resolve as with `autumn contracts export --from`: with no
+/// dependency graph. A path that resolves to no type, or to more than one,
+/// gives an empty shape. That turns enrichment off; it does not invent a
+/// contract.
 fn resolve(endpoint: EndpointDescriptor, types: &[TypeDescriptor]) -> ResolvedEndpoint {
-    let shape = |name: &str| -> WireTypeDescriptor {
-        types
-            .iter()
-            .find(|t| t.shape.name == name && t.krate == endpoint.krate)
-            .or_else(|| types.iter().find(|t| t.shape.name == name))
-            .map(|t| t.shape.clone())
-            .unwrap_or_default()
+    let scope = Scope {
+        krate: &endpoint.krate,
+        module: &endpoint.module,
     };
-    let request = shape(&endpoint.request_type);
-    let response = shape(&endpoint.response_type);
+    let shape = |path: &str| -> WireTypeDescriptor {
+        match resolve_type(path, scope, types, None) {
+            Ok(Some(Resolved::Type(t))) => t.shape.clone(),
+            _ => WireTypeDescriptor::default(),
+        }
+    };
+    // A descriptor without the flag predates it: infer it.
+    let has_body = endpoint.has_body || endpoint.request_type != NO_BODY;
+    let request = if has_body {
+        shape(endpoint.request_path())
+    } else {
+        WireTypeDescriptor::default()
+    };
+    let response = shape(endpoint.response_path());
     ResolvedEndpoint {
         endpoint,
         request,
@@ -288,6 +337,7 @@ mod tests {
     fn item_type(krate: &str) -> TypeDescriptor {
         TypeDescriptor {
             krate: krate.to_owned(),
+            module: String::new(),
             shape: WireTypeDescriptor {
                 name: "Item".to_owned(),
                 serialized: vec![WireFieldDescriptor {
@@ -296,9 +346,11 @@ mod tests {
                     ty: "String".to_owned(),
                     required: true,
                     aliases: Vec::new(),
+                    ..Default::default()
                 }],
                 deserialized: Vec::new(),
                 closed: false,
+                ..Default::default()
             },
         }
     }
@@ -341,6 +393,48 @@ mod tests {
         write_type(&dir, &mine).expect("writes");
         let got = find_by_ident(&dir, "get_item_endpoint");
         assert_eq!(got[0].response.serialized[0].rust_name, "sku");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crate_qualified_response_path_picks_that_crate_over_a_local_type() {
+        let dir = scratch("qualified");
+        let mut ep = endpoint("catalog", "get_item");
+        ep.response_path = "shared::Item".to_owned();
+        write_endpoint(&dir, &ep).expect("writes");
+        let mut mine = item_type("catalog");
+        mine.shape.serialized[0].rust_name = "sku".to_owned();
+        write_type(&dir, &mine).expect("writes");
+        write_type(&dir, &item_type("shared")).expect("writes");
+        let got = find_by_ident(&dir, "get_item_endpoint");
+        assert_eq!(got[0].response.serialized[0].rust_name, "id");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_endpoint_with_no_body_has_an_empty_request_beside_a_user_no_body() {
+        let dir = scratch("nobody");
+        write_endpoint(&dir, &endpoint("catalog", "get_item")).expect("writes");
+        let mut user = item_type("catalog");
+        user.shape.name = "NoBody".to_owned();
+        write_type(&dir, &user).expect("writes");
+        let got = find_by_ident(&dir, "get_item_endpoint");
+        assert_eq!(got[0].request.serialized, [] as [WireFieldDescriptor; 0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_routes_marker_round_trips() {
+        let dir = scratch("routes");
+        let marker = RoutesDescriptor {
+            krate: "catalog".to_owned(),
+            module: String::new(),
+            handlers: vec!["get_item".to_owned()],
+        };
+        write_routes(&dir, &marker, "k").expect("writes");
+        let bytes = std::fs::read(dir.join("routes.catalog.k.json")).expect("written");
+        let back: RoutesDescriptor = serde_json::from_slice(&bytes).expect("parses");
+        assert_eq!(back, marker);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

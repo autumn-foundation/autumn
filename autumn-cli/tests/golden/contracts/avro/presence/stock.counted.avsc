@@ -1,0 +1,24 @@
+{
+  "type": "record",
+  "name": "StockCounted",
+  "namespace": "autumn.core",
+  "doc": "topic: stock.counted, version 1",
+  "autumn.topic": "stock.counted",
+  "fields": [
+    { "name": "id", "type": "long" },
+    { "name": "count", "type": ["null", "long"], "default": null },
+    {
+      "name": "tags",
+      "type": { "type": "array", "items": "string" },
+      "default": []
+    },
+    {
+      "name": "labels",
+      "type": { "type": "map", "values": "string" },
+      "default": {}
+    },
+    { "name": "primary", "type": "string", "aliases": ["main"] },
+    { "name": "secondary", "type": "string" },
+    { "name": "internal", "type": ["null", "string"], "default": null }
+  ]
+}

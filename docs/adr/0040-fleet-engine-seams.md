@@ -320,6 +320,21 @@ Step 3 changed this section in these ways:
   unchanged files, the prune and the restore. `fleet_slot_ownership.rs`
   has the ship step `may_put`.
 
+##### Notes after step 3
+
+- A close-time generation can fail to ship (a failed put, or a passed
+  shutdown cutoff). Then `FleetReplication` keeps its key, path and epoch.
+  A close after a lapse of the lease keeps it too. The replication loop
+  and the shutdown flush try the ship again. A retry skips a key that is
+  open or draining. The next pass tries it again. During the snapshot of
+  a retry, opens, deletes and restores wait. A ship that works drops the
+  record. A newer epoch drops it. A delete or a restore
+  (`FleetLifecycle::release`) stops it, and drops it when the files are
+  gone or replaced. A failed one keeps it. Then nothing ships for it. A
+  lapsed lease with no newer epoch keeps it. `DatabaseFleet::release_ownership` counts
+  it as unshipped, so the ranges lapse. `verification/fleet_generations.rs`
+  models the record and `may_release`.
+
 #### 6. `LakeSink`
 
 Core keeps the inclusion rule: tombstones, markers, `as_of`, and one listing

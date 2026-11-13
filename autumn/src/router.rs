@@ -6138,14 +6138,14 @@ fn apply_middleware(
     // aborting the worker task. That 500 still flows out through the
     // exception-filter chain for HTML negotiation. `config.reporting.enabled` is
     // a constructor argument, not a gate: the layer is installed whenever the
-    // `reporting` feature is on, so the panic catch cannot be configured away.
-    #[cfg(feature = "reporting")]
+    // `error-reporting` feature is on, so the panic catch cannot be configured away.
+    #[cfg(feature = "error-reporting")]
     let reporting_layer = crate::reporting::ReportingLayer::new(
         state.error_reporters(),
         config.reporting.enabled,
         config.reporting.sample_rate,
     );
-    #[cfg(not(feature = "reporting"))]
+    #[cfg(not(feature = "error-reporting"))]
     let reporting_layer = tower::layer::util::Identity::new();
 
     // Structured per-request access log (#999), primary emitter: one INFO event

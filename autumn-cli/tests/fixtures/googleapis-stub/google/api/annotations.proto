@@ -1,0 +1,12 @@
+// A test stub of `google/api/annotations.proto` from googleapis, with the
+// same extension number.
+syntax = "proto3";
+
+package google.api;
+
+import "google/api/http.proto";
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.MethodOptions {
+  HttpRule http = 72295728;
+}

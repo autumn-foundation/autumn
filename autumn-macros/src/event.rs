@@ -107,12 +107,13 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let written = if refusal.is_empty() {
         let unit =
             matches!(&input.data, syn::Data::Struct(s) if matches!(s.fields, syn::Fields::Unit));
-        write_descriptor(&attrs, &ident_str, shape, &key, unit)
+        write_descriptor(&attrs, &ident_str, shape, (&key, ident.span()), unit)
     } else {
         TokenStream::new()
     };
     let track = store::track_contract_dir();
     let catalogued = event_contract(&attrs, &input, &refusal);
+    let emitted = without_wire_attrs(input.clone());
 
     // `#[serde(crate = "...")]`'s value is a string serde parses into a path
     // itself (it never passes through this crate's own generic
@@ -138,7 +139,7 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::std::fmt::Debug,
         )]
         #[serde(crate = #serde_crate_path)]
-        #input
+        #emitted
 
         #track
         #written
@@ -151,6 +152,18 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #shape_const
         }
     }
+}
+
+/// The struct with each `#[wire(…)]` taken off. `#[event]` reads it; no
+/// derive on the emitted struct declares it.
+fn without_wire_attrs(mut input: DeriveInput) -> DeriveInput {
+    input.attrs.retain(|a| !a.path().is_ident("wire"));
+    if let syn::Data::Struct(data) = &mut input.data {
+        for field in &mut data.fields {
+            field.attrs.retain(|a| !a.path().is_ident("wire"));
+        }
+    }
+    input
 }
 
 /// Register a named event in the event catalogue, else nothing.
@@ -209,6 +222,9 @@ fn payload_shape(
         )
     };
     if attrs.opaque {
+        if let Err(err) = shape::check_wire_attrs(input) {
+            refusal.extend(err.to_compile_error());
+        }
         return none();
     }
     match shape::wire_type_descriptor(input) {
@@ -244,25 +260,34 @@ fn write_descriptor(
     attrs: &EventAttrs,
     type_name: &str,
     shape: WireTypeDescriptor,
-    key: &str,
+    (key, span): (&str, proc_macro2::Span),
     unit: bool,
 ) -> TokenStream {
     let Some(dir) = store::contract_dir() else {
         return TokenStream::new();
     };
-    store::write_outcome(store::write_event(
-        &dir,
-        key,
-        &EventDescriptor {
-            krate: std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
-            type_name: type_name.to_owned(),
-            name: attrs.name.clone(),
-            version: attrs.version,
-            opaque: attrs.opaque,
-            unit,
-            shape,
-        },
-    ))
+    let descriptor = event_descriptor(attrs, type_name, shape, store::source_module(span), unit);
+    store::write_outcome(store::write_event(&dir, key, &descriptor))
+}
+
+/// The descriptor `#[event]` writes, for the crate being compiled.
+fn event_descriptor(
+    attrs: &EventAttrs,
+    type_name: &str,
+    shape: WireTypeDescriptor,
+    module: String,
+    unit: bool,
+) -> EventDescriptor {
+    EventDescriptor {
+        krate: std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
+        module,
+        type_name: type_name.to_owned(),
+        name: attrs.name.clone(),
+        version: attrs.version,
+        opaque: attrs.opaque,
+        unit,
+        shape,
+    }
 }
 
 /// Whether `name` ends in `.v<digits>`.
@@ -275,6 +300,27 @@ fn has_version_suffix(name: &str) -> bool {
 mod tests {
     use super::*;
     use quote::quote;
+
+    #[test]
+    fn an_opaque_event_still_refuses_an_unknown_wire_argument() {
+        let out = event_macro(
+            quote! { name = "catalog.repriced", opaque },
+            quote! { pub struct Repriced { #[wire(bogus)] pub status: Status } },
+        )
+        .to_string();
+        assert!(out.contains("expected `opaque`"), "{out}");
+    }
+
+    #[test]
+    fn a_wire_attribute_is_read_and_not_emitted() {
+        let out = event_macro(
+            quote! { name = "catalog.repriced" },
+            quote! { pub struct Repriced { #[wire(opaque)] pub status: Status, pub id: String } },
+        )
+        .to_string();
+        assert!(!out.contains("# [wire"), "{out}");
+        assert!(out.contains("pub status : Status"), "{out}");
+    }
 
     #[test]
     fn applies_serde_derives_and_implements_event() {
@@ -379,6 +425,33 @@ mod tests {
             "{expanded}"
         );
         assert!(expanded.contains("AUTUMN_CONTRACT_DIR"), "{expanded}");
+    }
+
+    #[test]
+    fn the_event_descriptor_records_each_wire_type() {
+        let attrs = parse_event_args(quote! { name = "contact.updated" }).expect("args");
+        let input: DeriveInput = syn::parse2(
+            quote! { struct ContactUpdated { id: uuid::Uuid, #[serde(with = "ts")] at: i64 } },
+        )
+        .expect("struct");
+        let mut refusal = TokenStream::new();
+        let (_, _, shape) = payload_shape(&attrs, &input, &mut refusal);
+        assert!(refusal.is_empty(), "{refusal}");
+        let event = event_descriptor(&attrs, "ContactUpdated", shape, String::new(), false);
+        let json = serde_json::to_string(&event).expect("serializes");
+        let back: EventDescriptor = serde_json::from_str(&json).expect("parses");
+        let wire = |name: &str| {
+            back.shape
+                .serialized
+                .iter()
+                .find(|f| f.rust_name == name)
+                .and_then(|f| f.wire_type.clone())
+        };
+        assert_eq!(
+            wire("id"),
+            Some(crate::wire::ir::WireType::string_in("uuid"))
+        );
+        assert_eq!(wire("at"), Some(crate::wire::ir::WireType::Any));
     }
 
     #[test]

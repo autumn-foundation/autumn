@@ -70,8 +70,8 @@ expect a sub-microsecond-to-microsecond difference rather than exact
 equality — and both are subject to the same monotonic-clock guarantees on
 the host.
 
-The `db` metric aggregates elapsed times from `run_instrumented` and the
-`Db` drop hook. Queries that run outside a request (background jobs,
+The `db` metric adds up the time of each statement on a request's
+connection. The `Db` connection hold is not in it. Queries that run outside a request (background jobs,
 startup work) don't count — they can't, because the middleware only scopes
 the accumulator for the request future.
 

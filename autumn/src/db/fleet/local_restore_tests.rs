@@ -38,6 +38,7 @@ fn config(root: &Path, retention: Duration) -> DatabaseFleetConfig {
         restore_check_sample: 0,
         replication_workers: 4,
         min_residency: Duration::ZERO,
+        max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
         mmap_size: 0,
         cache_size_kib: 0,
     }

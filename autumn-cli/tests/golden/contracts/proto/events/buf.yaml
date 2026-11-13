@@ -1,0 +1,16 @@
+# Written by `autumn contracts export --proto`. Do not edit.
+version: v2
+lint:
+  use:
+    - STANDARD
+  except:
+    # An rpc returns the message Autumn sends as the JSON body. A
+    # `<Rpc>Response` wrapper would change that JSON.
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    # The package is the service name. Autumn has no API version.
+    - PACKAGE_VERSION_SUFFIX
+breaking:
+  use:
+    # JSON is the wire format.
+    - WIRE_JSON

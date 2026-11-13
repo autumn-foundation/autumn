@@ -17,8 +17,10 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+use std::future::Future;
 use std::time::Duration;
 
+use crate::deadline::Deadline;
 use crate::entropy::Entropy;
 
 /// Default cap for outbound HTTP client retries, in ms
@@ -79,6 +81,110 @@ pub fn full_jitter(entropy: &dyn Entropy, base: Duration, cap: Duration, retry: 
 #[must_use]
 pub fn retry_after_wait(hint: Duration, backoff: Duration) -> Duration {
     backoff.saturating_add(hint.min(RETRY_AFTER_SLACK))
+}
+
+/// A bounded retry plan: jittered delays that stop when the attempts run out
+/// or the time left cannot cover the next sleep.
+///
+/// Pass [`Deadline::remaining`](crate::deadline::Deadline::remaining) to
+/// [`next_delay`](Self::next_delay) so a retry loop gives up instead of
+/// sleeping past the request deadline.
+#[derive(Debug)]
+pub struct RetrySchedule<'a> {
+    entropy: &'a dyn Entropy,
+    base: Duration,
+    cap: Duration,
+    max_retries: u32,
+    retry: u32,
+}
+
+impl<'a> RetrySchedule<'a> {
+    /// A schedule of at most `max_retries` full-jitter delays.
+    #[must_use]
+    pub const fn new(
+        entropy: &'a dyn Entropy,
+        base: Duration,
+        cap: Duration,
+        max_retries: u32,
+    ) -> Self {
+        Self {
+            entropy,
+            base,
+            cap,
+            max_retries,
+            retry: 0,
+        }
+    }
+
+    /// How many delays have been handed out.
+    #[must_use]
+    pub const fn retries_taken(&self) -> u32 {
+        self.retry
+    }
+
+    /// The next delay, or `None` when the retries are spent or the delay
+    /// would not finish before `remaining` (`None` means no deadline).
+    /// A refused delay does not use up a retry.
+    pub fn next_delay(&mut self, remaining: Option<Duration>) -> Option<Duration> {
+        if self.retry >= self.max_retries {
+            return None;
+        }
+        let delay = full_jitter(self.entropy, self.base, self.cap, self.retry);
+        if remaining.is_some_and(|left| delay >= left) {
+            return None;
+        }
+        self.retry += 1;
+        Some(delay)
+    }
+
+    /// Run `op` until it succeeds, fails with an error `retryable` rejects,
+    /// or the schedule gives up. Between tries it sleeps the next jittered
+    /// delay. `op` gets the try number (0 = first try).
+    ///
+    /// `deadline` defaults to the task's [`Deadline::current`] when `None`.
+    /// When the schedule stops, the last error comes back unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The last error `op` returned.
+    pub async fn run<T, E, Fut>(
+        &mut self,
+        deadline: Option<Deadline>,
+        mut op: impl FnMut(u32) -> Fut,
+        mut retryable: impl FnMut(&E) -> bool,
+    ) -> Result<T, E>
+    where
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let deadline = deadline.or_else(Deadline::current);
+        let mut attempt = 0_u32;
+        loop {
+            let err = match op(attempt).await {
+                Ok(value) => return Ok(value),
+                Err(err) => err,
+            };
+            if !retryable(&err) {
+                return Err(err);
+            }
+            match self.next_delay(deadline.map(Deadline::remaining)) {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => return Err(err),
+            }
+            // The task may resume late; never start a try past the deadline.
+            if deadline.is_some_and(Deadline::is_expired) {
+                return Err(err);
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    }
+}
+
+impl Iterator for RetrySchedule<'_> {
+    type Item = Duration;
+
+    fn next(&mut self) -> Option<Duration> {
+        self.next_delay(None)
+    }
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -191,6 +297,123 @@ mod tests {
             retry_after_wait(Duration::MAX, Duration::MAX),
             Duration::MAX
         );
+    }
+
+    #[test]
+    fn schedule_stops_after_max_retries() {
+        let entropy = Fixed(u64::MAX);
+        let delays: Vec<_> = RetrySchedule::new(
+            &entropy,
+            Duration::from_millis(100),
+            Duration::from_millis(250),
+            4,
+        )
+        .collect();
+        assert_eq!(delays.len(), 4);
+        assert!(delays.iter().all(|d| *d <= Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn schedule_gives_up_when_the_deadline_is_too_close() {
+        let entropy = Fixed(100);
+        let mut plan = RetrySchedule::new(
+            &entropy,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            5,
+        );
+        assert_eq!(
+            plan.next_delay(Some(Duration::from_secs(1))),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(plan.next_delay(Some(Duration::from_millis(100))), None);
+        assert_eq!(plan.retries_taken(), 1);
+        assert!(plan.next_delay(None).is_some());
+    }
+
+    #[test]
+    fn schedule_with_zero_retries_is_empty() {
+        let entropy = Fixed(1);
+        let mut plan = RetrySchedule::new(&entropy, Duration::from_millis(1), Duration::MAX, 0);
+        assert_eq!(plan.next(), None);
+    }
+
+    fn plan(entropy: &Fixed, max: u32) -> RetrySchedule<'_> {
+        RetrySchedule::new(
+            entropy,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            max,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_retries_until_success() {
+        let entropy = Fixed(100);
+        let start = tokio::time::Instant::now();
+        let got: Result<u32, &str> = plan(&entropy, 5)
+            .run(
+                None,
+                |n| async move { if n < 2 { Err("busy") } else { Ok(n) } },
+                |_| true,
+            )
+            .await;
+        assert_eq!(got, Ok(2));
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_returns_last_error_when_retries_run_out() {
+        let entropy = Fixed(100);
+        let got: Result<(), u32> = plan(&entropy, 2)
+            .run(None, |n| async move { Err(n) }, |_| true)
+            .await;
+        assert_eq!(got, Err(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_stops_on_a_permanent_error() {
+        let entropy = Fixed(100);
+        let got: Result<(), u32> = plan(&entropy, 5)
+            .run(None, |n| async move { Err(n) }, |_| false)
+            .await;
+        assert_eq!(got, Err(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_gives_up_before_sleeping_past_the_deadline() {
+        let entropy = Fixed(100);
+        let start = tokio::time::Instant::now();
+        let got: Result<(), u32> = plan(&entropy, 10)
+            .run(
+                Some(Deadline::after(Duration::from_millis(250))),
+                |n| async move { Err(n) },
+                |_| true,
+            )
+            .await;
+        // Sleeps at 0 and 100 ms; a third 100 ms sleep would reach 300 ms.
+        assert_eq!(got, Err(2));
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_does_not_retry_after_resuming_past_the_deadline() {
+        let entropy = Fixed(100);
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        let mut schedule = plan(&entropy, 5);
+        let retrying = schedule.run(
+            Some(Deadline::after(Duration::from_millis(150))),
+            |n| {
+                tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Err::<(), u32>(n) }
+            },
+            |_| true,
+        );
+        // The clock jumps past the deadline while `run` sleeps 100 ms.
+        let jump = async { tokio::time::advance(Duration::from_secs(1)).await };
+        let (got, ()) = tokio::join!(retrying, jump);
+        assert_eq!(got, Err(0));
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     proptest! {

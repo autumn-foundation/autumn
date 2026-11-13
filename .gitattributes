@@ -32,6 +32,10 @@ examples/cms/** text eol=lf
 # comparison on checkout (same rationale as the saas rules above).
 autumn-cli/tests/golden/** text eol=lf
 
+# The wire-type golden table is compared byte for byte with the macro's
+# output, which writes LF.
+autumn-macros/tests/golden/** text eol=lf
+
 # A committed wire-contract bundle is compared byte for byte with a fresh
 # export, which writes LF. Force LF so a Windows checkout gives the same bytes.
 examples/mesh-storefront/contracts/** text eol=lf
@@ -52,3 +56,4 @@ autumn/tests/fixtures/axe-core/axe.min.js -diff linguist-vendored
 # hash and size budget as Linux.
 autumn/vendor/*.js text eol=lf
 autumn/src/ui/**/*.css text eol=lf
+examples/mesh-catalog/tests/proto_consumer/** text eol=lf

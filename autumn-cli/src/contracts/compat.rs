@@ -13,13 +13,24 @@
 //! Fields match by wire key (`wire_name` and aliases), not by Rust name, so a
 //! `#[serde(rename)]` that keeps the key is not a break. Path parameters match
 //! by position, not by name.
+//!
+//! A field whose type is a nested `WireShape` type is compared field by
+//! field, with the same rules, under a dotted name (`details.size`). A unit
+//! struct is JSON `null`, so a unit type and an object type do not match.
+//! Both need a bundle of [`IDENTITY_FORMAT`](super::bundle::IDENTITY_FORMAT):
+//! an older bundle does not record
+//! them, and the check then compares the type names only.
+//!
+//! A field's wire type is its JSON form. When both sides record one, a new
+//! form with the same Rust type is a break. A bundle older than
+//! [`WIRE_TYPE_FORMAT`](super::bundle::WIRE_TYPE_FORMAT) records none.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use autumn_macros_support::wire::{WireFieldDescriptor, WireTypeDescriptor};
 
-use super::bundle::{Bundle, BundleCall, BundleEndpoint, BundleEvent, BundleListener};
+use super::bundle::{Bundle, BundleCall, BundleEndpoint, BundleEvent, BundleListener, BundleType};
 
 /// The two deploy windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,6 +48,15 @@ pub enum BreakKind {
     RouteRemoved,
     /// The caller's route has no endpoint on the serving side.
     RouteMissing,
+    /// A new caller calls a route that no `routes![…]` in its own release
+    /// registers. It breaks when both sides run the new release.
+    RouteNotServed,
+    /// The response body is JSON `null` (a unit struct) on one side and an
+    /// object on the other.
+    ResponseUnitChanged,
+    /// The request body is JSON `null` (a unit struct) on one side and an
+    /// object on the other.
+    RequestUnitChanged,
     /// The response body changed between a JSON object and a JSON array.
     ResponseListChanged,
     /// The caller reads a response field the callee does not produce.
@@ -49,7 +69,7 @@ pub enum BreakKind {
     /// The caller's response type gets one field under two keys: its name
     /// and an alias. serde refuses that object.
     ResponseDuplicateKey(String),
-    /// A response field changed its Rust type.
+    /// A response field changed its Rust type or its JSON form.
     ResponseTypeChanged {
         /// The field's wire key.
         field: String,
@@ -71,7 +91,7 @@ pub enum BreakKind {
     /// The callee gets one field under two keys: its name and an alias.
     /// serde refuses that object.
     RequestDuplicateKey(String),
-    /// A request field changed its Rust type.
+    /// A request field changed its Rust type or its JSON form.
     RequestTypeChanged {
         /// The field's wire key.
         field: String,
@@ -94,7 +114,7 @@ pub enum BreakKind {
     EventFieldRejected(String),
     /// The consumer's event type gets one field under two keys.
     EventDuplicateKey(String),
-    /// An event field changed its Rust type.
+    /// An event field changed its Rust type or its JSON form.
     EventTypeChanged {
         /// The field's wire key.
         field: String,
@@ -196,7 +216,7 @@ pub fn compare(deployed: &Bundle, current: &Bundle) -> Report {
     // A deployed route must still be served. Clients outside the bundle may
     // call it, so this holds with no known caller. A caller break already
     // names the route when a deployed caller calls it.
-    for old in &deployed.endpoints {
+    for old in deployed.endpoints.iter().filter(|e| !e.unrouted) {
         let named = old_callers
             .iter()
             .any(|b| b.kind == BreakKind::RouteMissing && b.endpoint == old.id());
@@ -215,6 +235,36 @@ pub fn compare(deployed: &Bundle, current: &Bundle) -> Report {
     let mut new_callers = Vec::new();
     for call in &current.callers {
         new_callers.extend(check_call(Window::CallerFirst, current, call, deployed));
+    }
+    // A new caller of a route that its own release does not serve fails once
+    // both sides run the new release, whatever the order. A caller that the
+    // deployed release already left without a route is not new.
+    for call in &current.callers {
+        let Some(view) = current.endpoint(&call.service, &call.endpoint) else {
+            continue;
+        };
+        if serving(current, view).is_some() || already_unserved(deployed, call) {
+            continue;
+        }
+        new_callers.push(call_break(
+            Window::CallerFirst,
+            view,
+            call,
+            BreakKind::RouteNotServed,
+        ));
+        let named = old_callers.iter().any(|b| {
+            b.kind == BreakKind::RouteMissing
+                && b.endpoint == view.id()
+                && b.caller.as_deref() == Some(call.caller().as_str())
+        });
+        if !named {
+            old_callers.push(call_break(
+                Window::CalleeFirst,
+                view,
+                call,
+                BreakKind::RouteNotServed,
+            ));
+        }
     }
     for listener in &deployed.listeners {
         old_callers.extend(check_listener(
@@ -240,6 +290,30 @@ pub fn compare(deployed: &Bundle, current: &Bundle) -> Report {
         callee_first: old_callers,
         caller_first: new_callers,
         notes: event_notes(deployed, current),
+    }
+}
+
+/// Whether the deployed release has a call from the same function to the
+/// same endpoint, and does not serve its route either.
+fn already_unserved(deployed: &Bundle, call: &BundleCall) -> bool {
+    deployed.callers.iter().any(|c| {
+        (&c.krate, &c.function, &c.service, &c.endpoint)
+            == (&call.krate, &call.function, &call.service, &call.endpoint)
+    }) && deployed
+        .endpoint(&call.service, &call.endpoint)
+        .is_some_and(|view| serving(deployed, view).is_none())
+}
+
+/// A break of one call, named as the caller's release knows the endpoint.
+fn call_break(window: Window, view: &BundleEndpoint, call: &BundleCall, kind: BreakKind) -> Break {
+    Break {
+        window,
+        endpoint: view.id(),
+        route: view.route(),
+        service: view.service.clone(),
+        caller: Some(call.caller()),
+        caller_krate: Some(call.krate.clone()),
+        kind,
     }
 }
 
@@ -320,7 +394,13 @@ pub fn check_listener(
         report(BreakKind::EventUnitChanged);
         return out;
     }
-    for issue in decode_issues(&view.shape, &sent.shape.serialized, &listener.reads) {
+    let mut walk = Walk::new(built_against, sending_release);
+    for issue in decode_issues(
+        &view.shape,
+        &sent.shape.serialized,
+        &listener.reads,
+        &mut walk,
+    ) {
         report(match issue {
             Decode::Missing(f) => BreakKind::EventFieldMissing(f),
             Decode::Fails(f) => BreakKind::EventDecodeFails(f),
@@ -417,10 +497,13 @@ fn normalize_path(path: &str) -> String {
 }
 
 /// The endpoint in `side` that serves `wanted`'s route. A same-named endpoint
-/// wins when two serve one route.
+/// wins when two serve one route. An unrouted endpoint serves nothing.
 fn serving<'a>(side: &'a Bundle, wanted: &BundleEndpoint) -> Option<&'a BundleEndpoint> {
     let key = route_key(wanted);
-    let mut found = side.endpoints.iter().filter(|e| route_key(e) == key);
+    let mut found = side
+        .endpoints
+        .iter()
+        .filter(|e| !e.unrouted && route_key(e) == key);
     let first = found.next()?;
     if first.name == wanted.name {
         return Some(first);
@@ -488,6 +571,28 @@ fn type_reads(decoder: &str, producer: &str) -> bool {
     decoder == producer || decoder == format!("Option<{producer}>")
 }
 
+/// The two type labels when a decoder of `reader` cannot read what
+/// `writer` holds, else `None`.
+///
+/// The Rust types come first. When they read, and both fields record a wire
+/// type, the wire types must read too: a new JSON form with the same Rust
+/// type is a break. A label then names both, as `ty as wire`.
+fn type_change(
+    reader: &WireFieldDescriptor,
+    writer: &WireFieldDescriptor,
+) -> Option<(String, String)> {
+    if !type_reads(&reader.ty, &writer.ty) {
+        return Some((reader.ty.clone(), writer.ty.clone()));
+    }
+    match (&reader.wire_type, &writer.wire_type) {
+        (Some(read), Some(written)) if !read.reads(written) => Some((
+            format!("{} as {read}", reader.ty),
+            format!("{} as {written}", writer.ty),
+        )),
+        _ => None,
+    }
+}
+
 /// How many fields in `fields` carry a key of `field`.
 fn key_hits(fields: &[WireFieldDescriptor], field: &WireFieldDescriptor) -> usize {
     keys(field).filter(|k| by_key(fields, k).is_some()).count()
@@ -507,25 +612,172 @@ pub fn check_call(
     let Some(view) = built_against.endpoint(&call.service, &call.endpoint) else {
         return Vec::new();
     };
+    // A route that the caller's own release does not serve is not a break
+    // of this window. `compare` reports a new one.
+    if serving(built_against, view).is_none() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
-    let mut report = |kind| {
-        out.push(Break {
-            window,
-            endpoint: view.id(),
-            route: view.route(),
-            service: view.service.clone(),
-            caller: Some(call.caller()),
-            caller_krate: Some(call.krate.clone()),
-            kind,
-        });
-    };
+    let mut report = |kind| out.push(call_break(window, view, call, kind));
     let Some(serve) = serving(serving_release, view) else {
         report(BreakKind::RouteMissing);
         return out;
     };
-    response_breaks(view, serve, call, &mut report);
-    request_breaks(view, serve, call, &mut report);
+    let mut decode = Walk::new(built_against, serving_release);
+    response_breaks(view, serve, call, &mut decode, &mut report);
+    let mut encode = Walk::new(serving_release, built_against);
+    request_breaks(view, serve, call, &mut encode, &mut report);
     out
+}
+
+/// The state of one walk through nested types. `reader` holds the types of
+/// the side that decodes, `writer` the types of the side that encodes.
+///
+/// Field names are relative to the level they are found on. The level above
+/// adds its field name, so `color` becomes `details.color`. Each type pair is
+/// compared once and its result is kept, so a type that many fields share
+/// costs one comparison.
+struct Walk<'a> {
+    reader: &'a Bundle,
+    writer: &'a Bundle,
+    /// Both bundles record nested types and the `unit` flag.
+    typed: bool,
+    /// The type pairs on the current path, so a recursive type ends.
+    path: BTreeSet<(String, String)>,
+    /// The decode result of each type pair compared so far.
+    decoded: BTreeMap<(String, String), Vec<Decode>>,
+    /// The request result of each type pair compared so far.
+    encoded: BTreeMap<(String, String), Vec<BreakKind>>,
+}
+
+impl<'a> Walk<'a> {
+    const fn new(reader: &'a Bundle, writer: &'a Bundle) -> Self {
+        Self {
+            reader,
+            writer,
+            typed: reader.knows_types() && writer.knows_types(),
+            path: BTreeSet::new(),
+            decoded: BTreeMap::new(),
+            encoded: BTreeMap::new(),
+        }
+    }
+
+    /// The nested type pairs that two matched fields name, by position. An
+    /// opaque field and an older bundle give none. `Err` holds the two
+    /// fields' type labels when the two lists differ in length: one side has
+    /// a shape where the other has none.
+    fn pairs(
+        &self,
+        reader: &WireFieldDescriptor,
+        writer: &WireFieldDescriptor,
+    ) -> Result<Vec<(&'a BundleType, &'a BundleType)>, (String, String)> {
+        if !self.typed || reader.opaque || writer.opaque {
+            return Ok(Vec::new());
+        }
+        if reader.nested.len() != writer.nested.len() {
+            let label = |f: &WireFieldDescriptor| format!("{} [{}]", f.ty, f.nested.join(", "));
+            return Err((label(reader), label(writer)));
+        }
+        Ok(reader
+            .nested
+            .iter()
+            .zip(&writer.nested)
+            .filter_map(|(r, w)| Some((self.reader.nested(r)?, self.writer.nested(w)?)))
+            .collect())
+    }
+
+    /// The decode issues of one type pair, with names relative to it.
+    fn decode(&mut self, reader: &'a BundleType, writer: &'a BundleType) -> Vec<Decode> {
+        let key = (reader.id.clone(), writer.id.clone());
+        if let Some(done) = self.decoded.get(&key) {
+            return done.clone();
+        }
+        if !self.path.insert(key.clone()) {
+            return Vec::new();
+        }
+        let mut found = decode_issues(&reader.shape, &writer.shape.serialized, &[], self);
+        found.truncate(MAX_NESTED_ISSUES);
+        self.path.remove(&key);
+        self.decoded.insert(key, found.clone());
+        found
+    }
+
+    /// The request issues of one type pair, with names relative to it.
+    /// `receiver` decodes what `sender` sends.
+    fn encode(&mut self, receiver: &'a BundleType, sender: &'a BundleType) -> Vec<BreakKind> {
+        let key = (receiver.id.clone(), sender.id.clone());
+        if let Some(done) = self.encoded.get(&key) {
+            return done.clone();
+        }
+        if !self.path.insert(key.clone()) {
+            return Vec::new();
+        }
+        let mut found = request_issues(&sender.shape, &receiver.shape, None, self);
+        found.truncate(MAX_NESTED_ISSUES);
+        self.path.remove(&key);
+        self.encoded.insert(key, found.clone());
+        found
+    }
+}
+
+/// The most issues one nested type pair reports. A type that many fields
+/// share at many levels has one issue per path, and the paths grow fast. One
+/// issue is enough for the verdict.
+const MAX_NESTED_ISSUES: usize = 100;
+
+/// `field.name`: a nested name under the field that holds it.
+fn under(field: &str, name: &str) -> String {
+    format!("{field}.{name}")
+}
+
+impl Decode {
+    /// This issue one level down, under `field`.
+    fn under(self, field: &str) -> Self {
+        match self {
+            Self::Missing(f) => Self::Missing(under(field, &f)),
+            Self::Fails(f) => Self::Fails(under(field, &f)),
+            Self::Rejected(f) => Self::Rejected(under(field, &f)),
+            Self::DuplicateKey(f) => Self::DuplicateKey(under(field, &f)),
+            Self::TypeChanged {
+                field: f,
+                reader,
+                writer,
+            } => Self::TypeChanged {
+                field: under(field, &f),
+                reader,
+                writer,
+            },
+        }
+    }
+}
+
+impl BreakKind {
+    /// This request break one level down, under `field`. Other kinds do not
+    /// occur on a nested level and stay as they are.
+    fn under(self, field: &str) -> Self {
+        match self {
+            Self::RequestFieldNotSent(f) => Self::RequestFieldNotSent(under(field, &f)),
+            Self::RequestFieldDropped(f) => Self::RequestFieldDropped(under(field, &f)),
+            Self::RequestFieldRejected(f) => Self::RequestFieldRejected(under(field, &f)),
+            Self::RequestDuplicateKey(f) => Self::RequestDuplicateKey(under(field, &f)),
+            Self::RequestTypeChanged {
+                field: f,
+                caller,
+                callee,
+            } => Self::RequestTypeChanged {
+                field: under(field, &f),
+                caller,
+                callee,
+            },
+            other => other,
+        }
+    }
+}
+
+/// `Name (JSON null)` or `Name (JSON object)`.
+fn unit_label(shape: &WireTypeDescriptor) -> String {
+    let form = if shape.unit { "null" } else { "object" };
+    format!("{} (JSON {form})", shape.name)
 }
 
 /// Response rules: the caller decodes the callee's output with its own type.
@@ -533,6 +785,7 @@ fn response_breaks(
     view: &BundleEndpoint,
     serve: &BundleEndpoint,
     call: &BundleCall,
+    walk: &mut Walk<'_>,
     report: &mut impl FnMut(BreakKind),
 ) {
     if view.response_list != serve.response_list {
@@ -540,7 +793,17 @@ fn response_breaks(
         report(BreakKind::ResponseListChanged);
         return;
     }
-    for issue in decode_issues(&view.response, &serve.response.serialized, &call.reads) {
+    if walk.typed && view.response.unit != serve.response.unit {
+        // `null` where an object was, or the reverse. Also for list elements.
+        report(BreakKind::ResponseUnitChanged);
+        return;
+    }
+    for issue in decode_issues(
+        &view.response,
+        &serve.response.serialized,
+        &call.reads,
+        walk,
+    ) {
         report(match issue {
             Decode::Missing(f) => BreakKind::ResponseFieldMissing(f),
             Decode::Fails(f) => BreakKind::ResponseDecodeFails(f),
@@ -570,7 +833,7 @@ enum Decode {
     Rejected(String),
     /// The reader's type gets one field under two keys.
     DuplicateKey(String),
-    /// A field changed its Rust type.
+    /// A field changed its Rust type or its JSON form.
     TypeChanged {
         /// The field's wire key.
         field: String,
@@ -583,10 +846,14 @@ enum Decode {
 
 /// The decode rules, shared by responses and events: `reader` decodes what
 /// `produced` holds, and the code reads the fields in `reads`.
+///
+/// A nested type of a matched field is compared in the same way, one level
+/// down, with no reads.
 fn decode_issues(
     reader: &WireTypeDescriptor,
     produced: &[WireFieldDescriptor],
     reads: &[String],
+    walk: &mut Walk<'_>,
 ) -> Vec<Decode> {
     let mut out = Vec::new();
     let decoded = &reader.deserialized;
@@ -601,24 +868,50 @@ fn decode_issues(
         }
     }
     for field in decoded {
+        let name = field.wire_name.clone();
         if key_hits(produced, field) > 1 {
-            out.push(Decode::DuplicateKey(field.wire_name.clone()));
+            out.push(Decode::DuplicateKey(name.clone()));
         }
-        match produced_for(produced, field) {
-            Some(made) if !type_reads(&field.ty, &made.ty) => {
+        match produced_for(produced, field).map(|made| (made, type_change(field, made))) {
+            Some((_, Some((reader, writer)))) => {
                 out.push(Decode::TypeChanged {
-                    field: field.wire_name.clone(),
-                    reader: field.ty.clone(),
-                    writer: made.ty.clone(),
+                    field: name,
+                    reader,
+                    writer,
                 });
             }
-            Some(made) if field.required && !made.required => {
-                out.push(Decode::Fails(field.wire_name.clone()));
+            Some((made, None)) => {
+                if field.required && !made.required {
+                    out.push(Decode::Fails(name.clone()));
+                }
+                let pairs = match walk.pairs(field, made) {
+                    Ok(pairs) => pairs,
+                    Err((reader, writer)) => {
+                        out.push(Decode::TypeChanged {
+                            field: name.clone(),
+                            reader,
+                            writer,
+                        });
+                        Vec::new()
+                    }
+                };
+                for (theirs, ours) in pairs {
+                    if theirs.shape.unit != ours.shape.unit {
+                        out.push(Decode::TypeChanged {
+                            field: name.clone(),
+                            reader: unit_label(&theirs.shape),
+                            writer: unit_label(&ours.shape),
+                        });
+                        continue;
+                    }
+                    let deeper = walk.decode(theirs, ours);
+                    out.extend(deeper.into_iter().map(|d| d.under(&field.wire_name)));
+                }
             }
             None if field.required && !named.contains(&field.wire_name) => {
-                out.push(Decode::Fails(field.wire_name.clone()));
+                out.push(Decode::Fails(name));
             }
-            _ => {}
+            None => {}
         }
     }
     if reader.closed {
@@ -636,10 +929,9 @@ fn request_breaks(
     view: &BundleEndpoint,
     serve: &BundleEndpoint,
     call: &BundleCall,
+    walk: &mut Walk<'_>,
     report: &mut impl FnMut(BreakKind),
 ) {
-    let sent = &view.request.serialized;
-    let accepted = &serve.request.deserialized;
     if view.request_list != serve.request_list {
         report(BreakKind::RequestListChanged);
         return;
@@ -649,21 +941,43 @@ fn request_breaks(
         // refuses that request, whatever its fields are.
         report(BreakKind::RequestBodyMissing);
     }
-    let writes = call.writes.as_deref().unwrap_or_default();
+    if walk.typed && view.has_body && serve.has_body && view.request.unit != serve.request.unit {
+        report(BreakKind::RequestUnitChanged);
+        return;
+    }
+    for kind in request_issues(&view.request, &serve.request, call.writes.as_deref(), walk) {
+        report(kind);
+    }
+}
+
+/// The request rules for one level: `sender` is the caller's type, and
+/// `receiver` the callee's. `writes` is the call site's write-set. A nested
+/// level has none.
+fn request_issues(
+    sender: &WireTypeDescriptor,
+    receiver: &WireTypeDescriptor,
+    writes: Option<&[String]>,
+    walk: &mut Walk<'_>,
+) -> Vec<BreakKind> {
+    let mut out = Vec::new();
+    let mut report = |kind| out.push(kind);
+    let sent = &sender.serialized;
+    let accepted = &receiver.deserialized;
+    let written = writes.unwrap_or_default();
     // With an unknown write-set, a field the type sometimes sends counts as
     // sent only when the caller's own release already required it: the
     // one-build check accepted that call. A requirement that is new in the
     // serving release gets no such benefit.
     let own_release_requires = |f: &WireFieldDescriptor| {
-        view.request
+        sender
             .deserialized
             .iter()
             .any(|d| d.required && d.wire_name == f.wire_name)
     };
     let always_sent = |f: &WireFieldDescriptor| {
         f.required
-            || writes.contains(&f.rust_name)
-            || (call.writes.is_none() && own_release_requires(f))
+            || written.contains(&f.rust_name)
+            || (writes.is_none() && own_release_requires(f))
     };
     for need in accepted {
         if key_hits(sent, need) > 1 {
@@ -676,29 +990,56 @@ fn request_breaks(
             report(BreakKind::RequestFieldNotSent(need.wire_name.clone()));
         }
     }
-    for write in writes {
+    for write in written {
         let Some(field) = sent.iter().find(|f| &f.rust_name == write) else {
             continue;
         };
-        if accepting(accepted, field).is_none() && !serve.request.closed {
+        if accepting(accepted, field).is_none() && !receiver.closed {
             report(BreakKind::RequestFieldDropped(field.wire_name.clone()));
         }
     }
     for field in sent {
-        match accepting(accepted, field) {
-            Some(into) if !type_reads(&into.ty, &field.ty) => {
+        match accepting(accepted, field).map(|into| (into, type_change(into, field))) {
+            Some((_, Some((receiving, sending)))) => {
                 report(BreakKind::RequestTypeChanged {
                     field: field.wire_name.clone(),
-                    caller: field.ty.clone(),
-                    callee: into.ty.clone(),
+                    caller: sending,
+                    callee: receiving,
                 });
             }
-            None if serve.request.closed => {
+            Some((into, None)) => {
+                let pairs = match walk.pairs(into, field) {
+                    Ok(pairs) => pairs,
+                    Err((receiving, sending)) => {
+                        report(BreakKind::RequestTypeChanged {
+                            field: field.wire_name.clone(),
+                            caller: sending,
+                            callee: receiving,
+                        });
+                        Vec::new()
+                    }
+                };
+                for (theirs, ours) in pairs {
+                    if theirs.shape.unit != ours.shape.unit {
+                        report(BreakKind::RequestTypeChanged {
+                            field: field.wire_name.clone(),
+                            caller: unit_label(&ours.shape),
+                            callee: unit_label(&theirs.shape),
+                        });
+                        continue;
+                    }
+                    for kind in walk.encode(theirs, ours) {
+                        report(kind.under(&field.wire_name));
+                    }
+                }
+            }
+            None if receiver.closed => {
                 report(BreakKind::RequestFieldRejected(field.wire_name.clone()));
             }
-            _ => {}
+            None => {}
         }
     }
+    out
 }
 
 impl Report {
@@ -829,88 +1170,110 @@ fn render_window(out: &mut String, title: &str, breaks: &[Break]) {
             let _ = writeln!(out, "  - {} ({}): {}", b.endpoint, b.route, event_detail(b));
             continue;
         }
-        let who = b.caller.as_deref().map_or_else(
-            || "any client".to_owned(),
-            |caller| format!("caller `{caller}`"),
+        let _ = writeln!(
+            out,
+            "  - {} ({}): {}",
+            b.endpoint,
+            b.route,
+            endpoint_detail(b)
         );
-        let (callee, caller_release) = match b.window {
-            Window::CalleeFirst => ("the new callee", "its deployed type"),
-            Window::CallerFirst => ("the deployed callee", "its new type"),
-        };
-        let detail = match &b.kind {
-            BreakKind::RouteRemoved => {
-                format!("{callee} no longer serves this route; {who} gets no endpoint")
-            }
-            BreakKind::RouteMissing => {
-                format!("{who} calls this route, and {callee} does not serve it")
-            }
-            BreakKind::ResponseFieldMissing(f) => {
-                format!("{who} reads response field `{f}`, which {callee} does not produce")
-            }
-            BreakKind::ResponseDecodeFails(f) => format!(
-                "{who} decodes the response with {caller_release}, which needs field `{f}`, and \
-                 {callee} does not always produce it"
-            ),
-            BreakKind::ResponseFieldRejected(f) => format!(
-                "{who} decodes the response with {caller_release}, which denies unknown fields, \
-                 and {callee} produces `{f}`"
-            ),
-            BreakKind::ResponseDuplicateKey(f) => format!(
-                "{who} decodes field `{f}` under its name or an alias, and {callee} produces \
-                 both keys"
-            ),
-            BreakKind::ResponseListChanged => format!(
-                "the response body is a JSON array on one side and an object on the other, so \
-                 {who} cannot decode what {callee} sends"
-            ),
-            BreakKind::RequestListChanged => format!(
-                "the request body is a JSON array on one side and an object on the other, so \
-                 {callee} cannot decode what {who} sends"
-            ),
-            BreakKind::RequestBodyMissing => {
-                format!("{who} sends no request body, and {callee} reads one")
-            }
-            BreakKind::RequestDuplicateKey(f) => format!(
-                "{callee} decodes field `{f}` under its name or an alias, and {who} sends both \
-                 keys"
-            ),
-            BreakKind::ResponseTypeChanged {
-                field,
-                caller,
-                callee: theirs,
-            } => format!(
-                "response field `{field}` is `{theirs}` in {callee}, and {who} decodes it as \
-                 `{caller}`"
-            ),
-            BreakKind::RequestFieldNotSent(f) => {
-                format!("{callee} requires request field `{f}`, and {who} does not always send it")
-            }
-            BreakKind::RequestFieldDropped(f) => {
-                format!("{who} sets request field `{f}`, and {callee} ignores it")
-            }
-            BreakKind::RequestFieldRejected(f) => {
-                format!("{callee} denies unknown request fields, and {who} sends `{f}`")
-            }
-            BreakKind::RequestTypeChanged {
-                field,
-                caller,
-                callee: theirs,
-            } => format!(
-                "{who} sends request field `{field}` as `{caller}`, and {callee} decodes it as \
-                 `{theirs}`"
-            ),
-            // Rendered by `event_detail`.
-            BreakKind::EventTopicMissing
-            | BreakKind::EventUnitChanged
-            | BreakKind::EventFieldMissing(_)
-            | BreakKind::EventDecodeFails(_)
-            | BreakKind::EventFieldRejected(_)
-            | BreakKind::EventDuplicateKey(_)
-            | BreakKind::EventTypeChanged { .. } => String::new(),
-        };
-        let _ = writeln!(out, "  - {} ({}): {detail}", b.endpoint, b.route);
     }
     out.push('\n');
+}
+
+/// The text for one endpoint break.
+fn endpoint_detail(b: &Break) -> String {
+    let who = b.caller.as_deref().map_or_else(
+        || "any client".to_owned(),
+        |caller| format!("caller `{caller}`"),
+    );
+    let (callee, caller_release) = match b.window {
+        Window::CalleeFirst => ("the new callee", "its deployed type"),
+        Window::CallerFirst => ("the deployed callee", "its new type"),
+    };
+    match &b.kind {
+        BreakKind::RouteRemoved => {
+            format!("{callee} no longer serves this route; {who} gets no endpoint")
+        }
+        BreakKind::RouteMissing => {
+            format!("{who} calls this route, and {callee} does not serve it")
+        }
+        BreakKind::ResponseFieldMissing(f) => {
+            format!("{who} reads response field `{f}`, which {callee} does not produce")
+        }
+        BreakKind::ResponseDecodeFails(f) => format!(
+            "{who} decodes the response with {caller_release}, which needs field `{f}`, and \
+                 {callee} does not always produce it"
+        ),
+        BreakKind::ResponseFieldRejected(f) => format!(
+            "{who} decodes the response with {caller_release}, which denies unknown fields, \
+                 and {callee} produces `{f}`"
+        ),
+        BreakKind::ResponseDuplicateKey(f) => format!(
+            "{who} decodes field `{f}` under its name or an alias, and {callee} produces \
+                 both keys"
+        ),
+        BreakKind::ResponseListChanged => format!(
+            "the response body is a JSON array on one side and an object on the other, so \
+                 {who} cannot decode what {callee} sends"
+        ),
+        BreakKind::RequestListChanged => format!(
+            "the request body is a JSON array on one side and an object on the other, so \
+                 {callee} cannot decode what {who} sends"
+        ),
+        BreakKind::RequestBodyMissing => {
+            format!("{who} sends no request body, and {callee} reads one")
+        }
+        BreakKind::RequestDuplicateKey(f) => format!(
+            "{callee} decodes field `{f}` under its name or an alias, and {who} sends both \
+                 keys"
+        ),
+        BreakKind::ResponseTypeChanged {
+            field,
+            caller,
+            callee: theirs,
+        } => format!(
+            "response field `{field}` is `{theirs}` in {callee}, and {who} decodes it as \
+                 `{caller}`"
+        ),
+        BreakKind::RequestFieldNotSent(f) => {
+            format!("{callee} requires request field `{f}`, and {who} does not always send it")
+        }
+        BreakKind::RequestFieldDropped(f) => {
+            format!("{who} sets request field `{f}`, and {callee} ignores it")
+        }
+        BreakKind::RequestFieldRejected(f) => {
+            format!("{callee} denies unknown request fields, and {who} sends `{f}`")
+        }
+        BreakKind::RequestTypeChanged {
+            field,
+            caller,
+            callee: theirs,
+        } => format!(
+            "{who} sends request field `{field}` as `{caller}`, and {callee} decodes it as \
+                 `{theirs}`"
+        ),
+        BreakKind::RouteNotServed => format!(
+            "{who} calls this route, and no `routes![…]` in its own release registers the \
+                 handler"
+        ),
+        BreakKind::ResponseUnitChanged => format!(
+            "the response body is JSON `null` on one side and an object on the other, so \
+                 {who} cannot decode what {callee} sends"
+        ),
+        BreakKind::RequestUnitChanged => format!(
+            "the request body is JSON `null` on one side and an object on the other, so \
+                 {callee} cannot decode what {who} sends"
+        ),
+        // Rendered by `event_detail`.
+        BreakKind::EventTopicMissing
+        | BreakKind::EventUnitChanged
+        | BreakKind::EventFieldMissing(_)
+        | BreakKind::EventDecodeFails(_)
+        | BreakKind::EventFieldRejected(_)
+        | BreakKind::EventDuplicateKey(_)
+        | BreakKind::EventTypeChanged { .. } => String::new(),
+    }
 }
 
 /// The text for one event break.
@@ -961,7 +1324,7 @@ fn event_detail(b: &Break) -> String {
 mod tests {
     use super::*;
     use crate::contracts::bundle::{BUNDLE_FORMAT, BundleEvent, BundleListener};
-    use autumn_macros_support::wire::WireTypeDescriptor;
+    use autumn_macros_support::wire::{WireType, WireTypeDescriptor};
 
     fn field(rust: &str, wire: &str, ty: &str, required: bool) -> WireFieldDescriptor {
         WireFieldDescriptor {
@@ -970,6 +1333,7 @@ mod tests {
             ty: ty.to_owned(),
             required,
             aliases: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -987,6 +1351,7 @@ mod tests {
             serialized: out,
             deserialized: inn,
             closed: false,
+            ..Default::default()
         }
     }
 
@@ -1016,6 +1381,7 @@ mod tests {
                         ],
                     ),
                     response: item(),
+                    unrouted: false,
                 },
                 BundleEndpoint {
                     service: "catalog".to_owned(),
@@ -1028,6 +1394,7 @@ mod tests {
                     response_list: false,
                     request: shape("NoBody", Vec::new(), Vec::new()),
                     response: item(),
+                    unrouted: false,
                 },
             ],
             callers: vec![
@@ -1037,6 +1404,7 @@ mod tests {
             events: Vec::new(),
             listeners: Vec::new(),
             unresolved: Vec::new(),
+            types: Vec::new(),
         }
     }
 
@@ -1977,5 +2345,517 @@ mod tests {
         ep(&mut current, "create_item").request_list = true;
         let report = compare(&deployed, &current);
         assert_eq!(kinds(&report.callee_first), [BreakKind::RequestListChanged]);
+    }
+
+    // --- unit bodies, nested types, route registration ---
+
+    /// A format-3 copy of release 1.
+    fn typed_release() -> Bundle {
+        Bundle {
+            format: crate::contracts::bundle::IDENTITY_FORMAT,
+            ..release_1()
+        }
+    }
+
+    #[test]
+    fn a_unit_response_that_becomes_an_object_breaks_both_windows() {
+        let mut deployed = typed_release();
+        ep(&mut deployed, "get_item").response = WireTypeDescriptor {
+            unit: true,
+            ..shape("Empty", Vec::new(), Vec::new())
+        };
+        let mut current = typed_release();
+        ep(&mut current, "get_item").response = shape("Empty", Vec::new(), Vec::new());
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::ResponseUnitChanged]
+        );
+        assert_eq!(
+            kinds(&report.caller_first),
+            [BreakKind::ResponseUnitChanged]
+        );
+        assert!(report.render(Order::Any).contains("JSON `null`"));
+    }
+
+    #[test]
+    fn an_older_bundle_does_not_know_unit_so_unit_is_not_compared() {
+        let deployed = release_1();
+        let mut current = typed_release();
+        ep(&mut current, "get_item").response.unit = true;
+        ep(&mut current, "get_item").response.serialized.clear();
+        let report = compare(&deployed, &current);
+        assert!(!kinds(&report.callee_first).contains(&BreakKind::ResponseUnitChanged));
+    }
+
+    #[test]
+    fn a_unit_request_body_that_becomes_an_object_is_a_break() {
+        let mut deployed = typed_release();
+        ep(&mut deployed, "create_item").request = WireTypeDescriptor {
+            unit: true,
+            ..shape("Empty", Vec::new(), Vec::new())
+        };
+        let mut current = typed_release();
+        ep(&mut current, "create_item").request = shape("Empty", Vec::new(), Vec::new());
+        let report = compare(&deployed, &current);
+        assert!(kinds(&report.callee_first).contains(&BreakKind::RequestUnitChanged));
+        assert!(kinds(&report.caller_first).contains(&BreakKind::RequestUnitChanged));
+    }
+
+    fn details(fields: Vec<WireFieldDescriptor>) -> crate::contracts::bundle::BundleType {
+        crate::contracts::bundle::BundleType {
+            id: "mesh-catalog::Details".to_owned(),
+            shape: shape("Details", fields.clone(), fields),
+        }
+    }
+
+    /// Release 1 with `Item.details: Details { size, color }`.
+    fn nested_release() -> Bundle {
+        let mut bundle = typed_release();
+        let mut nested = field("details", "details", "Details", true);
+        nested.nested = vec!["mesh-catalog::Details".to_owned()];
+        for e in &mut bundle.endpoints {
+            if e.name == "get_item" {
+                e.response.serialized.push(nested.clone());
+                e.response.deserialized.push(nested.clone());
+            } else {
+                e.request.serialized.push(nested.clone());
+                e.request.deserialized.push(nested.clone());
+            }
+        }
+        bundle.types = vec![details(vec![plain("color", true), plain("size", true)])];
+        bundle
+    }
+
+    #[test]
+    fn a_required_field_removed_from_a_nested_type_breaks_the_old_decode() {
+        let deployed = nested_release();
+        let mut current = nested_release();
+        current.types = vec![details(vec![plain("size", true)])];
+        let report = compare(&deployed, &current);
+        assert!(
+            kinds(&report.callee_first)
+                .contains(&BreakKind::ResponseDecodeFails("details.color".to_owned())),
+            "{report:?}"
+        );
+        assert!(
+            kinds(&report.caller_first)
+                .contains(&BreakKind::RequestFieldNotSent("details.color".to_owned())),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_unit_type_that_becomes_an_object_is_a_break() {
+        let deployed = nested_release();
+        let mut current = nested_release();
+        current.types[0].shape.unit = true;
+        current.types[0].shape.serialized.clear();
+        current.types[0].shape.deserialized.clear();
+        let report = compare(&deployed, &current);
+        assert!(
+            report.callee_first.iter().any(|b| matches!(
+                &b.kind,
+                BreakKind::ResponseTypeChanged { field, .. } if field == "details"
+            )),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_nested_type_passes() {
+        let report = compare(&nested_release(), &nested_release());
+        assert_eq!(report.verdict(), Verdict::Compatible, "{report:?}");
+    }
+
+    #[test]
+    fn an_endpoint_removed_from_its_router_is_a_removed_route() {
+        let deployed = typed_release();
+        let mut current = typed_release();
+        ep(&mut current, "get_item").unrouted = true;
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::RouteMissing]);
+        assert_eq!(kinds(&report.caller_first), [BreakKind::RouteNotServed]);
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+        assert!(report.render(Order::Any).contains("no `routes![…]`"));
+    }
+
+    #[test]
+    fn a_new_caller_of_a_new_unrouted_endpoint_breaks_both_windows() {
+        let deployed = typed_release();
+        let mut current = typed_release();
+        let mut fresh = ep(&mut current, "get_item").clone();
+        fresh.name = "get_price".to_owned();
+        fresh.path = "/prices/{id}".to_owned();
+        fresh.unrouted = true;
+        current.endpoints.push(fresh);
+        current
+            .callers
+            .push(call("show_price", "get_price", &["name"], None));
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::RouteNotServed]);
+        assert_eq!(kinds(&report.caller_first), [BreakKind::RouteNotServed]);
+    }
+
+    #[test]
+    fn a_caller_the_deployed_release_already_left_unserved_is_not_new() {
+        let mut release = typed_release();
+        ep(&mut release, "get_item").unrouted = true;
+        let report = compare(&release, &release);
+        assert_eq!(report.verdict(), Verdict::Compatible, "{report:?}");
+    }
+
+    #[test]
+    fn an_unrouted_endpoint_whose_route_another_endpoint_serves_is_served() {
+        let deployed = typed_release();
+        let mut current = typed_release();
+        let mut v2 = ep(&mut current, "get_item").clone();
+        v2.name = "get_item_v2".to_owned();
+        current.endpoints.push(v2);
+        ep(&mut current, "get_item").unrouted = true;
+        let report = compare(&deployed, &current);
+        assert_eq!(report.verdict(), Verdict::Compatible, "{report:?}");
+    }
+
+    #[test]
+    fn a_field_that_gains_a_shape_on_one_side_is_a_type_change() {
+        let deployed = nested_release();
+        let mut current = nested_release();
+        for e in &mut current.endpoints {
+            for f in e
+                .response
+                .serialized
+                .iter_mut()
+                .chain(e.request.serialized.iter_mut())
+            {
+                f.nested.clear();
+            }
+        }
+        let report = compare(&deployed, &current);
+        assert!(
+            report.callee_first.iter().any(|b| matches!(
+                &b.kind,
+                BreakKind::ResponseTypeChanged { field, .. } if field == "details"
+            )),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn two_fields_of_one_nested_type_are_both_reported() {
+        let mut deployed = nested_release();
+        let mut current = nested_release();
+        for bundle in [&mut deployed, &mut current] {
+            let item = ep(bundle, "get_item");
+            let mut second = item.response.serialized.last().expect("details").clone();
+            second.rust_name = "billing".to_owned();
+            second.wire_name = "billing".to_owned();
+            item.response.serialized.push(second.clone());
+            item.response.deserialized.push(second);
+        }
+        current.types = vec![details(vec![plain("size", true)])];
+        let report = compare(&deployed, &current);
+        let fails: Vec<&BreakKind> = report
+            .callee_first
+            .iter()
+            .map(|b| &b.kind)
+            .filter(|k| matches!(k, BreakKind::ResponseDecodeFails(_)))
+            .collect();
+        assert!(fails.contains(&&BreakKind::ResponseDecodeFails("details.color".to_owned())));
+        assert!(fails.contains(&&BreakKind::ResponseDecodeFails("billing.color".to_owned())));
+    }
+
+    #[test]
+    fn a_caller_that_reads_more_of_a_route_that_was_already_unserved_is_not_new() {
+        let mut deployed = typed_release();
+        ep(&mut deployed, "get_item").unrouted = true;
+        let mut current = deployed.clone();
+        for c in &mut current.callers {
+            if c.endpoint == "get_item" {
+                c.reads.push("id".to_owned());
+            }
+        }
+        assert_eq!(compare(&deployed, &current).verdict(), Verdict::Compatible);
+    }
+
+    #[test]
+    fn a_type_that_many_fields_share_at_many_levels_is_compared_once_per_pair() {
+        // Eight fields of the next level's type, eight levels deep: a walk
+        // without a memo takes 8^8 steps.
+        let mut bundle = typed_release();
+        let level = |n: usize| format!("mesh-catalog::L{n}");
+        for n in 0..8 {
+            let fields: Vec<WireFieldDescriptor> = (0..8)
+                .map(|i| {
+                    let mut f = field(
+                        &format!("f{i}"),
+                        &format!("f{i}"),
+                        &format!("L{}", n + 1),
+                        true,
+                    );
+                    f.nested = vec![level(n + 1)];
+                    f
+                })
+                .collect();
+            bundle.types.push(crate::contracts::bundle::BundleType {
+                id: level(n),
+                shape: shape(&format!("L{n}"), fields.clone(), fields),
+            });
+        }
+        bundle.types.push(crate::contracts::bundle::BundleType {
+            id: level(8),
+            shape: shape("L8", vec![plain("x", true)], vec![plain("x", true)]),
+        });
+        bundle.types.sort();
+        let mut root = field("root", "root", "L0", true);
+        root.nested = vec![level(0)];
+        let item = ep(&mut bundle, "get_item");
+        item.response.serialized.push(root.clone());
+        item.response.deserialized.push(root);
+        let mut current = bundle.clone();
+        let last = current
+            .types
+            .iter_mut()
+            .find(|t| t.id == level(8))
+            .expect("L8");
+        last.shape.serialized.clear();
+        let started = std::time::Instant::now();
+        let report = compare(&bundle, &current);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            kinds(&report.callee_first).contains(&BreakKind::ResponseDecodeFails(
+                "root.f0.f0.f0.f0.f0.f0.f0.f0.x".to_owned()
+            )),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrouted_endpoint_with_no_caller_is_a_removed_route() {
+        let mut deployed = typed_release();
+        deployed.callers.retain(|c| c.endpoint != "get_item");
+        let mut current = deployed.clone();
+        ep(&mut current, "get_item").unrouted = true;
+        let report = compare(&deployed, &current);
+        assert_eq!(kinds(&report.callee_first), [BreakKind::RouteRemoved]);
+    }
+
+    #[test]
+    fn a_route_the_deployed_release_did_not_serve_is_not_removed() {
+        let mut deployed = typed_release();
+        deployed.callers.retain(|c| c.endpoint != "get_item");
+        ep(&mut deployed, "get_item").unrouted = true;
+        let current = deployed.clone();
+        assert_eq!(compare(&deployed, &current).verdict(), Verdict::Compatible);
+    }
+
+    // --- wire types ---
+
+    /// A wire type with the same JSON form in both directions.
+    fn set_wire(fields: &mut [WireFieldDescriptor], name: &str, wire: &WireType) {
+        for f in fields.iter_mut().filter(|f| f.rust_name == name) {
+            f.wire_type = Some(wire.clone());
+        }
+    }
+
+    /// Release 1 with `Item.created_at: DateTime<Utc>` in `form`.
+    fn dated_release(form: &WireType) -> Bundle {
+        let mut bundle = Bundle {
+            format: crate::contracts::bundle::WIRE_TYPE_FORMAT,
+            ..release_1()
+        };
+        for e in &mut bundle.endpoints {
+            for side in [&mut e.request, &mut e.response] {
+                if side.name == "NoBody" {
+                    continue;
+                }
+                let at = field("created_at", "created_at", "DateTime<Utc>", true);
+                side.serialized.push(at.clone());
+                side.deserialized.push(at);
+                set_wire(&mut side.serialized, "created_at", form);
+                set_wire(&mut side.deserialized, "created_at", form);
+            }
+        }
+        bundle
+    }
+
+    fn unix_seconds() -> WireType {
+        WireType::Integer {
+            bits: 64,
+            signed: true,
+            format: Some(autumn_macros_support::wire::format::UNIX_SECONDS.to_owned()),
+        }
+    }
+
+    fn rfc3339() -> WireType {
+        WireType::string_in(autumn_macros_support::wire::format::DATE_TIME)
+    }
+
+    #[test]
+    fn a_new_json_form_with_the_same_rust_type_is_a_break_in_both_windows() {
+        let deployed = dated_release(&rfc3339());
+        let current = dated_release(&unix_seconds());
+        let report = compare(&deployed, &current);
+        let response = BreakKind::ResponseTypeChanged {
+            field: "created_at".to_owned(),
+            caller: "DateTime<Utc> as string(date-time)".to_owned(),
+            callee: "DateTime<Utc> as integer(i64, unix-seconds)".to_owned(),
+        };
+        assert!(
+            kinds(&report.callee_first).contains(&response),
+            "{report:?}"
+        );
+        let request = BreakKind::RequestTypeChanged {
+            field: "created_at".to_owned(),
+            caller: "DateTime<Utc> as integer(i64, unix-seconds)".to_owned(),
+            callee: "DateTime<Utc> as string(date-time)".to_owned(),
+        };
+        assert!(kinds(&report.caller_first).contains(&request), "{report:?}");
+        assert_eq!(report.verdict(), Verdict::Incompatible);
+        let text = report.render(Order::Any);
+        assert!(
+            text.contains("`DateTime<Utc> as integer(i64, unix-seconds)`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_same_json_form_is_compatible() {
+        let report = compare(&dated_release(&rfc3339()), &dated_release(&rfc3339()));
+        assert_eq!(report, Report::default());
+    }
+
+    #[test]
+    fn a_bundle_without_wire_types_compares_the_rust_type_only() {
+        let mut deployed = dated_release(&rfc3339());
+        deployed.format = crate::contracts::bundle::IDENTITY_FORMAT;
+        for e in &mut deployed.endpoints {
+            for f in e
+                .request
+                .serialized
+                .iter_mut()
+                .chain(e.request.deserialized.iter_mut())
+                .chain(e.response.serialized.iter_mut())
+                .chain(e.response.deserialized.iter_mut())
+            {
+                f.wire_type = None;
+            }
+        }
+        let report = compare(&deployed, &dated_release(&unix_seconds()));
+        assert_eq!(report, Report::default());
+    }
+
+    #[test]
+    fn a_rust_type_change_names_the_rust_types_only() {
+        let deployed = dated_release(&rfc3339());
+        let mut current = dated_release(&unix_seconds());
+        for e in &mut current.endpoints {
+            for f in e
+                .response
+                .serialized
+                .iter_mut()
+                .chain(e.response.deserialized.iter_mut())
+                .filter(|f| f.rust_name == "created_at")
+            {
+                f.ty = "i64".to_owned();
+            }
+        }
+        let report = compare(&deployed, &current);
+        assert!(
+            kinds(&report.callee_first).contains(&BreakKind::ResponseTypeChanged {
+                field: "created_at".to_owned(),
+                caller: "DateTime<Utc>".to_owned(),
+                callee: "i64".to_owned(),
+            }),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoder_of_a_nullable_form_reads_the_plain_form() {
+        // `type When = Option<DateTime<Utc>>` with `#[wire(type = "string",
+        // format = "date-time", nullable)]` on the caller side only.
+        let mut deployed = dated_release(&rfc3339());
+        let current = dated_release(&rfc3339());
+        for e in &mut deployed.endpoints {
+            set_wire(
+                &mut e.response.deserialized,
+                "created_at",
+                &WireType::nullable(rfc3339()),
+            );
+        }
+        let report = compare(&deployed, &current);
+        assert!(
+            !report.callee_first.iter().any(|b| matches!(
+                &b.kind,
+                BreakKind::ResponseTypeChanged { field, .. } if field == "created_at"
+            )),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn an_event_field_with_a_new_json_form_is_a_break() {
+        let mut deployed = with_events();
+        deployed.format = crate::contracts::bundle::WIRE_TYPE_FORMAT;
+        let mut current = deployed.clone();
+        let text = WireType::string();
+        let number = WireType::integer(64, true);
+        set_wire(&mut deployed.events[0].shape.serialized, "email", &text);
+        set_wire(&mut deployed.events[0].shape.deserialized, "email", &text);
+        set_wire(&mut current.events[0].shape.serialized, "email", &number);
+        set_wire(&mut current.events[0].shape.deserialized, "email", &number);
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::EventTypeChanged {
+                field: "email".to_owned(),
+                consumer: "String as string".to_owned(),
+                producer: "String as integer(i64)".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_release_with_a_one_sided_custom_function_is_compatible() {
+        // `serialize_with` writes `any`. The other side reads the mapped form.
+        let mut release = dated_release(&rfc3339());
+        for e in &mut release.endpoints {
+            for side in [&mut e.request, &mut e.response] {
+                set_wire(&mut side.serialized, "created_at", &WireType::Any);
+            }
+        }
+        assert_eq!(compare(&release, &release), Report::default());
+    }
+
+    #[test]
+    fn any_on_one_side_is_not_compared() {
+        // A custom serde function with no override makes its form `any`.
+        let deployed = dated_release(&rfc3339());
+        let current = dated_release(&WireType::Any);
+        assert_eq!(compare(&deployed, &current), Report::default());
+    }
+
+    #[test]
+    fn a_new_json_form_inside_a_nested_type_is_a_break() {
+        let mut deployed = nested_release();
+        deployed.format = crate::contracts::bundle::WIRE_TYPE_FORMAT;
+        let mut current = deployed.clone();
+        for (bundle, form) in [
+            (&mut deployed, WireType::string()),
+            (&mut current, WireType::integer(32, false)),
+        ] {
+            let shape = &mut bundle.types[0].shape;
+            set_wire(&mut shape.serialized, "size", &form);
+            set_wire(&mut shape.deserialized, "size", &form);
+        }
+        let report = compare(&deployed, &current);
+        assert!(
+            report.callee_first.iter().any(|b| matches!(
+                &b.kind,
+                BreakKind::ResponseTypeChanged { field, .. } if field == "details.size"
+            )),
+            "{report:?}"
+        );
     }
 }

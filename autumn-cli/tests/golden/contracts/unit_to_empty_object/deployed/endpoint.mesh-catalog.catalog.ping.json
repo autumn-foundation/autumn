@@ -1,0 +1,14 @@
+{
+  "service": "catalog",
+  "name": "ping",
+  "endpoint_ident": "ping_endpoint",
+  "krate": "mesh-catalog",
+  "method": "GET",
+  "path": "/ping",
+  "request_type": "NoBody",
+  "response_type": "Empty",
+  "has_body": false,
+  "request_list": false,
+  "response_list": false,
+  "handler": "ping"
+}

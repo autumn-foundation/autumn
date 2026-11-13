@@ -222,6 +222,46 @@ from `DatabaseFleet::stats`.
 
 ---
 
+### Fleet: `max_open_policy` adds a field and an error
+
+**Why:** an app can make `max_open` a hard limit (issue #3538).
+`DatabaseFleetConfig` has a new field `max_open_policy`. `FleetError` has a
+new variant `AtCapacity` (`503`). `FleetStats` has the new fields `peak_open`,
+`over_cap_opens_total` and `refused_total`.
+
+**You are affected only if your code builds a `DatabaseFleetConfig` with a
+struct literal and no `..` spread, or matches `FleetError` without a
+wildcard arm.** TOML and `AUTUMN_*` config need no change: the default
+`"soft"` keeps the old behavior.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    // ...every other field...
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    max_open: 256,
+    max_open_policy: FleetMaxOpenPolicy::Soft,
+    // ...every other field...
+}
+```
+
+**Automation:** `manual` — add `max_open_policy: FleetMaxOpenPolicy::Soft`,
+and a `FleetError::AtCapacity { .. }` arm (it answers `503`).
+
+---
+
 ### Fleet: `ShipMode::Continuous` carries a shipper
 
 **Why:** core ships the databases of every engine and checks the fence
@@ -414,6 +454,90 @@ if the app wants that, or a payload the check can read.
 
 ---
 
+### Wire contracts: the export refuses a field type it cannot compare
+
+**Why:** `autumn contracts check` compared a nested type by its name only, so
+a change inside it was not seen. The export now puts each nested
+`WireShape` type in the bundle. A field type with no descriptor cannot be
+compared, so the export stops rather than approve it by name.
+
+**You are affected only if you run `autumn contracts export` or
+`autumn contracts check`, and a `WireShape` or `#[event]` field has a type
+that is not a `WireShape` type and not a known leaf.** Known leaves are
+primitives, `String`, standard containers, `serde_json::Value`, `Uuid`,
+`chrono` and `time` types, `Decimal`, `Url`, and similar. An enum field is
+the usual case. The build does not change.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    pub id: String,
+    pub status: Status,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    pub id: String,
+    #[wire(opaque)]
+    pub status: Status,
+}
+```
+
+`#[wire(opaque)]` compares the field by its type name, as before. For a
+struct, derive `WireShape` on it instead, so the check compares its fields.
+
+The export also writes bundle format 3. An older CLI refuses it. Upgrade the
+CLI on every job that reads the bundle. This CLI still reads formats 1 and 2.
+
+A bare type name that two reachable crates define now stops the export.
+Write the full path in the handler signature, for example
+`Json<shared::Item>` or `Json<crate::dto::Item>`.
+
+Type descriptor files now hold the module in their name. Delete
+`target/autumn-contracts` once after the upgrade, so an old file does not
+change a build message.
+
+**Automation:** `manual` — only the app knows if a type should get a shape
+or stay opaque.
+
+---
+
+### Wire contracts: bundle format 4
+
+**Why:** each field now records its wire type, the JSON form serde writes.
+The check compares it, so a new JSON form with the same Rust type is
+reported. An older CLI would not compare wire types, so it refuses the new
+format.
+
+**You are affected only if a job reads a bundle from
+`autumn contracts export` with an older CLI.** The build does not change.
+
+**Before (`{X.Y}`):**
+
+```bash
+autumn contracts check --against deployed.json  # CLI {X.Y}, bundle format 3
+```
+
+**After (`{(X+1).0}`):**
+
+```bash
+autumn contracts check --against deployed.json  # CLI {(X+1).0}, bundle format 4
+```
+
+Upgrade the CLI on every job that reads the bundle. This CLI reads formats
+1 to 4. When one of the two bundles is format 3 or older, the check
+does not compare wire types.
+
+**Automation:** `manual` — upgrade the CLI in each job.
+
+---
+
 ### State: `AppState` getters are no longer `const fn`
 
 **Why:** `AppState` holds its fields behind one `Arc`, so a clone is one
@@ -486,6 +610,138 @@ in a const context, so no call changes.
 `..OutboxConfig::default()`. A codemod cannot know which ending the app
 wants.
 
+### Metrics: `MetricsSnapshot` has a `db_connection_holds` field and is non-exhaustive
+
+**Why:** the `Db` extractor recorded its connection hold time as a query,
+under `db_queries["<route> SELECT"]` (issue #3579). The hold now has its own
+map, `db_connection_holds`, keyed by the route. See
+[Metrics: the `"<route> SELECT"` key is deprecated](#metrics-the-route-select-key-is-deprecated).
+
+`MetricsSnapshot` is now `#[non_exhaustive]`, so a later field does not
+break your code.
+
+**You are affected only if your code builds a `MetricsSnapshot` with a
+struct literal, or destructures one without `..`.** Code that reads
+`/actuator/metrics` or calls `MetricsCollector::snapshot` needs no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+MetricsSnapshot {
+    http,
+    idempotency,
+    db_queries,
+    read_your_writes_pins_total: 0,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+// A literal does not compile. Get the snapshot from the collector.
+let snapshot = state.metrics().snapshot();
+// A destructure ends with `..`.
+let MetricsSnapshot { db_queries, db_connection_holds, .. } = snapshot;
+```
+
+**Automation:** `manual` — a test that builds a snapshot by hand must record
+into a `MetricsCollector` and call `snapshot()`. A codemod cannot write those
+samples.
+
+### Graph: `CrateGraph` has a `bins` field and is non-exhaustive
+
+**Why:** a boundary package now also covers its renamed `[[bin]]` targets
+(issue #3599). `CrateGraph::bins` holds the binary names of each package.
+
+`CrateGraph` is now `#[non_exhaustive]`, so a later field does not break your
+code.
+
+**You are affected only if your code builds a `CrateGraph` with a struct
+literal, or destructures one without `..`.** `autumn graph check-boundaries`
+and `boundaries.toml` need no change.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let crates = CrateGraph { deps, libs };
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let mut crates = CrateGraph::default();
+crates.deps = deps;
+crates.libs = libs;
+// A destructure ends with `..`.
+let CrateGraph { deps, libs, .. } = crates;
+```
+
+**Automation:** `manual` — start from `CrateGraph::default()` and set the
+fields.
+
+---
+
+### Features: the `cluster` module is optional
+
+**Why:** `autumn_web::cluster` was 3% of the code that `autumn-web` compiles, in
+every app (issue #2795, ADR 0045). It now has the `cluster` feature. The
+feature is in `default`, so a default build does not change.
+
+**You are affected only if your app sets `default-features = false` and uses
+`autumn_web::cluster` or `[cluster] enabled = true`.** The compiler reports
+``error[E0432]: unresolved import `autumn_web::cluster` ``. Without the
+feature, `[cluster]` still parses, and `enabled = true` fails boot with a
+validation error.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "cluster"] }
+```
+
+**Automation:** `manual` — a codemod cannot know if the app uses the
+cluster. Add the feature only if it does.
+
+---
+
+### Features: failure capture needs `reporting`
+
+**Why:** the `reporting` feature had two parts: the panic-catch layer and
+failure capture (issue #2795, ADR 0046). The panic-catch layer now has its
+own feature, `error-reporting`. `reporting` turns it on and adds failure
+capture, so a manifest that names `reporting` builds the same code as
+before. Both are in `default`.
+
+**You are affected only if your app sets `default-features = false`, does not
+name `reporting`, and sets `[failure_capture] enabled = true`.** Before,
+that build did not know the section and wrote no capsule. Now the section
+parses, and boot fails with a validation error that names the feature.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):** add `"reporting"`, or set
+`failure_capture.enabled = false`.
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "reporting"] }
+```
+
+An app that wants the panic-catch layer and no failure capture names
+`"error-reporting"`.
+
+**Automation:** `manual` — a codemod cannot know if the app wants failure
+capture.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -539,6 +795,17 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   `FleetDatabase::sidecar_replica`. A `SlotOwnershipStore` gets a default
   `ensure_schema`, so an existing store needs no change. See
   [Writing a fleet extractor](../guide/sqlite-fleet.md#writing-a-fleet-extractor).
+- **New stable surface (conformance, #2828):**
+  `plugin_conformance::run_route_checks` and `RouteSource::from_wire`.
+  `autumn plugin-check --plugin-name <your-plugin>` calls
+  `run_route_checks`, so your conformance test and the CLI give the same
+  result for the same routes.
+- **Stable surface behavior (conformance, #2828):** `run_conformance` with a
+  contract uses the contract's `registered_as` when no route carries the
+  config name and a route carries `registered_as`. Routes under more than one name of the
+  plugin fail `route-attribution`. No signature changes. A test that passed
+  its crate name while the routes carry `Plugin::name()` now passes. Some
+  CLI diagnostic text changes; do not match on it.
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -586,6 +853,15 @@ If nothing changed, delete this section.
 - **Fleet:** the fleet core is in every `db` build, Postgres too. The `db`
   feature now pulls in `fd-lock`, which the `sqlite` feature pulled in
   before. No new crate.
+- **Graph:** `autumn graph check-boundaries` checks the nodes of a renamed
+  `[[bin]]` target in the boundary of its package (#3599). New violations
+  can show. Fix them, or run with `--update-baseline`.
+- **Config:** a type error in `autumn.toml` now names the full key, for
+  example ``in `server.port` ``. Before, `AutumnConfig::load` showed a line
+  of the merged config, which is not a file you wrote. `load_from` errors
+  also give the key, not the line. A syntax error keeps its line. A message
+  parser that read the `TOML parse error at line` prefix of a type error
+  must read the key instead.
 
 Changes that still compile but behave differently at runtime. Examples:
 
@@ -621,6 +897,34 @@ What to do:
    does not show the new comment.
 4. Index the comments table: `(commentable_type, commentable_id, created_at,
    id) WHERE parent_id IS NULL AND deleted_at IS NULL`, and `parent_id`.
+
+### Metrics: the `"<route> SELECT"` key is deprecated
+
+`db_queries["<route> SELECT"]` from the `Db` extractor is not a query. It is
+the time a request held its connection, from checkout to release. It includes
+all statements and all other work in the hold, for example a fan-out. A route
+that only writes also shows it.
+
+This release records each hold in two places:
+
+| Key | Status |
+| --- | --- |
+| `db_queries["POST /census SELECT"]` | Deprecated for holds. The next release stops the `Db` extractor writing it. |
+| `db_connection_holds["POST /census"]` | New. Use this one. |
+
+`run_instrumented` also records a real `SELECT` under `"<route> SELECT"`.
+In this release, that key can mix holds and statements. After the next
+release, it holds only statements.
+
+What to do:
+
+1. Move each dashboard and alert that reads `db_queries["<route> SELECT"]`
+   for the hold to `db_connection_holds["<route>"]`. The new key has no
+   verb. A `Db` from a shard adds the shard, for example
+   `"GET /notes shard=shard0"`.
+2. Read statement times from `db_queries`. They come only from
+   `autumn_web::db::run_instrumented`. If the app does not call it,
+   `db_queries` is empty after the next release.
 
 ## Deprecations retained from `{X.Y}`
 

@@ -60,7 +60,7 @@ use autumn_web::config::AutumnConfig;
 use autumn_web::job;
 use autumn_web::plugin::Plugin;
 use autumn_web::prelude::*;
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 use autumn_web::reporting::{ErrorEvent, ErrorReporter, ReportFuture};
 use autumn_web::sim::{Chaos, FaultEffect, FaultOutcome, FaultPlan, Sim};
 use autumn_web::sim_test;
@@ -1000,9 +1000,9 @@ async fn a_multi_worker_config_is_rejected_at_build_time() {
 /// random and the "byte-identical across 100 replays" claim would be false a
 /// fraction of the time. `TestApp::build` refuses that config outright.
 ///
-/// Gated on `reporting` because the guard — and the `reporting` config section
-/// it reads — only exist under that feature.
-#[cfg(feature = "reporting")]
+/// Gated on `error-reporting` because the guard — and the `reporting` config
+/// section it reads — only exist under that feature.
+#[cfg(feature = "error-reporting")]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[should_panic(expected = "reporting.sample_rate = 1.0")]
 async fn a_sampled_reporting_config_is_rejected_at_build_time() {
@@ -1041,10 +1041,10 @@ async fn a_failure_capture_config_is_rejected_at_build_time() {
 
 /// An app-owned reporter whose future never resolves — the shape of a reporter
 /// that waits on a Tokio timer under a paused simulation.
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 struct StallingReporter;
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 impl ErrorReporter for StallingReporter {
     fn report<'a>(&'a self, _event: &'a ErrorEvent) -> ReportFuture<'a> {
         Box::pin(std::future::pending())
@@ -1068,7 +1068,7 @@ async fn boom() -> AutumnResult<&'static str> {
 ///
 /// AC4 hardening — the 5xx capture must be independent of the app's own
 /// reporters' progress.
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 #[sim_test]
 async fn a_stalled_user_reporter_does_not_starve_the_fault_projection(mut sim: Sim) {
     // This app builds no jobs, but `sim.build` still runs the shared

@@ -1,0 +1,167 @@
+PREPARE
+BEGIN
+                                                                                                      QUERY PLAN                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on autumn_jobs (actual rows=1 loops=1)
+   Buffers: shared hit=52024
+   InitPlan 6 (returns $14)
+     ->  Limit (actual rows=1 loops=1)
+           Buffers: shared hit=52003
+           CTE names
+             ->  Recursive Union (actual rows=11 loops=1)
+                   Buffers: shared hit=42
+                   ->  Limit (actual rows=1 loops=1)
+                         Buffers: shared hit=4
+                         ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on autumn_jobs autumn_jobs_1 (actual rows=1 loops=1)
+                               Index Cond: (queue = 'default'::text)
+                               Heap Fetches: 0
+                               Buffers: shared hit=4
+                   ->  Nested Loop (actual rows=1 loops=11)
+                         Buffers: shared hit=38
+                         ->  WorkTable Scan on names (actual rows=1 loops=11)
+                         ->  Limit (actual rows=1 loops=11)
+                               Buffers: shared hit=38
+                               ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on autumn_jobs autumn_jobs_2 (actual rows=1 loops=11)
+                                     Index Cond: ((queue = 'default'::text) AND (name > names.n))
+                                     Heap Fetches: 0
+                                     Buffers: shared hit=38
+           CTE heads
+             ->  WindowAgg (actual rows=11 loops=1)
+                   Buffers: shared hit=82
+                   ->  Sort (actual rows=11 loops=1)
+                         Sort Key: autumn_jobs_3.run_at, names_1.n
+                         Sort Method: quicksort  Memory: 25kB
+                         Buffers: shared hit=82
+                         ->  Nested Loop (actual rows=11 loops=1)
+                               Buffers: shared hit=76
+                               ->  CTE Scan on names names_1 (actual rows=11 loops=1)
+                                     Filter: (NOT skip)
+                                     Buffers: shared hit=42
+                               ->  Limit (actual rows=1 loops=11)
+                                     Buffers: shared hit=34
+                                     ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on autumn_jobs autumn_jobs_3 (actual rows=1 loops=11)
+                                           Index Cond: ((queue = 'default'::text) AND (name = names_1.n) AND (run_at <= now()))
+                                           Heap Fetches: 0
+                                           Buffers: shared hit=34
+           CTE walk
+             ->  Recursive Union (actual rows=3 loops=1)
+                   Buffers: shared hit=52000
+                   ->  Result (actual rows=1 loops=1)
+                         One-Time Filter: $6
+                         Buffers: shared hit=82
+                         InitPlan 3 (returns $6)
+                           ->  CTE Scan on heads (actual rows=1 loops=1)
+                                 Buffers: shared hit=82
+                   ->  Nested Loop Left Join (actual rows=1 loops=3)
+                         Buffers: shared hit=51918
+                         ->  Hash Join (actual rows=1 loops=3)
+                               Hash Cond: (heads_1.i = (walk.i + 1))
+                               Join Filter: ((walk.best_at IS NULL) OR (heads_1.head < walk.best_at))
+                               Rows Removed by Join Filter: 0
+                               ->  CTE Scan on heads heads_1 (actual rows=11 loops=3)
+                               ->  Hash (actual rows=1 loops=3)
+                                     Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                     ->  WorkTable Scan on walk (actual rows=1 loops=3)
+                         ->  Subquery Scan on p (actual rows=0 loops=2)
+                               Buffers: shared hit=51918
+                               ->  Limit (actual rows=0 loops=2)
+                                     Buffers: shared hit=51918
+                                     ->  LockRows (actual rows=0 loops=2)
+                                           Buffers: shared hit=51918
+                                           ->  Index Scan using idx_autumn_jobs_queue_name_ready on autumn_jobs candidate (actual rows=0 loops=2)
+                                                 Index Cond: ((queue = 'default'::text) AND (name = heads_1.n) AND (run_at <= now()))
+                                                 Filter: (((walk.best_at IS NULL) OR (run_at < walk.best_at)) AND (status = 'enqueued'::text) AND ((concurrency_limit IS NULL) OR ((SubPlan 4) < concurrency_limit)))
+                                                 Rows Removed by Filter: 25000
+                                                 Buffers: shared hit=51916
+                                                 SubPlan 4
+                                                   ->  Aggregate (actual rows=1 loops=50000)
+                                                         Buffers: shared hit=50001
+                                                         ->  Index Only Scan using idx_autumn_jobs_concurrency_running on autumn_jobs running (actual rows=2 loops=50000)
+                                                               Index Cond: (name = candidate.name)
+                                                               Filter: (NOT (concurrency_key IS DISTINCT FROM candidate.concurrency_key))
+                                                               Heap Fetches: 0
+                                                               Buffers: shared hit=50001
+           ->  Sort (actual rows=1 loops=1)
+                 Sort Key: walk_1.i DESC
+                 Sort Method: quicksort  Memory: 25kB
+                 Buffers: shared hit=52003
+                 ->  CTE Scan on walk walk_1 (actual rows=1 loops=1)
+                       Filter: (best_id IS NOT NULL)
+                       Rows Removed by Filter: 2
+                       Buffers: shared hit=52000
+   ->  Index Scan using autumn_jobs_pkey on autumn_jobs (actual rows=1 loops=1)
+         Index Cond: (id = $14)
+         Buffers: shared hit=52007
+ Planning:
+   Buffers: shared hit=261 read=1
+(92 rows)
+
+ROLLBACK
+PREPARE
+BEGIN
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on autumn_jobs (actual rows=1 loops=1)
+   Buffers: shared hit=101826
+   InitPlan 1 (returns $5)
+     ->  Limit (actual rows=1 loops=1)
+           Buffers: shared hit=101806
+           ->  LockRows (actual rows=1 loops=1)
+                 Buffers: shared hit=101806
+                 ->  Nested Loop Left Join (actual rows=1 loops=1)
+                       Join Filter: (candidate.concurrency_limit IS NOT NULL)
+                       Rows Removed by Join Filter: 1
+                       Filter: ((candidate.concurrency_limit IS NULL) OR (r.c < candidate.concurrency_limit))
+                       Rows Removed by Filter: 50000
+                       Buffers: shared hit=101805
+                       ->  Index Scan using idx_autumn_jobs_queue_ready on autumn_jobs candidate (actual rows=50001 loops=1)
+                             Index Cond: ((queue = 'default'::text) AND (run_at <= now()))
+                             Filter: (status = 'enqueued'::text)
+                             Buffers: shared hit=1800
+                       ->  Subquery Scan on r (actual rows=1 loops=50001)
+                             Buffers: shared hit=100005
+                             ->  Aggregate (actual rows=1 loops=50001)
+                                   Buffers: shared hit=100005
+                                   ->  Index Only Scan using idx_autumn_jobs_concurrency_running on autumn_jobs running (actual rows=2 loops=50001)
+                                         Index Cond: (name = candidate.name)
+                                         Filter: (NOT (concurrency_key IS DISTINCT FROM candidate.concurrency_key))
+                                         Heap Fetches: 100001
+                                         Buffers: shared hit=100005
+   ->  Index Scan using autumn_jobs_pkey on autumn_jobs (actual rows=1 loops=1)
+         Index Cond: (id = $5)
+         Buffers: shared hit=101812
+ Planning:
+   Buffers: shared hit=9
+(31 rows)
+
+ROLLBACK
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ GroupAggregate (actual rows=1 loops=1)
+   Group Key: blocked.name
+   Buffers: shared hit=102423
+   ->  Sort (actual rows=50000 loops=1)
+         Sort Key: blocked.name
+         Sort Method: quicksort  Memory: 2708kB
+         Buffers: shared hit=102423
+         ->  Bitmap Heap Scan on autumn_jobs blocked (actual rows=50000 loops=1)
+               Recheck Cond: ((run_at <= now()) AND (status = 'enqueued'::text))
+               Filter: ((concurrency_limit IS NOT NULL) AND ((SubPlan 1) >= concurrency_limit))
+               Rows Removed by Filter: 20001
+               Heap Blocks: exact=2229
+               Buffers: shared hit=102423
+               ->  Bitmap Index Scan on idx_autumn_jobs_ready (actual rows=70001 loops=1)
+                     Index Cond: (run_at <= now())
+                     Buffers: shared hit=193
+               SubPlan 1
+                 ->  Aggregate (actual rows=1 loops=50000)
+                       Buffers: shared hit=100001
+                       ->  Index Only Scan using idx_autumn_jobs_concurrency_running on autumn_jobs running (actual rows=2 loops=50000)
+                             Index Cond: (name = blocked.name)
+                             Filter: (NOT (concurrency_key IS DISTINCT FROM blocked.concurrency_key))
+                             Heap Fetches: 100000
+                             Buffers: shared hit=100001
+ Planning:
+   Buffers: shared hit=2
+(26 rows)
+

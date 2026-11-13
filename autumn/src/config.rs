@@ -91,6 +91,7 @@
 //! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_OPEN` | `database.fleet.max_open` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY` | `database.fleet.max_open_policy` | `soft` / `wait` / `refuse` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES` | `database.fleet.max_resident_bytes` | `u64` |
 //! | `AUTUMN_DATABASE__FLEET__MIN_RESIDENCY` | `database.fleet.min_residency` | duration; empty is `2s` |
 //! | `AUTUMN_DATABASE__FLEET__POOL_SIZE` | `database.fleet.pool_size` | `usize` |
@@ -268,6 +269,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
+
+mod value_de;
 
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
 use std::sync::OnceLock;
@@ -592,7 +595,7 @@ pub fn profile_shutdown_defaults(profile: &str) -> (u64, u64) {
 /// their profile TOML file and env overrides.
 fn profile_defaults_as_toml(profile: &str) -> toml::Value {
     match profile {
-        "dev" => toml::from_str(
+        "dev" => toml::from_str::<toml::Value>(
             r#"
 [log]
 level = "debug"
@@ -645,7 +648,7 @@ ranges = ["127.0.0.0/8", "::1/128"]
                 feature = "sqlite",
                 allow(unused_mut, reason = "only the Postgres build adds to it")
             )]
-            let mut prod: toml::Value = toml::from_str(
+            let mut prod = toml::from_str::<toml::Value>(
                 r#"
 [log]
 level = "info"
@@ -697,7 +700,7 @@ secure = true
             #[cfg(not(feature = "sqlite"))]
             deep_merge(
                 &mut prod,
-                toml::from_str(
+                toml::from_str::<toml::Value>(
                     r#"
 [database]
 statement_timeout = "30s"
@@ -1479,7 +1482,6 @@ pub struct AutumnConfig {
     /// unknown-key validation never descends into its children. The regression
     /// guard `failure_capture_child_keys_are_strictly_validated` fails if this
     /// ordering breaks.
-    #[cfg(feature = "reporting")]
     #[serde(default)]
     pub failure_capture: FailureCaptureConfig,
 
@@ -1491,8 +1493,8 @@ pub struct AutumnConfig {
     /// # Field ordering (load-bearing — do not move below `database`)
     ///
     /// Declared here, before [`database`](Self::database), for the same reason
-    /// [`deploy`](Self::deploy) and `failure_capture` (a field only present
-    /// with the `reporting` feature, hence not linked) are: `DatabaseConfig`'s
+    /// [`deploy`](Self::deploy) and [`failure_capture`](Self::failure_capture)
+    /// are: `DatabaseConfig`'s
     /// `deserialize_with` duration field aborts the
     /// `SchemaDeserializer` traversal, so a section declared after it is
     /// recorded only as an opaque root leaf and strict unknown-key validation
@@ -1747,9 +1749,9 @@ pub struct AutumnConfig {
     /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
     ///
     /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
-    /// to registered reporters. Honored only when the `reporting` cargo
+    /// to registered reporters. Honored only when the `error-reporting` cargo
     /// feature is enabled.
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[serde(default)]
     pub reporting: ReportingConfig,
 
@@ -2487,7 +2489,7 @@ pub struct RobotsConfig {
 /// Note: `enabled = false` only suppresses *delivery* to reporters. Handler
 /// panics are still caught and converted to a clean 500 response regardless of
 /// this setting.
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReportingConfig {
     /// Whether error events are delivered to registered reporters.
@@ -2505,7 +2507,7 @@ pub struct ReportingConfig {
     pub sample_rate: f64,
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 impl Default for ReportingConfig {
     fn default() -> Self {
         Self {
@@ -2515,12 +2517,12 @@ impl Default for ReportingConfig {
     }
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 const fn default_reporting_enabled() -> bool {
     true
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 const fn default_reporting_sample_rate() -> f64 {
     1.0
 }
@@ -2544,7 +2546,9 @@ const fn default_reporting_sample_rate() -> f64 {
 /// through `[log] filter_parameters`, but unstructured bodies, URL paths and
 /// result rows are not. Read `docs/guide/failure-capsules.md` before enabling
 /// this outside development.
-#[cfg(feature = "reporting")]
+///
+/// The section parses in every build. `enabled = true` needs the `reporting`
+/// feature: without it, boot fails.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FailureCaptureConfig {
     /// Whether failing requests are recorded as capsules.
@@ -2580,7 +2584,6 @@ pub struct FailureCaptureConfig {
     pub max_capsules: usize,
 }
 
-#[cfg(feature = "reporting")]
 impl Default for FailureCaptureConfig {
     fn default() -> Self {
         Self {
@@ -2593,27 +2596,48 @@ impl Default for FailureCaptureConfig {
     }
 }
 
-#[cfg(feature = "reporting")]
+impl FailureCaptureConfig {
+    /// Refuse `enabled = true` in a build without the `reporting` feature.
+    ///
+    /// That build cannot write a capsule. An operator who turns capture on
+    /// expects one after a failure, so boot fails. Only boot calls this.
+    /// `validate` does not, because the CLI reads the config of an app that
+    /// it does not run.
+    pub(crate) fn check_build(&self) -> Result<(), ConfigError> {
+        Self::check_feature(self.enabled, cfg!(feature = "reporting"))
+    }
+
+    /// [`check_build`](Self::check_build) for a build with (`built`) or
+    /// without the feature.
+    pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        if enabled && !built {
+            return Err(ConfigError::Validation(
+                "failure_capture.enabled is true, but this build does not have the \
+                 `reporting` feature. Turn on the feature, or set \
+                 failure_capture.enabled = false"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 const fn default_failure_capture_enabled() -> bool {
     false
 }
 
-#[cfg(feature = "reporting")]
 fn default_failure_capture_dir() -> String {
     "tmp/autumn-capsules".to_owned()
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_body_bytes() -> usize {
     65_536
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_capsule_bytes() -> usize {
     1_048_576
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_capsules() -> usize {
     50
 }
@@ -3128,9 +3152,11 @@ fn default_channels_redis_prefix() -> String {
 ///
 /// Off by default. When enabled, the node binds a small authenticated gossip
 /// listener, discovers the peers named in `seed_peers`, and exposes a
-/// cluster-wide counter through
-/// [`ClusterHandle`](crate::cluster::ClusterHandle). No external coordination
-/// service is involved — see `docs/guide/clustering.md`.
+/// cluster-wide counter through `autumn_web::cluster::ClusterHandle`. No
+/// external coordination service is involved — see `docs/guide/clustering.md`.
+///
+/// `enabled = true` needs the `cluster` feature. The section parses without
+/// it, and boot fails.
 ///
 /// The transport is **authenticated (HMAC-SHA256), not encrypted**: run it on a
 /// trusted network.
@@ -3308,6 +3334,27 @@ impl Default for ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Refuse `enabled = true` in a build without the `cluster` feature.
+    ///
+    /// That build has no cluster runtime. A node that does not join is a
+    /// fault, so boot fails and does not continue alone. Only boot calls
+    /// this. `validate` does not, because the CLI reads the config of an
+    /// app that it does not run.
+    #[cfg_attr(
+        all(feature = "cluster", not(test)),
+        allow(dead_code, reason = "boot calls it only without the `cluster` feature")
+    )]
+    pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        if enabled && !built {
+            return Err(ConfigError::Validation(
+                "cluster.enabled is true, but this build does not have the `cluster` \
+                 feature. Turn on the feature, or set cluster.enabled = false"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Fail fast on a `[cluster]` section that would boot an insecure or
     /// flapping cluster.
     ///
@@ -6571,7 +6618,7 @@ impl AutumnConfig {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
-            let _ = Self::deserialize(de.clone());
+            let _ = Self::deserialize(value_de::ConfigDe::Schema(de.clone()));
             let mut rejected: Vec<String> = std::mem::take(
                 &mut de
                     .rejected
@@ -7121,10 +7168,8 @@ impl AutumnConfig {
             warn_profile_typo(&profile);
         }
 
-        // Deserialize the merged TOML table into AutumnConfig
-        let toml_str =
-            toml::to_string(&merged).expect("internal error: failed to serialize merged config");
-        let mut config: Self = toml::from_str(&toml_str)?;
+        // Read the merged table into AutumnConfig. An error names its key.
+        let mut config: Self = value_de::from_value(merged.clone())?;
         config.profile = Some(profile);
 
         // An `AUTUMN_ROLE` that is not a role name fails the load, as a bad
@@ -7148,6 +7193,8 @@ impl AutumnConfig {
                 || env
                     .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
                     .is_ok_and(|v| v == "true" || v == "1");
+            let toml_str = toml::to_string(&merged)
+                .expect("internal error: failed to serialize merged config");
             Self::run_strict_unknown_key_check(
                 &toml_str,
                 enforce_all,
@@ -7436,7 +7483,8 @@ impl AutumnConfig {
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let config: Self = toml::from_str(&contents)?;
+                let table = toml::from_str::<toml::Table>(&contents)?;
+                let config: Self = value_de::from_value(toml::Value::Table(table))?;
                 config.validate()?;
                 Ok(config)
             }
@@ -7809,9 +7857,8 @@ impl AutumnConfig {
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         self.apply_metrics_env_overrides_with_env(env);
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         self.apply_reporting_env_overrides_with_env(env);
-        #[cfg(feature = "reporting")]
         self.apply_failure_capture_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
@@ -8124,7 +8171,7 @@ impl AutumnConfig {
         );
     }
 
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     fn apply_reporting_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(
             env,
@@ -8138,7 +8185,6 @@ impl AutumnConfig {
         );
     }
 
-    #[cfg(feature = "reporting")]
     fn apply_failure_capture_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(
             env,
@@ -8623,6 +8669,11 @@ impl AutumnConfig {
         parse_env(env, "AUTUMN_DATABASE__FLEET__ROOT", &mut fleet.root);
         parse_env_option_string(env, "AUTUMN_DATABASE__FLEET__PATH", &mut fleet.path);
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_OPEN", &mut fleet.max_open);
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY",
+            &mut fleet.max_open_policy,
+        );
         let budget = &mut fleet.max_resident_bytes;
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES", budget);
         let mut residency = Some(fleet.min_residency);
@@ -12193,6 +12244,61 @@ pub struct DatabaseConfig {
     pub roles: std::collections::BTreeMap<String, crate::db_roles::DatabaseRoleConfig>,
 }
 
+/// What an open does when the fleet already holds `max_open` databases.
+///
+/// The fleet does not close a database that is in use or that was used within
+/// [`min_residency`](DatabaseFleetConfig::min_residency). The cap applies to
+/// opens for requests. A background open never passes it, with any policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetMaxOpenPolicy {
+    /// Open anyway. `max_open` is a soft limit that a burst can pass. The
+    /// sweeper closes the extra databases after the burst. This is the default.
+    #[default]
+    Soft,
+    /// Wait for a free slot, for at most `connect_timeout_secs`. Then answer
+    /// `503`. The count of open and closing databases never passes `max_open`.
+    Wait,
+    /// Answer `503` with `Retry-After` at once when no idle database can
+    /// close. If one can close, wait for that close, for at most
+    /// `connect_timeout_secs`. The count of open and closing databases never
+    /// passes `max_open`.
+    Refuse,
+}
+
+impl FleetMaxOpenPolicy {
+    /// The name used in `autumn.toml` and in the environment.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::Wait => "wait",
+            Self::Refuse => "refuse",
+        }
+    }
+}
+
+impl std::fmt::Display for FleetMaxOpenPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FleetMaxOpenPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "soft" => Ok(Self::Soft),
+            "wait" => Ok(Self::Wait),
+            "refuse" => Ok(Self::Refuse),
+            other => Err(format!(
+                "expected `soft`, `wait` or `refuse`, got {other:?}"
+            )),
+        }
+    }
+}
+
 /// `[database.fleet]`: one `SQLite` database per tenant or per routing slot.
 ///
 /// ```toml
@@ -12227,16 +12333,48 @@ pub struct DatabaseFleetConfig {
     ///
     /// Past this, the sweeper closes the least recently used idle database.
     /// It does not close a database that is in use or that was used within
-    /// [`min_residency`](Self::min_residency), and an open never waits for
-    /// room. Thus a burst across many keys can open more databases than this
-    /// value. The count decreases when the burst stops.
+    /// [`min_residency`](Self::min_residency). With `max_open_policy = "soft"`,
+    /// an open never waits for room. Thus a burst across many keys can open
+    /// more databases than this value. The count decreases when the burst
+    /// stops. See [`max_open_policy`](Self::max_open_policy) for a hard limit.
     ///
     /// Each open database holds up to [`pool_size`](Self::pool_size)
     /// connections, and about `2 × pool_size + 1` file descriptors (the
-    /// database and `-wal` per connection, one `-shm`). Set the open-file
-    /// limit (`ulimit -n`) for the peak count, not for this value.
+    /// database and `-wal` per connection, one `-shm`). With the `"soft"`
+    /// policy, set the open-file limit (`ulimit -n`) for the peak count, not
+    /// for this value.
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
+
+    /// What an open does when the fleet already holds
+    /// [`max_open`](Self::max_open) databases. Default: `"soft"`.
+    ///
+    /// - `"soft"`: open anyway (see `max_open`).
+    /// - `"wait"`: wait for a free slot, for at most `connect_timeout_secs`,
+    ///   then answer `503`.
+    /// - `"refuse"`: answer `503` with `Retry-After` at once when no idle
+    ///   database can close. If one can close, wait for that close, for at
+    ///   most `connect_timeout_secs`.
+    ///
+    /// With `"wait"` or `"refuse"`, the count of open and closing databases
+    /// never passes `max_open`. The fleet databases then hold at most
+    /// `max_open × (2 × pool_size + 1)` file descriptors. Replicas, the
+    /// control database and sockets use more.
+    ///
+    /// The fleet keeps a database open while it is in use or was used within
+    /// [`min_residency`](Self::min_residency). A burst of new keys gets `503`
+    /// until that time ends. `Retry-After` is `min_residency` rounded up to
+    /// whole seconds (from 1 to 30).
+    ///
+    /// The cap counts a request for any key, also one that does not exist.
+    /// Check the tenant id before you open its database. With `"wait"`, set a
+    /// request limit too: a parked request holds its task for the timeout.
+    ///
+    /// This policy does not apply to
+    /// [`max_resident_bytes`](Self::max_resident_bytes). With `"wait"` and
+    /// `"refuse"`, a database that is too large stays open.
+    #[serde(default)]
+    pub max_open_policy: FleetMaxOpenPolicy,
 
     /// A soft limit, in bytes, on the memory of the open databases. Default:
     /// `0` (no limit).
@@ -12244,8 +12382,8 @@ pub struct DatabaseFleetConfig {
     /// Each engine reports the memory of one open database. The `SQLite`
     /// engine counts about 2 MB of page cache for each connection. Above the
     /// limit, the fleet closes the least recently used idle database. The
-    /// rules are the same as for [`max_open`](Self::max_open). The fleet
-    /// keeps one database open, also when it alone is above the limit.
+    /// rules are the same as for [`max_open`](Self::max_open) with the
+    /// `"soft"` policy. The fleet keeps one database open, also when it alone is above the limit.
     /// While the budget is full, a background open gets no room.
     #[serde(default)]
     pub max_resident_bytes: u64,
@@ -12546,6 +12684,7 @@ const fn default_fleet_section(
         max_open: default_fleet_max_open(),
         max_resident_bytes: 0,
         min_residency: default_fleet_min_residency(),
+        max_open_policy: FleetMaxOpenPolicy::Soft,
         pool_size: default_fleet_pool_size(),
         create_on_demand: None,
         idle_close_secs: default_fleet_idle_close_secs(),
@@ -12736,9 +12875,11 @@ pub(crate) fn open_files_warning(
     Some(format!(
         "SQLite may keep about {files} files open at database.fleet.max_open, near \
          the open-file limit of {limit} (ulimit -n). The process also needs files \
-         for sockets and logs. database.fleet.max_open is a soft limit: a burst \
-         opens more. Increase ulimit -n. Or decrease database.fleet.max_open, \
-         database.fleet.pool_size or database.pool_size. Set \
+         for sockets and logs. With max_open_policy = \"soft\", \
+         database.fleet.max_open is a soft limit: a burst opens more. Use \
+         \"wait\" or \"refuse\" to bound the count. Increase ulimit -n. Or \
+         decrease database.fleet.max_open, database.fleet.pool_size or \
+         database.pool_size. Set \
          database.max_connections_warn_threshold = 0 to silence."
     ))
 }
@@ -15213,7 +15354,7 @@ impl AutumnConfig {
     }
 }
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Visitor};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -15264,413 +15405,56 @@ impl SchemaDeserializer {
     }
 }
 
+/// Each method runs the schema walk of [`value_de::ConfigDe`]. The walk
+/// lives there, so the config types compile one walk, not two.
+macro_rules! schema_walk {
+    ($($method:ident($($arg:ident: $ty:ty),*);)*) => {$(
+        fn $method<V: Visitor<'de>>(
+            self,
+            $($arg: $ty,)*
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            de::Deserializer::$method(value_de::ConfigDe::Schema(self), $($arg,)* visitor)
+                .map_err(value_de::Error::into_value_error)
+        }
+    )*};
+}
+
 impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     type Error = serde::de::value::Error;
 
-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        // `deserialize_any` is inherently ambiguous for a placeholder walker:
-        // untagged SCALAR parsers (e.g. `deserialize_duration`) need a string,
-        // while a visitor that accepts only seq/map (e.g. `JobQueuesConfig` at
-        // `jobs.queues`) rejects a string and aborts the whole remaining walk
-        // (#1890). We can't know which shape a given visitor wants, and serde
-        // seeds can't be retried mid-walk, so we probe with a scalar by default
-        // and let `get_schema_keys` re-run the walk, escalating any REJECTED
-        // path to a map/seq probe on the next pass until none reject.
-        let path = self.path.join(".");
-        let probe = self
-            .any_probe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&path)
-            .copied()
-            .unwrap_or(AnyProbe::Str);
-        let result = match probe {
-            // "0" is a valid non-empty string that also parses as an int/duration,
-            // so untagged string- and number-shaped scalar parsers both accept it.
-            AnyProbe::Str => visitor.visit_str("0"),
-            // Empty map/seq: a seq/map-only visitor accepts it and yields an empty
-            // value, so the walk records the field as a leaf and CONTINUES past it
-            // (we intentionally do NOT descend — e.g. jobs.queues has dynamic keys).
-            AnyProbe::Map => visitor.visit_map(SchemaMapAccess {
-                fields: [].iter(),
-                current_field: None,
-                deserializer: self.clone(),
-            }),
-            AnyProbe::Seq => visitor.visit_seq(SchemaSeqAccess {
-                done: true,
-                deserializer: self.clone(),
-            }),
-        };
-        if result.is_err() {
-            self.rejected
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(path);
-        }
-        result
-    }
-
-    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_bool(false)
-    }
-
-    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i8(0)
-    }
-
-    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i16(0)
-    }
-
-    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i32(0)
-    }
-
-    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_i64(0)
-    }
-
-    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u8(0)
-    }
-
-    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u16(0)
-    }
-
-    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u32(0)
-    }
-
-    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_u64(0)
-    }
-
-    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_f32(0.0)
-    }
-
-    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_f64(0.0)
-    }
-
-    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_char('\0')
-    }
-
-    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_str("")
-    }
-
-    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_string(String::new())
-    }
-
-    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_bytes(&[])
-    }
-
-    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_byte_buf(Vec::new())
-    }
-
-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_some(self)
-    }
-
-    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn deserialize_unit_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn deserialize_newtype_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_newtype_struct(self)
-    }
-
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_seq(SchemaSeqAccess {
-            done: false,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_tuple_struct<V>(
-        self,
-        _name: &'static str,
-        _len: usize,
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_map(SchemaMapAccess {
-            fields: [].iter(),
-            current_field: None,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_struct<V>(
-        self,
-        _name: &'static str,
-        fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let path_str = self.path.join(".");
-        {
-            let mut schema = self.schema.lock().unwrap();
-            schema.insert(path_str, fields.iter().map(|&s| s.to_string()).collect());
-        }
-
-        visitor.visit_map(SchemaMapAccess {
-            fields: fields.iter(),
-            current_field: None,
-            deserializer: self,
-        })
-    }
-
-    fn deserialize_enum<V>(
-        self,
-        _name: &'static str,
-        variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        // Feed the FIRST declared variant name (not `""`) so serde's derived
-        // variant-identifier visitor accepts it. An empty tag is an "unknown
-        // variant" error that aborts the ENTIRE remaining schema traversal, so a
-        // single enum field (e.g. `server.tls.acme.directory`) would drop every
-        // sibling/subsequent section (`database`, …) from the derived schema —
-        // silently disabling the strict unknown-key validator for them. The enum
-        // is still treated as an opaque leaf: every `SchemaEnumAccess` variant
-        // arm resolves to `visit_unit` without recursing.
-        visitor.visit_enum(SchemaEnumAccess {
-            variant: variants.first().copied().unwrap_or_default(),
-        })
-    }
-
-    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_str("")
-    }
-
-    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-}
-
-struct SchemaSeqAccess {
-    done: bool,
-    deserializer: SchemaDeserializer,
-}
-
-impl<'de> SeqAccess<'de> for SchemaSeqAccess {
-    type Error = serde::de::value::Error;
-
-    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
-    where
-        T: DeserializeSeed<'de>,
-    {
-        if self.done {
-            Ok(None)
-        } else {
-            self.done = true;
-            seed.deserialize(self.deserializer.clone()).map(Some)
-        }
-    }
-}
-
-struct SchemaMapAccess {
-    fields: std::slice::Iter<'static, &'static str>,
-    current_field: Option<&'static str>,
-    deserializer: SchemaDeserializer,
-}
-
-impl<'de> MapAccess<'de> for SchemaMapAccess {
-    type Error = serde::de::value::Error;
-
-    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
-    where
-        K: DeserializeSeed<'de>,
-    {
-        if let Some(&field) = self.fields.next() {
-            self.current_field = Some(field);
-            seed.deserialize(de::value::StrDeserializer::new(field))
-                .map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
-    where
-        V: DeserializeSeed<'de>,
-    {
-        let field = self.current_field.take().unwrap();
-        let mut new_path = self.deserializer.path.clone();
-        new_path.push(field.to_string());
-
-        let nested = SchemaDeserializer {
-            path: new_path,
-            schema: self.deserializer.schema.clone(),
-            any_probe: self.deserializer.any_probe.clone(),
-            rejected: self.deserializer.rejected.clone(),
-        };
-        seed.deserialize(nested)
-    }
-}
-
-struct SchemaEnumAccess {
-    /// The variant name to report to serde's derived variant-identifier visitor.
-    /// Must be a REAL variant name (the first declared one), never `""`, or
-    /// serde returns an "unknown variant" error that aborts schema traversal.
-    variant: &'static str,
-}
-
-impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
-    type Error = serde::de::value::Error;
-    type Variant = Self;
-
-    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
-    where
-        V: de::DeserializeSeed<'de>,
-    {
-        let val = seed.deserialize(de::value::StrDeserializer::new(self.variant))?;
-        Ok((val, self))
-    }
-}
-
-impl<'de> de::VariantAccess<'de> for SchemaEnumAccess {
-    type Error = serde::de::value::Error;
-
-    fn unit_variant(self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
-    where
-        T: de::DeserializeSeed<'de>,
-    {
-        seed.deserialize(SchemaDeserializer::new())
-    }
-
-    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-
-    fn struct_variant<V>(
-        self,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
+    schema_walk! {
+        deserialize_any();
+        deserialize_bool();
+        deserialize_i8();
+        deserialize_i16();
+        deserialize_i32();
+        deserialize_i64();
+        deserialize_i128();
+        deserialize_u8();
+        deserialize_u16();
+        deserialize_u32();
+        deserialize_u64();
+        deserialize_u128();
+        deserialize_f32();
+        deserialize_f64();
+        deserialize_char();
+        deserialize_str();
+        deserialize_string();
+        deserialize_bytes();
+        deserialize_byte_buf();
+        deserialize_option();
+        deserialize_unit();
+        deserialize_unit_struct(name: &'static str);
+        deserialize_newtype_struct(name: &'static str);
+        deserialize_seq();
+        deserialize_tuple(len: usize);
+        deserialize_tuple_struct(name: &'static str, len: usize);
+        deserialize_map();
+        deserialize_struct(name: &'static str, fields: &'static [&'static str]);
+        deserialize_enum(name: &'static str, variants: &'static [&'static str]);
+        deserialize_identifier();
+        deserialize_ignored_any();
     }
 }
 
@@ -17952,7 +17736,7 @@ path = "/healthz"
         assert_eq!(config.database.pool_size, 25);
     }
 
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[test]
     fn env_override_reporting() {
         let env = MockEnv::new()
@@ -17966,7 +17750,6 @@ path = "/healthz"
         assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
     }
 
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_defaults_are_off() {
         let config = AutumnConfig::default();
@@ -17980,7 +17763,6 @@ path = "/healthz"
         assert_eq!(config.failure_capture.max_capsules, 50);
     }
 
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_env_overrides_apply() {
         let env = MockEnv::new()
@@ -18007,7 +17789,6 @@ path = "/healthz"
     /// `deserialize_with` duration field aborts the schema walk. If someone
     /// moves `failure_capture` below `database`, its child keys silently
     /// vanish from the schema and this fails.
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_child_keys_are_strictly_validated() {
         let leaves = AutumnConfig::schema_leaf_paths();
@@ -18038,6 +17819,46 @@ path = "/healthz"
     }
 
     // ── [cluster] (issue #1762) ──────────────────────────────────────────
+
+    #[test]
+    fn failure_capture_enabled_without_the_feature_fails() {
+        let err = FailureCaptureConfig::check_feature(true, false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`reporting` feature"), "{text}");
+        assert!(FailureCaptureConfig::check_feature(true, true).is_ok());
+        assert!(FailureCaptureConfig::check_feature(false, false).is_ok());
+    }
+
+    #[test]
+    fn boot_accepts_or_refuses_failure_capture_by_the_build() {
+        let on = FailureCaptureConfig {
+            enabled: true,
+            ..FailureCaptureConfig::default()
+        };
+        // A build with `reporting` can capture. A build without it cannot.
+        assert_eq!(on.check_build().is_ok(), cfg!(feature = "reporting"));
+        assert!(FailureCaptureConfig::default().check_build().is_ok());
+    }
+
+    #[cfg(not(feature = "reporting"))]
+    #[test]
+    fn boot_refuses_failure_capture_in_a_build_without_reporting() {
+        let on = FailureCaptureConfig {
+            enabled: true,
+            ..FailureCaptureConfig::default()
+        };
+        let text = on.check_build().unwrap_err().to_string();
+        assert!(text.contains("`reporting` feature"), "{text}");
+    }
+
+    #[test]
+    fn cluster_enabled_without_the_feature_fails() {
+        let err = ClusterConfig::check_feature(true, false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`cluster` feature"), "{text}");
+        assert!(ClusterConfig::check_feature(true, true).is_ok());
+        assert!(ClusterConfig::check_feature(false, false).is_ok());
+    }
 
     /// A cluster with no shared secret is an unauthenticated cluster: anyone
     /// who can reach the port can inject state. Boot must fail, not warn.
@@ -23044,6 +22865,7 @@ path = "/healthz"
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         }
@@ -23546,6 +23368,75 @@ path = "/healthz"
             config.database.fleet.unwrap().min_residency,
             std::time::Duration::from_secs(2),
             "an empty value is the default"
+        );
+    }
+
+    #[test]
+    fn fleet_max_open_policy_default_parse_and_env() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+        };
+        let policy = |extra: &str| {
+            parse(extra)
+                .unwrap()
+                .database
+                .fleet
+                .unwrap()
+                .max_open_policy
+        };
+        assert_eq!(policy(""), FleetMaxOpenPolicy::Soft);
+        assert_eq!(
+            policy("max_open_policy = \"wait\""),
+            FleetMaxOpenPolicy::Wait
+        );
+        assert_eq!(
+            policy("max_open_policy = \"refuse\""),
+            FleetMaxOpenPolicy::Refuse
+        );
+        assert!(parse("max_open_policy = \"hard\"").is_err());
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY", "refuse");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().max_open_policy,
+            FleetMaxOpenPolicy::Refuse
+        );
+    }
+
+    #[test]
+    fn fleet_max_open_policy_names_round_trip() {
+        for policy in [
+            FleetMaxOpenPolicy::Soft,
+            FleetMaxOpenPolicy::Wait,
+            FleetMaxOpenPolicy::Refuse,
+        ] {
+            assert_eq!(policy.to_string(), policy.as_str());
+            assert_eq!(
+                format!(" {policy} ").parse::<FleetMaxOpenPolicy>(),
+                Ok(policy)
+            );
+        }
+        let error = "hard".parse::<FleetMaxOpenPolicy>().unwrap_err();
+        assert!(
+            error.contains("soft") && error.contains("refuse"),
+            "{error}"
+        );
+        // An invalid env value is ignored: the default stays.
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "slot")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN_POLICY", "hard");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().max_open_policy,
+            FleetMaxOpenPolicy::Soft
         );
     }
 

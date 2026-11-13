@@ -159,6 +159,42 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         self.inner.replication.get()
     }
 
+    /// Every transaction committed to `key` at or before the returned
+    /// instant is in the replica. See
+    /// [`FleetReplication::replicated_through`](crate::db::fleet_replication::FleetReplication::replicated_through).
+    /// `None` with no replication.
+    #[must_use]
+    pub fn replicated_through(&self, key: &FleetDbKey) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.replication()
+            .and_then(|replication| replication.replicated_through(key))
+    }
+
+    /// Wait until the replica of `key` holds every commit at or before
+    /// `committed_at`. See
+    /// [`FleetReplication::wait_replicated`](crate::db::fleet_replication::FleetReplication::wait_replicated).
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicatedWaitError::NotReplicating`](crate::db::fleet_replication::ReplicatedWaitError::NotReplicating)
+    /// with no replication. Else see `FleetReplication::wait_replicated`.
+    pub async fn wait_replicated(
+        &self,
+        key: &FleetDbKey,
+        committed_at: chrono::DateTime<chrono::Utc>,
+        timeout: Duration,
+    ) -> Result<(), crate::db::fleet_replication::ReplicatedWaitError> {
+        let Some(replication) = self.replication() else {
+            return Err(
+                crate::db::fleet_replication::ReplicatedWaitError::NotReplicating {
+                    name: key.name(),
+                },
+            );
+        };
+        replication
+            .wait_replicated(key, committed_at, timeout)
+            .await
+    }
+
     /// The replica of `key`: the destination and its key prefix.
     pub(super) fn replica_base(&self, key: &FleetDbKey) -> Option<super::ReplicaBase> {
         self.replication().map(|replication| super::ReplicaBase {
@@ -168,9 +204,11 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         })
     }
 
-    /// Whether the replication has frames it did not ship yet.
+    /// Whether the replication has writes it did not ship yet: a parked
+    /// WAL replicator, or a kept generation.
     pub(super) fn unshipped(&self) -> bool {
-        self.replication().is_some_and(|r| r.closing() > 0)
+        self.replication()
+            .is_some_and(|r| r.closing() > 0 || r.unshipped_generations() > 0)
     }
 
     /// The tombstone row of a delete of `name`.
@@ -213,6 +251,13 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             known
                 .upgrade()
                 .map_or(0, |ownership| ownership.fence_floor(key.routing_slot()))
+        }));
+        let serving = Arc::downgrade(ownership);
+        replication.set_serving_hook(Arc::new(move |key: &FleetDbKey| {
+            serving
+                .upgrade()
+                .and_then(|ownership| ownership.epoch_for(key.routing_slot()))
+                .map(crate::lock::FencingToken::get)
         }));
         let ownership = Arc::downgrade(ownership);
         replication.set_fence_hook(Arc::new(move |key: &FleetDbKey, newest: u64| {
@@ -307,10 +352,16 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             for hook in self.hooks() {
                 hook.release(key);
             }
+            let mut settle = super::ReleaseSettle {
+                fleet: self,
+                key: key.clone(),
+                replaced: false,
+            };
             check_contained(self.root(), path)?;
             match mode {
                 ShipMode::Continuous(_) => {
                     restore_in_place(self.root(), replication, key, None, path)?;
+                    settle.done();
                 }
                 ShipMode::Generations { .. } => {
                     // Only a generation above the stamp holds newer data. The
@@ -328,6 +379,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                         }
                         other => {
                             other?;
+                            settle.done();
                         }
                     }
                 }
@@ -635,6 +687,15 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 replication.stop();
             })
             .await;
+        }
+    }
+
+    /// The hooks released `key` for a delete or a restore. `replaced`: the
+    /// files are gone or replaced, so a kept generation of them goes.
+    /// Otherwise it stays and ships again.
+    pub(super) fn settle_release(&self, key: &FleetDbKey, replaced: bool) {
+        if let Some(replication) = self.replication() {
+            replication.settle_released_generation(key, replaced);
         }
     }
 

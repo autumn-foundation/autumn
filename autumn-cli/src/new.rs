@@ -877,9 +877,11 @@ fn strip_migrations(main_rs: &str) -> String {
 /// dropped here, not just `db`. Dropping `http-client` also drops `reqwest`
 /// and its TLS stack from the build.
 ///
-/// `reporting` stays on. It adds no extra dependency, and it drives the
-/// panic-catch middleware every app should keep by default.
-const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "reporting"];
+/// `error-reporting` stays on. It adds no extra dependency, and it drives the
+/// panic-catch middleware every app should keep by default. The wider
+/// `reporting` feature adds failure capture and `autumn replay`. The starter
+/// does not use them, so it does not compile them (#2795).
+const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "error-reporting"];
 
 /// Default `autumn-web` features minus the HTML view stack (`maud`/`htmx`/
 /// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` and its
@@ -2097,8 +2099,9 @@ mod tests {
     }
 
     /// Windows PDB files cap public symbols (LNK4319, issue #2448). Every
-    /// starter shape must set a reduced dev profile, for the app and for its
-    /// dependencies.
+    /// starter shape must set a reduced dev profile. The app keeps file and
+    /// line. Dependencies have no debug info, which also makes the first
+    /// build faster (#2795).
     #[test]
     fn every_generated_shape_scaffolds_reduced_dev_debug_info() {
         let shapes = [
@@ -2143,9 +2146,9 @@ mod tests {
                 "{name}: {raw}"
             );
             assert_eq!(
-                dev["package"]["*"]["debug"].as_str(),
-                Some("line-tables-only"),
-                "{name}: dependencies need their own setting: {raw}"
+                dev["package"]["*"]["debug"].as_bool(),
+                Some(false),
+                "{name}: dependencies build with no debug info: {raw}"
             );
         }
     }
@@ -2264,6 +2267,24 @@ mod tests {
             !cargo.contains("diesel_migrations"),
             "daemon starter must not depend on diesel_migrations"
         );
+    }
+
+    /// The daemon starter catches handler panics. It does not compile failure
+    /// capture, which the wider `reporting` feature adds (#2795).
+    #[test]
+    fn daemon_starter_keeps_error_reporting_and_drops_failure_capture() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-report-app", tmp.path(), daemon_opts()).unwrap();
+        let raw = fs::read_to_string(tmp.path().join("daemon-report-app/Cargo.toml")).unwrap();
+        let doc: toml::Table = raw.parse().unwrap();
+        let features: Vec<&str> = doc["dependencies"]["autumn-web"]["features"]
+            .as_array()
+            .expect("feature list")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert!(features.contains(&"error-reporting"), "{raw}");
+        assert!(!features.contains(&"reporting"), "{raw}");
     }
 
     #[test]
@@ -3469,6 +3490,10 @@ mod tests {
         assert!(
             policy.contains("RUSTSEC-2023-0071"),
             "every flavor keeps the default `jwt` feature, so its tree reaches rsa through jsonwebtoken"
+        );
+        assert!(
+            policy.contains("RUSTSEC-2026-0459"),
+            "every flavor bundles SQLite through diesel, and no libsqlite3-sys fix can resolve yet"
         );
     }
 

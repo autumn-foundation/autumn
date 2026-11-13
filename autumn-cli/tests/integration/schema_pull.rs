@@ -2071,3 +2071,63 @@ pub struct Post {
         "doctor sees no drift:\n{doc_out}"
     );
 }
+
+/// A model in a Postgres schema: the migration creates the schema, `schema
+/// pull --schema` reads it back, and a later diff reports no change. A new
+/// model gets a qualified `table!` block in `src/schema.rs`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_round_trips_a_model_in_a_named_schema() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_tmp, project) = fresh_project("schema_named");
+
+    write_models(
+        &project,
+        r#"
+#[autumn_web::model(managed, table = "campaigns", schema = "marketing")]
+pub struct Campaign {
+    #[id]
+    pub id: i64,
+    pub name: String,
+}
+"#,
+    );
+    std::fs::write(project.join("src/schema.rs"), "").expect("schema.rs");
+    build_schema_into_db(&project, &envs);
+
+    let migrations = project.join("migrations");
+    let up = std::fs::read_dir(&migrations)
+        .expect("migrations")
+        .filter_map(Result::ok)
+        .map(|e| e.path().join("up.sql"))
+        .find(|p| {
+            std::fs::read_to_string(p).is_ok_and(|t| t.contains("CREATE TABLE marketing.campaigns"))
+        })
+        .expect("a migration creates marketing.campaigns");
+    let up = std::fs::read_to_string(up).expect("up.sql");
+    assert!(
+        up.contains("CREATE SCHEMA IF NOT EXISTS marketing;"),
+        "{up}"
+    );
+
+    let schema_rs = std::fs::read_to_string(project.join("src/schema.rs")).expect("schema.rs");
+    assert!(
+        schema_rs.contains("marketing.campaigns (id)"),
+        "{schema_rs}"
+    );
+
+    let (stdout, stderr) = run_autumn_ok(
+        &project,
+        &["schema", "pull", "--schema", "marketing"],
+        &envs,
+    );
+    assert_no_secret_leak(&stdout, &stderr);
+    let snapshot =
+        std::fs::read_to_string(project.join(".autumn/schema-snapshot.json")).expect("snapshot");
+    assert!(snapshot.contains("\"schema\": \"marketing\""), "{snapshot}");
+
+    let (stdout, _) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(stdout.contains("No schema changes"), "{stdout}");
+}

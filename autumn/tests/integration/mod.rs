@@ -65,6 +65,7 @@ mod chaos_session_loom;
 mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
+#[cfg(feature = "cluster")]
 mod cluster_two_node;
 #[cfg(all(feature = "db", feature = "collab"))]
 mod collab_model;
@@ -122,6 +123,7 @@ mod embed_assets_integration;
 mod encryption_columns;
 #[cfg(feature = "db")]
 mod encryption_repository;
+#[cfg(feature = "error-reporting")]
 mod error_reporting;
 mod error_validation_details;
 #[cfg(feature = "db")]
@@ -556,6 +558,8 @@ mod sim_testapp_jobs;
 mod sla_obligation_macro;
 mod sqlite_ci_coverage;
 mod sqlite_postgres_free;
+#[cfg(feature = "db")]
+mod sqlite_replicated_through;
 #[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]

@@ -127,7 +127,7 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "storage")]
         blob_store: None,
         cache_backend: None,
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         error_reporters: Vec::new(),
         #[cfg(feature = "alerts")]
         alert_channels: Vec::new(),
@@ -540,7 +540,7 @@ pub struct AppBuilder {
     /// [`ReportingLayer`](crate::reporting::ReportingLayer) delivers panic and
     /// 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s to each. Empty means
     /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
     #[cfg(feature = "alerts")]
     /// Operator-alert channels registered via [`AppBuilder::with_alert_channel`].
@@ -2894,7 +2894,7 @@ impl AppBuilder {
     /// #   ;
     /// # }
     /// ```
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[must_use]
     pub fn with_error_reporter<R: crate::reporting::ErrorReporter>(mut self, reporter: R) -> Self {
         self.error_reporters
@@ -4532,7 +4532,7 @@ impl AppBuilder {
             #[cfg(feature = "storage")]
             blob_store,
             cache_backend,
-            #[cfg(feature = "reporting")]
+            #[cfg(feature = "error-reporting")]
             error_reporters,
             #[cfg(feature = "alerts")]
             alert_channels,
@@ -4947,6 +4947,14 @@ impl AppBuilder {
         }
         state.insert_extension(crate::background::BackgroundQueues(background.queues()));
 
+        // A build without the `reporting` feature refuses failure capture.
+        if let Err(error) = config.failure_capture.check_build() {
+            tracing::error!(error = %error, "failure capture cannot start");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         // Tee clock reads into the capsule of whatever request took them, so a
         // replayed handler sees the same `now()` sequence the failure did.
         // Mirrored by `TestApp::build` so test apps exercise the same wiring.
@@ -5268,13 +5276,13 @@ impl AppBuilder {
         // task (spawned below) so each renewal failure reaches the same
         // Sentry/etc. sinks a request-path 5xx would. Empty is fine — failures
         // still log via `tracing` inside the loop.
-        #[cfg(all(feature = "acme", feature = "reporting"))]
+        #[cfg(all(feature = "acme", feature = "error-reporting"))]
         let acme_reporters = error_reporters.clone();
 
         // Install registered error reporters so the reporting layer (wired in
         // `apply_middleware`) can deliver panic + 5xx events. Empty is fine —
         // the layer falls back to the built-in `LogReporter`.
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         if !error_reporters.is_empty() {
             state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
@@ -6005,10 +6013,15 @@ impl AppBuilder {
         // nothing replicates and die with the process. The cluster is therefore
         // cancelled after the drain completes (see `cluster_shutdown.cancel()`
         // below), inside the same budget.
+        #[cfg(feature = "cluster")]
         let cluster_shutdown = tokio_util::sync::CancellationToken::new();
-        if let Err(error) =
-            crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown)
-        {
+        #[cfg(feature = "cluster")]
+        let installed =
+            crate::cluster::install_from_config(&state, &config.cluster, &cluster_shutdown);
+        // Without the `cluster` feature, boot refuses `enabled = true`.
+        #[cfg(not(feature = "cluster"))]
+        let installed = crate::config::ClusterConfig::check_feature(config.cluster.enabled, false);
+        if let Err(error) = installed {
             tracing::error!(error = %error, "cluster installation failed");
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
@@ -6376,9 +6389,9 @@ impl AppBuilder {
                 tracing::warn!(scheduler_backend = coordinator.backend(), "{message}");
             }
 
-            #[cfg(feature = "reporting")]
+            #[cfg(feature = "error-reporting")]
             let reporter = make_acme_reporter(acme_reporters);
-            #[cfg(not(feature = "reporting"))]
+            #[cfg(not(feature = "error-reporting"))]
             let reporter = make_acme_reporter();
             // Certificate renewal is a framework-scheduled operation, so a
             // failed issuance/renewal raises #1610's `scheduled_task_failure`
@@ -7078,6 +7091,7 @@ impl AppBuilder {
         // up to the budget rather than budget + `LEAVE_BUDGET`. A departure that is
         // budgeted away leaves the peer to converge on the suspicion timeout, which
         // is the actual contract.
+        #[cfg(feature = "cluster")]
         if config.cluster.enabled {
             cluster_shutdown.cancel();
             let departure_wait =
@@ -7179,7 +7193,7 @@ impl AppBuilder {
             #[cfg(feature = "storage")]
             blob_store,
             cache_backend,
-            #[cfg(feature = "reporting")]
+            #[cfg(feature = "error-reporting")]
             error_reporters,
             #[cfg(feature = "alerts")]
                 alert_channels: _,
@@ -7441,7 +7455,7 @@ impl AppBuilder {
         } else {
             crate::cache::clear_global_cache();
         }
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         if !error_reporters.is_empty() {
             state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
@@ -12537,7 +12551,7 @@ fn acme_placeholder_key(
 /// [`ErrorEvent`](crate::reporting::ErrorEvent) to the registered reporter chain
 /// on a detached task, so failures reach Sentry/etc. when configured (failures
 /// also always log via `tracing` inside the loop).
-#[cfg(all(feature = "acme", feature = "reporting"))]
+#[cfg(all(feature = "acme", feature = "error-reporting"))]
 fn make_acme_reporter(
     reporters: Vec<std::sync::Arc<dyn crate::reporting::ErrorReporter>>,
 ) -> crate::acme::renewal::ReporterFn {
@@ -12842,9 +12856,9 @@ fn make_acme_alert_recovery(state: &AppState) -> crate::acme::renewal::RecoveryF
     })
 }
 
-/// The no-op ACME reporter used when the `reporting` feature is off (failures
+/// The no-op ACME reporter used when the `error-reporting` feature is off (failures
 /// still log via `tracing`).
-#[cfg(all(feature = "acme", not(feature = "reporting")))]
+#[cfg(all(feature = "acme", not(feature = "error-reporting")))]
 fn make_acme_reporter() -> crate::acme::renewal::ReporterFn {
     std::sync::Arc::new(|_message: String| {})
 }
@@ -13217,6 +13231,7 @@ fn fleet_flush_budget(
 /// Returns zero when the drain has already consumed the budget: the departure
 /// is skipped and the peer converges on the suspicion timeout, which is the
 /// documented contract for a shutdown that overran.
+#[cfg(feature = "cluster")]
 fn cluster_departure_wait(
     shutdown_budget: std::time::Duration,
     drain_elapsed: std::time::Duration,
@@ -16770,6 +16785,7 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         })
@@ -16868,6 +16884,7 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         });
@@ -16917,6 +16934,7 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         });
@@ -16968,6 +16986,7 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         });
@@ -17148,6 +17167,7 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         });
@@ -17205,6 +17225,7 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         });
@@ -17247,6 +17268,7 @@ mod fleet_boot_tests {
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         });
@@ -20497,6 +20519,7 @@ mod tests {
     /// replicate it and die with the process: a write accepted and silently
     /// thrown away. Source-order test in the house style, because the ordering
     /// is a property of this function and nothing smaller.
+    #[cfg(feature = "cluster")]
     #[test]
     fn cluster_departs_after_the_request_drain() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
@@ -20568,6 +20591,7 @@ mod tests {
     /// `LEAVE_BUDGET` sleep between the drain and the hooks would make the
     /// worst case `shutdown_timeout_secs + LEAVE_BUDGET`, so the wait is
     /// clamped to the budget the drain left over.
+    #[cfg(feature = "cluster")]
     #[test]
     fn the_cluster_departure_wait_fits_inside_the_shutdown_budget() {
         use std::time::Duration;
@@ -22520,6 +22544,7 @@ mount = ["service"]
             restore_check_sample: 0,
             replication_workers: 4,
             min_residency: std::time::Duration::from_secs(2),
+            max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size: 0,
             cache_size_kib: 0,
         });

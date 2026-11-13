@@ -1,0 +1,4 @@
+shipped cold_wal_bytes=66769632 warm_wal_bytes=43308712
+feed cold_wal_bytes=113604408 warm_wal_bytes=56124552
+feed_created cold_wal_bytes=193153640 warm_wal_bytes=83434552
+wide cold_wal_bytes=146306128 warm_wal_bytes=70619328

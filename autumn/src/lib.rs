@@ -166,6 +166,7 @@ mod media_type;
 pub mod classify;
 // A plain comment, not a doc comment: the module carries its own `//!` docs
 // and an outer `///` here would be merged with them.
+#[cfg(feature = "cluster")]
 pub mod cluster;
 #[cfg(feature = "collab")]
 pub mod collab;
@@ -737,8 +738,9 @@ pub mod redis_tls;
 /// Pluggable error reporting: catch handler panics and route panics + 5xx
 /// responses to configured [`ErrorReporter`](reporting::ErrorReporter)s.
 ///
-/// Enabled by the `reporting` Cargo feature (on by default).
-#[cfg(feature = "reporting")]
+/// Enabled by the `error-reporting` Cargo feature (on by default). The
+/// `reporting` feature adds failure capture, the `capsule` module.
+#[cfg(feature = "error-reporting")]
 pub mod reporting;
 pub mod scheduler;
 pub mod security;

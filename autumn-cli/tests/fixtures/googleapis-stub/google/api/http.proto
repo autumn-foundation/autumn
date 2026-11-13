@@ -1,0 +1,26 @@
+// A test stub of `google/api/http.proto` from googleapis: the messages that
+// `google.api.http` options use, with the same field numbers. The buf test
+// builds the `--http-annotations` export with it, so it needs no network.
+syntax = "proto3";
+
+package google.api;
+
+message HttpRule {
+  string selector = 1;
+  oneof pattern {
+    string get = 2;
+    string put = 3;
+    string post = 4;
+    string delete = 5;
+    string patch = 6;
+    CustomHttpPattern custom = 8;
+  }
+  string body = 7;
+  string response_body = 12;
+  repeated HttpRule additional_bindings = 11;
+}
+
+message CustomHttpPattern {
+  string kind = 1;
+  string path = 2;
+}

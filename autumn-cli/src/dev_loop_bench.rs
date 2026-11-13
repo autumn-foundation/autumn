@@ -128,24 +128,18 @@ pub const fn budget_for(class: ChangeClass) -> LatencyBudget {
             p95_ms: 8_000,
             max_ms: 15_000,
         },
-        // Cold-start onboarding budget (issue #977). Issue #2309 lowered this
-        // budget from p95 60s / max 90s to the values below.
+        // Cold-start onboarding budget (issue #977). The original target was
+        // p95 60s / max 90s. Issue #2309 raised it to p95 130s / max 160s.
         //
-        // Two fixes cut the real cold-start time. The first: the
-        // `autumn-macros` `db` gate. The second: the removal of two unused
-        // default features from the no-DB daemon starter. Neither fix
-        // brings cold start under the original 60s/90s target. The reason:
-        // `autumn-web`'s own hand-written source now sets the pace. No
-        // feature gates that source.
-        //
-        // The values below come from measured CI runs (p50 about 108-117s,
-        // p95 and max about 120-122s), plus margin for runner noise. See
-        // docs/guide/dev-loop-latency.md for the full history and issue
-        // #2795, which tracks `autumn-web`'s own compile time.
+        // Issue #2795 cut the build (ADR 0027, ADR 0045, ADR 0046). Two CI
+        // runs of 5 samples then measured 50.4-52.8s and 75.8-76.9s: the
+        // runners differ. The gate checks p95 and max only. With 3 runs,
+        // p95 is the slowest sample. p95 is 30% above the slowest sample
+        // seen. See docs/guide/dev-loop-latency.md for the full history.
         ChangeClass::ColdStartHello => LatencyBudget {
-            p50_ms: 100_000,
-            p95_ms: 130_000,
-            max_ms: 160_000,
+            p50_ms: 80_000,
+            p95_ms: 100_000,
+            max_ms: 120_000,
         },
         // Database-backed cold start is informational only in this slice, so
         // these limits are not gated. The bundled managed-Postgres provider adds
@@ -362,6 +356,11 @@ pub struct FullReport {
     pub example_name: String,
     pub all_passed: bool,
     pub results: Vec<BudgetCheckResult>,
+    /// Milliseconds of the cold-start preparation of the gated `hello` shape:
+    /// toolchain install, index update and crate downloads. The samples do
+    /// not include it. The database shape's preparation is not recorded here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prepare_ms: Option<u64>,
 }
 
 // ── Formatters ───────────────────────────────────────────────────────────────
@@ -396,6 +395,9 @@ pub fn format_human_summary(report: &FullReport) -> String {
     )
     .unwrap();
     writeln!(out, "Example: {}", report.example_name).unwrap();
+    if let Some(ms) = report.prepare_ms {
+        writeln!(out, "Preparation (not in the samples): {ms} ms").unwrap();
+    }
     out.push('\n');
 
     let col_w = 46usize;
@@ -466,6 +468,7 @@ pub fn run(
         example_name: example.to_string(),
         all_passed,
         results,
+        prepare_ms: None,
     };
 
     emit_report(&report, json, output, fail_on_regression)
@@ -683,6 +686,60 @@ pub fn build_cold_start_report(hello_samples: &[u64], db: &DbOutcome) -> FullRep
         example_name: "cold-start".to_string(),
         all_passed,
         results,
+        prepare_ms: None,
+    }
+}
+
+/// The untimed step before the cold-start samples.
+///
+/// The scaffold pins its own toolchain and has no lockfile. The first `cargo`
+/// call in a scaffold can install a toolchain, update the index and download
+/// crates. That is network time, not compile time. In the scheduled runs the
+/// first sample was always the slowest one, and this work is the probable
+/// cause. The driver does this work once before the clock starts and reports
+/// the time here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdStartPreparation {
+    /// How long the preparation took.
+    pub elapsed_ms: u64,
+    /// `rustc --version` in the scaffold directory: the compiler that the
+    /// samples use. `None` when the probe failed.
+    pub rust_version: Option<String>,
+}
+
+/// The `cargo` arguments of the preparation step. It downloads. It never
+/// compiles, so the timed build stays cold.
+pub fn cold_start_fetch_args(target: Option<&str>) -> Vec<String> {
+    let mut args = vec!["fetch".to_owned()];
+    if let Some(triple) = target {
+        args.push("--target".to_owned());
+        args.push(triple.to_owned());
+    }
+    args
+}
+
+/// Environment of the timed build and of the preparation step.
+///
+/// An empty wrapper variable turns a compiler wrapper off, also one set in a
+/// config file. `CARGO_INCREMENTAL=0` builds the patched `autumn-web` as Cargo
+/// builds a registry dependency. The `[patch]` makes it a path dependency,
+/// which is incremental by default and slower to build from cold. The
+/// variable applies to the whole build, so the app crate also builds without
+/// incremental mode. A new user's first build compiles the app crate in
+/// incremental mode.
+pub const COLD_BUILD_ENV: &[(&str, &str)] = &[
+    ("RUSTC_WRAPPER", ""),
+    ("RUSTC_WORKSPACE_WRAPPER", ""),
+    ("CARGO_BUILD_RUSTC_WRAPPER", ""),
+    ("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", ""),
+    ("CARGO_INCREMENTAL", "0"),
+];
+
+/// Put the preparation step into a cold-start report.
+pub fn record_preparation(report: &mut FullReport, preparation: &ColdStartPreparation) {
+    report.prepare_ms = Some(preparation.elapsed_ms);
+    if let Some(version) = &preparation.rust_version {
+        report.rust_version.clone_from(version);
     }
 }
 
@@ -1593,6 +1650,7 @@ mod tests {
             example_name: "examples/hello".to_string(),
             all_passed: computed_all_passed,
             results,
+            prepare_ms: None,
         }
     }
 
@@ -1865,10 +1923,13 @@ mod tests {
     // ── cold-start budgets ────────────────────────────────────────────────
 
     #[test]
-    fn budget_cold_start_hello_p95_is_130000ms() {
-        // Recalibrated budget (issue #2309). The no-DB cold start must stay
-        // at or under p95 130s. See docs/guide/dev-loop-latency.md for why.
-        assert_eq!(budget_for(ChangeClass::ColdStartHello).p95_ms, 130_000);
+    fn budget_cold_start_hello_is_tightened_from_ci_data() {
+        // Issue #2795. Two CI runs of 5 samples measured 50.4-52.8 s and
+        // 75.8-76.9 s. p95 is 30% above the slowest sample.
+        let budget = budget_for(ChangeClass::ColdStartHello);
+        assert_eq!(budget.p50_ms, 80_000);
+        assert_eq!(budget.p95_ms, 100_000);
+        assert_eq!(budget.max_ms, 120_000);
     }
 
     #[test]
@@ -1910,10 +1971,10 @@ mod tests {
             table.to_lowercase().contains("cold start"),
             "table must mention cold start, got:\n{table}"
         );
-        // 130s p95 budget for the gated no-DB shape must be visible.
+        // The 100s p95 budget for the gated no-DB shape must be visible.
         assert!(
-            table.contains("130000") || table.contains("130 000"),
-            "table must show the 130s p95 budget, got:\n{table}"
+            table.contains("100000") || table.contains("100 000"),
+            "table must show the 100s p95 budget, got:\n{table}"
         );
     }
 
@@ -1931,6 +1992,95 @@ mod tests {
         );
     }
 
+    // ── cold-start preparation ────────────────────────────────────────────
+
+    #[test]
+    fn the_preparation_step_fetches_and_never_builds() {
+        assert_eq!(cold_start_fetch_args(None), ["fetch"]);
+        let args = cold_start_fetch_args(Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(args, ["fetch", "--target", "x86_64-unknown-linux-gnu"]);
+    }
+
+    #[test]
+    fn the_cold_build_turns_incremental_off_and_wrappers_off() {
+        let get = |name: &str| {
+            COLD_BUILD_ENV
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(get("CARGO_INCREMENTAL"), Some("0"));
+        for wrapper in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert_eq!(get(wrapper), Some(""), "{wrapper}");
+        }
+    }
+
+    #[test]
+    fn the_report_shows_the_preparation_and_the_scaffold_toolchain() {
+        let mut report = build_cold_start_report(&[40_000], &DbOutcome::NotRequested);
+        report.rust_version = "rustc 1.99.0".to_owned();
+        record_preparation(
+            &mut report,
+            &ColdStartPreparation {
+                elapsed_ms: 9_500,
+                rust_version: Some("rustc 1.97.0".to_owned()),
+            },
+        );
+        assert_eq!(report.prepare_ms, Some(9_500));
+        assert_eq!(report.rust_version, "rustc 1.97.0");
+        let json: serde_json::Value = serde_json::from_str(&format_json_report(&report)).unwrap();
+        assert_eq!(json["prepare_ms"], 9_500);
+        let text = format_human_summary(&report);
+        assert!(
+            text.contains("Preparation (not in the samples): 9500 ms"),
+            "{text}"
+        );
+        assert!(text.contains("Rust: rustc 1.97.0"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_toolchain_probe_keeps_the_reported_version() {
+        let mut report = build_cold_start_report(&[40_000], &DbOutcome::NotRequested);
+        report.rust_version = "rustc 1.99.0".to_owned();
+        record_preparation(
+            &mut report,
+            &ColdStartPreparation {
+                elapsed_ms: 1,
+                rust_version: None,
+            },
+        );
+        assert_eq!(report.rust_version, "rustc 1.99.0");
+    }
+
+    /// The preparation is not a sample. It does not change the gate.
+    #[test]
+    fn the_preparation_time_does_not_change_the_gate() {
+        let mut report = build_cold_start_report(&[40_000], &DbOutcome::NotRequested);
+        let stats_before = report.results[0].stats.p95_ms;
+        record_preparation(
+            &mut report,
+            &ColdStartPreparation {
+                elapsed_ms: 900_000,
+                rust_version: None,
+            },
+        );
+        assert!(report.all_passed);
+        assert_eq!(report.results[0].stats.p95_ms, stats_before);
+    }
+
+    #[test]
+    fn a_report_without_a_preparation_has_no_field() {
+        let report = make_test_report(true);
+        let json: serde_json::Value = serde_json::from_str(&format_json_report(&report)).unwrap();
+        assert!(json.get("prepare_ms").is_none());
+        assert!(!format_human_summary(&report).contains("Preparation"));
+    }
+
     // ── cold-start report builder ─────────────────────────────────────────
 
     #[test]
@@ -1945,7 +2095,7 @@ mod tests {
 
     #[test]
     fn build_cold_start_report_hello_over_budget_fails_gate() {
-        // p95 well above the 130s budget → gate fails.
+        // p95 well above the 100s budget → gate fails.
         let report =
             build_cold_start_report(&[200_000, 210_000, 220_000], &DbOutcome::NotRequested);
         assert!(!report.all_passed, "over-budget hello must fail the gate");

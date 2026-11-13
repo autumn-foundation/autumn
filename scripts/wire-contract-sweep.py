@@ -11,6 +11,11 @@ services into a release 2 and runs `autumn contracts check` against release 1.
 The exit code and the named deploy order must match. Part 2 also exports the
 unchanged tree twice and requires the same bytes as the committed bundle.
 
+Part 3 exports the unchanged tree with `--proto` twice and requires the same
+bytes as the committed `examples/mesh-storefront/contracts/proto/` and its
+lock. `--check` must pass on the committed files. It does the same with
+`--avro` and the committed `examples/mesh-storefront/contracts/avro/`.
+
 The script restores every file when it finishes.
 
 Run from the workspace root:
@@ -22,6 +27,7 @@ Exits non-zero when any case does not give the expected result.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +35,9 @@ import tempfile
 LIB = 'examples/mesh-catalog/src/lib.rs'
 MAIN = 'examples/mesh-storefront/src/main.rs'
 RELEASE_1 = 'examples/mesh-storefront/contracts/release-1.json'
+PROTO = 'examples/mesh-storefront/contracts/proto'
+PROTO_LOCK = 'examples/mesh-storefront/contracts/proto.lock'
+AVRO = 'examples/mesh-storefront/contracts/avro'
 BASE = open(LIB).read()
 BASE_MAIN = open(MAIN).read()
 PACKAGES = ['-p', 'mesh-catalog', '-p', 'mesh-storefront']
@@ -124,6 +133,10 @@ CROSS_RELEASE = [
  ("method changed", [
     (LIB, '#[get("/items/{id}")]', '#[post("/items/{id}")]'),
  ], 1, 'not safe in any deploy order'),
+ # The handler keeps its `#[endpoint]`, and the router no longer serves it.
+ ("endpoint removed from the router", [
+    (LIB, "routes![get_item, create_item]", "routes![create_item]"),
+ ], 1, 'not safe in any deploy order'),
  ("event field a listener reads removed, listener stops reading it", [
     (LIB, EVENT, "}"),
     (MAIN, LISTENER_READ, "    let _price = event.id;\n"),
@@ -143,6 +156,11 @@ CROSS_RELEASE = [
     (MAIN, "event: mesh_catalog::ItemRepriced)", "event: mesh_catalog::ItemRepricedV2)"),
     (MAIN, LISTENER_READ, "    let _price = (event.id, event.amount, event.currency);\n"),
  ], 3, EVENT_PRODUCERS_FIRST),
+ # The Rust type stays `u32`. The JSON form changes from a number to a
+ # string, so only the field's wire type shows the break.
+ ("response field written in a new JSON form", [
+    (LIB, "    /// Price in cents.\n    pub price_cents: u32,\n}", "    /// Price in cents, written as text.\n    #[serde(with = \"cents_text\")]\n    #[wire(type = \"string\", format = \"decimal\")]\n    pub price_cents: u32,\n}\n\n/// Writes cents as decimal text.\nmod cents_text {\n    pub fn serialize<S: serde::Serializer>(v: &u32, s: S) -> Result<S::Ok, S::Error> {\n        s.collect_str(v)\n    }\n\n    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {\n        let text = <String as serde::Deserialize>::deserialize(d)?;\n        text.parse().map_err(serde::de::Error::custom)\n    }\n}"),
+ ], 1, 'not safe in any deploy order'),
  ("path parameter renamed", [
     (LIB, '#[get("/items/{id}")]\n#[public]\npub async fn get_item(id: Path<String>)', '#[get("/items/{item_id}")]\n#[public]\npub async fn get_item(item_id: Path<String>)'),
     (LIB, "        id.to_string(),\n        format!(\"Item {}\", *id),", "        item_id.to_string(),\n        format!(\"Item {}\", *item_id),"),
@@ -183,6 +201,14 @@ def autumn_bin():
     subprocess.run(['cargo', 'build', '-q', '-p', 'autumn-cli'], check=True)
     return os.path.join('target', 'debug', 'autumn')
 
+def tree(root):
+    out = {}
+    for base, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(base, name)
+            out[os.path.relpath(path, root).replace(os.sep, '/')] = open(path, 'rb').read()
+    return out
+
 def contracts(binary, *args):
     out = subprocess.run([binary, 'contracts', *args, *PACKAGES], capture_output=True, text=True)
     return out.returncode, out.stdout, out.stderr
@@ -204,6 +230,33 @@ try:
             assert code == 0, err
             stable.append(open(out, 'rb').read())
     stable_ok = stable[0] == stable[1] == open(RELEASE_1, 'rb').read()
+
+    proto_runs = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for n in (1, 2):
+            out = os.path.join(scratch, f'proto-{n}')
+            lock = os.path.join(scratch, f'proto-{n}.lock')
+            shutil.copyfile(PROTO_LOCK, lock)
+            code, _, err = contracts(binary, 'export', '--proto', '--out', out, '--lock', lock)
+            assert code == 0, err
+            proto_runs.append((tree(out), open(lock, 'rb').read()))
+    committed = (tree(PROTO), open(PROTO_LOCK, 'rb').read())
+    code, _, err = contracts(binary, 'export', '--proto', '--check', '--out', PROTO, '--lock', PROTO_LOCK)
+    proto_ok = proto_runs[0] == proto_runs[1] == committed and code == 0
+    if not proto_ok:
+        print(err)
+
+    avro_runs = []
+    with tempfile.TemporaryDirectory() as scratch:
+        for n in (1, 2):
+            out = os.path.join(scratch, f'avro-{n}')
+            code, _, err = contracts(binary, 'export', '--avro', '--out', out)
+            assert code == 0, err
+            avro_runs.append(tree(out))
+    code, _, err = contracts(binary, 'export', '--avro', '--check', '--out', AVRO)
+    avro_ok = avro_runs[0] == avro_runs[1] == tree(AVRO) and code == 0
+    if not avro_ok:
+        print(err)
 
     cross = []
     for label, edits, want_code, want_text in CROSS_RELEASE:
@@ -233,7 +286,9 @@ for label, want, got, ok, text in cross:
         print(text)
 cross_wrong = [c for c in cross if not c[3]]
 print(f'bundle byte-stable across two exports and equal to {RELEASE_1}: {stable_ok}')
+print(f'proto export byte-stable across two exports and equal to {PROTO}: {proto_ok}')
+print(f'avro export byte-stable across two exports and equal to {AVRO}: {avro_ok}')
 
 # The acceptance criterion is a CALLER-NAMED error, not merely a red build, so
 # the exit code gates on `caught` rather than on `red`.
-sys.exit(1 if false_pos or len(caught) < len(breaking) or cross_wrong or not stable_ok else 0)
+sys.exit(1 if false_pos or len(caught) < len(breaking) or cross_wrong or not stable_ok or not proto_ok or not avro_ok else 0)

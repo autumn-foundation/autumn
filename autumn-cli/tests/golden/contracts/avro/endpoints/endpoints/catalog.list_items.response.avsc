@@ -1,0 +1,14 @@
+{
+  "type": "array",
+  "doc": "endpoint: catalog.list_items, GET /items, response body. The body is a JSON array of the item record",
+  "autumn.endpoint": "catalog.list_items",
+  "items": {
+    "type": "record",
+    "name": "ListItemsResponseItem",
+    "namespace": "autumn.catalog",
+    "fields": [
+      { "name": "id", "type": "string" },
+      { "name": "price_cents", "type": "long" }
+    ]
+  }
+}

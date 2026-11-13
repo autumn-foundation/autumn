@@ -1199,7 +1199,7 @@ impl TestApp {
     ///
     /// Mirrors [`crate::app::AppBuilder::with_error_reporter`]. Call multiple
     /// times to chain reporters; each receives every panic + 5xx event.
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[must_use]
     pub fn with_error_reporter<R: crate::reporting::ErrorReporter>(mut self, reporter: R) -> Self {
         let reporter =
@@ -1495,7 +1495,7 @@ impl TestApp {
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
         // that they get from `AppBuilder::run`.
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         {
             let reporters = std::mem::take(&mut app_builder.error_reporters);
             if !reporters.is_empty() {
@@ -2126,7 +2126,7 @@ impl TestApp {
                 "a fault plan needs `jobs.workers = 1`: concurrent workers can swap \
                  which execution is the Nth, so the ordinals would not replay"
             );
-            #[cfg(feature = "reporting")]
+            #[cfg(feature = "error-reporting")]
             assert!(
                 self.config.reporting.enabled && self.config.reporting.sample_rate >= 1.0,
                 "a fault plan needs `reporting.enabled = true` and \
@@ -2637,7 +2637,7 @@ impl TestApp {
         // built and resolves immediately, so leading the chain delays nobody.
         // Must land before the router is built, which is where
         // `ReportingLayer` reads the chain.
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         if let Some(ledger) = fault_ledger.as_ref() {
             let mut reporters = state
                 .extension::<crate::reporting::RegisteredReporters>()
@@ -3514,28 +3514,28 @@ impl TestClient {
     /// no [`crate::sim::FaultPlan`] is attached (so an ordinary test app never
     /// touches an atomic per request).
     ///
-    /// Also `None` without the `reporting` feature: nothing can ever populate
+    /// Also `None` without the `error-reporting` feature: nothing can ever populate
     /// `FaultOutcome::server_errors` then, so counting observed 5xx would only
     /// make [`fault_outcome`](Self::fault_outcome) spin out its whole settle
     /// budget against a list that stays empty by contract.
     #[cfg_attr(
-        not(feature = "reporting"),
+        not(feature = "error-reporting"),
         allow(
             clippy::unused_self,
             clippy::missing_const_for_fn,
-            reason = "without `reporting` the answer is a constant `None`, but the \
+            reason = "without `error-reporting` the answer is a constant `None`, but the \
                       signature has to stay one method so every request builder \
                       keeps a single call site"
         )
     )]
     fn fault_error_counter(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         {
             self.fault_ledger
                 .as_ref()
                 .map(|_| std::sync::Arc::clone(&self.observed_server_errors))
         }
-        #[cfg(not(feature = "reporting"))]
+        #[cfg(not(feature = "error-reporting"))]
         {
             None
         }
