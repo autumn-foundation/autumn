@@ -9,7 +9,9 @@
 # the three on, and its dependency tree has no WebSocket crate. The default
 # feature set has that crate, so the check cannot pass on an empty match.
 #
-# Phase 2: that feature list compiles.
+# Phase 2: that feature list compiles. The CLI also compiles alone, with no
+# warning: it turns default features off and names the gates it uses, and a
+# workspace build hides a name that is missing there.
 #
 # Phase 3: the specs run with the other default features and the three off.
 # This is the only build that compiles the test targets with them off.
@@ -98,6 +100,19 @@ if ! cargo check -p autumn-web --lib --no-default-features --features "$daemon" 
   exit 1
 fi
 echo "The daemon starter's feature list compiles."
+
+echo "==> cargo check -p autumn-cli"
+if ! cargo check -p autumn-cli >"$LOG" 2>&1; then
+  cat "$LOG"
+  echo "::error::autumn-cli does not compile alone"
+  exit 1
+fi
+if grep -qE '^warning' "$LOG"; then
+  cat "$LOG"
+  echo "::error::a build of autumn-cli alone gives a warning"
+  exit 1
+fi
+echo "The CLI compiles alone, with no warning."
 
 # ── Phase 3: the specs pass with the three features off ─────────────────────
 

@@ -1502,8 +1502,8 @@ jobs:
         # `plugin-conformance`, `runtime-config` and `axum-ws` are default-on,
         # so `cargo test --workspace` never builds autumn-web with one of them
         # off. The no-DB daemon starter does. The script checks that its
-        # dependency tree has no WebSocket crate, compiles its feature set,
-        # then runs the specs with the three features off.
+        # dependency tree has no WebSocket crate, compiles its feature set
+        # and the CLI alone, then runs the specs with the three features off.
         run: ./scripts/check-daemon-starter-features.sh
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'
