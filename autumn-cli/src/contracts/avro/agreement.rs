@@ -538,6 +538,47 @@ fn cases() -> Vec<Case> {
         "",
     );
 
+    // `home.zip` is optional, and the deployed consumer reads it.
+    let address = |zip: bool| {
+        let mut fields = vec![field("city", "String", true)];
+        if zip {
+            fields.push(field("zip", "Option<String>", false));
+        }
+        BundleType {
+            id: "core::Address".to_owned(),
+            shape: WireTypeDescriptor {
+                name: "Address".to_owned(),
+                serialized: fields.clone(),
+                deserialized: fields,
+                ..WireTypeDescriptor::default()
+            },
+        }
+    };
+    let mut deployed = with_events();
+    deployed.events[0].shape = contact_shape(&[("id", "i64"), ("home", "Address")]);
+    let shape = &mut deployed.events[0].shape;
+    for home in [&mut shape.serialized[1], &mut shape.deserialized[1]] {
+        home.nested = vec!["core::Address".to_owned()];
+    }
+    deployed.types = vec![address(true)];
+    deployed.listeners = vec![listener(
+        "on_contact",
+        "contact.updated",
+        &["home", "home.zip"],
+    )];
+    let mut current = deployed.clone();
+    current.types = vec![address(false)];
+    current.listeners = vec![listener("on_contact", "contact.updated", &["home"])];
+    add(
+        "an_optional_nested_event_field_a_deployed_consumer_reads_removed_is_a_break",
+        deployed,
+        current,
+        (false, true),
+        (true, true),
+        "reads: Avro gives a missing optional field its default. The check knows that a \
+         deployed consumer reads the field, so it would get `None` with no error",
+    );
+
     out
 }
 

@@ -1427,6 +1427,7 @@ jobs:
             widgets,
             jwt-push,
             error-reporting,
+            daemon-starter,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1496,6 +1497,14 @@ jobs:
         # failure capture. The no-DB daemon starter does. The script compiles
         # that feature set, then runs the reporter specs with `reporting` off.
         run: ./scripts/check-error-reporting-feature.sh
+      - name: Check what the daemon starter does not compile
+        if: matrix.lane == 'daemon-starter'
+        # `plugin-conformance`, `runtime-config` and `axum-ws` are default-on,
+        # so `cargo test --workspace` never builds autumn-web with one of them
+        # off. The no-DB daemon starter does. The script checks that its
+        # dependency tree has no WebSocket crate, compiles its feature set
+        # and the CLI alone, then runs the specs with the three features off.
+        run: ./scripts/check-daemon-starter-features.sh
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'
         # `markdown` is not a default feature, so the `test` job's `cargo test
@@ -3042,8 +3051,10 @@ jobs:
             | tee "$RUNNER_TEMP/cli-plugin-check-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-plugin-check-cov.log"
           # Issue #2795: same gap for `dev_loop_bench::`, the budget and report
-          # half of the latency gates. Check the count.
+          # half of the latency gates, and for the `autumn calibrate` argument
+          # tests. Check the count.
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- dev_loop_bench:: \
+            parse_calibrate \
             | tee "$RUNNER_TEMP/cli-dev-loop-bench-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-dev-loop-bench-cov.log"
           # Issues #2468 and #2497: same gap for `posture::` and
@@ -3269,7 +3280,7 @@ jobs:
         # step writes the tree to a file. Then a failed `cargo tree` fails the
         # step.
         env:
-          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard,widgets-search,widgets-social,widgets-workflow,widgets-charts,jwt,push,cluster
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard,widgets-search,widgets-social,widgets-workflow,widgets-charts,jwt,push,cluster,plugin-conformance,runtime-config,axum-ws
         run: |
           cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
           tree="${RUNNER_TEMP}/sqlite-only-tree.txt"

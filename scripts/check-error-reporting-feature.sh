@@ -28,8 +28,9 @@ trap 'rm -f "$LOG"' EXIT
 # ── Phase 1: the daemon starter's feature list compiles ─────────────────────
 
 # The list that `autumn new --daemon` writes into the app's manifest.
-daemon=$(grep -E '^const DAEMON_NO_DB_FEATURES' autumn-cli/src/new.rs |
-  sed -E 's/^.*= &\[(.*)\];.*$/\1/; s/[" ]//g')
+# The item can be on more than one line.
+daemon=$(awk '/^const DAEMON_NO_DB_FEATURES/ {on = 1} on {printf "%s", $0} on && /;/ {exit}' autumn-cli/src/new.rs |
+  sed -E 's/^.*=[[:space:]]*&\[(.*)\];.*$/\1/; s/[" ]//g; s/,$//' || true)
 if [[ ",$daemon," != *",error-reporting,"* || ",$daemon," == *",reporting,"* ]]; then
   echo "::error::could not read a daemon feature list with error-reporting and no reporting: '$daemon'"
   exit 1

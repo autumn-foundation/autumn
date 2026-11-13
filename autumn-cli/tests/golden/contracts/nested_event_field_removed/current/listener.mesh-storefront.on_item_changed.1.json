@@ -1,0 +1,9 @@
+{
+  "krate": "mesh-storefront",
+  "function": "on_item_changed",
+  "event": "mesh_catalog::ItemChanged",
+  "reads": [
+    "details",
+    "id"
+  ]
+}

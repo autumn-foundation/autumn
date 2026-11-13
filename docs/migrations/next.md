@@ -742,6 +742,77 @@ An app that wants the panic-catch layer and no failure capture names
 **Automation:** `manual` — a codemod cannot know if the app wants failure
 capture.
 
+---
+
+### Features: `plugin-conformance`, `runtime-config` and `axum-ws`
+
+**Why:** each app compiled the plugin conformance harness, the runtime-config
+store and axum's WebSocket code, used or not (issue #2795, ADR 0049). Each
+now has a feature. The three features are in `default`, so a default build
+does not change.
+
+**You are affected only if your app or plugin sets `default-features = false`
+and uses one of these:**
+
+| You use | The compiler reports | Add |
+|---------|----------------------|-----|
+| `autumn_web::plugin_conformance` | ``unresolved import `autumn_web::plugin_conformance` `` | `plugin-conformance` |
+| `autumn_web::runtime_config`, `CostSignal::sync_from` | ``could not find `runtime_config` in `autumn_web` `` | `runtime-config` |
+| axum's `extract::ws` or `extract::WebSocketUpgrade`, through `autumn_web::reexports::axum` or your own `axum` dependency | ``could not find `ws` in `extract` ``, or ``no `WebSocketUpgrade` in `axum::extract` `` | `axum-ws` |
+
+`ws` turns `axum-ws` on, so an app that names `ws` does not change. An app
+that turns `ws` on in its own `axum` dependency does not change. An app
+that has its own `axum` dependency without `ws` adds `axum-ws` here, or
+`ws` there: before, `autumn-web` turned `ws` on for it.
+Without `runtime-config`, the cost signal does not follow the runtime-config
+key. Set it from code with `CostSignal::set`.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y}", default-features = false, features = ["maud"] }
+```
+
+**After (`{(X+1).0}`):** add only the features that the app uses.
+
+```toml
+autumn-web = { version = "{(X+1).0}", default-features = false, features = ["maud", "plugin-conformance", "runtime-config", "axum-ws"] }
+```
+
+**Automation:** `manual` — a codemod cannot know which of the three the app
+uses.
+
+---
+
+### Config: a section is a table, not an array
+
+**Why:** the config reader compiled code that reads each config struct from
+an array, by field position (issue #2795, ADR 0049). No guide shows that
+form. The reader now reads a struct from a table only, and `autumn-web`
+compiles less code.
+
+**You are affected only if `autumn.toml` gives the fields of a section as an
+array.** Boot fails with
+``invalid type: sequence, expected struct ServerConfig`` and the key,
+``in `server` ``. An array of tables (`[[database.shards]]`) and an array
+value (`allowed_origins = ["https://a.example"]`) do not change.
+
+**Before (`{X.Y}`):**
+
+```toml
+server = [8080, "0.0.0.0"]
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+[server]
+port = 8080
+host = "0.0.0.0"
+```
+
+**Automation:** `manual` — give each field its name.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -806,6 +877,11 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   plugin fail `route-attribution`. No signature changes. A test that passed
   its crate name while the routes carry `Plugin::name()` now passes. Some
   CLI diagnostic text changes; do not match on it.
+- **Stable surface behind a feature (conformance, #2795):**
+  `plugin_conformance` has the `plugin-conformance` feature. The feature is
+  in `default`. A plugin that depends on `autumn-web` with
+  `default-features = false` and runs the harness in its tests names the
+  feature. No signature changes.
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -862,6 +938,15 @@ If nothing changed, delete this section.
   also give the key, not the line. A syntax error keeps its line. A message
   parser that read the `TOML parse error at line` prefix of a type error
   must read the key instead.
+- **Capacity:** a value of the wrong type in `capacity.lock` now names the
+  key, for example ``in `envelope.admission_limit` ``. Before, the error
+  showed the line. A syntax error keeps its line.
+- **Capacity:** a `capacity.lock` with an integer above 9223372036854775807
+  does not load (`u64 value was too large`). That is the largest TOML
+  integer. Only `seed` can be that large, and only from an explicit
+  `autumn calibrate --seed`. Run `autumn calibrate` again with a smaller
+  seed. `--seed` now refuses a larger value, and `autumn calibrate` does not
+  write one.
 
 Changes that still compile but behave differently at runtime. Examples:
 

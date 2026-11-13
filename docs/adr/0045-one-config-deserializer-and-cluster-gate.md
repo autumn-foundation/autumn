@@ -1,6 +1,6 @@
 # ADR 0045: One Config Deserializer, and a `cluster` Gate
 
-- Status: Accepted
+- Status: Accepted (2026-11-11; the differences from `toml` changed in ADR 0049)
 - Date: 2026-11-11
 - Deciders: Autumn maintainers
 - Tags: build-time, config, features, cold-start

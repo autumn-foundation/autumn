@@ -272,6 +272,17 @@ use thiserror::Error;
 
 mod value_de;
 
+/// Deserialize `T` from a parsed TOML table, with the config deserializer.
+///
+/// An error names the key path, for example ``in `server.port` ``. Use this
+/// and not a typed `from_str` of the toml crate: that call compiles a second
+/// reader for `T`.
+pub(crate) fn from_table<T: serde::de::DeserializeOwned>(
+    table: toml::Table,
+) -> Result<T, toml::de::Error> {
+    value_de::from_value(toml::Value::Table(table))
+}
+
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
 use std::sync::OnceLock;
 

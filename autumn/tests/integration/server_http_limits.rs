@@ -377,6 +377,7 @@ async fn default_limits_keep_a_slow_header_connection_open() {
     );
 }
 
+#[cfg(feature = "axum-ws")]
 #[tokio::test]
 async fn websocket_outlives_keep_alive_timeout() {
     use axum::extract::ws::{Message, WebSocketUpgrade};

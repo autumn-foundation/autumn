@@ -1,0 +1,19 @@
+{
+  "krate": "mesh-storefront",
+  "function": "add_item",
+  "calls": [
+    {
+      "client": "CatalogClient",
+      "method": "create_item",
+      "reads": [
+        "id"
+      ],
+      "writes": [
+        "details",
+        "details.color",
+        "details.size",
+        "name"
+      ]
+    }
+  ]
+}

@@ -337,6 +337,11 @@ default build never has the panic-catch layer without failure capture. The
 `error-reporting` lane compiles the no-DB daemon starter's feature set and
 runs the reporter specs with `reporting` off.
 
+`plugin-conformance`, `runtime-config` and `axum-ws` have the
+`daemon-starter` lane. It checks that the daemon starter's dependency tree
+has no WebSocket crate, compiles that feature set and the CLI alone, and
+runs the specs with the three features off.
+
 `db` alone selects no backend, so it stops at a `compile_error!`. The sweep
 skips it and the features that enable `db` but no backend (`seed`, `repl`,
 `offline-sync`, `ledger-profile`). The combinations above build them with a

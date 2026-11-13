@@ -535,6 +535,7 @@ fn a_duplicate_registration_records_the_contract_once() {
 
 // ── 4. The conformance harness reports experimental dependence ─────────────
 
+#[cfg(feature = "plugin-conformance")]
 mod conformance {
     use autumn_web::plugin_conformance::{CheckStatus, ConformanceConfig, run_conformance};
     use autumn_web::plugin_contract::PluginContract;

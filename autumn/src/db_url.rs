@@ -79,7 +79,19 @@ pub fn is_bare_in_memory_sqlite(url: &str) -> bool {
 /// # Errors
 ///
 /// Returns the refusal message, with the target redacted.
-#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+// The callers are the Postgres stores of three modules. Each module has its
+// own feature.
+#[cfg_attr(
+    not(all(
+        feature = "postgres",
+        any(
+            feature = "feature-flags",
+            feature = "experiments",
+            feature = "runtime-config"
+        )
+    )),
+    allow(dead_code)
+)]
 pub fn require_postgres_target(url: &str, store: &str) -> Result<(), String> {
     if url.trim().is_empty() || DatabaseBackend::detect(url) == Some(DatabaseBackend::Postgres) {
         return Ok(());

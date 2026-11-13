@@ -116,7 +116,14 @@ missing.
   macro body (`html! { (item.name) }`);
 * the **write-set** — every request field an inline struct literal sets.
 
-Each becomes a const assertion against the callee's own const field table:
+A nested field is a dotted path. `item.details.color` reads `details.color`.
+`details: Details { color: Some(c), ..Default::default() }` sets it. Each set
+also holds the prefix, `details`.
+
+The const assertions check only the top-level fields. In one build, the
+caller and the callee use the same nested type. So rustc checks each nested
+field. Each top-level field becomes a const assertion against the callee's
+own const field table:
 
 ```rust
 const _: () = assert!(
@@ -276,8 +283,13 @@ serves with the types of its release. The rules:
   both orders. This also holds for list elements and nested types.
 * **Nested types.** A field whose type is a `WireShape` type is compared
   field by field, with the same rules. A break names the path, for example
-  `details.color`. A caller's read-set is known at the top level only (see
-  [Limits](#limits-of-the-first-slice)).
+  `details.color`. The read and write rules also apply one level down. The
+  callee must produce each nested field that the caller reads. The callee
+  must accept each nested field that an inline literal sets. This is also
+  true for an optional nested field. One build does not check a nested
+  field against the caller's own release. So a nested rule reports only a
+  change from that release: a field it did not produce or accept is not a
+  break.
 * **Field types.** A field's Rust type must not change. Path prefixes do not
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.
@@ -355,6 +367,12 @@ bundles is format 3 or older, the check does not compare wire types. With a
 bundle of format 1 or 2, the check compares nested types by name only. It
 does not compare the `unit` flag of a body or a nested type. It compares the
 `unit` flag of an event in every format.
+
+Nested reads and writes do not change the format. Each dotted path also
+lists its prefix, so an older CLI reads the top-level fields as before. A
+bundle from an earlier export has no nested reads or writes. Then the check
+compares nested fields as before. Export the deployed release again to get
+them.
 
 ### Deploy order
 
@@ -562,8 +580,9 @@ keeps the form that the macro reads off the Rust type, and is not opaque.
 
 An `#[event]` payload is a wire contract too. `#[event]` derives `WireShape`
 and gives the event a topic and a version. A `#[listener]`, or an
-`#[event_consumer]` on an outbox topic handler, records its read-set. Each
-read becomes a const assertion against the event's field table:
+`#[event_consumer]` on an outbox topic handler, records its read-set. A
+nested read is a dotted path, as for a caller. Each top-level read becomes a
+const assertion against the event's field table:
 
 ```rust
 const _: () = assert!(
@@ -991,11 +1010,17 @@ on some changes:
   crate (through a `use`), registers that handler. It does not judge that
   crate, because the name can also be a local function. Write
   `routes![mesh_catalog::get_item]` to have the check judge it.
-* A caller's read-set is known at the top level only. `item.details.color`
-  reads `details`. So the check does not see the removal of an *optional*
-  field of a nested type that a caller reads. A *required* nested field is
-  safe: the caller's type cannot decode without it. A write-set is also top
-  level only.
+* The check sees a nested read through field access, a struct pattern, a
+  `let`, `if let` or `match` binding, a macro body, a maud `@let` or
+  `@if let`, `unwrap`, `clone`, `as_ref`, and the `Option` and `Result`
+  callbacks (`item.details.as_ref().map(|d| d.color)`).
+* A loop, an index or another method call stops the path.
+  `item.details.lines[0].price` reads `details.lines` only.
+* A field with more than one nested type, such as `Envelope<Payload>`, gives
+  the same nested reads and writes to each type.
+* The check knows a nested write-set only when the call site sets a named
+  field in an inline literal, or in `Some(literal)`. For other values, the
+  check uses the type, as for a request built elsewhere.
 * A request or response type is found by the path in the signature. A path
   through a re-export, such as `crate::dto::Item` for `shared::Item`, is
   refused when another crate has a type of that name. Write the path where the

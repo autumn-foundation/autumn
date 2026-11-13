@@ -241,6 +241,7 @@ pub mod plugin;
 /// name the type, match its variants, or write the signature of a function
 /// that forwards it.
 pub use router::RouterBuildError;
+#[cfg(feature = "plugin-conformance")]
 pub mod plugin_conformance;
 pub mod plugin_contract;
 #[cfg(feature = "plugin-sandbox")]
@@ -698,6 +699,7 @@ pub mod payload_version;
 pub(crate) mod ppm;
 #[cfg(feature = "repl")]
 pub mod repl;
+#[cfg(feature = "runtime-config")]
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
@@ -2399,7 +2401,12 @@ mod tests {
     /// documented clone class (see each struct's doc) that advertises the
     /// same 1 s snapshot TTL. Nothing shares this constant, so a change to
     /// one that forgets its siblings would otherwise drift silently.
-    #[cfg(feature = "db")]
+    #[cfg(all(
+        feature = "postgres",
+        feature = "feature-flags",
+        feature = "experiments",
+        feature = "runtime-config"
+    ))]
     #[test]
     fn pg_store_cache_ttl_matches_across_clone_class_siblings() {
         assert_eq!(

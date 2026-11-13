@@ -394,8 +394,9 @@ fn score(words: &ToolWords, terms: &[String]) -> u32 {
 /// Whether a catalog `word` matches a query `term`. A term of three or more
 /// characters also matches the start of a word, so `report` finds `reports`.
 fn matches(word: &str, term: &str) -> bool {
-    // Cheapest checks first: most words differ in the first byte, and the
-    // character count runs only after `starts_with` finds a real prefix.
+    // Cheapest checks first: the inline first-byte compare rejects most words
+    // without a `memcmp` call, and the character count runs only for a real
+    // prefix.
     word.as_bytes().first() == term.as_bytes().first()
         && (word == term || (word.starts_with(term) && term.chars().nth(2).is_some()))
 }
