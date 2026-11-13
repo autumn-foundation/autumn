@@ -38,7 +38,7 @@ fn node() -> Option<String> {
     }
     assert!(
         std::env::var_os("CI").is_none(),
-        "`{binary}` was not found: the JS host suite needs Node 18+ in CI"
+        "`{binary}` was not found: the JS host suite needs Node 18.15+ in CI"
     );
     eprintln!("skipping: `{binary}` is not on PATH (set NODE to run the JS host suite)");
     None
@@ -803,8 +803,8 @@ fn the_js_gateway_suite_passes() {
     let Some(node) = node() else {
         return;
     };
-    // The default reporter depends on the Node version and the terminal. TAP
-    // gives the `# pass N` line that the check below reads.
+    // Ask for TAP. Node 23 and later write the spec format by default, also
+    // to a pipe, and the pass count below reads the TAP summary.
     let output = Command::new(node)
         .arg("--test")
         .arg("--test-reporter=tap")
@@ -818,9 +818,14 @@ fn the_js_gateway_suite_passes() {
         String::from_utf8_lossy(&output.stderr)
     );
     // A filter or a path mistake that runs nothing must not read as a pass.
+    // Node 22 prints TAP when stdout is not a terminal (`# pass 25`); later
+    // releases print the spec reporter there too (`ℹ pass 25`).
     assert!(
-        stdout.lines().any(|line| line.trim_start().starts_with("# pass")
-            && !line.trim_end().ends_with(" 0")),
+        stdout.lines().any(|line| {
+            let line = line.trim_start();
+            (line.starts_with("# pass ") || line.starts_with("ℹ pass "))
+                && !line.trim_end().ends_with(" 0")
+        }),
         "the JS gateway suite ran no tests:\n{stdout}"
     );
 }
