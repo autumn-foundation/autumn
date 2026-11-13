@@ -46,20 +46,25 @@ crates() {
 
 # ── Phase 1: the daemon starter's features and dependency tree ──────────────
 
-# The list that `autumn new --daemon` writes into the app's manifest.
-daemon=$(grep -E '^const DAEMON_NO_DB_FEATURES' autumn-cli/src/new.rs |
-  sed -E 's/^.*= &\[(.*)\];.*$/\1/; s/[" ]//g')
-if [[ -z "$daemon" ]]; then
-  echo "::error::could not read the daemon feature list from autumn-cli/src/new.rs"
+# A feature list: names with commas between them.
+LIST='^[a-z0-9-]+(,[a-z0-9-]+)*$'
+
+# The list that `autumn new --daemon` writes into the app's manifest. The
+# item can be on more than one line.
+daemon=$(awk '/^const DAEMON_NO_DB_FEATURES/ {on = 1} on {printf "%s", $0} on && /;/ {exit}' autumn-cli/src/new.rs |
+  sed -E 's/^.*=[[:space:]]*&\[(.*)\];.*$/\1/; s/[" ]//g; s/,$//' || true)
+if [[ ! "$daemon" =~ $LIST || ",$daemon," != *",maud,"* ]]; then
+  echo "::error::could not read the daemon feature list from autumn-cli/src/new.rs: '$daemon'"
   exit 1
 fi
 # The scaffold turns `flash` on through its own default feature.
 daemon="$daemon,flash"
 
 # The `default` list of autumn-web.
-defaults=$(grep -E '^default = \[' autumn/Cargo.toml | sed -E 's/^default = \[(.*)\]/\1/; s/[" ]//g')
-if [[ -z "$defaults" ]]; then
-  echo "::error::could not read the default feature list from autumn/Cargo.toml"
+defaults=$(grep -E '^default = \[' autumn/Cargo.toml |
+  sed -E 's/^default = \[(.*)\]/\1/; s/[" ]//g' || true)
+if [[ ! "$defaults" =~ $LIST ]]; then
+  echo "::error::could not read the default feature list from autumn/Cargo.toml: '$defaults'"
   exit 1
 fi
 
@@ -107,7 +112,9 @@ if ! cargo check -p autumn-cli >"$LOG" 2>&1; then
   echo "::error::autumn-cli does not compile alone"
   exit 1
 fi
-if grep -qE '^warning' "$LOG"; then
+# Cargo prints this line for each workspace crate that has a warning. A
+# warning of Cargo itself (a network retry) does not match.
+if grep -qE '^warning: `[^`]+` \([^)]*\) generated [0-9]+ warnings?' "$LOG"; then
   cat "$LOG"
   echo "::error::a build of autumn-cli alone gives a warning"
   exit 1
@@ -159,6 +166,12 @@ cargo test -p autumn-web --no-default-features --features "$features" \
 assert_ran "integration"
 assert_passed 'compile_gate_features::axum_ws_is_owned_by_its_feature'
 assert_passed 'compile_gate_features::every_gated_module_has_a_cfg'
+# One test of each module ran, so an absent name below is a gated test and
+# not an empty filter.
+assert_passed 'cost_metering::an_inserted_accountant_does_not_report_metering_as_on'
+assert_passed 'server_http_limits::default_limits_keep_a_slow_header_connection_open'
+assert_passed 'plugin_contract::a_duplicate_registration_records_the_contract_once'
 assert_absent 'signal_follows_runtime_config_without_redeploy'
 assert_absent 'websocket_outlives_keep_alive_timeout'
+assert_absent 'plugin_contract::conformance::'
 echo "The specs pass with ${GATES[*]} off."
