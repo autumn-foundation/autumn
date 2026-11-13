@@ -351,6 +351,12 @@ fn build_diagnostics(
 pub struct FullReport {
     pub timestamp_utc: String,
     pub runner_os: String,
+    /// Logical CPU cores that the benchmark process can use.
+    pub cpu_count: usize,
+    /// CPU model name. Only Linux on x86 gives one. Two CI runners of one
+    /// kind can have different CPUs, and their samples differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_model: Option<String>,
     pub rust_version: String,
     pub autumn_version: String,
     pub example_name: String,
@@ -394,6 +400,10 @@ pub fn format_human_summary(report: &FullReport) -> String {
         report.runner_os, report.rust_version, report.autumn_version
     )
     .unwrap();
+    match &report.cpu_model {
+        Some(model) => writeln!(out, "CPU: {} x {model}", report.cpu_count).unwrap(),
+        None => writeln!(out, "CPU: {} cores", report.cpu_count).unwrap(),
+    }
     writeln!(out, "Example: {}", report.example_name).unwrap();
     if let Some(ms) = report.prepare_ms {
         writeln!(out, "Preparation (not in the samples): {ms} ms").unwrap();
@@ -463,6 +473,8 @@ pub fn run(
     let report = FullReport {
         timestamp_utc: chrono_utc_now(),
         runner_os: std::env::consts::OS.to_string(),
+        cpu_count: cpu_count(),
+        cpu_model: cpu_model(),
         rust_version: rust_version_string(),
         autumn_version: env!("CARGO_PKG_VERSION").to_string(),
         example_name: example.to_string(),
@@ -626,6 +638,27 @@ pub fn rust_version_string() -> String {
     std::env::var("AUTUMN_BENCH_RUST_VERSION").unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Logical CPU cores that this process can use. 1 when the OS does not say.
+fn cpu_count() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// The CPU model name of this machine, where `/proc/cpuinfo` gives one.
+fn cpu_model() -> Option<String> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    cpu_model_from_cpuinfo(&cpuinfo)
+}
+
+/// The first `model name` value in the text of `/proc/cpuinfo`.
+fn cpu_model_from_cpuinfo(cpuinfo: &str) -> Option<String> {
+    cpuinfo
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.trim() == "model name")
+        .map(|(_, value)| value.trim().to_owned())
+        .filter(|model| !model.is_empty())
+}
+
 // ── Cold-start onboarding benchmark (issue #977) ──────────────────────────────
 //
 // This file holds the **pure, unit-tested** half of the cold-start benchmark:
@@ -681,6 +714,8 @@ pub fn build_cold_start_report(hello_samples: &[u64], db: &DbOutcome) -> FullRep
     FullReport {
         timestamp_utc: chrono_utc_now(),
         runner_os: std::env::consts::OS.to_string(),
+        cpu_count: cpu_count(),
+        cpu_model: cpu_model(),
         rust_version: rust_version_string(),
         autumn_version: env!("CARGO_PKG_VERSION").to_string(),
         example_name: "cold-start".to_string(),
@@ -1645,6 +1680,8 @@ mod tests {
         FullReport {
             timestamp_utc: "2026-05-26T00:00:00Z".to_string(),
             runner_os: "Linux".to_string(),
+            cpu_count: 4,
+            cpu_model: None,
             rust_version: "1.88.0".to_string(),
             autumn_version: "0.5.0".to_string(),
             example_name: "examples/hello".to_string(),
@@ -2071,6 +2108,62 @@ mod tests {
         );
         assert!(report.all_passed);
         assert_eq!(report.results[0].stats.p95_ms, stats_before);
+    }
+
+    #[test]
+    fn the_cpu_model_is_the_first_model_name_in_cpuinfo() {
+        let cpuinfo = "processor\t: 0\nvendor_id\t: AuthenticAMD\n\
+                       model name\t: AMD EPYC 7763 64-Core Processor\n\
+                       processor\t: 1\nmodel name\t: Other CPU\n";
+        assert_eq!(
+            cpu_model_from_cpuinfo(cpuinfo).as_deref(),
+            Some("AMD EPYC 7763 64-Core Processor")
+        );
+    }
+
+    #[test]
+    fn cpuinfo_without_a_model_name_gives_no_model() {
+        // An ARM kernel writes no `model name` line.
+        assert_eq!(
+            cpu_model_from_cpuinfo("processor\t: 0\nBogoMIPS\t: 50.00\n"),
+            None
+        );
+        assert_eq!(cpu_model_from_cpuinfo("model name\t:\n"), None);
+        assert_eq!(cpu_model_from_cpuinfo(""), None);
+    }
+
+    #[test]
+    fn the_report_names_the_runner_cpu() {
+        let mut report = make_test_report(true);
+        report.cpu_count = 4;
+        report.cpu_model = Some("AMD EPYC 7763 64-Core Processor".to_owned());
+        let json: serde_json::Value = serde_json::from_str(&format_json_report(&report)).unwrap();
+        assert_eq!(json["cpu_count"], 4);
+        assert_eq!(json["cpu_model"], "AMD EPYC 7763 64-Core Processor");
+        let text = format_human_summary(&report);
+        assert!(
+            text.contains("CPU: 4 x AMD EPYC 7763 64-Core Processor"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_report_without_a_cpu_model_shows_the_count_only() {
+        let mut report = make_test_report(true);
+        report.cpu_count = 3;
+        report.cpu_model = None;
+        let json: serde_json::Value = serde_json::from_str(&format_json_report(&report)).unwrap();
+        assert_eq!(json["cpu_count"], 3);
+        assert!(json.get("cpu_model").is_none());
+        assert!(format_human_summary(&report).contains("CPU: 3 cores\n"));
+    }
+
+    #[test]
+    fn a_built_report_has_the_cpu_of_this_machine() {
+        let report = build_cold_start_report(&[40_000], &DbOutcome::NotRequested);
+        assert!(report.cpu_count >= 1);
+        assert_eq!(report.cpu_count, cpu_count());
+        assert_eq!(report.cpu_model, cpu_model());
     }
 
     #[test]

@@ -104,7 +104,8 @@ starts. Each sample then:
    computes p50/p95/max.
 
 The cold-start report carries the **same environment metadata** as the warm
-report (`timestamp_utc`, `runner_os`, `rust_version`, `autumn_version`) and, like
+report (`timestamp_utc`, `runner_os`, `cpu_count`, `cpu_model`, `rust_version`,
+`autumn_version`) and, like
 it, never includes local absolute paths, usernames, or secrets.
 
 ### Running the cold-start benchmark
@@ -296,6 +297,8 @@ local paths or secrets:
 |---|---|
 | `timestamp_utc` | ISO 8601 UTC timestamp of the measurement run |
 | `runner_os` | Operating system identifier (`linux`, `macos`, `windows`) |
+| `cpu_count` | Logical CPU cores that the benchmark can use (latency and cold-start reports) |
+| `cpu_model` | CPU model name. Only Linux on x86 gives one. Two runners of one kind can have different CPUs |
 | `rust_version` | `rustc` version used for the compile steps |
 | `autumn_version` | `autumn-web` crate version |
 | `example_name` | Which example was benchmarked |
@@ -375,6 +378,8 @@ evidence. Example structure:
 {
   "timestamp_utc": "2026-05-26T12:00:00Z",
   "runner_os": "linux",
+  "cpu_count": 4,
+  "cpu_model": "AMD EPYC 7763 64-Core Processor",
   "rust_version": "rustc 1.88.0 (stable)",
   "autumn_version": "0.5.0",
   "example_name": "examples/hello",
