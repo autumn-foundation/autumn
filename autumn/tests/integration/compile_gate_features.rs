@@ -1,8 +1,8 @@
 //! Spec for the compile-gate features (#2795).
 //!
-//! Each feature gates one module. All are default-on, so a default build is
-//! unchanged. The no-DB daemon starter turns them off, except
-//! `error-reporting`, the panic-catch layer.
+//! Each feature gates one module, or one feature of a dependency (`axum-ws`).
+//! All are default-on, so a default build is unchanged. The no-DB daemon
+//! starter turns them off, except `error-reporting`, the panic-catch layer.
 
 use std::collections::BTreeSet;
 
@@ -29,6 +29,8 @@ const GATES: &[(&str, &str)] = &[
     ("push", "push"),
     ("cluster", "cluster"),
     ("error-reporting", "reporting"),
+    ("plugin-conformance", "plugin_conformance"),
+    ("runtime-config", "runtime_config"),
 ];
 
 /// A feature that must switch on another one.
@@ -42,6 +44,7 @@ const IMPLIES: &[(&str, &str)] = &[
     ("acme", "custom-domains"),
     ("oauth2", "jwt"),
     ("reporting", "error-reporting"),
+    ("ws", "axum-ws"),
 ];
 
 const ALL_FEATURES: &[&str] = &[
@@ -65,6 +68,9 @@ const ALL_FEATURES: &[&str] = &[
     "push",
     "cluster",
     "error-reporting",
+    "plugin-conformance",
+    "runtime-config",
+    "axum-ws",
 ];
 
 fn manifest() -> toml::Table {
@@ -73,6 +79,12 @@ fn manifest() -> toml::Table {
         .expect("read Cargo.toml")
         .parse()
         .expect("parse Cargo.toml")
+}
+
+/// A file of the repository, by its path from the repository root.
+fn repo_file(path: &str) -> String {
+    let full = format!("{}/../{path}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full}: {e}"))
 }
 
 fn features(m: &toml::Table) -> &toml::Table {
@@ -298,6 +310,99 @@ fn dependent_features_switch_on_what_they_need() {
         assert!(
             names(&features(&m)[*feature]).contains(*needs),
             "`{feature}` must enable `{needs}`"
+        );
+    }
+}
+
+/// axum's WebSocket code and the tungstenite stack compile only with
+/// `axum-ws`. The workspace entry must not turn it on for every build.
+#[test]
+fn axum_ws_is_owned_by_its_feature() {
+    let m = manifest();
+    assert!(names(&features(&m)["axum-ws"]).contains("axum/ws"));
+    for (name, list) in features(&m) {
+        if name != "axum-ws" {
+            assert!(
+                !names(list).contains("axum/ws"),
+                "only `axum-ws` may enable `axum/ws`, not `{name}`"
+            );
+        }
+    }
+    let workspace: toml::Table = repo_file("Cargo.toml").parse().expect("parse Cargo.toml");
+    let axum = &workspace["workspace"]["dependencies"]["axum"];
+    assert!(
+        !names(&axum["features"]).contains("ws"),
+        "the workspace `axum` entry must not name `ws`"
+    );
+}
+
+/// The CLI builds `autumn-web` with default features off, and
+/// `autumn plugin check` uses the conformance module.
+#[test]
+fn the_cli_names_the_plugin_conformance_feature() {
+    let cli: toml::Table = repo_file("autumn-cli/Cargo.toml")
+        .parse()
+        .expect("parse autumn-cli/Cargo.toml");
+    let autumn_web = &cli["dependencies"]["autumn-web"];
+    assert_eq!(
+        autumn_web
+            .get("default-features")
+            .and_then(toml::Value::as_bool),
+        Some(false),
+        "this spec is for a CLI that turns default features off"
+    );
+    assert!(names(&autumn_web["features"]).contains("plugin-conformance"));
+}
+
+/// The docs builds turn default features off and name their own lists. A
+/// gate that a list does not name removes its module from the docs, and the
+/// links to that module break.
+#[test]
+fn the_docs_feature_lists_name_the_new_gates() {
+    let m = manifest();
+    let docs_rs = names(&m["package"]["metadata"]["docs"]["rs"]["features"]);
+    let script = repo_file("scripts/check-docs.sh");
+    let line = script
+        .lines()
+        .find(|l| l.starts_with("AUTUMN_WEB_DOCS_FEATURES="))
+        .expect("the docs feature list in scripts/check-docs.sh");
+    let in_script: BTreeSet<&str> = line
+        .trim_start_matches("AUTUMN_WEB_DOCS_FEATURES=")
+        .trim_matches('"')
+        .split(',')
+        .collect();
+    for feature in ["plugin-conformance", "runtime-config", "axum-ws"] {
+        assert!(
+            docs_rs.contains(feature),
+            "the docs.rs list must name `{feature}`"
+        );
+        assert!(
+            in_script.contains(feature),
+            "scripts/check-docs.sh must name `{feature}`"
+        );
+    }
+}
+
+/// The semver gate compares the public API with the last release. A module
+/// that the release had with no feature looks removed, unless the gate turns
+/// the new feature on for the current build.
+#[test]
+fn the_semver_gate_names_the_new_module_gates() {
+    let script = repo_file("scripts/check-semver.sh");
+    let line = script
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("autumn_web_semver_current_only="))
+        .expect("the current-only feature list in scripts/check-semver.sh");
+    let listed: BTreeSet<&str> = line
+        .trim_start_matches("autumn_web_semver_current_only=")
+        .trim_matches('"')
+        .split(',')
+        .collect();
+    for feature in ["plugin-conformance", "runtime-config"] {
+        assert!(
+            listed.contains(feature),
+            "scripts/check-semver.sh must name `{feature}`"
         );
     }
 }
