@@ -516,10 +516,16 @@ impl CapacityContract {
     /// # Errors
     ///
     /// [`CapacityError::Serialize`] when the document cannot be rendered.
+    /// [`CapacityError::Parse`] when [`Self::parse`] cannot read the rendered
+    /// text: an unsigned value above `i64::MAX`.
     pub fn to_toml(&self) -> Result<String, CapacityError> {
         let mut canonical = self.clone();
         canonical.canonicalize();
         let body = toml::to_string_pretty(&canonical)?;
+        // A TOML integer is a signed 64-bit number. The writer does not
+        // check an unsigned field above that range, and the reader refuses
+        // it. Do not write a contract that does not load.
+        toml::from_str::<toml::Table>(&body)?;
         Ok(format!("{CONTRACT_HEADER}{body}"))
     }
 
@@ -941,6 +947,33 @@ mod tests {
             message.contains("in `envelope.admission_limit`"),
             "got {message}"
         );
+    }
+
+    /// A TOML integer is a signed 64-bit number. The reader refuses a larger
+    /// one, so the writer must not write it.
+    #[test]
+    fn to_toml_refuses_a_value_that_the_reader_cannot_read() {
+        let mut contract = sample_contract();
+        contract.calibration.seed = u64::MAX;
+
+        let err = contract
+            .to_toml()
+            .expect_err("the reader refuses this seed");
+        assert!(matches!(err, CapacityError::Parse(_)), "got {err}");
+
+        let raw = toml::to_string_pretty(&contract).expect("raw serialize");
+        let err = CapacityContract::parse(&raw).expect_err("above the TOML range");
+        assert!(matches!(err, CapacityError::Parse(_)), "got {err}");
+    }
+
+    #[test]
+    fn to_toml_writes_the_largest_toml_integer() {
+        let mut contract = sample_contract();
+        contract.calibration.seed = u64::try_from(i64::MAX).expect("positive");
+
+        let rendered = contract.to_toml().expect("in range");
+        let parsed = CapacityContract::parse(&rendered).expect("parses back");
+        assert_eq!(parsed.calibration.seed, contract.calibration.seed);
     }
 
     #[test]

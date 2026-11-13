@@ -2743,8 +2743,10 @@ enum Commands {
         #[arg(long = "target", value_name = "PATH")]
         targets: Vec<String>,
         /// Seed for the request profile, so a calibration is replayable.
+        /// At most 9223372036854775807: the contract is TOML, and that is its
+        /// largest integer.
         /// [default: 1733; with --check, the committed contract's own seed]
-        #[arg(long, value_name = "SEED")]
+        #[arg(long, value_name = "SEED", value_parser = clap::value_parser!(u64).range(..=i64::MAX.cast_unsigned()))]
         seed: Option<u64>,
         /// Concurrency ladder to walk (comma-separated).
         /// [default: 1,2,4,8,16,32,64; with --check, the committed ladder]
@@ -13143,6 +13145,23 @@ mod tests {
         assert_eq!(warmup_ms, None);
         assert!((tolerance_rps - capacity::DEFAULT_RPS_TOLERANCE).abs() < f64::EPSILON);
         assert!((tolerance_p99 - capacity::DEFAULT_P99_TOLERANCE).abs() < f64::EPSILON);
+    }
+
+    /// The contract is TOML, and a TOML integer is a signed 64-bit number.
+    #[test]
+    fn parse_calibrate_refuses_a_seed_above_the_toml_integer_range() {
+        let largest = i64::MAX.to_string();
+        let cli = Cli::try_parse_from(["autumn", "calibrate", "--seed", &largest]).unwrap();
+        let Commands::Calibrate { seed, .. } = cli.command else {
+            panic!("expected Calibrate");
+        };
+        assert_eq!(seed, Some(u64::try_from(i64::MAX).unwrap()));
+
+        let too_large = (u64::try_from(i64::MAX).unwrap() + 1).to_string();
+        let Err(err) = Cli::try_parse_from(["autumn", "calibrate", "--seed", &too_large]) else {
+            panic!("a seed above the range must not parse");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
