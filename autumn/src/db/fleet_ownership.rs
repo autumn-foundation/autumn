@@ -1549,13 +1549,13 @@ impl crate::actuator::HealthIndicator for OwnershipIndicator {
 /// An ownership table in memory, for tests of one process and the fleet
 /// conformance kit. Each call is one [`OwnershipTable`] decision at the
 /// clock's time.
-#[cfg(any(test, feature = "sqlite"))]
+#[cfg(any(test, all(feature = "sqlite", feature = "plugin-conformance")))]
 pub(crate) struct MemoryOwnership {
     table: Mutex<OwnershipTable>,
     clock: Arc<dyn crate::time::ClockSource>,
 }
 
-#[cfg(any(test, feature = "sqlite"))]
+#[cfg(any(test, all(feature = "sqlite", feature = "plugin-conformance")))]
 impl MemoryOwnership {
     pub(crate) fn new(clock: Arc<dyn crate::time::ClockSource>) -> Self {
         Self {
@@ -1580,7 +1580,7 @@ impl MemoryOwnership {
     }
 }
 
-#[cfg(any(test, feature = "sqlite"))]
+#[cfg(any(test, all(feature = "sqlite", feature = "plugin-conformance")))]
 impl SlotOwnershipStore for MemoryOwnership {
     fn claim<'a>(
         &'a self,
