@@ -1915,6 +1915,11 @@ jobs:
           pg_dump --version
           pg_restore --version
           ssh -V
+      - name: Use the PostgreSQL 16 client tools (Linux)
+        if: runner.os == 'Linux'
+        # pg_restore 17+ cannot restore into the 11 and 16 test servers.
+        # See the script header.
+        run: ./scripts/ci-pg-client-16.sh
       - name: Install diesel_cli (Linux)
         if: runner.os == 'Linux'
         # #1945: the cli_tests Docker sweep below now reaches
