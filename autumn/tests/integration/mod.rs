@@ -287,6 +287,8 @@ mod model_field_attrs;
 #[cfg(feature = "db")]
 mod model_votable;
 #[cfg(feature = "db")]
+mod money_ledger_post_perf;
+#[cfg(feature = "db")]
 mod money_ledger_postgres;
 mod named_roles;
 #[cfg(feature = "maud")]
