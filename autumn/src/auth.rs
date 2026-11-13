@@ -153,14 +153,13 @@ pub async fn hash_password(password: &str) -> crate::AutumnResult<String> {
 pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> {
     let password = password.to_string();
 
-    // Parse the hash format outside the blocking task.
-    // A valid bcrypt hash is typically 60 characters and starts with "$".
+    // A bcrypt hash is 60 characters and starts with "$".
     let is_valid_format = hash.len() == 60 && hash.starts_with('$');
 
     let hash_to_verify = if is_valid_format {
         hash.to_string()
     } else {
-        // To prevent timing attacks, perform a dummy verification against a known hash.
+        // Verify against a dummy hash anyway so a malformed hash takes the same time.
         "$2b$12$KIXe8K4j1sH6/xH.x9d71uJ5Jk8t6O4m6Q110g4H8y1r6J6O6O6O6".to_string()
     };
 
@@ -206,39 +205,21 @@ pub async fn __check_secured_with_key(
     auth_session_key: &str,
     roles: &[&str],
 ) -> crate::AutumnResult<()> {
-    // Check authentication: session must contain the auth key
     let Some(user_id) = session.get(auth_session_key).await else {
         return Err(crate::AutumnError::unauthorized_msg(
             "authentication required",
         ));
     };
 
-    // Publish the authenticated principal as the request's current actor
-    // (#1383) so generated repository/audit writes auto-attribute to it, and
-    // tag the request-scoped log context (#1169) with the same user so every
-    // subsequent event automatically carries `user_id`.
-    //
-    // Seed the actor only if no stronger/earlier principal is already set. This
-    // `#[secured]` role check runs inside the handler body, *inner* to the auth
-    // middleware layers (`RequireApiToken` bearer, `RequireAuth` session). On a
-    // route that combines `RequireApiToken` with `#[secured]`, the bearer
-    // middleware has already published the token principal by the time this runs;
-    // a request that *also* carries a session cookie must stay attributed to the
-    // token principal, so we must not clobber it with the session user here.
-    // (`log::context::set_user_id` for #1169 is independent and stays
-    // unconditional.)
-    //
-    // While the session is impersonating (#1394) the responsible principal is
-    // the *real* impersonator, not the user the request resolves as, so the
-    // actor published here is the impersonator. The log context keeps carrying
-    // the effective user (that is the identity the request is acting under).
+    // Publish the actor for audit attribution (#1383), unless an outer layer already set one:
+    // this check runs inside the handler, so on a `RequireApiToken` route that also carries a
+    // session cookie the token principal must win. While impersonating (#1394) the actor is the
+    // operator; the log context's `user_id` (#1169) is always the effective user.
     if crate::current::Current::actor().is_none() {
         crate::current::Current::set_actor(impersonation::audit_actor_id(session, &user_id).await);
     }
     crate::log::context::set_user_id(user_id);
 
-    // Check authorization: if roles are specified, the session's "role"
-    // must match at least one of them
     if !roles.is_empty() {
         let user_role = session.get("role").await.unwrap_or_default();
         if !roles.iter().any(|&r| r == user_role) {
@@ -259,8 +240,7 @@ pub async fn __check_secured_with_key(
 /// Forbidden`. An empty requirement is a no-op (`Ok`). A token with no granted
 /// scopes (`granted == None`) is denied whenever a scope is required, so a pure
 /// service token that lacks the scope is rejected.
-// Async (with no await) to mirror `__check_secured_with_key`, so the macro can
-// uniformly `.await` whichever check it emits.
+// Async with no await, so the macro can `.await` every check it emits.
 #[doc(hidden)]
 #[allow(clippy::unused_async)]
 pub async fn __check_secured_scopes(
@@ -423,7 +403,6 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            // Check if session has the required key
             let session = req.extensions().get::<crate::session::Session>().cloned();
 
             let user_id = if let Some(ref session) = session {
@@ -433,32 +412,17 @@ where
             };
 
             if let Some(user_id) = user_id {
-                // Fulfil the RateLimitPrincipal contract so key_strategy =
-                // "authenticated_principal" works without an extra middleware shim.
-                // Keyed on the operator while impersonating (issue #2347).
+                // Lets `key_strategy = "authenticated_principal"` work with no extra middleware.
+                // Keyed on the operator while impersonating (#2347).
                 let throttle_id = match session.as_ref() {
                     Some(session) => impersonation::audit_actor_id(session, &user_id).await,
                     None => user_id.clone(),
                 };
                 req.extensions_mut()
                     .insert(crate::security::RateLimitPrincipal(throttle_id));
-                // Publish the authenticated principal as the request's current
-                // actor (#1383) and tag the request-scoped log context (#1169)
-                // so handler logs for middleware-authenticated requests carry
-                // `user_id` too, matching the `#[secured]` path.
-                //
-                // Seed the actor only if no stronger/earlier principal is already
-                // set. On a normal session-auth route nothing publishes an actor
-                // before this middleware (the outer `LogContextLayer` only
-                // establishes an empty scope), so `actor().is_none()` is true and
-                // this still seeds. The guard keeps the uniform "first/outermost
-                // resolver wins" rule: if an outer bearer layer or an explicit
-                // `with_actor(...)` scope already resolved a principal, that one
-                // stays. (`set_user_id` for #1169 is independent, stays unconditional.)
-                //
-                // Impersonation (#1394): the actor is the real impersonator
-                // whenever the session carries one, so writes made while
-                // impersonating stay attributed to the operator.
+                // Same rules as `__check_secured_with_key`: the first resolver of the actor wins
+                // (#1383), the actor is the operator while impersonating (#1394), and the log
+                // context's `user_id` (#1169) is set unconditionally.
                 if crate::current::Current::actor().is_none() {
                     let actor = match session.as_ref() {
                         Some(session) => impersonation::audit_actor_id(session, &user_id).await,
@@ -1035,13 +999,10 @@ pub fn provider_preset(name: &str) -> Option<OAuth2ProviderConfig> {
             userinfo_url: None,
             redirect_uri: String::new(),
             scope: "openid profile email".into(),
-            // ⚠ The `common` endpoint is a routing alias — ID tokens it issues carry
-            // a tenant-specific `iss` claim (`https://login.microsoftonline.com/{tid}/v2.0`),
-            // which will NOT match this issuer and will fail validation.
-            //
-            // Single-tenant apps: replace every `common` segment with your tenant ID.
-            // Multi-tenant apps: use the `organizations` or `consumers` endpoint and
-            // override `issuer` with the concrete tenant ID after decoding the `tid` claim.
+            // `common` is a routing alias: its ID tokens carry a tenant-specific `iss`
+            // (`https://login.microsoftonline.com/{tid}/v2.0`) that fails validation against this
+            // issuer. Single-tenant apps: replace `common` with the tenant ID. Multi-tenant apps:
+            // use `organizations` or `consumers` and set `issuer` from the `tid` claim.
             issuer: Some("https://login.microsoftonline.com/common/v2.0".into()),
             jwks_url: Some("https://login.microsoftonline.com/common/discovery/v2.0/keys".into()),
             discovery_url: Some("https://login.microsoftonline.com/common/v2.0".into()),
@@ -1105,7 +1066,7 @@ pub async fn oauth2_authorize_url(
     let state = uuid::Uuid::new_v4().to_string();
     let nonce = uuid::Uuid::new_v4().to_string();
 
-    // PKCE S256: generate a 32-byte random verifier, base64url-encode it.
+    // PKCE S256 (RFC 7636).
     let mut verifier_bytes = [0u8; 32];
     getrandom::fill(&mut verifier_bytes).map_err(|e| {
         crate::AutumnError::service_unavailable_msg(format!("pkce rng failed: {e}"))
@@ -1169,7 +1130,6 @@ pub async fn oauth2_finish_login(
     callback: &OAuth2Callback,
 ) -> crate::AutumnResult<OidcIdentity> {
     validate_callback_state(session, provider_name, callback).await?;
-    // Retrieve (and consume) the PKCE code_verifier stored during authorize.
     let code_verifier = session
         .remove(&format!("oauth2:{provider_name}:code_verifier"))
         .await
@@ -1190,9 +1150,8 @@ async fn validate_callback_state(
     callback: &OAuth2Callback,
 ) -> crate::AutumnResult<()> {
     let state_key = format!("oauth2:{provider_name}:state");
-    // Read without removing so a stray/attacker-controlled callback with a
-    // wrong state value cannot consume the real state and break the pending
-    // legitimate redirect.
+    // Read without removing, so a callback with a wrong state cannot consume the real one and
+    // break the pending legitimate redirect.
     let expected_state = session.get(&state_key).await.ok_or_else(|| {
         crate::AutumnError::unauthorized_msg("oauth2 state missing; restart login")
     })?;
@@ -1215,7 +1174,6 @@ async fn exchange_oauth2_token(
     callback: &OAuth2Callback,
     code_verifier: String,
 ) -> crate::AutumnResult<OAuth2TokenResponse> {
-    // Build the base form fields; PKCE code_verifier is appended.
     let form_fields: Vec<(&str, String)> = vec![
         ("grant_type", "authorization_code".to_owned()),
         ("code", callback.code.clone()),
@@ -1295,9 +1253,7 @@ async fn validate_oidc_nonce(
     let nonce_key = format!("oauth2:{provider_name}:nonce");
     let stored_nonce = session.remove(&nonce_key).await;
     if source == IdentitySource::IdToken {
-        // The nonce MUST be present in the session for ID-token logins.
-        // A missing nonce (e.g. session was partially cleared) must be
-        // treated as an error to prevent replay/mix-up attacks.
+        // A missing nonce is an error, not a skip, to prevent replay and mix-up attacks.
         let expected_nonce = stored_nonce.ok_or_else(|| {
             crate::AutumnError::unauthorized_msg("oauth2 nonce missing from session")
         })?;
@@ -1322,8 +1278,7 @@ async fn finalize_oauth2_session(
     subject: String,
     claims: serde_json::Value,
 ) -> crate::AutumnResult<OidcIdentity> {
-    // Write provider metadata only — callers set the application session key
-    // after resolving or creating the local user record.
+    // Callers set the app's session key after resolving or creating the local user.
     session.insert("auth_provider", provider_name).await;
     session.rotate_id().await;
     Ok(OidcIdentity {
@@ -1437,8 +1392,7 @@ fn jwk_allowed_algorithms(
             KeyAlgorithm::ES256 => Algorithm::ES256,
             KeyAlgorithm::ES384 => Algorithm::ES384,
             KeyAlgorithm::EdDSA => Algorithm::EdDSA,
-            // Symmetric (HS*) and encryption algorithms are never valid for
-            // verifying an id_token signature against a JWKS document.
+            // Symmetric (HS*) and encryption algorithms never verify an id_token against a JWKS.
             other => {
                 return Err(crate::AutumnError::unauthorized_msg(format!(
                     "jwk algorithm {other} not allowed for id_token verification"
@@ -1448,8 +1402,7 @@ fn jwk_allowed_algorithms(
         return Ok(vec![alg]);
     }
 
-    // Otherwise derive the allowed set from the key type. Only asymmetric
-    // signature algorithms compatible with the key are permitted.
+    // Otherwise allow the asymmetric signature algorithms that fit the key type.
     match &jwk.algorithm {
         AlgorithmParameters::RSA(_) => Ok(vec![
             Algorithm::RS256,
@@ -1470,10 +1423,8 @@ fn jwk_allowed_algorithms(
         AlgorithmParameters::OctetKey(_) => Err(crate::AutumnError::unauthorized_msg(
             "symmetric jwk not allowed for id_token verification",
         )),
-        // `Other` (a `kty` this crate does not recognise) and any variant a
-        // future `jsonwebtoken` adds — the enum is `#[non_exhaustive]` since
-        // 11.0 — cannot verify a signature here, so fail closed rather than
-        // guess an algorithm family.
+        // `Other` (an unknown `kty`) and future variants of this `#[non_exhaustive]` enum: fail
+        // closed rather than guess an algorithm family.
         _ => Err(crate::AutumnError::unauthorized_msg(
             "unsupported jwk key type for id_token verification",
         )),
@@ -1523,11 +1474,8 @@ async fn validate_and_decode_id_token(
     let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk)
         .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid jwk key: {e}")))?;
 
-    // Never trust the token header's `alg` to select the verification
-    // algorithm (algorithm-confusion defense). Pin the accepted set from the
-    // matched JWK and reject tokens whose header alg is not in it — in
-    // particular symmetric (HS*) algorithms, which would otherwise let an
-    // attacker forge tokens HMAC-signed with the public JWKS material.
+    // Algorithm-confusion defense: the header's `alg` must be in the set pinned by the JWK.
+    // Otherwise an attacker could forge an HS* token HMAC-signed with the public JWKS key.
     let allowed_algs = jwk_allowed_algorithms(jwk)?;
     if !allowed_algs.contains(&alg) {
         return Err(crate::AutumnError::unauthorized_msg(format!(
@@ -1697,9 +1645,9 @@ fn run_http_chain(
             let fut = interceptor.intercept(req, &next_fn);
             fut.await
         } else {
-            // This client is not the recorded outbound seam (#2351 item 1).
-            // The guard sits at the network call: a request that an
-            // interceptor answers, or that fails to build, sends nothing.
+            // This client is not the recorded outbound seam (#2351), so the egress guard sits at
+            // the network call: a request an interceptor answers, or that fails to build, sends
+            // nothing.
             #[cfg(feature = "reporting")]
             if let Err(refused) =
                 crate::capsule::guard_egress("oauth2", req.method().as_str(), req.url().as_str())
@@ -2010,7 +1958,7 @@ struct StoredToken {
 
 #[derive(Clone)]
 pub struct InMemoryApiTokenStore {
-    // hash → stored token
+    // Keyed by token hash.
     tokens: Arc<std::sync::RwLock<std::collections::HashMap<String, StoredToken>>>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
     clock: Arc<dyn crate::time::ClockSource>,
@@ -2494,7 +2442,6 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            // Parse "Authorization: Bearer <token>"
             let raw_token = req
                 .headers()
                 .get(http::header::AUTHORIZATION)
@@ -2514,27 +2461,14 @@ where
                         scopes,
                         ..
                     } = verified;
-                    // Fulfil the RateLimitPrincipal contract so key_strategy =
-                    // "authenticated_principal" works without an extra middleware shim.
+                    // Lets `key_strategy = "authenticated_principal"` work with no extra layer.
                     req.extensions_mut()
                         .insert(crate::security::RateLimitPrincipal(principal_id.clone()));
-                    // Expose the granted scopes via request extensions (NOT the
-                    // session — writing to the session would persist a cookie
-                    // and leak scopes onto later cookie-only requests). The
-                    // `#[secured(scopes = …)]` gate and `PolicyContext`
-                    // scope-aware helpers read this extension.
+                    // Extensions, not the session: the session would persist the scopes onto later
+                    // cookie-only requests.
                     req.extensions_mut().insert(ApiTokenScopes(scopes));
-                    // Publish the token's principal as the request's current
-                    // actor (#1383) so generated repository/audit writes
-                    // auto-attribute to it.
-                    //
-                    // Seed the actor only if no stronger/earlier principal is
-                    // already set. On a bearer-auth route nothing publishes an
-                    // actor before this middleware (the outer `LogContextLayer`
-                    // only establishes an empty scope), so `actor().is_none()` is
-                    // true and this still seeds. The guard keeps the uniform
-                    // "first/outermost resolver wins" rule: an explicit
-                    // `with_actor(...)` scope already in effect is preserved.
+                    // Audit actor (#1383). The first resolver wins, so an enclosing
+                    // `with_actor(...)` scope is kept.
                     if crate::current::Current::actor().is_none() {
                         crate::current::Current::set_actor(principal_id.clone());
                     }
@@ -2597,11 +2531,9 @@ fn api_token_error_response<ResBody: From<String> + Default>(
     // which stays the wrapped error even when the error carries a field map.
     let message = err.message();
     let details = err.details().cloned();
-    // Redact server-error detail in the body itself: this is the response the
-    // client sees unless a downstream exception filter rebuilds it, and the
-    // raw message stays available to filters/logging via
-    // `AutumnErrorInfo.message`. A reclassified query timeout must read
-    // "Service unavailable", not leak the store's db message.
+    // Redact server-error detail in the body: a reclassified query timeout reads "Service
+    // unavailable", not the store's db message. Filters and logs still get the raw message via
+    // `AutumnErrorInfo.message`.
     let body = crate::error::problem_details_json_string(
         status,
         message.clone(),
@@ -2883,12 +2815,9 @@ mod db_store {
                 let new_hash = hash_api_token(&new_raw);
                 let now = self.clock.now().naive_utc();
                 let mut conn = self.conn().await?;
-                // Atomic CTE: revoke the old token and insert a replacement carrying
-                // the same name/scopes/expiry in a single statement. If the old hash
-                // is unknown or already revoked the UPDATE returns 0 rows, the INSERT
-                // is a no-op, and COUNT(*) returns 0 — the caller sees None.
-                // $3 is the store clock's `now` so the expiry predicate matches the
-                // same instant used by verify_scoped, avoiding clock-skew races.
+                // One statement, so revoke and replace are atomic. An unknown or revoked old hash
+                // updates no rows, inserts nothing and counts 0 (None). $3 is the store clock's
+                // `now`, the same instant `verify_scoped` checks expiry against.
                 let row: CountRow = diesel::sql_query(
                     "WITH rotated AS ( \
                         UPDATE api_tokens \
@@ -2957,8 +2886,7 @@ mod db_store {
                 let Some((id, principal_id, name, expires_at_naive, scopes_json)) = row else {
                     return Ok(None);
                 };
-                // Throttled usage stamp: only write last_used_at when it is NULL or
-                // older than 5 minutes, avoiding a write on every single request.
+                // Stamp `last_used_at` at most every 5 minutes, not on every request.
                 let threshold = now - chrono::Duration::minutes(5);
                 let _ = diesel::update(
                     api_tokens::table.filter(api_tokens::id.eq(id)).filter(
@@ -3072,18 +3000,15 @@ mod tests {
 
     #[tokio::test]
     async fn verify_password_rejects_invalid_hash_format_safely() {
-        // Test short hash
         let result = verify_password("test", "short").await;
         assert!(result.is_ok());
         assert!(!result.unwrap());
 
-        // Test hash with correct length but not starting with $
         let bad_prefix = "a".repeat(60);
         let result = verify_password("test", &bad_prefix).await;
         assert!(result.is_ok());
         assert!(!result.unwrap());
 
-        // Test hash with incorrect length but starting with $
         let bad_length = "$2b$12$short";
         let result = verify_password("test", bad_length).await;
         assert!(result.is_ok());
@@ -3445,9 +3370,6 @@ mod tests {
     #[cfg(feature = "oauth2")]
     #[tokio::test]
     async fn validate_callback_state_preserves_state_on_mismatch() {
-        // An attacker hitting the callback with a wrong state must NOT
-        // consume the real state stored in the session; the legitimate
-        // provider redirect must still succeed.
         let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
         session
             .insert("oauth2:github:state".to_owned(), "real-state".to_owned())
@@ -3460,7 +3382,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("state mismatch"));
-        // Real state must still be present after the failed attempt.
         assert_eq!(
             session.get("oauth2:github:state").await.as_deref(),
             Some("real-state")
@@ -3470,10 +3391,8 @@ mod tests {
     #[cfg(feature = "oauth2")]
     #[tokio::test]
     async fn validate_oidc_nonce_rejects_missing_nonce_for_id_token() {
-        // ID-token logins must fail when there is no stored nonce (e.g.,
-        // session was partially cleared or forged).
         let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
-        // No nonce key inserted — simulates a cleared / missing session.
+        // No nonce stored.
         let claims = serde_json::json!({ "nonce": "any" });
         let err = validate_oidc_nonce(&session, "github", &claims, IdentitySource::IdToken)
             .await
@@ -3674,10 +3593,6 @@ mod tests {
 
     #[tokio::test]
     async fn check_secured_seeds_actor_when_none_established() {
-        // On a normal single-auth `#[secured]` route nothing publishes an actor
-        // before the role check (the outer `LogContextLayer` establishes only an
-        // empty scope), so the resolved session user becomes the ambient actor
-        // and versioned writes attribute to them (#1383).
         crate::current::scope_request(async {
             assert_eq!(crate::current::Current::actor(), None);
             let data = std::collections::HashMap::from([("user_id".into(), "42".into())]);
@@ -3691,20 +3606,14 @@ mod tests {
 
     #[tokio::test]
     async fn check_secured_preserves_already_established_actor() {
-        // The flagged clobber (#1383): a route that combines `RequireApiToken`
-        // (bearer, OUTER) with `#[secured]` and *also* carries a session cookie.
-        // The bearer middleware has already published the token principal by the
-        // time this inner role check runs; resolving the session user here must
-        // NOT overwrite the stronger, earlier principal, so versioned writes stay
-        // attributed to the token principal rather than the cookie user.
+        // A `RequireApiToken` route with `#[secured]` and a session cookie: the outer bearer
+        // layer set the actor first, and the session user must not overwrite it (#1383).
         crate::current::scope_request(async {
             crate::current::Current::set_actor("token-principal".to_owned());
             let data = std::collections::HashMap::from([("user_id".into(), "42".into())]);
             let session = crate::session::Session::new_for_test("sess".into(), data);
             let result = __check_secured_with_key(&session, "user_id", &[]).await;
-            // The session still authenticates/authorizes normally...
             assert!(result.is_ok());
-            // ...but the already-established principal wins as the ambient actor.
             assert_eq!(
                 crate::current::Current::actor(),
                 Some("token-principal".to_owned())
@@ -3964,7 +3873,6 @@ mod tests {
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 
         let store = MemoryStore::new();
-        // Pre-populate a session with user_id
         let mut session_data = std::collections::HashMap::new();
         session_data.insert("user_id".into(), "42".into());
         store.save("valid-session", session_data).await.unwrap();
@@ -4045,9 +3953,8 @@ mod tests {
 
     #[tokio::test]
     async fn require_auth_rate_limits_by_session_principal() {
-        // Verifies end-to-end: RequireAuth (outer) sets RateLimitPrincipal so a
-        // route-scoped RateLimitLayer (inner) keys on the principal, not the IP.
-        // Layer composition:  Session → RequireAuth → RateLimitLayer → handler
+        // RequireAuth (outer) sets RateLimitPrincipal, so the inner RateLimitLayer keys on the
+        // principal, not the IP.
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -4167,12 +4074,10 @@ mod tests {
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // When inner is not ready, RequireAuthService should not be ready
         let poll = service.poll_ready(&mut cx);
         assert!(poll.is_pending());
         assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // When inner is ready, RequireAuthService should be ready
         let mock_service_ready = MockService {
             ready: true,
             poll_count: poll_count.clone(),
@@ -4208,19 +4113,16 @@ mod tests {
     async fn test_hash_password() {
         let test_input = uuid::Uuid::new_v4().to_string();
 
-        // Test hashing
         let hash = super::hash_password(&test_input)
             .await
             .expect("Failed to hash password");
         assert!(hash.starts_with("$2b$"));
 
-        // Test verification with correct password
         let is_valid = super::verify_password(&test_input, &hash)
             .await
             .expect("Failed to verify password");
         assert!(is_valid, "Password should be verified successfully");
 
-        // Test verification with incorrect password
         let is_invalid = super::verify_password(&uuid::Uuid::new_v4().to_string(), &hash)
             .await
             .expect("Failed to verify wrong password");
@@ -4243,7 +4145,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_password_long() {
-        // bcrypt truncates after 72 bytes. We just want to ensure it doesn't crash.
+        // bcrypt truncates after 72 bytes; a longer input must still hash.
         let test_input = "a".repeat(100);
         let hash = super::hash_password(&test_input)
             .await
@@ -4258,7 +4160,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_password_unicode() {
-        // Test with non-ascii characters
         let test_input = format!("{}🚀my_secrët_passwörd🔑", uuid::Uuid::new_v4());
         let hash = super::hash_password(&test_input)
             .await
@@ -4273,14 +4174,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_password_invalid_hash() {
-        // Ensure that providing invalid hashes doesn't crash or cause issues, but returns an error/false
         let test_input = uuid::Uuid::new_v4().to_string();
 
-        // Invalid prefix
         let result = super::verify_password(&test_input, "invalid_hash_string").await;
         assert!(result.is_err() || !result.unwrap());
 
-        // Truncated hash
         let result2 = super::verify_password(&test_input, "$2b$04$").await;
         assert!(result2.is_err() || !result2.unwrap());
     }
@@ -4308,8 +4206,6 @@ mod http_interceptor_task_local_tests {
             next: &'a dyn Fn(reqwest::Request) -> HttpInterceptorFuture<'a>,
         ) -> HttpInterceptorFuture<'a> {
             self.fired.store(true, Ordering::SeqCst);
-            // Delegate to next so the caller gets a real (likely connection-refused)
-            // error back — we discard it in the test with `let _ = ...`.
             next(req)
         }
     }
@@ -4353,7 +4249,6 @@ mod http_interceptor_task_local_tests {
             fired: Arc::clone(&fired),
         });
 
-        // Intentionally do NOT establish a scope — simulating pre-fix task mode.
         let client = reqwest::Client::new();
         let http_client = super::HttpClient::new(client);
         let _ = http_client
@@ -4494,7 +4389,6 @@ mod api_token_tests {
     async fn in_memory_store_raw_token_not_stored_verbatim() {
         let store = InMemoryApiTokenStore::default();
         let raw = store.issue("user:1").await.unwrap();
-        // Appending a character changes the hash → lookup must return None.
         let tampered = format!("{raw}x");
         assert_eq!(store.verify(&tampered).await.unwrap(), None);
     }
@@ -4518,17 +4412,13 @@ mod api_token_tests {
 
     #[tokio::test]
     async fn with_token_seeds_token_resolvable_through_same_path() {
-        // A seeded token must flow through the exact `verify` / `verify_scoped`
-        // path a minted token uses — no second hashing or lookup scheme.
+        // A seeded token uses the same hashing and lookup as a minted one.
         let store = InMemoryApiTokenStore::default().with_token("known-dev-token", "user:dev");
         assert_eq!(
             store.verify("known-dev-token").await.unwrap(),
             Some("user:dev".to_owned()),
         );
-        // The stored hash is exactly `hash_api_token(raw)` — a tampered raw
-        // hashes differently and must miss.
         assert_eq!(store.verify("known-dev-tokenx").await.unwrap(), None);
-        // And it resolves through the scoped path too (empty scopes).
         let verified = store
             .verify_scoped("known-dev-token")
             .await
@@ -4536,7 +4426,6 @@ mod api_token_tests {
             .unwrap();
         assert_eq!(verified.principal_id, "user:dev");
         assert!(verified.scopes.is_empty());
-        // Revocation uses the same hash → the seeded token can be revoked.
         store.revoke("known-dev-token").await.unwrap();
         assert_eq!(store.verify("known-dev-token").await.unwrap(), None);
     }
@@ -4560,19 +4449,15 @@ mod api_token_tests {
 
     #[tokio::test]
     async fn blank_seed_token_stores_no_credential() {
-        // A blank (empty or whitespace-only) seed on the infallible builders must
-        // be a safe no-op — never minting a `hash("")` credential that a blank
-        // `Authorization: Bearer ` header could satisfy. `with_token` and
-        // `with_scoped_token` both route through the same `store_raw_token` guard.
+        // A blank seed must store nothing: a `hash("")` credential would match a blank
+        // `Authorization: Bearer ` header.
         for blank in ["", "   ", "\t\n"] {
             let store = InMemoryApiTokenStore::default().with_token(blank, "user:oops");
-            // Neither the blank raw value nor an empty bearer resolves anything.
             assert_eq!(store.verify(blank).await.unwrap(), None);
             assert_eq!(store.verify("").await.unwrap(), None);
             assert!(store.verify_scoped(blank).await.unwrap().is_none());
             assert!(store.verify_scoped("").await.unwrap().is_none());
 
-            // The scoped builder shares the guard.
             let scoped = InMemoryApiTokenStore::default().with_scoped_token(
                 blank,
                 "svc:oops",
@@ -4582,8 +4467,7 @@ mod api_token_tests {
             assert!(scoped.verify_scoped("").await.unwrap().is_none());
         }
 
-        // A normal non-blank seed alongside still works, proving the guard only
-        // drops the blank one.
+        // The guard drops only blank seeds.
         let store = InMemoryApiTokenStore::default().with_token("real-token", "user:ok");
         assert_eq!(
             store.verify("real-token").await.unwrap(),
@@ -4593,13 +4477,8 @@ mod api_token_tests {
 
     #[test]
     fn from_env_errors_when_variable_unset() {
-        // The crate is `#![forbid(unsafe_code)]`, and `std::env::set_var` is
-        // `unsafe` in edition 2024, so a test cannot mutate the process
-        // environment to exercise the positive path here — the seeding core is
-        // proven by the `with_token` / `with_scoped_token` tests above. This
-        // proves `from_env` consults exactly the named variable and rejects an
-        // unset one (a uniquely-named var is naturally absent, so no mutation is
-        // needed).
+        // Only the unset case: `set_var` is `unsafe` in edition 2024 and the crate forbids unsafe
+        // code. The `with_token` tests cover seeding.
         const VAR: &str = "AUTUMN_TEST_MCP_TOKEN_1970_UNSET";
         assert!(std::env::var(VAR).is_err(), "test var must be unset");
         assert!(InMemoryApiTokenStore::from_env(VAR, "user:mcp").is_err());
@@ -4720,7 +4599,6 @@ mod api_token_tests {
             .await
             .unwrap();
 
-        // Before use, last_used_at is unset.
         assert!(
             list_api_tokens(&store, "service:ci").await.unwrap()[0]
                 .last_used_at
@@ -4752,8 +4630,8 @@ mod api_token_tests {
 
         let listed = list_api_tokens(&store, "service:ci").await.unwrap();
         assert_eq!(listed.len(), 1);
-        // Metadata must not expose anything replayable as a credential: the raw
-        // token and its hash never appear in TokenMetadata's fields.
+        // `TokenMetadata` has no field for the raw token or its hash, so nothing listed is
+        // replayable.
         assert!(listed[0].revoked_at.is_none());
 
         store.revoke(&raw).await.unwrap();
@@ -4778,34 +4656,27 @@ mod api_token_tests {
 
         let new = rotate_api_token(&store, &old).await.unwrap().unwrap();
         assert_ne!(new, old);
-        // Old token no longer authenticates.
         assert!(store.verify_scoped(&old).await.unwrap().is_none());
-        // New token carries the same scopes.
         let verified = store.verify_scoped(&new).await.unwrap().unwrap();
         assert_eq!(verified.scopes, granted);
         assert_eq!(verified.principal_id, "service:ci");
 
-        // Rotating an unknown token yields None.
         assert!(rotate_api_token(&store, "nope").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn check_secured_scopes_is_default_deny_and_all_must_match() {
-        // Empty requirement is a no-op.
         assert!(__check_secured_scopes(None, &[]).await.is_ok());
-        // No granted scopes but a requirement => denied (403).
         let err = __check_secured_scopes(None, &["posts:write"])
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
-        // Subset present => allowed.
         let granted = ApiTokenScopes(scopes(&["posts:read", "posts:write"]));
         assert!(
             __check_secured_scopes(Some(&granted), &["posts:write"])
                 .await
                 .is_ok()
         );
-        // Missing one of several required => denied (all-must-match).
         assert!(
             __check_secured_scopes(Some(&granted), &["posts:write", "posts:delete"])
                 .await
@@ -4922,9 +4793,7 @@ mod api_token_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], 503);
         assert_eq!(json["code"], "autumn.service_unavailable");
-        // Server-error detail is redacted in the body (issue #2635): the
-        // store's message stays available to exception filters and logging
-        // via `AutumnErrorInfo.message`, never to the client.
+        // Server-error detail is redacted in the body (#2635).
         assert_eq!(json["detail"], "Service unavailable");
     }
 
@@ -5009,10 +4878,7 @@ mod api_token_tests {
 
     #[test]
     fn api_token_error_response_detail_omits_the_field_map() {
-        // The body renders through the canonical classification, but `detail`
-        // must take `message()`. With `Display` a store returning a
-        // validation error would put the field list in `detail` (issue
-        // #2587).
+        // `detail` takes `message()`: `Display` would put the field list in it (#2587).
         let mut fields = std::collections::HashMap::new();
         fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
         let err = crate::AutumnError::validation(fields);
@@ -5026,9 +4892,7 @@ mod api_token_tests {
 
     #[test]
     fn api_token_error_response_carries_code_and_errors_for_validation() {
-        // Regression for issue #2635: the body dropped the field map and the
-        // explicit problem type, so `code`/`errors` disagreed with the
-        // canonical render (`autumn.unprocessable_entity`, `errors` empty).
+        // `code` and `errors` must match the canonical render (#2635).
         let mut fields = std::collections::HashMap::new();
         fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
         let err = crate::AutumnError::validation(fields);
@@ -5046,14 +4910,12 @@ mod api_token_tests {
             json["errors"],
             serde_json::json!([{"field": "token", "messages": ["Malformed"]}]),
         );
-        // The canonical render agrees: same error through `code()`.
         assert_eq!(err.code(), "autumn.validation_failed");
     }
 
     #[test]
     fn api_token_error_response_carries_explicit_problem_type() {
-        // Regression for issue #2635: an explicit problem type rendered under
-        // the status-derived code (`autumn.service_unavailable`).
+        // An explicit problem type wins over the status-derived code (#2635).
         let err = crate::AutumnError::query_timeout("query exceeded statement_timeout");
 
         let response: http::Response<String> = super::api_token_error_response(&err, None, None);
@@ -5067,9 +4929,8 @@ mod api_token_tests {
 
     #[test]
     fn api_token_error_response_reclassifies_cancelled_statements() {
-        // A database error from a custom `ApiTokenStore` whose message shows a
-        // cancelled statement renders as a redacted 503 query timeout, like
-        // the canonical `IntoResponse` path, not the assigned 500.
+        // A cancelled-statement db error renders as a redacted 503 query timeout, as through
+        // `IntoResponse`, not as the assigned 500.
         let err = crate::AutumnError::internal_server_error_msg(
             "db: canceling statement due to statement timeout",
         );
@@ -5079,15 +4940,12 @@ mod api_token_tests {
             serde_json::from_str(response.body()).expect("problem+json body");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["code"], "autumn.query_timeout");
-        // Internal detail stays redacted in the body.
         assert_eq!(json["detail"], "Service unavailable");
     }
 
     #[test]
     fn api_token_error_response_stashes_details_for_exception_filters() {
-        // Regression for issue #2635: the `AutumnErrorInfo` extension dropped
-        // `details`/`problem_type`, so a downstream exception filter could not
-        // recover them either.
+        // Exception filters read `details` and `problem_type` from `AutumnErrorInfo` (#2635).
         let mut fields = std::collections::HashMap::new();
         fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
         let err = crate::AutumnError::validation(fields);
@@ -5102,9 +4960,7 @@ mod api_token_tests {
             info.details.as_ref().and_then(|m| m.get("token")),
             Some(&vec!["Malformed".to_owned()]),
         );
-        // Validation errors carry no explicit problem type (the type URI is
-        // derived from the 422 + field map at render); explicit types like
-        // `query_timeout` are preserved verbatim.
+        // A validation error's type is derived at render time, so none is stored.
         assert_eq!(info.problem_type, None);
         let timeout_err = crate::AutumnError::query_timeout("slow");
         let timeout_response: http::Response<String> =
@@ -5348,10 +5204,8 @@ mod api_token_tests {
 
     #[tokio::test]
     async fn require_api_token_rate_limits_by_principal() {
-        // Verifies end-to-end: RequireApiToken (outer) sets RateLimitPrincipal
-        // with the VERIFIED principal ID so a route-scoped RateLimitLayer (inner)
-        // keys on the principal — two different tokens for the same principal share
-        // one bucket.  Layer composition: RequireApiToken → RateLimitLayer → handler
+        // RequireApiToken (outer) sets RateLimitPrincipal to the verified principal, so two
+        // tokens for one principal share the inner RateLimitLayer's bucket.
         use axum::body::Body;
         use tower::ServiceExt;
 
@@ -5639,8 +5493,6 @@ mod oauth2_unit_tests {
     #[test]
     fn auth_config_has_oauth_linking_policy() {
         let config = AuthConfig::default();
-        // Default policy must be CreateAccount so unknown provider identities
-        // automatically create a local user record.
         assert!(
             matches!(
                 config.oauth_linking_policy,

@@ -354,9 +354,8 @@ impl<P, C: NestedChild> NestedChangeset<P, C> {
             rows,
             valid_children,
         } = self;
-        // `is_valid()` guarantees both arms below take the happy path; the
-        // reconstruction branches keep the code panic-free without relying on
-        // that invariant.
+        // `is_valid()` means the happy path is taken; the fallback arms keep this panic-free
+        // without relying on that.
         match valid_children {
             Some(children) => match parent.into_valid() {
                 Ok(p) => Ok((p, children)),
@@ -449,11 +448,9 @@ impl<P, C: NestedChild + serde::Serialize> NestedChangeset<P, C> {
             .iter()
             .map(|child| {
                 let mut values: HashMap<String, Vec<String>> = HashMap::new();
-                // Serialize the child to the same `field=value` wire form the
-                // decoder reads, then parse it back so `RowScope::value` pre-fills
-                // seeded rows identically to a re-rendered submitted row. A
-                // serialization failure (never expected for a plain struct) simply
-                // yields an empty value map rather than panicking on the request path.
+                // Round-trip through the decoder's `field=value` wire form so `RowScope::value`
+                // pre-fills seeded rows exactly like a re-rendered submitted row. A
+                // serialization failure leaves the row empty.
                 if let Ok(encoded) = serde_html_form::to_string(child) {
                     for (k, v) in url::form_urlencoded::parse(encoded.as_bytes()) {
                         values
@@ -552,8 +549,7 @@ where
 {
     let collection = C::COLLECTION;
 
-    // Split parent pairs from grouped child subfields. `BTreeMap` keeps the
-    // rows in ascending index order; enumerating it later compacts gaps.
+    // `BTreeMap` keeps the rows in ascending index order; enumerating it later compacts gaps.
     let mut parent_pairs: Vec<(String, String)> = Vec::new();
     let mut child_groups: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
     for (key, value) in pairs {
@@ -567,33 +563,22 @@ where
         }
     }
 
-    // #2423: sweep NUL bytes out of the submitted values before anything
-    // decodes them, remembering which names carried one so the byte lands as
-    // an ordinary error on the field or subfield that held it. Postgres cannot
-    // store `0x00` in a TEXT column, so without this the row parses, validates,
-    // and fails only at the database with an unhandled 500. Parent fields and
-    // each row's subfields are swept separately because they are keyed
-    // separately in the rendered form.
-    // `_destroy` is excluded from the sweep, not merely from the reporting.
-    // Cleaning it would rewrite the marker itself: `is_truthy` trims only
-    // whitespace, so `"1\u{0}"` reads as false today and would read as *true*
-    // after stripping — silently destroying a row the author submitted to keep.
-    // It is never written to a column, so leaving the byte in it costs nothing.
+    // Postgres cannot store `0x00` in TEXT, so strip NUL bytes before decoding and report each
+    // as a field error instead of a 500 at the database (#2423).
+    //
+    // `_destroy` is not swept: `"1\u{0}"` is not truthy, but would become truthy once stripped
+    // and destroy a row the author meant to keep. It is never stored, so the byte is harmless.
     let parent_nul_fields: Vec<String> = crate::form::strip_nul_from_pairs(&mut parent_pairs)
         .into_iter()
-        // A direct caller of this public function passes the raw pairs, tokens
-        // and all, and never sees the request extensions that carry the
-        // configurable field names — so exempt the defaults here. The
-        // extractor additionally exempts the configured names.
+        // A direct caller passes the raw pairs, tokens included, so exempt the default
+        // plumbing names here. The extractor also exempts the configured names.
         .filter(|field| !crate::form::is_plumbing_field(field))
         .collect();
     let child_nul_fields: BTreeMap<usize, Vec<String>> = child_groups
         .iter_mut()
         .map(|(idx, subfields)| {
-            // Deduplicated for the same reason `strip_nul_from_pairs` is: a
-            // subfield may be submitted any number of times, and one message
-            // per *pair* would let a crafted body inflate a single row's error
-            // list without bound. One message per offending subfield.
+            // One message per subfield, not per pair: a crafted body could repeat a subfield to
+            // grow the row's error list without bound.
             let mut swept: BTreeSet<String> = BTreeSet::new();
             for (sub, value) in subfields.iter_mut() {
                 if sub != DESTROY_SUBFIELD && value.as_bytes().contains(&0) {
@@ -607,7 +592,6 @@ where
         })
         .collect();
 
-    // Decode the parent through the shared blank-optional-dropping path.
     let parent_encoded = encode_pairs(&parent_pairs);
     let parent_data: P =
         decode_urlencoded_dropping_blank_optional_fields::<P>(parent_encoded.as_bytes())?;
@@ -684,8 +668,7 @@ fn decode_child_row<C: NestedChild>(
 ) -> ChildRow<C> {
     let mut values: HashMap<String, Vec<String>> = HashMap::new();
     let mut destroyed = false;
-    // Subfields decoded into `C`, excluding the `_destroy` marker (not a
-    // field of `C`).
+    // Everything but the `_destroy` marker, which is not a field of `C`.
     let mut decode_pairs: Vec<(String, String)> = Vec::new();
     for (sub, val) in subfields {
         values.entry(sub.clone()).or_default().push(val.clone());
@@ -698,28 +681,17 @@ fn decode_child_row<C: NestedChild>(
         }
     }
 
-    // Rails `reject_if: :all_blank`: when every non-`_destroy` subfield value is blank —
-    // empty or whitespace-only after trimming — drop the row entirely. This is the
-    // auto-rendered blank template row `inputs_for` emits for the no-JS "add a child"
-    // path, not a real submitted child, so treat it as if the index was never submitted:
-    // do not decode, validate, retain, or count it toward the children. A row with at
-    // least one non-blank, non-`_destroy` value is kept and validated as usual, so a
-    // partially filled row still surfaces its per-field errors. `decode_pairs` already
-    // excludes `_destroy`, so an all-blank row that also carries `_destroy` is dropped
-    // here too, the same outcome as the destroy path.
+    // Rails `reject_if: :all_blank`: a row whose every non-`_destroy` value is blank is the
+    // blank template row `inputs_for` emits for the no-JS "add a child" path. Drop it, destroyed
+    // or not, as if the index was never submitted. A partially filled row is still validated.
     let all_blank = decode_pairs.iter().all(|(_, val)| val.trim().is_empty());
 
-    // A genuinely blank template row drops, destroyed or not — unchanged.
     if all_blank && nul_fields.is_empty() {
         return ChildRow::Dropped;
     }
 
-    // #2423: a destroyed row is never written, so there is nothing to reject
-    // there — the cleaned values are retained only so the row re-renders. This
-    // has to be decided *before* the NUL rejection below: a row whose only
-    // remaining content was an unstorable byte is still a row the author asked
-    // to delete, and rejecting it would block `into_valid` and leave them
-    // unable to remove it.
+    // A destroyed row is never written, so check it before the NUL rejection below: rejecting
+    // it would block `into_valid` and leave the author unable to delete the row (#2423).
     if destroyed {
         return ChildRow::Bound {
             row: NestedRow {
@@ -731,11 +703,8 @@ fn decode_child_row<C: NestedChild>(
         };
     }
 
-    // #2423: values were cleaned before the blank check, so a subfield whose
-    // only content was a NUL now reads as blank. That must not make the row
-    // *vanish* — the author did submit something, it just could not be stored
-    // — so a row that carried a NUL is reported even when nothing legible is
-    // left of it.
+    // NULs were stripped before the blank check, so a row whose only content was a NUL reads as
+    // blank. Report it rather than let it vanish (#2423).
     if all_blank {
         let mut errors: HashMap<String, Vec<String>> = HashMap::new();
         for field in nul_fields {
@@ -761,30 +730,16 @@ fn decode_child_row<C: NestedChild>(
             Err(ve) => errors = validation_errors_to_map(&ve),
         },
         Err(e) => {
-            // Row parse failure — deserialization failed before validation,
-            // as when `sku` is filled but the required numeric `quantity` is
-            // malformed or present-but-blank. Key the message under the
-            // offending subfield so it surfaces as `items[i].{field}`,
-            // rendered by `errors_for("{field}")` next to the offending input
-            // rather than only under the row-level "" key.
-            //
-            // The blank-optional retry inside
-            // `decode_urlencoded_dropping_blank_optional_fields` can drop a
-            // present-but-blank typed field (`quantity=`) before serde sees it,
-            // so the primary error is then a `missing field` report at the row
-            // root with an empty path, losing the field name the row helpers
-            // need. `recover_child_error_field` recovers it by preferring the
-            // primary error's `missing field` message, with a raw non-dropping
-            // re-decode only as a last resort. Only if every layer fails does it
-            // fall back to the row-level "" key, so the error is never silently
-            // dropped.
+            // Key the parse error under the offending subfield so `errors_for("{field}")` shows
+            // it next to its input. The blank-dropping retry can turn `quantity=` into a
+            // root-level `missing field` error with no path, so `recover_child_error_field`
+            // digs the name out, falling back to the row-level "" key.
             let field = recover_child_error_field::<C>(&e, &decode_pairs);
             errors.entry(field).or_default().push(e.to_string());
         }
     }
 
-    // #2423: a NUL byte in this row's text is a rejection in its own right,
-    // recorded alongside whatever the validators said.
+    // A NUL byte rejects the row on its own, alongside any validator errors (#2423).
     for field in nul_fields {
         errors
             .entry(field.clone())
@@ -926,20 +881,19 @@ fn recover_child_error_field<C: serde::de::DeserializeOwned>(
         return primary.field().unwrap_or_default().to_owned();
     };
 
-    // 1. Primary decode path (present-but-malformed value at a real path).
+    // 1. A present-but-malformed value at a real path.
     if let Some(field) = last_path_field(primary.path()) {
         return field;
     }
 
-    // 2. The `missing field \`X\`` identifier from the PRIMARY error — names
-    //    the required field the blank-dropping pass actually stopped on.
+    // 2. The `missing field \`X\`` name from the primary error: the required field the
+    //    blank-dropping pass stopped on.
     if let Some(field) = missing_field_name(&primary.inner().to_string()) {
         return field;
     }
 
-    // 3. Fallback: raw (non-dropping) re-decode over the original row pairs,
-    //    for the rare root-level error with neither a path nor a missing-field
-    //    message.
+    // 3. A raw, non-dropping re-decode, for a root-level error with neither a path nor a
+    //    missing-field message.
     let encoded = encode_pairs(decode_pairs);
     let deserializer = serde_html_form::Deserializer::from_bytes(encoded.as_bytes());
     if let Err(raw_err) = serde_path_to_error::deserialize::<_, C>(deserializer)
@@ -1270,8 +1224,7 @@ where
     type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        // Capture CSRF + submit-token context from request extensions exactly
-        // as `ChangesetForm` does, before the body is consumed.
+        // Read the extensions before the body is consumed.
         let csrf_token = req
             .extensions()
             .get::<crate::security::CsrfToken>()
@@ -1289,8 +1242,7 @@ where
             .get::<crate::security::SubmitFormField>()
             .map_or_else(|| "_submit_token".to_owned(), |f| f.0.clone());
 
-        // Same content-type gate axum's own form extractors apply. Multipart
-        // is out of scope for now (follow-up).
+        // Same content-type gate as axum's form extractors. Multipart is not supported.
         let (req, nul_message) = crate::form::nul_field_message(req, state).await;
         let content_type = req
             .headers()
@@ -1306,8 +1258,7 @@ where
                 .into_response());
         }
 
-        // Buffer through axum's `Bytes` extractor so `DefaultBodyLimit` is
-        // enforced (a bare `to_bytes(.., usize::MAX)` would defeat it).
+        // Through axum's `Bytes` extractor so `DefaultBodyLimit` is enforced.
         let (parts, body) = req.into_parts();
         let bytes_req = Request::from_parts(parts, body);
         let bytes = axum::body::Bytes::from_request(bytes_req, state)
@@ -1318,13 +1269,10 @@ where
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
 
-        // #2423: the CSRF token, the submit token and the method override are
-        // transport plumbing, not form fields — no template renders them, so an
-        // error keyed under one would make the form permanently invalid with
-        // nothing on screen to explain why. Clean them here so
-        // `decode_nested_urlencoded`'s sweep, which knows nothing about the two
-        // configurable names, never sees a NUL in one. Each is still rejected on
-        // its own terms when malformed.
+        // The CSRF token, submit token and method override are never rendered, so a NUL error
+        // keyed under one would leave the form invalid with nothing on screen (#2423). Clean
+        // them here: the decoder's sweep does not know the configured names. Each is still
+        // checked on its own terms.
         for (key, value) in &mut pairs {
             if *key == csrf_field || *key == submit_field || crate::form::is_plumbing_field(key) {
                 *value = crate::normalize::strip_nul(value);
@@ -1527,17 +1475,9 @@ impl RowScope<'_> {
         label: &str,
         options: &FieldOptions<'_>,
     ) -> maud::Markup {
-        // Emit the client-side `required`/`aria-required` constraint only for a
-        // real/submitted row that is *not* marked for destruction. A blank
-        // template row (`row: None`) must stay leaveable-empty so the browser
-        // does not block submit on the trailing auto-appended blank row before
-        // the server's all-blank rejection runs; server-side validation still
-        // enforces required-ness for any row the user actually fills (it is
-        // retained as a `Some` row on re-render). A submitted row the user
-        // ticked `_destroy` on is likewise skipped: the decoder drops destroyed
-        // rows before validation, so re-emitting client-side `required` on an
-        // empty destroyed field would let the browser's constraint validation
-        // block the next submit before the server can honor `_destroy`.
+        // Client-side `required` only on a submitted row not marked `_destroy`. On the blank
+        // template row (`row: None`) or a destroyed row it would make the browser block a submit
+        // the server accepts: blank rows are dropped and destroyed rows are not validated.
         let unmasked = self.row.is_some() && !self.is_destroyed();
         let masked;
         let options = if options.is_required() && !unmasked {
@@ -1746,8 +1686,7 @@ pub fn inputs_for<P, C: NestedChild>(
         .clone()
         .unwrap_or_else(|| format!("{collection}-rows"));
     let rows = nested.rows();
-    // Always emit at least one blank template row so the no-JS path can add a
-    // child even when the caller asked for zero.
+    // At least one blank row, so the no-JS path can always add a child.
     let blank_count = opts.blank_rows.max(1);
 
     maud::html! {
@@ -1766,33 +1705,15 @@ pub fn inputs_for<P, C: NestedChild>(
                 }
             }
             @if let Some(url) = &opts.add_row_url {
-                // Send a *fresh* unique row index with every Add-row request.
-                // `nested_row_fragment` requires the returned row's index to be
-                // unique within this form; a static request would keep reusing
-                // the same index and produce duplicate control names. Compute
-                // `max(existing data-index) + 1` from this container's rows,
-                // scoped by `#{container_id}`. That scoping is only distinct when
-                // the id is distinct: callers rendering more than one
-                // same-collection nested form on a page MUST give each a unique
-                // `container_id` (see `InputsForOptions::container_id`), because
-                // the vendored htmx 2.0.4 evaluates this `js:` `hx-vals` with no
-                // `this`/`event` bound to the button, so an id-free relative walk
-                // to the button's own container is not available. The decoder
-                // tolerates gaps, so this stays collision-free even after
-                // client-side row removals.
+                // Each Add-row request sends a fresh index, `max(data-index) + 1` over this
+                // container's rows, so control names stay unique; the decoder tolerates gaps.
+                // htmx 2.0.4 evaluates a `js:` `hx-vals` with no `this` bound, so the rows are
+                // found by `#{container_id}`: two same-collection forms on one page need distinct
+                // `container_id`s.
                 //
-                // `hx-params="index"` serializes ONLY the `index` param with
-                // the Add-row GET: per htmx semantics a bare comma-list keeps
-                // just the named params, so every parent + line-item field
-                // (and `_csrf`/submit token) is dropped from the request query
-                // string / proxy logs, avoiding leaks and URL-length limits.
-                // We can NOT use `"none"`: in the vendored htmx 2.0.4 the
-                // `hx-vals` values are merged into the request FormData BEFORE
-                // the `hx-params` filter runs (see `htmx.min.js`: the request
-                // builder does `const v=ln(j,V);let w=hn(v,r)` where `V` is the
-                // resolved `hx-vals` and `hn` is `filterValues`), so `"none"`
-                // (which returns an empty FormData) would strip the `index` we
-                // compute here too. Naming `index` keeps exactly that one value.
+                // `hx-params="index"` keeps the form's fields and tokens out of the GET query
+                // string. Not `"none"`: htmx merges `hx-vals` before the `hx-params` filter runs,
+                // so `"none"` would drop `index` too.
                 @let hx_vals = format!(
                     "js:{{\"index\": Math.max(-1, ...Array.from(document.querySelectorAll(\"#{container_id} .nested-fields__row[data-index]\")).map(function(e){{return parseInt(e.dataset.index,10);}})) + 1}}"
                 );
@@ -2004,8 +1925,7 @@ mod tests {
 
     #[test]
     fn repeated_child_values_survive_a_validation_error_re_render() {
-        // `sku` fails validation; the re-render must keep both tags, not only
-        // the last one.
+        // `sku` fails validation; the re-render must keep both tags, not just the last.
         let pairs = vec![
             p("name", "Order 1"),
             p("items[0][sku]", ""),
@@ -2069,7 +1989,7 @@ mod tests {
         assert!(!cs.is_valid());
         assert_eq!(cs.rows().len(), 1);
         assert_eq!(cs.rows()[0].errors_for("sku"), [NUL_CHARACTER_FIELD_ERROR]);
-        // The retained value the row re-renders is the cleaned text.
+        // The row re-renders the cleaned text.
         assert_eq!(cs.rows()[0].value("sku"), Some("A-1"));
         assert!(
             cs.rows()[0].errors_for("quantity").is_empty(),
@@ -2315,12 +2235,11 @@ mod tests {
         assert_eq!(cs.rows().len(), 2);
         assert!(!cs.rows()[0].is_destroyed());
         assert!(cs.rows()[1].is_destroyed());
-        // Destroyed row is still retained with its raw values for re-render.
+        // The destroyed row is still retained for re-render.
         assert_eq!(cs.rows()[1].value("sku"), Some("X"));
         assert!(cs.is_valid());
 
         let (_order, items) = cs.into_valid().unwrap_or_else(|_| panic!("valid"));
-        // Only the non-destroyed row contributes.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].sku, "A");
     }
@@ -2338,7 +2257,6 @@ mod tests {
         let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
         assert!(!cs.is_valid());
         assert!(!cs.errors_for("items[1].quantity").is_empty());
-        // The valid sibling row has no error for that key.
         assert!(cs.errors_for("items[0].quantity").is_empty());
         assert!(cs.into_valid().is_err());
     }
@@ -2355,7 +2273,6 @@ mod tests {
         let (order, items) = cs.into_valid().unwrap_or_else(|_| panic!("valid"));
         assert_eq!(order.name, "Order");
         assert_eq!(items.len(), 1);
-        // "5" coerced to i32.
         let q: i32 = items[0].quantity;
         assert_eq!(q, 5);
     }
@@ -2378,25 +2295,19 @@ mod tests {
     fn child_parse_failure_keys_error_to_offending_field() {
         let pairs = vec![
             p("name", "Order"),
-            // `sku` is filled, so the row is NOT all-blank (it is kept, not
-            // dropped) — contrast `all_blank_template_row_is_ignored`, where an
-            // empty row is dropped entirely with no error.
+            // `sku` is filled, so the row is not all-blank and is kept.
             p("items[0][sku]", "A"),
-            // Non-numeric quantity: hard parse failure for i32, before
-            // validation. `serde_path_to_error` attributes it to `quantity`.
+            // A parse failure before validation.
             p("items[0][quantity]", "not-a-number"),
         ];
         let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
         assert!(!cs.is_valid());
         assert_eq!(cs.rows().len(), 1);
-        // Raw values retained for re-render.
         assert_eq!(cs.rows()[0].value("sku"), Some("A"));
         assert_eq!(cs.rows()[0].value("quantity"), Some("not-a-number"));
-        // The parse error is keyed to the offending subfield, so it renders next
-        // to the bad input via `errors_for("quantity")` on that row.
         assert!(!cs.errors_for("items[0].quantity").is_empty());
         assert!(!cs.rows()[0].errors_for("quantity").is_empty());
-        // It is NOT stored under the row-level "" key anymore.
+        // Not under the row-level "" key.
         assert!(cs.rows()[0].errors_for("").is_empty());
         assert!(cs.errors_for("items[0]").is_empty());
         assert!(cs.into_valid().is_err());
@@ -2404,13 +2315,8 @@ mod tests {
 
     #[test]
     fn child_parse_failure_on_blank_typed_field_keys_error_to_field() {
-        // The Codex case: a row with `sku` filled but the required TYPED
-        // `quantity` present-but-blank. The blank-optional retry inside
-        // `decode_urlencoded_dropping_blank_optional_fields` DROPS the blank
-        // `quantity=` pair, so serde reports `missing field \`quantity\`` at the
-        // ROW ROOT (empty path). The field-recovery re-decode over the original
-        // (blank-retained) pairs must still key the error to `quantity` so it
-        // renders next to the blank input rather than the row-level "" key.
+        // The blank-dropping decode drops `quantity=`, so serde reports `missing field` at the row
+        // root with no path. The error must still be keyed to `quantity`.
         let pairs = vec![
             p("name", "Order"),
             p("items[0][sku]", "A"),
@@ -2419,10 +2325,9 @@ mod tests {
         let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
         assert!(!cs.is_valid());
         assert_eq!(cs.rows().len(), 1);
-        // Keyed to the offending subfield, so it renders next to the blank input.
         assert!(!cs.errors_for("items[0].quantity").is_empty());
         assert!(!cs.rows()[0].errors_for("quantity").is_empty());
-        // NOT stored under the row-level "" / `items[0]` key.
+        // Not under the row-level "" / `items[0]` key.
         assert!(cs.rows()[0].errors_for("").is_empty());
         assert!(cs.errors_for("items[0]").is_empty());
         assert!(cs.into_valid().is_err());
@@ -2430,18 +2335,12 @@ mod tests {
 
     #[test]
     fn child_row_with_blank_optional_typed_field_still_decodes_valid() {
-        // Regression guard for the fix: a row with the required field filled and
-        // an OPTIONAL TYPED field present-but-blank (`weight=`) must still decode
-        // to a VALID row. The primary blank-dropping decode drops the blank
-        // `weight=` pair so it resolves to `None` and the decode SUCCEEDS — the
-        // field-recovery re-decode (which runs only on the failed path) is never
-        // reached, and the row must stay valid.
+        // A blank optional typed field (`weight=`) decodes to `None`; the field-recovery path,
+        // which runs only on failure, must not make the row invalid.
         #[derive(serde::Deserialize, validator::Validate)]
         struct Widget {
             #[validate(length(min = 1, message = "label required"))]
             label: String,
-            // Typed optional: a blank submission is dropped to `None` by the
-            // blank-optional decode (an empty string is not a valid `i32`).
             weight: Option<i32>,
         }
         impl NestedChild for Widget {
@@ -2466,25 +2365,16 @@ mod tests {
 
     #[test]
     fn child_optional_blank_before_required_blank_keys_error_to_required_field() {
-        // Codex P2 follow-on: a child whose OPTIONAL typed field (`weight:
-        // Option<i32>`) is declared BEFORE a REQUIRED typed field (`quantity:
-        // i32`), with BOTH submitted blank. The blank-dropping decode drops both
-        // blank pairs and ends at `missing field \`quantity\`` — the required
-        // one. A raw non-dropping re-decode, by contrast, trips FIRST on the
-        // harmless optional `weight=` (parsing `""` as an `i32` at `.weight`), so
-        // it would mis-key the error to `weight`. The field-recovery therefore
-        // prefers the PRIMARY error's missing-field message over the raw
-        // re-decode, so the inline error lands on `quantity`, not `weight`.
+        // Both typed fields are blank, the optional one declared first. A raw re-decode would trip
+        // on `weight=` first and mis-key the error, so recovery must prefer the primary error's
+        // `missing field \`quantity\``.
         #[derive(serde::Deserialize, validator::Validate)]
         struct Part {
             #[validate(length(min = 1, message = "sku required"))]
             sku: String,
-            // Optional, declared FIRST — a blank submission is harmless (→ None).
-            // Never read on this invalid-row path (the row fails to fully decode),
-            // so silence the dead-field lint.
+            // Never read: the row fails to decode.
             #[allow(dead_code)]
             weight: Option<i32>,
-            // Required, declared AFTER — a blank submission is the real error.
             #[validate(range(min = 1, message = "quantity must be >= 1"))]
             quantity: i32,
         }
@@ -2494,7 +2384,7 @@ mod tests {
 
         let pairs = vec![
             p("name", "Order"),
-            // `sku` filled so the row is retained (not all-blank).
+            // `sku` filled so the row is not all-blank.
             p("items[0][sku]", "Widget"),
             p("items[0][weight]", ""),
             p("items[0][quantity]", ""),
@@ -2502,13 +2392,10 @@ mod tests {
         let cs = decode_nested_urlencoded::<Order, Part>(&pairs).expect("parent decodes");
         assert!(!cs.is_valid());
         assert_eq!(cs.rows().len(), 1);
-        // The error is keyed to the truly-missing REQUIRED field…
         assert!(!cs.errors_for("items[0].quantity").is_empty());
         assert!(!cs.rows()[0].errors_for("quantity").is_empty());
-        // …and NOT to the harmless OPTIONAL blank the raw re-decode trips on.
         assert!(cs.errors_for("items[0].weight").is_empty());
         assert!(cs.rows()[0].errors_for("weight").is_empty());
-        // Not stored under the row-level "" / `items[0]` key either.
         assert!(cs.rows()[0].errors_for("").is_empty());
         assert!(cs.errors_for("items[0]").is_empty());
         assert!(cs.into_valid().is_err());
@@ -2545,16 +2432,14 @@ mod tests {
     fn all_blank_template_row_is_ignored() {
         let pairs = vec![
             p("name", "Order"),
-            // One filled, valid child row.
             p("contacts[0][name]", "Alice"),
             p("contacts[0][nickname]", "Al"),
-            // The auto-rendered blank template row: every subfield empty.
+            // The blank template row.
             p("contacts[1][name]", ""),
             p("contacts[1][nickname]", ""),
         ];
         let cs = decode_nested_urlencoded::<Order, Contact>(&pairs).expect("parent decodes");
         assert!(cs.is_valid());
-        // The blank template row was dropped entirely — only the real row remains.
         assert_eq!(cs.rows().len(), 1);
         assert_eq!(cs.rows()[0].value("name"), Some("Alice"));
 
@@ -2570,7 +2455,6 @@ mod tests {
         let pairs = vec![
             p("name", "Order"),
             p("contacts[0][name]", "Bob"),
-            // Whitespace-only + empty: still all-blank after trimming.
             p("contacts[1][name]", "   "),
             p("contacts[1][nickname]", ""),
         ];
@@ -2590,17 +2474,14 @@ mod tests {
     fn partially_filled_row_with_missing_required_still_errors() {
         let pairs = vec![
             p("name", "Order"),
-            // Required `name` left blank, but the optional `nickname` is filled,
-            // so the row is NOT all-blank: it is kept and must error.
+            // Required `name` blank, optional `nickname` filled: not all-blank.
             p("contacts[0][name]", ""),
             p("contacts[0][nickname]", "Ally"),
         ];
         let cs = decode_nested_urlencoded::<Order, Contact>(&pairs).expect("parent decodes");
         assert!(!cs.is_valid());
         assert_eq!(cs.rows().len(), 1);
-        // The kept row surfaces the required-field error under its combined key.
         assert!(!cs.errors_for("contacts[0].name").is_empty());
-        // Raw values retained for re-render.
         assert_eq!(cs.rows()[0].value("nickname"), Some("Ally"));
         assert!(cs.into_valid().is_err());
     }
@@ -2645,9 +2526,8 @@ mod tests {
 
     #[test]
     fn blank_changeset_is_valid_with_no_rows_or_errors() {
-        // The initial `new`-page path: the required parent `name` is still
-        // empty, but `blank` does NOT validate, so nothing errors before the
-        // user types (unlike `decode_nested_urlencoded`).
+        // `blank` does not validate, so an empty required `name` shows no error before the user
+        // types.
         let cs = NestedChangeset::<Order, LineItem>::blank(Order {
             name: String::new(),
         });
@@ -2664,9 +2544,6 @@ mod tests {
 
     #[test]
     fn decoded_empty_parent_errors_unlike_blank() {
-        // Contrast the POST decode path: it DOES validate, so the same empty
-        // required parent surfaces an error — exactly what `blank` avoids on the
-        // initial GET render.
         let cs =
             decode_nested_urlencoded::<Order, LineItem>(&[p("name", "")]).expect("parent decodes");
         assert!(!cs.is_valid());
@@ -2677,8 +2554,6 @@ mod tests {
 
     #[test]
     fn seeded_changeset_pre_populates_one_row_per_child() {
-        // The initial `edit`-page path: seed the changeset with the two existing
-        // children so an edit form can display/preserve them before first submit.
         let cs = NestedChangeset::seeded(
             Order {
                 name: "Existing order".to_owned(),
@@ -2695,15 +2570,13 @@ mod tests {
             ],
         );
 
-        // One row per seeded child, each pre-filled with its serialized values —
-        // the same string representation the decoder populates.
+        // Pre-filled with the same string form the decoder populates.
         assert_eq!(cs.rows().len(), 2);
         assert_eq!(cs.rows()[0].value("sku"), Some("A-1"));
         assert_eq!(cs.rows()[0].value("quantity"), Some("2"));
         assert_eq!(cs.rows()[1].value("sku"), Some("B-2"));
         assert_eq!(cs.rows()[1].value("quantity"), Some("3"));
 
-        // Non-validating and clean: no errors, no destroyed rows.
         assert!(cs.is_valid());
         assert!(cs.errors_for("name").is_empty());
         assert!(cs.errors_for("items[0].sku").is_empty());
@@ -2711,7 +2584,6 @@ mod tests {
         assert!(!cs.rows()[0].is_destroyed());
         assert!(!cs.rows()[1].is_destroyed());
 
-        // `into_valid` returns the seeded parent + children unchanged.
         let (order, items) = cs
             .into_valid()
             .unwrap_or_else(|_| panic!("seeded changeset is valid"));
@@ -2725,9 +2597,6 @@ mod tests {
 
     #[test]
     fn seeded_changeset_with_no_children_is_valid_and_empty() {
-        // Seeding zero children behaves like `blank` — a valid changeset with no
-        // rows — so an edit form for a parent that currently has no children is
-        // handled uniformly.
         let cs = NestedChangeset::<Order, LineItem>::seeded(
             Order {
                 name: "Empty".to_owned(),
@@ -2799,7 +2668,6 @@ mod maud_tests {
 
         assert!(html.contains(r#"name="items[0][sku]""#), "{html}");
         assert!(html.contains(r#"name="items[1][sku]""#), "{html}");
-        // Pre-filled values from the re-rendered changeset.
         assert!(html.contains(r#"value="A-1""#), "{html}");
         assert!(html.contains(r#"value="B-2""#), "{html}");
         // Container defaults to "{collection}-rows".
@@ -2816,7 +2684,6 @@ mod maud_tests {
         assert!(html.contains(r#"id="items-1-quantity-error""#), "{html}");
         assert!(html.contains(r#"role="alert""#), "{html}");
         assert!(html.contains("quantity must be &gt;= 1"), "{html}");
-        // The valid sibling row's quantity has no error block.
         assert!(!html.contains(r#"id="items-0-quantity-error""#), "{html}");
     }
 
@@ -2855,13 +2722,11 @@ mod maud_tests {
         let opts = InputsForOptions::default();
         let html = inputs_for(&cs, &opts, render_row).into_string();
 
-        // Submitted rows (indices 0, 1) keep the client-side constraint.
         let submitted = tag_with_name(&html, "items[0][sku]");
         assert!(submitted.contains(" required"), "{submitted}");
         assert!(submitted.contains(r#"aria-required="true""#), "{submitted}");
 
-        // The appended blank template row (index 2) omits both, so it is
-        // leaveable-empty and does not block submitting the form.
+        // The blank template row (index 2) omits both.
         let blank = tag_with_name(&html, "items[2][sku]");
         assert!(!blank.contains("required"), "{blank}");
         assert!(!blank.contains("aria-required"), "{blank}");
@@ -2876,9 +2741,8 @@ mod maud_tests {
     /// the constraint.
     #[test]
     fn destroyed_row_omits_client_required_while_submitted_row_keeps_it() {
-        // Row 0: an ordinary submitted row. Row 1: the user ticked Remove on a
-        // row whose required `sku` is empty (it is retained because `quantity`
-        // is non-blank, so the all-blank rejection does not drop it).
+        // Row 1 is destroyed with an empty required `sku`; its non-blank `quantity` keeps it from
+        // being dropped as all-blank.
         let pairs = vec![
             p("name", "Order 1"),
             p("items[0][sku]", "A-1"),
@@ -2891,14 +2755,11 @@ mod maud_tests {
         assert!(cs.rows()[1].is_destroyed());
         let html = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
 
-        // The non-destroyed submitted row keeps the client-side constraint.
         let kept = tag_with_name(&html, "items[0][sku]");
         assert!(kept.contains(" required"), "{kept}");
         assert!(kept.contains(r#"aria-required="true""#), "{kept}");
 
-        // The destroyed row omits both, exactly like a blank template row, so a
-        // form carrying an empty required field on a to-be-removed row still
-        // submits and the server can honor `_destroy`.
+        // The destroyed row omits both, like a blank template row.
         let destroyed = tag_with_name(&html, "items[1][sku]");
         assert!(!destroyed.contains("required"), "{destroyed}");
         assert!(!destroyed.contains("aria-required"), "{destroyed}");
@@ -2935,8 +2796,6 @@ mod maud_tests {
         let none = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
         assert!(!none.contains("Add row"), "{none}");
 
-        // With URL: button serializes only the `index` param (`hx-params="index"`)
-        // and uses a beforeend swap.
         let opts = InputsForOptions {
             add_row_url: Some("/orders/line-item-row".into()),
             ..InputsForOptions::default()
@@ -2966,17 +2825,14 @@ mod maud_tests {
         };
         let html = inputs_for(&cs, &opts, render_row).into_string();
 
-        // Pre-existing htmx wiring is preserved.
         assert!(html.contains(r#"hx-get="/orders/line-item-row""#), "{html}");
         assert!(html.contains(r#"hx-swap="beforeend""#), "{html}");
         assert!(html.contains(r#"hx-params="index""#), "{html}");
 
-        // A JS-computed `hx-vals` that sends a fresh `index`…
         assert!(html.contains("hx-vals="), "{html}");
         assert!(html.contains("Math.max(-1"), "{html}");
-        // …referencing the `index` param and reading each row's `data-index`…
         assert!(html.contains("parseInt(e.dataset.index,10)"), "{html}");
-        // …via a selector scoped to THIS form's container id.
+        // Scoped to this form's container id.
         assert!(
             html.contains("#items-rows .nested-fields__row[data-index]"),
             "{html}"
@@ -2994,27 +2850,23 @@ mod maud_tests {
         let cs = two_row_changeset();
         let opts = InputsForOptions {
             add_row_url: Some("/orders/line-item-row".into()),
-            // A second same-collection form on the page would pass its own id;
-            // this one deliberately avoids containing the `items-rows` default so
-            // the negative assertions below are exact substring checks.
+            // Does not contain the `items-rows` default, so the negative assertions below are
+            // exact substring checks.
             container_id: Some("shipping-lines".into()),
             ..InputsForOptions::default()
         };
         let html = inputs_for(&cs, &opts, render_row).into_string();
 
-        // The container carries the custom id, not the `{collection}-rows` default.
         assert!(
             html.contains(r#"<div id="shipping-lines" class="nested-fields">"#),
             "{html}"
         );
-        // The Add-row button targets the custom container…
         assert!(html.contains(r##"hx-target="#shipping-lines""##), "{html}");
-        // …and its index scan reads that same custom container's rows…
         assert!(
             html.contains("#shipping-lines .nested-fields__row[data-index]"),
             "{html}"
         );
-        // …with no leftover reference to the default id.
+        // No leftover reference to the default id.
         assert!(!html.contains("items-rows .nested-fields__row"), "{html}");
         assert!(!html.contains(r##"hx-target="#items-rows""##), "{html}");
     }
@@ -3029,7 +2881,6 @@ mod maud_tests {
         ];
         let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
         let html = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
-        // The destroyed row's checkbox is checked.
         assert!(
             html.contains(r#"name="items[0][_destroy]" value="1" checked"#),
             "{html}"
@@ -3041,11 +2892,10 @@ mod maud_tests {
         let html = nested_row_fragment::<LineItem>(7, render_row).into_string();
         assert!(html.contains(r#"data-index="7""#), "{html}");
         assert!(html.contains(r#"name="items[7][sku]""#), "{html}");
-        // Exactly one row wrapper.
         assert_eq!(html.matches("nested-fields__row").count(), 1, "{html}");
     }
 
-    // ── Fix 1: form_tag preserves the captured CSRF/submit-token fields ─
+    // ── form_tag preserves the captured CSRF/submit-token fields ─────────
 
     /// `NestedChangesetForm::form_tag` must emit the CSRF hidden input under the
     /// **captured/configured** field name — NOT the standalone `form_tag`'s
@@ -3065,12 +2915,11 @@ mod maud_tests {
             .form_tag("/orders", "post", maud::html! {})
             .into_string();
 
-        // The captured custom field name carries the token…
         assert!(
             html.contains(r#"name="authenticity_token" value="tok-123""#),
             "{html}"
         );
-        // …and the hardcoded default the standalone `form_tag` would emit does not.
+        // Not the default the standalone `form_tag` emits.
         assert!(!html.contains(r#"name="_csrf""#), "{html}");
         assert!(html.contains(r#"action="/orders""#), "{html}");
         assert!(html.contains(r#"method="post""#), "{html}");
@@ -3105,7 +2954,7 @@ mod maud_tests {
         assert!(!html.contains(r#"name="_csrf""#), "{html}");
     }
 
-    // ── Fix 2: blank render shows no premature parent errors ────────────
+    // ── blank render shows no premature parent errors ─────────────────
 
     /// The initial `new`-page render from `blank`: the required parent field is
     /// empty but un-validated, so no error message or `aria-invalid="true"`
@@ -3157,7 +3006,7 @@ mod maud_tests {
         assert!(html.contains("name required"), "{html}");
     }
 
-    // ── Fix 3: blank forms can carry the current submit token ───────────
+    // ── blank forms can carry the current submit token ─────────────────
 
     /// A `blank` form given a submit token (and a custom submit field name) emits
     /// the hidden submit-token input on the initial GET render, so the FIRST
@@ -3229,12 +3078,11 @@ mod maud_tests {
         );
         let html = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
 
-        // Both seeded rows render their indexed inputs with pre-filled values.
         assert!(html.contains(r#"name="items[0][sku]""#), "{html}");
         assert!(html.contains(r#"value="A-1""#), "{html}");
         assert!(html.contains(r#"name="items[1][sku]""#), "{html}");
         assert!(html.contains(r#"value="B-2""#), "{html}");
-        // The trailing blank template row is still appended (index 2).
+        // The blank template row is still appended.
         assert!(html.contains(r#"data-index="2""#), "{html}");
         assert!(html.contains(r#"name="items[2][sku]""#), "{html}");
     }

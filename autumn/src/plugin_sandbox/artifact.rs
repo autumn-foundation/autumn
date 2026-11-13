@@ -255,20 +255,12 @@ impl SandboxArtifact {
     pub fn seal(mut manifest: SandboxManifest, module: Vec<u8>) -> Result<Self, ArtifactError> {
         check_module(&module)?;
         manifest.sha256 = Self::digest(&module);
-        // Gate before rendering, not after. `parse` below is what makes the
-        // manifest legal, but it only sees the TOML — so serializing first
-        // means a manifest that is refusable from its own fields (over
-        // `MAX_ROUTES`, an oversized name or prefix) is expanded into a second,
-        // larger copy on the way to being rejected. `SandboxManifest`'s fields
-        // are public and this is a public packaging entry point, so the caller
-        // chooses that size. Validation reads the fields in place and refuses
-        // without allocating anything proportional to them.
+        // Validate the fields before rendering: `to_toml` on a caller-built manifest that is
+        // already refusable (over `MAX_ROUTES`, an oversized name or prefix) would allocate a
+        // second, larger copy only to reject it.
         manifest.validate()?;
-        // Re-validate through the public constructor so a hand-built manifest
-        // can never enter an artifact without passing the same gate a parsed
-        // one does. Kept as well as the check above: this one also covers what
-        // only the round trip can — a field that serializes to something the
-        // parser reads back differently.
+        // Re-parse so a hand-built manifest passes the same gate a parsed one does. This also
+        // catches a field that serializes to something the parser reads back differently.
         let manifest = SandboxManifest::parse(&manifest.to_toml()?)?;
         Ok(Self { manifest, module })
     }
@@ -394,11 +386,8 @@ impl SandboxArtifact {
             std::str::from_utf8(manifest_bytes).map_err(|_| ArtifactError::ManifestNotUtf8)?;
         let manifest = SandboxManifest::parse(manifest_src)?;
 
-        // Checked on the borrowed slice, *then* cloned: `to_vec` first would
-        // copy a multi-gigabyte payload into a second allocation before the
-        // ceiling that exists to refuse it ever ran, so the refusal itself was
-        // the expensive part. The caller already holds these bytes; the point
-        // of the ceiling is not to hold them twice.
+        // Check the borrowed slice before cloning, so an oversized payload is refused without
+        // first being copied into a second allocation.
         let module = body.get(manifest_len..).unwrap_or_default();
         check_module(module)?;
         let module = module.to_vec();
@@ -433,17 +422,12 @@ impl SandboxArtifact {
         use std::io::Write as _;
 
         let bytes = self.to_bytes()?;
-        // Write beside the target and rename, so a failure part-way through
-        // cannot leave a truncated artifact where a good one was. A rename is
-        // atomic on every platform this runs on.
+        // Write beside the target and rename (atomic), so a failure part-way through cannot leave
+        // a truncated artifact where a good one was.
         //
-        // The temporary name is unique *and* the file is created with
-        // `create_new`, which is the half that matters: a predictable sibling
-        // that `std::fs::write` opens is a file it will truncate and a symlink
-        // it will follow, so packaging in a checkout the author did not write
-        // became a write primitive aimed at anything the user can write.
-        // `create_new` fails on anything already there — a symlink included —
-        // rather than resolving it.
+        // The temporary name is unique, and `create_new` fails on anything already there,
+        // symlinks included. A predictable name opened with `std::fs::write` would truncate or
+        // follow whatever an untrusted checkout planted there.
         let unique = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
         let temporary = path.with_extension(format!(
             "autumn-plugin-tmp-{pid}-{unique}",
@@ -462,9 +446,8 @@ impl SandboxArtifact {
             .open(&temporary)
             .map_err(|err| io(&temporary, &err))?;
 
-        // From here the temporary exists, so every failure has to remove it —
-        // leaving debris beside the artifact would make the next run's
-        // `create_new` the thing that fails.
+        // From here every failure removes the temporary, or the next run's `create_new` would
+        // fail on the leftover.
         if let Err(err) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
             drop(file);
             let _ = std::fs::remove_file(&temporary);
@@ -515,12 +498,9 @@ pub fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, ArtifactError> {
     let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0).min(max));
     let read = file
         .by_ref()
-        // Reading one past the cap is how "larger than the cap" is detected.
-        // At `usize::MAX` there is nothing past it to detect and the addition
-        // itself overflows: a debug build panics, and a release build wraps the
-        // limit to zero and returns an empty read that looks like a success.
-        // Saturating is the honest answer — at the top of the range the cap
-        // cannot be exceeded, so the read is simply unbounded.
+        // Reading one byte past the cap detects an oversized file. At `usize::MAX` the `+ 1`
+        // would overflow (wrapping the limit to zero in release), so saturate: that cap cannot
+        // be exceeded anyway.
         .take((max as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|err| io(&err))?;
@@ -591,18 +571,9 @@ path = "/hello/greet"
 
     #[test]
     fn splitting_a_container_on_a_nul_byte_truncates_it_at_the_version_field() {
-        // Not a property of the reader — a property of the format, pinned here
-        // because the fuzz target depends on it. `fuzz_targets/sandbox.rs` used
-        // to split its input on the first NUL and hand the first half to the
-        // container reader. Every v1 header writes the format version as a
-        // little-endian `u32`, so `\x01\0\0\0` sits at offset 8 and the first
-        // NUL of any well-formed container is at offset 9: the reader could
-        // never see past the version field, and the manifest length, manifest
-        // and digest that target exists to fuzz were unreachable.
-        //
-        // If the format ever changes so that a container's first NUL moves,
-        // this is the test that should be read before assuming the framing is
-        // safe again.
+        // The fuzz target must not split its input on the first NUL: the format version is a
+        // little-endian `u32` at offset 8, so the first NUL of every well-formed container is
+        // at offset 9 and the half before it never reaches the manifest or digest.
         let bytes = sealed().to_bytes().expect("packs");
         assert_eq!(
             bytes.iter().position(|byte| *byte == 0),
@@ -622,7 +593,6 @@ path = "/hello/greet"
             "the split half must be too short to be read as a container",
         );
 
-        // And the whole thing reads, which is what the target now receives.
         SandboxArtifact::read(&bytes).expect("the unsplit container reads");
     }
 
@@ -637,8 +607,7 @@ path = "/hello/greet"
 
     #[test]
     fn the_manifest_is_readable_at_a_fixed_offset() {
-        // The container is deliberately not an archive format: a reviewer with
-        // `head -c` can see the manifest without any tooling at all.
+        // A reviewer with `head -c` can read the manifest without any tooling.
         let bytes = sealed().to_bytes().expect("packs");
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("name = \"autumn-plugin-hello\""), "{text}");
@@ -656,10 +625,7 @@ path = "/hello/greet"
 
     #[test]
     fn an_unlimited_read_cap_reads_the_file_rather_than_nothing() {
-        // `usize::MAX` is how a caller says "no limit". The cap is applied by
-        // reading one byte past it, and that addition used to overflow: debug
-        // panicked, release wrapped the limit to zero and handed back an empty
-        // `Ok` — the worst of the three outcomes, because it looks like data.
+        // `usize::MAX` means "no limit"; the read must not come back empty.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("small.autumn-plugin");
         std::fs::write(&path, b"some bytes").expect("writes");
@@ -670,39 +636,30 @@ path = "/hello/greet"
 
     #[test]
     fn the_artifact_digest_moves_when_the_grant_does_and_the_module_digest_does_not() {
-        // The guide tells an operator that reviewing an artifact means
-        // recording the digest `inspect` printed and comparing it against what
-        // the deployment loads. The module digest cannot carry that promise:
-        // what is reviewed is the prefix, the routes, the capabilities and the
-        // ceilings, and every one of those lives in the manifest. Rewrite them
-        // and the module digest is still correct — it is still describing the
-        // same bytes — so a wider grant matches the number that was written
-        // down.
+        // Operators review the prefix, routes, capabilities and ceilings, all in the manifest.
+        // A rewritten manifest keeps the module digest, so the review identity must cover it.
         let reviewed = sealed();
         let reviewed_identity = reviewed.artifact_digest().expect("digests");
 
-        // The same module, one word of the grant different: a prefix that
-        // reaches somewhere else in the host's origin.
+        // Same module, a prefix that reaches somewhere else in the host's origin.
         let widened = SandboxManifest::parse(
             &manifest_toml(&SandboxArtifact::digest(EMPTY_MODULE)).replace("/hello", "/admin"),
         )
         .expect("valid manifest");
         let widened = SandboxArtifact::seal(widened, EMPTY_MODULE.to_vec()).expect("seals");
 
-        // The module digest is identical, and honestly so — same bytes.
         assert_eq!(
             widened.manifest().sha256,
             reviewed.manifest().sha256,
             "the module did not change, so its digest must not",
         );
-        // …which is exactly why it cannot be the review identity.
         assert_ne!(
             widened.artifact_digest().expect("digests"),
             reviewed_identity,
             "a rewritten grant kept the identity an operator recorded",
         );
 
-        // A ceiling is part of the grant too, not just the routing.
+        // A ceiling is part of the grant too.
         let mut raised =
             SandboxManifest::parse(&manifest_toml(&SandboxArtifact::digest(EMPTY_MODULE)))
                 .expect("valid manifest");
@@ -714,8 +671,6 @@ path = "/hello/greet"
             "a raised ceiling kept the identity an operator recorded",
         );
 
-        // And it is stable: the same artifact through the container and back
-        // reviews as the same thing, or an operator could never compare it.
         let round_tripped =
             SandboxArtifact::read(&reviewed.to_bytes().expect("packs")).expect("reads back");
         assert_eq!(
@@ -762,8 +717,7 @@ path = "/hello/greet"
         for cut in 0..bytes.len() {
             let err = SandboxArtifact::read(&bytes[..cut])
                 .expect_err("a truncated container must never parse");
-            // Any refusal will do; what must never happen is a panic or a
-            // successful parse of a partial artifact.
+            // Any refusal will do; a panic or a parse of a partial artifact will not.
             let _ = err.to_string();
         }
     }
@@ -773,8 +727,7 @@ path = "/hello/greet"
         let mut bytes = sealed().to_bytes().expect("packs");
         bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = SandboxArtifact::read(&bytes).expect_err("must be caught");
-        // The ceiling check runs before the slice, so a 4 GiB claim is refused
-        // without the reader ever sizing a buffer from it.
+        // The ceiling check runs before the slice, so a 4 GiB claim never sizes a buffer.
         assert!(
             matches!(err, ArtifactError::ManifestTooLarge { .. }),
             "{err}"
@@ -816,9 +769,8 @@ path = "/hello/greet"
 
     #[test]
     fn a_manifest_that_does_not_validate_is_refused_on_read() {
-        // A hand-built container, which is the only way this can happen: the
-        // manifest is not a public field, so nothing can widen a prefix on a
-        // sealed artifact after the fact.
+        // Only a hand-built container can carry this: the manifest is not a public field, so a
+        // sealed artifact's prefix cannot be widened after the fact.
         let manifest = manifest_toml(&SandboxArtifact::digest(EMPTY_MODULE))
             .replace(r#"prefix = "/hello""#, r#"prefix = "/""#);
         let mut bytes = Vec::new();
@@ -834,10 +786,7 @@ path = "/hello/greet"
 
     #[test]
     fn an_oversized_file_is_refused_before_it_is_read_into_memory() {
-        // `std::fs::read` sizes its buffer from the file, so the container
-        // ceilings inside `read()` are applied to bytes the process already
-        // allocated. A crafted multi-gigabyte artifact would exhaust the
-        // inspecting process instead of being refused by it.
+        // `std::fs::read` would allocate the whole file before the container ceilings ran.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("huge.autumn-plugin");
         let file = std::fs::File::create(&path).expect("creates");
@@ -855,9 +804,8 @@ path = "/hello/greet"
 
     #[test]
     fn a_missing_file_is_distinguishable_from_an_unreadable_one() {
-        // "this optional plugin is not installed" is a skip; "this plugin is
-        // installed and unreadable" is a boot failure. A caller cannot tell
-        // those apart from a stringified error.
+        // A missing optional plugin is a skip; an unreadable installed one is a boot failure.
+        // Callers need the `ErrorKind` to tell them apart.
         let dir = tempfile::tempdir().expect("tempdir");
         let err = SandboxArtifact::read_file(&dir.path().join("absent.autumn-plugin"))
             .expect_err("must fail");
@@ -876,10 +824,8 @@ path = "/hello/greet"
     #[cfg(unix)]
     #[test]
     fn writing_never_follows_something_already_sitting_at_the_temporary_path() {
-        // The temporary sibling had a name anyone could predict, and
-        // `std::fs::write` truncates through a symlink. In a checkout the
-        // author did not write, that turns `autumn plugin package` into a
-        // write primitive aimed at any file the user can write.
+        // A symlink at a predictable temporary name must not let packaging overwrite the file
+        // it points at.
         let dir = tempfile::tempdir().expect("tempdir");
         let victim = dir.path().join("precious");
         std::fs::write(&victim, b"do not clobber me").expect("victim written");
@@ -888,8 +834,7 @@ path = "/hello/greet"
         let predictable = path.with_extension("autumn-plugin-tmp");
         std::os::unix::fs::symlink(&victim, &predictable).expect("symlink");
 
-        // Packaging may succeed or refuse, but it must not write through the
-        // link: the victim's contents are what this is about.
+        // Packaging may succeed or refuse; only the victim's contents matter.
         let _ = sealed().write_file(&path);
         assert_eq!(
             std::fs::read(&victim).expect("victim still readable"),
@@ -903,7 +848,6 @@ path = "/hello/greet"
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("hello.autumn-plugin");
         sealed().write_file(&path).expect("writes");
-        // A second write lands atomically over the first.
         sealed().write_file(&path).expect("rewrites");
         assert!(SandboxArtifact::read_file(&path).is_ok());
         assert!(

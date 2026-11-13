@@ -111,9 +111,8 @@ pub fn physical_table(plugin: &str, table: &str) -> Option<String> {
         return None;
     }
     let plugin = escape_identifier_segment(plugin)?;
-    // `__` is the separator precisely because `escape_identifier_segment` can
-    // never emit it: it emits `_` only as the first character of a three-byte
-    // `_xx` escape, and `x` is a hex digit rather than `_`.
+    // `escape_identifier_segment` never emits `__`: it emits `_` only to start a `_xx`
+    // hex escape, so `__` marks the split point unambiguously.
     let name = format!("{TABLE_PREFIX}{plugin}__{table}");
     (name.len() <= MAX_IDENTIFIER_LEN).then_some(name)
 }
@@ -125,8 +124,7 @@ pub fn physical_table(plugin: &str, table: &str) -> Option<String> {
 /// including `_` itself: without escaping `_`, the plugin `a_b` and the plugin
 /// `a-b` would both come out `a_b`.
 fn escape_identifier_segment(name: &str) -> Option<String> {
-    // The manifest's own name charset. Checked rather than assumed, for the
-    // same reason the table name is.
+    // The manifest's name charset, re-checked rather than assumed, like the table name.
     if name.is_empty()
         || !name
             .bytes()
@@ -145,9 +143,8 @@ fn escape_identifier_segment(name: &str) -> Option<String> {
             let _ = write!(out, "{byte:02x}");
         }
     }
-    // A derived name must still start with a letter: a plugin named `1shop`
-    // would otherwise produce a table beginning with a digit. `TABLE_PREFIX`
-    // supplies that, so only the total length is left to check, in the caller.
+    // The segment may start with a digit (`1shop`); `TABLE_PREFIX` makes the full name
+    // start with a letter. The caller checks the total length.
     Some(out)
 }
 
@@ -431,9 +428,8 @@ pub(super) fn perform(
         CapabilityCall::DbInsert { row, .. } => match validated_row(row) {
             Err(result) => result(id),
             Ok(row) => match store.insert(&scope, row) {
-                // The write has happened; an id the guest could never use to
-                // address the row is the store's fault, and is reported at the
-                // operation that caused it.
+                // The write has happened, but the guest could never address the row by
+                // this id. Report it here, at the operation that caused it.
                 Ok(row_id) if check_row_id(&row_id).is_err() => CallResult::denied(
                     id,
                     DenialReason::ResultRejected,
@@ -459,11 +455,9 @@ pub(super) fn perform(
                     if let Err(detail) = check_stored_rows(found.iter()) {
                         return CallResult::denied(id, DenialReason::ResultRejected, detail);
                     }
-                    // Through the same bound as a query, though a single row is
-                    // under `MAX_ROW_BYTES` and therefore always survives it: a
-                    // store is an embedder's implementation, and a row it
-                    // returns larger than one it would have accepted is exactly
-                    // the case that must not reach the reply queue.
+                    // A legal row always fits this bound. It catches a store (embedder code)
+                    // returning a row larger than the host would have accepted, which must
+                    // not reach the reply queue.
                     let (rows, truncated) = super::bounded_rows(found.into_iter().collect());
                     CallResult::Ok {
                         id,
@@ -486,10 +480,8 @@ pub(super) fn perform(
                 {
                     return result(id);
                 }
-                // A limit of zero means "as many as the quota allows", which is
-                // what a guest that omits the field gets. Anything larger is
-                // clamped rather than refused: the quota is the operator's
-                // ceiling, and a plugin asking past it should get the ceiling.
+                // Zero (the field omitted) means "as many as the quota allows". A larger
+                // limit is clamped to the quota, not refused.
                 let want = if *limit == 0 {
                     row_limit
                 } else {
@@ -507,19 +499,13 @@ pub(super) fn perform(
                             return CallResult::denied(id, DenialReason::ResultRejected, detail);
                         }
                         let mut rows = page.rows;
-                        // Recorded before the cut, not inferred after it. A
-                        // store that returned more than `want` and called the
-                        // page complete would otherwise have the excess removed
-                        // here and still be reported as complete, so the guest
-                        // would treat a shortened page as the end of the table
-                        // and never ask for the rest.
+                        // Recorded before the cut: a store that returned more than `want`
+                        // and called the page complete must still report it truncated, or
+                        // the guest takes the shortened page for the end of the table.
                         let over_asked = rows.len() > want;
                         rows.truncate(want);
-                        // The store's own report, OR'd with a re-check of what
-                        // it handed back: the trait is an embedder's to
-                        // implement, so "the host does not hold more than this"
-                        // cannot rest on someone else's loop honouring the
-                        // budget it was given.
+                        // Re-check the byte budget: the store is embedder code and may not
+                        // have honoured it.
                         let (rows, cut) = super::bounded_rows(rows);
                         CallResult::Ok {
                             id,
@@ -572,20 +558,11 @@ type Denial = Box<dyn FnOnce(u64) -> CallResult>;
 
 /// The checks of [`validated_row`], without building the copy.
 fn check_write_row(row: &PluginRow) -> Result<(), Denial> {
-    // The host's own column comes off *before* the guest's ceilings are applied
-    // to what is left. `db-get` hands back the row plus its `row_id`, and the
-    // documented read-modify-write is to change a field and send that map to
-    // `db-update` — so a row stored at exactly `MAX_ROW_COLUMNS`, or near
-    // `MAX_ROW_BYTES`, would be refused on the way back in for carrying a column
-    // the host added itself. Counting it would make the ceilings a function of
-    // where the row had been rather than of what the plugin wrote.
+    // Ceilings apply to the row without `ID_COLUMN`. `db-get` returns the row with its
+    // `row_id`, and a read-modify-write that echoes it to `db-update` must not be refused
+    // (at `MAX_ROW_COLUMNS` or near `MAX_ROW_BYTES`) for a column the host added.
     //
-    // Checked on the borrowed row, excluding that column, rather than on a
-    // stripped copy: cloning first meant a row over `MAX_ROW_BYTES` was
-    // duplicated in full before the ceiling refused it — guest-controlled, up
-    // to the frame — and a legal one was duplicated twice, once to strip and
-    // once to return. One owned copy is built at the end, after every check has
-    // passed.
+    // Checked on the borrowed row so an oversized row is refused before it is copied.
     if let Err(detail) = super::check_row_without(row, Some(ID_COLUMN)) {
         return Err(Box::new(move |id| {
             CallResult::denied(id, DenialReason::Malformed, detail)
@@ -773,12 +750,8 @@ impl MemoryPluginStore {
     pub fn seed(&self, table: &str, tenant: &str, row_id: &str, row: PluginRow) {
         let key = (table.to_owned(), tenant.to_owned(), row_id.to_owned());
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        // Accounted like any other write. Bypassing the ceilings is the point
-        // of this helper - it exists to place a row the plugin path would
-        // refuse - but bypassing the *total* is not: a seeded row that weighed
-        // nothing let the store hold its whole byte capacity again on top of
-        // everything seeded, and left later updates and deletes adjusting a
-        // number that never included those rows.
+        // Bypasses the per-row ceilings on purpose, but not the running total: later
+        // updates and deletes adjust it, and the byte capacity must include seeded rows.
         let outgoing = rows
             .map
             .get(&key)
@@ -819,11 +792,8 @@ impl PluginStore for MemoryPluginStore {
                 self.capacity
             )));
         }
-        // And by size, which is the ceiling that actually bounds memory: a row
-        // count times `MAX_ROW_BYTES` is gigabytes.
-        // Against the running total rather than a fresh scan: re-weighing every
-        // row on each insert made a full store the expensive case, and the scan
-        // ran while holding this lock.
+        // The byte ceiling is what bounds memory: the row count times `MAX_ROW_BYTES` is
+        // gigabytes. Checked against the running total, not a rescan under this lock.
         let incoming_key = (
             scope.table.clone(),
             scope.tenant.clone(),
@@ -836,17 +806,9 @@ impl PluginStore for MemoryPluginStore {
                 self.byte_capacity
             )));
         }
-        // Skipping what is already there, rather than trusting the counter to
-        // be the only source of ids. `seed` places a row at an id of the
-        // caller's choosing and does not advance this counter — it cannot, since
-        // that id need not be a number at all — so a store seeded with `r1`
-        // handed `r1` straight back out on its first insert. `HashMap::insert`
-        // would then *replace* the seeded row while the weight of both had been
-        // charged, losing a row silently and leaving bytes charged against
-        // capacity that no row occupies, which a later delete refunds only once.
-        //
-        // Bounded by the number of rows: at most that many candidates can be
-        // occupied, so the search cannot run longer than the map is wide.
+        // Skip ids already taken: `seed` places rows at caller-chosen ids without advancing
+        // the counter, and `HashMap::insert` would silently replace a seeded row. At most
+        // `len` candidates can be occupied, so the loop finds a free one.
         let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
         let mut row_id = None;
         for _ in 0..=rows.map.len() {
@@ -901,13 +863,8 @@ impl PluginStore for MemoryPluginStore {
         after: Option<&str>,
     ) -> Result<QueryPage, StoreError> {
         let rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        // Ids first, values second. Sorting borrowed ids rather than cloned
-        // rows is what lets the byte budget be honoured *before* a row is
-        // cloned: gathering every match and truncating afterwards would
-        // materialise the megabytes this argument exists to refuse.
-        //
-        // Sorted so a query is a deterministic function of the store, which is
-        // what lets a test assert on the rows rather than on their set.
+        // Sort borrowed keys first and clone rows only within the byte budget, so an
+        // over-budget match is never materialised. Ascending row id, as paging requires.
         let mut matched: Vec<&(String, String, String)> = rows
             .map
             .iter()
@@ -921,12 +878,8 @@ impl PluginStore for MemoryPluginStore {
             .map(|(key, _)| key)
             .collect();
         matched.sort_by(|left, right| left.2.cmp(&right.2));
-        // A match beyond `limit` is a cut as much as a match beyond
-        // `max_bytes`, and the guest cannot tell it happened: with `limit: 0`
-        // the row cap is the *quota*, which the guest is never sent, so a full
-        // page and a finished table look identical to it. One extra look is what
-        // makes `truncated` mean "there is more" rather than "the bytes ran
-        // out".
+        // A match past `limit` is a cut too. With `limit: 0` the cap is the quota, which
+        // the guest is never sent, so it cannot tell a full page from the end of the table.
         let mut truncated = matched.len() > limit;
         let mut out = Vec::new();
         let mut total = 0_usize;
@@ -935,18 +888,10 @@ impl PluginStore for MemoryPluginStore {
                 continue;
             };
             let weight = super::row_weight(row).saturating_add(super::row_framing(row));
-            // No "but keep the first one" exemption, the same as
-            // `bounded_rows` one layer up — and this is the sibling that pass
-            // missed. `seed` can place a row the plugin path would have
-            // refused, and the exemption cloned it in full, under this mutex,
-            // on every query that matched it, for a guest to repeat as often
-            // as it liked. The layer above drops it anyway, so the clone
-            // bought nothing but the copy.
+            // No exemption for the first row, matching `bounded_rows`: `seed` can place a row
+            // over the budget, and cloning it under this lock on every query buys nothing.
             if total.saturating_add(weight) > max_bytes {
-                // A row that matched and was left out. Reported rather than
-                // merely omitted: the caller cannot see the difference between
-                // this and a table with nothing more in it, and neither can the
-                // guest it answers.
+                // Report the cut: the guest cannot tell it from the end of the table.
                 truncated = true;
                 break;
             }
@@ -971,13 +916,9 @@ impl PluginStore for MemoryPluginStore {
         let Some(existing) = rows.map.get(&key) else {
             return Err(StoreError::NotFound);
         };
-        // The byte ceiling applies to a *replacement* as much as to an insert.
-        // An update adds no row, so a check that only ran on `insert` left the
-        // store growable without bound: replacing each of many small rows with
-        // one near `MAX_ROW_BYTES` is the same memory, arrived at by the path
-        // that was not looking. The outgoing row's weight comes off first, so
-        // rewriting a row in place is never refused for the size it already
-        // was.
+        // The byte ceiling covers a replacement too, or swapping small rows for large ones
+        // grows the store without bound. The outgoing weight comes off first, so a rewrite
+        // is never refused for the size the row already was.
         let outgoing = Self::entry_weight(&key, existing);
         let incoming = Self::entry_weight(&key, &row);
         if rows.bytes.saturating_sub(outgoing).saturating_add(incoming) > self.byte_capacity {

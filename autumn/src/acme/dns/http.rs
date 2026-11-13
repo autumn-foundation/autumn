@@ -130,17 +130,13 @@ impl ReqwestTransport {
     ///
     /// Returns a message if the HTTP client cannot be constructed.
     pub fn new(timeout: std::time::Duration) -> Result<Self, String> {
-        // A DNS provider API call must never park the renewal loop: without a
-        // timeout a black-holed connection would hold the ACME order open until
-        // the CA expired it, with nothing in the logs to say why.
+        // Without a timeout a black-holed connection would hold the ACME order open
+        // until the CA expired it, with nothing logged.
         let client = crate::reqwest_tls::client_builder()
             .timeout(timeout)
-            // Never follow a redirect. `reqwest` strips `Authorization` on a
-            // cross-origin hop, but it does not know `x-amz-security-token` is a
-            // credential — so a `3xx` from the Route 53 endpoint would forward
-            // the STS session token to whatever host it named. Neither the
-            // Cloudflare v4 API nor Route 53 legitimately redirects these calls,
-            // and this matches the workspace's other outbound clients.
+            // Never follow a redirect: `reqwest` strips `Authorization` on a
+            // cross-origin hop but not `x-amz-security-token`, so a `3xx` would
+            // forward the STS session token. Neither API redirects these calls.
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("failed to build the DNS provider HTTP client: {e}"))?;
@@ -166,9 +162,8 @@ impl HttpTransport for ReqwestTransport {
                 format!("DNS provider request to {} failed: {e}", request.url)
             })?;
             let status = response.status().as_u16();
-            // Bounded: a misbehaving or compromised endpoint answering with a
-            // multi-gigabyte body would otherwise OOM the renewal task, and the
-            // body also feeds the operator-facing error message.
+            // Bounded: an endpoint answering with a huge body would otherwise OOM
+            // the renewal task.
             let body = read_bounded(response).await?;
             Ok(HttpResponse { status, body })
         })

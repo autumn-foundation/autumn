@@ -59,10 +59,7 @@
 //! # }
 //! ```
 
-// The builder methods take `self` by value and record floats at runtime, so they
-// are not `const`-eligible; this narrowly-scoped allow keeps the module clean
-// under the workspace's `nursery` lint set (matching the parent `sim` module and
-// the sibling `chaos` module) without masking real issues.
+// The builder methods take `self` by value and store floats, so they cannot be `const`.
 #![allow(clippy::missing_const_for_fn)]
 
 use std::future::Future;
@@ -416,8 +413,8 @@ impl LlmClient for SeededLlm {
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
             let seq = self.call_seq.fetch_add(1, Ordering::SeqCst);
-            // Draw the latency first so the schedule advances by exactly one
-            // draw per call, then sleep it — released only by a clock advance.
+            // Exactly one latency draw per call, whatever the outcome. Only a clock advance
+            // releases the sleep.
             let latency = self.draw_latency();
             if latency > Duration::ZERO {
                 tokio::time::sleep(latency).await;
@@ -461,18 +458,14 @@ mod tests {
 
     #[test]
     fn fallback_is_seed_and_prompt_stable_and_diverges() {
-        // Same (seed, prompt) ⇒ identical text, regardless of call order.
         assert_eq!(fallback_text(7, "hello"), fallback_text(7, "hello"));
-        // Different prompt ⇒ different text.
         assert_ne!(fallback_text(7, "hello"), fallback_text(7, "world"));
-        // Different seed ⇒ different text.
         assert_ne!(fallback_text(7, "hello"), fallback_text(8, "hello"));
     }
 
     #[test]
     fn explicit_fault_is_a_pure_lookup() {
         let llm = SeededLlm::builder(1).fault_at(2, LlmError::Timeout).build();
-        // The outcome helper decides faults without needing the async runtime.
         assert!(matches!(
             llm.outcome(2, &super::LlmRequest::new("m", "p")),
             Err(LlmError::Timeout)
@@ -483,8 +476,6 @@ mod tests {
     #[test]
     fn from_entropy_seed_is_reproducible() {
         use crate::entropy::SeededEntropy;
-        // Two fresh sources of the same seed draw the same builder seed, so the
-        // captured seed (and therefore the fallback text) agrees.
         let a = SeededLlm::from_entropy(&SeededEntropy::new(3)).build();
         let b = SeededLlm::from_entropy(&SeededEntropy::new(3)).build();
         assert_eq!(a.seed, b.seed);

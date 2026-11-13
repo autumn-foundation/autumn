@@ -152,8 +152,7 @@ fn error_page_layout(ctx: &ErrorContext, content: &Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " | Autumn" }
-                // Inline minimal Tailwind-compatible styles as a fallback.
-                // When Tailwind CSS is loaded, its utility classes take over.
+                // Fallback styles for when Tailwind CSS is not loaded.
                 (PreEscaped(FALLBACK_STYLES))
             }
             body class="min-h-screen bg-white dark:bg-gray-950 flex items-center justify-center p-4" {

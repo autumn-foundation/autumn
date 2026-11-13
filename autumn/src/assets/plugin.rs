@@ -683,12 +683,9 @@ fn asset_response(
 
 // ── Process-wide registry, for `asset_url` ──────────────────────────────────
 //
-// `asset_url` is a free function that templates call with no app handle, so
-// resolving `_plugins/<ns>/…` needs a process-wide lookup. The registry only
-// ever maps a namespace to a `&'static` bundle, and a bundle's URLs are a
-// pure function of its compiled bytes, so two apps in one process (tests)
-// registering the same bundle see identical answers. Serving stays per app:
-// each `AppBuilder` mounts only the bundles it was given.
+// Templates call `asset_url` with no app handle, so `_plugins/<ns>/…` needs a global lookup.
+// A bundle's URLs depend only on its compiled bytes, so apps sharing a process see the same
+// answers. Serving stays per app: each `AppBuilder` mounts only the bundles it was given.
 
 static REGISTRY: RwLock<Vec<&'static PluginAssets>> = RwLock::new(Vec::new());
 

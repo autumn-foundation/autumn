@@ -912,7 +912,6 @@ where
     type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        // Capture CSRF token and field name before the body is consumed.
         let csrf_token = req
             .extensions()
             .get::<crate::security::CsrfToken>()
@@ -921,11 +920,8 @@ where
             .extensions()
             .get::<crate::security::csrf::CsrfFormField>()
             .map_or_else(|| "_csrf".to_owned(), |f| f.0.clone());
-        // Read for the #2423 exemption only. `ChangesetForm` does not otherwise
-        // use the submit token — `SubmitTokenLayer` consumes it from the raw
-        // body upstream — but a scaffolded flat form does post the hidden
-        // field, so its name has to be exempt here exactly as the nested
-        // extractor exempts it.
+        // Read only to exempt the field from the NUL check (#2423): `SubmitTokenLayer` consumes
+        // the token upstream, but a scaffolded flat form still posts the hidden field.
         let submit_field = req
             .extensions()
             .get::<crate::security::SubmitFormField>()
@@ -936,13 +932,10 @@ where
 
         let mut changeset = data.into_changeset();
         for field in nul_fields {
-            // The two tokens and the method override are transport plumbing,
-            // not form fields: no template renders any of them, so an error
-            // keyed under one would make the form permanently invalid with
-            // nothing on screen to explain why, and none is ever written to a
-            // column. The configurable names come from request extensions; the
-            // defaults are in `PLUMBING_FIELDS` too, because `CsrfService`
-            // accepts the literal `_csrf` even when another name is configured.
+            // The two tokens and the method override are transport plumbing that no template
+            // renders: an error keyed under one would leave the form invalid with nothing on
+            // screen. `PLUMBING_FIELDS` also holds the defaults, because `CsrfService` accepts
+            // the literal `_csrf` even when another name is configured.
             if field == csrf_field
                 || field == submit_field
                 || PLUMBING_FIELDS.contains(&field.as_str())
@@ -967,12 +960,9 @@ where
 /// carried a NUL byte (#2423), and the file parts of a multipart body. NUL
 /// values are cleaned before `T` is built, so the caller only has to decide
 /// what to say about them.
-// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
-// 128 bytes — that is `axum::response::Response`'s own size, not something this
-// crate chose. Returning a ready-made rejection response IS the idiom here, and
-// boxing it would add an allocation to every rejection path to satisfy a size
-// heuristic. Allowed at the site rather than workspace-wide so the lint stays
-// armed for error types we do control.
+// The `Err` variant is `axum::response::Response` (128 bytes), the ready-made rejection; boxing
+// it would add an allocation to every rejection. Allowed here, not workspace-wide, so the lint
+// stays on for error types this crate controls.
 #[allow(clippy::result_large_err)]
 async fn decode_form_body<T, S>(
     req: Request,
@@ -994,11 +984,8 @@ where
         return decode_multipart(req, state).await;
     }
 
-    // Same content-type gate axum's own `Form`/`RawForm` extractors apply: a
-    // POST whose Content-Type isn't (or doesn't start with) the form-urlencoded
-    // mime type is rejected outright, rather than being decoded anyway. `Bytes`
-    // alone has no opinion on Content-Type, so this must be checked explicitly
-    // now that we no longer route through `axum::extract::Form`.
+    // The same Content-Type gate axum's `Form`/`RawForm` apply. `Bytes` ignores Content-Type, so
+    // it must be checked here.
     if !crate::media_type::is_media_type(&content_type, "application/x-www-form-urlencoded") {
         return Err((
             axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -1007,10 +994,8 @@ where
             .into_response());
     }
 
-    // Buffer the body through axum's own `Bytes` extractor so the configured
-    // `DefaultBodyLimit` is enforced exactly as it would be for a single-shot
-    // `Form` extraction (a bare `to_bytes(.., usize::MAX)` would accept an
-    // unbounded body and defeat that protection).
+    // Buffer through axum's `Bytes` extractor so `DefaultBodyLimit` applies; a bare
+    // `to_bytes(.., usize::MAX)` would accept an unbounded body.
     let (parts, body) = req.into_parts();
     let bytes_req = Request::from_parts(parts, body);
     let bytes = axum::body::Bytes::from_request(bytes_req, state)
@@ -1339,9 +1324,7 @@ pub fn __fuzz_decode_urlencoded(bytes: &[u8]) {
 /// the request cap. Text parts decode with the same rules as a URL-encoded
 /// body. An empty optional file input (no file name, no bytes) is skipped.
 #[cfg(feature = "multipart")]
-// Same as `decode_form_body` above: the `Err` variant is an
-// `axum::response::Response`, which IS the rejection, and boxing it would cost
-// an allocation on every rejection to satisfy a size heuristic.
+// The `Err` variant is the rejection response itself; see `decode_form_body`.
 #[allow(clippy::result_large_err)]
 async fn decode_multipart<T, S>(
     req: Request,
@@ -1405,8 +1388,7 @@ where
         }
     }
 
-    // #2423: the same NUL sweep the URL-encoded path runs, applied to the
-    // text fields only. File bytes are not text.
+    // The NUL sweep of the URL-encoded path (#2423), on text fields only: file bytes are not text.
     let nul_fields = strip_nul_from_pairs(&mut pairs);
     let data = decode_pairs_dropping_blank_optional_fields::<T>(pairs)
         .map_err(|e| (e.status(), e.to_string()).into_response())?;
@@ -1692,8 +1674,7 @@ pub fn method_input(method: &str) -> maud::Markup {
     } else if normalized.eq_ignore_ascii_case("DELETE") {
         "DELETE"
     } else {
-        // `GET`/`POST` (and anything else) don't need an override — emit
-        // nothing rather than producing an invalid override field.
+        // `GET`, `POST` and unknown methods get no override field.
         return maud::html! {};
     };
     maud::html! {
@@ -3923,13 +3904,9 @@ fn rich_text_area_inner<T: Serialize>(
             @if preview.is_some() {
                 div class="autumn-rich-text__preview-wrapper" {
                     span class="autumn-rich-text__preview-label" id=(format!("{field}-preview-label")) { (labels.preview_heading) }
-                    // Deliberately NOT an `aria-live` region: this element is
-                    // the htmx swap target and re-renders on every pause in
-                    // typing, so announcing it would read the entire post back
-                    // to the author mid-sentence. `docs/guide/accessibility.md`
-                    // reserves live regions for short, deliberate status
-                    // messages delivered out-of-band. It stays a labeled
-                    // landmark the author can navigate to on demand.
+                    // Not an `aria-live` region: it re-renders on every pause in typing, so
+                    // announcing it would read the whole post back to the author. It is a
+                    // labeled region the author can navigate to instead.
                     div
                         id=(preview_id)
                         class="autumn-rich-text__preview"
@@ -4117,10 +4094,8 @@ fn normalize_date_value(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    // `NaiveDateTime`'s `Display` (as opposed to its serde serialization,
-    // which uses `T`) separates date and time with a space, e.g. from a raw
-    // `.to_string()` or some database drivers. Normalize defensively so
-    // those still parse instead of falling through to the raw string.
+    // `NaiveDateTime`'s `Display` (unlike its serde form) and some database drivers put a space
+    // between date and time; normalize it so those values parse instead of passing through raw.
     let normalized = raw.replace(' ', "T");
     if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
         return date.to_string();
@@ -5488,7 +5463,7 @@ pub fn skip_link(target: &str, label: &str) -> maud::Markup {
     }
 }
 
-// ── form_for (issue #1135 phase 2) ──────────────────────────────────
+// ── form_for (issue #1135) ────────────────────────────────────────
 
 /// The HTML control a model field renders as inside [`form_for`].
 ///
@@ -6191,12 +6166,13 @@ fn render_form_control<T: Serialize>(
     field: &FormField,
     options: &FieldOptions<'_>,
 ) -> maud::Markup {
-    // A non-null `bool` is not a "must be checked" box. A password is never
-    // pre-filled, so a required one blocks every edit form. These two controls
-    // use only `FieldOptions::required`.
-    // A switch, a slider, a color, a hidden input and a checkbox group
-    // always have a value, or have no "must be set" meaning in HTML.
-    // A multiple select binds a `Vec`, which can be empty.
+    // The model's NOT NULL does not make these controls required:
+    // - a non-null `bool` is not a "must be checked" box;
+    // - a password is never pre-filled, so a required one would block every edit form;
+    // - a switch, slider, color, hidden input or checkbox group always has a value, or has no
+    //   "must be set" meaning in HTML;
+    // - a multiple select binds a `Vec`, which can be empty.
+    // They still honor `FieldOptions::required`.
     let multiple_select = options.multiple
         && matches!(
             field.control,
@@ -6979,10 +6955,8 @@ mod tests {
     /// checked against this obviously-correct-by-inspection reference
     /// rather than against its own bulk-copy logic.
     fn naive_escape_reference(input: &str) -> String {
-        // Builds on raw bytes (like `maud`'s own implementation does) rather
-        // than `char`, since casting a UTF-8 continuation/lead byte to `char`
-        // and pushing it would re-encode it as a *different* multi-byte
-        // sequence instead of preserving the original bytes.
+        // Works on bytes, as `maud` does: casting a UTF-8 lead or continuation byte to `char`
+        // would re-encode it as a different multi-byte sequence.
         let mut out = Vec::with_capacity(input.len());
         for b in input.bytes() {
             match b {
@@ -7172,8 +7146,8 @@ mod tests {
 
         #[test]
         fn many_blank_elements_decode_in_one_retry() {
-            // Each retry drops every blank pair of one key. One retry per pair
-            // made this body cost one full decode per blank (quadratic).
+            // Each retry drops every blank pair of one key; one retry per pair would cost one full
+            // decode per blank (quadratic).
             let mut body = "ids=&".repeat(50_000);
             body.push_str("ids=1");
             let started = std::time::Instant::now();
@@ -7644,7 +7618,7 @@ mod tests {
             name: String,
         }
         let form = ChangesetForm::blank(F { name: "ok".into() }, "tok");
-        assert!(form.is_valid()); // via Deref
+        assert!(form.is_valid());
         assert_eq!(form.csrf_token(), Some("tok"));
     }
 
@@ -7662,7 +7636,6 @@ mod tests {
             csrf_field: "_csrf".into(),
             files: None,
         };
-        // Deref gives access to Changeset methods
         assert!(!form.is_valid());
         assert!(!form.errors_for("name").is_empty());
     }
@@ -7919,7 +7892,7 @@ mod tests {
         assert!(html.contains("Save"), "{html}");
     }
 
-    // ── RED: accessible form helpers ───────────────────────────────
+    // ── Accessible form helpers ───────────────────────────────
 
     #[cfg(feature = "maud")]
     #[test]
@@ -8073,12 +8046,9 @@ mod tests {
 
     #[test]
     fn strict_form_decode_fails_on_a_partially_filled_form() {
-        // The premise of `field_from_urlencoded` (PR #2157 review): a live
-        // preview `hx-include`s the WHOLE form, so on a fresh "new" page every
-        // other field is still empty. Deserializing the whole form struct to
-        // reach one field therefore fails on the first strictly-typed empty
-        // field — and the preview would go blank until the author filled in
-        // every unrelated required column.
+        // Why `field_from_urlencoded` exists: a live preview `hx-include`s the whole form, so on a
+        // fresh page the other fields are empty and a whole-form decode fails on the first
+        // strictly-typed one.
         #[derive(serde::Deserialize)]
         struct PostForm {
             #[allow(dead_code)]
@@ -8091,7 +8061,6 @@ mod tests {
             serde_urlencoded::from_bytes::<PostForm>(partial).is_err(),
             "whole-form decode must fail here — that is the bug being fixed"
         );
-        // The lenient single-field extractor reaches the field regardless.
         assert_eq!(
             field_from_urlencoded(partial, "body").as_deref(),
             Some("hello **world**")
@@ -8111,13 +8080,12 @@ mod tests {
 
     #[test]
     fn field_from_urlencoded_handles_empty_and_repeated_keys() {
-        // An empty value is present-but-blank, not absent — a cleared editor
-        // must preview as empty, not fall back to a stale value.
+        // Present but blank, not absent: a cleared editor previews as empty.
         assert_eq!(
             field_from_urlencoded(b"body=&x=1", "body").as_deref(),
             Some("")
         );
-        // First occurrence wins. This helper is lenient on purpose.
+        // First occurrence wins: this helper is lenient on purpose.
         assert_eq!(
             field_from_urlencoded(b"body=first&body=second", "body").as_deref(),
             Some("first")
@@ -8175,7 +8143,7 @@ mod tests {
         let html = rich_text_area_with_labels(&cs, "body", "Body", &labels).into_string();
         assert!(html.contains("Negrita"), "{html}");
         assert!(html.contains("**negrita**"), "{html}");
-        // The default English control names are gone entirely, not just augmented.
+        // The default English control names are replaced, not augmented.
         assert!(!html.contains(">Bold<"), "{html}");
         assert!(!html.contains("**bold**"), "{html}");
     }
@@ -8360,10 +8328,8 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn required_rich_text_area_signals_a_required_field() {
-        // PR #2157 review: a non-nullable `body:richtext` column had no
-        // required signal at all, unlike every other non-nullable generated
-        // control. Both `String` deserialization and a `TEXT NOT NULL` column
-        // accept `""`, so an empty editor persisted a blank body silently.
+        // Both `String` and a `TEXT NOT NULL` column accept `""`, so without a required signal an
+        // empty editor would save a blank body.
         #[derive(serde::Serialize)]
         struct F {
             body: String,
@@ -8374,12 +8340,10 @@ mod tests {
         let html = required_rich_text_area(&cs, "body", "Body").into_string();
         assert!(html.contains("required"), "{html}");
         assert!(html.contains(r#"aria-required="true""#), "{html}");
-        // Still the same editor otherwise.
         assert!(html.contains("<textarea"), "{html}");
         assert!(html.contains("autumn-rich-text"), "{html}");
 
-        // The optional variant keeps its previous behaviour: leaving a nullable
-        // column blank is valid, so no browser-native "please fill this out".
+        // A nullable column may be left blank.
         let optional = rich_text_area(&cs, "body", "Body").into_string();
         assert!(!optional.contains(r#"aria-required="true""#), "{optional}");
     }
@@ -8417,10 +8381,8 @@ mod tests {
         assert!(html.contains(r#"id="body""#), "{html}");
         assert!(html.contains(r#"<label for="body""#), "{html}");
         assert!(html.contains("Body"), "{html}");
-        // The submitted Markdown source round-trips into the editor.
         assert!(html.contains("Hello **world**"), "{html}");
-        // A hint tells the author the field takes Markdown — the whole point of
-        // the control over a bare textarea.
+        // The hint tells the author the field takes Markdown.
         assert!(html.to_lowercase().contains("markdown"), "{html}");
         assert!(html.contains("autumn-rich-text"), "{html}");
     }
@@ -8437,8 +8399,7 @@ mod tests {
         });
         let html = rich_text_area(&cs, "body", "Body").into_string();
 
-        // A grouped, labeled toolbar — announced as one unit rather than as
-        // loose text between the label and the editor.
+        // A labeled group, announced as one unit rather than loose text before the editor.
         assert!(html.contains(r#"role="group""#), "{html}");
         assert!(html.contains("autumn-rich-text__toolbar"), "{html}");
         assert!(
@@ -8447,7 +8408,7 @@ mod tests {
             "{html}"
         );
 
-        // Every syntax the allowlist actually renders is represented.
+        // Every syntax the allowlist renders.
         for token in [
             "**bold**",
             "_italic_",
@@ -8462,8 +8423,7 @@ mod tests {
             );
         }
 
-        // The graceful base case: the toolbar must not depend on JavaScript,
-        // and must not render a control that silently does nothing without it.
+        // No JavaScript, and no button that would do nothing without it.
         assert!(!html.contains("<script"), "{html}");
         assert!(!html.contains("<button"), "{html}");
         assert!(!html.contains("onclick"), "{html}");
@@ -8532,14 +8492,11 @@ mod tests {
         assert!(html.contains("hx-trigger="), "{html}");
         // The one-time submit token must not be spent by preview requests.
         assert!(html.contains(r#"hx-params="not _submit_token""#), "{html}");
-        // The pane htmx swaps into. Deliberately not an `aria-live` region —
-        // it re-renders on every pause in typing, and announcing the whole
-        // rendered body back to its author is noise, not help.
+        // Not an `aria-live` region: it re-renders on every pause in typing.
         assert!(html.contains(r#"id="body-preview""#), "{html}");
         assert!(!html.contains("aria-live"), "{html}");
         assert!(html.contains(r#"role="region""#), "{html}");
         assert!(html.contains("aria-labelledby="), "{html}");
-        // No inline JavaScript anywhere — htmx attributes only.
         assert!(!html.contains("<script"), "{html}");
         assert!(!html.contains("onkeyup"), "{html}");
     }
@@ -8577,20 +8534,16 @@ mod tests {
             body: "**bold** [x](javascript:alert(1))".into(),
         });
         let html = rich_text_area_htmx(&cs, "body", "Body", "/posts/preview/body").into_string();
-        // A 422 re-render shows the preview immediately, without waiting for
-        // the first keystroke to fire the htmx request…
+        // A 422 re-render shows the preview before the first keystroke...
         assert!(html.contains("<strong>bold</strong>"), "{html}");
-        // …and that server-side pre-render goes through the same sanitizer.
-        // Scoped to the preview pane: the textarea legitimately still holds the
-        // raw Markdown source, escaped as text content, because the column
-        // stores the source and the author must be able to edit it back.
+        // ...through the same sanitizer. Checked in the pane only: the textarea holds the escaped
+        // Markdown source.
         let pane = html
             .split_once(r#"id="body-preview""#)
             .expect("preview pane present")
             .1;
         assert!(!pane.to_ascii_lowercase().contains("javascript:"), "{pane}");
         assert!(!pane.contains("href="), "{pane}");
-        // The editor keeps the source verbatim (escaped), not the render.
         assert!(
             html.contains("[x](javascript:alert(1))</textarea>"),
             "{html}"
@@ -8689,7 +8642,7 @@ mod tests {
         assert!(html.contains("skip-link"), "{html}");
     }
 
-    // ── AC2: Stable wrapper IDs ────────────────────────────────────
+    // ── Stable wrapper IDs ────────────────────────────────────
 
     #[cfg(feature = "maud")]
     #[test]
@@ -8900,7 +8853,7 @@ mod tests {
         assert!(html.contains("is required"), "{html}");
     }
 
-    // ── AC2 + AC3: text_input_htmx ────────────────────────────────
+    // ── text_input_htmx ────────────────────────────────
 
     #[cfg(feature = "maud")]
     #[test]
@@ -9006,11 +8959,9 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn text_input_htmx_drops_submit_token_param() {
-        // The inline-validation POST `hx-include`s the whole form, which carries
-        // the hidden one-time `_submit_token` (issue #1360). `SubmitTokenLayer`
-        // consumes any `_submit_token` a mutating POST carries, so validation
-        // must filter it out via `hx-params` — otherwise the first field
-        // validation spends the token and the real submit replays the fragment.
+        // The inline-validation POST `hx-include`s the whole form, including the one-time
+        // `_submit_token` (#1360). `SubmitTokenLayer` consumes it on any mutating POST, so without
+        // `hx-params` the first validation would spend it and the real submit would replay.
         #[derive(serde::Serialize)]
         struct F {
             name: String,
@@ -9034,9 +8985,8 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn text_input_htmx_with_token_field_filters_custom_field() {
-        // When the app customizes `[security.submit_token].field_name`, the
-        // `*_with_token_field` variants must exclude the configured field name
-        // from the inline-validation POST (issue #1843), not the default.
+        // A custom `[security.submit_token].field_name` is the name excluded, not the default
+        // (#1843).
         #[derive(serde::Serialize)]
         struct F {
             name: String,
@@ -9068,8 +9018,6 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn with_token_field_default_matches_legacy_helpers() {
-        // Passing the default field name reproduces the original hardcoded
-        // `hx-params="not _submit_token"` behaviour, guarding backward compat.
         #[derive(serde::Serialize)]
         struct F {
             name: String,
@@ -9192,13 +9140,9 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn checkbox_input_never_emits_a_hidden_fallback() {
-        // A hidden "false" sibling sharing the checkbox's `name` would make a
-        // *checked* submission send the key twice (`field=false&field=true`).
-        // A `bool` field takes one value, so the form decoders reject the
-        // repeat rather than taking the last value. Unchecked
-        // state must be recovered via `#[serde(default)]` on the target
-        // field instead (see the function's doc comment) — never via a
-        // hidden fallback input.
+        // A hidden "false" sibling would make a checked box send the key twice
+        // (`field=false&field=true`), which the decoders reject for a `bool`. The unchecked state
+        // comes from `#[serde(default)]` on the field instead.
         #[derive(serde::Serialize)]
         struct F {
             active: bool,
@@ -9218,11 +9162,8 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn checkbox_input_round_trips_through_real_url_decode_when_checked() {
-        // Regression test for the duplicate-key 400: decode the *exact*
-        // query string a browser sends for a CHECKED box rendered by
-        // checkbox_input (i.e. only the fields checkbox_input itself
-        // renders — no hidden sibling), through both decoders: axum's `Form`
-        // (`serde_urlencoded`) and ChangesetForm's (`from_urlencoded`).
+        // Decodes what a browser sends for a checked box through both decoders: axum's `Form`
+        // (`serde_urlencoded`) and `ChangesetForm`'s (`from_urlencoded`).
         #[derive(serde::Serialize)]
         struct F {
             active: bool,
@@ -9246,8 +9187,7 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn checkbox_input_round_trips_through_real_url_decode_when_unchecked() {
-        // An unchecked box submits no `active` key at all; `#[serde(default)]`
-        // must recover `false` rather than erroring "missing field".
+        // An unchecked box submits no `active` key; `#[serde(default)]` recovers `false`.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(default)]
@@ -9383,10 +9323,7 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn date_input_normalizes_space_separated_datetime_to_date_only() {
-        // `NaiveDateTime`'s `Display` (as opposed to its serde
-        // serialization) uses a space separator, e.g. from a raw
-        // `.to_string()` or some database drivers — accept it defensively
-        // rather than falling through to the raw (browser-rejected) string.
+        // `NaiveDateTime`'s `Display` and some database drivers put a space between date and time.
         #[derive(serde::Serialize)]
         struct F {
             born_on: String,
@@ -9431,12 +9368,10 @@ mod tests {
         });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
         assert!(html.contains(r#"type="datetime-local""#), "{html}");
-        // Seconds must be preserved, not truncated to minutes: chrono's
-        // default Deserialize requires the seconds component, so a
-        // minute-only value would fail to decode on an untouched submission.
+        // Seconds are kept: chrono's default `Deserialize` requires them, so a minute-only value
+        // would fail to decode on an untouched submission.
         assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
-        // `step="any"` so that value doesn't fail step-mismatch validation
-        // (default step is minute-granularity) and block submission.
+        // The default step is one minute, so a value with seconds would fail step validation.
         assert!(html.contains(r#"step="any""#), "{html}");
     }
 
@@ -9451,8 +9386,7 @@ mod tests {
             starts_at: "2024-03-15T10:30:00Z".into(),
         });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
-        // Browsers reject a trailing `Z`/offset in a `datetime-local` value;
-        // must be reduced to the bare local-shaped `YYYY-MM-DDTHH:MM:SS`.
+        // Browsers reject a `Z` or offset in a `datetime-local` value.
         assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
         assert!(!html.contains(r#"value="2024-03-15T10:30:00Z""#), "{html}");
     }
@@ -9460,10 +9394,8 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn datetime_input_normalizes_space_separated_datetime() {
-        // `NaiveDateTime`'s `Display` uses a space separator, e.g. from a
-        // raw `.to_string()` or some database drivers — accept it
-        // defensively rather than falling through to the raw string, which
-        // `<input type="datetime-local">` (strictly requiring `T`) rejects.
+        // `NaiveDateTime`'s `Display` and some database drivers use a space, which
+        // `<input type="datetime-local">` rejects: it requires `T`.
         #[derive(serde::Serialize)]
         struct F {
             starts_at: String,
@@ -9499,12 +9431,8 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn datetime_input_value_round_trips_through_chronos_default_deserialize() {
-        // Regression test: chrono's default `serde::Deserialize` for
-        // `NaiveDateTime` requires the seconds component ("premature end of
-        // input" otherwise). A hand-written form using `datetime_input` with
-        // a plain `chrono::NaiveDateTime` changeset field must be able to
-        // submit the *pre-filled, untouched* value and have it decode
-        // successfully — not just render without visible truncation.
+        // chrono's default `Deserialize` for `NaiveDateTime` requires seconds. The pre-filled
+        // value, submitted untouched, must decode into a plain `NaiveDateTime` field.
         #[derive(serde::Serialize)]
         struct F {
             starts_at: chrono::NaiveDateTime,
@@ -9520,8 +9448,7 @@ mod tests {
         let cs = Changeset::new(F { starts_at: stored });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
 
-        // Extract the rendered value attribute and submit it exactly as a
-        // browser would on a no-op edit (field untouched).
+        // Submit the rendered value as a browser would on a no-op edit.
         let value = html
             .split("value=\"")
             .nth(1)
@@ -9536,12 +9463,8 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn datetime_input_value_round_trips_for_utc_datetime_with_deserialize_helper() {
-        // Regression test: a DateTime<Utc> field's datetime_input value has
-        // no offset (datetime-local has no timezone concept), which chrono's
-        // *default* Deserialize for DateTime<Utc> rejects. Confirm the
-        // pre-filled value decodes successfully when the field is annotated
-        // with deserialize_datetime_local_utc, as documented on
-        // datetime_input.
+        // The rendered value has no offset, which chrono's default `Deserialize` for
+        // `DateTime<Utc>` rejects; `deserialize_datetime_local_utc` accepts it.
         #[derive(serde::Serialize)]
         struct F {
             starts_at: chrono::DateTime<chrono::Utc>,
@@ -9560,13 +9483,12 @@ mod tests {
         );
         let cs = Changeset::new(F { starts_at: stored });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
-        // The rendered value must not carry an offset/Z (would break the
-        // datetime-local input); confirm that first.
         let value = html
             .split("value=\"")
             .nth(1)
             .and_then(|s| s.split('"').next())
             .expect("value attribute present");
+        // `datetime-local` takes no offset.
         assert!(!value.contains('Z') && !value.contains('+'), "{value}");
 
         let body = format!("starts_at={value}");
@@ -9598,9 +9520,8 @@ mod tests {
 
     #[test]
     fn deserialize_datetime_local_utc_accepts_rfc3339_with_offset() {
-        // The same struct often serves JSON API create bodies — the helper
-        // must keep accepting RFC 3339, honoring an explicit offset by
-        // converting to UTC.
+        // The same struct often serves JSON API bodies, so RFC 3339 with an offset still decodes,
+        // converted to UTC.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_datetime_local_utc")]
@@ -9657,11 +9578,8 @@ mod tests {
 
     #[test]
     fn deserialize_datetime_local_local_interprets_offsetless_as_local_wall_clock() {
-        // The offsetless datetime-local shape names a wall clock in the
-        // server's local zone; the decoded instant's local wall clock must
-        // match it regardless of what TZ the test host runs in. Midday is
-        // safely outside every real zone's DST transition window, so this is
-        // deterministic without pinning `TZ`.
+        // An offsetless value is a wall clock in the server's local zone. Midday is outside every
+        // real zone's DST transition, so this holds in any host `TZ`.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_datetime_local_local")]
@@ -9688,9 +9606,8 @@ mod tests {
 
     #[test]
     fn deserialize_datetime_local_local_accepts_rfc3339_with_offset() {
-        // The same struct often serves JSON API create bodies — the helper
-        // must keep accepting RFC 3339, honoring an explicit offset by
-        // converting the instant to the local zone.
+        // The same struct often serves JSON API bodies, so RFC 3339 with an offset still decodes,
+        // converted to the local zone.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_datetime_local_local")]
@@ -9735,9 +9652,7 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn deserialize_naive_datetime_local_pads_missing_seconds() {
-        // Regression test: a value the user actively edits through the
-        // native picker isn't guaranteed to include seconds, unlike the
-        // always-seconds-inclusive pre-filled value — this must not 400.
+        // A value edited in the native picker can lack seconds, unlike the pre-filled one.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_naive_datetime_local")]
@@ -9890,7 +9805,7 @@ mod tests {
         assert!(html.contains(r#"id="status-field""#), "{html}");
     }
 
-    // ── form_for (issue #1135 phase 2) ──────────────────────────────
+    // ── form_for (issue #1135) ────────────────────────────────────
 
     #[cfg(feature = "maud")]
     #[derive(serde::Serialize)]
@@ -9923,9 +9838,8 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn form_for_prefills_serde_renamed_field_via_value_name() {
-        // The data type serializes `title` under "headline" — field_value
-        // indexes serialized output, so without value_name routing the
-        // pre-fill would come back blank even though the data is present.
+        // `title` serializes as "headline" and `field_value` reads serialized output, so the
+        // pre-fill must go through `value_name`.
         #[derive(serde::Serialize)]
         struct RenamedModel {
             #[serde(rename = "headline")]
@@ -10078,10 +9992,9 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn form_for_prepend_inserts_before_fields() {
-        // A prepended hidden field (e.g. a one-time submit token, issue #1360)
-        // must render at the FRONT of the form — after the CSRF input but before
-        // every derived field — so a body-scanning middleware finds it even when
-        // an earlier field carries a large value.
+        // A prepended hidden field (a one-time submit token, #1360) goes right after the CSRF
+        // input, before every derived field, so a body-scanning middleware finds it even when a
+        // field carries a large value.
         let cs = Changeset::new(blank_form_for_model());
         let html = form_for(&cs, "/posts", "post")
             .csrf("tok")
@@ -10103,9 +10016,7 @@ mod tests {
     #[test]
     fn form_for_required_date_field_renders_required_attribute() {
         let cs = Changeset::new(blank_form_for_model());
-        // `title` is a required field; promoted to a Date control it must
-        // keep the required signal (issue #1135 audit: `required` used to be
-        // silently dropped for `FieldControl::Date`).
+        // `title` is required; as a Date control it keeps the required signal.
         let html = form_for(&cs, "/posts", "post")
             .override_field("title", FieldControl::Date)
             .render()
@@ -10180,9 +10091,8 @@ mod tests {
         assert!(html.contains(r#"aria-required="true""#), "{html}");
         assert!(html.contains("required"), "{html}");
 
-        // Error-free, non-required file field: no required signal, no alert.
-        // (`title` — the only required field — is excluded so any
-        // `aria-required` in the output could only come from the file arm.)
+        // Error-free, non-required file field: no required signal, no alert. `title`, the only
+        // required field, is excluded so any `aria-required` could only come from the file arm.
         let cs = Changeset::new(blank_form_for_model());
         let html = form_for(&cs, "/posts", "post")
             .exclude("title")
@@ -10341,11 +10251,8 @@ mod tests {
 
         #[tokio::test]
         async fn blank_optional_numeric_field_decodes_as_none_not_400() {
-            // A number input the user left empty submits `age=` — an empty
-            // string is not a valid `i32`, so `serde_urlencoded` rejects it
-            // outright unless the extractor retries with the blank pair
-            // dropped (falling back to `None`) instead of surfacing a
-            // spurious decode failure that bypasses the Changeset entirely.
+            // An empty number input submits `age=`, which is not a valid `i32`. The extractor
+            // retries without the blank pair, so it decodes as `None`.
             async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
                 format!("valid={} age={:?}", form.is_valid(), form.data().age)
             }
@@ -10374,8 +10281,7 @@ mod tests {
 
         #[tokio::test]
         async fn garbage_numeric_field_still_fails_decode() {
-            // A genuinely undecodable value (not blank) must still 400/422 —
-            // the blank-retry accommodation must not paper over real garbage.
+            // The blank retry must not hide a non-blank undecodable value.
             async fn handler(_form: ChangesetForm<OptionalNumericForm>) -> String {
                 "unreachable".to_string()
             }
@@ -10389,13 +10295,8 @@ mod tests {
 
         #[tokio::test]
         async fn blank_required_string_survives_alongside_blank_optional_numeric() {
-            // A submission with *both* a blank optional numeric field and a
-            // blank required/validated `String` field (`name=&age=`) must not
-            // have the blank-optional-field retry drop the string pair too —
-            // that would turn a real validation error (name too short) into a
-            // spurious decode failure. `name` must reach the Changeset as an
-            // empty string so `is_valid()` reports the actual length-rule
-            // violation, not a 400/422 that hides it.
+            // With `name=&age=`, the retry drops only `age`: `name` reaches the Changeset as ""
+            // so the length rule reports, rather than a decode failure hiding it.
             async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
                 format!(
                     "valid={} name={:?} age={:?}",
@@ -10421,14 +10322,8 @@ mod tests {
 
         #[tokio::test]
         async fn blank_defaulted_checkbox_field_decodes_to_its_default() {
-            // Documented, intended behavior (see
-            // `decode_urlencoded_dropping_blank_optional_fields`'s "Scope"
-            // doc section): a `#[serde(default)] bool` field explicitly
-            // submitted blank (as opposed to omitted, which is what a real
-            // unchecked `<input type="checkbox">` actually sends) resolves
-            // to the same default a client could already get by omitting
-            // the key entirely — no new capability, just consistent with
-            // the field's own declared tolerance for a missing key.
+            // Intended (see "Scope" on `decode_urlencoded_dropping_blank_optional_fields`): a
+            // `#[serde(default)]` field submitted blank gets the default it would get if omitted.
             async fn handler(form: ChangesetForm<CheckboxForm>) -> String {
                 format!("published={}", form.data().published)
             }
@@ -10452,14 +10347,9 @@ mod tests {
 
         #[tokio::test]
         async fn blank_required_field_without_default_still_fails_to_decode() {
-            // The boundary the "Scope" doc section on
-            // `decode_urlencoded_dropping_blank_optional_fields` promises:
-            // a field with *no* tolerance for a missing key at all (no
-            // `Option`, no `#[serde(default)]`) must still hard-fail on a
-            // blank submission — dropping its key surfaces a "missing
-            // field" error on the next attempt instead of resolving, so
-            // the function gives up and returns that error rather than
-            // silently accepting a bogus value.
+            // The other side of "Scope" on `decode_urlencoded_dropping_blank_optional_fields`: a
+            // field with no `Option` and no `#[serde(default)]` still fails when blank, since
+            // dropping its key gives "missing field".
             async fn handler(_form: ChangesetForm<RequiredBoolForm>) -> String {
                 "unreachable".to_string()
             }
@@ -10473,10 +10363,7 @@ mod tests {
 
         #[tokio::test]
         async fn oversized_body_is_rejected_not_fully_buffered() {
-            // The blank-optional-field retry must not come at the cost of
-            // bypassing axum's `DefaultBodyLimit` (2MB by default) — a body
-            // larger than the configured limit must still be rejected rather
-            // than fully buffered into memory.
+            // `DefaultBodyLimit` (2 MB by default) still applies.
             async fn handler(_form: ChangesetForm<TestForm>) -> String {
                 "unreachable".to_string()
             }
@@ -10497,10 +10384,7 @@ mod tests {
 
         #[tokio::test]
         async fn wrong_content_type_is_rejected_not_decoded_anyway() {
-            // `Bytes` alone has no opinion on Content-Type, so a `text/plain`
-            // (or missing-Content-Type) POST whose body happens to look like
-            // `name=Alice` must still be rejected outright — matching axum's
-            // own `Form`/`RawForm` extractors — rather than silently decoded.
+            // `Bytes` ignores Content-Type, so the extractor checks it, as axum's `Form` does.
             async fn handler(_form: ChangesetForm<TestForm>) -> String {
                 "unreachable".to_string()
             }
@@ -10603,8 +10487,7 @@ mod tests {
 
         #[tokio::test]
         async fn csrf_token_captured_from_request_extensions() {
-            // Build a request with CsrfToken pre-inserted in extensions,
-            // simulating what CsrfLayer does, then call from_request directly.
+            // Insert `CsrfToken` as `CsrfLayer` would, then call `from_request` directly.
             use crate::security::CsrfToken;
 
             let mut req = axum::http::Request::builder()
@@ -10669,7 +10552,7 @@ mod tests {
             assert_body(resp, "valid=false").await;
         }
 
-        // ── AC3: Inline field validation (htmx partial response) ──
+        // ── Inline field validation (htmx partial response) ──
 
         #[derive(serde::Deserialize, validator::Validate, serde::Serialize)]
         struct InlineTestForm {
@@ -10714,7 +10597,6 @@ mod tests {
                 body.contains("Name must be at least 3 characters"),
                 "{body}"
             );
-            // Value preserved after failed validation
             assert!(body.contains(r#"value="ab""#), "{body}");
         }
 
@@ -10730,7 +10612,7 @@ mod tests {
                 .await
                 .unwrap();
             let body = body_text(resp).await;
-            // Wrapper must have stable id for hx-swap="outerHTML" targeting
+            // A stable wrapper id for `hx-swap="outerHTML"`.
             assert!(body.contains(r#"id="name-field""#), "{body}");
         }
 

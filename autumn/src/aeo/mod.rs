@@ -1091,9 +1091,9 @@ mod tests {
 
     #[test]
     fn a_prefixed_app_publishes_no_oauth_metadata() {
-        // Codex review: RFC 8414 discovery for `https://example.com` asks
-        // `/.well-known/oauth-authorization-server` at the host root, which
-        // an app below `/shop` does not answer.
+        // RFC 8414 discovery for `https://example.com` asks for
+        // `/.well-known/oauth-authorization-server` at the host root, which an
+        // app below `/shop` does not answer.
         let mut config = crate::config::AutumnConfig::default();
         config.aeo.oauth.authorization_server.issuer = Some("https://example.com".to_owned());
         config.aeo.oauth.authorization_server.token_endpoint =
@@ -1152,7 +1152,7 @@ mod tests {
         assert!(read(skill).starts_with("---\n"));
         assert!(!dist.path().join(".well-known/api-catalog").exists());
 
-        // Codex review (P2): a static host gets each document's headers.
+        // A static host gets each document's headers.
         assert!(written.iter().any(|p| p == "/_headers"), "{written:?}");
         let headers = read("_headers");
         let index_entry = headers

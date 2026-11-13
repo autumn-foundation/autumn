@@ -190,8 +190,8 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
                 // Off the startup path: the build waits for every older
                 // transaction on the table, however long that takes.
                 let pool = pool.clone();
-                // The build holds a pooled connection until every older
-                // transaction on the table ends. A pool of one has none to spare.
+                // The build holds a pooled connection the whole time. A pool of one
+                // has none to spare.
                 if pool.status().max_size < 2 {
                     tracing::warn!(
                         "pool too small to build idx_autumn_outbox_claim in the background; run \
@@ -1150,10 +1150,9 @@ async fn drain_until(
             "outbox relay is not installed; set outbox.enabled = true",
         )
     })?;
-    // Each pool gets its own budget, so a busy app pool cannot starve a
-    // shard.
-    // A failed pool (a shard that is down) does not stop the others. The
-    // drain fails only when every pool fails.
+    // Each pool gets its own budget, so a busy app pool cannot starve a shard. A failed
+    // pool (a shard that is down) does not stop the others; the drain fails only when
+    // every pool fails.
     let pools = relay_pools(state)?;
     let mut handled = 0;
     let mut failures = Vec::new();

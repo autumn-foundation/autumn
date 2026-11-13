@@ -228,8 +228,7 @@ fn entity_tags(list: &str) -> impl Iterator<Item = Option<&str>> {
             rest = after;
             return Some(Some(&quoted[..close]));
         }
-        // Text follows the closing quote, so the member is malformed.
-        // Skip to the next comma.
+        // Text after the closing quote makes the member malformed: skip to the next comma.
         rest = after.find(',').map_or("", |end| &after[end..]);
         Some(None)
     })
@@ -378,9 +377,8 @@ impl FreshWhen {
             && let Some(ref ims_str) = self.raw_if_modified_since
             && let Some(lm) = self.last_modified
         {
-            // Truncate to whole seconds: http_date() emits second-level precision,
-            // so a sub-second lm would compare as earlier than the IMS round-trip
-            // value and yield a spurious stale result.
+            // HTTP dates carry whole seconds. Truncate so a sub-second `lm` does not read as
+            // newer than its own round-tripped IMS value.
             let lm_secs = chrono::DateTime::from_timestamp(lm.timestamp(), 0).unwrap_or(lm);
             self.is_fresh = parse_http_date(ims_str)
                 .is_some_and(|parsed| std::time::SystemTime::from(lm_secs) <= parsed);
@@ -402,14 +400,13 @@ impl FreshWhen {
         let r = response.into_response();
         if self.is_fresh {
             let mut not_modified = not_modified_response(&self.etag, self.last_modified);
-            // Copy RFC 7232 §4.1 preservation headers from the built response.
+            // Headers RFC 7232 §4.1 requires a 304 to preserve.
             for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
                 for v in r.headers().get_all(&name) {
                     not_modified.headers_mut().append(name.clone(), v.clone());
                 }
             }
-            // Copy Last-Modified from the response only when not already set via
-            // the .last_modified() builder (to avoid duplicate values).
+            // Only when `.last_modified()` did not set one, to avoid duplicate values.
             if self.last_modified.is_none() {
                 for v in r.headers().get_all(LAST_MODIFIED) {
                     not_modified.headers_mut().append(LAST_MODIFIED, v.clone());
@@ -496,10 +493,8 @@ impl FreshWhen {
 pub fn fresh_when<E: IntoETag>(request_headers: &HeaderMap, etag: E) -> FreshWhen {
     let etag = etag.into_etag();
     let if_none_match_present = request_headers.contains_key(IF_NONE_MATCH);
-    // RFC 7232 §3.3: evaluate INM first; IMS is deferred to last_modified().
+    // RFC 7232 §3.3: IMS is ignored when INM is present. Otherwise `last_modified()` evaluates it.
     let is_fresh = if_none_match_present && check_if_none_match(request_headers, &etag);
-    // Store the raw IMS header only when INM is absent; per RFC 7232 §3.3
-    // IMS MUST be ignored when INM is present.
     let raw_if_modified_since = if if_none_match_present {
         None
     } else {
@@ -773,9 +768,7 @@ impl CacheControl {
         if self.no_store {
             return "no-store".to_string();
         }
-        // Pre-allocate a single buffer and append directives directly, only
-        // allocating for the dynamic `max-age`/`s-maxage`/`stale-while-revalidate`
-        // parts. The ", " separator is written before every directive but the first.
+        // One preallocated buffer: only the numeric directives allocate.
         let mut out = String::with_capacity(64);
         let mut push = |directive: &str| {
             if !out.is_empty() {
@@ -875,7 +868,7 @@ pub struct EtagLayer;
 impl EtagLayer {
     /// Maximum body size (bytes) that will be buffered for `ETag` computation.
     /// Responses larger than this are passed through unchanged (no `ETag`).
-    pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+    pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
     /// Create a new `EtagLayer`.
     #[must_use]
@@ -956,8 +949,7 @@ fn copy_304_headers(src: &http::HeaderMap, dst: &mut Response<Body>) {
 
 /// Core `ETag` logic applied to a confirmed `GET 200` response.
 async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> Response<Body> {
-    // If the handler already set an ETag, check If-None-Match against it
-    // before buffering the body.
+    // A handler-set ETag is checked without buffering the body.
     if let Some(existing_etag) = response.headers().get(ETAG).cloned() {
         // An unreadable or malformed handler ETag matches only `*`.
         let tag = header_str(&existing_etag).and_then(single_tag);
@@ -975,7 +967,7 @@ async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> 
 
     let (mut parts, mut body) = response.into_parts();
 
-    // Content-Length upfront guard: skip ETag on known-large bodies.
+    // Skip bodies already known to be too large.
     if parts
         .headers
         .get(http::header::CONTENT_LENGTH)
@@ -986,7 +978,8 @@ async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> 
         return Response::from_parts(parts, body);
     }
 
-    // Manual bounded collection with overflow-safe reconstruction.
+    // Buffer up to MAX_BODY_BYTES. Past that, the body is rebuilt from what was read plus the
+    // rest of the stream.
     let mut buf = bytes::BytesMut::new();
     let mut overflow_frame: Option<http_body::Frame<bytes::Bytes>> = None;
     let mut stream_errored = false;
@@ -1007,8 +1000,7 @@ async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> 
                     buf.extend_from_slice(&data);
                 }
                 Err(non_data) => {
-                    // Trailer or unknown frame — stop buffering and reconstruct
-                    // so the non-data frame is forwarded rather than dropped.
+                    // A trailer or unknown frame: stop and forward it rather than drop it.
                     overflow_frame = Some(non_data);
                     break;
                 }
@@ -1017,9 +1009,8 @@ async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> 
     }
 
     if stream_errored {
-        // Surface the error so clients/caches see a truncated response rather
-        // than silently-complete partial data.  Deliver any bytes already
-        // buffered, then inject an error frame to close the body abnormally.
+        // Send the buffered bytes, then an error frame, so clients and caches see a truncated
+        // response rather than one that looks complete.
         let frozen = buf.freeze();
         let err = axum::Error::new(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -1143,8 +1134,7 @@ pub fn build_not_modified(
             response.headers_mut().append(name.clone(), v.clone());
         }
     }
-    // Copy Last-Modified from original_headers only when not already set
-    // by the explicit `last_modified` argument (avoids conflicting duplicates).
+    // Only when the `last_modified` argument did not set one, to avoid conflicting values.
     if last_modified.is_none() {
         for v in original_headers.get_all(LAST_MODIFIED) {
             response.headers_mut().append(LAST_MODIFIED, v.clone());
@@ -1160,7 +1150,7 @@ mod tests {
     use http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
     use tower::ServiceExt;
 
-    // ── RED: ETag type ────────────────────────────────────────────────────────
+    // ── ETag type ────────────────────────────────────────────────────────
 
     #[test]
     fn strong_etag_header_value_has_quotes() {
@@ -1186,7 +1176,7 @@ mod tests {
         assert!(etag.is_weak());
     }
 
-    // ── RED: IntoETag conversions ─────────────────────────────────────────────
+    // ── IntoETag conversions ─────────────────────────────────────────────
 
     #[test]
     fn str_into_etag_produces_deterministic_strong_etag() {
@@ -1279,7 +1269,7 @@ mod tests {
         assert_eq!(etag1, etag2);
     }
 
-    // ── RED: ETag matching ────────────────────────────────────────────────────
+    // ── ETag matching ────────────────────────────────────────────────────
 
     #[test]
     fn etag_matches_exact_quoted_value() {
@@ -1311,7 +1301,7 @@ mod tests {
         assert!(etag.matches_if_none_match(r#""xyz", "abc", "foo""#));
     }
 
-    // ── RED: fresh_when core behaviour ───────────────────────────────────────
+    // ── fresh_when core behaviour ───────────────────────────────────────
 
     #[test]
     fn fresh_when_returns_stale_with_no_headers() {
@@ -1383,7 +1373,6 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
-        // Body must be empty.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let bytes = rt.block_on(async { response.into_body().collect().await.unwrap().to_bytes() });
         assert!(bytes.is_empty(), "304 body must be empty, got {bytes:?}");
@@ -1413,7 +1402,7 @@ mod tests {
         assert!(result.is_fresh());
     }
 
-    // ── RED: last_modified support ────────────────────────────────────────────
+    // ── last_modified support ────────────────────────────────────────────
 
     #[test]
     fn fresh_when_last_modified_sets_header_on_stale_response() {
@@ -1450,21 +1439,19 @@ mod tests {
         assert!(response.headers().contains_key(LAST_MODIFIED));
     }
 
-    // ── RED: If-Modified-Since fallback ───────────────────────────────────────
+    // ── If-Modified-Since fallback ───────────────────────────────────────
 
     #[test]
     fn fresh_when_if_modified_since_fresh_when_last_modified_not_newer() {
         use chrono::TimeZone;
 
         let last_modified = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        // IMS is one second after last_modified → resource not modified since → fresh.
         let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
         let ims_str = http_date(ims_time);
 
         let mut headers = HeaderMap::new();
         headers.insert(IF_MODIFIED_SINCE, HeaderValue::from_str(&ims_str).unwrap());
 
-        // No INM → freshness is re-evaluated in last_modified() per RFC 7232 §3.3.
         let result = fresh_when(&headers, 1_i64).last_modified(last_modified);
         assert!(result.is_fresh(), "IMS >= last_modified → fresh (304)");
     }
@@ -1474,7 +1461,6 @@ mod tests {
         use chrono::TimeZone;
 
         let last_modified = chrono::Utc.timestamp_opt(1_700_000_002, 0).unwrap();
-        // IMS is before last_modified → resource was modified after IMS → stale.
         let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
         let ims_str = http_date(ims_time);
 
@@ -1493,13 +1479,11 @@ mod tests {
         let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
         let ims_str = http_date(ims_time);
 
-        // INM is present but does NOT match (different etag).
         let wrong_etag: ETag = 99_i64.into_etag();
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, wrong_etag.header_value());
         headers.insert(IF_MODIFIED_SINCE, HeaderValue::from_str(&ims_str).unwrap());
 
-        // INM present → IMS MUST be ignored (RFC 7232 §3.3). INM doesn't match → stale.
         let result = fresh_when(&headers, 1_i64).last_modified(last_modified);
         assert!(
             !result.is_fresh(),
@@ -1507,7 +1491,7 @@ mod tests {
         );
     }
 
-    // ── RED: EtagLayer ────────────────────────────────────────────────────────
+    // ── EtagLayer ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn etag_layer_adds_etag_to_get_200() {
@@ -1547,7 +1531,6 @@ mod tests {
             )
         }));
 
-        // First call to discover the ETag.
         let first_req = Request::builder()
             .method(Method::GET)
             .uri("/")
@@ -1556,7 +1539,6 @@ mod tests {
         let first_response = svc.clone().oneshot(first_req).await.unwrap();
         let etag = first_response.headers().get(ETAG).unwrap().clone();
 
-        // Second call with If-None-Match.
         let second_req = Request::builder()
             .method(Method::GET)
             .uri("/")
@@ -1693,11 +1675,10 @@ mod tests {
         );
     }
 
-    // ── RED: determinism across replicas ──────────────────────────────────────
+    // ── determinism across replicas ──────────────────────────────────────
 
     #[test]
     fn etag_derivation_is_deterministic_no_rng_or_clock() {
-        // Same inputs → same ETag. Calling multiple times must yield identical results.
         let e1: ETag = (42_i64).into_etag();
         let e2: ETag = (42_i64).into_etag();
         let e3: ETag = (42_i64).into_etag();
@@ -1705,7 +1686,7 @@ mod tests {
         assert_eq!(e2, e3);
     }
 
-    // ── RED: build_not_modified helper ────────────────────────────────────────
+    // ── build_not_modified helper ────────────────────────────────────────
 
     #[test]
     fn build_not_modified_preserves_cache_control_and_vary() {
@@ -1731,7 +1712,6 @@ mod tests {
             response.headers().get(VARY).unwrap().to_str().unwrap(),
             "Accept"
         );
-        // Set-Cookie is NOT preserved — build_not_modified strips it.
         assert!(!response.headers().contains_key(SET_COOKIE));
     }
 
@@ -1759,7 +1739,6 @@ mod tests {
             }
         }));
 
-        // First GET → 200 + ETag.
         let first = svc
             .clone()
             .oneshot(
@@ -1774,7 +1753,6 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         let etag = first.headers().get(ETAG).cloned().unwrap();
 
-        // Second GET with matching If-None-Match → 304 empty body.
         let second = svc
             .clone()
             .oneshot(
@@ -1791,10 +1769,8 @@ mod tests {
         let body_bytes = second.into_body().collect().await.unwrap().to_bytes();
         assert!(body_bytes.is_empty(), "304 body must be empty");
 
-        // Simulate mutation: lock_version bumped.
         lock_version.store(2, Ordering::SeqCst);
 
-        // Third GET with old ETag → 200 with new ETag.
         let third = svc
             .oneshot(
                 Request::builder()
@@ -1809,13 +1785,10 @@ mod tests {
         assert_eq!(third.status(), StatusCode::OK);
         let new_etag = third.headers().get(ETAG).unwrap();
         let old_etag: ETag = 1_i64.into_etag();
-        // New ETag must differ from old one.
         assert_ne!(new_etag, &old_etag.header_value());
     }
 
-    // ── RED: CacheControl freshness (issue #1344) ─────────────────────────────
-
-    // AC#2: byte-for-byte header_value() rendering.
+    // ── CacheControl freshness (issue #1344) ─────────────────────────────
 
     #[test]
     fn cache_for_default_is_private_max_age() {
@@ -1840,7 +1813,6 @@ mod tests {
 
     #[test]
     fn cache_for_no_store_emits_only_no_store() {
-        // no-store overrides every freshness directive.
         let v = cache_for(Duration::from_secs(60))
             .public()
             .s_maxage(Duration::from_secs(120))
@@ -1852,7 +1824,6 @@ mod tests {
 
     #[test]
     fn cache_control_full_ordering() {
-        // Every directive present exercises the fixed ordering.
         let v = cache_for(Duration::from_secs(1))
             .public()
             .no_cache()
@@ -1870,12 +1841,9 @@ mod tests {
 
     #[test]
     fn cache_control_durations_render_as_whole_seconds() {
-        // Sub-second remainder is truncated (as_secs()).
         let v = cache_for(Duration::from_millis(1500)).header_value();
         assert_eq!(v, "private, max-age=1");
     }
-
-    // AC#4: default-private safety — never public unless asked.
 
     #[test]
     fn cache_for_never_public_by_default() {
@@ -1895,8 +1863,6 @@ mod tests {
         let v = cache_for(Duration::from_secs(300)).public().header_value();
         assert!(v.starts_with("public"), "{v}");
     }
-
-    // AC#1: wrap() inserts the header on a response.
 
     #[tokio::test]
     async fn cache_control_wrap_sets_single_cache_control_header() {
@@ -1921,8 +1887,6 @@ mod tests {
         assert_eq!(values[0].to_str().unwrap(), "private, max-age=60");
     }
 
-    // AC#1: IntoResponseParts tuple composition.
-
     #[tokio::test]
     async fn cache_control_tuple_sets_header() {
         let response = (cache_for(Duration::from_secs(90)).public(), "body").into_response();
@@ -1931,11 +1895,8 @@ mod tests {
         assert_eq!(values[0].to_str().unwrap(), "public, max-age=90");
     }
 
-    // AC#3: composing ETag + freshness emits exactly ONE Cache-Control header.
-
     #[tokio::test]
     async fn fresh_when_or_with_cache_control_emits_single_header_on_200() {
-        // Stale request (no If-None-Match): 200 with both ETag and Cache-Control.
         let headers = HeaderMap::new();
         let markup = "<h1>hi</h1>";
         let response = fresh_when(&headers, "v1")
@@ -1947,8 +1908,6 @@ mod tests {
         assert_eq!(values.len(), 1, "exactly one Cache-Control on 200");
         assert_eq!(values[0].to_str().unwrap(), "public, max-age=60");
     }
-
-    // AC#5: 304 revalidation preserves the freshness directives (single header).
 
     #[tokio::test]
     async fn fresh_when_or_preserves_cache_control_on_304() {
@@ -1966,7 +1925,7 @@ mod tests {
         assert_eq!(values[0].to_str().unwrap(), "public, max-age=60");
     }
 
-    // ── RED: commas inside quoted tags (issue #3080) ─────────────────────────
+    // ── commas inside quoted tags (issue #3080) ─────────────────────────
 
     /// Sends one `GET` through `EtagLayer` and returns the status. The
     /// handler sets the `ETag` header to `etag`.

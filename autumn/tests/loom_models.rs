@@ -38,11 +38,11 @@ use loom::thread;
 /// Models the per-topic `ReplayBuffer` monotonic-id + bounded-cap ring buffer.
 ///
 /// Mirrors `ReplayBuffer` / `send_without_publish_metric` in
-/// `autumn/src/channels.rs:149-156,703-711`. Crucially, production locks the
-/// replay buffer once PER MESSAGE (`state.replay.lock()` at channels.rs:703 is
+/// `autumn/src/channels.rs`. Crucially, production locks the
+/// replay buffer once PER MESSAGE (`state.replay.lock()` in channels.rs is
 /// re-acquired on every `send`), assigns `next_id`, `saturating_add`s it,
 /// `push_back`s, and evicts over cap via `pop_front`. The snapshot half of
-/// `resume_local` (`autumn/src/channels.rs:732-785`) reads the buffer under that
+/// `resume_local` (`autumn/src/channels.rs`) reads the buffer under that
 /// same per-message lock, so a resumer can win the lock BETWEEN two independent
 /// publishes and legitimately observe a partial buffer.
 ///
@@ -95,7 +95,7 @@ fn replay_ring_buffer_monotonic_ids() {
     loom::model(|| {
         // cap 2, two INDEPENDENT publishers. Each acquires the replay lock ON ITS
         // OWN, assigns next_id, increments, and pushes ONE message — mirroring the
-        // per-message locking in `send_without_publish_metric` (channels.rs:703).
+        // per-message locking in `send_without_publish_metric`.
         // This is the real race `next_id` guards: two concurrent sends contending
         // for the same counter. loom explores every ordering of the two lock
         // acquisitions (and the resumer's).
@@ -111,7 +111,7 @@ fn replay_ring_buffer_monotonic_ids() {
         };
 
         // Concurrent resumer: snapshots whatever is buffered when it wins the lock
-        // (channels.rs:732-785 snapshots under the same per-message lock a publish
+        // (`resume_local` snapshots under the same per-message lock a publish
         // holds). Because each publish locks independently, this can fall BETWEEN
         // the two pushes and observe a partial buffer — which is legal.
         let resumer = {
@@ -172,10 +172,10 @@ fn replay_ring_buffer_monotonic_ids() {
 /// Models the `THROTTLE_REGISTRY` get-or-insert plus token-bucket consume.
 ///
 /// Mirrors the registry get-or-insert in
-/// `autumn/src/security/rate_limit.rs:1074-1076,1484-1498`
+/// `autumn/src/security/rate_limit.rs`
 /// (`Mutex<HashMap<String, Arc<Limiter>>>` + `entry(..).or_insert_with(..)`) and
 /// the token-bucket consume in `MemoryStore::decide`
-/// (`autumn/src/security/rate_limit.rs:171-203`, `tokens -= 1.0` when
+/// (`autumn/src/security/rate_limit.rs`, `tokens -= 1.0` when
 /// `tokens >= 1.0`).
 ///
 /// Invariant: two threads racing the insert for the same key resolve to exactly
@@ -269,11 +269,11 @@ fn rate_limit_bucket_single_winner() {
 /// `MetricsFuture` completion race.
 ///
 /// A single in-flight request is counted once by `increment_active`
-/// (`autumn/src/middleware/metrics.rs:586`). Its active count is then released by
+/// (`autumn/src/middleware/metrics.rs`). Its active count is then released by
 /// ONE of two mutually-exclusive completion paths that both consult the same
 /// `Option<MetricsCollector>` guard: the `Poll::Ready` arm records + decrements
-/// (`metrics.rs:638-648`) and `PinnedDrop` decrements
-/// (`metrics.rs:621-622`). Both claim ownership with `Option::take()`, so exactly
+/// (`metrics.rs`) and `PinnedDrop` decrements
+/// (`metrics.rs`). Both claim ownership with `Option::take()`, so exactly
 /// one of them sees `Some` and performs the decrement — the other sees `None` and
 /// does nothing. This model reifies that guard as a shared `Mutex<Option<()>>`
 /// and RACES the two paths against it.
@@ -293,7 +293,7 @@ fn metrics_active_gauge_balance() {
     let show_bug = std::env::var_os("METRICS_LOOM_SHOW_BUG").is_some();
     loom::model(move || {
         // Gauge starts at 1: one in-flight request already counted by
-        // increment_active (metrics.rs:586). The Ready and Drop paths now race to
+        // `increment_active`. The Ready and Drop paths now race to
         // finalize it; the gauge must land at exactly 0.
         let active = Arc::new(AtomicUsize::new(1));
         // The finalize guard. Production is the future's `Option<MetricsCollector>`

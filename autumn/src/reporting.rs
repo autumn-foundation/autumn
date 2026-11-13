@@ -263,18 +263,14 @@ impl ReporterChain {
         if !deliver && capture.is_none() {
             return;
         }
-        // Reporting is best-effort: if we're somehow off-runtime, drop it
-        // rather than panic.
+        // Best-effort: off a Tokio runtime, drop the event rather than panic.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let chain = Arc::clone(self);
             handle.spawn(async move {
                 let mut event = event;
-                // Held for the whole reporter chain: the capsule must stay
-                // out of pruning's reach until every reporter has had its
-                // chance to read the referenced file — a slow reporter must
-                // not outlive its evidence. The pin is taken *inside* the
-                // write (before the file is visible), so a concurrent
-                // failure's prune has no window to delete it first.
+                // Held for the whole reporter chain, so pruning cannot delete a capsule a
+                // reporter still reads. The pin is taken inside the write, before the file is
+                // visible, so a concurrent prune has no window.
                 let _pin = match capture {
                     Some(capture) => capture::persist(capture, &mut event).await,
                     None => None,
@@ -497,16 +493,12 @@ where
             capture,
         });
 
-        // Catch panics raised synchronously while the inner service constructs
-        // its future (e.g. a handler closure or user Tower layer that panics in
-        // `call` before returning a future), not just panics raised while
-        // polling. Mirrors `tower_http::catch_panic`.
+        // Catch panics in `call` itself, not only while polling, as `tower_http::catch_panic`
+        // does.
         let inner = &mut self.inner;
-        // A replay enters its scope around the inner `call` as well as around
-        // the future it returns, matching `CaptureService`, which runs `call`
-        // inside the capture scope. A one-`call` difference between the two
-        // boundaries would shift the whole clock/entropy tape by however many
-        // readings an inner middleware takes synchronously.
+        // A replay scopes the inner `call` as well as its future, as `CaptureService` does.
+        // Otherwise the clock/entropy tape would shift by every reading an inner middleware
+        // takes synchronously.
         let replaying = capture::replaying();
         let called = || {
             #[cfg(feature = "reporting")]
@@ -529,12 +521,9 @@ where
                 chain: Arc::clone(&self.chain),
             },
         };
-        // A capsule replay consumes its recorded clock readings and entropy
-        // draws from *here* inwards, because that is exactly where capture
-        // recorded them: `CaptureLayer` sits immediately outside this layer, so
-        // anything further out (a minted request id, a minted session id) was
-        // never on the tape and must not eat it. See
-        // `capsule::clock::with_replay_request_scope`.
+        // A replay consumes the tape from here inwards, where capture recorded it:
+        // `CaptureLayer` sits just outside this layer, so ids minted further out were never on
+        // the tape. See `capsule::clock::with_replay_request_scope`.
         #[cfg(feature = "reporting")]
         if replaying {
             return ReportingOuterFuture::Replaying {
@@ -621,8 +610,7 @@ where
             return Poll::Pending;
         };
 
-        // Catch a panic raised while polling the handler future. Wrapping the
-        // poll keeps a panicking handler from aborting the worker task.
+        // A panicking handler must not abort the worker task.
         match std::panic::catch_unwind(AssertUnwindSafe(move || inner.poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(Ok(mut response))) => {
@@ -709,12 +697,10 @@ fn handle_panic(
         );
     }
 
-    // The client gets a clean, sanitized Problem Details 500 — the panic
-    // payload only ever reaches the reporter, never the wire. The
-    // `AutumnErrorInfo` stashed by `into_response` lets the exception-filter
-    // chain negotiate HTML error pages as usual. The `CaughtPanic` extension
-    // is in-process metadata for the replay driver; extensions are never
-    // serialized onto the wire.
+    // The panic payload reaches only the reporter: the client gets a sanitized 500. The
+    // `AutumnErrorInfo` that `into_response` stashes lets exception filters render HTML pages.
+    // `CaughtPanic` is in-process metadata for the replay driver; extensions never reach the
+    // wire.
     let mut response =
         crate::error::AutumnError::internal_server_error_msg("Internal server error")
             .into_response();
@@ -804,14 +790,10 @@ mod capture {
         message: &str,
         problem_type: Option<&str>,
     ) -> Option<Sealed> {
-        // A body that is not yet materialized can run more handler code as it is
-        // polled — database queries, clock reads — after the capsule snapshot, so
-        // those effects would be missing from the tape while the capsule claims to
-        // be complete. A replay drains the body and would report divergences that
-        // never happened. Probed only when a capsule is actually being written: with
-        // capture off the response is handed on exactly as the handler produced it.
-        // A request in which a fault fired writes no capsule: a replay runs
-        // without the fault and would report a divergence (#3071).
+        // A lazy body can run handler code (queries, clock reads) after the snapshot, so the
+        // tape would miss those effects and a replay would report false divergences. Probe only
+        // when a capsule is written. A request in which a fault fired writes no capsule: its
+        // replay runs without the fault and would diverge (#3071).
         let handle = handle.filter(|_| !crate::fault_injection::fault_fired());
         let body_is_materialized = handle.is_some() && materialize_body(response);
 
@@ -824,10 +806,8 @@ mod capture {
                 );
                 handle.scope().mark_truncated();
             }
-            // Close the scope here rather than leaving it to the capture layer's
-            // registry guard: persistence starts as soon as this is dispatched, and
-            // a connection recorder still appending effects would be racing the
-            // snapshot. Closing first makes the capsule's contents final.
+            // Close the scope here, not in the capture layer's guard: persistence starts on
+            // dispatch, and a recorder still appending effects would race the snapshot.
             handle.scope().close();
             Sealed {
                 handle,
@@ -849,9 +829,7 @@ mod capture {
         handle
             .filter(|_| !crate::fault_injection::fault_fired())
             .map(|handle| {
-                // Same reason as `for_status`: seal the scope before the
-                // capsule is built, so nothing can append to it while it is
-                // being written.
+                // As in `for_status`: close the scope before the capsule is written.
                 handle.scope().close();
                 Sealed {
                     handle,
@@ -921,10 +899,8 @@ mod capture {
                     *response.body_mut() = rebuild_probed_body(frames, None, None, data_only);
                     return true;
                 }
-                // An error ends the body, but it is part of what the client must
-                // observe — collapsing it into a clean EOF would report a
-                // successful response the handler never produced. Keep it, and do
-                // not call the capsule complete: the body did not finish.
+                // Keep the error: a clean EOF would report a success the handler never
+                // produced. The body did not finish, so the capsule is not complete.
                 Poll::Ready(Some(Err(error))) => {
                     *response.body_mut() =
                         rebuild_probed_body(frames, Some(error), None, data_only);
@@ -1362,9 +1338,7 @@ mod tests {
     #[cfg(feature = "reporting")]
     #[test]
     fn a_sealed_capture_can_cross_to_the_blocking_pool() {
-        // `capture::persist` moves the `Sealed` value into `spawn_blocking`,
-        // which needs `Send + 'static`. A future field that is neither would
-        // only show up as a confusing error inside `dispatch`, so pin it here.
+        // `capture::persist` moves `Sealed` into `spawn_blocking`, which needs `Send + 'static`.
         const fn assert_send_static<T: Send + 'static>() {}
         assert_send_static::<capture::Sealed>();
     }
@@ -1571,9 +1545,7 @@ mod tests {
 
     #[tokio::test]
     async fn reporter_panicking_while_constructing_future_is_swallowed() {
-        // A reporter whose `report` method panics *before* returning a future
-        // exercises the `Err` arm of `report_all` (distinct from a future that
-        // panics when polled).
+        // Panics before returning a future: the `Err` arm of `report_all`.
         struct PanicOnConstruct;
         impl ErrorReporter for PanicOnConstruct {
             fn report<'a>(&'a self, _event: &'a ErrorEvent) -> ReportFuture<'a> {

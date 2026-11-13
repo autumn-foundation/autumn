@@ -682,15 +682,12 @@ impl Instrument {
         cache: &OnceLock<Arc<Series>>,
         update: impl FnOnce(&Series),
     ) {
-        // ONE snapshot for both capped decisions below. Reading the label cap
-        // and the series cap separately could straddle a `set_limits` and
-        // admit a series that neither configuration would have produced — and
-        // a retained series is never evicted, so it would stay wrong forever.
+        // One snapshot for both caps: two reads could straddle a `set_limits` and admit a series
+        // neither configuration allows, and a series is never evicted.
         let limits = limits();
-        // A handle's labels never change after it is built, so the series they
-        // name is resolved once. Valid only while no label is truncated: a
-        // lowered `max_labels_per_series` changes the key, so that case takes
-        // the full path (which also keeps its "too many labels" warning).
+        // A handle's labels never change, so its series is resolved once. Only while no label is
+        // truncated: a lowered `max_labels_per_series` changes the key, so that takes the full
+        // path (and keeps its warning).
         if labels.len() <= limits.max_labels_per_series
             && let Some(series) = cache.get()
         {
@@ -699,8 +696,7 @@ impl Instrument {
         }
         let key = self.capped_key(labels, limits.max_labels_per_series);
         if key.is_empty() {
-            // No labels, or every label was rejected as it was attached; the
-            // sample still belongs somewhere.
+            // No labels, or every label was rejected: the sample still counts.
             self.record_unlabeled(update);
             return;
         }
@@ -727,11 +723,8 @@ impl Instrument {
     /// Look up (or register) the series for `key`, honouring the cardinality
     /// cap. Returns `None` when the cap dropped this label set.
     fn series_for(&self, key: &[(String, String)], cap: usize) -> Option<Arc<Series>> {
-        // `cap` comes from the caller's single snapshot and is reused for both
-        // halves of the check-then-register: re-reading it would let a
-        // concurrent `set_limits` admit the label set under the read lock and
-        // then drop it under the write lock, counting a drop for a series that
-        // the configuration in force at either instant would have kept.
+        // Both halves of the check-then-register use the caller's `cap`: re-reading it could let
+        // a concurrent `set_limits` admit the set under the read lock and drop it under the write.
         {
             let series = self.series.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(existing) = series.get(key) {
@@ -754,8 +747,8 @@ impl Instrument {
                 self.note_dropped(cap);
                 return None;
             }
-            // The only allocation on the record path: a label set seen for the
-            // first time is copied in once and probed by borrow ever after.
+            // The record path's only allocation: a new label set is copied once, then probed by
+            // borrow.
             let owned: SeriesKey = key.into();
             series.insert(owned, Arc::clone(&fresh));
         }
@@ -824,9 +817,8 @@ impl Instrument {
             let help = self.help.read().unwrap_or_else(PoisonError::into_inner);
             help.to_string()
         };
-        // Build each series' owned label map while the read lock is held: the
-        // alternative — cloning every `SeriesKey` and converting afterwards —
-        // allocates each label twice for no less time under the lock.
+        // Convert under the lock: cloning each `SeriesKey` and converting later would allocate
+        // every label twice.
         let labeled: Vec<(BTreeMap<String, String>, Arc<Series>)> = {
             let series = self.series.read().unwrap_or_else(PoisonError::into_inner);
             series
@@ -970,12 +962,9 @@ impl Series {
 /// Add `delta` to the `f64` held as a bit pattern in `cell`, atomically.
 fn add_f64(cell: &AtomicU64, delta: f64) {
     let _ = cell.try_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
-        // Both operands are finite (deltas and observations are validated,
-        // and this clamp keeps the stored value finite), so the sum can
-        // overflow to ±Inf but never be NaN. Clamp so a gauge near
-        // `f64::MAX` nudged by a finite delta — or a `_sum` fed enormous
-        // observations — saturates instead of permanently storing a
-        // non-finite value the JSON view would render as `null`.
+        // Inputs are validated and the clamp keeps the stored value finite, so the sum can overflow
+        // to ±Inf but not be NaN. Clamping saturates instead of storing a non-finite value the
+        // JSON view renders as `null`.
         Some(
             (f64::from_bits(bits) + delta)
                 .clamp(f64::MIN, f64::MAX)
@@ -1090,9 +1079,8 @@ const NAME_TOO_LONG: &str = "longer than the metric name cap";
 /// and the `autumn_` namespace belongs to the framework's built-in families.
 fn registration_rejection(name: &str) -> Option<&'static str> {
     if name.len() > MAX_METRIC_NAME_LEN {
-        // Checked before the grammar so a pathological name is not scanned in
-        // full. Rejected, never truncated: two names sharing a 128-byte prefix
-        // would otherwise silently become one family.
+        // Checked before the grammar so a huge name is not scanned. Rejected, not truncated: two
+        // names sharing a prefix would silently become one family.
         return Some(NAME_TOO_LONG);
     }
     if !crate::actuator::is_valid_metric_name(name) {
@@ -1203,30 +1191,24 @@ enum Registration {
 /// an unusable name, a collision with another instrument's family names, a
 /// kind that contradicts an existing registration, or an exhausted registry.
 fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
-    // The one check that must precede the probe below: hashing a pathological
-    // name in full is exactly what the length cap exists to prevent.
+    // Before the probe: the length cap exists so a huge name is never hashed.
     if name.len() > MAX_METRIC_NAME_LEN {
         REGISTRY.warn_once(name, NAME_TOO_LONG);
         return None;
     }
 
-    // One read for the whole registration. The fast path's capacity check and
-    // the slow path's re-check under the write lock must agree, or a
-    // concurrent `set_limits` could refuse a name the fast path had already
-    // decided there was room for.
+    // One read, so the fast path's capacity check and the slow path's re-check agree across a
+    // concurrent `set_limits`.
     let instrument_cap = max_instruments();
 
-    // Fast path: already registered. Clone the `Arc` out before releasing the
-    // lock so nothing (including `tracing`) runs while it is held.
+    // Fast path: already registered. Nothing, `tracing` included, runs under the lock.
     {
         let registered = REGISTRY
             .instruments
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        // The registry interns accepted names: nothing reaches it without
-        // passing `registration_rejection`, so a hit needs no re-validation,
-        // and the grammar walk and reserved-name scan run on first sight of a
-        // name rather than on every `counter(..)` call.
+        // Only names that passed `registration_rejection` are registered, so a hit needs no
+        // re-validation.
         if let Some(existing) = registered.get(name) {
             let existing = Arc::clone(existing);
             drop(registered);
@@ -1249,15 +1231,13 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
         }
     }
 
-    // Slow path: register. Every check is repeated under the write lock
-    // because another thread may have won the race to this point.
+    // Slow path: repeat every check under the write lock; another thread may have won the race.
     let outcome = {
         let mut registered = REGISTRY
             .instruments
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        // Decided (never acted on) under the lock; the guard is released
-        // before any warning is emitted.
+        // Decide under the lock; warn only after the guard is released.
         let existing = registered.get(name).map(Arc::clone);
         let at_capacity = registered.len() >= instrument_cap;
         let collides = collides_with_registered(&registered, name, kind);
@@ -1266,11 +1246,9 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
             None if at_capacity => Registration::OverCapacity,
             None if collides => Registration::Collision,
             None => {
-                // Both pending maps are resolved *inside* this critical
-                // section, so a `describe_*` or `set_histogram_buckets` call
-                // racing with a first use either lands before the instrument
-                // exists (and applies) or finds it registered (and says so) —
-                // never in between, silently losing the setting.
+                // Take the pending help and buckets inside this critical section, so a racing
+                // `describe_*` or `set_histogram_buckets` either applies or finds the instrument
+                // registered, and is never silently lost.
                 let bounds = take_pending_bounds(name, kind);
                 let fresh = Arc::new(Instrument::new(name, kind, bounds));
                 let discarded = match take_pending_help(name, kind) {
@@ -1455,10 +1433,8 @@ fn describe(name: &str, kind: InstrumentKind, help: &str) {
     let help = sanitize_help(help);
 
     let outcome = {
-        // Lock order: `pending_help` nested under `instruments` (see
-        // `Registry`). Holding the read lock across both branches is what
-        // keeps a concurrent first use from registering between the lookup
-        // and the stash.
+        // Lock order: `pending_help` under `instruments`. Holding the read lock across both
+        // branches keeps a concurrent first use from registering between lookup and stash.
         let registered = REGISTRY
             .instruments
             .read()
@@ -1487,8 +1463,7 @@ fn describe(name: &str, kind: InstrumentKind, help: &str) {
         }
     };
 
-    // Warnings only once the guards are gone: a `tracing` subscriber is user
-    // code and must never run under a facade lock.
+    // Warn after the guards are gone: a `tracing` subscriber is user code.
     match outcome {
         Description::Recorded => {}
         Description::Mismatch(existing) => warn_kind_conflict(&existing, kind),
@@ -1546,10 +1521,8 @@ pub fn set_histogram_buckets(name: &str, upper_bounds: &[f64]) {
     }
 
     let outcome = {
-        // Lock order: `pending_buckets` nested under `instruments`. Holding the
-        // read lock across the check *and* the insert is what stops a
-        // concurrent first use from registering the histogram with the default
-        // bounds in between, which would drop this override on the floor.
+        // Lock order: `pending_buckets` under `instruments`. Holding the read lock across check
+        // and insert stops a concurrent first use from registering default bounds in between.
         let registered = REGISTRY
             .instruments
             .read()
@@ -1882,15 +1855,11 @@ impl TimerGuard {
     }
 
     /// Stop timing, record the observation, and return the elapsed duration.
-    // Not `#[must_use]`: recording the observation is the point of the call and
-    // `guard.stop();` — stop timing here, before the scope ends — is a correct,
-    // complete use. The returned duration is a convenience for callers that
-    // also want to log or assert on it.
+    // Not `#[must_use]`: `guard.stop();` is a complete use; the duration is a convenience.
     #[allow(clippy::must_use_candidate)]
     pub fn stop(mut self) -> Duration {
         let elapsed = crate::time::ambient_instant().saturating_duration_since(self.started);
-        // Taking the timer latches the measurement: `Drop` finds `None` and
-        // will not record it a second time.
+        // Taking the timer means `Drop` finds `None` and does not record a second time.
         if let Some(timer) = self.timer.take() {
             timer.record(elapsed);
         }
@@ -1900,12 +1869,9 @@ impl TimerGuard {
 
 impl Drop for TimerGuard {
     fn drop(&mut self) {
-        // `saturating_duration_since` is monotonic and saturating, and nothing
-        // below unwraps, indexes or divides. It is not *provably* panic-free: a
-        // labelled guard canonicalizes its labels, which allocates, and a
-        // rejected value calls into the `tracing` subscriber — either can
-        // panic in principle. Neither is on the path a guard normally takes,
-        // which records a finite duration into an already-registered series.
+        // Nothing here unwraps, indexes or divides. Label canonicalization allocates and a
+        // rejected value calls the `tracing` subscriber, so a panic is possible in principle,
+        // but not on the normal path: a finite duration into a registered series.
         if let Some(timer) = self.timer.take() {
             timer.record(crate::time::ambient_instant().saturating_duration_since(self.started));
         }
@@ -1965,9 +1931,8 @@ pub struct InstrumentSnapshot {
     /// distinct-set count would need unbounded memory to compute.
     pub dropped_series: u64,
 }
-// A histogram's bucket bounds are deliberately *not* a field here: they appear
-// in every histogram series already, as the `le` strings of
-// [`SeriesValue::Histogram`], in the exact form the scrape renders.
+// Bucket bounds are not a field: every histogram series already carries them as the `le`
+// strings of [`SeriesValue::Histogram`].
 
 /// One labeled series of an instrument.
 #[derive(Debug, Clone, Serialize)]
@@ -2044,8 +2009,7 @@ pub fn reset_for_tests() {
     REGISTRY
         .pending_help_full_warned
         .store(false, Ordering::Relaxed);
-    // Restore the shipped caps too: a test that raised one must not leave the
-    // next test running under a limit it never asked for.
+    // Restore the default caps so a raised one does not leak into the next test.
     set_limits(Limits::default());
 }
 
@@ -2283,8 +2247,7 @@ mod tests {
 
     #[test]
     fn a_held_handle_and_per_call_handles_share_one_series() {
-        // A held handle probes the series map with its own labels; a fresh
-        // handle built in another order must find the very same series.
+        // The per-call handle adds the same labels in the other order.
         let name = unique_name("facade_held_shared");
         let held = counter(&name)
             .with_label("status", "paid")
@@ -2312,9 +2275,7 @@ mod tests {
 
     #[test]
     fn gauge_and_histogram_labels_canonicalize_like_counter_labels() {
-        // `Gauge::with_label` and `Histogram::with_label` share the counter's
-        // canonicalization: order-independent, first-wins, invalid names
-        // dropped. Two handles built in different orders land in one series.
+        // Order-independent, first-wins, invalid names dropped, as for counters.
         let gauge_name = unique_name("facade_gauge_labels");
         gauge(&gauge_name)
             .with_label("pool", "primary")
@@ -2352,9 +2313,6 @@ mod tests {
 
     #[test]
     fn a_held_handle_applies_the_label_cap_in_force_when_it_records() {
-        // The cap is a property of the configuration at record time, not of
-        // the moment the handle was built: a handle built under one cap and
-        // recorded under another must follow the one in force.
         let name = unique_name("facade_held_cap_raised");
         let mut handle = counter(&name);
         for i in 0..DEFAULT_MAX_LABELS_PER_SERIES + 2 {
@@ -2599,8 +2557,7 @@ mod tests {
 
         let instrument = expect_instrument(&name);
         let (count, _sum, buckets) = histogram_parts(only_series(&instrument));
-        // `try_from` rather than `count as usize`: a truncating cast in an
-        // assertion could hide the very miscount this test exists to catch.
+        // `try_from`, not `as`: a truncating cast could hide the miscount under test.
         assert_eq!(usize::try_from(count).unwrap(), THREADS * PER_THREAD);
         assert_eq!(buckets.last().map(|(_, v)| *v), Some(count));
     }
@@ -2782,9 +2739,7 @@ mod tests {
 
     #[test]
     fn held_handle_follows_a_lowered_label_cap_like_a_fresh_one() {
-        // A held handle caches the series its labels name. Lowering
-        // `max_labels_per_series` below the handle's label count changes the
-        // key, so the cached series must not be reused.
+        // A lowered cap changes the held handle's key, so its cached series must not be reused.
         let _limits = LimitsGuard::raised_to(Limits {
             max_labels_per_series: DEFAULT_MAX_LABELS_PER_SERIES + 2,
             ..Limits::default()
@@ -2870,9 +2825,7 @@ mod tests {
 
     #[test]
     fn lowering_the_series_cap_stops_new_series_without_evicting_old_ones() {
-        // Eviction is the one thing a cardinality cap must never do: dropping
-        // a retained counter resets it, and a reset is indistinguishable from
-        // a process restart to `rate()`.
+        // Never evict: dropping a retained counter resets it, which `rate()` reads as a restart.
         let raised = DEFAULT_MAX_SERIES_PER_METRIC + 20;
         let _limits = LimitsGuard::raised_to(Limits {
             max_series_per_metric: raised,
@@ -2887,12 +2840,8 @@ mod tests {
         }
         assert_eq!(expect_instrument(&name).series.len(), raised);
 
-        // Back to the default — still above every other test's needs, so no
-        // concurrent test can see a cap below the one it was written against.
-        // Still under `_limits`, which holds the lock and restores the
-        // defaults on drop; lowering *to* the default is the floor the guard
-        // enforces, so no concurrent test can see a cap below the one it was
-        // written against.
+        // Lower only to the default, the floor `_limits` enforces, so no concurrent test sees a
+        // cap below the one it was written against.
         set_limits(Limits::default());
         counter(&name).with_label("shard", "late").increment(1);
 
@@ -2946,19 +2895,10 @@ mod tests {
 
     #[test]
     fn a_description_stashed_before_the_cap_is_raised_still_applies() {
-        // The documented startup pattern calls `describe_*` from `main`,
-        // *before* `AppBuilder::run` installs `[metrics]` (see
-        // `examples/bookmarks/src/main.rs`). A stash bounded by the running
-        // cap would drop those descriptions for an app that raised
-        // `max_instruments`, and no later raise can recover one that was
-        // never taken — so the staging area is bounded by the ceiling and
-        // this asserts the ordering end to end.
-        // Reproduces the drop: the stash must hold MORE than the default cap
-        // while that default is still the one in force, which is exactly the
-        // position an app raising `max_instruments` is in before `run`.
-        // Describing does not register, so this costs pending entries (bounded
-        // by the ceiling) and not registry slots — only the one name recorded
-        // at the end becomes an instrument.
+        // Apps call `describe_*` from `main`, before `AppBuilder::run` installs `[metrics]`. So
+        // the stash is bounded by the ceiling, not the running cap: this describes more names
+        // than the default cap while the default is in force. Describing does not register, so
+        // only the last name becomes an instrument.
         let names: Vec<String> = (0..DEFAULT_MAX_INSTRUMENTS + 50)
             .map(|_| unique_name("facade_describe_before_limits"))
             .collect();
@@ -2966,14 +2906,12 @@ mod tests {
             describe_counter(name, "described before the config was installed");
         }
 
-        // Now the config lands, raising the cap past what was described.
         let _limits = LimitsGuard::raised_to(Limits {
             max_instruments: DEFAULT_MAX_INSTRUMENTS + 256,
             ..Limits::default()
         });
 
-        // The last name is past the default cap, so a stash bounded by the
-        // running cap would have refused it and its HELP would be empty.
+        // Past the default cap: a stash bounded by the running cap would have refused it.
         let last = names.last().expect("described at least one name");
         counter(last).increment(1);
 
@@ -2987,8 +2925,7 @@ mod tests {
 
     #[test]
     fn limits_survive_a_pack_unpack_round_trip() {
-        // The three caps share one 64-bit word so a recorder reads them
-        // together; a slot too narrow for its ceiling would silently truncate
+        // The three caps share one 64-bit word; a slot too narrow for its ceiling would truncate
         // a configured cap into a different one.
         for limits in [
             Limits::default(),
@@ -3024,23 +2961,12 @@ mod tests {
 
     #[test]
     fn a_zero_cap_clamps_up_to_one() {
-        // Not reachable through `autumn.toml` — `validate` rejects a 0 there —
-        // but a binary building its own `Limits` must not end up with a cap
-        // that silently drops every labeled sample.
+        // `validate` rejects 0 in `autumn.toml`, but a binary can build its own `Limits`, and a
+        // zero cap would silently drop every labeled sample.
         //
-        // Asserted against `Limits::clamped` rather than by installing the
-        // zero through `set_limits`, and NOT because the lock would be
-        // inconvenient: holding `LIMITS_LOCK` would not make that safe. The
-        // lock serializes this test only against the handful that take it,
-        // while every ordinary metrics test records without it — and a
-        // process-global `max_instruments` of 1 hands *those* an inert handle
-        // for the whole window, since the registry is long past one
-        // instrument by the time this runs. A floor value is the one setting
-        // that cannot be published globally at all, so the floor is checked
-        // where it is decided. `set_limits`'s own clamping is covered by
-        // `set_limits_clamps_a_value_outside_the_accepted_range`, whose
-        // values clamp *down to the ceilings* — above every default, so the
-        // window it opens can only admit more.
+        // Checked on `Limits::clamped`, not installed with `set_limits`: a global
+        // `max_instruments` of 1 would hand inert handles to concurrent tests that do not take
+        // `LIMITS_LOCK`.
         assert_eq!(
             Limits {
                 max_series_per_metric: 0,
@@ -3094,10 +3020,8 @@ mod tests {
 
     #[test]
     fn dropped_series_counts_samples_not_distinct_label_sets() {
-        // The counter and its `# HELP` line both promise *samples*: a hot call
-        // site hammering one over-cap label set is the signal an operator
-        // needs, and counting distinct sets would mean remembering exactly the
-        // label sets the cap exists to stop remembering.
+        // A hot call site on one over-cap set is the signal an operator needs, and counting
+        // distinct sets would mean remembering the sets the cap exists to forget.
         let _limits = LimitsGuard::pinned();
         let name = unique_name("facade_dropped_counts_samples");
         for i in 0..DEFAULT_MAX_SERIES_PER_METRIC {
@@ -3135,9 +3059,8 @@ mod tests {
 
     #[test]
     fn label_subset_beyond_the_cap_does_not_depend_on_call_order() {
-        // Which labels survive the cap must be a function of the label *set*,
-        // never of the order `with_label` happened to be called in — otherwise
-        // the same ten labels applied two ways land in two distinct series.
+        // Which labels survive must depend on the label set, not on `with_label` call order,
+        // or the same labels applied in two orders land in two series.
         let _limits = LimitsGuard::pinned();
         let name = unique_name("facade_label_cap_order");
         let keys: Vec<String> = (0..10).map(|i| format!("k{i}")).collect();
@@ -3330,9 +3253,8 @@ mod tests {
 
     #[test]
     fn describe_histogram_then_set_histogram_buckets_keeps_both() {
-        // The trap this ordering used to spring: `describe_*` registered the
-        // instrument, freezing its bounds, so the custom buckets vanished with
-        // no diagnostic at all.
+        // `describe_*` must not register the instrument: that would freeze its bounds and drop
+        // the custom buckets silently.
         let name = unique_name("facade_describe_then_buckets");
         describe_histogram(&name, "how long a thing took");
         set_histogram_buckets(&name, &[1.0, 2.0, 3.0]);
@@ -3639,10 +3561,8 @@ mod tests {
 
     #[test]
     fn format_bound_matches_go_g_formatting() {
-        // client_golang renders `le` with Go's shortest %g: exponential
-        // outside [1e-4, 1e6), exponent signed and padded to two digits.
-        // (Go caps the %g precision decision at 6 for shortest formatting,
-        // which is why `1000000.0` famously prints as `1e+06`.)
+        // client_golang renders `le` with Go's shortest %g: exponential outside [1e-4, 1e6), the
+        // exponent signed and padded to two digits.
         assert_eq!(format_bound(0.000_05), "5e-05");
         assert_eq!(format_bound(0.000_025), "2.5e-05");
         assert_eq!(format_bound(1e6), "1e+06");

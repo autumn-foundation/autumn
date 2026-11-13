@@ -78,8 +78,8 @@
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
 
-// Several thin accessors here could be `const fn`; they stay non-const so the
-// frozen public surface can grow a non-const body later without a break.
+// Some accessors could be `const fn`; they stay non-const so a later non-const body is
+// not a breaking change.
 #![allow(clippy::missing_const_for_fn)]
 
 use std::sync::Arc;
@@ -92,34 +92,22 @@ use uuid::Uuid;
 use crate::entropy::{Entropy, SeededEntropy, uuid_v4_from_bytes, uuid_v7_from_parts};
 use crate::time::TickingClock;
 
-// The per-sim SQLite DB lane (W4, issue #1797): a fresh, migrated, in-process
-// SQLite substrate the sim builds its app on. Self-contained and additive — W2
-// consumes its pool when it mounts the app on `SimApp`. Only meaningful under the
-// `sqlite` feature (the sim's DB substrate is SQLite by design).
-//
-// Exposed as `#[doc(hidden)] pub` — unstable test/sim plumbing, not the stable
-// surface — mirroring this module's `__seed_from_env` / `__replay_line` hidden
-// hooks. It is `pub` (not `pub(crate)`) purely so the W4 DoD consolidated
-// integration test, which is an external crate, can drive the end-to-end drain;
-// the stable mount API remains W2's `Sim::build`.
+// The per-sim migrated, in-process SQLite database the sim builds its app on (#1797).
+// Hidden `pub`, not `pub(crate)`, only so integration tests can drive it; the stable
+// mount API is `Sim::build`.
 #[cfg(feature = "sqlite")]
 #[doc(hidden)]
 pub mod substrate;
 
-// The chaos lane (W5, issue #1797): deterministic fault injection wired into
-// `Sim::build`. Additive and opt-in — a default (empty) `Chaos` installs
-// nothing. See the module docs for the determinism contract.
+// Seeded probabilistic fault injection wired into `Sim::build` (#1797).
 pub mod chaos;
 
 #[cfg(feature = "mail")]
 pub use chaos::MailFault;
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
 
-// The authored fault lane (issue #1680): `FaultPlan`, an ordinal-targeted,
-// seed-deterministic fault schedule installed through `TestApp::with_fault_plan`
-// (not through `Sim::chaos`), plus the serializable `FaultOutcome` a scenario
-// asserts on. Additive and opt-in — a `TestApp` with no plan is untouched. See
-// the module docs for the determinism contract and how it differs from `Chaos`.
+// Ordinal-targeted faults installed through `TestApp::with_fault_plan`, not
+// `Sim::chaos` (#1680).
 pub mod fault;
 
 pub use fault::{
@@ -127,25 +115,15 @@ pub use fault::{
     ReportedError,
 };
 
-// The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
-// completion client — canned responses + a seeded fault/latency schedule — for
-// exercising agent retry/fallback paths under the virtual clock. Standalone and
-// additive; it does not route through the `Chaos` builder. See the module docs
-// for the determinism contract.
+// A seeded fake LLM client for agent retry/fallback paths (#1797).
 pub mod llm;
 
 pub use llm::{LlmCall, LlmClient, LlmError, LlmRequest, LlmResponse, SeededLlm, SeededLlmBuilder};
 
-// The crash lane (W5.c item 7, issue #1797): a seed-derived crash schedule plus
-// the `Sim` kill/restart primitive for durable crash-recovery tests. Additive —
-// the schedule is a pure function of the seed and installs nothing at build.
+// Seed-derived crash schedules for crash-recovery tests (#1797).
 pub mod crash;
 
-// The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
-// macros and the thread-local non-vacuity registry. Public (documented) module —
-// the macros are `#[macro_export]`ed at the crate root (`autumn_web::always` /
-// `autumn_web::sometimes`), and their hidden plumbing plus the sweep-facing
-// registry API live here.
+// Plumbing and registry for the crate-root `always!` / `sometimes!` macros (#1797).
 pub mod assert;
 
 // The simulated network (issue #2967): seeded latency, drops and partitions
@@ -156,9 +134,7 @@ pub mod net;
 #[cfg(feature = "http-client")]
 pub use net::{NetEvent, NetFault, SimNet};
 
-// The shared demo scenario (issue #2967): one `Op` vocabulary for the
-// `sim-sweep` proptest sweep and the `sim_ops` cargo-fuzz target. Hidden,
-// unstable harness plumbing.
+// One `Op` vocabulary for the `sim-sweep` sweep and the `sim_ops` fuzz target (#2967).
 #[doc(hidden)]
 pub mod scenario;
 
@@ -199,23 +175,13 @@ pub use assert::{
 };
 pub use crash::{CrashOutcome, CrashPoint, CrashSchedule, crash_at};
 
-// The W6 op-driver (PR2, issue #1797): `Sim::gen_ops`/`Sim::gen_ops_with` (deterministic,
-// non-shrinking generation) and `Sim::run_proptest` (the shrink-capable
-// runner-owning entrypoint). Behind the `sim-testing` feature because it needs
-// `proptest` as a library (not just dev) dependency — see `autumn/Cargo.toml`.
+// Op generation and `Sim::run_proptest` (#1797). Feature-gated because it needs
+// `proptest` as a library dependency, not only a dev one.
 #[cfg(feature = "sim-testing")]
 pub mod op;
 
-// The W6 seed-sweep runner (PR3, issue #1797): `sweep_proptest` runs
-// `Sim::run_proptest` sequentially across a batch of seeds, reporting the
-// first failing seed (if any), and folds `sometimes!` reachability — across
-// every proptest case in every seed — across the whole swept range so a
-// green sweep is provably non-vacuous. Sequential, not parallel: see
-// `sim::sweep`'s module docs for why a `body` that mounts a real app makes
-// OS-thread parallelism unsafe here. The `sim-sweep` `[[bin]]`
-// (`autumn/src/bin/sim_sweep.rs`) is its CI-facing driver. Same
-// `sim-testing` feature gate as `op` — it builds directly on
-// `Sim::run_proptest_with_case_hook`.
+// The seed-sweep runner behind the `sim-sweep` binary (#1797). It runs seeds
+// sequentially; `sim::sweep`'s module docs explain why.
 #[cfg(feature = "sim-testing")]
 pub mod sweep;
 
@@ -354,9 +320,7 @@ impl Sim {
     /// it; `#[sim_test]` does this for you.
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
-        // Each seed run starts with a clean reachability registry, so the sweep
-        // can attribute observed/satisfied `sometimes!` labels to exactly one
-        // seed before folding them into its cross-seed aggregate (W6, #1797).
+        // A clean registry per seed lets the sweep attribute `sometimes!` labels to one seed.
         assert::reset_sometimes_registry();
         let clock = SimClock::new(TickingClock::starting_at(sim_epoch()));
         let ambient_clock = Arc::new(AmbientSimClock {
@@ -523,12 +487,11 @@ impl Sim {
     /// path. When chaos is active this re-derives the chaos decision state from
     /// the seed, so a restart's fault schedule replays deterministically.
     fn mount(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
-        // Seed the app's entropy unless the test injected its own source, so
-        // framework-minted ids replay from the seed with no extra call.
+        // Unless the test injected its own entropy, framework-minted ids replay from the seed.
         let mount_seed = mount_entropy_seed(self.seed, self.mounts);
         let app = app.with_default_entropy(SeededEntropy::shared(mount_seed));
         self.mounts += 1;
-        // Install the simulated network, with a stream fresh for this mount.
+        // A fresh network stream for each mount.
         #[cfg(feature = "http-client")]
         let app = match &self.net {
             Some(net) => {
@@ -537,10 +500,8 @@ impl Sim {
             }
             None => app,
         };
-        // When chaos is active, install its deterministic hooks (which also own
-        // the clock so a skew wrapper can be applied); otherwise the build is
-        // byte-for-byte the pre-W5 path — just the virtual clock.
-        // The ambient wall clock matches the app clock, skewed or not.
+        // The ambient wall clock matches the app clock, skewed or not. Active chaos owns
+        // the app clock so it can apply its skew.
         *self
             .ambient
             .wall
@@ -584,15 +545,13 @@ impl Sim {
     /// the in-memory job queue's by-design loss is documented, never pretended
     /// durable. See the [`crash`] module docs.
     pub fn kill(&mut self) {
-        // Stop the app's tasks, as a process death does. Dropping the client
-        // then runs `TestJobRuntime::drop` (shutdown.cancel() +
-        // clear_global_job_client()).
+        // Dropping the client runs `TestJobRuntime::drop`, which cancels shutdown and
+        // clears the global job client.
         if let Some(client) = self.app.client.take() {
             abort_app_tasks(&client);
             drop(client);
         }
-        // A fresh process has no in-memory chaos decision log; a restart
-        // re-derives it deterministically from the seed.
+        // A restart re-derives the chaos decision log from the seed.
         self.chaos_state = None;
     }
 
@@ -1077,26 +1036,20 @@ impl Sim {
     /// Pair with [`run_to_idle`](Sim::run_to_idle) to then drain the work the
     /// fired timers enqueued.
     pub async fn advance(&self, duration: std::time::Duration) {
-        // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
-        // sample a REAL instant (not tokio's paused time) at entry and check the
-        // real elapsed against the budget before returning. `advance_to` routes
-        // through here, so it inherits the guard for free.
+        // Real-time leak guard (no-op unless `strict_wall_clock` is set): a real instant,
+        // not tokio's paused time. `advance_to` routes through here.
         let guard_start = self.wall_clock_guard_start();
-        // `advance` yields and never parks, so database work runs without the
-        // gate's turns, as before the gate (#3067).
+        // `advance` yields and never parks, so database work runs outside the gate's
+        // turns (#3067).
         let _open = gate::Open::new();
-        // Let every ready task take one step at the current instant before time
-        // moves. A task spawned since the last yield (a `#[scheduled]` loop that
-        // `build` started, a job worker) then registers its first timer at the
-        // instant it was started, not at the end of this advance.
+        // Let ready tasks step before time moves, so a task spawned since the last yield
+        // (a `#[scheduled]` loop, a job worker) registers its first timer at the instant it
+        // started, not at the end of this advance.
         tokio::task::yield_now().await;
-        // Step the framework clock first so any task woken by the tokio timer
-        // that reads the clock observes the already-advanced instant.
+        // Framework clock first, so a task woken by the tokio timer reads the new instant.
         self.clock.advance(duration);
-        // Advance tokio's paused timer wheel; this fires due timers and yields
-        // so their tasks are polled before returning.
-        // `tokio::time::advance` moves the clock in its first poll, the same
-        // poll as this note, and only then yields.
+        // `tokio::time::advance` moves the clock in its first poll, the same poll as this
+        // note, and only then yields.
         note_own_advance(&self.ambient, duration);
         tokio::time::advance(duration).await;
         self.enforce_wall_clock_budget(guard_start);
@@ -1276,27 +1229,23 @@ impl Sim {
     /// A single long-running job, or a task that loops without spawning,
     /// does not count as work.
     pub async fn try_run_to_idle(&self) -> Result<(), SimStall> {
-        // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
-        // sample a REAL instant at entry and enforce the budget before
-        // returning, catching a real blocking sleep in a drained task.
+        // Real-time leak guard (no-op unless `strict_wall_clock` is set): catches a real
+        // blocking sleep in a drained task.
         let guard_start = self.wall_clock_guard_start();
-        // The drain yields and never parks, so database work runs without the
-        // gate's turns, as before the gate (#3067).
+        // The drain yields and never parks, so database work runs outside the gate's
+        // turns (#3067).
         let _open = gate::Open::new();
 
-        // Resolve the mounted app's DB pool once (a cheap, cloned Arc-backed
-        // handle). Durable repository commit hooks are rows, so there is
-        // nothing to drain when the app was built without a database (e.g. the
-        // in-memory job DoD path) — the lane is skipped entirely then.
+        // Commit hooks are rows, so an app built without a database has none to drain.
         #[cfg(feature = "db")]
         let commit_hook_pools: Vec<_> = self
             .live_clients()
             .filter_map(|client| crate::db::DbState::pool(client.state()).cloned())
             .collect();
 
-        // Run the full `MAX_DRAIN_STEPS`. Then stop at the first
-        // `STALL_WINDOW` quiet rounds in a row; work that ends late still
-        // settles. Work that never goes quiet is a stall.
+        // Run the full `MAX_DRAIN_STEPS`, then stop at the first `STALL_WINDOW` quiet rounds
+        // in a row, so work that ends late still settles. Work not quiet by twice
+        // `MAX_DRAIN_STEPS` is a stall.
         let mut quiet_rounds = 0;
         let mut rounds = 0;
         while rounds < MAX_DRAIN_STEPS
@@ -1304,22 +1253,13 @@ impl Sim {
         {
             rounds += 1;
             let before = drain_fingerprint();
-            // One yield lets each currently-ready spawned task take a step; a
-            // zero-duration timer advance flushes any timers registered for the
-            // current instant and yields again, so a chain of ready timer/task
-            // wakeups settles without advancing the clock. This quiesces the
-            // in-process job runtime (TestJobRuntime / JobAdminMemoryBackend)
-            // and any tasks woken by already-due scheduler ticks.
+            // The yield lets each ready task step; the zero-duration advance fires timers due
+            // at the current instant, so chained wakeups settle without moving the clock.
             tokio::task::yield_now().await;
             tokio::time::advance(std::time::Duration::ZERO).await;
 
-            // Third ready-work source: durable repository commit hooks. Drain
-            // the ready set through the public test-harness wrapper
-            // (`crate::test::drain_ready_repository_commit_hooks`), which runs
-            // the same claim → run → ack wiring the background commit-hook
-            // worker uses, but deterministically and worker-free. A hook may
-            // itself enqueue a job, so draining inside the settle loop lets a
-            // subsequent iteration pick that job up.
+            // Durable commit hooks, through the same claim → run → ack path as the background
+            // worker. A hook may enqueue a job, which a later round picks up.
             #[cfg(feature = "db")]
             for pool in &commit_hook_pools {
                 let hooks_drained =
@@ -1329,8 +1269,8 @@ impl Sim {
                 }
             }
 
-            // Fourth source: the transactional outbox (issue #3062). The same
-            // claim → handle → mark path the relay worker runs, worker-free.
+            // The transactional outbox, through the relay worker's claim → handle → mark
+            // path (#3062).
             #[cfg(feature = "db")]
             for state in self
                 .live_clients()
@@ -1364,8 +1304,7 @@ impl Sim {
 
 impl Drop for Sim {
     fn drop(&mut self) {
-        // A replica is a host of the sim network, and its app holds the
-        // network: a cycle. Remove the hosts, so the replica apps drop.
+        // A replica is a network host and its app holds the network: break the cycle.
         #[cfg(feature = "http-client")]
         for slot in &mut self.replicas {
             if let Some(net) = slot.net.take() {
@@ -1684,11 +1623,8 @@ where
         LocalResult::Single(dt) => dt.with_timezone(&Utc),
         LocalResult::Ambiguous(earlier, _later) => earlier.with_timezone(&Utc),
         LocalResult::None => {
-            // Spring-forward gap: the wall time never occurs. Resolve it by
-            // looking up the zone's offset at the UTC-clock reading numerically
-            // equal to the wall time and applying it — a total, deterministic
-            // mapping that carries the nonexistent time forward across the gap to
-            // a single post-transition instant.
+            // Spring-forward gap: apply the zone's offset at the UTC reading numerically equal
+            // to the wall time, which carries the time forward past the gap.
             let offset_secs =
                 i64::from(tz.offset_from_utc_datetime(&local).fix().local_minus_utc());
             (local - chrono::Duration::seconds(offset_secs)).and_utc()
@@ -2271,9 +2207,7 @@ mod tests {
 
     #[test]
     fn strict_budget_from_env_falls_back_to_default_when_unset() {
-        // The env var is not set in this unit-test process, so the default is
-        // returned verbatim (the override path is exercised via the public
-        // integration tests, which never set the var).
+        // The env var is not set in this unit-test process.
         let default = std::time::Duration::from_millis(7);
         assert_eq!(strict_budget_from_env_or(default), default);
         assert_eq!(

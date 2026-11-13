@@ -84,62 +84,33 @@ thread_local! {
 fn subtree_has_visible_content(
     nodes: &[Node],
     glue_risk: bool,
-    // True when the caller's buffer gets `trim_trailing_break`d and
-    // nothing else would ever be appended after this subtree — a *lone*
-    // break is safe here only if truly nothing (not even whitespace)
-    // follows it: any whitespace found after it becomes the buffer's
-    // actual trailing span, keeping the break alive.
+    // The buffer is trimmed and nothing is appended after this subtree. Whitespace after a lone
+    // break becomes the buffer's last span and keeps the break alive.
     trailing_break_is_trimmed: bool,
-    // True when this subtree is `inline_list_items`'s marker call, at the
-    // exact position (`content_start`) whose leading `Span::Break` it
-    // strips unconditionally, regardless of what follows. Unlike the
-    // trailing case, whitespace *after* the break here doesn't keep it
-    // alive — the break is gone either way, and any whitespace-only
-    // remainder is itself invisible (isolated whitespace never becomes a
-    // word), since a list marker always ends in its own trailing space,
-    // so `glue_risk` can never be true here. When both this and
-    // `trailing_break_is_trimmed` apply, this — the stronger, unconditional
-    // guarantee — wins.
+    // This is `inline_list_items`'s call at `content_start`, whose leading `Span::Break` it strips
+    // unconditionally, so whitespace after the break does not revive it. Whitespace-only text is
+    // invisible here because the marker ends in a space. Wins over `trailing_break_is_trimmed`.
     leading_break_is_stripped: bool,
 ) -> bool {
-    // Document order matters here, not just for its own sake: telling a
-    // truly trailing `<br>` (nothing rendered after it) apart from one
-    // merely followed by whitespace requires walking in the order those
-    // spans would actually get pushed. A plain `Vec` used as a stack pops
-    // last-in-first-out, so both this initial collect and each `children`
-    // push below are reversed to compensate — same trick
-    // `node_glue_lookahead` already uses.
+    // Walk in document order (hence the reversed pushes) to tell a trailing `<br>` apart from one
+    // followed by whitespace.
     let mut stack: Vec<&Node> = nodes.iter().rev().collect();
     let mut has_whitespace_only_text = false;
     let mut seen_break = false;
-    // True once any whitespace-only text has been emitted (as a
-    // `Span::Run`, uncapped) *before* the first `<br>` is reached — which
-    // means that `<br>`, if rendered, would NOT land at `content_start`
-    // after all, so `inline_list_items`'s leading-break strip would never
-    // touch it. Only relevant to `leading_break_is_stripped`, which
-    // otherwise assumes the break is the very first thing emitted.
-    // (Codex review on PR #2810.)
+    // Whitespace emitted before the first `<br>` means that break would not sit at
+    // `content_start`, so the leading-break strip would not remove it.
     let mut emitted_before_first_break = false;
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
-                // words_of splits on breakable whitespace and drops the
-                // pieces it produces, so a run of nothing but breakable
-                // whitespace (plain spaces, newlines) never becomes a word
-                // and draw_spans never draws or advances for it — only a
-                // char that survives that split (an ordinary character, or
-                // a non-breaking space, which is whitespace by Unicode's
-                // definition but still renders as its own word) means this
-                // text is really visible on its own.
+                // `words_of` drops breakable whitespace, so only another char (NBSP included,
+                // which renders as its own word) makes this text visible.
                 if text.chars().any(|c| !is_breakable_whitespace(c)) {
                     return true;
                 }
                 if !text.is_empty() {
-                    // Only the trailing exemption cares whether this
-                    // break stays the buffer's *actual* last span — the
-                    // leading-strip exemption removes it unconditionally,
-                    // so trailing whitespace afterward doesn't revive it.
-                    // (Codex review on PR #2810.)
+                    // Whitespace after the break makes the break no longer the trailing span,
+                    // so trimming keeps it. The leading strip removes it regardless.
                     if seen_break && trailing_break_is_trimmed && !leading_break_is_stripped {
                         return true;
                     }
@@ -213,23 +184,15 @@ fn subtree_has_nonempty_text(nodes: &[Node]) -> bool {
             }
             Node::Element { tag, children } => {
                 if tag == "ul" || tag == "ol" {
-                    // inline_list_items scans only direct <li> children
-                    // and ignores everything else without recursing into
-                    // it, so a listless <ul>/<ol>'s descendants (stray
-                    // text, nested elements) never reach the page —
-                    // don't scan past this node either way.
+                    // `inline_list_items` reads only direct `<li>` children; nothing else under
+                    // a `<ul>`/`<ol>` reaches the page.
                     if nodes_contain_an_li(children) {
                         return true;
                     }
                     continue;
                 }
-                // Two or more <br> tags survive trim_trailing_break (it
-                // pops only the last one), leaving a real Span::Break that
-                // draws a row. <br> pushes its break directly, bypassing
-                // push_block_break's "no two in a row" suppression that
-                // every other break-producing tag goes through, so a
-                // plain occurrence count is enough here regardless of
-                // order or nesting.
+                // `trim_trailing_break` removes only one break, so a second `<br>` draws a row.
+                // `<br>` bypasses `push_block_break`'s dedup, so a plain count is enough.
                 if tag == "br" {
                     br_count += 1;
                     if br_count >= 2 {
@@ -284,12 +247,7 @@ fn nodes_contain_table_output(nodes: &[Node], table_has_other_populated_row: boo
                     return true;
                 }
             }
-            // The HTML parser auto-closes a <thead>/<tbody>/<tfoot> when
-            // another one of the three opens (see html::implicitly_closes),
-            // so real markup can never nest them — pushed onto the same
-            // stack as everything else purely for defense in depth, the
-            // same reason the whole walk is iterative rather than
-            // recursive.
+            // The parser never nests these (`html::implicitly_closes`); descending is defensive.
             "thead" | "tbody" | "tfoot" => stack.extend(children),
             _ if is_non_rendered(tag) => {}
             _ => {
@@ -476,14 +434,8 @@ fn is_block_boundary_in_inline_context(tag: &str) -> bool {
                 | "footer"
                 | "nav"
                 | "aside"
-                // A nested `<table>` (e.g. `<td><table>...</table></td>`) has
-                // no dedicated `Block::Table` path here — `extract_table_rows`
-                // only runs on a *top-level* table — so without this, its
-                // `table`/`tr`/`td`/`th` structure fell through to the
-                // generic transparent-wrapper case and glued adjacent cells'
-                // text directly together (`<td>A</td><td>B</td>` rendering
-                // as "AB"). Not a real nested table (no grid/borders), but
-                // keeps each cell's content from merging into its neighbor.
+                // Only a top-level table gets a `Block::Table`. Breaking around a nested
+                // table's parts keeps `<td>A</td><td>B</td>` from rendering as "AB".
                 | "table"
                 | "thead"
                 | "tbody"
@@ -491,12 +443,8 @@ fn is_block_boundary_in_inline_context(tag: &str) -> bool {
                 | "tr"
                 | "td"
                 | "th"
-                // `<hr>` (e.g. `<li>Before<hr>After</li>`) is a void
-                // element (no children to recurse into), and this context
-                // has no `Block::Rule` to give it the way `flatten_blocks`
-                // does for a top-level `<hr>` — but it still needs to keep
-                // "Before" and "After" from gluing into "BeforeAfter". A
-                // line break is the closest flat-span equivalent of a rule.
+                // No `Block::Rule` here; a line break keeps `<li>Before<hr>After</li>` from
+                // rendering as "BeforeAfter".
                 | "hr"
         )
 }
@@ -542,26 +490,12 @@ fn inline_spans(
     italic: bool,
     depth: u32,
     has_more_after: &GlueContext,
-    // True when `out` is a fresh buffer that gets `trim_trailing_break`d
-    // once this whole call (and everything it recurses into) returns —
-    // e.g. a heading's, a table cell's, or a list item's own dedicated
-    // spans — as opposed to a shared paragraph buffer nothing ever trims
-    // (`flatten_blocks`'s/`flatten_into_pending`'s own `pending`). See
-    // `subtree_has_visible_content`'s `lone_trailing_break_is_trimmed`.
-    // Every recursive call below passes this straight through unchanged:
-    // they all keep writing into the same `out`, so whether it eventually
-    // gets trimmed never changes partway through one call tree.
+    // `out` is a fresh buffer (a heading, cell or list item) that is `trim_trailing_break`d once
+    // this call tree returns, not a shared paragraph buffer. Passed through unchanged, since every
+    // recursive call writes into the same `out`.
     trimmed: bool,
-    // `Some(content_start)` only for the call `inline_list_items` makes
-    // right after a marker: it strips a leading `Span::Break` at exactly
-    // that index once this call returns (see its own comment), regardless
-    // of what a *later* sibling does — unlike `trimmed`'s "is this the
-    // buffer's actual last span" question, this one only needs "is `out`
-    // still exactly as long as it was when this position started", which
-    // stays valid as-is through every recursive call below (an earlier
-    // sibling pushing anything makes the comparison naturally false for
-    // whatever comes after it). `None` everywhere else, since only that
-    // one call site ever strips a leading break this way.
+    // `Some(content_start)` only for `inline_list_items`'s call after a marker, which strips a
+    // leading `Span::Break` at that index. `None` elsewhere.
     leading_break_strip_point: Option<usize>,
     out: &mut Vec<Span>,
 ) {
@@ -569,14 +503,8 @@ fn inline_spans(
         if subtree_has_visible_content(
             nodes,
             ends_with_glueable_word(out) && has_more_after.resolve(),
-            // Safe only if dropping this subtree's own lone break truly
-            // changes nothing — which also requires `out` not to
-            // *already* end in a break: if it does, appending ours would
-            // still get trimmed away, but the earlier one would then
-            // survive as the buffer's new actual last span (uncapped),
-            // whereas capping this subtree leaves that earlier break as
-            // the trailing span too, which trim_trailing_break removes —
-            // a real, visible difference. (Codex review on PR #2810.)
+            // If `out` already ends in a break, uncapped output keeps it after trimming ours,
+            // while capped output trims it, so the lone-break exemption does not apply.
             trimmed && has_more_after.nothing_follows() && !matches!(out.last(), Some(Span::Break)),
             leading_break_strip_point == Some(out.len()),
         ) {
@@ -645,16 +573,9 @@ fn inline_spans(
                     push_block_break(out);
                 }
                 _ if is_block_boundary_in_inline_context(tag) => {
-                    // Unlike the transparent cases above, this tag's own
-                    // trailing push_block_break (right below) unconditionally
-                    // separates its content from whatever follows it out
-                    // here — so that later content can never glue to
-                    // anything inside, regardless of what more_after says.
-                    // `BlockBoundary` still remembers the real context
-                    // underneath the override, for `nothing_follows`'s sake
-                    // — `more_after` (this position's own later-siblings
-                    // context), not `has_more_after` (the caller's, which
-                    // omits siblings following this tag at *this* level).
+                    // The trailing break below means nothing after this tag can glue to its
+                    // content. `BlockBoundary` keeps `more_after` (not `has_more_after`, which
+                    // omits this level's later siblings) for `nothing_follows`.
                     push_block_break(out);
                     inline_spans(
                         children,
@@ -702,8 +623,7 @@ fn inline_spans(
 /// to both the marker and, via a plain pass-through to the recursive
 /// `inline_spans` call below, each item's own content, exactly like
 /// `inline_spans` already threads it through every other nested tag.
-// `ordered`/`bold`/`italic`/`trimmed` are four independent, unrelated
-// caller-supplied flags, not a state machine an enum would model better.
+// Four independent caller flags, not states an enum would model.
 #[allow(clippy::fn_params_excessive_bools)]
 fn inline_list_items(
     nodes: &[Node],
@@ -711,9 +631,7 @@ fn inline_list_items(
     bold: bool,
     italic: bool,
     depth: u32,
-    // See `inline_spans`'s own `trimmed` parameter — threaded straight
-    // through from the caller, since every item's content still lands in
-    // that same shared `out`.
+    // As `inline_spans`'s `trimmed`: every item's content lands in the same `out`.
     trimmed: bool,
     out: &mut Vec<Span>,
 ) {
@@ -745,13 +663,9 @@ fn inline_list_items(
             bold,
             italic,
         });
-        // If this item's content starts with a block boundary — `<li><p>Child</p></li>` —
-        // `inline_spans` pushes a break before it. That is normally correct, separating
-        // one block from the one before it, but here `out` already ends with the marker's
-        // own `Run`, so the leading break lands between the marker and its first line of
-        // content instead of before a preceding sibling, splitting them across two lines.
-        // Strip exactly that one leading break, never more: anything after it is
-        // legitimate inter-block spacing within the item's own content.
+        // Content that opens with a block (`<li><p>Child</p></li>`) gets a leading break that
+        // would split the marker from its first line. Strip only that one; later breaks are
+        // real spacing inside the item.
         let content_start = out.len();
         inline_spans(
             children,
@@ -805,8 +719,7 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
                     let is_header = cell_tag == "th";
                     if is_header || cell_tag == "td" {
                         let mut spans = Vec::new();
-                        // `cell_children` is two levels below `tr`'s `depth`
-                        // (tr -> td/th -> cell_children).
+                        // `depth + 2`: tr -> td/th -> cell_children.
                         inline_spans(
                             cell_children,
                             is_header,
@@ -823,18 +736,11 @@ fn extract_table_rows(nodes: &[Node], depth: u32, has_more_after: bool, out: &mu
                 }
                 out.push(TableRow { cells });
             }
-            // Structural wrappers (thead/tbody/tfoot) — descend without
-            // emitting a row themselves.
             "thead" | "tbody" | "tfoot" => {
                 extract_table_rows(children, depth + 1, more_after[i], out);
             }
             _ if is_non_rendered(tag) => {}
-            // Anything else inside a <table> (most commonly <caption>, or a
-            // stray text-bearing tag) isn't a row — but its text must still
-            // render somewhere, matching this renderer's "unknown tags pass
-            // their text through transparently" contract (see module docs).
-            // A single-cell row is the simplest way to surface it without a
-            // dedicated non-tabular-content block type.
+            // Any other child (usually `<caption>`) still renders its text, as a one-cell row.
             _ => {
                 let mut spans = Vec::new();
                 inline_spans(
@@ -899,17 +805,12 @@ fn extract_list_items(nodes: &[Node], ordered: bool, depth: u32, out: &mut Vec<B
 /// content not wrapped in a block tag (bare text, `<span>`, `<strong>`, ... at
 /// the top level) is collected into an implicit paragraph, matching how a
 /// browser would flow loose text.
-// One arm per HTML tag this renderer treats specially, so its length tracks
-// the tag list, not accidental complexity — same rationale as the
-// `too_many_arguments` allows already in this file.
+// One arm per specially handled tag, so its length tracks the tag list.
 #[allow(clippy::too_many_lines)]
 fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
     if depth > MAX_DEPTH {
-        // No glue risk here: `pending` (below) doesn't exist yet at this
-        // point, so there's no accumulated word this call could ever glue
-        // a dropped whitespace-only span onto. Not trimmed either: this
-        // call's own paragraph buffer never runs through
-        // `trim_trailing_break` (see `flatten_blocks`'s `flush`).
+        // No glue risk: `pending` does not exist yet. Not trimmed: this paragraph buffer is never
+        // `trim_trailing_break`d.
         if subtree_has_visible_content(nodes, false, false, false) {
             DEPTH_CAP_HIT.with(|hit| hit.set(true));
         }
@@ -937,14 +838,9 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
         };
         match node {
             Node::Text(text) => {
-                // Pushed even when whitespace-only: a text node between two
-                // loose inline elements (`<span>Hello</span> <span>world</span>`)
-                // carries the one significant space HTML collapses runs of
-                // whitespace to — dropping it here would make `words_of`
-                // glue the surrounding words together with no space at all.
-                // A whitespace-only span still contributes zero *words* (see
-                // `words_of`), so this never emits a visible extra blank
-                // line — it only preserves the separator.
+                // Kept even when whitespace-only: it is the separator in `<span>Hello</span>
+                // <span>world</span>`, and dropping it glues the words. It yields no words, so it
+                // never adds a blank line.
                 if !text.is_empty() {
                     pending.push(Span::Run {
                         text: text.clone(),
@@ -972,19 +868,9 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     continue;
                 }
                 match tag.as_str() {
-                    // `p` and `li` cannot legally nest another block element in
-                    // HTML — a nested block inside them is already malformed
-                    // input — so flattening their content to one implicit
-                    // paragraph is a reasonable degrade. `li`'s normal path is
-                    // `extract_list_items` below, not here; this arm sees only a
-                    // stray `<li>` outside a `<ul>`/`<ol>`. `dt` and `dd`, a
-                    // description list's term and value, are the same shape: each
-                    // is its own block-level unit whose content is normally
-                    // inline, so it gets its own paragraph rather than gluing onto
-                    // its sibling. Without this,
-                    // `<dl><dt>Title</dt><dd>My Post</dd>...</dl>`, as scaffold
-                    // detail views emit from a `property_list` widget, renders as
-                    // one run of unbroken text with no row boundaries.
+                    // Valid HTML nests no blocks in these, so one paragraph each is a fair
+                    // degrade. Only a stray `<li>` outside a list reaches here. `dt`/`dd` get
+                    // their own paragraphs so `<dt>Title</dt><dd>My Post</dd>` does not glue.
                     "p" | "li" | "dt" | "dd" => {
                         flush(&mut pending, out);
                         let mut spans = Vec::new();
@@ -1001,27 +887,10 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         trim_trailing_break(&mut spans);
                         out.push(Block::Paragraph(spans));
                     }
-                    // `div`, `blockquote`, and `dl` commonly wrap other block
-                    // elements — `<div><h1>...</h1><p>...</p></div>`,
-                    // `<blockquote><p>...</p></blockquote>`, a `<dl>`'s `<dt>`
-                    // and `<dd>` children. Recursing through `flatten_blocks`,
-                    // rather than flattening every descendant through
-                    // `inline_spans` into one paragraph, lets nested block tags
-                    // produce their own blocks; otherwise a heading and two
-                    // paragraphs merge into a single run of unbroken text. When
-                    // the children are purely inline
-                    // (`<div><span>hi</span></div>`), `flatten_blocks`'s own
-                    // pending/flush accumulator produces exactly the same single
-                    // implicit paragraph this used to build directly.
-                    //
-                    // HTML5's sectioning and landmark elements — `section`,
-                    // `article`, `main`, `header`, `footer`, `nav`, `aside` —
-                    // commonly wrap block content the way a `<div>` does. Without
-                    // them here, adjacent elements of loose text fell through to
-                    // the generic transparent-passthrough arm and accumulated
-                    // into one pending paragraph with no separator, rendering
-                    // `<aside>Summary</aside><aside>Details</aside>` as
-                    // `SummaryDetails`.
+                    // Containers that commonly wrap other blocks: recursing gives nested
+                    // headings and paragraphs their own blocks, and keeps sibling containers
+                    // apart (`<aside>Summary</aside><aside>Details</aside>` is not
+                    // "SummaryDetails"). Purely inline children still form one paragraph.
                     "div" | "blockquote" | "dl" | "section" | "article" | "main" | "header"
                     | "footer" | "nav" | "aside" => {
                         flush(&mut pending, out);
@@ -1046,9 +915,7 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         extract_list_items(children, true, depth + 1, out);
                     }
                     "br" => pending.push(Span::Break),
-                    // `pending` here is `flatten_blocks`'s own paragraph
-                    // buffer, flushed via `flush` above with no
-                    // `trim_trailing_break` — so `false`, never trimmed.
+                    // `pending` is never `trim_trailing_break`d, so `trimmed` is false.
                     "strong" | "b" => {
                         inline_spans(
                             children,
@@ -1074,9 +941,8 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         );
                     }
                     _ if is_non_rendered(tag) => {}
-                    // Transparent passthrough: unknown/inline wrapper tags
-                    // (span, a, ...) flow their children into the current
-                    // implicit paragraph rather than being dropped.
+                    // Unknown and inline wrappers (`span`, `a`, ...) flow into the current
+                    // paragraph.
                     _ => {
                         flatten_into_pending(children, depth + 1, &more_after, &mut pending, out);
                     }
@@ -1098,9 +964,7 @@ fn flatten_into_pending(
     out: &mut Vec<Block>,
 ) {
     if depth > MAX_DEPTH {
-        // Not trimmed: `pending` here always traces back to
-        // `flatten_blocks`'s own paragraph buffer (see `flatten_blocks`'s
-        // `flush`), which never runs through `trim_trailing_break`.
+        // Not trimmed: `pending` is `flatten_blocks`'s paragraph buffer.
         if subtree_has_visible_content(
             nodes,
             ends_with_glueable_word(pending) && has_more_after.resolve(),
@@ -1111,10 +975,6 @@ fn flatten_into_pending(
         }
         return;
     }
-    // Reuse `flatten_blocks` by giving it a scratch buffer, then splice: if
-    // it only ever produced inline text (no nested block tags fired), that
-    // text lives in blocks as trailing paragraphs — simplest correct
-    // approach is to just recurse the same tag-matching logic directly.
     let raw_cache = vec![Cell::new(None); nodes.len()];
     let resolve_cache = vec![Cell::new(None); nodes.len()];
     let nothing_follows_cache = vec![Cell::new(None); nodes.len()];
@@ -1130,9 +990,7 @@ fn flatten_into_pending(
         };
         match node {
             Node::Text(text) => {
-                // See the matching comment in `flatten_blocks` — a
-                // whitespace-only text node is a significant separator
-                // between loose inline elements, not noise to discard.
+                // Whitespace-only text is a significant separator; see `flatten_blocks`.
                 if !text.is_empty() {
                     pending.push(Span::Run {
                         text: text.clone(),
@@ -1169,10 +1027,7 @@ fn flatten_into_pending(
                     }
                     flatten_blocks(std::slice::from_ref(node), depth, out);
                 } else {
-                    // `pending` traces back to `flatten_blocks`'s own
-                    // paragraph buffer, never `trim_trailing_break`d — so
-                    // `false` here too, same as `flatten_blocks`'s own
-                    // strong/em arms.
+                    // `pending` is never `trim_trailing_break`d, so `trimmed` is false.
                     match tag.as_str() {
                         "br" => pending.push(Span::Break),
                         "strong" | "b" => {
@@ -1289,12 +1144,8 @@ fn node_glue_lookahead(node: &Node, table_children_are_boundaries: bool) -> Glue
     while let Some(node) = stack.pop() {
         match node {
             Node::Text(text) => {
-                // Leading breakable whitespace already clears words_of's
-                // glue boundary on its own — same conclusiveness as a
-                // Stopped tag, regardless of what real text follows it in
-                // this same run. Only text with a real char and no
-                // whitespace ahead of it is a genuine glue risk; pure
-                // whitespace (or an empty string) decides nothing yet.
+                // Leading breakable whitespace is a word boundary, as conclusive as a boundary tag.
+                // Pure whitespace (or empty text) decides nothing yet.
                 if text.starts_with(is_breakable_whitespace) {
                     return GlueLookahead::Stopped;
                 }
@@ -1340,23 +1191,12 @@ enum GlueContext<'a> {
     LaterSiblings {
         nodes: &'a [Node],
         start: usize,
-        // Caches each node's own raw `node_glue_lookahead` result (not an
-        // already-interpreted bool): `resolve` and `nothing_follows` read
-        // the *same* three-state answer for the same node, they just map
-        // it to a bool differently, so both reuse it instead of paying
-        // for `node_glue_lookahead` twice.
+        // Per-node `node_glue_lookahead` result, shared by `resolve` and `nothing_follows`, which
+        // map the same three-state answer to a bool differently.
         raw_cache: &'a [Cell<Option<GlueLookahead>>],
-        // Caches `resolve`'s and `nothing_follows`'s own *folded* answer
-        // per starting position — "if I start scanning at index i, what do
-        // I end up returning" — each filled in (with backfill across every
-        // `Exhausted` position skipped to reach it) the first time either
-        // method is asked to resolve starting there. Without this, a
-        // capped sibling run still costs O(distance-to-the-answer) *loop
-        // iterations* per sibling even with `raw_cache` alone — each
-        // iteration becomes an O(1) `Cell` read instead of an O(1)
-        // `node_glue_lookahead` call, but there are still O(n) of them per
-        // capped sibling, O(n^2) overall. This is what actually collapses
-        // that to O(1) amortized per sibling.
+        // Each method's final answer per start index, backfilled across the `Exhausted` positions
+        // skipped to reach it. Without this a capped sibling run costs O(n^2) overall; with it,
+        // O(1) amortized per sibling.
         resolve_cache: &'a [Cell<Option<bool>>],
         nothing_follows_cache: &'a [Cell<Option<bool>>],
         table_children_are_boundaries: bool,
@@ -1517,10 +1357,8 @@ impl GlueContext<'_> {
 fn words_of(spans: &[Span]) -> Vec<Word> {
     let mut words = Vec::new();
     let mut glue_next = false;
-    // Whether the pending `glue_next` boundary is specifically an NBSP —
-    // i.e. the previous span's text ended with a literal U+00A0 — as
-    // opposed to two spans with plain nothing (no whitespace at all)
-    // between them. See [`Word::Text::unbreakable`].
+    // The pending glue is a non-breaking space (the previous span ended with one), not mere
+    // adjacency. See [`Word::Text::unbreakable`].
     let mut glue_next_unbreakable = false;
     for span in spans {
         match span {
@@ -1530,30 +1368,17 @@ fn words_of(spans: &[Span]) -> Vec<Word> {
                 glue_next_unbreakable = false;
             }
             Span::Run { text, bold, italic } => {
-                // Must agree with the split predicate below on what counts as a
-                // real, breakable whitespace boundary. NBSP does not, since it is
-                // deliberately kept inside the resulting token rather than split
-                // off. The blanket `char::is_whitespace`, which NBSP also
-                // satisfies, would say a span starting or ending with NBSP has a
-                // real separator at that edge, gluing it to nothing — so `wrap`
-                // inserts its own extra plain space next to a token that already
-                // renders the NBSP as one, and allows a line break at a boundary
-                // the NBSP was meant to make unbreakable.
+                // Shared with the split below. NBSP satisfies `char::is_whitespace` but stays
+                // inside its token; treating an NBSP edge as a separator would make `wrap` add a
+                // second space and allow a break the NBSP forbids.
                 let is_breakable_ws = |c: char| c.is_whitespace() && !is_non_breaking_space(c);
                 let starts_with_ws = text.starts_with(is_breakable_ws);
                 let ends_with_ws = text.ends_with(is_breakable_ws);
                 let starts_with_nbsp = text.starts_with(is_non_breaking_space);
                 let ends_with_nbsp = text.ends_with(is_non_breaking_space);
                 let mut emitted_any = false;
-                // Split on breakable whitespace only. NBSP and its non-breaking
-                // variants (`&nbsp;`/U+00A0, U+2007, U+202F — see
-                // `is_non_breaking_space`) satisfy `char::is_whitespace()`, so
-                // `split_whitespace()` would treat them as ordinary word
-                // separators, discarding the whole point of a non-breaking space.
-                // It stays inside the resulting token instead, so a line can never
-                // break between the words it joins. It still renders as a real
-                // space — `char_width_1000em` gives it a plain space's width — the
-                // token is simply atomic.
+                // Not `split_whitespace`, which would split on U+00A0/U+2007/U+202F. Keeping them
+                // inside the token makes it atomic; they still render at a space's width.
                 for (i, w) in text
                     .split(is_breakable_ws)
                     .filter(|w| !w.is_empty())
@@ -1637,9 +1462,8 @@ fn split_into_fitting_chunks(
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut current_width = 0.0f32;
-    // Byte index into `current` (always a char boundary) where the
-    // NBSP-connected run ending at `current`'s last character begins, and
-    // that run's width — see the function docs above.
+    // Byte index in `current` (a char boundary) where the NBSP-connected run ending at its last
+    // char begins, and that run's width.
     let mut run_start = 0usize;
     let mut run_width = 0.0f32;
     for ch in text.chars() {
@@ -1659,9 +1483,7 @@ fn split_into_fitting_chunks(
                     current_width = run_width;
                     run_start = 0;
                 }
-                // Else the whole chunk built so far is one NBSP-connected
-                // chain with nowhere earlier to split — accept the
-                // overflow rather than break mid-chain.
+                // Else `current` is one NBSP-connected chain: overflow rather than split it.
             } else {
                 chunks.push(std::mem::take(&mut current));
                 current_width = 0.0;
@@ -1852,12 +1674,8 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
     let mut lines = Vec::new();
     let mut current: Vec<StyledWord> = Vec::new();
     let mut current_width = 0.0f32;
-    // Index into `current` where the active unbreakable (NBSP-glued) run
-    // begins, and that run's total width — tracked incrementally (not
-    // recomputed by summing `current[run_start..]` on each word) so a long
-    // chain of NBSP-glued words stays linear, not quadratic, in the number
-    // of words — see the `long_run_of_unterminated_*` lint on this module
-    // for why that class of bug matters here.
+    // Start index in `current` and total width of the active NBSP-glued run, tracked
+    // incrementally so a long chain stays linear rather than quadratic.
     let mut run_start = 0usize;
     let mut run_width = 0.0f32;
 
@@ -1877,12 +1695,8 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                 unbreakable,
             } => {
                 let w = text_width_pt(text, font_size_pt, *bold);
-                // See `handle_unbreakable_word`'s docs for why this needs
-                // its own path, checked *before* the oversized-token
-                // branch below — an unbreakable (NBSP-glued) word must
-                // never be split away from whatever it's glued to just
-                // because it also happens to be individually too wide for
-                // one line on its own.
+                // Before the oversized branch: an NBSP-glued word must stay with its neighbour
+                // even when it is too wide for a line on its own.
                 if *unbreakable && !current.is_empty() {
                     handle_unbreakable_word(
                         text,
@@ -1926,11 +1740,8 @@ fn wrap(words: &[Word], max_width_pt: f32, font_size_pt: f32) -> Vec<Vec<StyledW
                     continue;
                 }
                 let mut glued = *glue && !current.is_empty();
-                // Glued words skip the space width (nothing renders between
-                // them and the previous word) but otherwise get the same
-                // fit check as any other word — a glued run that doesn't
-                // fit still breaks the line, it just doesn't gain a
-                // rendered space by doing so.
+                // Glued words add no space but still get the fit check, so an overflowing glued
+                // run still breaks the line.
                 let needed = if current.is_empty() || glued {
                     w
                 } else {
@@ -2128,9 +1939,7 @@ impl Writer {
     /// attempt (see the module docs on scope); tables sized for realistic
     /// scaffold content (invoice line items, a handful of columns) never
     /// approach this limit.
-    // Column/row counts are bounded by how many cells a template author
-    // writes into one table (never remotely close to f32's 24-bit mantissa),
-    // so the usize/f32 conversions below can't meaningfully lose precision.
+    // Row and column counts are far below f32's 24-bit mantissa, so the casts are exact.
     #[allow(clippy::cast_precision_loss)]
     fn draw_table(&mut self, rows: &[TableRow]) {
         const FONT_SIZE: f32 = 10.5;
@@ -2180,14 +1989,8 @@ impl Writer {
                 self.draw_spans(spans, 11.0, 14.5, 10.0);
             }
             Block::ListItem { marker, spans } => {
-                // A fixed 16pt indent fits every bullet/low-numbered marker
-                // this renderer draws ("•", "1." .. "9.") comfortably, but
-                // an ordered list's marker keeps growing with its index —
-                // "100." alone is already ~21pt at 11pt Helvetica, wider
-                // than the indent, so content wrapped at a fixed 16pt
-                // overlapped the marker instead of starting after it. Grow
-                // the indent (and thus the content's wrap width) to fit
-                // whichever marker this specific item actually has.
+                // The indent grows to fit the marker: "100." is ~21pt at 11pt Helvetica, wider
+                // than the 16pt minimum, and content would otherwise overlap it.
                 const MIN_INDENT: f32 = 16.0;
                 const MARKER_GAP: f32 = 4.0;
                 const LINE_HEIGHT: f32 = 14.5;
@@ -2197,13 +2000,8 @@ impl Writer {
                 let words = words_of(spans);
                 let lines = wrap(&words, self.content_width - indent, 11.0);
                 if lines.is_empty() {
-                    // An empty item (`<li></li>`, or one whose only content
-                    // was skipped, e.g. `<li><script>...</script></li>`)
-                    // has no lines for `draw_lines` to advance `y_from_top`
-                    // by — it only adds `line_height` per *line drawn*, and
-                    // there are none — so without this, only the fixed 4pt
-                    // spacer below would separate this marker from the next
-                    // item's, landing them almost on top of each other.
+                    // An empty item draws no lines, so advance one here or its marker would
+                    // nearly overlap the next item's.
                     self.y_from_top += LINE_HEIGHT;
                 } else {
                     self.draw_lines(&lines, indent, 11.0, LINE_HEIGHT, true);
@@ -2216,7 +2014,7 @@ impl Writer {
     }
 
     fn finish(mut self) -> Vec<PdfPage> {
-        // Always emit at least one (possibly empty) page.
+        // Flush the last page; an empty document still gets one page.
         if self.pages.is_empty() || self.y_from_top > 0.0 || !self.ops.is_empty() {
             self.new_page();
         }
@@ -2276,9 +2074,6 @@ mod tests {
 
     #[test]
     fn oversized_single_token_is_character_wrapped_not_overflowed() {
-        // Regression: a single word wider than the whole column/page (a long
-        // URL, hash, or identifier with no whitespace to break at) used to
-        // be placed on its own line unsplit, overflowing past the boundary.
         let words = words_of(&[Span::Run {
             text: "https://example.com/a/very/long/path/that/has/no/spaces/anywhere/at/all"
                 .to_owned(),
@@ -2309,18 +2104,8 @@ mod tests {
 
     #[test]
     fn oversized_token_does_not_split_immediately_adjacent_to_an_embedded_nbsp() {
-        // Regression: an oversized token — already too wide for one line, so it
-        // goes through `split_into_fitting_chunks`'s plain character splitter —
-        // containing an embedded NBSP had no NBSP awareness. If the natural
-        // per-character width boundary fell right after the NBSP, the NBSP ended
-        // up as the last character of one chunk and whatever followed it started
-        // the next, breaking exactly the boundary NBSP forbids. A first fix moved
-        // the NBSP itself to the next chunk, which merely relocated the forbidden
-        // break to before the NBSP, leaving a rendered leading space at the start
-        // of the next line and still splitting the pair: the character before the
-        // NBSP must move with it. Repro: 67 `A`s followed by `&nbsp;B` — the 67 As
-        // plus the NBSP fit within the content width, but adding `B` does not, so
-        // the naive split lands right after the NBSP.
+        // The 67 `A`s plus the NBSP fit but `B` does not, so the naive split lands right after the
+        // NBSP. The NBSP and the characters on both sides of it must stay in one chunk.
         let text = format!("{}\u{00A0}B", "A".repeat(67));
         let font_size_pt = 11.0;
         let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
@@ -2343,8 +2128,7 @@ mod tests {
 
     #[test]
     fn oversized_token_does_not_split_around_other_unicode_non_breaking_space_variants() {
-        // Same regression as the U+00A0 case above, for U+2007/U+202F —
-        // see `is_non_breaking_space`.
+        // As above, for U+2007 and U+202F.
         for nbsp in ['\u{2007}', '\u{202F}'] {
             let text = format!("{}{nbsp}B", "A".repeat(67));
             let font_size_pt = 11.0;
@@ -2372,14 +2156,8 @@ mod tests {
 
     #[test]
     fn oversized_token_does_not_split_when_the_incoming_character_is_the_nbsp() {
-        // Regression: overflow can be triggered by the NBSP arriving as the current
-        // character, not only by it already sitting at the end of the accumulated
-        // chunk. `current` does not yet end with an NBSP at that point, so the
-        // NBSP-adjacency guard keyed off `current.ends_with(NBSP)` never fired, and
-        // the boundary landed right before the NBSP the way it used to land right
-        // after one. Repro: 67 `A`s followed by `i&nbsp;B` — the As plus `i` fit
-        // within the content width, but adding the NBSP does not, so the naive split
-        // lands right before it.
+        // The As plus `i` fit but the NBSP does not, so the overflow is triggered by the incoming
+        // NBSP itself, while `current` does not yet end in one.
         let text = format!("{}i\u{00A0}B", "A".repeat(67));
         let font_size_pt = 11.0;
         let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
@@ -2402,14 +2180,8 @@ mod tests {
 
     #[test]
     fn oversized_token_moves_the_entire_nbsp_connected_chain_not_just_one_neighbor() {
-        // Regression: when an oversized token contains several NBSPs, the previous
-        // fix pulled only one preceding character back before emitting the chunk. If
-        // that character was itself connected to an earlier NBSP, the emitted chunk
-        // still ended in that earlier NBSP, relocating which boundary got broken
-        // rather than fixing the bug. Repro: 66 `A`s followed by `&nbsp;B&nbsp;C` —
-        // the As plus the first NBSP plus `B` fit within the content width, but
-        // adding the second NBSP does not, so the naive split used to land the first
-        // chunk right after the first NBSP.
+        // The As plus `&nbsp;B` fit but the second NBSP does not. Moving only `B` to the next chunk
+        // would leave the first chunk ending in an NBSP; the whole chain must move.
         let text = format!("{}\u{00A0}B\u{00A0}C", "A".repeat(66));
         let font_size_pt = 11.0;
         let max_width_pt = text_width_pt(&"A".repeat(66), font_size_pt, false)
@@ -2432,9 +2204,7 @@ mod tests {
 
     #[test]
     fn oversized_token_narrower_than_max_width_is_left_whole() {
-        // A word that fits on its own line (even if it wouldn't fit
-        // alongside other content already on the current line) must not be
-        // needlessly split.
+        // A word that fits on a line by itself is not split.
         let words = words_of(&[Span::Run {
             text: "short".to_owned(),
             bold: false,
@@ -2471,11 +2241,7 @@ mod tests {
 
     #[test]
     fn non_breaking_space_keeps_its_words_on_one_line() {
-        // Regression: `&nbsp;` decodes to U+00A0, which satisfies
-        // `char::is_whitespace()` — `split_whitespace()` treated it as an
-        // ordinary word separator, discarding its entire point (a line must
-        // never break between the words it joins). `words_of` must keep an
-        // NBSP-joined run as a single atomic token instead.
+        // U+00A0 satisfies `char::is_whitespace`, but an NBSP-joined run must stay one token.
         let words = words_of(&[Span::Run {
             text: "Invoice\u{00A0}#42".to_owned(),
             bold: false,
@@ -2492,9 +2258,7 @@ mod tests {
             }],
             "NBSP must not split the run into two breakable words"
         );
-        // Even at a width that fits neither word comfortably alongside the
-        // other, the pair must stay on one line — same as any other single
-        // token, just with a real (not zero-width) space rendered in it.
+        // At a width with no slack, the pair still stays whole on one line.
         let narrow_width = text_width_pt("Invoice\u{00A0}#42", 12.0, false) + 1.0;
         let lines = wrap(&words, narrow_width, 12.0);
         assert_eq!(lines.len(), 1);
@@ -2504,13 +2268,8 @@ mod tests {
 
     #[test]
     fn other_unicode_non_breaking_space_variants_also_keep_their_words_on_one_line() {
-        // Regression: `is_breakable_ws` and `words_of` exempted only U+00A0, but
-        // U+2007 FIGURE SPACE and U+202F NARROW NO-BREAK SPACE are both whitespace
-        // per Unicode's `White_Space` property — so `char::is_whitespace()` alone
-        // cannot tell them from an ordinary breakable space — and both are common in
-        // localized number formatting: aligned digit columns, and French-style
-        // thousands separators like `10 000`. Without special-casing them the way
-        // U+00A0 is handled, a line could break inside such a number.
+        // U+2007 FIGURE SPACE and U+202F NARROW NO-BREAK SPACE are Unicode whitespace too, and
+        // common in number formatting (`10 000`). A line must not break inside such a number.
         for nbsp in ['\u{2007}', '\u{202F}'] {
             let text = format!("10{nbsp}000");
             let words = words_of(&[Span::Run {
@@ -2543,14 +2302,9 @@ mod tests {
 
     #[test]
     fn non_breaking_space_leading_a_styled_span_still_glues_to_the_previous_word() {
-        // Regression: in `Hello<strong>&nbsp;world</strong>` the leading NBSP stays
-        // inside the second span's token (`"\u{00A0}world"`, per the fix above), but
-        // `starts_with_ws`/`ends_with_ws` used the blanket `char::is_whitespace()`
-        // predicate, which NBSP also satisfies. That treated the span boundary as a
-        // real separator and set `glue: false`, so `wrap` would insert its own plain
-        // space next to a token that already renders the NBSP as one — a visible
-        // double space — and would allow a line break exactly where the NBSP forbids
-        // one.
+        // `Hello<strong>&nbsp;world</strong>`: the NBSP stays inside the second token, so the span
+        // boundary is not a separator. Without `glue`, `wrap` would add a second space and allow
+        // a break the NBSP forbids.
         let words = words_of(&[
             Span::Run {
                 text: "Hello".to_owned(),
@@ -2587,12 +2341,8 @@ mod tests {
 
     #[test]
     fn glued_run_that_cannot_fit_still_breaks_the_line() {
-        // Regression: two adjacently-styled runs with no whitespace between
-        // them (e.g. `<strong>...</strong><em>...</em>`) were always kept on
-        // one line regardless of size, because the fit check was skipped
-        // entirely for glued words — each individually fit under
-        // `max_width_pt`, but their combined width could run to nearly
-        // double it, clipping the second run past the column/page boundary.
+        // Adjacent styled runs (`<strong>..</strong><em>..</em>`) that each fit but not together
+        // must wrap rather than overflow.
         let words = vec![
             Word::Text {
                 text: "WWWW".to_owned(),
@@ -2635,14 +2385,8 @@ mod tests {
 
     #[test]
     fn unbreakable_nbsp_pair_moves_together_when_it_does_not_fit() {
-        // Regression: `Hello<strong>&nbsp;world</strong>` after earlier text
-        // that leaves room for "Hello" but not the NBSP-glued "world" — the
-        // overflow branch used to treat this exactly like ordinary glue
-        // (`glued_run_that_cannot_fit_still_breaks_the_line` above), pushing
-        // "Prefix Hello" together as a finished line and placing the
-        // NBSP-led word alone on the next line — splitting the exact
-        // boundary NBSP forbids a break at. An NBSP pair that doesn't fit
-        // must move to the new line *together*, not split.
+        // `Prefix Hello<strong>&nbsp;world</strong>` where "world" does not fit: unlike ordinary
+        // glue, "Hello" must move to the next line with it.
         let words = vec![
             Word::Text {
                 text: "WWWW".to_owned(), // stands in for "Prefix"
@@ -2668,9 +2412,7 @@ mod tests {
         ];
         let word_width = text_width_pt("WWWW", 12.0, false);
         let space_w = text_width_pt(" ", 12.0, false);
-        // Fits "Prefix Hello" (two words + one space) but not a third glued
-        // "WWWW" on top of that; a fresh line fits the NBSP pair alone
-        // (two words, no space between them).
+        // Fits two words and a space, not a third glued word; a fresh line fits the NBSP pair.
         let max_width_pt = 2.0f32.mul_add(word_width, space_w) + 0.5;
         let lines = wrap(&words, max_width_pt, 12.0);
         assert_eq!(
@@ -2695,19 +2437,8 @@ mod tests {
 
     #[test]
     fn unbreakable_word_that_is_individually_oversized_stays_glued_to_its_predecessor() {
-        // Regression: `Hello<strong>&nbsp;` followed by a long unbroken run of
-        // characters wider than a whole line. Fixed in two rounds:
-        // 1. The oversized-token branch ran before the unbreakable check, so it
-        //    unconditionally flushed `current` ("Hello") as its own finished line,
-        //    losing the glue to the NBSP-led word, and then character-split the
-        //    oversized word with no notion of the NBSP boundary. Fixed by checking
-        //    `unbreakable` first.
-        // 2. That fix went too far the other way: it glued the entire oversized word
-        //    onto "Hello" with no splitting, so the whole run rendered as one
-        //    unsplit, unbounded token — overflowing and clipped, not merely spilling
-        //    past the margin. The NBSP forbids a break only at its own boundary, so
-        //    the rest of the run is still character-split, with its first chunk kept
-        //    glued to "Hello".
+        // The NBSP forbids a break only at its own boundary: the first chunk of the oversized run
+        // stays glued to "Hello", and the rest is still character-split.
         let words = vec![
             Word::Text {
                 text: "Hello".to_owned(),
@@ -2752,10 +2483,8 @@ mod tests {
             "the first chunk of the NBSP-led word must still render glued (no rendered \
              space before it)"
         );
-        // Every line, including the first (whose first chunk is sized
-        // against the space actually remaining after "Hello", not the
-        // full column — see `oversized_glued_word_first_chunk_is_sized_to_the_remaining_line_width`
-        // for the regression this guards), must actually fit.
+        // Every line fits, including the first, whose chunk is sized to the space left after
+        // "Hello".
         for (i, line) in lines.iter().enumerate() {
             let line_width: f32 = line
                 .iter()
@@ -2779,16 +2508,8 @@ mod tests {
 
     #[test]
     fn oversized_glued_word_first_chunk_is_sized_to_the_remaining_line_width() {
-        // Regression: the character-split fix above sized the *first*
-        // chunk against the full `max_width_pt`, the same as every later
-        // chunk — but the first chunk is appended to a line that already
-        // has other content on it, so sizing it against the full column
-        // still overflowed by roughly however wide that existing content
-        // was. 40 "A"s (~294pt at this font size) followed by an
-        // NBSP-glued run of "<strong>&nbsp;" + 100 more "A"s used to
-        // produce a first chunk sized to ~489pt — combined with the
-        // 40-"A" prefix, well past the 495pt column, with only later
-        // chunks actually respecting `max_width_pt`.
+        // The first chunk joins a line already holding 40 "A"s (~294pt), so it must be sized to
+        // the remaining width, not the full 495pt column.
         let words = vec![
             Word::Text {
                 text: "A".repeat(40),
@@ -2830,10 +2551,7 @@ mod tests {
 
     #[test]
     fn adjacent_spans_with_no_whitespace_render_with_no_space_between() {
-        // Regression: "$" and a separately-styled "42.00" right next to it
-        // (e.g. `$<strong>42.00</strong>`, this feature's own flagship
-        // money-formatting example) used to always get a space inserted
-        // between them by word-based layout, rendering "$ 42.00".
+        // `$<strong>42.00</strong>` renders as "$42.00", not "$ 42.00".
         let words = words_of(&[
             Span::Run {
                 text: "$".to_owned(),
@@ -2910,10 +2628,6 @@ mod tests {
 
     #[test]
     fn table_caption_text_is_not_silently_dropped() {
-        // Regression: `<caption>` (or any non-row table child) matched the
-        // `extract_table_rows` catch-all with no fallback, discarding its
-        // text — contradicting this renderer's "unknown tags still render
-        // their text" contract.
         let nodes = super::super::html::parse(
             "<table><caption>Grand Total</caption><tr><td>1</td></tr></table>",
         );
@@ -2950,11 +2664,8 @@ mod tests {
 
     #[test]
     fn div_wrapper_preserves_nested_block_structure() {
-        // Regression: `<div>` used to flatten every descendant through
-        // `inline_spans` into one paragraph, merging a heading and two
-        // paragraphs into a single unbroken run of text ("TitleFirstSecond")
-        // — exactly the "one div wraps the whole page body" shape a typical
-        // Maud layout function produces.
+        // One `<div>` wrapping the whole page body (the usual Maud layout shape) must keep its
+        // child blocks separate rather than merge them into one run ("TitleFirstSecond").
         let nodes = super::super::html::parse("<div><h1>Title</h1><p>First</p><p>Second</p></div>");
         let mut blocks = Vec::new();
         flatten_blocks(&nodes, 0, &mut blocks);
@@ -2995,11 +2706,6 @@ mod tests {
 
     #[test]
     fn semantic_sectioning_elements_keep_adjacent_blocks_separate() {
-        // Regression: `section`/`article`/`main`/`header`/`footer` weren't
-        // in the "wraps other block elements" arm alongside `div`, so they
-        // fell through to the generic transparent-passthrough case — two
-        // adjacent `<section>`s of loose text accumulated into the same
-        // pending paragraph with no separator at all.
         let nodes = super::super::html::parse(
             "<main><section>Summary</section><section>Details</section></main>",
         );
@@ -3024,8 +2730,6 @@ mod tests {
 
     #[test]
     fn nav_and_aside_keep_adjacent_blocks_separate() {
-        // Same bug as `semantic_sectioning_elements_keep_adjacent_blocks_separate`,
-        // reported again for `nav`/`aside` after the first fix.
         let nodes = super::super::html::parse("<aside>Summary</aside><aside>Details</aside>");
         let mut blocks = Vec::new();
         flatten_blocks(&nodes, 0, &mut blocks);
@@ -3048,10 +2752,6 @@ mod tests {
 
     #[test]
     fn list_item_with_nested_paragraphs_keeps_them_separate() {
-        // Regression: `<li>`'s content goes through `inline_spans`, which
-        // had no notion of a block boundary — `<li><p>First</p><p>Second</p></li>`
-        // rendered "FirstSecond" with no separator at all (worse than plain
-        // whitespace collapsing: there wasn't even a space).
         let nodes = super::super::html::parse("<ul><li><p>First</p><p>Second</p></li></ul>");
         let mut blocks = Vec::new();
         flatten_blocks(&nodes, 0, &mut blocks);
@@ -3080,12 +2780,8 @@ mod tests {
 
     #[test]
     fn hr_inside_a_list_item_still_separates_adjacent_text() {
-        // Regression: `<hr>` is a void element (no children), so it wasn't
-        // in `is_block_boundary_in_inline_context` and fell through to the
-        // generic transparent-wrapper case in `inline_spans` — recursing
-        // into its (empty) children produced nothing, and no break was
-        // inserted either, so `<li>Before<hr>After</li>` rendered
-        // "BeforeAfter" with the rule silently vanishing.
+        // `<hr>` is a void element with no children to emit a break, so it must count as a block
+        // boundary itself or `Before<hr>After` renders "BeforeAfter".
         let nodes = super::super::html::parse("<ul><li>Before<hr>After</li></ul>");
         let mut blocks = Vec::new();
         flatten_blocks(&nodes, 0, &mut blocks);
@@ -3114,11 +2810,6 @@ mod tests {
 
     #[test]
     fn nested_list_inside_a_list_item_keeps_its_markers() {
-        // Regression: `<li>`'s content goes through `inline_spans`, which had
-        // no explicit handling for a nested `<ul>`/`<ol>` — it fell through
-        // to the generic transparent-wrapper case, so `<ul><li>Parent<ul><li>Child</li></ul></li></ul>`
-        // reduced the inner `<li>` to a bare line break plus text, with no
-        // bullet and no list semantics at all.
         let nodes = super::super::html::parse("<ul><li>Parent<ul><li>Child</li></ul></li></ul>");
         let mut blocks = Vec::new();
         flatten_blocks(&nodes, 0, &mut blocks);
@@ -3153,14 +2844,8 @@ mod tests {
 
     #[test]
     fn list_nested_inside_a_table_header_cell_stays_bold() {
-        // Regression: `inline_spans`'s `"ul"`/`"ol"` branch called
-        // `inline_list_items` without passing through the ambient
-        // `bold`/`italic` it had just been called with — so
-        // `<th><ul><li>Header</li></ul></th>`, where `extract_table_rows`
-        // starts `inline_spans` with `bold: true` for a `<th>` cell, lost
-        // that bold styling for both the list's marker and its item text,
-        // even though the same content would stay bold if it weren't
-        // wrapped in a list.
+        // `extract_table_rows` renders `<th>` content with `bold: true`; a nested list must inherit
+        // it for both its marker and its item text.
         let nodes =
             super::super::html::parse("<table><tr><th><ul><li>Header</li></ul></th></tr></table>");
         let mut blocks = Vec::new();
@@ -3192,13 +2877,8 @@ mod tests {
 
     #[test]
     fn nested_list_item_marker_stays_beside_paragraph_wrapped_content() {
-        // Regression: `inline_list_items` pushes the marker `Run` directly
-        // into `out`, then calls `inline_spans` for the item's content —
-        // when that content starts with a block boundary (here `<p>`),
-        // `inline_spans` pushes a break *before* it, which is correct when
-        // something precedes it but here lands directly between the
-        // marker and its own first line, splitting `<li><p>Child</p></li>`
-        // into the marker alone on one line and "Child" on the next.
+        // `inline_spans` pushes a break before a leading `<p>`. Right after a list marker, that
+        // break would leave the marker alone on its own line.
         let nodes =
             super::super::html::parse("<ul><li>Parent<ul><li><p>Child</p></li></ul></li></ul>");
         let mut blocks = Vec::new();
@@ -3234,8 +2914,6 @@ mod tests {
 
     #[test]
     fn table_cell_with_nested_paragraphs_keeps_them_separate() {
-        // Same bug as `list_item_with_nested_paragraphs_keeps_them_separate`,
-        // reported for `<td>`/`<th>` cell content.
         let nodes = super::super::html::parse("<table><tr><td><p>A</p><p>B</p></td></tr></table>");
         let mut blocks = Vec::new();
         flatten_blocks(&nodes, 0, &mut blocks);
@@ -3267,12 +2945,8 @@ mod tests {
 
     #[test]
     fn nested_table_inside_a_cell_keeps_its_rows_and_cells_separate() {
-        // Regression: a `<table>` nested inside a `<td>` has no dedicated
-        // `Block::Table` path (only a top-level table gets one) — its inner
-        // `table`/`tr`/`td` nodes used to fall through `inline_spans`'s
-        // generic transparent-wrapper case, so adjacent cells' text glued
-        // directly together with no separator: `<td>A</td><td>B</td>`
-        // rendered as "AB".
+        // Only a top-level table becomes a `Block::Table`. A nested one is inlined into the cell,
+        // so its cells need breaks between them or `<td>A</td><td>B</td>` renders "AB".
         let nodes = super::super::html::parse(
             "<table><tr><td><table><tr><td>A</td><td>B</td></tr></table></td></tr></table>",
         );
@@ -3306,11 +2980,8 @@ mod tests {
 
     #[test]
     fn omitted_p_close_before_a_table_still_produces_a_real_table_block() {
-        // Regression: without an implied close, `<p>Intro<table>...</table>`
-        // nested the table *inside* the still-open `<p>`, so `flatten_blocks`'s
-        // `"p"` arm sent the whole thing through `inline_spans` — which has
-        // no notion of a table — flattening its rows/cells into bare inline
-        // text ("IntroAB") instead of a real `Block::Table`.
+        // The table must stay a real `Block::Table`, not be flattened into the paragraph's inline
+        // text ("IntroAB").
         let nodes = super::super::html::parse(
             "<p>Intro</p><table><tr><td>A</td><td>B</td></tr></table><p>After</p>",
         );
@@ -3340,11 +3011,8 @@ mod tests {
 
     #[test]
     fn omitted_head_close_before_body_does_not_discard_the_whole_document() {
-        // Regression: without an implied close, `<body>` nested *inside* the
-        // still-open `<head>` — and `head` is in `is_non_rendered`, so its
-        // entire subtree (which would now include `<body>`) was discarded
-        // wholesale, dropping the whole visible document, not just one
-        // element's structure.
+        // `<body>` implicitly closes an open `<head>`. Otherwise it would nest inside `head`, which
+        // is never rendered, and the whole visible document would be dropped.
         let nodes = super::super::html::parse(
             "<html><head><title>X</title><body><p>Visible</p></body></html>",
         );
@@ -3364,12 +3032,8 @@ mod tests {
 
     #[test]
     fn description_list_terms_and_values_keep_their_own_blocks() {
-        // Regression: `<dl>`/`<dt>`/`<dd>` (as emitted by scaffold detail
-        // views — e.g. a `property_list` widget) fell through the generic
-        // "unknown tag = transparent passthrough" rule with no block
-        // separation at all, so `<dl><dt>Title</dt><dd>My Post</dd>
-        // <dt>Published</dt><dd>true</dd></dl>` rendered as one glued run,
-        // "TitleMy PostPublishedtrue", instead of four separate rows.
+        // Scaffold detail views (the `property_list` widget) emit `<dl>`; each term and value must
+        // be its own block, not one glued run ("TitleMy PostPublishedtrue").
         let nodes = super::super::html::parse(
             "<dl><dt>Title</dt><dd>My Post</dd><dt>Published</dt><dd>true</dd></dl>",
         );
@@ -3395,12 +3059,8 @@ mod tests {
 
     #[test]
     fn description_list_inside_a_transparent_wrapper_still_keeps_blocks_separate() {
-        // Regression: `flatten_into_pending` (the path a `<dl>` takes when
-        // nested inside an unrecognized transparent wrapper, e.g.
-        // `<span><dl>...</dl></span>`) keeps its own separate block-tag
-        // list rather than sharing `flatten_blocks`'s — it was missed when
-        // `dl`/`dt`/`dd` were added there, so this path still glued terms
-        // and values together despite the top-level fix.
+        // Inside an unrecognized wrapper the `<dl>` goes through `flatten_into_pending`, which
+        // keeps its own block-tag list separate from `flatten_blocks`'s.
         let nodes =
             super::super::html::parse("<span><dl><dt>Title</dt><dd>My Post</dd></dl></span>");
         let mut blocks = Vec::new();
@@ -3425,11 +3085,8 @@ mod tests {
 
     #[test]
     fn whitespace_between_loose_inline_elements_is_not_dropped() {
-        // Regression: a whitespace-only text node separating two loose
-        // inline elements used to be filtered out entirely (treated the
-        // same as insignificant whitespace between block tags), so
-        // `words_of` never saw a boundary and glued the two words together
-        // ("Helloworld" instead of "Hello world").
+        // A whitespace-only text node between inline elements is a word boundary, unlike
+        // whitespace between block tags.
         let nodes = super::super::html::parse("<span>Hello</span> <span>world</span>");
         let mut blocks = Vec::new();
         flatten_blocks(&nodes, 0, &mut blocks);
@@ -3462,10 +3119,6 @@ mod tests {
 
     #[test]
     fn script_and_style_content_is_never_rendered() {
-        // Regression: `<script>`/`<style>` (and `<head>`/`<title>`) matched
-        // the generic "unrecognized tag = transparent passthrough" rule,
-        // so a full server-rendered page's inline CSS/JS source text was
-        // emitted into the PDF as visible content.
         let nodes = super::super::html::parse(
             "<head><title>Ignored</title><style>body { color: red; }</style></head>\
              <script>alert('hi');</script><p>Visible</p>",
@@ -3496,31 +3149,17 @@ mod tests {
         for _ in 0..50_000 {
             html.push_str("</span>");
         }
-        // Must not panic/overflow; content beyond MAX_DEPTH is allowed to be
-        // dropped (defense-in-depth against adversarial input), so this only
-        // asserts it completes and still produces at least one page.
+        // Content past MAX_DEPTH may be dropped; this only checks that rendering completes.
         let pages = render_pages(&html);
         assert!(!pages.is_empty());
     }
 
     #[test]
     fn deeply_nested_table_sections_do_not_overflow_the_stack() {
-        // nodes_contain_table_output (the depth-cap guard's own truncation
-        // check) must stay stack-safe for an arbitrarily deep subtree, the
-        // same way the renderer itself does — a naive recursive walk
-        // through thead/tbody/tfoot would crash right where the cap was
-        // supposed to protect against exactly this. The HTML parser
-        // auto-closes a <thead>/<tbody>/<tfoot> when another one of the
-        // three opens (see html::implicitly_closes), so real markup can
-        // never actually nest them — this builds the Node tree directly
-        // to test the function's own stack safety regardless of what the
-        // current parser happens to allow. (Codex review on PR #2810.)
-        //
-        // 100,000 levels, not 2,000,000: a naive recursive walk overflows
-        // well before this depth on any plausible native stack, and the
-        // smaller tree avoids a ~190 MiB allocation spike that could make
-        // this test OOM or stall on a memory-constrained CI worker running
-        // tests in parallel. (Codex review on PR #2810.)
+        // `nodes_contain_table_output` must be stack-safe on its own. The parser auto-closes one
+        // `<thead>`/`<tbody>`/`<tfoot>` when another opens, so real markup cannot nest them;
+        // build the tree directly. 100,000 levels overflows a naive recursive walk without a
+        // large allocation spike on memory-constrained CI.
         let mut node = Node::Element {
             tag: "thead".to_owned(),
             children: Vec::new(),
@@ -3531,7 +3170,6 @@ mod tests {
                 children: vec![node],
             };
         }
-        // Must not panic/overflow.
         assert!(!nodes_contain_table_output(
             std::slice::from_ref(&node),
             false
@@ -3605,13 +3243,8 @@ mod tests {
 
     #[test]
     fn whitespace_only_ul_past_the_depth_cap_does_not_warn() {
-        // A <ul> with only whitespace between its tags (no <li> at all) has
-        // a Text("\n") child. extract_list_items/inline_list_items skip
-        // every node that isn't an <li> — including that whitespace text —
-        // so it draws nothing. subtree_has_visible_content doesn't know
-        // that: it treats non-empty text as content on its own, which is
-        // right for the 4 general-purpose walkers but wrong for these two
-        // list-only ones.
+        // The list walkers skip every non-`<li>` child, so a `<ul>` holding only a newline draws
+        // nothing, even though `subtree_has_visible_content` counts that newline as text.
         let html = format!(
             "{}<ul>\n</ul>{}",
             "<span>".repeat(512),
@@ -3626,10 +3259,8 @@ mod tests {
 
     #[test]
     fn whitespace_only_table_past_the_depth_cap_does_not_warn() {
-        // Same shape as the <ul> case: extract_table_rows's loop skips any
-        // node that isn't an Element (`let Node::Element { .. } = node else
-        // { continue };`), so a <table> with only a newline between its
-        // tags produces no row.
+        // `extract_table_rows` skips non-element children, so whitespace between the tags makes
+        // no row.
         let html = format!(
             "{}<table>\n</table>{}",
             "<span>".repeat(512),
@@ -3644,10 +3275,8 @@ mod tests {
 
     #[test]
     fn empty_tr_past_the_depth_cap_does_not_warn() {
-        // extract_table_rows pushes a TableRow for any <tr>, even a
-        // cell-less one — but Writer::draw_table returns immediately when
-        // every row's cell count maxes out at 0 (n_cols == 0), so a table
-        // that is nothing but empty <tr>s draws no mark at all.
+        // `extract_table_rows` pushes a row for a cell-less `<tr>`, but `Writer::draw_table`
+        // draws nothing when no row has a cell.
         let html = format!(
             "{}<table><tr></tr></table>{}",
             "<span>".repeat(512),
@@ -3662,9 +3291,8 @@ mod tests {
 
     #[test]
     fn empty_caption_past_the_depth_cap_does_not_warn() {
-        // extract_table_rows's catch-all arm only pushes a row when the
-        // tag's own inline content is non-empty; an empty <caption> (or any
-        // other non-tr tag with nothing in it) produces none.
+        // `extract_table_rows`' catch-all arm (here `<caption>`) pushes a row only for non-empty
+        // inline content.
         let html = format!(
             "{}<table><caption></caption></table>{}",
             "<span>".repeat(512),
@@ -3679,8 +3307,6 @@ mod tests {
 
     #[test]
     fn table_with_real_cell_content_past_the_depth_cap_still_warns() {
-        // Sanity check alongside the two tests above: a <tr> that DOES have
-        // a real cell must still warn when dropped.
         let html = format!(
             "{}<table><tr><td>X</td></tr></table>{}",
             "<span>".repeat(512),
@@ -3695,23 +3321,11 @@ mod tests {
 
     #[test]
     fn empty_tr_past_the_depth_cap_still_warns_when_the_table_has_other_rows() {
-        // Unlike the fully-empty-table case (empty_tr_past_the_depth_cap_does_not_warn),
-        // a table with an earlier real-celled row already has a nonzero
-        // Writer::draw_table n_cols — every row from then on, including a
-        // later zero-cell one, still consumes a 14pt line and shifts
-        // everything after it. Dropping a capped empty <tr> is therefore a
-        // real layout change even though the row itself draws no visible
-        // mark, once some other row in the table has a real cell.
+        // Once another row has a cell, `Writer::draw_table` gives every row, even a zero-cell
+        // one, a full line, so dropping a capped empty `<tr>` shifts the layout after it.
         //
-        // Calls extract_table_rows directly at an already-past-cap depth,
-        // rather than building enough real HTML nesting to reach it: a
-        // <tr>'s own cell content is checked 2 levels deeper than the row
-        // itself (see the `depth + 2` in the "tr" arm below), so any HTML
-        // deep enough to push a *sibling* row's own recursion past the cap
-        // already drops this row's cell text too, at a shallower depth —
-        // there's no depth where "the other row's content survives intact"
-        // and "this row's recursion is capped" are both true at once.
-        // (Codex review on PR #2810.)
+        // Calls `extract_table_rows` directly past the cap: cells are walked at `depth + 2`, so
+        // no HTML depth caps the empty row while keeping the other row's cell text.
         DEPTH_CAP_HIT.with(|hit| hit.set(false));
         let mut out = vec![TableRow {
             cells: vec![(
@@ -3741,26 +3355,11 @@ mod tests {
 
     #[test]
     fn node_contains_a_populated_row_recognizes_catch_all_content() {
-        // node_contains_a_populated_row (the "does a later sibling
-        // populate this table" lookahead extract_table_rows' depth-cap
-        // guard uses) only recognized a literal <tr> with a real cell —
-        // but extract_table_rows's own catch-all arm (most commonly
-        // <caption>) also turns real content into a one-cell row, which
-        // is just as capable of making Writer::draw_table's n_cols
-        // nonzero. A <caption> with real text must count too, the same
-        // way nodes_contain_table_output's own catch-all arm already
-        // does via subtree_has_nonempty_text. (Codex review on PR #2810.)
+        // `extract_table_rows`' catch-all arm turns a `<caption>` with text into a one-cell row,
+        // which makes `Writer::draw_table`'s `n_cols` nonzero just like a `<tr>` with a cell.
         //
-        // Unit-tested directly on the helper rather than through
-        // extract_table_rows/DEPTH_CAP_HIT end to end: a sibling <tr>'s
-        // own recursion and a sibling <caption>'s own cell-content check
-        // are both checked at the same depth + 1 relative to their shared
-        // parent, so wrapping the whole thing deep enough to cap the
-        // <tr>'s recursion caps the <caption>'s own content at the exact
-        // same point too — there's no depth where only one of them is
-        // capped, the same shallower-depth conflict
-        // empty_tr_past_the_depth_cap_still_warns_when_the_table_has_other_rows's
-        // doc comment already ran into for cell content specifically.
+        // Tested on the helper directly: a sibling `<tr>`'s and `<caption>`'s content sit at
+        // the same depth, so no HTML depth caps one without the other.
         let caption = Node::Element {
             tag: "caption".to_owned(),
             children: vec![Node::Text("X".to_owned())],
@@ -3774,13 +3373,8 @@ mod tests {
 
     #[test]
     fn table_caption_with_an_empty_list_item_past_the_depth_cap_still_warns() {
-        // A <li> inside a <ul> always draws a marker, even empty (see
-        // empty_li_past_the_depth_cap_still_warns) — including one reached
-        // through extract_table_rows's catch-all arm, which hands a
-        // <caption>'s children to inline_spans same as anywhere else.
-        // subtree_has_nonempty_text alone can't see this: the marker isn't
-        // a literal Text node in the source HTML, it's synthesized by
-        // inline_list_items.
+        // An empty `<li>` still draws a marker, also inside a `<caption>`. The marker is
+        // synthesized by `inline_list_items`, so `subtree_has_nonempty_text` cannot see it.
         let html = format!(
             "{}<table><caption><ul><li></li></ul></caption></table>{}",
             "<span>".repeat(512),
@@ -3795,13 +3389,8 @@ mod tests {
 
     #[test]
     fn table_caption_with_a_listless_ul_past_the_depth_cap_does_not_warn() {
-        // A <ul> with no direct <li> child renders nothing: inline_spans
-        // hands ul/ol to inline_list_items, which scans only direct <li>
-        // children and ignores everything else without recursing into it
-        // — so bare text inside the <ul> (not wrapped in an <li>) never
-        // reaches the page. subtree_has_nonempty_text must not keep
-        // scanning a listless <ul>'s descendants either. (Codex review on
-        // PR #2810.)
+        // `inline_list_items` reads only direct `<li>` children, so text loose in a `<ul>` never
+        // renders, and `subtree_has_nonempty_text` must not count it.
         let html = format!(
             "{}<table><caption><ul>ignored</ul></caption></table>{}",
             "<span>".repeat(512),
@@ -3816,13 +3405,9 @@ mod tests {
 
     #[test]
     fn table_caption_with_two_breaks_past_the_depth_cap_still_warns() {
-        // Two literal <br> tags survive trim_trailing_break (it pops only
-        // the last one), so extract_table_rows's catch-all arm pushes a
-        // real one-cell row for the leftover break — but <br> pushes its
-        // Span::Break directly, bypassing push_block_break's "no two
-        // breaks in a row" suppression that every other break-producing
-        // tag goes through. subtree_has_nonempty_text doesn't count <br>
-        // at all, so it misses this case. (Codex review on PR #2810.)
+        // `trim_trailing_break` pops only the last of two `<br>`s, so the catch-all arm still
+        // pushes a row. `<br>` pushes `Span::Break` directly, bypassing `push_block_break`'s
+        // de-duplication, and `subtree_has_nonempty_text` does not count it.
         let html = format!(
             "{}<table><caption><br><br></caption></table>{}",
             "<span>".repeat(512),
@@ -3837,13 +3422,8 @@ mod tests {
 
     #[test]
     fn empty_span_past_the_depth_cap_does_not_warn() {
-        // N empty <span> wrappers around nothing, for several N past the
-        // cap: every level is checked, not just the first one past it,
-        // because a shallow "is this one slice empty" check only catches
-        // the exact depth where the wrapper chain runs out — one level
-        // deeper, that slice holds one more (still empty) wrapper element
-        // and looks non-empty by slice length alone. (Codex review on PR
-        // #2810, first at 513 levels, then again at 514.)
+        // Checks several depths: a check of whether the capped slice is empty passes only at the
+        // depth where the chain ends; one level shallower, the slice holds an empty wrapper.
         for n in 513..=520 {
             let html = format!("{}{}", "<span>".repeat(n), "</span>".repeat(n));
             assert_eq!(
@@ -3856,10 +3436,7 @@ mod tests {
 
     #[test]
     fn whitespace_only_text_past_the_depth_cap_does_not_warn() {
-        // A lone space or newline is nonempty text, but words_of splits on
-        // breakable whitespace and drops it, so draw_spans never draws or
-        // advances for it — nothing is actually lost by truncating it.
-        // (Codex review on PR #2810.)
+        // `words_of` drops whitespace-only text, so nothing is drawn or advanced for it.
         for content in ["\n", " ", "  \n  "] {
             let html = format!(
                 "{}{}{}",
@@ -3877,11 +3454,7 @@ mod tests {
 
     #[test]
     fn whitespace_only_text_sandwiched_between_real_words_past_the_depth_cap_still_warns() {
-        // Unlike the isolated case above, a dropped whitespace-only span
-        // here sits right after real text ("A") that the surrounding
-        // buffer already holds — so dropping it removes the one thing
-        // stopping words_of from gluing "A" and "B" into "AB". (Codex
-        // review on PR #2810.)
+        // The dropped space is the only thing keeping `words_of` from gluing "A" and "B".
         let html = format!("A{}{}{}B", "<span>".repeat(513), " ", "</span>".repeat(513));
         assert_eq!(
             count_pdf_depth_warnings(&html),
@@ -3892,12 +3465,8 @@ mod tests {
 
     #[test]
     fn whitespace_only_text_before_a_leading_space_past_the_depth_cap_does_not_warn() {
-        // Unlike the case above, the later sibling here ("B", preceded by
-        // its own literal space) already carries its own separator —
-        // words_of clears the glue boundary on that leading space
-        // regardless of whether the capped whitespace survives, so both
-        // capped and uncapped output render "A B" identically. (Codex
-        // review on PR #2810.)
+        // " B" carries its own leading space, so "A B" renders the same with or without the
+        // capped space.
         let html = format!(
             "A{}{}{} B",
             "<span>".repeat(513),
@@ -3913,10 +3482,7 @@ mod tests {
 
     #[test]
     fn whitespace_only_text_before_a_whitespace_sibling_past_the_depth_cap_does_not_warn() {
-        // Same idea, but the separator is a distinct whitespace-only
-        // sibling ahead of "B" rather than leading whitespace within the
-        // same text node — still resolves the glue risk on its own.
-        // (Codex review on PR #2810.)
+        // As above, but the separator is a whitespace-only sibling element before "B".
         let html = format!(
             "A{}{}{}<span> </span>B",
             "<span>".repeat(513),
@@ -3932,11 +3498,7 @@ mod tests {
 
     #[test]
     fn whitespace_only_text_at_end_of_document_past_the_depth_cap_does_not_warn() {
-        // A dropped whitespace-only span right after real text ("A") looks
-        // exactly like the sandwiched case above from `out`'s trailing
-        // content alone — but with nothing after it, there is no following
-        // word for the space to separate: the rendered text is "A" either
-        // way. (Codex review on PR #2810.)
+        // Nothing follows the dropped space, so the output is "A" either way.
         let html = format!("A{}{}{}", "<span>".repeat(513), " ", "</span>".repeat(513));
         assert_eq!(
             count_pdf_depth_warnings(&html),
@@ -3947,9 +3509,6 @@ mod tests {
 
     #[test]
     fn whitespace_only_text_followed_by_non_rendered_content_past_the_depth_cap_does_not_warn() {
-        // A later sibling exists, but a <script> never renders anything —
-        // so the capped whitespace still has no real word to separate.
-        // (Codex review on PR #2810.)
         let html = format!(
             "A{}{}{}<script>x</script>",
             "<span>".repeat(513),
@@ -3965,13 +3524,8 @@ mod tests {
 
     #[test]
     fn glue_lookahead_does_not_cross_an_enclosing_block_boundary() {
-        // inline_spans always wraps a <div> in push_block_break before AND
-        // after recursing into its children — so whatever the div's own
-        // deeply-capped content does, "B" outside it can never glue to
-        // "A" inside it: the trailing break already separates them either
-        // way. The lookahead passed into the div's own children must not
-        // inherit "B follows the div" as a reason to warn. (Codex review
-        // on PR #2810.)
+        // `inline_spans` puts a break after the `<div>`, so "B" outside it never glues to "A"
+        // inside it; the lookahead into the div's children must not see "B".
         let html = format!(
             "<table><tr><td><div>A{}{}{}</div>B</td></tr></table>",
             "<span>".repeat(513),
@@ -3987,17 +3541,9 @@ mod tests {
 
     #[test]
     fn glue_lookahead_recognizes_a_bare_table_cell_as_transparent() {
-        // node_glue_lookahead classifies td/th/tr/thead/tbody/tfoot as
-        // Stopped via is_block_boundary_in_inline_context — correct for
-        // inline_spans, which really does treat them as boundaries, but
-        // flatten_into_pending's own block-tag dispatch only special-cases
-        // "table" itself, so a bare <td> reached through *that* walker
-        // (outside any enclosing <table>) falls through to its transparent
-        // catch-all and flows straight into the same pending buffer. So
-        // "A" + capped whitespace + "<td>B</td>" here really does render
-        // as "A B" (the <td>'s "B" glues onto the same paragraph the
-        // capped space was meant to separate) — losing that space changes
-        // output, so this must warn. (Codex review on PR #2810.)
+        // `node_glue_lookahead` treats table tags as boundaries, which is right for
+        // `inline_spans`. `flatten_into_pending` special-cases only `table`, so a bare `<td>`
+        // flows into the same paragraph and dropping the space glues "A" and "B" together.
         let html = format!(
             "A{}{}{}<td>B</td>",
             "<span>".repeat(513),
@@ -4013,11 +3559,8 @@ mod tests {
 
     #[test]
     fn glue_lookahead_over_many_siblings_is_linear_not_quadratic() {
-        // Regression: computing more_after fresh for every sibling
-        // (later_content_could_glue(&nodes[i+1..]) inside the loop) scans
-        // the whole remaining suffix on every iteration — O(n) per node,
-        // O(n^2) overall for n flat top-level siblings, even nowhere near
-        // the depth cap. (Codex review on PR #2810.)
+        // Computing the lookahead per sibling from the remaining suffix is O(n^2) for n flat
+        // siblings, even far from the depth cap.
         let make = |k: usize| "<span>x</span>".repeat(k);
         let pages = crate::pdf::linear::assert_linear("render_pages", 20_000, make, |html| {
             render_pages(html)
@@ -4027,15 +3570,9 @@ mod tests {
 
     #[test]
     fn glue_lookahead_over_a_deep_chain_is_linear_not_quadratic() {
-        // Regression: glue_after_each(nodes, ...) scans nodes[0]'s entire
-        // subtree via node_glue_lookahead even though the caller only ever
-        // reads more_after[i + 1..] — never more_after[i] — so that scan is
-        // wasted. For a single-child wrapper chain, nodes[0]'s subtree IS
-        // the rest of the (possibly huge) chain, and this call happens
-        // fresh at every one of the ~512 levels the depth cap allows
-        // before it stops native recursion: O(depth) calls, each O(chain
-        // length), instead of O(chain length) total. (Codex review on PR
-        // #2810.)
+        // The lookahead must not scan `nodes[0]`'s subtree: callers read only
+        // `more_after[i + 1..]`, and in a single-child chain that subtree is the rest of the
+        // chain, rescanned at each of the ~512 levels before the cap.
         let n = 200_000;
         let make = |k: usize| format!("{}{}", "<span>".repeat(k), "</span>".repeat(k));
         let pages =
@@ -4045,14 +3582,8 @@ mod tests {
 
     #[test]
     fn glue_lookahead_over_a_deep_two_child_chain_is_linear_not_quadratic() {
-        // Regression: the prior fix only stopped glue_after_each from
-        // scanning nodes[0]'s own subtree — but with 2 siblings per level
-        // (an empty tag plus the deep chain), nodes[1] is scanned in full
-        // via node_glue_lookahead to build after[0], and that still
-        // happens fresh at every one of the ~512 levels the depth cap
-        // allows: O(depth) calls, each O(chain length), same blowup in a
-        // shape the single-child test doesn't cover. (Codex review on PR
-        // #2810.)
+        // With two siblings per level (an empty tag plus the chain), building the lookahead for
+        // `nodes[0]` scans `nodes[1]`'s whole subtree at each of the ~512 levels.
         let n = 200_000;
         let make = |k: usize| {
             format!(
@@ -4069,17 +3600,9 @@ mod tests {
 
     #[test]
     fn glue_lookahead_over_many_capped_siblings_is_linear_not_quadratic() {
-        // Regression: `A`, many empty `<span></span>` siblings, then `B`,
-        // all sitting exactly at the depth cap boundary. Each empty
-        // `<span>` recurses one level past MAX_DEPTH, so each one hits the
-        // depth-cap guard separately — and each guard call resolves
-        // `more_after` fresh: `node_glue_lookahead` on an empty transparent
-        // element is `Exhausted` (undecided), so every one of these
-        // siblings makes the scan walk past it and rescan the *entire*
-        // remaining suffix looking for `B`. That is O(n) work per capped
-        // sibling, O(n^2) for n of them, even though the lazy `GlueContext`
-        // fix already made a single resolve() itself cheap. (Codex review
-        // on PR #2810.)
+        // Each empty `<span>` sibling recurses one level past MAX_DEPTH and hits the cap guard.
+        // An empty wrapper's lookahead is undecided, so resolving each guard afresh rescans the
+        // suffix up to "B": O(n^2) for n capped siblings.
         let n = 20_000;
         let make = |k: usize| {
             format!(
@@ -4096,9 +3619,6 @@ mod tests {
 
     #[test]
     fn whitespace_only_text_followed_only_by_more_whitespace_past_the_depth_cap_does_not_warn() {
-        // A later sibling exists and is even nonempty text, but it too is
-        // whitespace-only — still nothing for the capped space to glue.
-        // (Codex review on PR #2810.)
         let html = format!("A{}{}{} ", "<span>".repeat(513), " ", "</span>".repeat(513));
         assert_eq!(
             count_pdf_depth_warnings(&html),
@@ -4109,9 +3629,7 @@ mod tests {
 
     #[test]
     fn hr_past_the_depth_cap_still_warns() {
-        // A dropped <hr> has no text, but it still draws a visible rule
-        // (or, in an inline context, a line break) — losing it is a real
-        // content loss, so "no text" must not mean "nothing to warn about".
+        // An `<hr>` has no text but still draws a rule (or a line break inline).
         let html = format!("{}<hr>{}", "<span>".repeat(513), "</span>".repeat(513));
         assert_eq!(
             count_pdf_depth_warnings(&html),
@@ -4122,9 +3640,7 @@ mod tests {
 
     #[test]
     fn empty_li_past_the_depth_cap_still_warns() {
-        // An empty <li> still draws a marker and reserves a line (see
-        // empty_list_item_still_reserves_a_full_line) even with no text of
-        // its own, so dropping it is a real content loss too.
+        // An empty `<li>` still draws a marker and reserves a line.
         let html = format!(
             "{}<ul><li></li></ul>{}",
             "<span>".repeat(513),
@@ -4139,9 +3655,6 @@ mod tests {
 
     #[test]
     fn script_text_past_the_depth_cap_does_not_warn() {
-        // <script>'s text is never rendered, capped or not (see
-        // script_and_style_content_is_never_rendered), so losing it to the
-        // depth cap is not a real content loss.
         let html = format!(
             "{}<script>alert('x')</script>{}",
             "<span>".repeat(513),
@@ -4156,9 +3669,6 @@ mod tests {
 
     #[test]
     fn br_past_the_depth_cap_still_warns() {
-        // <br>, like <hr>, draws no text but still becomes a Span::Break —
-        // a real (if small) piece of output, so it must warn like <hr>
-        // does, not stay silent because it has no text of its own.
         let html = format!("{}<br>{}", "<span>".repeat(513), "</span>".repeat(513));
         assert_eq!(
             count_pdf_depth_warnings(&html),
@@ -4169,13 +3679,8 @@ mod tests {
 
     #[test]
     fn lone_trailing_br_past_the_depth_cap_inside_a_heading_does_not_warn() {
-        // A heading's own spans buffer always runs through
-        // trim_trailing_break right after inline_spans builds it. If the
-        // capped subtree's *entire* would-be output is one trailing <br>
-        // with nothing else in the whole heading, an uncapped render would
-        // push one Span::Break and immediately trim it right back off —
-        // capped and uncapped output are identical, so this must not warn.
-        // (Codex review on PR #2810.)
+        // A heading's spans go through `trim_trailing_break`, so a lone trailing `<br>` is
+        // trimmed whether or not it is capped.
         let html = format!(
             "<h1>{}<br>{}</h1>",
             "<span>".repeat(513),
@@ -4190,13 +3695,8 @@ mod tests {
 
     #[test]
     fn br_followed_by_whitespace_past_the_depth_cap_inside_a_heading_still_warns() {
-        // Unlike a truly lone trailing <br>, one followed by breakable
-        // whitespace is NOT the buffer's actual trailing span: the
-        // uncapped walker pushes Span::Break then a whitespace Span::Run,
-        // and trim_trailing_break only ever pops the very last span (the
-        // whitespace run), leaving the break in place to still advance
-        // layout. Dropping both via the cap is a real content loss.
-        // (Codex review on PR #2810.)
+        // Whitespace after the `<br>` becomes the last span, so `trim_trailing_break` never
+        // reaches the break.
         let html = format!(
             "<h1>{}<br> {}</h1>",
             "<span>".repeat(513),
@@ -4211,17 +3711,9 @@ mod tests {
 
     #[test]
     fn br_capped_alone_then_a_whitespace_sibling_outside_it_still_warns() {
-        // Unlike the previous case (whitespace *inside* the same capped
-        // subtree as the <br>), here the <br> is the capped subtree's
-        // *entire* content, and the whitespace is a separate sibling text
-        // node outside the whole wrapper chain, at the heading's own top
-        // level. This still must warn, for the same reason: the whitespace
-        // becomes the buffer's actual trailing span, so trim_trailing_break
-        // never reaches the break. node_glue_lookahead already gets this
-        // right — a Text node whose first char is breakable whitespace
-        // resolves to Stopped, not Exhausted, regardless of how deep it's
-        // nested to get there — verified directly here as a regression
-        // guard. (Codex review on PR #2810.)
+        // As above, but the whitespace is a sibling outside the capped wrapper chain. It still
+        // becomes the last span; `node_glue_lookahead` resolves leading whitespace to
+        // `Stopped` at any depth.
         let html = format!(
             "<h1>{}<br>{} </h1>",
             "<span>".repeat(513),
@@ -4236,16 +3728,9 @@ mod tests {
 
     #[test]
     fn lone_br_capped_as_a_list_items_leading_content_does_not_warn() {
-        // inline_list_items strips a leading Span::Break unconditionally —
-        // `if out.get(content_start) == Some(&Span::Break) { out.remove(...) }`
-        // — regardless of what comes after it. So when a capped subtree's
-        // *entire* own content is one <br>, and it's the very first thing
-        // in a <li> (right after the marker), that break gets stripped
-        // either way: capped and uncapped render identically, even though
-        // real text ("B") follows as a separate sibling within the same
-        // <li>. This is independent of trim_trailing_break/nothing_follows
-        // — the removal happens unconditionally at content_start, not only
-        // when nothing else follows. (Codex review on PR #2810.)
+        // `inline_list_items` always removes a `Span::Break` at `content_start`, so a lone `<br>`
+        // as a list item's first content is stripped whether or not it is capped, even with
+        // "B" after it.
         let html = format!(
             "<h1><ul><li>{}<br>{}B</li></ul></h1>",
             "<span>".repeat(513),
@@ -4260,16 +3745,8 @@ mod tests {
 
     #[test]
     fn br_then_whitespace_capped_as_a_list_items_leading_content_does_not_warn() {
-        // Unlike the trailing-trim case (where whitespace after a capped
-        // <br> keeps it alive — see
-        // br_followed_by_whitespace_past_the_depth_cap_inside_a_heading_still_warns),
-        // here the <br> is the list item's leading content, and
-        // inline_list_items strips it unconditionally regardless of what
-        // follows. The remaining whitespace-only text is itself invisible
-        // (isolated whitespace never becomes a word) — a list marker
-        // always ends in its own trailing space, so there is no earlier
-        // word for it to glue to either way. Capped and uncapped render
-        // identically: just the marker. (Codex review on PR #2810.)
+        // The leading `<br>` is stripped as above, and the whitespace after it is invisible: the
+        // marker already ends in a space, so there is no earlier word to glue to.
         let html = format!(
             "<h1><ul><li>{}<br> {}</li></ul></h1>",
             "<span>".repeat(513),
@@ -4284,14 +3761,8 @@ mod tests {
 
     #[test]
     fn whitespace_then_br_capped_in_a_list_item_still_warns_when_real_text_follows() {
-        // Unlike whitespace *after* the capped <br> (which the leading-
-        // strip exemption tolerates — see the previous test), whitespace
-        // *before* it means the <br>, if rendered, would NOT land at
-        // content_start after all (the whitespace's own Span::Run would
-        // land there first) — so inline_list_items's leading-break strip
-        // would never reach it. With real text ("B") also following as a
-        // separate sibling, neither exemption applies, so this must warn.
-        // (Codex review on PR #2810.)
+        // Whitespace before the `<br>` lands at `content_start` first, so the leading-break strip
+        // never reaches the break, and "B" after it rules out the trailing-trim exemption.
         let html = format!(
             "<h1><ul><li>{} <br>{}B</li></ul></h1>",
             "<span>".repeat(513),
@@ -4306,17 +3777,9 @@ mod tests {
 
     #[test]
     fn br_past_the_depth_cap_still_warns_when_an_earlier_break_would_be_exposed() {
-        // A real, un-capped <br> already sits in `out` before the capped
-        // subtree (another deeply wrapped <br>). Uncapped: out ends in
-        // [Break, Break] — trim_trailing_break removes only the *second*
-        // one, leaving the first as a real visible line break. Capped:
-        // out ends in just [Break] (the first) — now the buffer's actual
-        // last span, so trim_trailing_break removes *that* one instead,
-        // leaving no break at all. Dropping the capped subtree therefore
-        // silently erases a break that would otherwise have survived —
-        // the "nothing follows, so it's safe" trailing exemption isn't
-        // enough on its own; `out` must not already end in a break either.
-        // (Codex review on PR #2810.)
+        // An uncapped `<br>` precedes the capped one. Uncapped, `trim_trailing_break` removes the
+        // second break and the first survives. Capped, the first becomes last and is trimmed,
+        // so the trailing exemption also requires that `out` not already end in a break.
         let html = format!(
             "<h1><br>{}<br>{}</h1>",
             "<span>".repeat(513),
@@ -4331,11 +3794,7 @@ mod tests {
 
     #[test]
     fn two_brs_capped_as_a_list_items_leading_content_still_warn() {
-        // Unlike the lone-<br> case, inline_list_items only ever removes
-        // the *one* Span::Break sitting exactly at content_start — a
-        // second one survives and still draws a visible line break, so
-        // dropping both via the cap is a real content loss.
-        // (Codex review on PR #2810.)
+        // `inline_list_items` removes only the one break at `content_start`; the second survives.
         let html = format!(
             "<h1><ul><li>{}<br><br>{}B</li></ul></h1>",
             "<span>".repeat(513),
@@ -4350,19 +3809,9 @@ mod tests {
 
     #[test]
     fn br_capped_as_a_list_items_leading_content_still_warns_when_not_actually_first() {
-        // Same shape as the lone-<br>-as-leading-content case, but this
-        // time real text precedes AND follows the capped subtree within
-        // the same <li> ("A" before, "B" after — both direct siblings of
-        // the deeply wrapped <br>, not nested inside it). "A" means the
-        // capped <br>, if rendered, would NOT land at content_start, so
-        // inline_list_items's leading-break strip would never touch it;
-        // "B" (a later sibling within the *same* nodes list, resolved by
-        // the local LaterSiblings chain regardless of
-        // inline_list_items's own has_more_after) means the *existing*
-        // trailing-trim exception (nothing_follows) doesn't separately
-        // explain away the drop either — isolating this test to the
-        // leading-strip mismatch specifically. Dropping the <br> here is
-        // a real content loss. (Codex review on PR #2810.)
+        // "A" before the capped `<br>` means it would not land at `content_start`, so the
+        // leading-break strip does not apply. "B" after it rules out the trailing-trim
+        // exemption, so this isolates the leading-strip check.
         let html = format!(
             "<h1><ul><li>A{}<br>{}B</li></ul></h1>",
             "<span>".repeat(513),
@@ -4377,11 +3826,7 @@ mod tests {
 
     #[test]
     fn br_past_the_depth_cap_inside_a_heading_still_warns_when_real_text_follows() {
-        // Same shape as the lone-trailing-<br> case, but this time the <br>
-        // is *not* trailing — real text ("B") follows it within the same
-        // heading, so trim_trailing_break's single pop never reaches it.
-        // Losing it is a real difference, so this must still warn.
-        // (Codex review on PR #2810.)
+        // "B" follows the `<br>`, so `trim_trailing_break` never reaches it.
         let html = format!(
             "<h1>{}<br>{}B</h1>",
             "<span>".repeat(513),
@@ -4396,10 +3841,7 @@ mod tests {
 
     #[test]
     fn two_brs_past_the_depth_cap_inside_a_heading_still_warn() {
-        // trim_trailing_break only ever removes the single trailing break —
-        // a second one survives and still produces a visible line break, so
-        // dropping both via the depth cap is a real content loss.
-        // (Codex review on PR #2810.)
+        // `trim_trailing_break` removes only one break; the second survives.
         let html = format!(
             "<h1>{}<br><br>{}</h1>",
             "<span>".repeat(513),
@@ -4414,13 +3856,8 @@ mod tests {
 
     #[test]
     fn bare_li_outside_a_list_past_the_depth_cap_still_warns() {
-        // A stray <li> with no enclosing <ul>/<ol> isn't a list item, but
-        // it is still a "flush point": flatten_into_pending closes off
-        // whatever text came before it into its own paragraph the moment
-        // it sees a <li> (same as <div>, <p>, ...), so an <li> sitting
-        // between two runs of real text keeps them on separate lines
-        // instead of gluing them — even though the <li> itself is empty.
-        // Dropping it changes the output, so this must warn.
+        // A stray `<li>` outside a list is still a flush point in `flatten_into_pending`: it ends
+        // the pending paragraph, so text before and after it stays on separate lines.
         let html = format!("{}<li></li>{}", "<span>".repeat(513), "</span>".repeat(513));
         assert_eq!(
             count_pdf_depth_warnings(&html),
@@ -4431,15 +3868,8 @@ mod tests {
 
     #[test]
     fn empty_div_sandwiched_between_text_past_the_depth_cap_still_warns() {
-        // An empty <div> between "A" and "B", buried past the cap, is a
-        // real (if easy to miss) rendering difference: uncapped, it forces
-        // "A" and "B" into separate paragraphs (flatten_into_pending flushes
-        // pending text into its own Block::Paragraph the instant it sees a
-        // <div>, then hands the (empty) <div> to flatten_blocks, which adds
-        // nothing further); dropped, "A" and "B" merge into one paragraph.
-        // Same story inline: inline_spans always pushes a Span::Break
-        // around a <div> (see is_block_boundary_in_inline_context's doc
-        // comment), empty or not.
+        // Uncapped, an empty `<div>` splits "A" and "B" into two paragraphs
+        // (`flatten_into_pending` flushes on it), and `inline_spans` puts breaks around it.
         let html = format!(
             "A{}<div></div>{}B",
             "<span>".repeat(513),
@@ -4464,13 +3894,8 @@ mod tests {
 
     #[test]
     fn ordered_list_marker_wide_enough_to_overlap_the_fixed_indent_gets_more_room() {
-        // Regression: the indent between a list marker and its item's
-        // content was a fixed 16pt, which fits every bullet/low-numbered
-        // marker comfortably ("•", "1." .. "9.") but not an ordered list
-        // marker whose digits keep growing — "100." alone is already
-        // ~21pt at 11pt Helvetica, wider than the indent, so content wrapped
-        // at a fixed 16pt started underneath the marker's own text instead
-        // of after it.
+        // A fixed 16pt marker indent fits "•" and "1."-"9.", but "100." is ~21pt at 11pt
+        // Helvetica; the content must start after the marker, not under it.
         let mut writer = Writer::new();
         let marker = "100.".to_owned();
         writer.draw_block(&Block::ListItem {
@@ -4505,12 +3930,8 @@ mod tests {
 
     #[test]
     fn empty_list_item_still_reserves_a_full_line() {
-        // Regression: `draw_lines` only advances `y_from_top` per *line it
-        // draws* — an empty item (`<li></li>`, or one whose only content was
-        // skipped) produces zero wrapped lines, so only the fixed 4pt
-        // spacer after it separated its marker from the next item's,
-        // placing the two markers almost on top of each other instead of on
-        // their own lines.
+        // `draw_lines` advances `y_from_top` only per drawn line, and an empty item has none, so
+        // the item must reserve a line itself or consecutive markers overlap.
         let mut writer = Writer::new();
         writer.draw_block(&Block::ListItem {
             marker: "\u{2022}".to_owned(),

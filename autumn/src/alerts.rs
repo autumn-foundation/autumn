@@ -536,11 +536,11 @@ impl AlertDeduplicator {
     pub fn on_trigger(&mut self, key: &str, now: DateTime<Utc>) -> DedupDecision {
         match self.keys.get_mut(key) {
             Some(state) if state.active && (now - state.last_sent) < self.window => {
-                // Still firing, still inside the window: bounded suppression.
+                // Still firing inside the window.
                 DedupDecision::Suppress
             }
             Some(state) => {
-                // Either it had recovered, or the window has elapsed: re-notify.
+                // Recovered since, or the window elapsed: re-notify.
                 state.active = true;
                 state.last_sent = now;
                 DedupDecision::Send
@@ -731,21 +731,16 @@ impl Alerter {
         if self.inner.channels.is_empty() {
             return;
         }
-        // Dispatch is best-effort: with a Tokio runtime handle we spawn one
-        // detached task *per channel* so a slow or hanging channel never blocks
-        // delivery to the others; with no handle available (unlikely from a hook
-        // site) the alert is logged and skipped, never blocking the caller.
+        // Best-effort: one detached task per channel, so a hanging channel never
+        // blocks the others or the caller. Without a runtime the alert is skipped.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::warn!("no tokio runtime available for alert dispatch; skipping");
             return;
         };
         let alert = Arc::new(alert);
         for channel in &self.inner.channels {
-            // Per-channel severity routing (issue #1630): a destination that
-            // does not accept this alert's severity is skipped, so an alert
-            // below a channel's threshold (e.g. a recovery to a critical-only
-            // chat channel) is never delivered to it. Defaults to accept-all,
-            // so every existing channel is unaffected.
+            // Per-channel severity routing (#1630), e.g. a critical-only channel
+            // gets no recoveries. Channels accept everything by default.
             if !channel.accepts_severity(alert.severity) {
                 continue;
             }
@@ -850,20 +845,12 @@ pub fn notify_scheduled_task_recovered(state: &AppState, task_name: &str) {
     let Some(alerter) = alerter(state) else {
         return;
     };
-    // KNOWN LIMITATION (multi-replica fleets): the `AlertDeduplicator` is
-    // process-local, so a recovery only clears an outstanding failure when it is
-    // emitted by the SAME replica that observed the failure. Scheduled tasks are
-    // lease-coordinated across the fleet, so the failure can be seen by replica A
-    // and the later success run by replica B after a leader handoff; B has no
-    // active `scheduled_task_failure:{task}` key locally, so `on_resolve`
-    // suppresses the resolve and A's failure alert is never cleared. This is why
-    // the scheduled-task key is deliberately NOT host-scoped (a global key is
-    // still the closest correlation available). A real fix needs shared
-    // active-alert state (Postgres/Redis) or an unconditional correlated resolve,
-    // both out of scope for #1610 (fleet-level alert aggregation is listed as a
-    // non-goal). The native PagerDuty/Slack/Discord transports (#1630) do not
-    // change this process-local behaviour; shared active-alert state remains a
-    // separate future follow-up.
+    // Known limitation: the deduplicator is process-local, so a recovery only
+    // clears a failure seen by the same replica. Scheduled tasks are
+    // lease-coordinated, so after a leader handoff replica B's success cannot
+    // clear replica A's failure. The key is not host-scoped because a global key
+    // is the closest correlation available. A real fix needs shared active-alert
+    // state.
     let alert = Alert::recovery(
         AlertCondition::ScheduledTaskFailure,
         format!("scheduled_task_failure:{task_name}"),
@@ -1219,10 +1206,8 @@ const fn pagerduty_severity(severity: AlertSeverity) -> &'static str {
 #[cfg(feature = "http-client")]
 #[must_use]
 pub fn pagerduty_event_payload(alert: &Alert, routing_key: &str) -> serde_json::Value {
-    // Reserved standard-field names Autumn writes into `custom_details` below.
-    // PagerDuty routing/correlation depends on these carrying the authoritative
-    // values, so a user detail keyed with one of these must NOT clobber it — nor
-    // be clobbered by it. Colliding user keys are preserved under `custom_<key>`.
+    // Standard fields Autumn writes into `custom_details`; PagerDuty routing and
+    // correlation depend on them. A colliding user key moves to `custom_<key>`.
     const RESERVED: &[&str] = &["condition", "where_to_look", "detail"];
     if alert.event == AlertEventKind::Resolve {
         return serde_json::json!({
@@ -1699,10 +1684,8 @@ fn build_mail_alert_channel(
     mailer: Arc<crate::mail::Mailer>,
     email: &str,
 ) -> Option<Arc<dyn AlertChannel>> {
-    // TRIM the resolved address and treat the trimmed value as canonical (the
-    // caller already guaranteed it is non-empty after trimming): lettre parses
-    // the recipient at send time, so validate — and deliver to — the exact
-    // address the send path would parse.
+    // Validate and deliver to the trimmed address, the one lettre parses at send
+    // time. The caller guarantees it is non-empty.
     let email_trimmed = email.trim();
     if mailer.is_disabled() {
         tracing::warn!(
@@ -1808,9 +1791,8 @@ pub fn install_from_config(
     config: &AlertConfig,
     extra_channels: Vec<Arc<dyn AlertChannel>>,
 ) {
-    // Master off switch: `enabled = false` silences EVERYTHING, including any
-    // custom channel registered via `with_alert_channel`. Install nothing, do
-    // not start the evaluation loop, and do not put an alerter onto `state`.
+    // `enabled = false` silences everything, including channels registered via
+    // `with_alert_channel`.
     if !config.enabled {
         return;
     }
@@ -1830,9 +1812,7 @@ pub fn install_from_config(
             );
         }
     }
-    // Without the `mail` feature the email branch above is compiled out, so an
-    // email-only config would silently install no channels and deliver no
-    // alerts. Warn loudly so operators don't believe email alerts are active.
+    // Without `mail` an email destination would silently deliver nothing.
     #[cfg(not(feature = "mail"))]
     if config.email.as_ref().is_some_and(|s| !s.trim().is_empty()) {
         tracing::warn!(
@@ -1843,26 +1823,17 @@ pub fn install_from_config(
     }
     #[cfg(feature = "http-client")]
     if let Some(raw_url) = config.webhook_url.as_ref().filter(|s| !s.trim().is_empty()) {
-        // TRIM the resolved webhook URL and treat the trimmed value as canonical:
-        // a copied env var commonly carries leading/trailing whitespace, and the
-        // runtime dispatch rule matches on `http://`/`https://` PREFIXES, so an
-        // untrimmed `"  https://…"` would never be treated as absolute and every
-        // POST would fail `reqwest::Url::parse`. Building the channel with the
-        // trimmed URL also keeps doctor (which trims + validates) and the runtime
-        // from disagreeing about whether the webhook is usable.
+        // A copied env var often carries whitespace, and dispatch matches on the
+        // `http://`/`https://` prefix, so an untrimmed URL would fail every POST.
+        // Doctor trims before validating too.
         let url = raw_url.trim();
-        // Match the missing-secret check's trimming so the stored secret is the
-        // canonical, whitespace-free value used to sign.
         let secret = config
             .webhook_secret
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
-        // Reject an unusable webhook URL BEFORE registering the channel. Without
-        // this, a relative/malformed value (or one whose whitespace an app that
-        // doesn't run doctor never trims) installs a webhook channel that looks
-        // configured but fails EVERY delivery at `build_request`. Mirror the
-        // disabled-transport / missing-secret skip-and-warn pattern above.
+        // A relative or malformed URL would register a channel that fails every
+        // delivery, so skip it and warn.
         if !is_absolute_http_url(url) {
             tracing::warn!(
                 webhook_url = url,
@@ -1872,13 +1843,9 @@ pub fn install_from_config(
                  AUTUMN_ALERTS__WEBHOOK_URL env var)."
             );
         } else if let Some(secret) = secret {
-            // Alert webhooks are ALWAYS signed: the operator guide documents
-            // receivers verifying the `Autumn-Signature` header. A configured
-            // webhook with no non-empty signing secret would send UNSIGNED
-            // requests that a documented receiver rejects (or accepts
-            // unauthenticated) — so refuse to register the channel and warn,
-            // mirroring the disabled-mail-transport skip above. Never send
-            // unsigned.
+            // Alert webhooks are always signed (receivers verify the
+            // `Autumn-Signature` header), so with no secret the channel is not
+            // registered.
             let client = crate::http_client::Client::from_state(state);
             channels.push(Arc::new(WebhookAlertChannel::new(
                 client,
@@ -1893,9 +1860,7 @@ pub fn install_from_config(
             );
         }
     }
-    // Without the `http-client` feature the webhook branch above is compiled out,
-    // so a webhook-only config would silently install no channels and deliver no
-    // alerts. Warn loudly so operators don't believe webhook alerts are active.
+    // Without `http-client` a webhook destination would silently deliver nothing.
     #[cfg(not(feature = "http-client"))]
     if config
         .webhook_url
@@ -1909,7 +1874,6 @@ pub fn install_from_config(
         );
     }
 
-    // Native provider transports (issue #1630): PagerDuty / Slack / Discord.
     push_native_transport_channels(state, config, &mut channels);
 
     channels.extend(extra_channels);
@@ -1918,18 +1882,12 @@ pub fn install_from_config(
         return;
     }
 
-    // Capture the effective actuator prefix AND the `sensitive` flag so every
-    // alert's `where_to_look` points at a REAL, mounted actuator endpoint: the
-    // prefix keeps custom-prefix deployments off `/actuator/*` 404s, and
-    // `sensitive` keeps the dead-lettered-job/scheduled-task alerts off the
-    // `/jobs` and `/tasks` endpoints, which are mounted only when `sensitive =
-    // true`. The full config is installed on `state` before this runs.
+    // `where_to_look` must name a mounted actuator endpoint: honour a custom
+    // prefix, and avoid `/jobs` and `/tasks` unless `sensitive = true` mounts them.
+    // The full config is on `state` before this runs.
     let app_config = state.config_arc();
     let actuator_cfg = &app_config.actuator;
     let actuator_sensitive = actuator_cfg.sensitive;
-    // Owned: `AlerterSettings` outlives this handle — it is stored on the
-    // `Alerter` installed as a state extension — so the prefix has to be a
-    // `String` it owns. One field, not the whole config.
     let actuator_prefix = actuator_cfg.prefix.clone();
     let settings = AlerterSettings::from_config(config, actuator_prefix, actuator_sensitive);
     let alerter = Alerter::new(channels, settings);
@@ -1943,9 +1901,9 @@ pub fn install_from_config(
 fn spawn_evaluation_loop(state: AppState, alerter: Alerter) {
     let settings = alerter.settings().clone();
     tokio::spawn(async move {
-        // Per-indicator: when it first went Down (None once it is Up again).
+        // When each indicator first went unhealthy; removed once it recovers.
         let mut down_since: HashMap<String, DateTime<Utc>> = HashMap::new();
-        // Prime the cumulative counters so the first tick measures a real delta.
+        // Prime the cumulative counters so the first tick measures a delta.
         let (mut last_requests, mut last_5xx) = {
             let snap = state.metrics().snapshot();
             (snap.http.requests_total, snap.http.by_status.s5xx)
@@ -2016,9 +1974,8 @@ fn evaluate_error_rate(
     };
     #[allow(clippy::cast_precision_loss)]
     let rate = err_delta as f64 / req_delta as f64;
-    // Host-scope the key: this rate is from the local process's metrics, so
-    // each replica must own its incident (see `error_rate_dedup_key`). The
-    // trigger and resolve below share this same `key`, so they still correlate.
+    // Host-scoped: the rate comes from this process's metrics, so each replica
+    // owns its incident. Trigger and resolve share the key.
     let key = error_rate_dedup_key(&host_id());
     if rate >= settings.error_rate_threshold {
         let pct = rate * 100.0;
@@ -2107,10 +2064,8 @@ async fn evaluate_health(
 
     let host = host_id();
     for result in &results {
-        // Host-scope the per-indicator key: health is evaluated from this
-        // process's local registry, so each replica owns its incident (see
-        // `health_indicator_dedup_key`). The trigger and resolve arms below
-        // share this same `key`, so they still correlate.
+        // Host-scoped: health comes from this process's registry, so each
+        // replica owns its incident. Trigger and resolve share the key.
         let key = health_indicator_dedup_key(&result.name, &host);
         match classify_health_transition(result.output.status) {
             HealthTransition::Trigger => {
@@ -2138,9 +2093,8 @@ async fn evaluate_health(
                 }
             }
             HealthTransition::Recover => {
-                // Only clear the down-tracking (and emit a recovery) when the
-                // indicator is genuinely healthy again. `recover` is itself gated
-                // by `on_resolve`, so it is a no-op unless an alert was active.
+                // `recover` is gated by `on_resolve`, so it sends nothing unless
+                // an alert was active.
                 if down_since.remove(&result.name).is_some() {
                     let alert = Alert::recovery(AlertCondition::HealthIndicatorDown, key)
                         .title(format!("Health indicator '{}' recovered", result.name))
@@ -2170,7 +2124,7 @@ mod tests {
         DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("valid timestamp")
     }
 
-    // ── Dedup window bounding (AC #3) ────────────────────────────────────────
+    // ── Dedup window bounding ────────────────────────────────────────────────
 
     #[test]
     fn first_trigger_sends() {
@@ -2182,7 +2136,6 @@ mod tests {
     fn repeated_triggers_within_window_are_suppressed() {
         let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         assert_eq!(d.on_trigger("k", ts(0)), DedupDecision::Send);
-        // Many occurrences inside the window -> all suppressed (not one-per).
         for s in 1..100 {
             assert_eq!(
                 d.on_trigger("k", ts(s)),
@@ -2209,17 +2162,14 @@ mod tests {
         assert_eq!(d.on_trigger("b", ts(0)), DedupDecision::Send);
     }
 
-    // ── Recovery emission (AC #3) ────────────────────────────────────────────
+    // ── Recovery emission ────────────────────────────────────────────────────
 
     #[test]
     fn recovery_sends_only_for_active_key() {
         let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
-        // Never triggered: no recovery.
         assert_eq!(d.on_resolve("k"), DedupDecision::Suppress);
-        // Trigger, then recover once.
         assert_eq!(d.on_trigger("k", ts(0)), DedupDecision::Send);
         assert_eq!(d.on_resolve("k"), DedupDecision::Send);
-        // Double-recover: suppressed.
         assert_eq!(d.on_resolve("k"), DedupDecision::Suppress);
     }
 
@@ -2228,17 +2178,13 @@ mod tests {
         let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         assert_eq!(d.on_trigger("k", ts(0)), DedupDecision::Send);
         assert_eq!(d.on_resolve("k"), DedupDecision::Send);
-        // Fresh trigger inside the original window still sends because the key
-        // recovered in between.
+        // Inside the original window, but the key recovered in between.
         assert_eq!(d.on_trigger("k", ts(10)), DedupDecision::Send);
     }
 
-    // ── Health-indicator classification (P2: unhealthy triggers, healthy recovers)
-    // The branch in `evaluate_health`: any non-healthy status (`Down`,
-    // `OutOfService`, …) triggers the grace-period logic, and only a genuinely
-    // healthy status recovers. This means `OutOfService` reached WITHOUT a prior
-    // `Down` is still alerted, while a `Down`→`OutOfService` dip stays unhealthy
-    // (no false recovery).
+    // ── Health-indicator classification ──────────────────────────────────────
+    // Any non-healthy status (`Down`, `OutOfService`, …) triggers; only a healthy
+    // status recovers. A `Down`→`OutOfService` dip stays unhealthy.
 
     use crate::actuator::HealthStatus;
 
@@ -2252,8 +2198,7 @@ mod tests {
 
     #[test]
     fn healthy_statuses_recover() {
-        // `is_healthy()` treats both `Up` and `Unknown` as healthy, so both
-        // recover — the actuator reports 200 for either.
+        // The actuator reports 200 for both `Up` and `Unknown`.
         assert_eq!(
             classify_health_transition(HealthStatus::Up),
             HealthTransition::Recover
@@ -2266,9 +2211,6 @@ mod tests {
 
     #[test]
     fn out_of_service_triggers_like_down() {
-        // `OutOfService` is non-`Down` but still UNHEALTHY: it must take the
-        // trigger path (not recover, not silently hold), so an indicator that
-        // reports `OUT_OF_SERVICE` without ever going `Down` is still alerted.
         assert!(!HealthStatus::OutOfService.is_healthy());
         assert_eq!(
             classify_health_transition(HealthStatus::OutOfService),
@@ -2331,10 +2273,6 @@ mod tests {
 
     #[test]
     fn out_of_service_without_prior_down_triggers_after_grace() {
-        // The former bug: an indicator that reports OutOfService WITHOUT ever
-        // going Down was never alerted. Now it takes the trigger path, so once the
-        // down-duration passes the grace period an alert fires (Send on the first
-        // notification).
         let tick = recovery_tick_for_sequence(&[HealthStatus::OutOfService]);
         assert_eq!(
             tick,
@@ -2345,9 +2283,7 @@ mod tests {
 
     #[test]
     fn down_then_out_of_service_does_not_recover() {
-        // Down (alert) → OutOfService: the alert stays active (the OutOfService
-        // tick re-enters the trigger arm and is deduped as still-active) and NO
-        // recovery is emitted — the service is still unhealthy.
+        // The `OutOfService` tick re-enters the trigger arm and is deduped.
         let tick = recovery_tick_for_sequence(&[HealthStatus::Down, HealthStatus::OutOfService]);
         assert_eq!(
             tick,
@@ -2358,7 +2294,6 @@ mod tests {
 
     #[test]
     fn down_then_up_recovers() {
-        // Down (alert) → Up: a genuine recovery is emitted for the active key.
         let tick = recovery_tick_for_sequence(&[HealthStatus::Down, HealthStatus::Up]);
         assert_eq!(
             tick,
@@ -2380,12 +2315,8 @@ mod tests {
 
     #[test]
     fn brief_unhealthy_blip_inside_grace_window_does_not_alert() {
-        // A single non-healthy tick that recovers before the grace period elapses
-        // must NOT alert. With a 60s grace and consecutive 1s ticks, the lone
-        // OutOfService tick is inside the window (no trigger fires), and the
-        // following Up tick clears the tracking — but since no alert ever
-        // triggered, the resolve is dedup-gated to `Suppress`, so no notification
-        // is sent either way.
+        // With a 60s grace and 1s ticks the lone `OutOfService` tick never
+        // triggers, so the following resolve is suppressed.
         let tick = health_tick_for_sequence(
             &[HealthStatus::OutOfService, HealthStatus::Up],
             chrono::Duration::seconds(60),
@@ -2462,13 +2393,12 @@ mod tests {
             actuator_where_to_look("/_ops", AlertCondition::ScheduledTaskFailure),
             "/_ops/tasks"
         );
-        // Normalization matches the router: a trailing slash is trimmed and a
-        // missing leading slash is added, so no `//` or missing-slash paths.
+        // Normalized like the router: trailing slash trimmed, leading slash added.
         assert_eq!(
             actuator_where_to_look("_ops/", AlertCondition::HealthIndicatorDown),
             "/_ops/health"
         );
-        // Root ("/" or empty) prefix yields the bare suffix, matching the router.
+        // A root ("/" or empty) prefix yields the bare suffix.
         assert_eq!(
             actuator_where_to_look("/", AlertCondition::DeadLetteredJob),
             "/jobs"
@@ -2477,7 +2407,7 @@ mod tests {
 
     #[test]
     fn sensitive_gated_where_to_look_points_at_mounted_endpoint() {
-        // `sensitive = true`: `/jobs` and `/tasks` ARE mounted, so point at them.
+        // `sensitive = true` mounts `/jobs` and `/tasks`.
         assert_eq!(
             sensitive_gated_where_to_look("/actuator", AlertCondition::DeadLetteredJob, true),
             "/actuator/jobs"
@@ -2487,10 +2417,8 @@ mod tests {
             "/actuator/tasks"
         );
 
-        // `sensitive = false` (the production default): `/jobs` and `/tasks` are
-        // NOT mounted (404). The pointer must NOT link them directly — it points
-        // at the always-mounted `/health` and names the setting that would expose
-        // the richer endpoint.
+        // `sensitive = false` (the default) leaves them unmounted: point at
+        // `/health` and name the setting that would expose them.
         let dead =
             sensitive_gated_where_to_look("/actuator", AlertCondition::DeadLetteredJob, false);
         assert!(
@@ -2535,22 +2463,18 @@ mod tests {
         assert_eq!(t.dedup_key, r.dedup_key);
     }
 
-    // ── Host-scoped dedup keys for the process-local conditions (P2) ──────────
-    // The 5xx-rate and health-indicator-down conditions are evaluated from THIS
-    // process's local metrics/registry, so their dedup keys carry the host id:
-    // two replicas produce DIFFERENT keys (their incidents stay distinct), while
-    // a single replica's trigger and resolve — same process, same `host_id()` —
-    // produce the SAME key so a consumer still correlates them.
+    // ── Host-scoped dedup keys for the process-local conditions ───────────────
+    // The 5xx-rate and health conditions are evaluated from this process's own
+    // metrics, so each replica gets its own key, and its trigger and resolve
+    // still share one.
 
     #[test]
     fn error_rate_dedup_key_is_host_scoped() {
-        // Different hosts -> different keys (incidents stay separate per replica).
         assert_ne!(
             error_rate_dedup_key("replica-a"),
             error_rate_dedup_key("replica-b"),
             "two replicas must not share the 5xx dedup key"
         );
-        // Same host -> the trigger and its later resolve (both in-process) match.
         let host = "replica-a";
         let trigger_key = error_rate_dedup_key(host);
         let resolve_key = error_rate_dedup_key(host);
@@ -2558,24 +2482,20 @@ mod tests {
             trigger_key, resolve_key,
             "same-host trigger and resolve must correlate"
         );
-        // The host is appended to the existing key format.
         assert_eq!(trigger_key, "high_error_rate:5xx:replica-a");
     }
 
     #[test]
     fn health_indicator_dedup_key_is_host_scoped() {
-        // Different hosts -> different keys for the same indicator.
         assert_ne!(
             health_indicator_dedup_key("db", "replica-a"),
             health_indicator_dedup_key("db", "replica-b"),
             "two replicas must not share a health dedup key for the same indicator"
         );
-        // Different indicators on the same host also stay distinct.
         assert_ne!(
             health_indicator_dedup_key("db", "replica-a"),
             health_indicator_dedup_key("cache", "replica-a"),
         );
-        // Same host + indicator -> the trigger and its resolve match.
         let host = "replica-a";
         let trigger_key = health_indicator_dedup_key("db", host);
         let resolve_key = health_indicator_dedup_key("db", host);
@@ -2583,7 +2503,6 @@ mod tests {
             trigger_key, resolve_key,
             "same-host trigger and resolve must correlate"
         );
-        // The host is appended to the existing per-indicator key format.
         assert_eq!(trigger_key, "health_indicator_down:db:replica-a");
     }
 
@@ -2643,7 +2562,7 @@ mod tests {
                     .build()
             )
         );
-        // Let the detached task run.
+        // Let the detached delivery tasks run.
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(a.lock().expect("lock").len(), 1);
@@ -2659,7 +2578,6 @@ mod tests {
             name: "cap",
         })];
         let alerter = Alerter::new(channels, settings());
-        // 50 occurrences of the same condition in quick succession.
         let mut sent = 0;
         for _ in 0..50 {
             if alerter.notify(
@@ -2683,11 +2601,9 @@ mod tests {
         assert!(!c.is_active(), "disabled -> inactive even with destination");
     }
 
-    // ── 5xx error_rate_threshold sanitization (P2) ───────────────────────────
-    // The threshold is compared against a FRACTION in [0, 1] (rate = err/req),
-    // so only (0, 1] is meaningful. A non-finite value or one > 1 makes the
-    // alert never fire; a value <= 0 makes it fire on 0%-error windows. Any such
-    // value falls back to the default so 5xx alerting stays functional.
+    // ── 5xx error_rate_threshold sanitization ────────────────────────────────
+    // The rate is a fraction (err/req), so only (0, 1] is meaningful. Anything
+    // else falls back to the default.
 
     fn from_config_with_threshold(threshold: f64) -> AlerterSettings {
         let config = AlertConfig {
@@ -2697,22 +2613,19 @@ mod tests {
         AlerterSettings::from_config(&config, "/actuator".to_owned(), false)
     }
 
-    // Compare two f64s for the EXACT equality these tests intend (the sanitizer
-    // returns either the verbatim input or the bit-identical default constant), by
-    // bit pattern — avoids `clippy::float_cmp` while staying exact.
+    // Bitwise comparison: the sanitizer returns the input or the default constant
+    // unchanged, and this avoids `clippy::float_cmp`.
     fn assert_threshold_eq(actual: f64, expected: f64, msg: &str) {
         assert_eq!(actual.to_bits(), expected.to_bits(), "{msg}");
     }
 
     #[test]
     fn valid_error_rate_threshold_is_kept() {
-        // An in-range finite value is preserved verbatim.
         assert_threshold_eq(
             from_config_with_threshold(0.2).error_rate_threshold,
             0.2,
             "a valid (0, 1] threshold must be kept",
         );
-        // The boundary value 1.0 (100% of requests) is valid.
         assert_threshold_eq(
             from_config_with_threshold(1.0).error_rate_threshold,
             1.0,
@@ -2727,7 +2640,6 @@ mod tests {
             default_error_rate_threshold(),
             "NaN threshold must fall back to the default (can't be clamped)",
         );
-        // Infinities are non-finite too and must fall back.
         assert_threshold_eq(
             from_config_with_threshold(f64::INFINITY).error_rate_threshold,
             default_error_rate_threshold(),
@@ -2737,13 +2649,13 @@ mod tests {
 
     #[test]
     fn out_of_range_error_rate_threshold_falls_back_to_default() {
-        // > 1: the alert would NEVER fire (no rate can reach it).
+        // > 1 would never fire.
         assert_threshold_eq(
             from_config_with_threshold(1.5).error_rate_threshold,
             default_error_rate_threshold(),
             "a threshold > 1 must fall back to the default",
         );
-        // <= 0: the alert would fire even on a 0%-error window.
+        // <= 0 would fire on a 0%-error window.
         assert_threshold_eq(
             from_config_with_threshold(0.0).error_rate_threshold,
             default_error_rate_threshold(),
@@ -2758,14 +2670,11 @@ mod tests {
 
     #[test]
     fn sanitized_threshold_behaves_as_default_in_comparison() {
-        // A valid threshold fires for a rate at/above it and not below (the
-        // runtime gate is `rate >= threshold`).
+        // The runtime gate is `rate >= threshold`.
         let valid = from_config_with_threshold(0.10).error_rate_threshold;
         assert!(0.10 >= valid, "a rate at the threshold fires");
         assert!(0.05 < valid, "a rate below the threshold does not fire");
-        // The sanitized (bad) threshold compares exactly like the default: a rate
-        // at/above the DEFAULT fires, one below does not — the 5xx alert stays
-        // functional rather than silently broken.
+        // A sanitized threshold compares exactly like the default.
         let sanitized = from_config_with_threshold(f64::NAN).error_rate_threshold;
         let default = default_error_rate_threshold();
         assert!(default >= sanitized, "a rate at the default fires");
@@ -2777,9 +2686,8 @@ mod tests {
 
     #[test]
     fn sub_threshold_ticks_accumulate_until_window_crosses_min_requests() {
-        // min_requests = 10; each tick adds 4 requests (below threshold) with
-        // 1 new 5xx. Baselines must NOT reset on the sub-threshold ticks so the
-        // requests accumulate until the summed window finally crosses 10.
+        // Each tick adds 4 requests and one 5xx. Baselines hold on sub-threshold
+        // ticks, so requests accumulate until the window reaches 10.
         let min_requests = 10;
         let mut last_requests = 0;
         let mut last_5xx = 0;
@@ -2790,7 +2698,6 @@ mod tests {
             None,
             "first sub-threshold tick must not evaluate"
         );
-        // Baselines must be untouched so progress is preserved.
         assert_eq!(
             last_requests, 0,
             "sub-threshold tick must not reset baseline"
@@ -2800,7 +2707,7 @@ mod tests {
             "sub-threshold tick must not reset 5xx baseline"
         );
 
-        // Tick 2: total=8, 5xx=2 -> still below threshold (delta from 0 is 8).
+        // Tick 2: total=8, 5xx=2 -> delta from 0 is 8, still below.
         assert_eq!(
             sample_error_window(8, 2, &mut last_requests, &mut last_5xx, min_requests),
             None,
@@ -2809,14 +2716,12 @@ mod tests {
         assert_eq!(last_requests, 0);
         assert_eq!(last_5xx, 0);
 
-        // Tick 3: total=12, 5xx=3 -> accumulated delta 12 >= 10, evaluate now
-        // over the whole accumulated window (12 requests, 3 errors).
+        // Tick 3: total=12, 5xx=3 -> delta 12 >= 10, evaluate the whole window.
         assert_eq!(
             sample_error_window(12, 3, &mut last_requests, &mut last_5xx, min_requests),
             Some((12, 3)),
             "window must evaluate once summed requests cross the threshold"
         );
-        // Only now do the baselines advance to the evaluated point.
         assert_eq!(last_requests, 12, "baseline advances only after evaluation");
         assert_eq!(last_5xx, 3);
 
@@ -2835,8 +2740,7 @@ mod tests {
     #[cfg(feature = "http-client")]
     #[test]
     fn is_absolute_http_url_matches_runtime_absoluteness() {
-        // Both schemes are accepted (runtime dispatches either verbatim), with no
-        // TLS requirement and query/fragment allowed.
+        // Either scheme, with query and fragment, matching what dispatch accepts.
         assert!(is_absolute_http_url(
             "https://alerts.example.com/hooks/autumn"
         ));
@@ -2844,7 +2748,6 @@ mod tests {
             "http://alerts.example.com/hooks/autumn"
         ));
         assert!(is_absolute_http_url("http://h.example.com:8080/x?a=1#f"));
-        // Relative / malformed / non-http / empty-host values are rejected.
         assert!(!is_absolute_http_url("hooks.example/x"));
         assert!(!is_absolute_http_url("/hooks/autumn"));
         assert!(!is_absolute_http_url("ftp://h.example.com/x"));
@@ -2870,10 +2773,8 @@ mod tests {
 
     #[test]
     fn alert_routing_accepts_matches_severity() {
-        // `All` receives both a firing alert and its recovery.
         assert!(AlertRouting::All.accepts(AlertSeverity::Critical));
         assert!(AlertRouting::All.accepts(AlertSeverity::Recovery));
-        // `Critical` receives only firing alerts; a recovery is NOT delivered.
         assert!(AlertRouting::Critical.accepts(AlertSeverity::Critical));
         assert!(!AlertRouting::Critical.accepts(AlertSeverity::Recovery));
     }
@@ -2897,9 +2798,8 @@ mod tests {
 
     #[test]
     fn routing_from_str_matches_toml_spellings() {
-        // The env-override path parses via FromStr; it must accept exactly the
-        // same `all` / `critical` spellings the TOML/serde path does, and reject
-        // anything else (the env layer then logs+ignores, keeping the default).
+        // The env-override path parses via `FromStr` and must accept exactly the
+        // spellings serde accepts.
         assert_eq!("all".parse::<AlertRouting>(), Ok(AlertRouting::All));
         assert_eq!(
             "critical".parse::<AlertRouting>(),
@@ -2944,11 +2844,6 @@ mod tests {
     #[cfg(feature = "http-client")]
     #[test]
     fn pagerduty_custom_details_preserves_user_key_colliding_with_reserved_field() {
-        // A user detail keyed with a RESERVED standard-field name (`condition`,
-        // `where_to_look`, `detail`) must not silently clobber — nor be clobbered
-        // by — the authoritative standard field. The standard field keeps its
-        // canonical name (PagerDuty routing/correlation depends on it); the user's
-        // value is preserved under a `custom_`-prefixed key.
         let alert = Alert::trigger(AlertCondition::DeadLetteredJob, "dead_lettered_job:emailer")
             .title("Job 'emailer' was dead-lettered")
             .summary("exhausted retries")
@@ -2958,11 +2853,9 @@ mod tests {
             .build();
         let v = pagerduty_event_payload(&alert, "R0UT1NGKEY");
         let cd = &v["payload"]["custom_details"];
-        // Standard fields stay authoritative under their canonical names.
         assert_eq!(cd["condition"], "dead_lettered_job");
         assert_eq!(cd["where_to_look"], "/actuator/jobs");
         assert_eq!(cd["detail"], "exhausted retries");
-        // The colliding user values are preserved under `custom_<key>`.
         assert_eq!(cd["custom_condition"], "user-supplied-condition");
         assert_eq!(cd["custom_where_to_look"], "user-supplied-pointer");
         assert_eq!(cd["custom_detail"], "user-supplied-detail");
@@ -2979,9 +2872,9 @@ mod tests {
         .build();
         let v = pagerduty_event_payload(&alert, "R0UT1NGKEY");
         assert_eq!(v["event_action"], "resolve");
-        // Same dedup key as its trigger → the correlated incident auto-resolves.
+        // The trigger's dedup key, so PagerDuty resolves that incident.
         assert_eq!(v["dedup_key"], "scheduled_task_failure:backup");
-        // A resolve carries no payload block per the Events API v2 contract.
+        // The Events API v2 resolve carries no payload block.
         assert!(v.get("payload").is_none(), "resolve must omit payload: {v}");
     }
 
@@ -2996,7 +2889,7 @@ mod tests {
             .build();
         let v = slack_message_payload(&alert);
         let text = v["text"].as_str().expect("text field");
-        // #1610 required fields: what failed, when, host/replica, where to look.
+        // Required fields (#1610): what failed, when, host, where to look.
         assert!(text.contains("5xx error rate is 12.0%"), "title: {text}");
         assert!(text.contains(&alert.host), "host: {text}");
         assert!(text.contains("/actuator/metrics"), "where_to_look: {text}");
@@ -3098,11 +2991,8 @@ mod tests {
     #[cfg(feature = "http-client")]
     #[test]
     fn native_transports_reject_non_https_slack_and_discord() {
-        // Slack and Discord only expose https webhook endpoints, so a plaintext
-        // http:// URL will not deliver (and would transmit insecurely). The
-        // runtime must reject it — mirroring `autumn doctor` — and register no
-        // channel. Prevents a config doctor rejects from silently "passing" at
-        // runtime.
+        // Slack and Discord webhooks are https-only. The runtime rejects http as
+        // `autumn doctor` does.
         let slack = AlertConfig {
             slack_webhook_url: Some("http://hooks.slack.com/services/x".to_owned()),
             ..AlertConfig::default()
@@ -3119,7 +3009,6 @@ mod tests {
             channel_names(&discord).is_empty(),
             "a non-https discord_webhook_url must not register a Discord channel"
         );
-        // An absolute https URL is still accepted.
         let ok = AlertConfig {
             slack_webhook_url: Some("https://hooks.slack.com/services/x".to_owned()),
             ..AlertConfig::default()

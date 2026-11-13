@@ -1014,8 +1014,6 @@ pub(crate) fn cpu_since(mark: CpuMark) -> Duration {
     }
 }
 
-// Real wall time, not the injected clock: this measures how long a poll ran on
-// the CPU. The sim clock does not move during a poll, so it would read zero.
 #[allow(
     clippy::disallowed_methods,
     reason = "measures on-CPU poll time; the injected clock does not move during a poll"
@@ -1780,7 +1778,7 @@ mod tests {
         assert!(!is_deferrable(WorkKind::Job, "cost_unit_test_other"));
     }
 
-    // ── Background work (slice 2) ───────────────────────────────────
+    // ── Background work ─────────────────────────────────────────────
 
     fn us(micros: u64) -> Duration {
         Duration::from_micros(micros)

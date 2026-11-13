@@ -82,7 +82,7 @@ async fn inject_live_reload_into_response(response: Response<Body>) -> Response<
     }
 
     let (mut parts, body) = response.into_parts();
-    // Dev-only middleware wraps normal HTML page responses.
+    // Dev-only, and only HTML page bodies reach here, so an unbounded read is acceptable.
     let body = axum::body::to_bytes(body, usize::MAX)
         .await
         .expect("live reload middleware should only wrap infallible HTML bodies");
@@ -92,7 +92,6 @@ async fn inject_live_reload_into_response(response: Response<Body>) -> Response<
         return Response::from_parts(parts, Body::from(body));
     }
 
-    // Avoids heap allocation by using zero-cost numeric conversion
     parts
         .headers
         .insert(CONTENT_LENGTH, HeaderValue::from(updated.len()));
@@ -616,10 +615,8 @@ mod tests {
 
     #[test]
     fn injected_snippet_uses_external_src_no_inline_js() {
-        // The default Autumn CSP is `script-src 'self'` (no 'unsafe-inline'),
-        // so the injected snippet must be a plain external-src <script> tag
-        // with no inline JavaScript body — otherwise the browser will refuse
-        // to execute it and live reload silently breaks.
+        // The default CSP is `script-src 'self'` with no 'unsafe-inline', so an inline script
+        // body would be refused and live reload would silently break.
         let injected = inject_snippet(b"<html><body>ok</body></html>");
         let html = std::str::from_utf8(&injected).expect("utf-8 html");
 
@@ -629,7 +626,6 @@ mod tests {
             )),
             "expected external-src script tag, got: {html}"
         );
-        // None of the inline script body should leak into the HTML.
         assert!(
             !html.contains("setInterval"),
             "inline JS leaked into HTML: {html}"
@@ -659,8 +655,6 @@ mod tests {
             .await
             .expect("body bytes");
         let js = std::str::from_utf8(&body).expect("utf-8");
-        // Sanity-check: handler returns the real polling client, not the
-        // <script> wrapper tag.
         assert!(js.contains("fetch("), "expected polling client, got: {js}");
         assert!(
             !js.contains("<script"),
@@ -670,7 +664,7 @@ mod tests {
 
     #[test]
     fn inject_snippet_edge_cases() {
-        // Multiple </body> tags: Should insert before the *last* </body> tag.
+        // Multiple </body> tags: insert before the last one.
         let multi_body = inject_snippet(b"<html><body>text</body> <!-- </body> --> </html>");
         let multi_body_str = std::str::from_utf8(&multi_body).expect("utf-8");
         assert!(multi_body_str.ends_with("</script></body> --> </html>"));
@@ -688,7 +682,6 @@ mod tests {
         // Invalid UTF-8 sequence, but containing </body>.
         let invalid_utf8 = b"<html><body>\xFF\xFE</body></html>".to_vec();
         let invalid_result = inject_snippet(&invalid_utf8);
-        // String::from_utf8_lossy Replaces invalid bytes with U+FFFD.
         assert!(String::from_utf8_lossy(&invalid_result).contains("</script></body></html>"));
     }
 
@@ -707,8 +700,7 @@ mod tests {
 
     #[test]
     fn inject_snippet_edge_cases_case_insensitivity() {
-        // Our current implementation is case sensitive.
-        // If a user has upper case tags, we shouldn't fail or panic, we just won't inject.
+        // Matching is case-sensitive: uppercase tags get no injection, and no panic.
         let upper_body = inject_snippet(b"<HTML><BODY>ok</BODY></HTML>");
         let upper_result = std::str::from_utf8(&upper_body).expect("utf-8");
         assert_eq!(upper_result, "<HTML><BODY>ok</BODY></HTML>");
@@ -742,16 +734,14 @@ mod tests {
             .unwrap();
         let body_str = std::str::from_utf8(&body_bytes).unwrap();
 
-        // Assert valid JSON string containing expected structure
         assert!(body_str.contains(r#""version""#));
         assert!(body_str.contains(r#""kind""#));
     }
 
     #[tokio::test]
     async fn live_reload_state_handler_passes_build_error_through() {
-        // The state file may now carry a `build_error` object (written by the
-        // CLI on a failed rebuild). The handler must return it verbatim so the
-        // browser client can render the compile-error overlay.
+        // The CLI writes a `build_error` object on a failed rebuild; the browser client needs it
+        // verbatim to render the compile-error overlay.
         let tmp_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
         let content = r#"{"version":7,"kind":"full","build_error":{"stale":true,"diagnostics":[{"code":"E0425","message":"boom","file":"src/main.rs","line":3,"column":5,"rendered":"error[E0425]: boom"}]}}"#;
         std::fs::write(tmp_file.path(), content).expect("failed to write to temp file");
@@ -781,9 +771,7 @@ mod tests {
 
     #[test]
     fn live_reload_script_body_renders_build_error_overlay_safely() {
-        // The polling client must render a compile-error overlay when the state
-        // carries a `build_error`, escaping arbitrary compiler output via
-        // `textContent` (never `innerHTML`) to stay XSS-safe and CSP-clean.
+        // Compiler output is arbitrary text: it goes in via `textContent`, never `innerHTML`.
         let js = live_reload_script_body();
 
         assert!(
@@ -800,13 +788,10 @@ mod tests {
             "diagnostics must not be rendered via innerHTML"
         );
 
-        // CSP-safety: the overlay must style elements via CSSOM per-property
-        // assignments (`element.style.<prop> = value`), which are NOT governed
-        // by the CSP `style-src` directive. Literal `style` attributes,
-        // `cssText`, and `setAttribute("style", ...)` ARE blocked under a
-        // strict nonce-based `style-src 'self' 'nonce-...'` policy, so none of
-        // those may appear or the overlay renders unstyled on apps that enable
-        // `security.headers.csp_nonce`.
+        // CSSOM per-property assignments (`element.style.<prop> = value`) are not governed by
+        // CSP `style-src`. Style attributes, `cssText` and `setAttribute("style", ...)` are
+        // blocked under a nonce-based `style-src`, so with `security.headers.csp_nonce` they
+        // would leave the overlay unstyled.
         assert!(
             !js.contains(r#"setAttribute("style""#),
             "overlay must not set styles via a literal style attribute"
@@ -827,32 +812,20 @@ mod tests {
 
     #[test]
     fn live_reload_script_body_guards_overlay_rebuild_by_version() {
-        // The overlay must only be rebuilt when the build-error content changes.
-        // Because `renderBuildErrorOverlay` tears down and recreates the overlay
-        // DOM (resetting scroll position and clearing text selection) and the
-        // client polls every 700ms, an unchanged `state.version` must NOT
-        // trigger a rebuild — otherwise a developer can never read or copy a
-        // scrolling error list. The guard records the rendered version on the
-        // overlay element and compares it against `state.version` before
-        // re-rendering.
+        // A rebuild resets scroll and text selection, and the client polls every 700ms, so an
+        // unchanged `state.version` must not rebuild the overlay or the errors cannot be read.
         let js = live_reload_script_body();
 
-        // The rendered version is recorded on the overlay element's dataset so
-        // it survives across polls.
         assert!(
             js.contains("dataset.autumnBuildErrorVersion"),
             "overlay must record the rendered build-error version on its dataset"
         );
-        // The build_error branch compares the recorded version against the
-        // freshly polled `state.version` before rebuilding.
         assert!(
             js.contains(
                 "existingOverlay.dataset.autumnBuildErrorVersion === String(state.version)"
             ),
             "overlay rebuild must be guarded by a version comparison"
         );
-        // renderBuildErrorOverlay is still reachable for the first appearance
-        // and for genuinely new (version-bumped) failed builds.
         assert!(
             js.contains("renderBuildErrorOverlay(state.build_error)"),
             "overlay must still render on first appearance / new build"
@@ -861,9 +834,7 @@ mod tests {
 
     #[test]
     fn build_error_overlay_is_gated_behind_dev_env() {
-        // The live-reload client (and thus the compile-error overlay) is only
-        // mounted when BOTH dev-reload env vars are present. Without them the
-        // middleware is disabled and nothing is served.
+        // The client, and so the overlay, is served only when both dev-reload env vars are set.
         assert!(!is_enabled_with_env(&MockEnv::new()));
         assert!(!is_enabled_with_env(
             &MockEnv::new().with(DEV_RELOAD_ENV, "1")
@@ -874,7 +845,6 @@ mod tests {
             .with(DEV_RELOAD_STATE_ENV, "state.json");
         assert!(is_enabled_with_env(&enabled));
 
-        // When enabled, the served client carries the overlay logic.
         assert!(live_reload_script_body().contains("__autumn_build_error"));
     }
 

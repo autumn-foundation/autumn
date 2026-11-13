@@ -214,30 +214,22 @@ impl HttpPushTransport {
 impl PushTransport for HttpPushTransport {
     fn deliver<'a>(&'a self, request: &'a PushRequest) -> PushTransportFuture<'a> {
         Box::pin(async move {
-            // Every address the host resolves to, all of them already checked
-            // against the SSRF deny-list. Keeping the whole set matters: a
-            // dual-stack push service on a host with no working IPv6 route —
-            // or a CDN whose first answer is momentarily unreachable — would
-            // otherwise fail every push despite the endpoint being perfectly
-            // reachable on another address.
+            // Keep every checked address, not just the first: a dual-stack host
+            // with no working IPv6 route, or a CDN with one unreachable answer,
+            // would otherwise fail every push.
             let addrs = resolve_and_validate_endpoint(&request.endpoint).await?;
 
-            // Send one request over the whole checked set. reqwest tries the
-            // next address only when it cannot connect. It never retries after
-            // the body is sent, because a retry could show the notification
-            // twice.
+            // reqwest moves to the next address only when it cannot connect,
+            // never after the body is sent, so a notification is not shown twice.
             let mut builder = self
                 .client
                 .post(&request.endpoint)
-                // See the type docs: pin the checked addresses and refuse to
-                // follow a redirect, so neither DNS rebinding nor a `307`
-                // can steer this POST at an internal host.
+                // Pin the checked addresses and refuse redirects, so neither DNS
+                // rebinding nor a `307` can steer this POST at an internal host.
                 .pin_to_addrs(addrs)
                 .no_redirect()
-                // The endpoint host is client-chosen and this transport
-                // reads only the status. Without this, a registered
-                // endpoint that streams indefinitely costs one unbounded
-                // allocation per notification until the timeout fires.
+                // Only the status is read. The client-chosen host could
+                // otherwise stream an unbounded body per notification.
                 .discard_response_body();
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
@@ -417,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn the_http_transport_refuses_an_endpoint_resolving_to_a_blocked_address() {
         // `localhost` is a hostname, so the subscribe-time IP-literal rule
-        // cannot catch it — this is the layer that must.
+        // cannot catch it; this layer must.
         let err = resolve_and_validate_endpoint("https://localhost/push")
             .await
             .expect_err("a loopback-resolving host is refused");

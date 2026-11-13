@@ -215,7 +215,6 @@ impl<S> MaintenanceService<S> {
         req: &Request<B>,
         config: &MaintenanceConfig,
     ) -> Option<Response<Body>> {
-        // 1. Actuator/health routes and configured bypass paths always pass through.
         let path = req.uri().path();
         if health_prefix_matches(
             path,
@@ -242,7 +241,6 @@ impl<S> MaintenanceService<S> {
             }
         }
 
-        // 2. Bypass header.
         if let Some((header_name, expected_value)) = &config.bypass_header
             && let Some(val) = req.headers().get(header_name.as_str())
             && val.as_bytes() == expected_value.as_bytes()
@@ -250,7 +248,6 @@ impl<S> MaintenanceService<S> {
             return None;
         }
 
-        // 3. IP allow-list.
         if !config.allow_ips.is_empty()
             && let Some(client_ip) = extract_client_ip(req)
             && ip_in_allow_list(&client_ip, &config.allow_ips)
@@ -258,7 +255,6 @@ impl<S> MaintenanceService<S> {
             return None;
         }
 
-        // 4. Read-only mode: safe methods pass through.
         if config.readonly {
             let method = req.method();
             // The HTTP/2 `WebSocket` upgrade passes, like the `GET` upgrade.
@@ -339,15 +335,12 @@ where
 /// `X-Forwarded-For` / `X-Real-IP` headers are only consulted as a fallback
 /// when the layer is not installed (e.g. in tests).
 fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
-    // Resolved by TrustedProxiesLayer — respects the proxy trust policy.
     if let Some(identity) = req
         .extensions()
         .get::<crate::security::ResolvedClientIdentity>()
     {
         return identity.addr;
     }
-
-    // Fallback: raw headers (TrustedProxiesLayer not installed).
 
     // X-Forwarded-For: <client>, <proxy1>, <proxy2>
     if let Some(xff) = req.headers().get("x-forwarded-for")
@@ -358,7 +351,6 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
         return Some(ip);
     }
 
-    // X-Real-Ip (set by nginx)
     if let Some(xri) = req.headers().get("x-real-ip")
         && let Ok(s) = xri.to_str()
         && let Ok(ip) = s.trim().parse::<IpAddr>()
@@ -366,7 +358,6 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
         return Some(ip);
     }
 
-    // SocketAddr extension set by Axum's ConnectInfo
     req.extensions()
         .get::<std::net::SocketAddr>()
         .map(std::net::SocketAddr::ip)
@@ -427,7 +418,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
-    use tower::ServiceExt; // for oneshot
+    use tower::ServiceExt;
 
     fn make_app(state: MaintenanceState) -> Router {
         Router::new()
@@ -748,18 +739,15 @@ mod tests {
         use std::net::IpAddr;
 
         let state = MaintenanceState::new();
-        // Only 10.x.x.x is allowed.
         state.enable(MaintenanceConfig {
             allow_ips: vec!["10.0.0.0/8".into()],
             ..Default::default()
         });
 
-        // The resolved identity (from TrustedProxiesLayer) says the real client
-        // is 192.168.1.5 — not in the allow list.
+        // The resolved client is outside the allow list; the forged XFF value is inside it.
         let real_ip: IpAddr = "192.168.1.5".parse().unwrap();
         let mut req = Request::builder()
             .uri("/")
-            // Attacker forges an allowed IP in XFF.
             .header("X-Forwarded-For", "10.0.0.1")
             .body(Body::empty())
             .unwrap();
@@ -774,7 +762,6 @@ mod tests {
             .layer(MaintenanceLayer::new(state));
 
         let resp = app.oneshot(req).await.unwrap();
-        // Must be blocked: resolved IP (192.168.1.5) is not in the allow list.
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -842,7 +829,6 @@ mod tests {
             .await
             .unwrap();
 
-        // HEAD returns 200 (no body)
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -853,8 +839,7 @@ mod tests {
         let state = MaintenanceState::new();
         let layer = MaintenanceLayer::new(state.clone());
 
-        // The cloned layer wraps the same underlying Arc, so enabling
-        // maintenance through `state` is visible through the clone.
+        // The clone shares the state's Arc, so enabling through `state` reaches it.
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
             .layer(layer.clone());

@@ -119,12 +119,10 @@ const PATH_BINARY_NAMES: &[&str] = &[
 pub fn browser_candidates() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    // 1. Explicit override.
     if let Ok(p) = std::env::var("AUTUMN_CHROMIUM") {
         candidates.push(PathBuf::from(p));
     }
 
-    // 2. Playwright browsers directory.
     if let Ok(base) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
         let base = PathBuf::from(base);
         if let Ok(entries) = std::fs::read_dir(&base) {
@@ -152,16 +150,13 @@ pub fn browser_candidates() -> Vec<PathBuf> {
         }
     }
 
-    // 3. PATH-based lookup — covers CI setups like browser-actions/setup-chrome
-    //    that install a `chrome` or `google-chrome` binary on PATH rather than
-    //    at a well-known fixed location.
+    // PATH covers CI setup actions that install `chrome` there rather than at a fixed location.
     candidates.extend(path_candidates(std::env::var_os("PATH").as_deref()));
 
-    // 4. Well-known system paths.
     candidates.extend(well_known_paths());
 
-    // A duplicate can only waste a probe and clutter the searched-paths list
-    // in the not-found error (duplicate PATH entries are common).
+    // Duplicate PATH entries are common; each would waste a probe and clutter the not-found
+    // error's searched-paths list.
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|p| seen.insert(p.clone()));
 
@@ -186,9 +181,8 @@ fn path_candidates(path_var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
 
     let mut found = Vec::new();
     for name in PATH_BINARY_NAMES {
-        // `Path::is_file` stats the literal path and does *not* apply
-        // Windows' PATHEXT resolution, so a bare `chrome` never matches
-        // `chrome.exe`. Ask for the name Windows actually stores on disk.
+        // `Path::is_file` does not apply Windows' PATHEXT, so a bare `chrome` never matches
+        // `chrome.exe`.
         let file_name = if cfg!(target_os = "windows") {
             format!("{name}.exe")
         } else {
@@ -206,11 +200,8 @@ fn path_candidates(path_var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
 /// Per-platform install locations, checked after `PATH`.
 fn well_known_paths() -> Vec<PathBuf> {
     if cfg!(target_os = "windows") {
-        // Chrome installs under `%ProgramFiles%` / `%ProgramFiles(x86)%` for a
-        // machine-wide install and `%LOCALAPPDATA%` for the (very common)
-        // per-user one. Read the variables rather than hard-coding `C:\` —
-        // the system drive is not always `C:`, and the 32-bit variable name
-        // contains parentheses, so it must be fetched by name.
+        // Machine-wide installs live under `%ProgramFiles%`/`%ProgramFiles(x86)%`, per-user ones
+        // under `%LOCALAPPDATA%`. Read the variables: the system drive is not always `C:`.
         ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
             .iter()
             .filter_map(std::env::var_os)
@@ -365,9 +356,8 @@ fn version_from_probe(probe: &VersionProbe) -> Option<String> {
     match probe {
         VersionProbe::Ran(stdout) => {
             let trimmed = stdout.trim();
-            // Exiting 0 is the usability signal; the text is a bonus. A
-            // launcher shim that prints its version to stderr (or nothing at
-            // all) is still a browser we can drive.
+            // Exiting 0 is the usability signal. A launcher shim that prints its version to
+            // stderr, or nothing, is still a browser we can drive.
             Some(if trimmed.is_empty() {
                 UNKNOWN_VERSION.to_owned()
             } else {
@@ -399,8 +389,6 @@ pub fn probe_version(path: &Path) -> Option<String> {
     version_from_probe(&run_version_probe(path))
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,10 +419,8 @@ mod tests {
 
     #[test]
     fn path_scan_keeps_every_match_not_just_the_first() {
-        // A stale, non-executable `chrome` early in PATH must not mask a
-        // working one installed later (e.g. by a CI setup action): existence
-        // is not usability, and `probe_version` — not this scan — is what
-        // decides. Both must survive into the candidate list, in PATH order.
+        // A stale `chrome` early in PATH must not mask a working one later: `probe_version`, not
+        // this scan, decides usability.
         let base = std::env::temp_dir().join(format!(
             "autumn-path-scan-{}-{}",
             std::process::id(),
@@ -484,9 +470,7 @@ mod tests {
 
     #[test]
     fn well_known_paths_target_the_host_platform() {
-        // #1456: the well-known list was Linux + macOS only, so a Windows host
-        // with a stock Chrome install reached no candidate at all and the
-        // version-probe fix downstream of it could never help.
+        // #1456: a stock Windows Chrome install must be reachable.
         let paths: Vec<String> = well_known_paths()
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
@@ -556,9 +540,7 @@ mod tests {
 
     #[test]
     fn version_from_probe_accepts_a_binary_that_exits_zero_without_output() {
-        // A launcher shim may print its version to stderr or not at all.
-        // Exiting 0 is the usability signal, and rejecting these would have
-        // regressed hosts that worked before #1456.
+        // A launcher shim may print its version to stderr or not at all; exiting 0 is enough.
         for stdout in ["", "   \r\n"] {
             assert_eq!(
                 version_from_probe(&VersionProbe::Ran(stdout.to_owned())),
@@ -581,10 +563,8 @@ mod tests {
 
     #[test]
     fn version_from_probe_rejects_a_failed_probe() {
-        // Spawn failure or a non-zero exit means the candidate is unusable.
-        // It must keep failing so the search falls through to the next
-        // candidate and, if none work, the caller still gets the
-        // searched-paths error with its remediation hint.
+        // A failed probe must fall through to the next candidate, and finally to the
+        // searched-paths error.
         assert_eq!(
             version_from_probe(&VersionProbe::Failed),
             None,
@@ -595,10 +575,8 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn the_probe_actually_passes_its_arguments_to_the_process() {
-        // The pure functions above cover the decisions; this covers the
-        // wiring. `echo` prints back whatever argv it received, so a
-        // successful probe whose "version" is our own flags proves both
-        // `--version` and the isolating `--user-data-dir` reached the child.
+        // `echo` prints back its argv, so the reported "version" shows which flags reached the
+        // child.
         let echo = ["/bin/echo", "/usr/bin/echo"]
             .into_iter()
             .map(Path::new)
@@ -640,10 +618,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_accepts_an_existing_exe_without_running_it() {
-        // A file that exists and is named like Chrome must resolve without
-        // being executed — running the candidate is exactly what #1456 says
-        // not to do on Windows. The file's *contents* are irrelevant here,
-        // which is the point: we never launch it.
+        // On Windows a candidate is never executed (#1456), so a non-binary file named like Chrome
+        // resolves.
         let dir = std::env::temp_dir().join("autumn-browser-detect-test");
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let fake_chrome = dir.join("chrome.exe");
@@ -699,9 +675,7 @@ mod tests {
         }
 
         for not_a_browser in [
-            // Right extension, wrong program. Accepting this would end
-            // discovery at a stale/mistyped override and hide an installed
-            // Chrome further down the candidate list.
+            // Right extension, wrong program: accepting it would hide a real Chrome further down.
             "notepad.exe",
             r"C:\Windows\System32\cmd.exe",
             // Right name, not an executable.

@@ -146,12 +146,9 @@ pub fn build_provenance() -> BuildProvenance {
 mod tests {
     use super::*;
 
-    // These tests share one process-global `OnceLock`; keep them read-only
-    // about global state except the single canonical set below. To avoid
-    // cross-test ordering issues we exercise the pure mapping via a helper that
-    // does not touch the global.
+    // `build_provenance` reads a process-global `OnceLock`, so tests exercise this copy of its
+    // mapping, which takes the context directly and avoids cross-test ordering issues.
     fn map(ctx: &BuildContext) -> BuildProvenance {
-        // Mirror of `build_provenance` for a supplied context (no global).
         let non_empty = |value: Option<&'static str>| {
             value
                 .map(str::trim)
@@ -217,7 +214,6 @@ mod tests {
         assert_eq!(p.git.commit, None);
         assert_eq!(p.git.commit_short, None);
         assert_eq!(p.git.dirty, None);
-        // Serializes git fields as JSON null.
         let json = serde_json::to_value(&p).unwrap();
         assert!(json["git"]["commit"].is_null());
         assert!(json["git"]["dirty"].is_null());

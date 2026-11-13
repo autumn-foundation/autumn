@@ -214,10 +214,8 @@ impl SandboxedPlugin {
     #[must_use]
     pub fn new(host: SandboxHost) -> Self {
         let permits = Arc::new(Semaphore::new(host.manifest().limits.max_concurrency));
-        // The rate limiter is built here rather than by the caller, and from
-        // the manifest rather than from a parameter, so a plugin that names a
-        // `calls_per_second` on its consent screen is limited by it whether or
-        // not whoever mounted it remembered to say so.
+        // Built from the manifest, not a caller parameter, so the `calls_per_second` on the consent
+        // screen always applies.
         let services = CapabilityServices {
             rate: Some(Arc::new(CapabilityRateLimiter::new(
                 host.manifest().quotas.calls_per_second,
@@ -296,9 +294,8 @@ impl SandboxedPlugin {
     /// Returns [`SandboxPluginError::Load`] if the module does not compile or
     /// imports something the sandbox does not provide.
     pub fn from_artifact(artifact: &SandboxArtifact) -> Result<Self, SandboxPluginError> {
-        // The whole container, not just the module: the grant an operator
-        // reviewed is in the manifest, and the module digest does not move when
-        // that does. See `SandboxArtifact::artifact_digest`.
+        // The whole container, not just the module: the reviewed grant is in the manifest, which
+        // the module digest does not cover. See `SandboxArtifact::artifact_digest`.
         let digest = artifact.artifact_digest()?;
         let mut plugin = Self::new(SandboxHost::load(artifact)?);
         plugin.artifact_sha256 = Some(digest);
@@ -340,17 +337,14 @@ impl SandboxedPlugin {
     /// Log the capability grant. `generation` is 0 for a boot-time mount.
     pub(super) fn log_grant(&self, message: &str, generation: u64) {
         let manifest = self.manifest();
-        // The grant reaches the operator's log before the plugin serves its
-        // first request, so "what did we agree to run" is answerable from a
-        // production log alone, without the artifact in hand.
+        // Logged before the first request, so the production log alone shows what was agreed to.
         tracing::info!(
             plugin = manifest.name,
             version = manifest.version,
             prefix = manifest.prefix,
             module_sha256 = manifest.sha256,
-            // The number to compare against the one `plugin inspect` printed:
-            // it covers the manifest too, so a grant rewritten after review
-            // does not match a log line from before it.
+            // Compare with `plugin inspect`. It covers the manifest too, so a grant rewritten
+            // after review does not match.
             artifact_sha256 = self
                 .artifact_sha256
                 .as_deref()
@@ -407,7 +401,7 @@ impl SandboxedPlugin {
             return None;
         };
         let services = CapabilityServices {
-            // Read here rather than in the closure; see the note in `serve`.
+            // Read here, not in the closure: see `serve`.
             tenant: crate::tenancy::CURRENT_TENANT
                 .try_with(Clone::clone)
                 .ok()
@@ -418,23 +412,14 @@ impl SandboxedPlugin {
         let ingest_log = Arc::clone(&self.activity);
         let ingest_plugin = plugin.clone();
         let slot_owned = slot.to_owned();
-        // Bounded before it is cloned onto the worker. The context is the
-        // *host's* — a handler builds it — but "the host built it" is not the
-        // same as "the host chose its size": it is routinely assembled from a
-        // row, a query string or a form, and none of it appears in the
-        // per-request footprint `max_concurrency` is validated against. An
-        // unbounded `to_vec` duplicates every string of it per render, at every
-        // concurrent render at once. Truncated rather than refused: a fragment
-        // rendered with fewer context entries is a panel missing a value, and a
-        // page losing its panel over a caller's mistake is the outcome this
-        // whole path exists to avoid.
+        // Bounded before it is cloned onto the worker. The host builds the context, often from a
+        // row, query string or form, and it is not in the footprint `max_concurrency` is validated
+        // against. Truncated rather than refused: a missing value beats a missing panel.
         let context = super::host::bounded_context(context);
         let outcome = crate::time::spawn_blocking(move || {
             let outcome = host.render(&slot_owned, &context, services);
-            // Inside the closure for the same reason as `serve`: a reader who
-            // navigates away drops this future and its join handle while the
-            // blocking task runs on, and recording after the `.await` lost the
-            // whole record of what the hook did.
+            // Inside the closure, as in `serve`: a reader who navigates away drops the join handle
+            // while the blocking task runs on, and the record would be lost after the `.await`.
             ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
             if let Some(dropped) = outcome.dropped_calls {
                 ingest_log.ingest_dropped_calls(&ingest_plugin, dropped);
@@ -457,7 +442,6 @@ impl SandboxedPlugin {
                 return None;
             }
         };
-        // Already ingested inside the blocking task above.
         match outcome.fragment {
             Ok(fragment) => Some(fragment),
             Err(failure) => {
@@ -505,19 +489,16 @@ impl SandboxedPlugin {
         let mut router = axum::Router::new();
         for route in &manifest.routes {
             let nested = nested_path(&route.path, &manifest.prefix);
-            // A declared HEAD on the same path mounts itself; adding the
-            // implied one here as well would be an overlapping method route,
-            // which axum refuses by panicking as the router is built.
+            // A declared HEAD on the same path mounts itself. Implying another would overlap, and
+            // axum panics on overlapping method routes when the router is built.
             let implies_head = route.method == "GET"
                 && !manifest
                     .routes
                     .iter()
                     .any(|other| other.method == "HEAD" && other.path == route.path);
             let Some(filter) = method_filter(&route.method, implies_head) else {
-                // `SandboxManifest` validation already refused every method
-                // outside the allowed set, so this is unreachable in practice.
-                // Skipping rather than panicking keeps a future manifest
-                // vocabulary from turning into a boot crash.
+                // Unreachable: manifest validation refuses other methods. Skip rather than panic so
+                // a future manifest vocabulary cannot crash boot.
                 tracing::error!(
                     plugin = manifest.name,
                     method = route.method,
@@ -648,9 +629,8 @@ async fn serve_inner(
     let limits = manifest.limits;
     let plugin = manifest.name.clone();
 
-    // Refuse rather than queue. An unbounded queue in front of a bounded
-    // interpreter converts a slow plugin into unbounded host memory; a 503 with
-    // `Retry-After` says exactly what happened and costs nothing to produce.
+    // Refuse rather than queue: a queue in front of a bounded interpreter turns a slow plugin
+    // into unbounded host memory.
     let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
         tracing::warn!(
             plugin,
@@ -669,9 +649,8 @@ async fn serve_inner(
         Err(response) => return *response,
     };
 
-    // Taken after the body is read, so a slow client holds no slot. Held,
-    // like the plugin's permit, inside the blocking task. See
-    // `DEFAULT_GUEST_SLOTS`.
+    // Taken after the body is read, so a slow client holds no slot. Like the permit, it is held
+    // inside the blocking task. See `DEFAULT_GUEST_SLOTS`.
     let Ok(slot) = guest_slots.try_acquire_owned() else {
         tracing::warn!(
             plugin,
@@ -684,27 +663,12 @@ async fn serve_inner(
         return response;
     };
 
-    // `wasmi` is a synchronous interpreter: running it on the async runtime
-    // would block a worker for the whole fuel budget. `spawn_blocking` also
-    // means a panic anywhere in the host shim surfaces as a `JoinError` here
-    // instead of unwinding through the request task.
-    //
-    // The permit moves INTO the closure. A `spawn_blocking` task is never
-    // cancelled — dropping its handle detaches it — so a permit held by this
-    // future would be released the instant a client disconnects while the
-    // interpreter kept running. `max_concurrency` would then bound nothing: a
-    // client that connects and immediately resets, in a loop, would fill the
-    // shared blocking pool with interpreters nobody is waiting for.
-    // Captured before the request is handed to the interpreter: the response
-    // path needs to know a HEAD was asked for, and `request` moves.
+    // Captured now: the response path must know a HEAD was asked for, and `request` moves into
+    // the interpreter below.
     let request_method_is_head = request.method.eq_ignore_ascii_case("HEAD");
 
-    // Read here, not inside the closure. `CURRENT_TENANT` is a task-local
-    // scoped by the tenancy middleware around *this* task; a `spawn_blocking`
-    // closure runs on a different thread with no task-local at all, so a
-    // capability resolved in there would silently be the single-tenant
-    // namespace for every tenant at once — the exact failure this whole
-    // subsystem exists to make impossible.
+    // Read here, not inside the closure. `CURRENT_TENANT` is a task-local of this task; the
+    // `spawn_blocking` thread has none, so every tenant would share the single-tenant namespace.
     let services = CapabilityServices {
         tenant: crate::tenancy::CURRENT_TENANT
             .try_with(Clone::clone)
@@ -713,17 +677,16 @@ async fn serve_inner(
         ..services
     };
 
-    // The permit still moves INTO the closure — a detached `spawn_blocking`
-    // task must not outlive it — but it comes back out so the response body can
-    // keep holding it while hyper delivers the bytes.
+    // `wasmi` is synchronous, so it runs on a blocking worker; a panic in the host shim then
+    // surfaces as a `JoinError` instead of unwinding through the request task.
     //
-    // The activity is ingested in *here*, before the closure returns, and not
-    // after the `.await`. A client that disconnects drops this future and its
-    // join handle, and the blocking closure keeps running to completion — it
-    // has already been admitted and holds a permit. Recording afterwards meant
-    // the outcome of an abandoned request was dropped with the handle, so every
-    // capability call it made became invisible to the operator. The one request
-    // whose record is most worth having is the one nobody waited for.
+    // The permit moves into the closure: a `spawn_blocking` task is never cancelled, so a permit
+    // held by this future would be released on client disconnect while the interpreter kept
+    // running, and `max_concurrency` would bound nothing. It comes back out so the response body
+    // holds it while hyper delivers the bytes.
+    //
+    // Activity is ingested inside the closure, not after the `.await`: a disconnecting client
+    // drops the join handle, and the abandoned request's capability calls would go unrecorded.
     let ingest_log = Arc::clone(&activity);
     let ingest_plugin = plugin.clone();
     let outcome = crate::time::spawn_blocking(move || {
@@ -749,31 +712,17 @@ async fn serve_inner(
         }
     };
 
-    // Already ingested inside the blocking task above, so that a request whose
-    // client walked away still leaves the record of what it did — a plugin
-    // whose denials are the reason it failed is exactly the one an operator
-    // will ask about.
-
     match outcome.result {
         Ok(response) => {
             let built = build_response(&plugin, &response, permit);
-            // Naming HEAD in the method filter is deliberate (see
-            // `method_filter`), but it costs axum's GET-to-HEAD fallback, and
-            // that fallback is what discards the body. Without this, a HEAD
-            // gets the whole GET payload — against both the documented
-            // behaviour and HTTP itself.
+            // Naming HEAD in the method filter (see `method_filter`) loses axum's GET-to-HEAD
+            // fallback, which is what discards the body, so do it here.
             //
-            // The bodyless statuses go the same way. RFC 9110 forbids content
-            // on 204, 205 and 304, and hyper drops it on the way out — but only
-            // on the way out. `mounted_router` is public, so middleware and an
-            // embedder see this `Response` itself, and there they would see
-            // payload bytes on a status that cannot carry them. Discarding here
-            // rather than refusing keeps it consistent with the HEAD case and
-            // with what the wire would have done anyway.
+            // RFC 9110 forbids content on 204, 205 and 304. Hyper drops it on the way out, but
+            // `mounted_router` is public, so middleware and embedders see this `Response` itself.
             //
-            // Dropping the body drops its share of the permit, not the permit:
-            // the other share rides in the extensions, which `into_parts`
-            // carries over, so the slot still lasts as long as the response.
+            // The extensions keep their share of the permit, so the slot lasts as long as the
+            // response.
             discard_body_if_it_cannot_be_sent(built, request_method_is_head)
         }
         Err(failure) => {
@@ -832,20 +781,15 @@ async fn read_request(
     request: axum::extract::Request,
 ) -> Result<SandboxRequest, Box<Response>> {
     let (parts, body) = request.into_parts();
-    // The nested router rewrote the URI, so the concrete path the caller asked
-    // for comes from the original.
+    // The nested router rewrote the URI; the caller's path comes from the original.
     let path_str = parts
         .extensions
         .get::<axum::extract::OriginalUri>()
         .map_or_else(|| parts.uri.path(), |original| original.0.path());
     let query_str = parts.uri.query().unwrap_or_default();
 
-    // Everything the frame will carry except the headers, measured on the
-    // borrowed values. Headers got this treatment first; the rest of the
-    // metadata is the same argument and was left cloning unconditionally — an
-    // in-process caller could hand `mounted_router` a megabyte of query string
-    // and have it duplicated, and held for the whole body-read deadline, before
-    // the ceiling that exists to refuse it ever ran.
+    // Everything but the headers, measured on the borrowed values so an oversized query string is
+    // refused before it is cloned and held through the body-read deadline.
     let mut metadata = 0usize;
     charge_metadata(
         plugin,
@@ -872,23 +816,13 @@ async fn read_request(
         .iter()
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
-    // Charged as they are read, and refused before the next one is cloned. The
-    // ceiling used to be applied inside `run`, which is after every header has
-    // already been copied into owned strings — so an oversized set forced the
-    // duplicate allocation the ceiling exists to prevent, and then held it for
-    // the whole body-read deadline before being told no. The cost per pair comes
-    // from the same function the ceiling counts with, so the two agree.
+    // Charged as read and refused before the next one is cloned. The per-pair cost uses the same
+    // function as the ceiling in `run`, so the two agree.
     let mut headers: Vec<(String, String)> = Vec::new();
     for (name, value) in &parts.headers {
-        // A dropped header is charged for its entry but not its contents.
-        // `HostFrame::request` drops everything outside this allowlist, so
-        // counting the rest measured bytes no guest will ever see: a request
-        // carrying 256 KiB of `Cookie` — headers this sandbox promises to
-        // withhold silently — would be refused outright, turning a
-        // confidentiality guarantee into an availability one. But skipping it
-        // free leaves the *count* unbounded, and the count is what this loop
-        // and the two walks inside `run` each pay per entry. See
-        // `DROPPED_PAIR_BYTES`.
+        // A dropped header is charged for its entry, not its contents: the guest never sees it,
+        // and a large `Cookie` must not get the request refused. Charging nothing would leave the
+        // entry count unbounded, which this loop and `run` pay for. See `DROPPED_PAIR_BYTES`.
         if !super::wire::request_header_allowed(name.as_str()) {
             charge_metadata(
                 plugin,
@@ -910,14 +844,10 @@ async fn read_request(
         headers.push((name.as_str().to_owned(), value.to_owned()));
     }
 
-    // The ceiling is applied while reading, so an oversized body is refused
-    // without ever being buffered in full — and the *wait* is bounded too. The
-    // permit is already held at this point, deliberately: that is what makes the
-    // declared footprint a bound on the whole request rather than on the part a
-    // guest is running. The cost of that choice is that a client dribbling a
-    // body could otherwise hold a permit forever without starting a guest, so
-    // the read gets a deadline. Unlike the interpreter, an async body read is
-    // genuinely cancellable, so this is a real bound rather than a hopeful one.
+    // The ceiling applies while reading, so an oversized body is never buffered in full. The
+    // permit is already held, so the declared footprint bounds the whole request; the deadline
+    // stops a dribbling client from holding it forever. An async read is cancellable, unlike the
+    // interpreter.
     let deadline = std::time::Duration::from_millis(limits.request_body_timeout_ms);
     let read = tokio::time::timeout(
         deadline,
@@ -1057,8 +987,7 @@ fn build_response(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let Ok(status) = StatusCode::from_u16(response.status) else {
-        // `SandboxResponse::validate` already refused anything outside the HTTP
-        // range, so this cannot happen; refusing again is cheaper than trusting.
+        // Unreachable: `SandboxResponse::validate` refuses statuses outside the HTTP range.
         return sandbox_error(plugin, StatusCode::BAD_GATEWAY);
     };
 
@@ -1077,17 +1006,11 @@ fn build_response(
         out = out.header(name, value);
     }
     if !saw_content_type {
-        // A body with no declared type is a body a browser will guess at.
-        // Guessing is how a plugin that can only return bytes turns into one
-        // that can return a script.
+        // Without a type a browser sniffs the body, which can turn plugin bytes into a script.
         out = out.header(http::header::CONTENT_TYPE, "application/octet-stream");
     }
-    // The permit rides *inside* the buffer, not alongside the body that carries
-    // it: hyper may hold these bytes long after `run` returned, and it holds
-    // them by `Bytes` rather than by the body they came out of.
-    //
-    // It rides in the response's extensions too, because the headers are
-    // charged against the same ceiling and are not dropped with the bytes. See
+    // The permit rides inside the buffer: hyper may hold the `Bytes` long after the body is gone.
+    // It also rides in the extensions, because headers count against the same ceiling. See
     // [`PermitShare`].
     let permit: PermitShare = Arc::new(permit);
     let body = Body::from(bytes::Bytes::from_owner(PermitBuf {
@@ -1193,8 +1116,8 @@ sha256 = "{digest}"
             .expect("the manifest limiter is always built")
             .per_second();
 
-        // Looser than the manifest: taken, this would let the plugin exceed the
-        // `calls_per_second` the operator approved on the consent screen.
+        // Looser than the manifest: ignored, or the plugin could exceed the approved
+        // `calls_per_second`.
         let looser = plugin.clone().with_services(CapabilityServices {
             rate: Some(Arc::new(CapabilityRateLimiter::new(
                 approved.saturating_mul(10).max(approved + 1),
@@ -1212,8 +1135,7 @@ sha256 = "{digest}"
             "a looser limiter must be ignored and the manifest's kept"
         );
 
-        // At or below it: taken, because sharing limiting state across
-        // instances is what the parameter is for.
+        // At or below it: used, so limiting state can be shared across instances.
         let shared = Arc::new(CapabilityRateLimiter::new(approved));
         let tighter = plugin.with_services(CapabilityServices {
             rate: Some(Arc::clone(&shared)),
@@ -1276,9 +1198,7 @@ sha256 = "{digest}"
 
     #[tokio::test]
     async fn the_manifest_is_the_mount_not_a_description_of_it() {
-        // An undeclared path under the prefix is a 404 from the *host*: the
-        // guest is never started, so the manifest bounds what the artifact can
-        // serve rather than merely documenting it.
+        // An undeclared path is a 404 from the host; the guest never starts.
         let plugin = hello_plugin();
         let (status, _) = send(app(&plugin), "GET", "/hello/undeclared").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1288,9 +1208,7 @@ sha256 = "{digest}"
 
     #[tokio::test]
     async fn a_head_on_a_declared_get_reaches_the_guest_rather_than_axum_s_405() {
-        // axum's method router dispatches a HEAD with no HEAD route to the GET
-        // one (`call!(req, HEAD, get)`), which is what HTTP requires — so the
-        // guest really does see `method: "HEAD"`, and the manifest says so.
+        // A GET route also serves HEAD, and the guest sees `method: "HEAD"`.
         let plugin = hello_plugin();
         let request = Request::builder()
             .method("HEAD")
@@ -1298,9 +1216,8 @@ sha256 = "{digest}"
             .body(Body::empty())
             .expect("request");
         let response = app(&plugin).oneshot(request).await.expect("infallible");
-        // This fixture answers 405 for anything but GET — which is the point:
-        // the *guest* decided, so the request crossed the boundary. axum's own
-        // 405 would carry no attribution.
+        // This fixture answers 405 to anything but GET. The attribution header proves the guest
+        // answered, not axum.
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert!(
             response.headers().contains_key(SANDBOX_ATTRIBUTION_HEADER),
@@ -1310,11 +1227,8 @@ sha256 = "{digest}"
 
     #[tokio::test]
     async fn a_manifest_declaring_both_get_and_head_still_mounts() {
-        // Mounting GET as `GET | HEAD` and then mounting the declared HEAD on
-        // the same path is an overlapping method route, which axum refuses by
-        // panicking while the router is built — a valid manifest taking the
-        // application down at boot, which is the one thing this lane must never
-        // do.
+        // Implying HEAD on the GET as well as mounting the declared HEAD would overlap, and axum
+        // panics on that at router build.
         let plugin = plugin_from(
             guests::HELLO,
             "[[routes]]\nmethod = \"GET\"\npath = \"/hello/greet\"\n\n\
@@ -1381,7 +1295,7 @@ sha256 = "{digest}"
         let app = app(&plugin);
         let (status, _) = send(app.clone(), "GET", "/hello/greet").await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        // The process is still here, and so is every other route.
+        // The process survives, and so does every other route.
         let (status, _) = send(app, "GET", "/healthz").await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -1426,7 +1340,7 @@ sha256 = "{digest}"
                 ..ResourceLimits::default()
             },
         );
-        // Hold the plugin's only permit, exactly as an in-flight request would.
+        // Hold the only permit, as an in-flight request would.
         let held = std::sync::Arc::clone(&plugin.permits)
             .try_acquire_owned()
             .expect("the first permit is free");
@@ -1467,7 +1381,7 @@ sha256 = "{digest}"
 
     #[test]
     fn the_public_setter_refuses_bad_limits_and_leaves_the_pool_alone() {
-        // Refused before the process-wide cell is touched.
+        // Refused before the process-wide cell is set.
         assert_eq!(set_guest_slots(0), Err(0));
         assert_eq!(set_guest_slots(usize::MAX), Err(0));
     }
@@ -1506,10 +1420,6 @@ sha256 = "{digest}"
 
     #[tokio::test(start_paused = true)]
     async fn a_body_that_never_arrives_does_not_pin_a_permit_forever() {
-        // The permit is held from admission, which is what makes the declared
-        // footprint a bound on the whole request. The cost of that is a client
-        // dribbling a body, so the read has a deadline — and unlike the
-        // interpreter, an async body read is genuinely cancellable.
         let plugin = plugin_from(
             guests::HELLO,
             "[[routes]]\nmethod = \"POST\"\npath = \"/hello/greet\"\n",
@@ -1525,9 +1435,7 @@ sha256 = "{digest}"
         let (status, _) = send_with_body(app(&plugin), "POST", "/hello/greet", stalled).await;
         assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
 
-        // …and the permit came back: the next request reaches the guest, which
-        // answers 405 because this fixture only handles GET. Any guest-produced
-        // answer proves the point — a pinned permit would have been a 503.
+        // The permit came back: the guest answers (405, it only handles GET) instead of a 503.
         let (status, _) =
             send_with_body(app(&plugin), "POST", "/hello/greet", Body::from("hi")).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
@@ -1535,17 +1443,9 @@ sha256 = "{digest}"
 
     #[tokio::test]
     async fn an_empty_answer_returns_its_slot_on_drop_without_being_polled() {
-        // Release must not ride on `poll_frame` reaching the end of the stream:
-        // a body that is *already* ended need never be polled at all — a
-        // consumer is entitled to read `is_end_stream` and stop there. Every
-        // 204, and every empty error page a guest returns, takes that path.
-        //
-        // This test used to assert that such an answer held no slot at all,
-        // which was the defect rather than the design: header bytes are charged
-        // against the same response ceiling as body bytes, so "empty body" does
-        // not mean "occupies nothing". The slot is now held until the response
-        // is dropped, and — the part that still matters here — it comes back
-        // then without anything having polled the body.
+        // A body that is already ended may never be polled: a consumer can read `is_end_stream`
+        // and stop. Release must not depend on `poll_frame`. The slot is held until the response
+        // drops, because headers count against the same ceiling as the body.
         use crate::plugin_sandbox::wire::SandboxResponse;
 
         let permits = Arc::new(Semaphore::new(1));
@@ -1575,9 +1475,7 @@ sha256 = "{digest}"
             "the slot must come back on drop, with no poll anywhere",
         );
 
-        // The converse, so the assertion above is about the response being gone
-        // and not about the permit having been dropped on the floor: bytes still
-        // resident do hold a slot, until they are.
+        // The converse: resident bytes hold the slot, so the assertion above is about the drop.
         let full = SandboxResponse {
             status: 200,
             headers: Vec::new(),
@@ -1599,15 +1497,8 @@ sha256 = "{digest}"
 
     #[tokio::test]
     async fn a_bodyless_status_carries_no_body_to_an_in_process_caller() {
-        // RFC 9110 forbids content on 204, 205 and 304. Hyper drops it on the
-        // way out, so on a network connection this is invisible — but
-        // `mounted_router` is public, and middleware or an embedder reads this
-        // `Response` directly. There, payload bytes on a status that cannot
-        // carry them are bytes a consumer may well act on.
-        //
-        // The permit is the reason to be careful here rather than just correct:
-        // discarding the body drops its share of the slot, so this also pins
-        // that the extensions share is what keeps the accounting honest.
+        // RFC 9110 forbids content on 204, 205 and 304. Hyper drops it on the wire, but
+        // middleware and embedders of the public `mounted_router` read this `Response` directly.
         use crate::plugin_sandbox::wire::SandboxResponse;
         use http_body_util::BodyExt as _;
 
@@ -1638,8 +1529,7 @@ sha256 = "{digest}"
             );
         }
 
-        // The converse, so the loop above is about the status and not about
-        // this function emptying everything it is given.
+        // The converse: a 200 keeps its body.
         let permits = Arc::new(Semaphore::new(1));
         let ok = SandboxResponse {
             status: 200,
@@ -1662,10 +1552,8 @@ sha256 = "{digest}"
 
     #[tokio::test]
     async fn discarding_a_body_does_not_return_the_slot_the_headers_still_hold() {
-        // `into_parts` carries the extensions over, so the response's share of
-        // the permit survives its body being thrown away. Without that, every
-        // HEAD and every bodyless status would release its slot early — the
-        // header-only defect again, reached through the discard path.
+        // `into_parts` carries the extensions over, so the response's share of the permit
+        // survives the discarded body. Otherwise every HEAD and bodyless status releases early.
         use crate::plugin_sandbox::wire::SandboxResponse;
 
         let permits = Arc::new(Semaphore::new(1));
@@ -1695,15 +1583,9 @@ sha256 = "{digest}"
 
     #[tokio::test]
     async fn a_header_only_response_holds_its_permit_until_the_headers_go() {
-        // `PermitBuf` tied the slot to the response *bytes*, which is right for
-        // every answer that has some. A guest may answer with none: headers are
-        // charged against the same response ceiling (`check_size` sums header
-        // bytes and body bytes against one `max`), so up to the whole allowance
-        // can sit in `HeaderValue`s with an empty body. `Bytes::from_owner`
-        // drops its owner at construction for an empty buffer, so the slot came
-        // back before the response was even returned — and a caller retaining
-        // header-only responses could admit another request for each, holding
-        // response-sized allocations outside `max_concurrency`.
+        // `check_size` charges headers and body against one `max`, so the whole allowance can sit
+        // in headers with an empty body. `Bytes::from_owner` drops its owner at once for an empty
+        // buffer, so `PermitBuf` alone cannot hold the slot here.
         use crate::plugin_sandbox::wire::SandboxResponse;
 
         let permits = Arc::new(Semaphore::new(1));
@@ -1718,8 +1600,7 @@ sha256 = "{digest}"
             Arc::clone(&permits).acquire_owned().await.expect("permit"),
         );
 
-        // The body is empty and end-of-stream from the start, so nothing about
-        // the *bytes* can be holding the slot here.
+        // The body is empty and ended, so the bytes cannot be holding the slot.
         assert!(http_body::Body::is_end_stream(response.body()));
         assert!(
             response.headers().contains_key("x-plugin-note"),
@@ -1731,7 +1612,7 @@ sha256 = "{digest}"
             "the slot came back while the response headers were still held",
         );
 
-        // And it is the headers keeping it: dropping them returns it.
+        // The headers hold it: dropping them returns it.
         drop(response);
         assert_eq!(
             permits.available_permits(),
@@ -1742,14 +1623,9 @@ sha256 = "{digest}"
 
     #[tokio::test]
     async fn the_permit_outlives_the_body_and_dies_with_the_bytes() {
-        // The release point moved three times before it moved to the right
-        // *place*. This is the case that showed the place was wrong: the poll
-        // that ends the stream also hands the buffer away, so a permit tied to
-        // the body's state came back while the consumer still held every byte —
-        // admitting another full-sized response outside `max_concurrency`.
-        //
-        // Now the permit lives under the `Bytes`, so this test follows the
-        // bytes rather than the body.
+        // The poll that ends the stream hands the buffer away, so a permit tied to the body's
+        // state would return while the consumer still holds every byte. The permit lives under the
+        // `Bytes`, so this test follows the bytes, not the body.
         use crate::plugin_sandbox::wire::SandboxResponse;
         use http_body_util::BodyExt as _;
 
@@ -1835,10 +1711,6 @@ sha256 = "{digest}"
 
     #[test]
     fn a_render_context_is_bounded_before_it_is_cloned_onto_a_worker() {
-        // The context is the host's, but "the host built it" is not "the host
-        // chose its size": it is routinely assembled from a row or a query
-        // string, and none of it is in the per-request footprint
-        // `max_concurrency` is validated against.
         let many: Vec<(String, String)> = (0
             ..crate::plugin_sandbox::host::MAX_RENDER_CONTEXT_ENTRIES * 4)
             .map(|index| (format!("k{index}"), String::new()))

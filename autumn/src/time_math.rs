@@ -73,10 +73,8 @@ pub fn saturating_deadline(now: Instant, ttl: Duration) -> Instant {
 /// free under a paused runtime), while `tokio::time::Instant` is a distinct type
 /// from `std::time::Instant` and cannot reuse the same function.
 #[must_use]
-// Currently reached only from the `redis` job worker's maintenance throttle, so
-// a default-feature build has no caller. Kept ungated (and not `#[cfg(feature =
-// "redis")]`) because it is a general helper: the moment any other tokio-timeline
-// deadline needs clamping it should reach for this, not re-derive the policy.
+// Only the `redis` job worker calls this today. It stays ungated so other tokio-timeline
+// deadlines reuse the clamp policy instead of re-deriving it.
 #[cfg_attr(not(feature = "redis"), allow(dead_code))]
 pub fn saturating_tokio_deadline(now: tokio::time::Instant, ttl: Duration) -> tokio::time::Instant {
     now.checked_add(ttl).unwrap_or_else(|| {
@@ -154,11 +152,8 @@ mod tests {
 
     #[test]
     fn saturating_tokio_deadline_matches_the_std_clamp_policy() {
-        // The tokio-timeline twin must behave identically: exact for ordinary
-        // TTLs, clamped (never panicking) for a pathological one. The redis
-        // maintenance throttle derives its interval from app config, so an
-        // absurd value must make the sweep one-shot rather than crash the
-        // worker (issue #1611's regression, now on tokio's timeline).
+        // Exact for ordinary TTLs, clamped for a pathological one: the redis maintenance
+        // interval comes from app config, and an absurd value must not crash the worker (#1611).
         let now = tokio::time::Instant::now();
         assert_eq!(
             saturating_tokio_deadline(now, Duration::from_secs(60)),

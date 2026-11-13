@@ -140,11 +140,9 @@ pub fn redact_target(url: &str) -> String {
         return url.to_owned();
     }
     if let Ok(mut parsed) = url::Url::parse(url) {
-        // Userinfo the PARSER did not account for is userinfo we did not mask.
-        // A URL with no authority keeps it in the path: `postgres:/user:pw@h/db`
-        // (one slash), `jdbc:postgresql://user:pw@h/db` (opaque outer scheme),
-        // `SQLITE:user:pw@h/app.db` (uppercase, so scheme detection routed it
-        // here). `Url::password()` is `None` for all three.
+        // A URL with no authority keeps userinfo in the path, where
+        // `Url::password()` does not see it: `postgres:/user:pw@h/db`,
+        // `jdbc:postgresql://user:pw@h/db`, `SQLITE:user:pw@h/app.db`.
         if parsed.path().contains('@')
             || parsed
                 .fragment()
@@ -152,8 +150,7 @@ pub fn redact_target(url: &str) -> String {
         {
             return "****".to_owned();
         }
-        // A one-letter scheme is a Windows drive letter: a path. It gets the
-        // bare-path test below.
+        // A one-letter scheme is a Windows drive letter, so this is a path.
         if parsed.scheme().len() == 1 {
             return if is_bare_path(url) {
                 url.to_owned()
@@ -169,9 +166,8 @@ pub fn redact_target(url: &str) -> String {
         {
             return format!("{}://****", parsed.scheme());
         }
-        // No authority, so the parser saw no userinfo, query or fragment: do
-        // not trust the rest. Keep it only when it is one path-shaped token,
-        // as for a bare path below.
+        // No authority, so the parser saw no userinfo, query or fragment. Keep
+        // the rest only when it is one path-shaped token.
         if parsed.cannot_be_a_base() {
             let opaque = url.split_once(':').map_or("", |(_, rest)| rest);
             if opaque.is_empty()
@@ -185,11 +181,8 @@ pub fn redact_target(url: &str) -> String {
         if has_password {
             let _ = parsed.set_password(Some("****"));
         }
-        // A fragment is not part of any database target Autumn accepts, so
-        // nothing in one is worth printing and there are no key names to
-        // allowlist. `#password=hunter2` survived every other check here:
-        // `password()` is `None`, `query()` is `None`, and the fail-closed
-        // scan above only looks for `@`.
+        // No database target Autumn accepts has a fragment, so mask it whole:
+        // `#password=hunter2` passes every check above.
         let has_fragment = parsed.fragment().is_some();
         if has_fragment {
             parsed.set_fragment(Some("****"));
@@ -202,19 +195,16 @@ pub fn redact_target(url: &str) -> String {
             parsed.set_query(Some(redacted));
             changed
         });
-        // Re-rendering a parsed URL normalizes it, so only hand back the
-        // rewritten form when something actually had to be hidden.
+        // Re-rendering normalizes the URL, so return it only when something was
+        // hidden.
         if has_password || query_changed || has_fragment {
             return parsed.to_string();
         }
         return url.to_owned();
     }
-    // A libpq keyword/value connection string (`host=db user=app
-    // password=hunter2`) is an explicitly supported Postgres target that
-    // `Url::parse` rejects and that carries no `@` or `?` — so the bare-path
-    // fallback below would hand the password straight back. Rebuild it from an
-    // ALLOWLIST: a key this code has never heard of must not default to being
-    // printed.
+    // A libpq keyword/value string (`host=db user=app password=hunter2`) fails
+    // `Url::parse` and has no `@` or `?`. Rebuild it from an allowlist so an
+    // unknown key is never printed.
     if let Some(pairs) = crate::pg_conn_str::keyword_value_pairs(url) {
         let kept: Vec<String> = pairs
             .iter()
@@ -252,8 +242,7 @@ fn is_bare_path(url: &str) -> bool {
 /// (`sqlite://admin:pa?ss@db/app.db`), and looking only inside a `//` authority
 /// would miss the documented scheme-only spellings (`sqlite:user:pw@h/app.db`).
 fn redact_sqlite_target(url: &str) -> String {
-    // Same reasoning as the URL arm: a `SQLite` target has no fragment, so
-    // whatever rides in one is masked rather than echoed.
+    // A `SQLite` target has no fragment, so whatever rides in one is masked.
     let (url, fragment) = match url.split_once('#') {
         Some((target, _)) => (target, "#****"),
         None => (url, ""),
@@ -306,10 +295,8 @@ fn filter_query(query: &str, allowed: &[&str], enumerable: bool) -> String {
     }
     let mut kept: Vec<String> = Vec::new();
     let mut dropped = false;
-    // BOTH separators. Splitting on `&` alone let a `;`-joined tail ride
-    // through on the back of an allowed key —
-    // `?sslmode=require;password=hunter2` was one pair whose key was
-    // `sslmode`. `;` is what an operator pastes in from a JDBC-style string.
+    // Split on `;` too (JDBC style): on `&` alone,
+    // `sslmode=require;password=hunter2` is one pair with an allowed key.
     for pair in query.split(['&', ';']) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         if !allowed.iter().any(|a| key.trim().eq_ignore_ascii_case(a)) {
@@ -488,11 +475,8 @@ pub fn redact_targets_in_message(msg: &str) -> String {
             target_start(trimmed).map_or_else(
                 || chunk.to_owned(),
                 |at| {
-                    // A closing delimiter is not part of the target. libpq
-                    // quotes the URI it rejects, so leaving the `"` attached
-                    // fed it to `Url::parse`, which re-emitted it as `%22`
-                    // inside the path — a mangled message for no gain. Split
-                    // it off and put it back after.
+                    // libpq quotes the URI it rejects. Left attached, the
+                    // closing `"` would come back from `Url::parse` as `%22`.
                     let (target, closer) = split_closing_delimiters(&trimmed[at..]);
                     format!(
                         "{}{}{closer}{trailing}",
@@ -575,14 +559,13 @@ mod tests {
             "postgres://user:****@localhost:5432/app"
         );
 
-        // An unrecognized backend's query string goes wholesale — its key
-        // names cannot be enumerated, and `Url::password()` sees none of them.
+        // An unrecognized backend's query string goes whole: its keys cannot be
+        // enumerated.
         assert_eq!(
             redact_target("mysql://host/db?password=hunter2"),
             "mysql://host/db?****"
         );
-        // A Postgres target's CAN be enumerated, so the policy parameters an
-        // operator reads the boot summary for survive and only the rest goes.
+        // A Postgres target keeps its policy parameters.
         assert_eq!(
             redact_target("postgres://host/app?sslpassword=hunter2&sslmode=require"),
             "postgres://host/app?sslmode=require&****"
@@ -601,8 +584,7 @@ mod tests {
         // A bare path names the target and hides nothing.
         assert_eq!(redact_target("/var/lib/app.db"), "/var/lib/app.db");
 
-        // SQLite targets stay legible — this is what the read-only and
-        // replica refusals report on.
+        // SQLite targets stay legible for the read-only and replica refusals.
         assert_eq!(
             redact_target("sqlite:///var/lib/app.db"),
             "sqlite:///var/lib/app.db"
@@ -619,10 +601,8 @@ mod tests {
         assert_eq!(redact_target(":memory:"), ":memory:");
     }
 
-    // `detect` classifies by SCHEME, so anything at all can ride in the rest of
-    // a `sqlite://` target. SQLite has no authentication, so userinfo there is
-    // never deliberate — but it is still printed by the default build's
-    // "requires --features sqlite" refusal and by the replica refusal.
+    // `detect` classifies by scheme, so anything can ride in the rest of a
+    // `sqlite://` target, and the refusals print it.
     #[test]
     fn sqlite_targets_do_not_carry_credentials_through() {
         assert_eq!(
@@ -653,8 +633,8 @@ mod tests {
         assert_eq!(redact_target("password=hunter2"), "****");
     }
 
-    // FAIL CLOSED: what could not be classified at all is masked, including a
-    // malformed keyword/value string that carries neither `@` nor `?`.
+    // Fail closed: what cannot be classified is masked, including a malformed
+    // keyword/value string with neither `@` nor `?`.
     #[test]
     fn unclassifiable_targets_are_masked() {
         assert_eq!(redact_target("host=db user=app password='hunter2"), "****");
@@ -663,9 +643,8 @@ mod tests {
         assert_eq!(redact_target("garbage password=hunter2 more"), "****");
     }
 
-    // A URL that PARSES but whose userinfo the parser never saw. All three of
-    // these were handed back whole: `Url::password()` is `None` when there is
-    // no authority, so the credential rides in the path.
+    // With no authority, `Url::password()` is `None` and the credential rides
+    // in the path.
     #[test]
     fn userinfo_outside_an_authority_fails_closed() {
         // One slash instead of three.
@@ -673,13 +652,12 @@ mod tests {
             redact_target("postgres:/user:hunter2@db.internal/app"),
             "****"
         );
-        // A JDBC-style outer scheme — a routine copy-paste from a Java config.
+        // A JDBC-style outer scheme.
         assert_eq!(
             redact_target("jdbc:postgresql://user:hunter2@db/app"),
             "****"
         );
-        // Uppercase dodges the (case-sensitive) SQLite scheme detection, so it
-        // arrives here rather than at the SQLite arm.
+        // Uppercase misses the case-sensitive SQLite scheme detection.
         assert_eq!(redact_target("SQLITE:user:hunter2@host/app.db"), "****");
         // A username with no password is not a secret and stays legible.
         assert_eq!(
@@ -688,10 +666,8 @@ mod tests {
         );
     }
 
-    // A fragment is not part of any database target Autumn accepts, and it
-    // survived every other check: `Url::password()` is `None`, `query()` is
-    // `None`, and the fail-closed scan looks only for `@`. The whole string
-    // then reached `DatabaseConfig::validate`'s boot error.
+    // A fragment passes every other check: `Url::password()` and `query()` are
+    // `None`, and the fail-closed scan looks only for `@`.
     #[test]
     fn a_url_fragment_cannot_carry_a_secret_out() {
         assert_eq!(
@@ -713,9 +689,8 @@ mod tests {
         );
     }
 
-    // `;` is a query separator an operator pastes in from a JDBC-style string.
-    // Split on `&` alone, `sslmode=require;password=hunter2` was ONE pair whose
-    // key was `sslmode` — allowlisted, so the tail rode through on its back.
+    // Split on `&` alone, `sslmode=require;password=hunter2` is one pair with an
+    // allowlisted key.
     #[test]
     fn a_semicolon_joined_tail_does_not_ride_through() {
         assert_eq!(
@@ -788,9 +763,8 @@ mod tests {
         );
     }
 
-    // libpq can quote ONE decoded part of a target, not the whole target,
-    // so a scheme scan finds nothing. The redactor that knows the target
-    // masks it (#2539 review).
+    // libpq can quote one decoded part of a target, which a scheme scan does
+    // not find. The redactor that knows the target masks it.
     #[test]
     fn a_driver_error_does_not_echo_a_part_of_the_target() {
         let url = "postgres://app:p%ss@localhost:1/db";
@@ -909,7 +883,6 @@ mod tests {
             redact_targets_in_message("failed: postgres://user:secret@host:5432/db"),
             "failed: postgres://user:****@host:5432/db"
         );
-        // The old message redactor recognized `postgres://` tokens only.
         assert_eq!(
             redact_targets_in_message("failed: mysql://user:secret@host/db"),
             "failed: mysql://user:****@host/db"
@@ -923,15 +896,9 @@ mod tests {
             redact_targets_in_message("note: retrying in 500ms"),
             "note: retrying in 500ms"
         );
-        // libpq QUOTES the URI it rejects, and an operator writes `url=…`.
-        // Requiring the token to START with a scheme handed all of these back
-        // whole — the coverage the substring-matching predecessor had.
-        //
-        // Asserted by EXACT equality, not just "the password is gone": these
-        // are the inputs where the scanner has to guess a token boundary
-        // inside a delimiter, so over-redacting them is the likelier failure,
-        // and a redactor that returned a bare `****` for all five would pass a
-        // leak-only check.
+        // A target inside quotes, parentheses or `url=`. Exact equality, not a
+        // leak check: the scanner guesses a token boundary here, so
+        // over-redacting is the likelier failure.
         assert_eq!(
             redact_targets_in_message(
                 r#"invalid connection string: "postgres://user:hunter2@host/db""#

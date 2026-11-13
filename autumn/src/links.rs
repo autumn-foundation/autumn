@@ -510,8 +510,6 @@ pub fn button_to_with(
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
-
 #[cfg(all(test, feature = "maud"))]
 mod tests {
     use super::*;
@@ -639,9 +637,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "attrs cannot override the built-in \"class\" attribute")]
     fn link_to_attrs_cannot_override_class_without_option_set_panics() {
-        // Regression: `class`/`target`/`rel` must be reserved even when the
-        // dedicated option was never called, not only when it collides with
-        // an already-set value.
+        // Reserved even when the dedicated option was never called.
         let options = LinkToOptions::new().attrs(&[("class", "evil")]);
         let _ = link_to_with("x", "/x", &options);
     }
@@ -649,8 +645,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "attrs cannot override the built-in \"target\" attribute")]
     fn link_to_attrs_cannot_override_target_without_option_set_panics() {
-        // Regression: bypassing `.target("_blank")` via attrs would skip the
-        // automatic `rel="noopener"` safety net entirely.
+        // Setting target via attrs would skip the automatic `rel="noopener"`.
         let options = LinkToOptions::new().attrs(&[("target", "_blank")]);
         let _ = link_to_with("x", "/x", &options);
     }
@@ -753,9 +748,7 @@ mod tests {
 
     #[test]
     fn button_to_extra_attrs_on_button() {
-        // The admin-plugin delete-button shape (templates.rs): htmx handles
-        // the interaction when JS is on; the form fallback keeps working
-        // without it.
+        // htmx handles the click with JS on; the form fallback works without it.
         let options = ButtonToOptions::new().class("btn btn-danger").attrs(&[
             ("hx-delete", "/admin/widgets/42"),
             ("hx-confirm", "Are you sure you want to delete this Widget?"),
@@ -805,8 +798,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "attrs cannot override the built-in \"class\" attribute")]
     fn button_to_attrs_cannot_override_class_without_option_set_panics() {
-        // Regression: `class` must be reserved even when `.class()` was
-        // never called, not only when it collides with an already-set value.
+        // Reserved even when `.class()` was never called.
         let options = ButtonToOptions::new().attrs(&[("class", "evil")]);
         let _ = button_to_with("x", "/x", Method::POST, "tok", &options);
     }
@@ -814,9 +806,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "attrs cannot override the built-in \"formmethod\" attribute")]
     fn button_to_attrs_cannot_override_formmethod_panics() {
-        // Regression: <button formmethod> overrides the wrapping <form>'s
-        // method for a no-JS submission, which would silently defeat the
-        // declared method (e.g. submitting DELETE's override fields as GET).
+        // <button formmethod> overrides the form's method on a no-JS submit, e.g. sending
+        // DELETE's override fields as GET.
         let options = ButtonToOptions::new().attrs(&[("formmethod", "get")]);
         let _ = button_to_with("x", "/x", Method::DELETE, "tok", &options);
     }
@@ -824,9 +815,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "attrs cannot override the built-in \"formaction\" attribute")]
     fn button_to_attrs_cannot_override_formaction_panics() {
-        // Regression: <button formaction> overrides the wrapping <form>'s
-        // action for a no-JS submission, redirecting the CSRF token and
-        // _method override to a different URL.
+        // <button formaction> would send the CSRF token and _method override to another URL.
         let options = ButtonToOptions::new().attrs(&[("formaction", "/evil")]);
         let _ = button_to_with("x", "/x", Method::DELETE, "tok", &options);
     }
@@ -834,9 +823,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "attrs cannot override the built-in \"form\" attribute")]
     fn button_to_attrs_cannot_override_form_panics() {
-        // Regression: <button form="other-id"> detaches the button from the
-        // generated <form>, submitting whatever form owns that id instead —
-        // without the helper's _method/CSRF hidden inputs.
+        // <button form="other-id"> submits another form, without the _method/CSRF inputs.
         let options = ButtonToOptions::new().attrs(&[("form", "other-form")]);
         let _ = button_to_with("x", "/x", Method::DELETE, "tok", &options);
     }
@@ -844,9 +831,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "button_to only supports GET, POST, PUT, PATCH, or DELETE")]
     fn button_to_rejects_unsupported_method_panics() {
-        // Regression: a <form> cannot represent HEAD/OPTIONS/etc., and
-        // method_input has no override for them — silently falling through
-        // to a plain POST would submit to the wrong handler.
+        // A <form> cannot express HEAD/OPTIONS and there is no override for them; falling
+        // back to POST would hit the wrong handler.
         let _ = button_to("x", "/x", Method::HEAD, "tok");
     }
 }

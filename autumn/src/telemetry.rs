@@ -476,7 +476,8 @@ fn build_capture_layer(
     if !log.capture.enabled {
         return None;
     }
-    // Include encrypted-column names so plaintext values never reach the buffer.
+    // Encrypted and confidential column names are filtered so their plaintext never reaches the
+    // buffer.
     let mut filter_parameters = log.filter_parameters.clone();
     filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
     filter_parameters.extend(crate::confidential::registered_confidential_column_names());
@@ -495,8 +496,7 @@ fn init_logging_only(
     let capture = build_capture_layer(log);
     let capture_layer = capture.as_ref().map(|(layer, _)| layer.clone());
 
-    // Wrap the process filter in a reload layer so `/actuator/loggers` can
-    // adjust log levels on the live subscriber at runtime (issue #1044).
+    // The reload layer lets `/actuator/loggers` change log levels at runtime (#1044).
     let reload_handle = match log_format {
         ResolvedLogFormat::Json => {
             let (filter_layer, handle) = reload::Layer::new(filter);
@@ -551,8 +551,7 @@ fn init_otlp_runtime(
     let capture = build_capture_layer(log);
     let capture_layer = capture.as_ref().map(|(layer, _)| layer.clone());
 
-    // Wrap the process filter in a reload layer so `/actuator/loggers` can
-    // adjust log levels on the live subscriber at runtime (issue #1044).
+    // The reload layer lets `/actuator/loggers` change log levels at runtime (#1044).
     let reload_handle = match log_format {
         ResolvedLogFormat::Json => {
             let (filter_layer, handle) = reload::Layer::new(filter);
@@ -613,13 +612,9 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
             let builder = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(otlp.endpoint.clone());
-            // For `https` endpoints opentelemetry-otlp installs a default
-            // `ClientTlsConfig::new()`, which carries an *empty* trust-root
-            // store: the roots supplied by tonic's `tls-native-roots`
-            // feature (via the `tls-roots` otlp feature) are only loaded
-            // when `with_enabled_roots()` is called. Without this, every
-            // TLS handshake to a publicly-trusted collector fails with an
-            // unknown-issuer error.
+            // opentelemetry-otlp's default `ClientTlsConfig::new()` has an empty trust store; the
+            // native roots load only with `with_enabled_roots()`. Without it every handshake to a
+            // publicly trusted collector fails with an unknown-issuer error.
             let builder = if is_https_endpoint(&otlp.endpoint) {
                 builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots())
             } else {
@@ -634,10 +629,7 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
     }
     .map_err(|error| TelemetryInitError::ExporterInit(error.to_string()))?;
 
-    // Install a W3C Trace Context propagator so the `TraceContextLayer`
-    // middleware can extract incoming `traceparent` headers and inject
-    // the current context into outgoing responses. Uses the global
-    // text-map propagator slot maintained by `opentelemetry::global`.
+    // `TraceContextLayer` reads and writes `traceparent` through the global propagator.
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
     Ok(SdkTracerProvider::builder()
@@ -667,9 +659,7 @@ fn build_resource_attributes(resource: &TelemetryResource) -> [KeyValue; 3] {
     ]
 }
 
-// ----------------------------------------------------------------------------
-// TelemetryProvider — tier-1 boot-time replaceable telemetry init
-// ----------------------------------------------------------------------------
+// TelemetryProvider: replaceable boot-time telemetry init.
 
 /// Pluggable boot-time telemetry initializer.
 ///
@@ -798,11 +788,10 @@ mod tests {
         let provider = NoOpTelemetryProvider;
         let log = LogConfig::default();
         let telemetry = TelemetryConfig::default();
-        // Should succeed and not touch the global subscriber.
+        // Must not touch the global subscriber.
         let guard = provider
             .init(&log, &telemetry, Some("test"))
             .expect("no-op provider should succeed");
-        // Sanity: the disabled guard must be droppable without panic.
         drop(guard);
     }
     #[cfg(feature = "telemetry-otlp")]
@@ -958,10 +947,7 @@ mod tests {
     async fn build_tracer_provider_installs_w3c_propagator_and_returns_provider() {
         use opentelemetry::trace::TraceContextExt as _;
 
-        // Exercises the full provider-construction path: resource building,
-        // tonic exporter setup, global propagator install, and batch
-        // provider assembly. Uses a bogus endpoint — exporter construction
-        // is lazy, so no network IO happens here.
+        // Exporter construction is lazy, so the bogus endpoint causes no network IO.
         let otlp = OtlpTraceRuntime {
             endpoint: "http://127.0.0.1:65530".into(),
             protocol: TelemetryProtocol::Grpc,
@@ -976,8 +962,7 @@ mod tests {
         let provider = build_tracer_provider(&otlp)
             .expect("tonic exporter + provider build should succeed lazily");
 
-        // Confirm the propagator global now round-trips a W3C traceparent —
-        // i.e., the install line ran.
+        // The global propagator now parses a W3C traceparent.
         let headers = std::collections::HashMap::from([(
             "traceparent",
             "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",

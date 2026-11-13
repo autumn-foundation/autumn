@@ -128,7 +128,7 @@ pub async fn check_step_up(session: &Session, max_age_secs: u64) -> crate::Autum
         .ok_or_else(|| crate::AutumnError::unauthorized_msg("step-up authentication required"))?;
 
     let age_secs = (crate::time::ambient_now() - last_auth).num_seconds();
-    // Negative means the timestamp is in the future (clock skew) — treat as expired.
+    // A negative age (timestamp in the future, e.g. clock skew) counts as expired.
     if u64::try_from(age_secs).map_or(true, |age| age > max_age_secs) {
         return Err(crate::AutumnError::unauthorized_msg(
             "step-up authentication required",
@@ -158,12 +158,10 @@ pub fn validate_return_to(url: &str) -> Result<(), &'static str> {
     if url.is_empty() {
         return Ok(());
     }
-    // Must begin with exactly one '/'
     if !url.starts_with('/') {
         return Err("return_to must be an absolute path starting with /");
     }
-    // Reject protocol-relative URLs (//host/path or /\host/path).
-    // Some browsers normalise /\ to // so we must reject both.
+    // Some browsers normalise `/\` to `//`, so both are protocol-relative.
     if url.starts_with("//") || url.starts_with("/\\") {
         return Err("return_to must not be a protocol-relative URL");
     }
@@ -313,11 +311,8 @@ pub async fn __check_step_up_with_config(
             .map_or(DEFAULT_MAX_AGE_SECS, |c| c.default_max_age_secs)
     });
 
-    // Attribute through the same rule the three `Current::set_actor` seams use:
-    // while the session is impersonating (#1394), the operator — not the user
-    // the request resolves as — is who performed the sensitive action, and a
-    // step-up event naming the target would be exactly the misattribution
-    // impersonation exists to prevent.
+    // While impersonating (#1394), the operator performed the action, not the user the request
+    // resolves as; same rule as the `Current::set_actor` seams.
     let actor_id = match session.get(state.auth_session_key()).await {
         Some(effective) => crate::auth::impersonation::audit_actor_id(session, &effective).await,
         None => "anonymous".to_owned(),
@@ -387,8 +382,6 @@ pub fn __step_up_json_response(max_age_secs: u64) -> axum::response::Response {
         .into_response()
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -438,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn check_step_up_succeeds_at_exactly_max_age() {
         let mut data = HashMap::new();
-        // Exactly 300 seconds ago — should still pass (age == max_age).
+        // age == max_age still passes.
         let ts = (Utc::now() - chrono::Duration::seconds(300))
             .timestamp()
             .to_string();
@@ -613,15 +606,14 @@ mod tests {
     #[test]
     fn encode_return_to_encodes_query_delimiters() {
         let encoded = encode_return_to("/account?tab=security");
-        // '?' must be encoded so the return_to param doesn't break the outer query
+        // An unencoded '?' would break the outer query string.
         assert!(encoded.contains("%3F"), "should encode '?': {encoded}");
     }
 
     #[test]
     fn encode_return_to_encodes_plus_sign() {
-        // '+' is decoded as a space by application/x-www-form-urlencoded parsers.
-        // It must be percent-encoded so a URL like /reports?q=a+b round-trips
-        // correctly through the return_to query parameter.
+        // Form-urlencoded parsers decode '+' as a space, so it must be percent-encoded
+        // for `/reports?q=a+b` to round-trip.
         let encoded = encode_return_to("/reports?q=a+b");
         assert!(
             encoded.contains("%2B"),
@@ -720,7 +712,6 @@ mod tests {
             default_max_age_secs: 60,
         });
         let mut data = HashMap::new();
-        // 2 minutes ago — fails against 60s global config
         let old_ts = (Utc::now() - chrono::Duration::seconds(120))
             .timestamp()
             .to_string();
@@ -740,7 +731,6 @@ mod tests {
             default_max_age_secs: 60,
         });
         let mut data = HashMap::new();
-        // 2 minutes ago — passes against 600s route override
         let ts = (Utc::now() - chrono::Duration::seconds(120))
             .timestamp()
             .to_string();

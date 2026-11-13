@@ -136,10 +136,9 @@ fn with_user(
             .decode_utf8_lossy()
             .into_owned()
     };
-    // A `user` or `password` in the query wins over the user part, so the
-    // role would connect as the owner. Remove them. The other parameters
-    // stay byte for byte: Postgres does not read `+` as a space. The driver
-    // decodes a name, so `%75ser` is `user`.
+    // A `user` or `password` in the query overrides the user part, so the role would connect as the
+    // owner: drop them. Other parameters stay byte for byte, since Postgres does not read `+` as a
+    // space. The driver decodes keys, so `%75ser` is `user`.
     let mut owner = decode(userinfo.split_once(':').map_or(userinfo, |(u, _)| u));
     let mut pairs: Vec<String> = Vec::new();
     for pair in query.split('&') {
@@ -445,7 +444,7 @@ mod tests {
                 .unwrap(),
             "postgres:///app?host=/run/postgresql&user=marketing&password=p%20w%26"
         );
-        // No database: the one of the owner stays.
+        // No database in the URL: the owner's database is pinned as `dbname`.
         assert_eq!(
             r.effective_url(Some("postgres://?host=/run/postgresql&user=owner"))
                 .unwrap(),

@@ -156,11 +156,7 @@ impl BlobStoreError {
     pub const fn status(&self) -> http::StatusCode {
         match self {
             Self::NotFound(_) => http::StatusCode::NOT_FOUND,
-            // `Signature` is an auth failure (the URL was tampered with
-            // or has expired), not a malformed-input error — map it
-            // alongside `PermissionDenied` so handlers using `?` get
-            // 403 consistently with what `local::serve_router` returns
-            // directly when verifying a presigned URL.
+            // A tampered or expired URL is an auth failure: 403, as `local::serve_router` returns.
             Self::PermissionDenied(_) | Self::Signature(_) => http::StatusCode::FORBIDDEN,
             Self::InvalidInput(_) => http::StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge(_) => http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -405,10 +401,7 @@ fn check_basic_formatting(key: &str) -> Result<(), BlobStoreError> {
             "blob key must be relative".into(),
         ));
     }
-    // Backslashes alias to forward slashes on Windows (`a\b` and `a/b`
-    // resolve to the same filesystem path), so two distinct logical
-    // keys would collide. Reject backslashes entirely so the canonical
-    // separator is always `/` regardless of the host platform.
+    // Windows treats `a\b` as `a/b`, so two keys would name one file.
     if key.contains('\\') {
         return Err(BlobStoreError::InvalidInput(
             "blob key contains a backslash; use `/` as the segment separator".into(),
@@ -418,11 +411,9 @@ fn check_basic_formatting(key: &str) -> Result<(), BlobStoreError> {
 }
 
 fn check_windows_paths(key: &str) -> Result<(), BlobStoreError> {
-    // Windows drive-letter forms (`C:\…`, `C:/…`, `\\?\…`, `\\server\share\…`)
-    // would be treated as absolute by `Path::join` on Windows, silently
-    // escaping the storage root regardless of whether the host happens
-    // to be Linux. Reject them up-front so the same key contract holds
-    // on every platform.
+    // `Path::join` on Windows treats drive-letter and UNC forms (`C:\…`, `C:/…`, `\\?\…`,
+    // `\\server\share\…`) as absolute, escaping the root. Rejected on every host so keys stay
+    // portable.
     let bytes = key.as_bytes();
     let drive_letter = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     if drive_letter {
@@ -444,13 +435,8 @@ fn validate_segment(segment: &str) -> Result<(), BlobStoreError> {
             "blob key contains traversal segment".into(),
         ));
     }
-    // `.` and empty segments collapse on the filesystem (`a/./b`,
-    // `a//b`, and `a/b` all resolve to the same path on POSIX) and
-    // are normalized away by most HTTP clients before they reach
-    // the serving route. Either way, two distinct logical keys
-    // would alias and the HMAC signature would no longer match
-    // the path the client actually requests. Reject them here so
-    // every key is canonical at the point it's persisted or signed.
+    // `a/./b` and `a//b` resolve to `a/b` on disk, and HTTP clients normalize them away, so
+    // the signed key would no longer match the requested path.
     if segment == "." {
         return Err(BlobStoreError::InvalidInput(
             "blob key contains a `.` segment".into(),
@@ -461,24 +447,15 @@ fn validate_segment(segment: &str) -> Result<(), BlobStoreError> {
             "blob key contains an empty segment".into(),
         ));
     }
-    // Windows silently strips trailing `.` and trailing space from
-    // filenames (`foo.png.` → `foo.png`, `con ` → `con`). That
-    // would let two distinct logical keys alias the same on-disk
-    // file on Windows, and could bypass the reserved-name guard
-    // below (a segment of `con ` passes the literal `==` check
-    // but normalizes to `con` once Windows touches it).
+    // Windows strips a trailing `.` or space (`foo.png.` → `foo.png`), which would alias two
+    // keys and let `con ` slip past the reserved-name check below.
     if segment.ends_with('.') || segment.ends_with(' ') {
         return Err(BlobStoreError::InvalidInput(format!(
             "blob key segment {segment:?} ends with `.` or space; Windows normalizes \
              these and would alias the segment with its stripped form"
         )));
     }
-    // Windows rejects these characters in filenames; a key
-    // containing any of them passes Linux/S3 but errors with
-    // I/O on Windows. Same portability rationale as the
-    // uppercase check above. Control chars (< 0x20) are also
-    // rejected on Windows and rarely meaningful as path
-    // components anyway.
+    // Windows rejects these characters and control bytes in filenames.
     if segment.bytes().any(|b| {
         matches!(
             b,
@@ -492,12 +469,9 @@ fn validate_segment(segment: &str) -> Result<(), BlobStoreError> {
                 .into(),
         ));
     }
-    // Windows reserved device names: a key like `con/foo` or
-    // `nul.png` errors with I/O on Windows even though Linux/S3
-    // accept it. Compare against the Unicode-lowercased
-    // basename (the part before the first `.`). The uppercase
-    // check above already enforces lowercase, so checking the
-    // raw lowercase set is sufficient.
+    // Device names (`con/foo`, `nul.png`) fail on Windows. The name is the part
+    // before the first `.`. `check_case_folding` rejects uppercase, so the lowercase set
+    // suffices.
     let basename = segment.split('.').next().unwrap_or("");
     if WINDOWS_RESERVED_NAMES.contains(&basename) {
         return Err(BlobStoreError::InvalidInput(format!(
@@ -509,22 +483,11 @@ fn validate_segment(segment: &str) -> Result<(), BlobStoreError> {
 }
 
 fn check_reserved_suffixes(key: &str) -> Result<(), BlobStoreError> {
-    // The local backend persists `<path>.meta` sidecars next to each
-    // blob's bytes (carrying the original `content_type` so the serving
-    // route can render images, PDFs, etc. correctly). If we let user
-    // keys end in `.meta`, the sidecar of key `foo` and the bytes of
-    // key `foo.meta` would collide — overwriting each other on `put`,
-    // and returning sidecar JSON in place of bytes on `get`. Reserve
-    // the suffix everywhere (case-insensitive — some filesystems are
-    // case-insensitive too) so the local-backend invariant is also a
-    // trait-level invariant; other backends (S3) don't need it but
-    // benefit from key portability.
+    // The local backend stores key `foo`'s metadata at `foo.meta`, so a key `foo.meta` would
+    // collide with it. Reserved on every backend, case-insensitively, so keys stay portable.
     if let Some(last) = key.rsplit('/').next() {
-        // Byte-level suffix comparison so a non-ASCII final segment
-        // (e.g. `"ééé"`, where each `é` is 2 bytes and the byte index
-        // 5-from-the-end lands mid-char) doesn't panic on string-slice
-        // bounds. The reserved suffix is pure ASCII, so comparing the
-        // last 5 raw bytes case-insensitively is unambiguous.
+        // Compare bytes: slicing a `&str` 5 bytes from the end can split a multi-byte char
+        // and panic.
         let bytes = last.as_bytes();
         if bytes.len() >= 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".meta") {
             return Err(BlobStoreError::InvalidInput(
@@ -538,26 +501,12 @@ fn check_reserved_suffixes(key: &str) -> Result<(), BlobStoreError> {
 }
 
 fn check_case_folding(key: &str) -> Result<(), BlobStoreError> {
-    // Case-insensitive filesystems (Windows NTFS default, macOS APFS
-    // default) collapse keys whose Unicode case-fold is identical to
-    // the same on-disk path, so two distinct logical keys would
-    // silently overwrite each other on the local backend while
-    // staying distinct in the app's data layer (different HMAC
-    // signatures, different DB rows). S3 keeps them distinct, so an
-    // app that "works" on local also breaks on a backend swap.
-    // Reject any character whose Unicode default case-fold differs
-    // from itself: that's both ASCII uppercase (`A-Z`) and Unicode
-    // uppercase (`Ä`, `É`, `İ`, …). Apps that need case preservation
-    // should encode it (base64, percent-encoding, …) before passing
-    // the key to the store.
+    // Case-insensitive filesystems (NTFS, APFS by default) map `A.png` and `a.png` to one
+    // file, while S3 keeps them apart. Reject any char that lowercases to something else,
+    // ASCII or Unicode (`Ä`, `İ`). Apps that need case must encode it first.
     for c in key.chars() {
         let mut lower = c.to_lowercase();
-        // The char is "already lowercase / caseless" iff its default
-        // case-fold yields exactly itself as a single code point.
-        // - `'Ä'.to_lowercase()` yields `'ä'` → reject.
-        // - `'ä'.to_lowercase()` yields `'ä'` → accept.
-        // - `'東'.to_lowercase()` yields `'東'` → accept (caseless).
-        // - `'A'.to_lowercase()` yields `'a'` → reject.
+        // Lowercase or caseless iff `to_lowercase` yields exactly `c`.
         let first = lower.next();
         let trailing = lower.next();
         if first != Some(c) || trailing.is_some() {
@@ -637,9 +586,6 @@ mod tests {
 
     #[test]
     fn validate_key_rejects_dot_segments() {
-        // `a/./b` would resolve to `a/b` on the filesystem, aliasing two
-        // distinct logical keys. HTTP clients also tend to normalize
-        // these out of URL paths, breaking signature verification.
         for k in ["a/./b", "./foo", "a/././b", "a/.\\b"] {
             let err = validate_key(k).unwrap_err();
             assert!(
@@ -651,9 +597,6 @@ mod tests {
 
     #[test]
     fn validate_key_rejects_empty_segments() {
-        // Same aliasing/canonicalization problem as `.` segments.
-        // `a//b` collapses to `a/b` on POSIX; `a/b/` produces a trailing
-        // empty segment that HTTP clients silently strip.
         for k in ["a//b", "a/b/", "a///b"] {
             let err = validate_key(k).unwrap_err();
             assert!(
@@ -665,8 +608,6 @@ mod tests {
 
     #[test]
     fn validate_key_rejects_backslash_separator() {
-        // Backslashes alias to forward slashes on Windows; reject them
-        // entirely so the canonical separator is always `/`.
         for k in [r"a\b", r"avatars\me.png", r"x\y\z"] {
             let err = validate_key(k).unwrap_err();
             assert!(
@@ -678,9 +619,6 @@ mod tests {
 
     #[test]
     fn validate_key_reserves_meta_suffix() {
-        // The local backend stores `<key>.meta` sidecars; a user key
-        // ending in `.meta` would collide with another key's sidecar.
-        // Case-insensitive because some filesystems normalize case.
         for k in ["foo.meta", "avatars/me.meta", "FOO.META", "x/y/Z.MeTa"] {
             let err = validate_key(k).unwrap_err();
             assert!(
@@ -688,7 +626,6 @@ mod tests {
                 "key {k:?} should be reserved",
             );
         }
-        // But these are fine — not the right suffix.
         for k in ["meta.png", "foo.metadata", "a.meta.gz", "metafile"] {
             validate_key(k).unwrap_or_else(|_| panic!("key {k:?} should be accepted"));
         }
@@ -696,31 +633,18 @@ mod tests {
 
     #[test]
     fn validate_key_handles_non_ascii_without_panicking() {
-        // The `.meta` suffix check must compare raw bytes, not a
-        // `&str` slice — otherwise a non-ASCII key whose byte length
-        // is ≥ 5 with a UTF-8 char boundary mid-suffix would panic
-        // with "byte index N is not a char boundary". Pin that we
-        // accept such keys cleanly instead.
+        // For most of these, a `&str` slice 5 bytes from the end would split a char and panic.
         for k in ["ééé", "résumé.png", "東京", "cafe\u{0301}"] {
             validate_key(k).unwrap_or_else(|err| {
                 panic!("non-ASCII key {k:?} should validate cleanly, got {err:?}")
             });
         }
-        // Non-ASCII keys that *do* end in `.meta` must still be
-        // rejected (the suffix is ASCII).
         let err = validate_key("résumé.meta").unwrap_err();
         assert!(matches!(err, BlobStoreError::InvalidInput(_)));
     }
 
     #[test]
     fn validate_key_rejects_uppercase() {
-        // Case-insensitive filesystems (NTFS, APFS) alias these with
-        // their lowercase counterparts on the local backend while
-        // keeping them distinct in app data. Reject up-front so the
-        // portable subset (Unicode-lowercase / caseless) is the only
-        // valid form. Covers ASCII uppercase + Unicode uppercase
-        // (`Ä`, `É`, `İ`, etc.) — anything whose Unicode default
-        // case-fold differs from itself.
         let rejected = [
             // ASCII uppercase
             "Foo.png",
@@ -740,8 +664,6 @@ mod tests {
                 "key {k:?} should be rejected for uppercase"
             );
         }
-        // Lowercase ASCII, lowercase Unicode, and caseless characters
-        // stay valid.
         let accepted = [
             "foo.png",
             "avatars/me.png",
@@ -760,9 +682,6 @@ mod tests {
 
     #[test]
     fn validate_key_rejects_windows_reserved_chars() {
-        // `<`, `>`, `:`, `"`, `|`, `?`, `*` aren't allowed in Windows
-        // filenames; control bytes (\x01-\x1F) likewise. Reject so the
-        // local backend behaves the same on every platform.
         let rejected = [
             "foo<bar",
             "foo>bar",
@@ -785,9 +704,6 @@ mod tests {
 
     #[test]
     fn validate_key_rejects_windows_reserved_names() {
-        // `con.png`, `nul/foo`, `com1.txt`, etc. error with I/O on
-        // Windows even with valid characters and casing. Reject the
-        // entire reserved set per segment.
         let rejected = [
             "con",
             "con.png",
@@ -808,8 +724,7 @@ mod tests {
                 "key {k:?} should be rejected"
             );
         }
-        // Names that *contain* a reserved word but aren't equal to one
-        // before the first dot stay valid.
+        // Only the part before the first dot must not equal a reserved name.
         let accepted = [
             "console.png",
             "lptastic.txt",
@@ -825,10 +740,6 @@ mod tests {
 
     #[test]
     fn validate_key_rejects_trailing_dot_or_space_segments() {
-        // Windows strips trailing `.` and trailing space from
-        // filenames, so two distinct logical keys would alias on the
-        // local backend (and bypass the reserved-name guard for
-        // `con ` / `con.`). Reject up-front.
         let rejected = [
             "foo.",            // trailing dot
             "avatars/me.png.", // trailing dot on last segment
@@ -845,8 +756,6 @@ mod tests {
                 "key {k:?} should be rejected"
             );
         }
-        // Internal/leading dots and spaces are still fine; only the
-        // segment-trailing forms are forbidden.
         let accepted = ["foo.bar", "a b", " foo", "x/y/.hidden"];
         for k in accepted {
             validate_key(k)
@@ -892,7 +801,7 @@ mod tests {
         assert_eq!(err.status(), http::StatusCode::NOT_FOUND);
     }
 
-    // ── RED: presign_put default returns Unsupported ────────────────────────
+    // ── presign_put default returns Unsupported ─────────────────────────────
 
     struct NoOpStore;
     impl BlobStore for NoOpStore {
@@ -957,8 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_if_absent_default_refuses_instead_of_overwriting() {
-        // A check and a write in two steps can replace a blob of another
-        // writer, so the default does not try.
+        // A separate check and write could replace another writer's blob.
         let err = NoConditionalStore
             .put_if_absent("a/b.png", "image/png", bytes::Bytes::from_static(b"x"))
             .await

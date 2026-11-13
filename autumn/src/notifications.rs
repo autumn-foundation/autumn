@@ -667,9 +667,8 @@ impl ListFilter {
                 _ => {}
             }
         }
-        // Without an explicit sort the feed reads newest-first; an explicit
-        // sort key uses the requested direction (`ListQuery` defaults to
-        // ascending).
+        // An allowlisted sort key uses the requested direction (`ListQuery`
+        // defaults to ascending).
         let (sort, dir) = match query.sort() {
             Some("created_at") => (FeedSort::CreatedAt, query.direction()),
             Some("id") => (FeedSort::Id, query.direction()),
@@ -702,10 +701,8 @@ mod db_store {
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
 
-    // The `notifications` table as scaffolded by `autumn generate
-    // notifications`. Timestamps are TIMESTAMPTZ on Postgres and RFC 3339
-    // TEXT on SQLite (diesel's `TimestamptzSqlite`), matching the DDL the
-    // generator emits per backend.
+    // Matches the DDL `autumn generate notifications` emits: timestamps are
+    // TIMESTAMPTZ on Postgres and RFC 3339 TEXT on SQLite (`TimestamptzSqlite`).
     #[cfg(not(feature = "sqlite"))]
     mod schema {
         diesel::table! {
@@ -750,9 +747,8 @@ mod db_store {
 
     impl From<NotificationRow> for Notification {
         fn from(row: NotificationRow) -> Self {
-            // A payload that no longer parses as JSON (e.g. edited out of
-            // band) degrades to a JSON string of the raw text rather than
-            // failing the whole feed.
+            // A payload that no longer parses as JSON (e.g. edited out of band)
+            // degrades to a JSON string rather than failing the whole feed.
             let payload = match serde_json::from_str(&row.payload) {
                 Ok(parsed) => parsed,
                 Err(_) => Value::String(row.payload),
@@ -810,10 +806,8 @@ mod db_store {
 
     fn store_err(e: &diesel::result::Error) -> NotificationStoreError {
         let message = e.to_string();
-        // A missing table means the app has a database but never scaffolded
-        // the notifications feed — turn the bare SQL error into an
-        // actionable one ("relation … does not exist" on Postgres, "no such
-        // table" on SQLite).
+        // Turn schema errors into actionable ones. A missing table reads
+        // "relation … does not exist" on Postgres and "no such table" on SQLite.
         if message.contains("tenant_id") && message.contains("column") {
             return NotificationStoreError::new(format!(
                 "query failed: {e}. The `notifications` table has no `tenant_id` column — \

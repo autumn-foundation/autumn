@@ -57,9 +57,7 @@ fn is_production() -> bool {
 #[cfg(test)]
 mod tests {
 
-    // We cannot call `init()` in standard unit tests because the global subscriber
-    // can only be set once per process and other tests may have already set it.
-    // Instead, we use `rusty_fork_test` to run tests that call `init()` in a separate process.
+    // `init()` sets the process-global subscriber, so tests that call it run in a forked process.
     use rusty_fork::rusty_fork_test;
 
     rusty_fork_test! {
@@ -80,10 +78,10 @@ mod tests {
                 format: LogFormat::Pretty,
                 ..LogConfig::default()
             };
-            init(&config); // Sets it successfully
+            init(&config);
 
             let result = std::panic::catch_unwind(|| {
-                init(&config); // Should definitely panic
+                init(&config);
             });
 
             assert!(result.is_err(), "init did not panic on second call");
@@ -130,18 +128,12 @@ mod tests {
 
     #[test]
     fn is_production_false_by_default() {
-        // In tests AUTUMN_ENV is not normally set, so this should be false.
-        // (We don't mutate env vars here to avoid cross-test interference.)
+        // Assumes AUTUMN_ENV is unset; setting it here would race concurrent tests.
         assert!(!is_production());
     }
 
-    // We cannot call `init()` in unit tests because the global subscriber
-    // can only be set once per process and other tests may have already
-    // set it. Instead, test the format selection logic directly.
-
     #[test]
     fn auto_format_is_not_json_in_non_production() {
-        // Without AUTUMN_ENV=production, Auto should resolve to pretty (not json).
         let use_json = match LogFormat::Auto {
             LogFormat::Auto => is_production(),
             LogFormat::Pretty => false,
@@ -172,7 +164,6 @@ mod tests {
 
     #[test]
     fn valid_filter_parses() {
-        // Ensure that valid EnvFilter directives don't trigger the fallback.
         let config = LogConfig {
             level: "debug".to_owned(),
             format: LogFormat::Auto,
@@ -184,8 +175,7 @@ mod tests {
 
     #[test]
     fn invalid_filter_falls_back() {
-        // An invalid directive should fail to parse (triggering the
-        // eprintln fallback in init).
+        // A parse failure is what sends `init` to its `info` fallback.
         let filter = tracing_subscriber::EnvFilter::try_new("not_a_valid_[directive");
         assert!(filter.is_err());
     }
@@ -194,9 +184,7 @@ mod tests {
     fn test_init_with_telemetry_forwards_to_telemetry_init() {
         use crate::config::{TelemetryConfig, TelemetryProtocol};
 
-        // We know that if we pass an invalid strict telemetry config without an endpoint,
-        // it will return an error without touching global subscriber state.
-        // Let's use this to verify `init_with_telemetry` forwards correctly.
+        // Strict telemetry with no endpoint fails before touching the global subscriber.
         let log_config = LogConfig {
             level: "debug".to_owned(),
             format: LogFormat::Pretty,
@@ -204,7 +192,7 @@ mod tests {
         };
         let telemetry_config = TelemetryConfig {
             enabled: true,
-            strict: true, // strict mode to ensure we get an error
+            strict: true,
             service_name: "test".to_owned(),
             service_namespace: None,
             service_version: "1.0.0".to_owned(),
@@ -214,10 +202,7 @@ mod tests {
             sample_ratio: 1.0,
         };
 
-        // This should return an error because it's enabled but no endpoint is provided (assuming OTLP feature).
-        // If OTLP feature is not enabled, it returns `FeatureDisabled`.
-        // If OTLP feature is enabled, it returns `MissingEndpoint`.
-        // In either case, it's an error.
+        // `MissingEndpoint` with the OTLP feature, `FeatureDisabled` without it.
         let result = init_with_telemetry(&log_config, &telemetry_config, None);
         assert!(result.is_err());
     }

@@ -251,9 +251,8 @@ impl<T> LiveStateHandle<T> {
         reason = "the journal must run under the write lock to keep write order"
     )]
     pub fn write<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R, LiveStateFrozen> {
-        // The freeze flag is both set and read under the *write* lock, so a
-        // write can never interleave with the snapshot that supersedes it:
-        // either it lands before the snapshot and is carried, or it is refused.
+        // The freeze flag is set and read under the write lock, so a write either lands before
+        // the snapshot (and is carried) or is refused.
         let mut guard = self
             .inner
             .write()
@@ -616,8 +615,7 @@ pub(crate) fn read_snapshot(path: &std::path::Path) -> Result<StateEnvelope, Ado
         path: path.display().to_string(),
         source,
     })?;
-    // Consume it whether or not it parses: it holds application state and has
-    // no business outliving this one handoff.
+    // Remove it even if it fails to parse: it holds application state.
     let _ = std::fs::remove_file(path);
     serde_json::from_slice(&raw).map_err(|error| AdoptError::Envelope(error.to_string()))
 }
@@ -700,12 +698,10 @@ where
     Old: LiveState,
     New: MigrateFrom<Old>,
 {
-    // Two shapes that declare the same VERSION are indistinguishable on the
-    // wire, so the migration below could never run and the old payload would be
-    // handed to the new shape's `Deserialize` — which, with a `#[serde(default)]`
-    // or an `Option` field, is exactly the silent loss this module exists to
-    // prevent. `state_migration!` refuses this at the migration itself; this
-    // catches a hand-written `impl MigrateFrom`, at monomorphization.
+    // Two shapes with the same VERSION look identical on the wire: the migration would never
+    // run, and the new shape's `Deserialize` could silently drop old data through a
+    // `#[serde(default)]` or `Option` field. `state_migration!` checks this too; this catches a
+    // hand-written `impl MigrateFrom`.
     const {
         assert!(
             Old::VERSION != New::VERSION,
@@ -727,11 +723,8 @@ where
 
 // ── The handoff itself (Unix) ────────────────────────────────────────────────
 //
-// Every step below is written without `unsafe`: the workspace forbids it, and
-// the socket crosses the process boundary through `OwnedFd` and the child's
-// **stdin** — the same convention inetd has used to hand a server its socket
-// for forty years — rather than through a raw descriptor number that only
-// `from_raw_fd` could turn back into a listener.
+// No `unsafe` (the workspace forbids it): the socket reaches the child as its stdin through
+// `OwnedFd`, as inetd does, not as a raw descriptor number that would need `from_raw_fd`.
 
 /// A duplicate of the bound listening socket, kept aside so it can be handed
 /// to a successor while this process goes on serving through the original.
@@ -797,18 +790,15 @@ pub(crate) fn adopt_inherited_listener() -> Option<std::net::TcpListener> {
         }
     };
     let listener = std::net::TcpListener::from(fd);
-    // `From<OwnedFd>` does not check what the descriptor is, and neither this
-    // process nor the kernel will complain later: an accept loop over a
-    // non-listening socket spins on `EINVAL` forever while `/ready` says 200.
-    // A listening socket has a local address and *no peer*; a terminal or pipe
-    // has neither, and a connected socket has both.
+    // `From<OwnedFd>` does not check the descriptor, and an accept loop over a non-listening
+    // socket spins on `EINVAL` forever while `/ready` says 200. A listening socket has a local
+    // address and no peer; a terminal or pipe has neither, a connected socket has both.
     let Ok(addr) = listener.local_addr() else {
         tracing::error!("{LISTEN_FD_ENV} is set but stdin is not a socket; refusing to adopt it");
         return None;
     };
-    // `getpeername` answers only for a *connected* socket, so a duplicate
-    // viewed as a `TcpStream` is the cheap discriminator. The duplicate closes
-    // with the probe; the listener keeps its own descriptor.
+    // `getpeername` answers only for a connected socket, so probe a duplicate as a `TcpStream`.
+    // The duplicate closes with the probe; the listener keeps its own descriptor.
     let connected_peer = listener
         .as_fd()
         .try_clone_to_owned()
@@ -826,10 +816,9 @@ pub(crate) fn adopt_inherited_listener() -> Option<std::net::TcpListener> {
         tracing::error!(error = %error, "inherited listening socket is unusable");
         return None;
     }
-    // The socket is ours now (the `TcpListener` above holds its own descriptor),
-    // so re-point stdin at `/dev/null`: otherwise every subprocess this app ever
-    // spawns inherits the listening socket on fd 0 by default, and could accept
-    // connections on it or keep the port bound after the app exits.
+    // The `TcpListener` holds its own descriptor, so re-point stdin at `/dev/null`. Otherwise
+    // every subprocess the app spawns inherits the socket on fd 0, and could accept on it or
+    // keep the port bound after the app exits.
     match std::fs::File::open("/dev/null")
         .and_then(|null| nix::unistd::dup2_stdin(&null).map_err(std::io::Error::from))
     {
@@ -1125,12 +1114,9 @@ pub(crate) struct UpgradePlan<'a> {
 pub(crate) async fn upgrade_in_place(plan: UpgradePlan<'_>) -> Result<Handover, UpgradeError> {
     let started = plan.clock.monotonic();
     let next_generation = generation().saturating_add(1);
-    // Resolved before anything is frozen, so a deploy that has not landed yet
-    // costs the running app nothing at all.
+    // Resolved before anything is frozen, so a missing new binary leaves the app untouched.
     let binary = upgrade_binary()?;
 
-    // Everything one in-flight handoff owns, and the undo for every way it can
-    // fail to complete.
     let mut handoff = Handoff {
         dir: create_handoff_dir(next_generation, plan.entropy.as_ref())?,
         child: None,
@@ -1193,19 +1179,13 @@ impl Handoff {
         if let Some(taken_over) = self.settled {
             return taken_over;
         }
-        // `completed` is this process's *observation* that the successor took
-        // over, and it lags the fact by up to one poll interval. A successor
-        // that has already published readiness and is still running owns the
-        // socket and the state whether or not this process got to notice —
-        // so a cancellation inside that window (a `SIGTERM` between the
-        // successor's rename and our next poll) must not kill it, and must not
-        // hand this process's state back: the successor is writable, and two
-        // writable copies of one block is exactly the divergence the freeze
-        // exists to prevent.
+        // `completed` lags the takeover by up to one poll interval. A successor that has
+        // published readiness and is still running owns the socket and the state, so a
+        // cancellation in that window must neither kill it nor unfreeze here: two writable
+        // copies would diverge.
         //
-        // The lock makes that decision atomic with the successor's
-        // "publish + unfreeze": a successor mid-publish finishes first, so
-        // this process never kills one that has become writable.
+        // The lock makes this decision atomic with the successor's publish + unfreeze, so a
+        // successor mid-publish finishes first.
         let ready_path = self.dir.join("ready");
         let _lock = lock_for_decision(self.lock.take(), &ready_path, &mut self.child);
         let taken_over = self.completed
@@ -1219,9 +1199,8 @@ impl Handoff {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            // The successor never took over, so this process still owns the
-            // state's future. One that published and then died may have
-            // acknowledged writes first: take those back, then resume.
+            // A successor that published and then died may have acknowledged writes:
+            // take those back, then resume.
             if let Some(registry) = &self.registry {
                 if ready_path.exists() {
                     registry.restore_journal(&self.dir.join(JOURNAL_FILE));
@@ -1238,8 +1217,7 @@ impl Handoff {
 impl Drop for Handoff {
     fn drop(&mut self) {
         self.settle();
-        // The handoff directory carries application state; it never outlives
-        // the handoff, completed or abandoned.
+        // It holds application state, so it goes whether the handoff completed or not.
         remove_handoff_dir(&self.dir);
     }
 }
@@ -1289,9 +1267,8 @@ async fn spawn_and_await_successor(
 ) -> Result<u32, UpgradeError> {
     let ready_path = handoff.dir.join("ready");
 
-    // 1. Freeze and snapshot the designated state. From here until the
-    //    successor is serving, a write to that block is refused rather than
-    //    lost — and if anything below fails, the freeze is lifted again.
+    // 1. Freeze and snapshot. Until the successor serves, a write is refused rather than lost;
+    //    if anything below fails, `Handoff` lifts the freeze.
     let state_path = match &plan.registry {
         Some(registry) => {
             let envelope = registry.freeze_and_snapshot(next_generation)?;
@@ -1328,16 +1305,12 @@ async fn spawn_and_await_successor(
         "in-place upgrade: successor spawned, waiting for it to serve"
     );
 
-    // 3. Wait for the successor to serve — or to die trying. A successor that
-    //    cannot boot (a bad binary, a state it cannot account for, a socket it
-    //    cannot adopt) is the case this whole handshake exists for: the old
-    //    build keeps serving.
+    // 3. Wait for the successor to serve. If it cannot boot (bad binary, unreadable state,
+    //    socket it cannot adopt), the old build keeps serving.
     let deadline = plan.clock.monotonic().saturating_add(plan.ready_timeout);
     loop {
         if ready_path.exists() {
-            // Readiness is a file, so it outlives the process that wrote it:
-            // check the successor is still alive before releasing the one
-            // process that is definitely serving.
+            // Readiness is a file that outlives its writer: check the successor is still alive.
             return match child.try_wait() {
                 Ok(Some(status)) => Err(UpgradeError::SuccessorExited(format!(
                     "{status}, immediately after signalling readiness"
@@ -1352,9 +1325,8 @@ async fn spawn_and_await_successor(
             Err(error) => return Err(UpgradeError::Io(error)),
         }
         if plan.clock.monotonic() >= deadline {
-            // One last look before calling it: the successor may have published
-            // readiness in the very tick the budget ran out, and abandoning it
-            // then would kill a build that is already serving and writable.
+            // The successor may have published in the tick the budget ran out; abandoning it
+            // now would kill a build that is already serving and writable.
             if successor_took_over(&ready_path, child) {
                 return Ok(successor_pid);
             }
@@ -1785,7 +1757,6 @@ mod tests {
         );
         write_snapshot(&path, &envelope).expect("writes");
 
-        // Written owner-only: the snapshot is application state on disk.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1806,17 +1777,14 @@ mod tests {
 
     #[test]
     fn a_handover_this_build_did_not_complete_is_refused_rather_than_half_taken() {
-        // A build handed a listening socket that it never adopted must not
-        // release its predecessor: the address the predecessor is still serving
-        // would be abandoned. (Adoption is a process-global one-shot, so this
-        // test asserts the guard, not the adoption.)
+        // A build that never adopted its listening socket must not release its predecessor.
+        // Adoption is a process-global one-shot, so this tests the guard, not the adoption.
         temp_env::with_var(LISTEN_FD_ENV, Some("0"), || {
             let refusal = verify_handover_complete().expect_err("must refuse");
             assert!(refusal.contains("never adopted it"), "{refusal}");
         });
 
-        // ...and neither must a build that was handed live state and never
-        // installed it (an app that dropped its `with_live_state(...)` call).
+        // Nor one that was handed live state and never installed it (no `with_live_state`).
         let dir = std::env::temp_dir().join(format!(
             "autumn-upgrade-test-{}-{}",
             std::process::id(),
@@ -1832,8 +1800,6 @@ mod tests {
             assert!(refusal.contains("never adopted it"), "{refusal}");
         });
 
-        // A snapshot that *was* consumed leaves nothing behind, so the same
-        // check passes.
         let _ = read_snapshot(&path).expect("reads");
         temp_env::with_var(STATE_FILE_ENV, Some(&path), || {
             verify_handover_complete().expect("a consumed snapshot is a completed handover");
@@ -1844,17 +1810,13 @@ mod tests {
 
     #[test]
     fn a_successor_cannot_acknowledge_a_write_its_upgrade_might_still_discard() {
-        // A successor accepts the moment it adopts the socket, but until it
-        // signals readiness the upgrade can still be abandoned — at which point
-        // the predecessor resumes from the snapshot it took before spawning.
-        // A write acknowledged in that window would die with this process, so
-        // it is refused, exactly as on the predecessor's side of the handover.
+        // Until the successor signals readiness the upgrade can be abandoned and the predecessor
+        // resumes from its snapshot, so a write acknowledged here would be lost.
         let handle = LiveStateHandle::new_frozen(StatsV1::default());
 
         assert!(handle.is_frozen());
         assert_eq!(handle.write(|s| s.hits += 1), Err(LiveStateFrozen));
-        // Reads work throughout: the adopted state is complete, it is only its
-        // *future* that is not settled yet.
+        // Reads work: the adopted state is complete.
         assert_eq!(handle.read(|s| s.hits), 0);
 
         // Readiness is what settles it.
@@ -1865,10 +1827,8 @@ mod tests {
 
     #[test]
     fn readiness_that_cannot_be_published_is_an_error_not_a_shrug() {
-        // The predecessor is released by this file appearing. If it cannot be
-        // written, the predecessor times out and kills this process — so the
-        // caller has to know, rather than this logging and carrying on with a
-        // handover that will not complete.
+        // If the file cannot be written, the predecessor times out and kills this process, so
+        // the caller must get an error.
         let dir = std::env::temp_dir().join(format!(
             "autumn-upgrade-test-{}-{}",
             std::process::id(),
@@ -1898,7 +1858,6 @@ mod tests {
             "the file is renamed into place, never left half-written beside it"
         );
 
-        // A cold start has nobody to tell.
         temp_env::with_vars_unset([READY_FILE_ENV], || {
             assert!(
                 !publish_upgrade_readiness(|| ()).expect("a cold start publishes nothing"),
@@ -1984,11 +1943,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_successor_that_already_published_readiness_survives_an_abandoned_wait() {
-        // The window: the successor renames its readiness file and becomes
-        // writable, and a `SIGTERM` reaches this process before its next poll
-        // observes it. The successor owns the socket and the state by then —
-        // killing it would discard writes it has already acknowledged, and
-        // unfreezing here would leave two writable copies of one block.
+        // The successor has published readiness and become writable, and a `SIGTERM` arrives
+        // before the next poll sees it. Killing it would lose acknowledged writes; unfreezing
+        // here would leave two writable copies.
         let dir = scratch_dir(line!());
         std::fs::write(dir.join("ready"), "1").expect("the successor published readiness");
 
@@ -2032,9 +1989,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_drop_waits_for_a_successor_that_is_publishing() {
-        // Case 1 of #2350: the successor holds the lock while it publishes and
-        // unfreezes. A drop that decides without the lock sees "no readiness"
-        // and kills a successor that is about to be writable.
+        // #2350: the successor holds the lock while it publishes and unfreezes. A drop that
+        // decides without the lock sees no readiness and kills a successor about to be writable.
         let dir = scratch_dir(line!());
         std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
         let handle = LiveStateHandle::new(StatsV1::default());

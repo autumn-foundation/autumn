@@ -241,44 +241,35 @@ pub fn host_of(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    // Everything up to the first `/`, `?` or `#` is the authority.
     let authority = rest
         .split(['/', '?', '#'])
         .next()
         .filter(|authority| !authority.is_empty())?;
-    // Userinfo is refused rather than stripped: `https://api.example.com@evil`
-    // is a URL whose host is `evil`, and every allow-list bypass in the header
-    // of this module is a variation on reading it the other way round. A plugin
-    // has no use for userinfo, so refusing is a rule with no edge cases.
+    // Userinfo is refused, not stripped: the host of `https://api.example.com@evil` is `evil`.
+    // A plugin has no use for userinfo, so refusing it has no edge cases.
     if authority.contains('@') {
         return None;
     }
-    // IPv6 literals carry colons, which the port split below would mangle. They
-    // are refused outright: a literal address is not a name, so a name
-    // allow-list can neither grant nor deny one honestly.
+    // IPv6 literals are refused: the port split below would mangle them, and a name
+    // allow-list cannot meaningfully grant or deny an address.
     if authority.contains('[') || authority.contains(']') {
         return None;
     }
     let mut parts = authority.split(':');
     let host = parts.next()?;
     if let Some(port) = parts.next() {
-        // Exactly one colon, and digits after it. `a:b:c` is not a host.
+        // Exactly one colon, followed by digits.
         if parts.next().is_some() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
     }
-    // Length first, then the fold. `is_grantable_host` refuses anything over
-    // `MAX_HOST_LEN` anyway, but it did so *after* this copied the whole thing —
-    // and the URL is the guest's, bounded only by the frame. Checking the bound
-    // the answer already depends on costs nothing and makes the copy
-    // proportional to a host name rather than to whatever arrived.
+    // Check the length before lowercasing, so a guest-sized host is never copied.
     if host.len() > super::super::grants::MAX_HOST_LEN {
         return None;
     }
     let host = host.to_ascii_lowercase();
-    // The same shape the grant list is validated against, so a URL can never
-    // name something no grant could have named — including a trailing dot,
-    // which resolves identically and would compare unequal.
+    // The same rule the grant list is validated against, so a URL cannot name something no
+    // grant could, such as a trailing dot that resolves identically but compares unequal.
     super::super::grants::is_grantable_host(&host).then_some(host)
 }
 
@@ -296,8 +287,7 @@ pub fn attempted_authority(url: &str) -> String {
         .map_or(url, |(_, rest)| rest)
         .trim_start_matches('/');
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    // Userinfo is the case that matters: `api.example.com@attacker.test` must
-    // record `attacker.test`, which is where a browser or a client would go.
+    // `api.example.com@attacker.test` records `attacker.test`, where a client would go.
     let authority = authority.rsplit('@').next().unwrap_or(authority);
     if authority.is_empty() {
         url.to_owned()
@@ -334,14 +324,9 @@ pub(super) fn check_request(
             "not an outbound call",
         ));
     };
-    // Matched without allocating, and without folding the guest's string
-    // first. `to_ascii_uppercase` built a second full copy of whatever arrived
-    // *before* anything decided it was a method at all, so a frame carrying a
-    // megabyte-long "method" was copied once for the case fold and once more
-    // for the denial — work done ahead of the check that refuses it, and not
-    // covered by `outbound_request_bytes`, which is measured later and does not
-    // count the method. `eq_ignore_ascii_case` compares lengths first, so an
-    // overlong method loses against `GET` in constant time.
+    // Matched without allocating: the method is guest-sized and `outbound_request_bytes` does
+    // not count it. `eq_ignore_ascii_case` compares lengths first, so an overlong method is
+    // refused in constant time.
     let Some(&method) = ALLOWED_OUTBOUND_METHODS
         .iter()
         .find(|allowed| allowed.eq_ignore_ascii_case(method))
@@ -377,8 +362,8 @@ pub(super) fn check_request(
                 ),
             ));
         }
-        // A CR or LF in a value splits one request into two at the wire, which
-        // is a way to reach a path — or a host — the allow-list never saw.
+        // A CR or LF in a value splits one request into two on the wire, reaching a path or
+        // host the allow-list never saw.
         if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
             return Err(CallResult::denied(
                 id,
@@ -388,23 +373,14 @@ pub(super) fn check_request(
         }
     }
 
-    // Refused before the request is built, not after the backend has copied it:
-    // everything here is the guest's, and an unbounded request is host memory
-    // and egress an operator never agreed to when they granted a hostname.
-    //
-    // Headers count against the same budget as the body. Bounding only the body
-    // left the quota trivially sidesteppable: the allow-list caps how *many*
-    // headers may be set and says nothing about their size, so one `user-agent`
-    // could carry what the body was just refused for.
+    // Bounded before the request is built: an unbounded guest request is host memory and
+    // egress the operator never agreed to. Headers and the URL count with the body, since
+    // the allow-list caps how many headers may be set but not their size.
     let request_ceiling = runtime.quotas().outbound_request_bytes as usize;
     let header_weight: usize = headers
         .iter()
         .map(|(name, value)| name.len().saturating_add(value.len()))
         .fold(0, usize::saturating_add);
-    // The URL counts too. It is cloned into the request and handed to the
-    // backend like everything else, and a budget that omitted it left a guest
-    // free to send multi-megabyte request targets with an empty body — the
-    // quota reading zero for a call that is anything but.
     let request_weight = header_weight
         .saturating_add(body.len())
         .saturating_add(url.len());
@@ -476,11 +452,8 @@ pub(super) fn perform(
     };
     match client.fetch(request) {
         Ok(response) => {
-            // Where the bytes actually came from, re-checked against the grant.
-            // An implementation that followed a redirect must say so here, and
-            // this is where saying so is refused — see the module header on why
-            // checking only the outgoing URL bounds the first hop and nothing
-            // else.
+            // Re-check where the bytes came from: a client that followed a redirect reports it
+            // in `final_url`, and an ungranted host is refused here.
             let landed = host_of(&response.final_url);
             if landed.as_deref() != Some(host) {
                 return CallResult::denied(
@@ -496,13 +469,9 @@ pub(super) fn perform(
                     ),
                 );
             }
-            // Checked as it will be *encoded*, not as it was received. An
-            // upstream body of NULs is six bytes each once escaped, so a
-            // response inside a 256 KiB quota serializes past 1.5 MiB and
-            // overruns the reply queue — failing the whole request after the
-            // call has already been made, which for a POST a retry then
-            // repeats. The raw ceiling stays too, because that is the number
-            // the operator set and the one the message should quote.
+            // Check the encoded size: a body of NULs grows sixfold when escaped and would
+            // overrun the reply queue after the call was made. The raw quota is checked below
+            // too, since that is the number the operator set.
             let encoded = super::encoded_text_len(&response.body);
             if encoded > super::MAX_RESULT_BYTES {
                 return CallResult::denied(
@@ -517,10 +486,8 @@ pub(super) fn perform(
                 );
             }
             if response.body.len() > ceiling {
-                // `ResponseTooLarge` rather than `QuotaExceeded`: the request
-                // *left* and the upstream answered, so the audit surface must
-                // count this as a host that was called. A quota denial means
-                // nothing reached the network.
+                // `ResponseTooLarge`, not `QuotaExceeded`: the request left the host, so the
+                // audit surface counts the host as called. A quota denial means nothing left.
                 return CallResult::denied(
                     id,
                     DenialReason::ResponseTooLarge,
@@ -531,13 +498,8 @@ pub(super) fn perform(
                     ),
                 );
             }
-            // Headers are bounded here, not only by the allow-list. The
-            // list says *which* headers pass; it says nothing about how many
-            // or how long, and an upstream the plugin was granted can answer
-            // with a body inside `outbound_response_bytes` and megabytes of
-            // `etag`. The reply is serialized in full before the queue ceiling
-            // is checked, so an unbounded collect here is an upstream's way to
-            // make the host allocate and then fail the plugin's request.
+            // The allow-list says which headers pass, not how many or how long, so the upstream's
+            // headers are bounded here before the reply is serialized.
             let mut headers = Vec::new();
             let mut header_bytes = 0_usize;
             for (name, value) in response.headers {

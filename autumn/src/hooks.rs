@@ -124,11 +124,7 @@ impl MutationContext {
     pub fn new(op: MutationOp) -> Self {
         Self {
             op,
-            // Seed the actor from the ambient request-scoped current actor so
-            // generated writes auto-attribute to the authenticated principal
-            // with zero per-call wiring. `None` outside any scope, preserving
-            // the previous behavior. A `before_*` hook still overrides this,
-            // since hooks run after construction.
+            // A `before_*` hook can still override this: hooks run after construction.
             actor: crate::current::Current::actor(),
             request_id: Some(uuid::Uuid::new_v4().to_string()),
             now: crate::time::ambient_now(),
@@ -417,8 +413,8 @@ impl<T: Serialize> Serialize for Patch<T> {
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // When this method is called, the field WAS present in the JSON.
-        // Absent fields use the Default impl (→ Unchanged) via #[serde(default)].
+        // Only called for a field present in the JSON. An absent field gets
+        // `Default` (`Unchanged`) through `#[serde(default)]`.
         let opt: Option<T> = Option::deserialize(deserializer)?;
         Ok(opt.map_or_else(|| Self::Clear, Self::Set))
     }
@@ -426,32 +422,15 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
 
 // ── `Patch<T>` validator per-field trait impls (#1719) ───────────────
 //
-// The `#[repository(api = ...)]` macro generates an `UpdateModel` whose mutable
-// fields are `Patch<T>`. So that the model's declarative `#[validate(...)]`
-// rules are enforced on PATCH/PUT (returning a 422 with the same per-field
-// error map as create), the generated `UpdateModel` derives
-// `validator::Validate` and carries the field `#[validate]` attributes. That
-// derive expands to per-field calls like `self.title.validate_length(..)`,
-// so `Patch<T>` must implement validator's per-field traits.
+// The generated `UpdateModel` has `Patch<T>` fields and derives `validator::Validate`, so
+// `#[validate(...)]` rules run on PATCH/PUT. The derive calls per-field traits such as
+// `self.title.validate_length(..)`, which `Patch<T>` implements here.
 //
-// These impls mirror validator's own `Option<T>` impls: an absent field
-// (`Unchanged`/`Clear`) is skipped — it behaves like `None` and always passes —
-// while `Set(v)` delegates to the inner value's rule. `Patch` is a local type,
-// so implementing these foreign traits raises no orphan-rule issue.
-//
-// Only the *declarative, single-field* validators are implemented.
-// `must_match`/`nested`/`custom` are intentionally omitted: they are
-// meaningless or ill-typed on a tri-state patch field. `required` IS implemented
-// (below), but with distinct, non-skip semantics: unlike the other rules, an
-// absent field is not uniformly "pass" — `Clear` (explicit null on a required
-// field) must FAIL so a PATCH/PUT cannot violate the model's `required` contract
-// by nulling the column. `ValidateDoesNotContain`
-// is deliberately NOT implemented here — validator provides it automatically via
-// its blanket `impl<T: ValidateContains> ValidateDoesNotContain for T`, which
-// covers `Patch<T>` through the `ValidateContains` impl below (a manual impl
-// would collide with that blanket). `ValidateCreditCard` (validator's `card`
-// feature) and `ValidateNonControlCharacter` (its `unic` feature) are not
-// exported under this workspace's `validator` feature set, so they are omitted.
+// Like validator's `Option<T>` impls, `Unchanged` and `Clear` pass and `Set(v)` delegates.
+// `required` is the exception (below). Omitted: `must_match`/`nested`/`custom` (no meaning on
+// a patch field); `ValidateDoesNotContain` (validator's blanket impl over `ValidateContains`
+// covers it, and a manual impl would collide); `ValidateCreditCard` and
+// `ValidateNonControlCharacter` (behind validator features this workspace does not enable).
 
 impl<T: validator::ValidateLength<u64>> validator::ValidateLength<u64> for Patch<T> {
     fn length(&self) -> Option<u64> {
@@ -537,17 +516,9 @@ impl<T: validator::ValidateRegex> validator::ValidateRegex for Patch<T> {
     }
 }
 
-// `required` has *tri-state* semantics that differ from the skip-on-absent rules
-// above (#1719 / Codex P2). `required` is meaningful only on `Option`-typed model
-// fields, whose `UpdateModel` field is `Patch<Option<T>>`, so the bound is
-// `T: ValidateRequired` (satisfied by validator's `impl<T> ValidateRequired for
-// Option<T>`). The derive calls `self.field.validate_required()`:
-//   - `Unchanged` -> `true`: the field was omitted from the patch, so the
-//     existing (non-null) value is kept — nothing to reject.
-//   - `Clear`     -> `false`: an explicit JSON `null` on a required field would
-//     write SQL `NULL`, violating the `required` contract — reject (422).
-//   - `Set(v)`    -> delegate to the inner `Option<T>`: `Set(Some)` passes,
-//     `Set(None)` fails (same as create).
+// `required` applies to `Option` model fields, so the patch field is `Patch<Option<T>>`.
+// `Unchanged` keeps the existing value and passes. `Clear` would write SQL `NULL`, so it
+// fails (422). `Set(v)` delegates: `Set(None)` fails, as on create (#1719).
 impl<T: validator::ValidateRequired> validator::ValidateRequired for Patch<T> {
     fn validate_required(&self) -> bool {
         match self {
@@ -854,32 +825,23 @@ mod tests {
     }
 
     // ── Patch validator-trait tests (#1719) ─────────────────────
-    //
-    // `Patch<T>` mirrors validator's `Option<T>` impls: an absent field
-    // (`Unchanged`/`Clear`) always passes; a `Set(v)` field delegates to the
-    // inner value's rule. This lets the generated `UpdateModel` derive
-    // `validator::Validate` and enforce `#[validate(...)]` on PATCH/PUT.
 
     #[test]
     fn patch_validate_length_set_delegates_to_inner() {
         use validator::ValidateLength;
-        // `Set` with an empty string fails a `length(min = 1)` rule …
         assert!(!Patch::Set(String::new()).validate_length(Some(1), None, None));
-        // … while a `Set` with a satisfying value passes.
         assert!(Patch::Set(String::from("ok")).validate_length(Some(1), None, None));
     }
 
     #[test]
     fn patch_validate_length_absent_passes() {
         use validator::ValidateLength;
-        // Absent variants behave like `None`: the rule is skipped (passes).
         assert!(Patch::<String>::Unchanged.validate_length(Some(1), None, None));
         assert!(Patch::<String>::Clear.validate_length(Some(1), None, None));
     }
 
-    // `required` has tri-state semantics (#1719 / Codex P2): unlike the
-    // skip-on-absent rules, `Clear` and `Set(None)` must FAIL so a PATCH/PUT
-    // cannot null a `#[validate(required)]` column; `Unchanged` skips.
+    // Unlike the other rules, `required` fails `Clear` and `Set(None)`, so a PATCH/PUT
+    // cannot null a `#[validate(required)]` column.
     #[test]
     fn patch_validate_required_unchanged_passes() {
         use validator::ValidateRequired;
@@ -983,15 +945,13 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_context_auto_populates() {
-        // Construct inside an (empty) request scope so `actor` is deterministically
-        // `None`: an in-scope read never consults the process-global default actor,
-        // which a concurrent test (`current::…default_actor_is_used_only_out_of_scope`)
-        // may transiently have set. Avoids a test-isolation race on that global.
+        // An in-scope read never consults the process-global default actor, which a
+        // concurrent test may have set, so `actor` is reliably `None` here.
         crate::current::scope_request(async {
             let ctx = MutationContext::new(MutationOp::Create);
             assert!(ctx.actor.is_none());
             assert!(ctx.request_id.is_some());
-            // UUID v4 format: 8-4-4-4-12 = 36 chars
+            // UUID v4: 8-4-4-4-12 = 36 chars.
             assert_eq!(ctx.request_id.as_ref().unwrap().len(), 36);
             assert!(matches!(ctx.op, MutationOp::Create));
             assert!(ctx.invalidate_keys.is_empty());
@@ -1016,15 +976,12 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_context_seeds_actor_from_ambient_scope() {
-        // Inside an (empty) request scope the constructor yields `None`
-        // deterministically — an in-scope read never consults the process-global
-        // default actor a concurrent test may transiently have set (isolation).
+        // In scope, the process-global default actor a concurrent test may set is not read.
         crate::current::scope_request(async {
             assert!(MutationContext::new(MutationOp::Create).actor.is_none());
         })
         .await;
 
-        // Inside `with_actor(...)` the constructor auto-populates the actor.
         crate::current::with_actor("u1", async {
             let ctx = MutationContext::new(MutationOp::Create);
             assert_eq!(ctx.actor.as_deref(), Some("u1"));
@@ -1075,7 +1032,6 @@ mod tests {
 
     #[tokio::test]
     async fn no_hooks_commit_variants_are_noop() {
-        // after_*_commit variants must also be no-ops on NoHooks
         let hooks: NoHooks<(), (), ()> = NoHooks::default();
         let mut ctx = MutationContext::new(MutationOp::Create);
         let model = ();
@@ -1147,7 +1103,7 @@ mod tests {
         hooks.after_delete_commit(&mut ctx, &model).await.unwrap();
 
         assert_eq!(CALLS.load(Ordering::SeqCst), 3);
-        let _ = Arc::new(CountingHooks); // ensure Arc usage works (Clone check)
+        let _ = Arc::new(CountingHooks);
     }
 
     // ── Patch serde tests ──────────────────────────────────────────
@@ -1286,7 +1242,6 @@ mod tests {
             assert!(field.changed());
             assert_eq!(field.after(), &20);
         }
-        // Verify mutation propagated to the original variable
         assert_eq!(after, 20);
     }
 

@@ -54,21 +54,14 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 /// app and can be reasoned about once.
 #[rustfmt::skip]
 pub const RICH_TEXT_ALLOWED_TAGS: &[&str] = &[
-    // Block structure
     "p", "br", "hr", "blockquote",
-    // Headings
     "h1", "h2", "h3", "h4", "h5", "h6",
-    // Inline formatting. `sub`/`sup` have no CommonMark syntax and so are
-    // unreachable from `render_user_content_html`; they are allowlisted for
-    // `sanitize_user_html` callers whose source is already HTML.
+    // `sub`/`sup` have no CommonMark syntax; they serve `sanitize_user_html` callers whose
+    // source is already HTML.
     "em", "strong", "del", "sub", "sup",
-    // Links
     "a",
-    // Lists
     "ul", "ol", "li",
-    // Code
     "code", "pre",
-    // Tables
     "table", "thead", "tbody", "tr", "th", "td",
 ];
 
@@ -258,10 +251,8 @@ fn build_sanitizer() -> ammonia::Builder<'static> {
     // Per-tag attribute allowlist. Everything not named here — every `on*`
     // handler, `id`, `name`, `srcdoc`, `formaction`, … — is dropped.
     let attrs: HashMap<&str, HashSet<&str>> = HashMap::from([
-        // `rel` is deliberately absent from `a`: `link_rel` above makes ammonia
-        // *set* it on every surviving `<a>`, and ammonia asserts the two are
-        // not both configured (an input-supplied `rel` would otherwise win over
-        // the forced hardening).
+        // No `rel` on `a`: `link_rel` sets it on every `<a>`, and ammonia asserts the
+        // two are not both configured.
         ("a", HashSet::from(["href", "title"])),
         ("code", HashSet::from(["class"])),
         ("pre", HashSet::from(["class"])),
@@ -272,14 +263,12 @@ fn build_sanitizer() -> ammonia::Builder<'static> {
     builder.tag_attributes(attrs);
     builder.generic_attributes(HashSet::new());
 
-    // The three attributes above that carry a *value* space wide enough to be
-    // abused (`class` selectors, `style` declarations) are narrowed to exactly
-    // the shapes the Markdown renderer itself produces.
+    // `class` and `style` values are wide enough to abuse, so they are narrowed to the
+    // shapes the Markdown renderer itself produces.
     builder.attribute_filter(|element, attribute, value| match (element, attribute) {
         ("code" | "pre", "class") => {
-            // Only the `language-{lang}` hint from a fenced code block, and only
-            // when `{lang}` is a plain identifier — never an arbitrary class an
-            // attacker could use to hook the host page's CSS or JS selectors.
+            // Only a `language-{lang}` hint with a plain identifier, never a class that
+            // could hook the host page's CSS or JS selectors.
             let is_language_hint = value.strip_prefix("language-").is_some_and(|lang| {
                 !lang.is_empty()
                     && lang
@@ -428,11 +417,8 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SafeEvents<'a, I> {
                             id,
                         }));
                     }
-                    // Rejected scheme: drop the anchor and keep the text. The
-                    // parser emits the link's visible text as its own `Text`
-                    // event — including for an autolink, whose text is the
-                    // destination — so suppressing just the `Start`/`End` pair
-                    // preserves it exactly once.
+                    // Rejected scheme: drop the anchor. The link text (an autolink's too)
+                    // is its own `Text` event, so suppressing `Start`/`End` keeps it once.
                     self.dropped_links.push(true);
                 }
                 Event::End(TagEnd::Link) => {

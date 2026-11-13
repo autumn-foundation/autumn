@@ -688,9 +688,8 @@ impl<'a> Renderer<'a> {
                 self.check_iterations(list.len(), path)?;
                 Box::new(list.into_iter().map(|item| Bound::Shared(Rc::new(item))))
             }
-            // A non-list renders nothing. Upstream's client runtime would
-            // throw here; rendering an empty list is the behaviour that
-            // degrades a generated page rather than losing it.
+            // A non-list renders nothing, so a bad value degrades the page
+            // rather than failing it.
             _ => return Ok(()),
         };
         for (i, item) in passes.enumerate() {
@@ -741,10 +740,8 @@ impl<'a> Renderer<'a> {
         depth: usize,
         out: &mut String,
     ) -> Result<(), ConstelaError> {
-        // Validation proved this resolves. Looked up rather than indexed all
-        // the same: a panic here is a 500 on a request carrying a document
-        // someone generated, so the one place that reasoning could be wrong is
-        // an error, not a crash.
+        // Validation proved this resolves; looked up rather than indexed so a
+        // broken invariant is an error, not a panic.
         let document: &'a super::Document = self.document;
         let Some(component) = document.program().components.get(name) else {
             return Err(ConstelaError::Render(Diagnostic::new(
@@ -797,9 +794,8 @@ impl<'a> Renderer<'a> {
         out: &mut String,
     ) -> Result<(), ConstelaError> {
         let tag = tag.to_ascii_lowercase();
-        // Validation proved the tag is on the allowlist. Re-checking costs a
-        // lookup and means a future path that reaches the renderer without
-        // going through validation still cannot emit a `<script>`.
+        // Validation already checked the allowlist. Re-checking means a path
+        // that skips validation still cannot emit a `<script>`.
         if !policy::is_allowed_tag(&tag) {
             return Err(ConstelaError::Render(Diagnostic::new(
                 path.to_string(),
@@ -869,11 +865,9 @@ impl<'a> Renderer<'a> {
         self.write(out, &tag, path)?;
         for (name, value) in &attrs {
             match value {
-                // An empty value is written as the bare attribute name. That
-                // is right for both readings: a boolean prop that evaluated to
-                // `true` (`disabled`), and a string prop that evaluated to ""
-                // (`alt=""` on a decorative image) — HTML parses an attribute
-                // with no value as the empty string, so the two coincide.
+                // An empty value is written as the bare name. HTML parses that
+                // as the empty string, so it serves both a `true` boolean prop
+                // (`disabled`) and an empty string (`alt=""`).
                 Some(value) if value.is_empty() => {
                     self.write(out, " ", path)?;
                     self.write(out, name, path)?;

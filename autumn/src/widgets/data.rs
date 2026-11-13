@@ -299,7 +299,6 @@ pub fn data_table<T>(
     config: &DataTableConfig<'_>,
 ) -> maud::Markup {
     let col_count = columns.len();
-    // Hoist loop-invariant: query/drop-keys are the same for every sortable column.
     let filtered = dt_filter_query(
         config.query,
         &[config.sort_param, config.dir_param, config.page_param],
@@ -314,7 +313,6 @@ pub fn data_table<T>(
                 tr {
                     @for col in columns {
                         @if let Some(sort_key) = col.sort_key {
-                            // Determine sort direction for this column's link.
                             @let is_active = config.active_sort == Some(sort_key);
                             @let link_dir = if is_active {
                                 config.active_dir.toggled()
@@ -434,7 +432,7 @@ impl BadgeVariant {
                 Self::Neutral
             }
             other => {
-                // Deterministic fallback over the colored (non-neutral) set.
+                // An unknown value gets a stable color from the non-neutral set.
                 const SET: [BadgeVariant; 4] = [
                     BadgeVariant::Info,
                     BadgeVariant::Success,
@@ -1074,7 +1072,6 @@ mod tests {
         assert!(html.contains("<tbody"), "{html}");
         assert!(html.contains("hello"), "{html}");
         assert!(html.contains("world"), "{html}");
-        // Two data rows
         assert_eq!(
             html.matches("<tr").count(),
             3,
@@ -1120,7 +1117,6 @@ mod tests {
         let html = data_table(&[], &cols, &DataTableConfig::new("Nothing here")).into_string();
         assert!(html.contains("Nothing here"), "{html}");
         assert!(html.contains(r#"colspan="3""#), "{html}");
-        // Only the header tr, no data rows
         assert_eq!(html.matches("<tr").count(), 2, "header + empty row: {html}");
     }
 
@@ -1135,7 +1131,6 @@ mod tests {
     fn data_table_nonsortable_header_is_plain() {
         let cols: Vec<Column<i32>> = vec![Column::new("Title", |_| maud::html! { "t" })];
         let html = data_table(&[1i32], &cols, &DataTableConfig::new("e")).into_string();
-        // No sort link in header
         let thead_end = html.find("</thead>").unwrap_or(html.len());
         let thead = &html[..thead_end];
         assert!(!thead.contains("<a "), "{html}");
@@ -1163,7 +1158,6 @@ mod tests {
             .active_dir(SortDir::Asc);
         let html = data_table(&[1i32], &cols, &cfg).into_string();
         assert!(html.contains(r#"aria-sort="ascending""#), "{html}");
-        // toggled dir link
         assert!(html.contains("dir=desc"), "{html}");
     }
 
@@ -1186,13 +1180,10 @@ mod tests {
             .base_path("/posts")
             .query("q=foo&sort=old&dir=asc&page=3");
         let html = data_table(&[1i32], &cols, &cfg).into_string();
-        // old sort params stripped, new sort=name present
         assert!(html.contains("sort=name"), "{html}");
-        // page stripped (reset to page 1)
+        // A new sort resets to page 1.
         assert!(!html.contains("page=3"), "{html}");
-        // q preserved
         assert!(html.contains("q=foo"), "{html}");
-        // no duplicate old sort
         assert!(!html.contains("sort=old"), "{html}");
     }
 

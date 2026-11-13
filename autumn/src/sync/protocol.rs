@@ -306,9 +306,8 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
 
-        // Explicit null: a REAL JSON document (e.g. store.put(&None::<T>)) —
-        // must survive as "payload": null and come back as Some(Null), not
-        // collapse into an omitted payload the server would reject.
+        // Explicit null is a real JSON document (e.g. `store.put(&None::<T>)`). It must stay
+        // `"payload": null`: an omitted payload would be rejected by the server.
         let mut change = sample_change();
         change.payload = Some(serde_json::Value::Null);
         let json = serde_json::to_string(&change).unwrap();
@@ -318,7 +317,6 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
 
-        // Ordinary value round-trips unchanged.
         let change = sample_change();
         let json = serde_json::to_string(&change).unwrap();
         assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
@@ -341,16 +339,15 @@ mod tests {
         assert!(!json.contains("payload"), "{json}");
         assert_eq!(serde_json::from_str::<RemoteRow>(&json).unwrap(), tombstone);
 
-        // Live row whose document IS null: present on the wire, intact back
-        // — a collapse to None would materialize as an absent row on pull.
+        // A live row whose document is null: collapsing to None would materialize as an absent
+        // row on pull.
         let null_row = row(Some(serde_json::Value::Null), false);
         let json = serde_json::to_string(&null_row).unwrap();
         assert!(json.contains(r#""payload":null"#), "{json}");
         assert_eq!(serde_json::from_str::<RemoteRow>(&json).unwrap(), null_row);
 
-        // The Y dedup snapshot (serde_json::to_value/from_value on the
-        // resolved row) uses the same field encoding — Some(Null) must
-        // round-trip through a Value too.
+        // The dedup snapshot (`to_value`/`from_value` on the resolved row) uses the same
+        // encoding, so Some(Null) must round-trip through a Value too.
         let snapshot = serde_json::to_value(&null_row).unwrap();
         assert_eq!(
             serde_json::from_value::<RemoteRow>(snapshot).unwrap(),

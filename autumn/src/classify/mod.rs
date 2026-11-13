@@ -483,9 +483,8 @@ where
 {
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Recover from poisoning rather than silently handing back a live-looking
-    // guard for an observer that was never registered: the list holds only
-    // `Arc`s, so a panic while another observer ran left nothing inconsistent.
+    // Recover from poisoning so the guard never refers to an observer that was not registered.
+    // The list holds only `Arc`s, so a panic elsewhere left nothing inconsistent.
     let mut list = observers()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -567,8 +566,8 @@ macro_rules! declassify {
         purpose = $purpose:literal,
         reason = $reason:literal $(,)?
     ) => {
-        // A boundary whose justification is three spaces is the one nobody can
-        // review -- the same BLANK rule `acknowledge_stale` enforces.
+        // A blank justification cannot be reviewed: the same BLANK rule `acknowledge_stale`
+        // enforces.
         const _: () = assert!(
             !$crate::classify::reason_is_blank($purpose),
             "declassify! requires a non-blank purpose",
@@ -747,10 +746,9 @@ mod tests {
 
     #[test]
     fn equality_sees_through_the_wrapper_but_hashing_is_not_offered() {
-        // `PartialEq` is what the generated repository correlation and
-        // `UpdateDraft` changed-field check need. `Hash` is deliberately absent:
-        // a stable digest of a low-entropy personal value is `Serialize`, and so
-        // is an offline-brute-forceable view of the value itself.
+        // The generated repository correlation and `UpdateDraft` changed-field check need
+        // `PartialEq`. `Hash` is absent on purpose: a stable digest of a low-entropy personal
+        // value is serializable and can be brute-forced offline.
         let a: Classified<String, TestField> = "x".to_string().into();
         let b: Classified<String, TestField> = "x".to_string().into();
         let c: Classified<String, TestField> = "y".to_string().into();

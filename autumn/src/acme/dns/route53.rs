@@ -119,9 +119,8 @@ impl Route53Provider {
             .filter(|id| !id.is_empty())
         {
             let id = strip_zone_prefix(explicit);
-            // The id goes straight into the request PATH, so it is held to Route
-            // 53's own charset rather than trusted: a stray `/`, `?` or `..`
-            // from a mistyped credential would otherwise reshape the request.
+            // The id goes into the request path, so a stray `/`, `?` or `..` from a mistyped
+            // credential would reshape the request.
             if !is_hosted_zone_id(id) {
                 return Err(format!(
                     "the configured Route 53 `hosted_zone_id` is not a hosted zone id: expected \
@@ -130,12 +129,9 @@ impl Route53Provider {
             }
             return Ok(id.to_owned());
         }
-        // Keyed on the whole challenge name, not on the suffix that turned out
-        // to be its zone. A suffix-keyed cache scanned across candidates hands
-        // back a cached PARENT before the more specific child has ever been
-        // queried, so once one order resolved `example.com`, a later name in the
-        // separately delegated `sub.example.com` would be written into the
-        // parent zone, where nothing is authoritative for it (issue #1620).
+        // Keyed on the whole challenge name, not the zone suffix: a suffix-keyed cache returns a
+        // cached parent (`example.com`) before a separately delegated child (`sub.example.com`)
+        // is ever queried, writing the record where nothing is authoritative (#1620).
         if let Some(cached) = self
             .zone_ids
             .read()
@@ -231,15 +227,14 @@ impl Route53Provider {
         previous: &TxtRrset,
     ) -> Result<(), String> {
         let (action, applied) = if values.is_empty() {
-            // Route 53 rejects an empty ResourceRecords list, so removing the
-            // last value means deleting the whole set — and a DELETE must carry
-            // the set exactly as it stands today, TTL included.
+            // Route 53 rejects an empty ResourceRecords list, so removing the last value deletes
+            // the set, and a DELETE must carry the live set exactly, TTL included.
             ("DELETE", previous.values.as_slice())
         } else {
             ("UPSERT", values)
         };
         if applied.is_empty() {
-            // Nothing was there and nothing is wanted: a no-op, not an error.
+            // Nothing was there and nothing is wanted.
             return Ok(());
         }
         let ttl = previous.ttl.unwrap_or(CHALLENGE_TTL_SECS);
@@ -550,8 +545,8 @@ fn txt_rrset_for(xml: &str, fqdn: &str) -> TxtRrset {
         .into_iter()
         .find(|set| {
             xml_element(set, "Name").is_some_and(|n| {
-                // Route 53 escapes a leading underscore label as-is but octal-
-                // escapes some characters; `_acme-challenge` needs no decoding.
+                // Route 53 octal-escapes some characters in names, but none that
+                // `_acme-challenge` names contain, so no decoding is needed.
                 n.to_ascii_lowercase() == wanted
             }) && xml_element(set, "Type") == Some("TXT")
         })
@@ -560,9 +555,7 @@ fn txt_rrset_for(xml: &str, fqdn: &str) -> TxtRrset {
                 .into_iter()
                 .map(|v| xml_unescape(v).trim_matches('"').to_owned())
                 .collect(),
-            // Absent or unparseable is treated as "no existing set", which makes
-            // the write use autumn's own short challenge TTL — the same thing it
-            // does when the name does not exist at all.
+            // Absent or unparseable falls back to autumn's challenge TTL, as for a new set.
             ttl: xml_element(set, "TTL").and_then(|t| t.trim().parse().ok()),
         })
         .unwrap_or_default()
@@ -574,12 +567,9 @@ fn txt_rrset_for(xml: &str, fqdn: &str) -> TxtRrset {
 /// same ACME DNS-01 zone-discovery rule (issue #1620) —
 /// `zone_candidates_match_cloudflare` below fails the build if the two drift.
 fn zone_candidates(fqdn: &str) -> Vec<String> {
-    // The `_acme-challenge` label is NOT stripped: delegating
-    // `_acme-challenge.example.com` to a zone of its own (so an ACME client
-    // needs credentials for nothing else) is a supported and recommended
-    // setup, and stripping the label would skip that zone and write the
-    // record into the parent, where nothing answers for it (issue #1620).
-    // It is simply the most specific candidate, tried first.
+    // The `_acme-challenge` label is kept as the first candidate: delegating it to its own zone
+    // (so ACME credentials reach nothing else) is a supported setup, and stripping it would write
+    // the record into the parent, where nothing answers for it (#1620).
     let name = fqdn.trim().trim_end_matches('.');
     let labels: Vec<&str> = name.split('.').filter(|l| !l.is_empty()).collect();
     (0..labels.len().saturating_sub(1))
@@ -601,10 +591,9 @@ fn check_response(
     if response.is_success() {
         return Ok(response.body.clone());
     }
-    // AWS answers a signature mismatch by echoing the canonical request it
-    // expected — which carries every signed header, `x-amz-security-token`
-    // included. This message reaches the unauthenticated `/actuator/health` and
-    // the operator's alert destination, so it is scrubbed and bounded first.
+    // A signature-mismatch reply echoes the canonical request, `x-amz-security-token` included.
+    // This message reaches the unauthenticated `/actuator/health` and operator alerts, so it is
+    // scrubbed and bounded first.
     let detail = xml_element(&response.body, "Message").map_or_else(
         || "no error detail returned".to_owned(),
         |message| sanitize_upstream(&xml_unescape(message), secrets),
@@ -767,12 +756,9 @@ fn sign_request_for_service(
     }
 
     let (canonical_uri, canonical_query) = split_url(&request.url);
-    // `BTreeMap` already holds the headers sorted by name, which is what the
-    // canonical request and `SignedHeaders` both require.
-    // SigV4 sorts by the LOWERCASED header name, and `SignedHeaders` must list
-    // them in exactly the order `canonical_headers` renders them. Lowercasing on
-    // the way into the map makes the `BTreeMap`'s own ordering canonical, so a
-    // future `.header("Content-Type", …)` cannot silently desynchronise the two.
+    // SigV4 sorts headers by lowercased name, and `SignedHeaders` must list them in the order
+    // `canonical_headers` renders them. Lowercasing into the `BTreeMap` makes its order canonical,
+    // so a mixed-case `.header("Content-Type", …)` cannot desynchronise the two.
     request.headers = request
         .headers
         .into_iter()
@@ -1435,9 +1421,8 @@ mod tests {
                 "the secret key must never reach a URL"
             );
         }
-        // One walk: `_acme-challenge.myapp.com` (not a delegated zone) then
-        // `myapp.com` (the zone). The SECOND record adds none — that is what
-        // "cached" means here.
+        // One walk: `_acme-challenge.myapp.com` (not a zone), then `myapp.com` (the zone). The
+        // second record adds no lookups.
         assert_eq!(
             transport
                 .calls()
@@ -1669,8 +1654,8 @@ mod tests {
         assert_eq!(format_amz_date(1_709_208_000), "20240229T120000Z");
     }
 
-    // AC/R3: an apex + wildcard order publishes TWO values at one name. The
-    // record set written back must carry both.
+    // An apex + wildcard order publishes two values at one name; the set written back must carry
+    // both.
     #[test]
     fn change_batch_carries_every_value_in_the_set() {
         let xml = change_batch_xml(
@@ -1699,9 +1684,8 @@ mod tests {
             Some("Z0001")
         );
 
-        // Route 53 answers with the NEXT zone lexicographically when the asked-for
-        // one does not exist; returning it would write the challenge into a
-        // stranger's zone.
+        // Route 53 answers with the next zone lexicographically when the asked-for one does not
+        // exist; returning it would write the challenge into a stranger's zone.
         let other = r"<ListHostedZonesByNameResponse><HostedZones>
             <HostedZone><Id>/hostedzone/Z9999</Id><Name>notmyapp.com.</Name></HostedZone>
             </HostedZones></ListHostedZonesByNameResponse>";
@@ -1770,11 +1754,8 @@ mod tests {
         assert!(!err.contains("name=secretish"), "got: {err}");
     }
 
-    // AWS's `SignatureDoesNotMatch` reply echoes the canonical request, which
-    // contains every signed header — including the STS session token this
-    // process is holding. That reply is published on the unauthenticated
-    // `/actuator/health` and pushed to Slack/PagerDuty, so it must not carry the
-    // credential through.
+    // `SignatureDoesNotMatch` echoes the canonical request, STS session token included. The
+    // message is published on the unauthenticated `/actuator/health` and pushed to alerts.
     #[test]
     fn a_signature_mismatch_reply_cannot_carry_the_session_token_through() {
         let mut creds = credentials();

@@ -194,11 +194,9 @@ impl S3Destination {
             // No client-wide total timeout: a base snapshot upload is
             // legitimately long. Small requests set their own below.
             .timeout(None)
-            // A signature covers the path it was computed for, so a redirect is
-            // useless to us and dangerous: a same-host scheme downgrade would
-            // re-send the Authorization header in cleartext, and a 307 would
-            // replay the request BODY — a WAL segment, or the database itself —
-            // to whatever host the endpoint named.
+            // No redirects: a scheme downgrade would re-send the Authorization header in
+            // cleartext, and a 307 would replay the body (a WAL segment or the whole database)
+            // to whatever host it names.
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| DestinationError::Rejected {
@@ -346,10 +344,8 @@ impl S3Destination {
                 request = request.timeout(REQUEST_TIMEOUT).body(bytes);
             }
             RequestBody::File { path, .. } => {
-                // Stream from disk: a base snapshot is a whole (gzipped)
-                // database, and buffering it would double the replicator's peak
-                // memory inside the app process. No total timeout for the same
-                // reason — the connect timeout still fails fast on a dead host.
+                // Stream from disk: buffering a whole gzipped database would double peak memory
+                // in the app process. No total timeout; the connect timeout catches a dead host.
                 let file = std::fs::File::open(path)
                     .map_err(DestinationError::io("open the upload source"))?;
                 request = request.body(file);
@@ -358,9 +354,8 @@ impl S3Destination {
 
         let response = request.send().map_err(|e| DestinationError::Io {
             op,
-            // reqwest's Display appends the request URL, which can carry
-            // userinfo on a misconfigured endpoint. `validate_endpoint` already
-            // refuses those, and this is the belt to that suspenders.
+            // reqwest's Display appends the request URL. `validate_endpoint` already refuses
+            // userinfo; redact anyway.
             detail: super::redact_credentials(&e.to_string()),
         })?;
         let status = response.status();
@@ -400,12 +395,9 @@ fn validate_endpoint(endpoint: &str) -> Result<(), DestinationError> {
             ),
         });
     }
-    // Same reasoning for a query or a fragment. `send` appends the canonical
-    // path to the endpoint string, so `https://host?tenant=a` becomes
-    // `https://host?tenant=a/bucket/key` on the wire while SigV4 signs
-    // `/bucket/key` with an empty canonical query: the server sees a different
-    // path and query than was signed, and every request 403s — after setup
-    // reported success.
+    // A query or fragment breaks signing too: `send` appends the path to the endpoint, so the
+    // wire carries `https://host?tenant=a/bucket/key` while SigV4 signs `/bucket/key` with an
+    // empty query, and every request 403s.
     if url.query().is_some() || url.fragment().is_some() {
         return Err(DestinationError::Rejected {
             detail: format!(
@@ -414,9 +406,8 @@ fn validate_endpoint(endpoint: &str) -> Result<(), DestinationError> {
             ),
         });
     }
-    // Credentials belong in the environment variables config NAMES, never in the
-    // endpoint: an endpoint string is logged at startup, printed by `autumn db
-    // replica status`, and stored in the health indicator's `destination` field.
+    // The endpoint is logged at startup, printed by `autumn db replica status` and published
+    // in the health indicator, so credentials go in the named environment variables instead.
     if !url.username().is_empty() || url.password().is_some() {
         return Err(DestinationError::Rejected {
             detail: "the replication endpoint must not embed credentials; set \
@@ -495,8 +486,7 @@ fn stream_to_file(
     };
     if outcome.is_err() {
         drop(file);
-        // Never leave a partial body behind under the caller's path: the restore
-        // path would take it for a complete object.
+        // A restore would take a partial body for a complete object.
         let _ = std::fs::remove_file(path);
     }
     outcome
@@ -563,9 +553,7 @@ impl ReplicaDestination for S3Destination {
 
     fn put_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
         validate_key(key)?;
-        // Hashed and streamed rather than read into memory: this is a whole
-        // gzipped database, and buffering it would double the replicator's peak
-        // memory inside the app process.
+        // Hashed and streamed, not buffered: this is a whole gzipped database.
         let (sha256_hex, len) = sha256_file(path)?;
         if len > MAX_SINGLE_PUT {
             return Err(DestinationError::Rejected {
@@ -609,12 +597,9 @@ impl ReplicaDestination for S3Destination {
             "",
             RequestBody::EmptyStreamed,
         )?;
-        // A base snapshot is the one object that can legitimately be large — up
-        // to what a single `PutObject` accepted — so it streams to disk rather
-        // than through memory, and its limit is that upload ceiling rather than
-        // the in-memory one. One byte past the ceiling is a refusal, never a
-        // truncated file: a short gzip stream would restore as a "clean"
-        // database missing its tail.
+        // A base snapshot can be as large as one `PutObject` allows, so it streams to disk under
+        // that ceiling. Past it is a refusal, never a truncated file: a short gzip stream would
+        // restore as a "clean" database missing its tail.
         stream_to_file(response, path, MAX_SINGLE_PUT, key)
     }
 
@@ -631,8 +616,7 @@ impl ReplicaDestination for S3Destination {
                 self.send("list", reqwest::Method::GET, "", &query, RequestBody::Empty)?;
             let body = read_bounded(response, MAX_RESPONSE_BYTES)?;
             let (page, next) = parse_list_objects(&String::from_utf8_lossy(&body))?;
-            // Never trust the endpoint's own filtering: a key outside the
-            // requested prefix has no business in this listing.
+            // Do not trust the endpoint to filter by prefix.
             keys.extend(page.into_iter().filter(|key| key.starts_with(prefix)));
             let Some(next) = next else {
                 keys.sort();

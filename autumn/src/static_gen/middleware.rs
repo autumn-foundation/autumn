@@ -289,11 +289,8 @@ impl StaticFileLayer {
     pub fn new(dist_dir: impl Into<PathBuf>) -> Option<Self> {
         let dist_dir = dist_dir.into();
         let manifest_path = dist_dir.join("manifest.json");
-        // A manifest that is *present but unparseable* used to disable static
-        // serving with no trace at all — every pre-rendered page silently fell
-        // through to the dynamic router. Absent is the normal "this app has no
-        // static build" case and stays quiet; malformed is a misconfiguration
-        // and says so.
+        // An absent manifest means no static build and stays quiet. A malformed one is a
+        // misconfiguration that sends every pre-rendered page to the dynamic router, so log it.
         let manifest = match StaticManifest::load(&manifest_path) {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -418,15 +415,13 @@ impl StaticFileLayer {
         let entry = self.manifest.routes.get(request_path)?;
         let file_path = self.dist_dir.join(&entry.file);
 
-        // Check ISR staleness
         if let Some(revalidate) = entry.revalidate {
             self.maybe_trigger_isr(
                 request_path,
                 &file_path,
                 revalidate,
-                // Only a value the serve path would actually honour: an
-                // unusable one is ignored there, so treating it as the ISR
-                // expectation would refuse every regeneration forever.
+                // Only a type the serve path honours: it ignores an unusable one, so using
+                // that as the expectation would refuse every regeneration forever.
                 isr_expected_content_type(entry, request_path, &file_path).as_deref(),
             );
         }
@@ -447,7 +442,6 @@ impl StaticFileLayer {
         revalidate_secs: u64,
         recorded_content_type: Option<&str>,
     ) {
-        // Check file age
         let is_stale = file_mtime_age_secs(file_path).is_none_or(|age| age > revalidate_secs);
 
         if !is_stale {
@@ -459,35 +453,29 @@ impl StaticFileLayer {
         };
 
         let Some(router) = &self.isr_router else {
-            // No router configured -- ISR detection only, no regeneration
             return;
         };
 
-        // Check cooldown -- don't retry too fast after a failure
+        // Cooldown, so a failing route is not re-rendered on every request.
         let now = unix_now();
         let last = route_state.last_attempt.load(Ordering::Relaxed);
         if last > 0 && now.saturating_sub(last) < REGEN_COOLDOWN_SECS {
             return;
         }
 
-        // Try to claim the in-flight flag (CAS: false -> true).
-        // This prevents this process from spawning more than one task per route.
+        // At most one regeneration task per route in this process.
         if route_state
             .in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
-            // Another task is already regenerating this route in this process
             return;
         }
 
-        // Record attempt time
         route_state.last_attempt.store(now, Ordering::Relaxed);
 
-        // Compute the revalidation window key for distributed coordination
         let window_key = isr_window_key(url_path, revalidate_secs, now);
 
-        // Spawn background regeneration
         let router = Arc::clone(router);
         let url = url_path.to_owned();
         let dest = file_path.to_owned();
@@ -496,16 +484,14 @@ impl StaticFileLayer {
         let expected_content_type = recorded_content_type.map(str::to_owned);
 
         tokio::spawn(async move {
-            // RAII guard: clears the in_flight flag when this scope exits,
-            // including on panic, so ISR is never permanently disabled for
-            // a route after a handler crash.
+            // Clears `in_flight` on every exit, including a panic, so a handler crash
+            // cannot disable ISR for the route.
             let _guard = InFlightReset {
                 state: &in_flight,
                 url: &url,
             };
 
-            // Distributed coordination: prevents multiple replicas from
-            // regenerating the same route in the same revalidation window.
+            // Keeps replicas from regenerating the same route in the same window.
             let acquired = coordinator.try_acquire(&url, &window_key).await;
             if !acquired {
                 tracing::debug!(
@@ -513,7 +499,7 @@ impl StaticFileLayer {
                     url,
                     coordinator.backend()
                 );
-                return; // _guard drops here, resetting in_flight
+                return;
             }
 
             let result =
@@ -530,7 +516,6 @@ impl StaticFileLayer {
                     tracing::warn!("ISR: regeneration failed for route: {}, error: {}", url, e);
                 }
             }
-            // _guard drops here, resetting in_flight
         });
     }
 }
@@ -699,11 +684,9 @@ fn normalize_content_type(value: &str) -> Vec<String> {
     let media_type = segments.next().unwrap_or("").trim().to_ascii_lowercase();
 
     let mut parameters: Vec<String> = segments
-        // An empty segment carries no meaning, so a trailing or doubled `;`
-        // must not make two otherwise-identical types compare unequal. Without
-        // this, a handler that re-emits `text/html; charset=utf-8;` would be
-        // refused by the ISR check forever against a recorded
-        // `text/html; charset=utf-8`, freezing the route until the next build.
+        // A trailing or doubled `;` must not make equal types differ: ISR would
+        // refuse `text/html; charset=utf-8;` against a recorded
+        // `text/html; charset=utf-8` until the next build.
         .filter(|segment| !segment.trim().is_empty())
         .map(|segment| {
             let segment = segment.trim();
@@ -713,8 +696,7 @@ fn normalize_content_type(value: &str) -> Vec<String> {
             };
             let name = name.trim().to_ascii_lowercase();
             let raw_value = raw_value.trim();
-            // Unquote quoted values, decoding quoted-pairs so e.g.
-            // `boundary="a\b"` and `boundary="ab"` normalize the same.
+            // Decoding quoted-pairs makes `boundary="a\b"` and `boundary="ab"` equal.
             let unquoted = decode_quoted_pairs(raw_value);
             if parameter_value_case_insensitive(&media_type, &name) {
                 format!("{name}={}", unquoted.to_ascii_lowercase())
@@ -761,23 +743,10 @@ async fn regenerate_page(
         return Err(format!("Handler returned HTTP {} for {}", response.status(), url).into());
     }
 
-    // #1832: the manifest's recorded Content-Type is a build-time property, and
-    // ISR deliberately does not rewrite the manifest (the design keeps it
-    // immutable behind an `Arc` and uses file mtime for staleness, avoiding
-    // write contention). So the header served for this route is fixed for the
-    // process lifetime while the *body* on disk is not.
-    //
-    // That makes a type change during regeneration a body/header desync waiting
-    // to happen: writing bytes the handler now calls `application/json` into a
-    // file still advertised as `text/html` would serve undecodable content. A
-    // handler that stops declaring a type at all is the same hazard — the
-    // recorded type would keep being asserted over bytes nothing vouches for.
-    //
-    // Refuse the regeneration instead. The previous file stays on disk and
-    // keeps matching its recorded type, so the route degrades to stale-but-
-    // correct rather than fresh-but-mislabeled. The error propagates to the
-    // caller's existing `warn!`, and the ISR cooldown throttles the retries; a
-    // rebuild (`autumn build`) is what re-records the type.
+    // ISR never rewrites the manifest (#1832), so the served Content-Type is fixed until the next
+    // `autumn build` while the body is not. If the handler now declares a different type, or
+    // none, refuse: the old file stays stale-but-correct instead of fresh-but-mislabeled, and
+    // the cooldown throttles retries.
     if let Some(expected) = expected_content_type {
         // Same normalization as build, so a generic default compares equal to
         // the extension type it was recorded as (#2409).
@@ -787,9 +756,8 @@ async fn regenerate_page(
             .and_then(|v| v.to_str().ok())
             .map(|v| effective_content_type(v.trim(), url));
         if !actual.is_some_and(|actual| content_type_equivalent(actual, expected)) {
-            // Logged here as well as by the caller: an ordinary regeneration
-            // failure is transient, but this one repeats every cooldown until
-            // someone rebuilds, so it needs to be greppable on its own.
+            // Logged here too: unlike a transient failure, this repeats every cooldown
+            // until a rebuild.
             tracing::error!(
                 route = url,
                 manifest_content_type = expected,
@@ -810,7 +778,7 @@ async fn regenerate_page(
 
     let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
 
-    // Write to a temp file, then atomically rename to avoid serving partial content
+    // Temp file + rename, so a request never reads a partial page.
     let temp_path = dest.with_extension("tmp");
     std::fs::write(&temp_path, &body_bytes)?;
     std::fs::rename(&temp_path, dest)?;
@@ -847,14 +815,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let dist = dir.path().join("dist");
 
-        // Create directories
         std::fs::create_dir_all(dist.join("about")).expect("mkdir about");
 
-        // Create HTML files
         std::fs::write(dist.join("index.html"), "<h1>Home</h1>").expect("write index");
         std::fs::write(dist.join("about/index.html"), "<h1>About</h1>").expect("write about");
 
-        // Build and write manifest
         let mut routes = HashMap::new();
         routes.insert("/".to_owned(), ManifestEntry::new("index.html".to_owned()));
         routes.insert(
@@ -879,15 +844,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let dist = dir.path().join("dist");
 
-        // Create directories
         std::fs::create_dir_all(dist.join("posts/hello")).expect("mkdir posts/hello");
         std::fs::create_dir_all(dist.join("posts/world")).expect("mkdir posts/world");
 
-        // Create HTML files
         std::fs::write(dist.join("posts/hello/index.html"), "<h1>Hello</h1>").expect("write hello");
         std::fs::write(dist.join("posts/world/index.html"), "<h1>World</h1>").expect("write world");
 
-        // Build and write manifest
         let mut routes = HashMap::new();
         routes.insert(
             "/posts/hello".to_owned(),
@@ -948,7 +910,6 @@ mod tests {
     #[test]
     fn layer_returns_none_without_manifest() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // No manifest.json at all
         let layer = StaticFileLayer::new(tmp.path());
         assert!(layer.is_none(), "should return None without manifest.json");
     }
@@ -966,9 +927,8 @@ mod tests {
             "an unparseable manifest must disable static serving, not panic"
         );
 
-        // A manifest carrying a key this runtime does not know still loads —
-        // the forward-compatibility STABILITY.md promises for an older runtime
-        // reading a manifest written by a newer Autumn.
+        // Unknown keys still load: an older runtime must read a manifest written by a
+        // newer Autumn (STABILITY.md).
         std::fs::write(
             tmp.path().join("manifest.json"),
             r#"{"generated_at":"1","autumn_version":"0.0.0","routes":{
@@ -1033,7 +993,7 @@ mod tests {
         assert_eq!(layer.manifest().routes.len(), 2);
     }
 
-    // --- Parameterized route middleware tests ---
+    // --- Parameterized routes ---
 
     #[test]
     fn resolve_finds_parameterized_routes() {
@@ -1064,7 +1024,7 @@ mod tests {
         );
     }
 
-    // --- ISR tests ---
+    // --- ISR ---
 
     #[test]
     fn isr_state_built_for_revalidate_routes() {
@@ -1083,7 +1043,6 @@ mod tests {
         let file = tmp.path().join("test.html");
         std::fs::write(&file, "test").expect("write");
 
-        // File just created, age should be very small
         let age = file_mtime_age_secs(&file).expect("mtime");
         assert!(age < 5, "Fresh file should be < 5 seconds old, got {age}");
     }
@@ -1096,17 +1055,14 @@ mod tests {
 
     #[tokio::test]
     async fn isr_triggers_regeneration_for_stale_page() {
-        // Create a dist dir with a very short revalidate (1 second)
         let tmp = create_isr_dist(1);
         let dist = tmp.path().join("dist");
 
-        // Make the file old by setting mtime to the past
         let file = dist.join("about/index.html");
         let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
         filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(old_time))
             .unwrap_or(());
 
-        // Create a router that returns fresh content
         let router =
             axum::Router::new().fallback(axum::routing::get(|| async { "<h1>About (fresh)</h1>" }));
 
@@ -1114,17 +1070,14 @@ mod tests {
             .expect("layer")
             .with_router(router);
 
-        // Resolve should return the stale file path but trigger ISR
+        // Serves the stale file and triggers ISR in the background.
         let resolved = layer.resolve("/about");
         assert!(resolved.is_some());
 
-        // Give the background task time to complete
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Check if file was updated (only if mtime was successfully set)
+        // A failed `set_file_mtime` is ignored above, so the page may still be stale.
         let content = std::fs::read_to_string(&file).unwrap();
-        // The content should be updated if ISR fired, or remain stale
-        // if filetime wasn't available. Either way, resolve works.
         assert!(
             content == "<h1>About (fresh)</h1>" || content == "<h1>About (stale)</h1>",
             "unexpected content: {content}"
@@ -1137,7 +1090,6 @@ mod tests {
         let dist = tmp.path().join("dist");
 
         let router = axum::Router::new().fallback(axum::routing::get(|| async {
-            // Simulate slow handler
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             "<h1>Slow</h1>"
         }));
@@ -1146,24 +1098,19 @@ mod tests {
             .expect("layer")
             .with_router(router);
 
-        // Make file stale
         let file = dist.join("about/index.html");
         let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
         let _ = filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(old_time));
 
-        // First resolve triggers ISR
         let _ = layer.resolve("/about");
 
-        // Check in-flight flag
         let state = layer.isr_state.get("/about").expect("isr state");
-        // May or may not be true depending on timing, but second resolve
-        // should not panic or double-trigger
+        // The flag may or may not be set yet; a second resolve must not panic or
+        // spawn a second task.
         let _ = layer.resolve("/about");
 
-        // Wait for background task
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
 
-        // Flag should be cleared
         assert!(
             !state.in_flight.load(Ordering::Relaxed),
             "in_flight should be cleared after regeneration"
@@ -1184,7 +1131,6 @@ mod tests {
         let content = std::fs::read_to_string(&dest).unwrap();
         assert_eq!(content, "new content");
 
-        // Temp file should be cleaned up
         assert!(!dest.with_extension("tmp").exists());
     }
 
@@ -1200,7 +1146,6 @@ mod tests {
         let result = regenerate_page(&router, "/test", &dest, None).await;
         assert!(result.is_err());
 
-        // Original file should be untouched
         let content = std::fs::read_to_string(&dest).unwrap();
         assert_eq!(content, "old content");
     }
@@ -1209,8 +1154,7 @@ mod tests {
     async fn isr_coordinator_deny_clears_in_flight_and_skips_regen() {
         use crate::static_gen::isr_coordinator::IsrFuture;
 
-        // A coordinator that always denies acquisition — exercises the
-        // `if !acquired { return; }` branch in the spawned ISR task.
+        // Always denies, to exercise the early return in the spawned ISR task.
         struct DenyCoordinator;
         impl IsrCoordinator for DenyCoordinator {
             fn backend(&self) -> &'static str {
@@ -1240,13 +1184,12 @@ mod tests {
             .with_router(router)
             .with_isr_coordinator(Arc::new(DenyCoordinator));
 
-        // Trigger the ISR background task.
         let _ = layer.resolve("/about");
 
         // Wait for the spawned task to run the deny branch and exit.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // InFlightReset guard must have cleared the flag despite early return.
+        // The `InFlightReset` guard must clear the flag despite the early return.
         let state = layer.isr_state.get("/about").unwrap();
         assert!(
             !state.in_flight.load(Ordering::Relaxed),
@@ -1373,7 +1316,7 @@ mod tests {
     /// not freeze the route the way a raw byte comparison would.
     #[test]
     fn content_type_equivalent_treats_media_type_valued_type_parameter_case_insensitively() {
-        // The bug: these denote the same thing but normalized differently.
+        // Same type, different case.
         assert!(content_type_equivalent(
             r#"multipart/related; type="TEXT/HTML""#,
             r#"multipart/related; type="text/html""#
@@ -1403,8 +1346,7 @@ mod tests {
             "multipart/related; protocol=bar"
         ));
 
-        // Must not regress: a genuinely different media type value still
-        // compares unequal.
+        // A different media type value still compares unequal.
         assert!(!content_type_equivalent(
             r#"multipart/related; type="text/html""#,
             r#"multipart/related; type="application/json""#
@@ -1594,12 +1536,8 @@ mod tests {
             usable_recorded_content_type(Some("  application/rss+xml  ")),
             Some("application/rss+xml")
         );
-        // A horizontal tab is legal OWS around media-type parameters, so a value
-        // carrying one is usable — rejecting it would send an extensionless
-        // `/feed` back to the `feed/index.html` derivation and serve RSS as
-        // `text/html`. `to_str` succeeds on tab, so the compression layer still
-        // matches such a type against its carve-outs in full; the hazard this
-        // screen exists for is a value that reads as *empty* there.
+        // Tab is legal OWS around media-type parameters, so a value carrying one is usable:
+        // rejecting it would serve an extensionless `/feed` as derived `text/html`.
         assert_eq!(
             usable_recorded_content_type(Some("application/rss+xml;\tprofile=\"x\"")),
             Some("application/rss+xml;\tprofile=\"x\"")
@@ -1755,8 +1693,8 @@ mod tests {
         assert_eq!(hit.file_path, dist.join("index.html"));
         assert_eq!(hit.content_type, "text/html");
 
-        // ...and a route that records nothing gets the legacy derivation, so
-        // callers never see an undecided type.
+        // ...and a route that records nothing gets the derived type, so callers never
+        // see an undecided one.
         let bare = layer.resolve_entry("/bare").expect("bare resolves");
         assert_eq!(bare.content_type, "text/html; charset=utf-8");
 
@@ -2320,8 +2258,7 @@ mod tests {
     async fn isr_accepts_regeneration_when_a_user_layer_rewrites_content_type() {
         use axum::http::header::{CONTENT_TYPE, HeaderValue};
 
-        // The offending shape: a user layer that rewrites Content-Type on the
-        // way out.
+        // A user layer that rewrites Content-Type on the way out.
         let rewrite = axum::middleware::from_fn(
             |req: axum::extract::Request, next: axum::middleware::Next| async move {
                 let mut response = next.run(req).await;
@@ -2355,8 +2292,7 @@ mod tests {
             "/page",
             axum::routing::get(|| async { axum::response::Html("<h1>v1</h1>") }),
         );
-        // The old build composition, for contrast: the layer applied at
-        // render time.
+        // For contrast: the layer applied at render time.
         let layered = base.clone().layer(rewrite);
 
         let meta = || crate::static_gen::StaticRouteMeta {
@@ -2368,7 +2304,7 @@ mod tests {
             content_type: None,
         };
 
-        // Old behavior: the build records the post-layer type ...
+        // Rendering through the layer records the post-layer type ...
         let tmp_old = tempfile::tempdir().expect("tempdir");
         let dist_old = tmp_old.path().join("dist");
         crate::static_gen::render_static_routes(layered, &[meta()], &dist_old)
@@ -2380,7 +2316,7 @@ mod tests {
             Some("application/x-rewritten"),
             "rendering through the layer records the rewritten type"
         );
-        // ... which ISR (pre-layer view) then refuses: the freeze.
+        // ... which ISR, seeing the pre-layer type, refuses: the route freezes.
         let refused = regenerate_page(
             &base,
             "/page",
@@ -2393,8 +2329,8 @@ mod tests {
             "the old build/ISR asymmetry must refuse the refresh — this is the freeze #2405 fixes"
         );
 
-        // New behavior: the build renders through the pre-layer router, so
-        // the manifest records the handler's type ...
+        // Rendering through the pre-layer router, as the build does, records the
+        // handler's type ...
         let tmp_new = tempfile::tempdir().expect("tempdir");
         let dist_new = tmp_new.path().join("dist");
         crate::static_gen::render_static_routes(base.clone(), &[meta()], &dist_new)

@@ -69,8 +69,7 @@
         clippy::arithmetic_side_effects,
     )
 )]
-// `pub` throughout this file is crate-visible only: the enclosing `cluster`
-// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// `pub` here is crate-visible only: the enclosing `cluster` module is `pub(crate)`
 // (clippy::redundant_pub_crate).
 
 use std::collections::BTreeMap;
@@ -159,9 +158,7 @@ impl MemberRecord {
     /// Merge `other` into `self` by the three-rule order in the module docs.
     pub fn merge(&mut self, other: &Self) {
         if other.merge_key() > self.merge_key() {
-            // The winning record wins whole: its address travels with its
-            // incarnation, so a member that moved address is not left half
-            // merged.
+            // The winner is taken whole so its address travels with its incarnation.
             self.clone_from(other);
         }
     }
@@ -220,14 +217,12 @@ impl ClusterState {
             if let Some(ours) = self.members.get_mut(id) {
                 ours.merge(theirs);
             } else if !overlay.refuses_readoption(id, theirs, now) {
-                // A member we have never heard of: learning it *is* discovery.
-                // Tombstones (`Left`) are learned too, so a leave keeps
-                // propagating through a node that never met the departed peer.
+                // Learning an unknown member is discovery. `Left` is learned too, so a leave
+                // propagates through nodes that never met the departed peer.
                 self.members.insert(id.clone(), theirs.clone());
             }
         }
         for (name, theirs) in &other.counters {
-            // Per-cell max, delegated: the counter owns its own join.
             self.counters.entry(name.clone()).or_default().merge(theirs);
         }
     }
@@ -248,26 +243,20 @@ impl ClusterState {
         let observed = self.members.get_mut(me)?;
 
         if observed == own {
-            // Our own record, echoed back by a peer. Bumping here would ratchet
-            // the incarnation on every single push round.
+            // Our own record echoed back: bumping would ratchet the incarnation every push round.
             return None;
         }
         if observed.incarnation < own.incarnation {
-            // Already loses merge rule 1 against the record we publish; the
-            // document heals itself on the next push without a bump.
+            // Already loses merge rule 1 to the record we publish; the next push heals it.
             return None;
         }
 
-        // Rule 1 outranks rule 2, so `observed + 1` buries a `Left` (or a stale
-        // `Alive` from an earlier boot) everywhere it has spread. Saturating
-        // because the panic gate forbids the wrapping alternative; a node that
-        // reaches `u64::MAX` here stops bumping rather than wrapping to zero and
-        // losing every argument.
+        // Rule 1 outranks rule 2, so `observed + 1` buries a `Left` (or a stale `Alive` from an
+        // earlier boot) everywhere it has spread. At `u64::MAX` stop bumping rather than wrap.
         let bumped = observed.incarnation.saturating_add(1);
         observed.incarnation = bumped;
         observed.status = MemberStatus::Alive;
-        // We are authoritative about our own address, whatever the document
-        // claimed.
+        // We are authoritative about our own address, whatever the document claimed.
         observed.addr.clone_from(&own.addr);
         Some(bumped)
     }
@@ -311,8 +300,7 @@ impl ClusterState {
         let mut converted = Vec::new();
         for (id, record) in &mut self.members {
             if id == me || record.status == MemberStatus::Left {
-                // Ours to publish, not to bury; and a tombstone is already on
-                // the lifecycle this converts records onto.
+                // Never bury our own record; a tombstone is already on the prune lifecycle.
                 continue;
             }
             let quiet_since = overlay.quiet_since(id, now);
@@ -391,14 +379,10 @@ impl ClusterState {
         for (id, incarnation) in &expired {
             self.members.remove(id);
             overlay.forget(id);
-            // Forgotten as a member, remembered as a *collection*: the receipts
-            // go, the record goes, and what stays is the one fact that keeps a
-            // lagging peer from handing the whole thing back.
+            // Remember the collection so a lagging peer cannot hand the record back.
             overlay.remember_pruned(id, *incarnation, now);
         }
-        // The memory is swept on the same pass that fills it, so it is bounded
-        // by the departures of the last two windows rather than by the process
-        // lifetime.
+        // Swept on the same pass that fills it, so the memory is bounded by recent departures.
         overlay.expire_pruned(now);
         expired.into_iter().map(|(id, _)| id).collect()
     }
@@ -506,8 +490,7 @@ impl LivenessOverlay {
     /// exists for.
     fn quiet_since(&mut self, node: &str, now: MonotonicInstant) -> MonotonicInstant {
         if let Some(seen) = self.last_receipt(node) {
-            // The stamp goes with it: a member that spoke is not unheard any
-            // more, and a stale stamp would otherwise outlive its silence.
+            // A member that spoke is no longer unheard; a stale stamp would outlive its silence.
             self.unheard_since.remove(node);
             return seen;
         }
@@ -596,16 +579,14 @@ impl LivenessOverlay {
 
     /// Classify `node` as of `now`. Pure: no clock read, no mutation.
     pub fn liveness(&self, node: &str, now: MonotonicInstant) -> Liveness {
-        // Never heard from — `Down`, not `Alive`. Optimism here would put a peer
-        // that has never once answered into the view.
+        // Never heard from: `Down`, so a peer that never answered stays out of the view.
         let Some(last) = self.last_receipt(node) else {
             return Liveness::Down;
         };
 
         let silence = now.saturating_duration_since(last);
-        // `saturating_mul` rather than `2 *`: the panic gate forbids arithmetic
-        // that can overflow, and a configured push interval near `Duration::MAX`
-        // must clamp rather than wrap the threshold down to something tiny.
+        // `saturating_mul`, not `2 *`: `Duration` multiplication panics on overflow, and a push
+        // interval near `Duration::MAX` must clamp.
         if silence > self.suspicion_timeout {
             Liveness::Down
         } else if silence > self.push_interval.saturating_mul(2) {
@@ -667,7 +648,6 @@ mod tests {
             "the winning record's address must win with it; observed {older:?}"
         );
 
-        // …and merging a stale record back in must change nothing.
         let stale = MemberRecord::left("127.0.0.1:7000", 2);
         older.merge(&stale);
         assert_eq!(
@@ -703,8 +683,7 @@ mod tests {
             "…in either merge direction; observed {left_first:?}"
         );
 
-        // Rule 3: at equal incarnation AND equal status the greater addr wins,
-        // purely so the merge stays commutative.
+        // Rule 3: at equal incarnation and status the greater addr wins, so the merge commutes.
         let mut lower_addr = MemberRecord::alive("127.0.0.1:7001", 7);
         lower_addr.merge(&MemberRecord::alive("127.0.0.1:7009", 7));
         assert_eq!(
@@ -739,8 +718,8 @@ mod tests {
             "refutation must restore Alive at the bumped incarnation; observed {record:?}"
         );
 
-        // A STALE ALIVE from a previous boot at a higher incarnation (a clock
-        // that stepped backwards, or two boots that read the same millisecond).
+        // A stale Alive from a previous boot at a higher incarnation (a clock that stepped back,
+        // or two boots that read the same millisecond).
         let mut stale_alive = ClusterState::default();
         stale_alive.members.insert(
             "node-a".to_owned(),
@@ -752,8 +731,6 @@ mod tests {
             "a stale Alive about ourselves at a higher incarnation must also be refuted"
         );
 
-        // Our own record echoed back must NOT bump, or the incarnation
-        // ratchets forever on every push.
         let mut echoed = ClusterState::default();
         echoed.members.insert("node-a".to_owned(), own.clone());
         assert_eq!(
@@ -762,7 +739,6 @@ mod tests {
             "an exact echo of our own record must not be refuted"
         );
 
-        // An older record about us needs no refutation either.
         let mut older = ClusterState::default();
         older
             .members
@@ -869,12 +845,8 @@ mod tests {
              let a straggling push resurrect the departed member; observed {state:?}"
         );
 
-        // A FRESH receipt for the departing member, recorded a hair before the
-        // prune. Without it the `Down` assertion below is vacuous: 25 s of
-        // silence reads as `Down` whether or not the row was forgotten, so a
-        // `forget` that stopped removing `last_seen` would pass unnoticed and
-        // pruned members' receipt rows would accumulate forever under node-id
-        // churn. With it, a surviving row reads `Alive` and the assertion bites.
+        // A fresh receipt just before the prune: without it the `Down` assertion below holds
+        // whether or not `forget` removed the receipt row.
         overlay.record_receipt("node-b", at(window_ms));
 
         assert_eq!(
@@ -933,9 +905,7 @@ mod tests {
             "sanity: the first tombstone must prune, or this test proves nothing"
         );
 
-        // A lagging peer pushes the same departure again, long after the
-        // pruning — exactly what `merge` does with a record we no longer hold,
-        // and late enough that the recently-pruned memory has lapsed.
+        // A lagging peer pushes the same departure again after the recently-pruned memory lapsed.
         let reintroduced =
             at(window_ms.saturating_mul(u64::from(PRUNE_MEMORY_WINDOW_MULTIPLE).saturating_add(2)));
         let mut lagging = ClusterState::default();
@@ -949,8 +919,7 @@ mod tests {
              the expiry assertions below prove nothing; observed {state:?}"
         );
         state.observe_tombstones(&mut overlay, reintroduced);
-        // The sender of that push is a DIFFERENT node, so attributing the age
-        // to receipts would restart the clock on every one of its pushes.
+        // The sender is a different node: aging by receipts would restart the clock on each push.
         overlay.record_receipt("node-c", reintroduced);
 
         assert_eq!(
@@ -1027,9 +996,7 @@ mod tests {
              pushing every interval; observed {state:?}"
         );
 
-        // 3. Past it, the guard is gone: the document is a join again, and a
-        //    record a peer still holds is learned (and re-expires — see
-        //    `reintroduced_tombstone_expires_again`).
+        // 3. Past it, the guard is gone and a record a peer still holds is learned again.
         state.merge(&lagging, &overlay, at(inside.saturating_add(1)));
         assert!(
             state.members.contains_key("node-b"),
@@ -1038,8 +1005,7 @@ mod tests {
              of the join rather than garbage collection; observed {state:?}"
         );
 
-        // 4. A HIGHER incarnation is a rejoin, not an echo — adopted at once,
-        //    inside the window, and its later departure with it.
+        // 4. A higher incarnation is a rejoin, adopted inside the window; so is a later departure.
         let (mut rejoining, overlay) = after_collecting_node_b(pruned_at);
         let mut returned = ClusterState::default();
         returned.members.insert(
@@ -1072,10 +1038,8 @@ mod tests {
              {departing_again:?}"
         );
 
-        // 5. A stale ALIVE at the collected incarnation — a pre-departure frame
-        //    captured off the wire and replayed after pruning forgot the
-        //    sender's watermark, so it verifies and merges — is refused on the
-        //    same terms, for the whole window and no longer.
+        // 5. A stale Alive at the collected incarnation (a replayed pre-departure frame) is
+        //    refused on the same terms, for the whole window and no longer.
         let replayed_alive = {
             let mut document = ClusterState::default();
             document.members.insert(
@@ -1118,8 +1082,7 @@ mod tests {
     fn members_down_for_a_tombstone_window_are_recorded_as_left() {
         let window = SUSPICION.saturating_mul(TOMBSTONE_TIMEOUT_MULTIPLE);
         let window_ms = u64::try_from(window.as_millis()).expect("the window fits in a u64 of ms");
-        // Comfortably past the suspicion timeout, so the member is out of the
-        // view on the first housekeeping round below.
+        // Past the suspicion timeout, so the member is out of the view on the first round.
         let out_of_view = 3_000;
 
         let mut overlay = LivenessOverlay::new(PUSH, SUSPICION);
@@ -1133,9 +1096,8 @@ mod tests {
             "node-b".to_owned(),
             MemberRecord::alive("127.0.0.1:7002", 9),
         );
-        // A member learned from a peer's document that has never sent this node
-        // a frame: no receipt to age against, and exactly the record a replayed
-        // pre-departure frame leaves behind once its watermark was forgotten.
+        // Learned from a peer's document and never heard from: no receipt to age against. A
+        // replayed pre-departure frame leaves exactly this record once its watermark is forgotten.
         state.members.insert(
             "node-c".to_owned(),
             MemberRecord::alive("127.0.0.1:7003", 2),
@@ -1182,8 +1144,7 @@ mod tests {
              would bury itself on the first round; observed {state:?}"
         );
 
-        // The never-heard member ages from the first round that looked for a
-        // receipt and found none, not from an instant it never had.
+        // The never-heard member ages from the first round that found no receipt.
         assert_eq!(
             state.members.get("node-c").map(|record| record.status),
             Some(MemberStatus::Alive),
@@ -1244,8 +1205,7 @@ mod tests {
             MemberRecord::alive("127.0.0.1:7002", 9),
         );
 
-        // A gap long enough to be Down, and then a push: the member saying it
-        // is still here.
+        // A gap long enough to be Down, then a push.
         assert_eq!(
             state.convert_down_members("node-a", &mut overlay, at(3_000)),
             Vec::<String>::new(),

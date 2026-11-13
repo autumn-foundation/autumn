@@ -353,7 +353,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::Extension;
     use axum::routing::get;
-    use tower::ServiceExt; // for oneshot
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn response_has_request_id_header() {
@@ -367,7 +367,6 @@ mod tests {
             .unwrap();
 
         assert!(response.headers().contains_key("x-request-id"));
-        // Verify it's a valid UUID
         let id_str = response.headers()["x-request-id"].to_str().unwrap();
         assert!(Uuid::parse_str(id_str).is_ok());
     }
@@ -410,7 +409,6 @@ mod tests {
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
-        // The response body should contain a valid UUID
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -546,7 +544,7 @@ mod tests {
         let id = response_id(trusting_layer(&ranges), Some("10.1.2.3:4000"), inbound).await;
         assert_eq!(id, inbound);
 
-        // No ranges and no hops: every peer is trusted (documented).
+        // No ranges and no hops: every peer is trusted.
         let open = crate::security::config::TrustedProxiesConfig {
             ranges: Vec::new(),
             trusted_hops: None,

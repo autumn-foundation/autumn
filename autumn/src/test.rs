@@ -267,16 +267,12 @@ use crate::route::Route;
 
 use crate::state::AppState;
 
-// Only the `test-support`-gated `TestDb` (a Postgres testcontainer helper) names
-// `AsyncPgConnection` by its short name now; the `TestClient` pool fields use the
-// `RuntimeConnection` alias, and the transactional establish path uses the fully
-// qualified path — so without `test-support` this import would be unused.
+// Only the `test-support` `TestDb` names `AsyncPgConnection` unqualified; without it this import
+// is unused.
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 use diesel_async::AsyncPgConnection;
-// Used by the Postgres transactional establish path (the `.get_result()` on
-// `TransactionalDbInterceptor`), which is itself gated `not(feature = "sqlite")`;
-// every other `RunQueryDsl` method call in this module brings the trait in via a
-// local `use`, so this import is unused under any `sqlite` build.
+// Only `TransactionalDbInterceptor` (Postgres-only) uses this; other call sites import the trait
+// locally.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 use diesel_async::RunQueryDsl;
 #[cfg(feature = "db")]
@@ -475,9 +471,7 @@ impl crate::interceptor::JobInterceptor for JobRecorder {
         };
         let jobs = std::sync::Arc::clone(&self.jobs);
         Box::pin(async move {
-            // Record the enqueue intent up front, then let delivery proceed so
-            // the app's real backend/worker still sees the job (mirroring how
-            // the mail recorder does not suppress the underlying transport).
+            // Record, then let delivery proceed so the real backend still sees the job.
             jobs.lock().unwrap().push(record);
             next.await
         })
@@ -492,7 +486,6 @@ impl crate::interceptor::JobInterceptor for JobRecorder {
         >,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
     {
-        // The recorder only observes enqueues; execution passes straight through.
         next
     }
 }
@@ -675,8 +668,7 @@ impl crate::interceptor::ChannelsInterceptor for BroadcastRecorder {
         ) -> Result<usize, crate::channels::ChannelPublishError>,
     ) -> Result<usize, crate::channels::ChannelPublishError> {
         let result = next(topic, msg);
-        // Record the publication even when it reached zero subscribers — the
-        // publish still happened and tests assert on intent, not delivery.
+        // Record even zero-subscriber publishes: tests assert on intent, not delivery.
         self.events.lock().unwrap().push(RecordedBroadcast {
             topic: topic.into(),
             payload: msg.as_str().into(),
@@ -847,7 +839,6 @@ impl TestApp {
         crate::ledger_capture::install();
         let mut config = AutumnConfig::default();
         config.profile = Some("test".into());
-        // Disable CSRF for tests by default (like Spring Security's test support)
         config.security.csrf.enabled = false;
 
         Self {
@@ -1243,10 +1234,7 @@ impl TestApp {
     #[must_use]
     pub fn from_router(router: axum::Router, state: AppState) -> TestClient {
         let auth_session_key = state.auth_session_key().to_owned();
-        // Resolve the session cookie name from the router's config (installed in
-        // state extensions by `build()`), falling back to the framework default
-        // when it isn't present — so `log_out` clears the right cookie even when
-        // the app configured a custom `session.cookie_name`.
+        // Use the app's configured cookie name so `log_out` clears the right cookie.
         let session_cookie_name = state.extension::<AutumnConfig>().map_or_else(
             || crate::session::SessionConfig::default().cookie_name,
             |cfg| cfg.session.cookie_name.clone(),
@@ -1268,11 +1256,8 @@ impl TestApp {
             cookie_jar: std::sync::Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
-            // `from_router` receives an already-built router, so we have no
-            // handle to whatever session store (if any) it installed. The jar
-            // still works — cookies from real requests round-trip — but
-            // `acting_as` cannot mint a session and panics, mirroring how
-            // `sent_mail()` degrades for `from_router` clients.
+            // A prebuilt router hides its session store, so `acting_as` panics. Cookies from
+            // real requests still round-trip through the jar.
             session_store: None,
             session_cookie_name,
             auth_session_key,
@@ -1433,7 +1418,6 @@ impl TestApp {
         self.extensions = app_builder.extensions;
         self.state_initializers = app_builder.state_initializers;
 
-        // Merge properties from the plugin's app_builder into self:
         self.routes.extend(app_builder.routes);
         self.scoped_groups.extend(app_builder.scoped_groups);
         pad_groups(&mut self.merge_router_groups, self.merge_routers.len());
@@ -1458,43 +1442,30 @@ impl TestApp {
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
         self.health_indicators.extend(app_builder.health_indicators);
-        // Carry plugin-registered inbound mail router into the test app so
-        // webhook plugins behave identically under TestApp.
         #[cfg(feature = "inbound-mail")]
         if let Some(router) = app_builder.inbound_mail_router {
             self.inbound_mail_router = Some(router);
         }
 
-        // Carry a plugin-registered suppression store (List-Unsubscribe storage)
-        // into the test app so unsubscribe POSTs and send-time suppression behave
-        // under TestApp exactly as they do under AppBuilder::run.
         #[cfg(feature = "mail")]
         if let Some(handle) = app_builder.suppression_store {
             self.suppression_store = Some(handle);
         }
 
-        // Carry a plugin-registered bounce/complaint suppression store (issue
-        // #1247) into the test app so send-time suppression is consulted under
-        // TestApp exactly as under AppBuilder::run — otherwise a plugin/app that
-        // wired a PgSuppressionStore would silently test against the in-memory
-        // default and hide production failures (e.g. a missing table).
+        // Bounce/complaint store (#1247). Without this a plugin's `PgSuppressionStore` would be
+        // tested against the in-memory default, hiding failures such as a missing table.
         #[cfg(feature = "mail")]
         if let Some(handle) = app_builder.mail_suppression_store {
             self.mail_suppression_store = Some(handle);
         }
 
-        // Carry a plugin's `mount_unsubscribe_endpoint()` opt-in: production copies
-        // this builder flag into config.mail before router assembly, so a plugin
-        // that mounts the default unsubscribe endpoint must mount it under TestApp
-        // too (otherwise /_autumn/unsubscribe 404s in tests but works in prod).
+        // Production copies this flag into `config.mail` before router assembly; without it
+        // `/_autumn/unsubscribe` would 404 in tests only.
         #[cfg(feature = "mail")]
         if app_builder.mount_unsubscribe_endpoint {
             self.config.mail.mount_unsubscribe_endpoint = true;
         }
 
-        // Carry plugin-registered error reporters into the test app so
-        // reporting-enabled plugins exercise the same behavior under `TestApp`
-        // that they get from `AppBuilder::run`.
         #[cfg(feature = "error-reporting")]
         {
             let reporters = std::mem::take(&mut app_builder.error_reporters);
@@ -1878,7 +1849,7 @@ impl TestApp {
         C: crate::time::ClockSource + 'static,
     {
         let arc: std::sync::Arc<C> = std::sync::Arc::new(clock);
-        // Retain as dyn Any so TestClient::advance_clock can downcast to TickingClock.
+        // Kept as `dyn Any` so `TestClient::advance_clock` can downcast to `TickingClock`.
         self.clock_as_any = Some(arc.clone() as std::sync::Arc<dyn std::any::Any + Send + Sync>);
         self.clock = Some(arc as std::sync::Arc<dyn crate::time::ClockSource>);
         self
@@ -2102,24 +2073,19 @@ impl TestApp {
                 panic!("{error}");
             }
         }
-        // Reset the global cache to prevent cross-test contamination. Briefly
-        // held so this can't land mid-flight inside another same-process
-        // test's own global-cache critical section (issue #2218) — see
-        // `GLOBAL_CACHE_TEST_LOCK`'s doc comment.
+        // Reset the global cache between tests. The lock keeps the reset out of another test's
+        // global-cache critical section (#2218).
         {
             let _guard = crate::cache::GLOBAL_CACHE_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::cache::clear_global_cache();
         }
-        // Reset the global event bus so a prior test's listeners/recorder do not
-        // leak into this one (it is re-installed below).
+        // Drop a prior test's listeners and recorder; the bus is re-installed below.
         crate::events::clear_global_event_bus();
 
-        // An attached fault plan (issue #1680) only replays byte-for-byte when
-        // the surrounding config cannot reorder, drop, or delay what it records,
-        // so the knobs that would are checked up front rather than silently
-        // producing a flaky scenario.
+        // A fault plan (#1680) replays byte-for-byte only if the config cannot reorder, drop or
+        // delay what it records, so reject such config up front instead of running flaky.
         if let Some(plan) = self.fault_plan.as_ref() {
             assert_eq!(
                 self.config.jobs.workers, 1,
@@ -2133,14 +2099,8 @@ impl TestApp {
                  `reporting.sample_rate = 1.0`: the sampler draws OS randomness, so a \
                  sampled-out 5xx would drop out of `FaultOutcome::server_errors` at random"
             );
-            // Codex review (round 2): with capture on, `ReporterChain::dispatch`
-            // awaits the capsule's blocking persistence (a directory scan, a
-            // write and a `sync_all` on the blocking pool) BEFORE any reporter
-            // runs, so `fault_outcome()`'s cooperative settle could snapshot
-            // while that write is still in flight on slow storage and miss a
-            // 5xx the client already observed. Capsules are production
-            // evidence with no place in a fault scenario, so refuse the
-            // combination rather than make the settle depend on disk speed.
+            // Capsules are production evidence with no place in a fault scenario, and waiting on
+            // their disk write would make `fault_outcome()`'s settle depend on storage speed.
             #[cfg(feature = "reporting")]
             assert!(
                 !self.config.failure_capture.enabled,
@@ -2156,23 +2116,12 @@ impl TestApp {
             }
         }
 
-        // Postgres transactional test isolation (`begin_test_transaction` +
-        // SAVEPOINT rollback on a `max_size(1)` control pool) is Postgres-only;
-        // SQLite has no equivalent, so under the `sqlite` feature the harness
-        // uses the configured pool directly (no per-test rollback isolation).
+        // SQLite has no transactional rollback isolation, so it uses a plain pool.
         #[cfg(all(feature = "db", feature = "sqlite"))]
         let (pool, replica_pool, db_interceptor) = {
             let _ = self.transactional;
-            // SQLite has no equivalent of the Postgres transactional-rollback
-            // isolation (`begin_test_transaction` + SAVEPOINT on a `max_size(1)`
-            // control pool), so a SQLite test DB gets a real pool but NOT
-            // per-test transactional isolation. Even so, `with_transactional_db`
-            // records an explicit SQLite database URL, and dropping it here would
-            // leave a `TestApp` built that way with no pool at all -- every route
-            // using the `Db` extractor would then return 503. So when no pool was
-            // attached via `with_db` but an explicit URL was given, build a plain
-            // (non-transactional) SQLite pool from it, reusing the runtime
-            // `create_pool` path so the pool matches production behavior.
+            // Without `with_db`, build a plain pool from the `with_transactional_db` URL through
+            // the runtime `create_pool`; otherwise every `Db` route would return 503.
             let pool = if let Some(pool) = self.pool {
                 Some(pool)
             } else if let Some(url) = self.transactional_url.as_deref() {
@@ -2251,10 +2200,7 @@ impl TestApp {
             (self.pool, self.replica_pool, self.db_interceptor)
         };
 
-        // Mirror production router selection (see `setup_database`): when the
-        // test config enables directory routing, build a `DirectoryShardRouter`
-        // over the control pool so tests that pin tenants in
-        // `_autumn_shard_directory` route the same way production would.
+        // Same router selection as production `setup_database`.
         #[cfg(feature = "db")]
         let shard_router: std::sync::Arc<dyn crate::sharding::ShardRouter> =
             match (self.config.database.directory_shard_router, &pool) {
@@ -2269,10 +2215,8 @@ impl TestApp {
                             .with_statement_timeout_ms(timeout_ms),
                     )
                 }
-                // Production `setup_database` errors here (the directory router
-                // needs a control DB), so fail the test app the same way rather
-                // than silently routing by hash and passing a test the deployed
-                // app would fail.
+                // Production errors here too; routing by hash instead would pass tests the
+                // deployed app fails.
                 (true, None) => panic!(
                     "directory_shard_router is enabled but TestApp has no control database pool; \
                      configure a control pool (with_db) or disable directory routing"
@@ -2295,18 +2239,15 @@ impl TestApp {
         // Shared with the collaboration hub, for the reason `app.rs` gives.
         #[cfg(feature = "presence")]
         let test_presence = crate::presence::Presence::new(test_channels.clone());
-        // Resolve the injected clock BEFORE the state literal so `started_at`
-        // is stamped on the same timeline the app will read time from. A sim
-        // installs a virtual clock here, and uptime has to start at that
-        // clock's origin rather than at real process time.
+        // Resolve the clock first so `started_at` is on the app's timeline: under a sim, uptime
+        // starts at the virtual clock's origin, not real process time.
         let clock: std::sync::Arc<dyn crate::time::ClockSource> = self
             .clock
             .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock));
         let started_at = clock.monotonic();
 
-        // The fault ledger is created here, per build, from the RESOLVED clock:
-        // a sim installs its virtual clock immediately before `build`, and a
-        // `Sim::kill`/`restart` rebuilds, so counting restarts with the app.
+        // Created per build from the resolved clock: a sim installs its virtual clock just before
+        // `build`, and `Sim::kill`/`restart` rebuild, so the ledger restarts with the app.
         let fault_ledger = self.fault_plan.as_ref().map(|plan| {
             crate::sim::fault::FaultLedger::new(plan, std::sync::Arc::clone(&clock), started_at)
         });
@@ -2320,15 +2261,9 @@ impl TestApp {
             pool,
             #[cfg(feature = "db")]
             replica_pool,
-            // Build the shard set from the test config so handlers using
-            // the sharding extractors behave as they would in production.
-            // Pools are lazy, so this needs no running databases.
-            //
-            // Under transactional isolation each shard primary pool is built
-            // with `max_size(1)` and a `begin_test_transaction` hook (mirroring
-            // the control pool above) so writes routed to a shard are rolled
-            // back at the end of the test — the same isolation the control pool
-            // gets. Replicas are skipped; all shard reads run on the primary.
+            // Pools are lazy, so this needs no running databases. Under transactional isolation
+            // each shard primary gets `max_size(1)` and a `begin_test_transaction` hook, like the
+            // control pool, so shard writes roll back too. Replicas are skipped.
             #[cfg(all(feature = "db", not(feature = "sqlite")))]
             shards: if self.transactional {
                 crate::sharding::create_shard_set_transactional(
@@ -2340,9 +2275,7 @@ impl TestApp {
                 crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
                     .expect("test shard pools should build from config")
             },
-            // The transactional shard-set builder is Postgres-only (per-shard
-            // `begin_test_transaction` isolation); under the `sqlite` feature the
-            // harness always uses the plain builder (no shard rollback isolation).
+            // SQLite has no shard rollback isolation; always use the plain builder.
             #[cfg(all(feature = "db", feature = "sqlite"))]
             shards: match fleet_shards {
                 Some(shards) => Some(shards),
@@ -2351,9 +2284,8 @@ impl TestApp {
                         .expect("test shard pools should build from config")
                 }
             },
-            // The test harness attaches pools directly (`with_pool`), without
-            // a topology to carry a capture gap; a DB test that needs the gap
-            // noted asserts through the production seam instead.
+            // Pools are attached directly, with no topology to carry a capture gap. A test that
+            // needs the gap asserts through the production seam.
             #[cfg(all(feature = "db", feature = "reporting"))]
             db_capture_gap: None,
             profile: self.config.profile.as_deref().map(std::sync::Arc::from),
@@ -2367,11 +2299,9 @@ impl TestApp {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&self.config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
-            // Built from the resolved clock, not `JobRegistry::new()`: the queue
-            // gauges compare ready-at marks the job runtime stamps from this
-            // same clock. This literal bypasses `AppState::with_clock`, so
-            // leaving it on the default real clock is what made a sim's delayed
-            // job read as ready the instant it was enqueued.
+            // Queue gauges compare ready-at marks the job runtime stamps from this clock. This
+            // literal bypasses `AppState::with_clock`, and on the real clock a sim's delayed job
+            // would read as ready on enqueue.
             job_registry: crate::actuator::JobRegistry::new()
                 .with_clock(std::sync::Arc::clone(&clock)),
             config_props: crate::actuator::ConfigProperties::default(),
@@ -2407,10 +2337,7 @@ impl TestApp {
                     as std::sync::Arc<dyn crate::time::ClockSource>;
             state = state.with_clock(recording);
         }
-        // Same for the entropy source (#1634): a handler that mints a session
-        // id, a token or a job id must mint the *recorded* one on replay, or
-        // the identifier in the capsule's SQL binds will not be the one the
-        // replayed code produced.
+        // Same for entropy (#1634): ids minted on replay must match the capsule's SQL binds.
         #[cfg(feature = "reporting")]
         if self.config.failure_capture.enabled {
             let recording =
@@ -2436,8 +2363,7 @@ impl TestApp {
                     .expect("test role pools should build from config"),
             );
         }
-        // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
-        // and HTTP Client resilience can read the test-supplied config.
+        // `DbState` timeouts and HTTP `Client` resilience read the config from here.
         state.insert_extension(self.config.clone());
         // A sim kill stops the app's background tasks through this (#3067).
         state.insert_extension(crate::sim::AppTasks::default());
@@ -2458,20 +2384,14 @@ impl TestApp {
             state.insert_extension(effective);
             recorder_for_client
         };
-        // Always install the job recorder so `enqueued_jobs`/`assert_job_*` and
-        // `perform_enqueued_jobs` work with no opt-in. The recorder runs first
-        // and composes with any user-supplied `with_job_interceptor` (which
-        // still runs, after the recorder). A single `Arc<dyn JobInterceptor>`
-        // extension is what the job runtime reads, so we chain rather than
-        // install two.
+        // The recorder is always on so job assertions need no opt-in. The runtime reads a single
+        // `Arc<dyn JobInterceptor>`, so chain it with any user interceptor.
         let job_recorder_for_client = {
             let recorder_for_client = self.job_recorder.clone();
             let recorder: std::sync::Arc<dyn crate::interceptor::JobInterceptor> =
                 std::sync::Arc::new(self.job_recorder);
-            // Chain order is recorder → user → fault plan, so an attached
-            // `FaultPlan` sits INNERMOST: a user interceptor observes the
-            // injected error exactly as it would a real handler failure, and
-            // the recorder still sees every enqueue.
+            // Order: recorder → user → fault plan. The fault plan is innermost so a user
+            // interceptor sees an injected error like a real handler failure.
             let mut inner = self.job_interceptor;
             if let Some(ledger) = fault_ledger.as_ref() {
                 let fault = ledger.job_interceptor();
@@ -2497,13 +2417,9 @@ impl TestApp {
         };
         #[cfg(feature = "db")]
         {
-            // The single `Arc<dyn DbConnectionInterceptor>` extension the
-            // checkout path reads. An attached `FaultPlan` WRAPS whatever was
-            // already composed (the user's interceptor, transactional test
-            // isolation, or both) and runs its decision innermost, forwarding
-            // `is_transactional_test` so rollback isolation survives. Written
-            // without `ComposedDbInterceptor`, which does not exist under the
-            // `sqlite` feature.
+            // The fault plan wraps the composed interceptor (user, transactional isolation, or
+            // both) and forwards `is_transactional_test` so rollback isolation survives.
+            // `ComposedDbInterceptor` is not used: it does not exist under `sqlite`.
             let db_interceptor = match fault_ledger.as_ref() {
                 Some(ledger) => Some(ledger.db_interceptor(db_interceptor)),
                 None => db_interceptor,
@@ -2524,14 +2440,12 @@ impl TestApp {
                 interceptors.push(std::sync::Arc::new(recorder));
             }
             if let Some(interceptor) = self.channels_interceptor {
-                // Preserve the existing `insert_extension` behavior so the
-                // user's interceptor is discoverable from state.
+                // Also keep the user's interceptor discoverable from state.
                 state.insert_extension(interceptor.clone());
                 interceptors.push(interceptor);
             }
 
-            // AC6: install nothing (and leave production `Channels` untouched)
-            // unless at least one interceptor was requested.
+            // Leave production `Channels` untouched unless an interceptor was requested.
             if !interceptors.is_empty() {
                 state.intercept_channels(interceptors);
             }
@@ -2557,9 +2471,7 @@ impl TestApp {
             if let Some(handle) = self.suppression_store.clone() {
                 state.insert_extension(handle);
             }
-            // Mirror AppBuilder::run: register the bounce/complaint suppression
-            // handle before install_mailer so the test mailer actually consults
-            // it (install_mailer reads it back via the extension).
+            // Before `install_mailer`, which reads the suppression handle back from extensions.
             if let Some(handle) = self.mail_suppression_store.clone() {
                 state.insert_extension(handle);
             }
@@ -2567,12 +2479,10 @@ impl TestApp {
                 .expect("Failed to configure test mailer");
         }
 
-        // Install HTTP client config so the Client extractor can read it.
         #[cfg(feature = "http-client")]
         state.insert_extension(self.config.http.clone());
 
-        // Register the shared reqwest::Client so Client::from_state reuses the
-        // connection pool in tests, mirroring the production build_state path.
+        // Shared so `Client::from_state` reuses one connection pool, as in production.
         #[cfg(feature = "http-client")]
         state.insert_extension(crate::http_client::SharedReqwestClient {
             client: crate::http_client::Client::build_inner(&self.config.http.client),
@@ -2581,7 +2491,6 @@ impl TestApp {
         #[cfg(feature = "http-client")]
         crate::http_client::install_shared_throttle(&state, &self.config.http.client);
 
-        // Install mock registry when http_mock() was called.
         #[cfg(feature = "http-client")]
         if let Some(registry) = self.http_mock_registry {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
@@ -2591,8 +2500,7 @@ impl TestApp {
             state.insert_extension(net);
         }
 
-        // Register metrics sources before state initializers — mirrors production
-        // AppBuilder::run ordering so initializers can observe the registry.
+        // Before state initializers, as in production, so initializers can see the registry.
         for (name, source) in self.metrics_sources {
             if let Err(e) = state.metrics_source_registry.register(name, source) {
                 tracing::warn!("{e}");
@@ -2606,13 +2514,9 @@ impl TestApp {
                 tracing::warn!("{e}");
             }
         }
-        // Mirror production `build_state`: the `[health]` cache TTL, ping
-        // time limit and database readiness gate.
         state.apply_health_config(&self.config.health);
-        // Mirror production `AppBuilder` wiring: surface each configured shard's
-        // replica readiness as a `db:shard:<name>` indicator so `/ready`
-        // refreshes shard replica health (gating `fail_readiness` shards and
-        // marking healthy replicas ready for `ShardedDb` read routing).
+        // As in production: a `db:shard:<name>` indicator per shard, so `/ready` refreshes replica
+        // health for `fail_readiness` gating and `ShardedDb` read routing.
         #[cfg(feature = "db")]
         if let Some(set) = state.shards() {
             crate::sharding::register_shard_health_indicators(
@@ -2627,15 +2531,9 @@ impl TestApp {
         }
         crate::cost::install(&state, &self.config);
 
-        // Register the fault plan's 5xx projector alongside the app's own
-        // reporters (which keep receiving every event). It goes FIRST in the
-        // chain: `ReporterChain::report_all` awaits the reporters one after
-        // another, so a user reporter whose future stays pending (one waiting
-        // on a timer under a paused sim, say) would otherwise starve the
-        // projector and the observed 5xx would never reach
-        // `FaultOutcome::server_errors`. The projector records as its future is
-        // built and resolves immediately, so leading the chain delays nobody.
-        // Must land before the router is built, which is where
+        // The fault plan's 5xx projector goes first: `ReporterChain::report_all` awaits reporters
+        // in turn, so a pending user reporter (e.g. a timer under a paused sim) would starve it.
+        // It resolves immediately, so it delays nobody. Must precede the router build, where
         // `ReportingLayer` reads the chain.
         #[cfg(feature = "error-reporting")]
         if let Some(ledger) = fault_ledger.as_ref() {
@@ -2647,10 +2545,8 @@ impl TestApp {
             state.insert_extension(crate::reporting::RegisteredReporters(reporters));
         }
 
-        // Wire the event bus: always install a recorder so tests can assert on
-        // published events without a job runner, register the listener registry
-        // for the `Events` extractor, and fold durable listeners into the jobs
-        // started below so they dispatch through the in-process test runtime.
+        // The recorder lets tests assert on events without a job runner. Durable listeners join
+        // the jobs started below so they run on the in-process runtime.
         state.insert_extension(crate::events::EventRecorder::default());
         let event_recorder = state
             .extension::<crate::events::EventRecorder>()
@@ -2665,10 +2561,8 @@ impl TestApp {
             state.job_registry.register(&job.name);
         }
 
-        // Mirror production `AppBuilder` wiring: one `redis:<subsystem>`
-        // PING indicator per Redis-backed subsystem (#3059). Here, the job set
-        // is final (durable listeners are jobs too). `TestApp` always uses
-        // in-process channels, and with no jobs no job runtime starts.
+        // One `redis:<subsystem>` PING indicator per Redis-backed subsystem (#3059), after the job
+        // set is final. `TestApp` channels are in-process, and with no jobs no runtime starts.
         #[cfg(feature = "redis")]
         crate::redis_health::register_redis_health_indicators(
             &self.config,
@@ -2713,8 +2607,7 @@ impl TestApp {
             Some(TestJobRuntime { shutdown })
         };
 
-        // Start `#[scheduled]` tasks on the in-process scheduler. Their loops
-        // sleep on tokio timers and read the injected clock, so under a
+        // `#[scheduled]` loops sleep on tokio timers and read the injected clock, so under
         // `#[sim_test]` they tick in virtual time.
         let task_scheduler = if self.tasks.is_empty() {
             None
@@ -2741,8 +2634,7 @@ impl TestApp {
             Some(TestBackground { shutdown })
         };
 
-        // Retain the registered job metadata so `perform_enqueued_jobs` can look
-        // up each captured job's handler by name and dispatch it directly.
+        // `perform_enqueued_jobs` looks up each captured job's handler here by name.
         let jobs_for_client = self.jobs.clone();
 
         #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
@@ -2790,12 +2682,8 @@ impl TestApp {
             }
         }
 
-        // Explicitly build the session store the router's `SessionLayer` will
-        // use, so the client keeps a handle for `acting_as` to mint sessions
-        // (#1359). For the default in-memory backend we install a `MemoryStore`
-        // and pass it as the custom store; for other backends we leave it to
-        // config-driven selection (`None`) and the client's `session_store`
-        // handle stays `None`, so `acting_as` panics with a clear message.
+        // Build the in-memory store here so the client keeps a handle for `acting_as` (#1359).
+        // Other backends are selected from config, leaving no handle; `acting_as` then panics.
         let session_backed_by_memory = matches!(
             self.config.session.backend,
             crate::session::SessionBackend::Memory
@@ -2808,8 +2696,7 @@ impl TestApp {
             };
         let session_cookie_name = self.config.session.cookie_name.clone();
         let auth_session_key = self.config.auth.session_key.clone();
-        // Mirror the router's session-cookie signing decision (router.rs): only
-        // thread signing keys when a secret is configured or in production.
+        // Same rule as `router.rs`: sign only when a secret is configured or in production.
         let session_signing_keys = {
             let is_production =
                 matches!(self.config.profile.as_deref(), Some("prod" | "production"));
@@ -2848,29 +2735,20 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
-        // Mirror production's two outermost fallbacks, which `apply_startup_barrier`
-        // applies outside the session and exception-filter layers:
-        //
-        //  * access-log fallback (#999) — emits only for responses the primary
-        //    in-stack layer never saw (e.g. session-store outage 503s), so tests
-        //    observe the same access-log behavior an operator would;
-        //  * Server-Timing fallback (#1348) — appends a `total` only for responses
-        //    the primary never saw (short-circuits and the late-merged `/mcp`
-        //    envelope). Without it a `tools/call` would carry no outer `total` in
-        //    tests, unlike production.
-        //
-        // Composed into ONE `Router::layer` call, exactly as production does, so a
-        // test router has the same nesting depth as the real one (issue #2193).
-        // Tuple order is OUTERMOST FIRST: Server-Timing wraps the access log,
-        // matching production order.
+        // Production's two outermost fallbacks (`apply_startup_barrier`), outside the session and
+        // exception-filter layers. Each acts only on responses the in-stack layer never saw:
+        //  * access log (#999), e.g. session-store outage 503s;
+        //  * Server-Timing `total` (#1348), e.g. short-circuits and the late-merged `/mcp`
+        //    envelope.
+        // One `Router::layer` call, as in production, keeps the same nesting depth (#2193).
+        // Tuple order is outermost first.
         let server_timing_fallback = crate::config::server_timing_enabled(&self.config)
             .then(|| crate::middleware::ServerTimingLayer::fallback(true));
         let access_log_fallback = self.config.log.access_log.then(|| {
             crate::middleware::AccessLogLayer::fallback(self.config.log.access_log_exclude.clone())
         });
-        // Guarded, because `Router::layer` re-boxes every route even when the
-        // tuple contributes no service: with both fallbacks off this would
-        // otherwise add a nesting level production does not have.
+        // `Router::layer` re-boxes every route even for an empty tuple, which would add a nesting
+        // level production does not have.
         let router = if server_timing_fallback.is_some() || access_log_fallback.is_some() {
             router.layer((
                 tower::util::option_layer(server_timing_fallback),
@@ -3125,9 +3003,7 @@ impl TestClient {
             if let Ok(ticking) = cloned.downcast::<crate::time::TickingClock>() {
                 ticking.advance(duration);
             }
-            // FixedClock or other types: advance_clock is a no-op.
         }
-        // No clock installed: also a no-op.
     }
 
     /// Unwrap the underlying [`axum::Router`] out of the [`TestClient`].
@@ -3400,14 +3276,11 @@ impl TestClient {
     ///
     /// Panics, listing every job that *was* enqueued, if no enqueue matched
     /// both the name and payload.
-    // Takes the payload by value for call-site ergonomics — `json!({..})`
-    // reads cleanly without a leading `&`, mirroring the acceptance criteria.
+    // By value so `json!({..})` reads cleanly at the call site.
     #[allow(clippy::needless_pass_by_value)]
     pub fn assert_job_enqueued_with(&self, name: &str, payload: serde_json::Value) -> &Self {
         let jobs = self.enqueued_jobs();
-        // Strip the opt-in schema-version envelope (issue #1205) so payload
-        // assertions stay on clean args even for `#[job(version = N)]` jobs
-        // whose stored payload is wrapped as `{__autumn_schema_version, args}`.
+        // Strip the `#[job(version = N)]` envelope (#1205) so assertions compare the bare args.
         assert!(
             jobs.iter().any(|j| j.name == name
                 && *crate::payload_version::split_version(&j.payload).1 == payload),
@@ -3583,8 +3456,7 @@ impl TestClient {
         let ledger = self.fault_ledger.as_ref().expect(
             "no fault plan attached to this TestApp; call `TestApp::with_fault_plan(..)` before `build()`",
         );
-        // Fully-qualified: a `diesel_async::RunQueryDsl` glob import in this
-        // module also offers a `.load(..)` method by that name.
+        // Fully qualified: `diesel_async::RunQueryDsl`, imported in this module, also has `.load`.
         let observed = usize::try_from(std::sync::atomic::AtomicU64::load(
             &self.observed_server_errors,
             std::sync::atomic::Ordering::SeqCst,
@@ -3830,22 +3702,16 @@ fn apply_set_cookie(
         return;
     }
 
-    // The jar reliably recognizes Autumn's own cookie-clear encodings: an empty
-    // value (handled below) and a non-positive `Max-Age`, which the session and
-    // CSRF layers use to delete cookies. Third-party `Expires`-based deletions
-    // are only best-effort — an RFC 2822 timestamp in the past is honored, but
-    // other date encodings a foreign server might send are not fully parsed.
+    // Autumn's own deletions (empty value, non-positive `Max-Age`) are always recognized.
+    // `Expires` deletions are best-effort: only RFC 2822 dates are parsed.
     let mut deletes = false;
-    // Absolute expiry parsed from a positive `Max-Age`/future `Expires`. When
-    // both are present, `Max-Age` wins (RFC 6265), so track them separately and
-    // resolve at the end.
+    // `Max-Age` wins over `Expires` (RFC 6265), so track both and resolve at the end.
     let mut max_age_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut expires_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut saw_max_age = false;
     for attr in parts {
         let attr = attr.trim();
-        // Both `Max-Age=` and `Expires=` are 8-byte ASCII prefixes; match them
-        // case-insensitively (`EXPIRES=` etc. are equally valid per RFC 6265).
+        // Both prefixes are 8 ASCII bytes; attribute names are case-insensitive (RFC 6265).
         let prefix = attr.get(..8);
         if prefix.is_some_and(|p| p.eq_ignore_ascii_case("Max-Age=")) {
             if let Ok(secs) = attr[8..].trim().parse::<i64>() {
@@ -3871,7 +3737,6 @@ fn apply_set_cookie(
     if deletes || value.is_empty() {
         jar.remove(name);
     } else {
-        // `Max-Age` takes precedence over `Expires` when both are present.
         let expires_at = if saw_max_age {
             max_age_expiry
         } else {
@@ -3990,29 +3855,21 @@ impl RequestBuilder {
     /// Fire the request through the full middleware pipeline and return
     /// a [`TestResponse`].
     pub async fn send(self) -> TestResponse {
-        // Captured for failure messages and the N+1 default threshold on the
-        // resulting `TestResponse`.
         let request_method = self.method.to_string();
         let request_path = self.uri.clone();
         let n_plus_one_threshold = self.n_plus_one_threshold;
-        // Cloned up front: `self` is partially moved below (the router and body
-        // are consumed building the request).
+        // Cloned now: building the request moves out of `self`.
         let observed_server_errors = self.observed_server_errors.clone();
 
         let mut builder = Request::builder().method(self.method).uri(&self.uri);
 
-        // Replay the cookie jar: compose a `Cookie` header from stored cookies
-        // unless the caller already set one explicitly (an explicit header
-        // wins, so tests can still exercise raw cookie behavior).
+        // An explicit `Cookie` header wins over the jar, so tests can exercise raw cookies.
         let caller_set_cookie = self
             .headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("cookie"));
         if !caller_set_cookie && let Some(jar) = &self.cookie_jar {
-            // Evaluate expiry against the same clock the jar folds `Set-Cookie`
-            // with, so a virtual-clock test sees cookies stop replaying once it
-            // advances past their `Max-Age`/`Expires`. Prune expired entries in
-            // passing so they don't linger.
+            // Same clock as `Set-Cookie` folding, so a virtual-clock test sees cookies expire.
             let now = self
                 .clock
                 .as_ref()
@@ -4036,30 +3893,17 @@ impl RequestBuilder {
 
         let request = builder.body(self.body).expect("failed to build request");
 
-        // Wrap the router with MethodOverrideLayer the same way the production
-        // serve site does, so a POST with a `_method=DELETE` form field reaches
-        // the declared DELETE handler in tests too. The layer is a no-op for
-        // non-POST methods and non-form bodies, so it's safe to apply
-        // unconditionally.
+        // As the production serve site does, so a `_method=DELETE` form POST reaches the DELETE
+        // handler.
         let service =
             tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), self.router);
 
-        // Drive the request under a per-request `REQUEST_QUERY_CAPTURE` scope so
-        // the connection-level `RequestQueryTimer` (installed at `Db::checkout`
-        // whenever this capture lane is active) records every SQL statement the
-        // handler issues into the capture sink — no manual `DbInterceptor`
-        // wiring required. This lane is independent of the `Server-Timing`
-        // timing accumulator (`REQUEST_DB_TIMINGS`), so query capture is
-        // unaffected by however `ServerTimingLayer` scopes (and nests) its
-        // per-scope DB metrics. `oneshot` runs on this same task, so the
-        // task-local is visible to the checkout. When the `db` feature is off
-        // there is no DB, so the captured query list is simply empty.
+        // Under `REQUEST_QUERY_CAPTURE`, `Db::checkout` records every SQL statement into
+        // `capture`, independent of the Server-Timing accumulator. `oneshot` runs on this task,
+        // so the task-local is visible.
         //
-        // The response body is drained (`to_bytes`) *inside* the scope so that
-        // handlers returning a lazy or streaming body (`Sse`, `Body::from_stream`,
-        // …) which perform DB work when the stream is polled still record those
-        // body-time checkouts into the capture sink. The sink is read only after
-        // the body is fully collected, so nothing is missed.
+        // Drain the body inside the scope so streaming bodies that query when polled are
+        // captured too.
         #[cfg(feature = "db")]
         let (status, headers, body_bytes, queries) = {
             let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4101,10 +3945,7 @@ impl RequestBuilder {
             (status, headers, body_bytes, Vec::new())
         };
 
-        // Fold every `Set-Cookie` from the response back into the jar so the
-        // next request from the same client replays it. Cookies whose
-        // attributes mark them for deletion (`Max-Age=0` or a past `Expires`)
-        // are removed instead of stored.
+        // Deletions (`Max-Age=0`, a past `Expires`) remove the cookie instead of storing it.
         if let Some(jar) = &self.cookie_jar {
             let now = self
                 .clock
@@ -4225,10 +4066,8 @@ impl Default for TestResponse {
             queries: Vec::new(),
             request_method: String::new(),
             request_path: String::new(),
-            // Inherit the detector's default (5) — not a zero-filled `0`, which
-            // `inspector::detect_n_plus_one` treats as DISABLED — so the
-            // documented `TestResponse { .. ..Default::default() }` construction
-            // still catches N+1 patterns.
+            // Not `0`: `detect_n_plus_one` treats it as disabled, so `..Default::default()`
+            // construction would never catch N+1 patterns.
             n_plus_one_threshold: crate::inspector::DEFAULT_N_PLUS_ONE_THRESHOLD,
         }
     }
@@ -4421,25 +4260,9 @@ impl TestResponse {
 
     // ── CSS-selector HTML assertions ────────────────────────────
     //
-    // Autumn renders server-side HTML (Maud + htmx), so tests want to assert on
-    // page *structure* — "the table has exactly 3 rows", "there is a `<form>`
-    // posting to `/notes`" — rather than brittle substrings. These helpers parse
-    // the body with a real HTML parser and match against a CSS-selector subset
-    // (tag, `.class`, `#id`, `[attr=…]`, plus descendant/child combinators), so
-    // assertions survive cosmetic template changes (whitespace, attribute order,
-    // wrapping markup) that would break [`assert_body_contains`].
-    //
-    // They work for full documents and for partial/fragment responses (htmx
-    // swaps) alike, and compose with the other matchers — every method returns
-    // `&Self` for chaining.
-    //
-    // ```rust,ignore
-    // client.get("/notes").send().await
-    //     .assert_ok()
-    //     .assert_selector_count("tbody tr.note-row", 3)   // exactly 3 rows
-    //     .assert_attr("tr.note-row:first-child a", "href", "/notes/1")
-    //     .assert_text("h1", "Notes");
-    // ```
+    // Match parsed HTML against a CSS-selector subset (tag, `.class`, `#id`, `[attr=…]`,
+    // descendant and child combinators), so assertions survive cosmetic template changes that
+    // break `assert_body_contains`. Works on full documents and htmx fragments.
 
     /// Parse the response body as HTML once for a selector assertion.
     fn parse_html(&self) -> Vec<crate::test_html::Node> {
@@ -4657,7 +4480,6 @@ impl TestResponse {
                 sql = q.sql,
             );
         }
-        // Counts per normalized statement (stable, sorted for determinism).
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for q in &self.queries {
             *counts
@@ -4724,8 +4546,7 @@ impl TestResponse {
     }
 }
 
-// Constructed only by the Postgres transactional test-isolation establish path,
-// which is cfg'd out under the `sqlite` feature — so gate these out too.
+// Only the Postgres transactional establish path builds this.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 struct TransactionalDbInterceptor;
 
@@ -4753,7 +4574,7 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
         Box::pin(async move {
             let mut conn = next.await?;
 
-            // Check if transaction has already been started on this connection
+            // The session GUC marks a connection whose test transaction is already open.
             let guc_result = diesel::select(diesel::dsl::sql::<
                 diesel::sql_types::Nullable<diesel::sql_types::Text>,
             >(
@@ -4764,7 +4585,7 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
 
             match guc_result {
                 Ok(Some(ref s)) if s == "true" => {
-                    // Already started and healthy
+                    // Already started and healthy.
                 }
                 Ok(_) => {
                     use diesel_async::AsyncConnection;
@@ -4786,8 +4607,8 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
                         })?;
                 }
                 Err(_) => {
-                    // The GUC query failed. This happens when the connection is in a failed/aborted transaction block.
-                    // Since the transaction is already active (but aborted), do not retry begin_test_transaction!
+                    // The query fails when the connection is in an aborted transaction block: the
+                    // test transaction is already open, so do not begin another.
                 }
             }
             Ok(conn)
@@ -4799,8 +4620,7 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
     }
 }
 
-// See `TransactionalDbInterceptor`: only the Postgres transactional establish
-// path composes interceptors, so this is dead under the `sqlite` feature.
+// Only the Postgres transactional establish path composes interceptors.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 struct ComposedDbInterceptor {
     first: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
@@ -5210,12 +5030,9 @@ pub async fn drain_ready_repository_commit_hooks(
         ready: i64,
     }
 
-    // The private drains return `()`, so measure the ready set up-front and
-    // report how many this pass will claim-and-run. In a single-threaded test
-    // (no competing worker) this equals the number processed, capped at
-    // `max_rows`. Predicate mirrors the claim query's readiness gate
-    // (`status = 'enqueued' AND run_at <= now`); `CURRENT_TIMESTAMP` is standard
-    // SQL on both the Postgres and SQLite backends.
+    // The private drains return `()`, so count the ready set first. With no competing worker
+    // this equals the number processed, capped at `max_rows`. The predicate matches the claim
+    // query's readiness gate; `CURRENT_TIMESTAMP` works on both Postgres and SQLite.
     let ready_before: usize = {
         let mut conn = pool
             .get()
@@ -5518,10 +5335,6 @@ mod tests {
             }
         }
 
-        // A plugin that wires List-Unsubscribe storage and opts into the default
-        // endpoint must propagate both into the TestApp, so unsubscribe POSTs /
-        // send-time suppression behave under TestApp exactly as in production
-        // without every test repeating the setup manually.
         let app = TestApp::new().plugin(SuppressionPlugin);
         assert!(
             app.suppression_store.is_some(),
@@ -5575,13 +5388,10 @@ mod tests {
             .assert_body_eq("deleted");
     }
 
-    // ── CSS-selector HTML assertions (issue #1147) ─────────────────────────
+    // ── CSS-selector HTML assertions (#1147) ─────────────────────────
     //
-    // These tests are the executable specification for the selector-aware
-    // assertions on [`TestResponse`]. They exercise the success metric:
-    // a structural assertion against a notes index survives a cosmetic
-    // template refactor (indentation, attribute order, wrapping markup)
-    // that would break the equivalent `assert_body_contains` substring test.
+    // A structural assertion must survive a cosmetic template refactor that breaks the
+    // equivalent `assert_body_contains` check.
     #[cfg(feature = "maud")]
     mod html_assertions {
         use super::*;
@@ -5691,7 +5501,6 @@ mod tests {
             for handler in [get(notes_index_v1), get(notes_index_v2)] {
                 let resp = client("/notes", handler).get("/notes").send().await;
                 resp.assert_ok()
-                    // Exactly three data rows, each linking to /notes/{id}.
                     .assert_selector_count("tbody tr.note-row", 3);
                 let hrefs = resp.selector_attr("tbody tr.note-row a", "href");
                 assert_eq!(
@@ -5781,19 +5590,15 @@ mod tests {
         let response = client.post("/create").form("_method=BREW").send().await;
         response.assert_status(400);
 
-        // RequestIdLayer is applied via `Router::layer` in
-        // `apply_middleware` and stamps a response header on every
-        // request that flows through the inner router. If the override
-        // layer short-circuited at the outer wrapper, this header would
-        // be absent.
+        // `RequestIdLayer` sits on the inner router; the header is missing if the override
+        // layer short-circuited outside it.
         assert!(
             response.header("x-request-id").is_some(),
             "framework request-id header must wrap method-override rejections; \
              observed headers: {:?}",
             response.headers
         );
-        // SecurityHeadersLayer applies a default set of headers; pick a
-        // representative one to assert the layer ran on this response.
+        // One representative header proves `SecurityHeadersLayer` ran.
         assert!(
             response.header("x-content-type-options").is_some(),
             "framework security headers must wrap method-override rejections; \
@@ -5804,9 +5609,7 @@ mod tests {
 
     // ── #1262: query-count / N+1 assertions (pure, no Postgres) ─────────
     //
-    // These exercise the assertion *logic* on a directly-constructed
-    // `TestResponse`, so they run in the always-on CI lane without a database
-    // — the framework self-test that guarantees the assertions actually fire.
+    // These run on a constructed `TestResponse`, so they need no database.
 
     fn resp_with_queries(sqls: &[&str], threshold: usize) -> TestResponse {
         TestResponse {
@@ -5893,7 +5696,6 @@ mod tests {
 
     #[test]
     fn assert_max_queries_passes_at_boundary() {
-        // len == n is within budget and must not panic.
         resp_with_queries(&["SELECT 1", "SELECT 2"], 5).assert_max_queries(2);
     }
 
@@ -5918,7 +5720,6 @@ mod tests {
 
     #[test]
     fn assert_no_n_plus_one_passes_for_distinct_queries() {
-        // Three distinct statements: no normalized template repeats.
         resp_with_queries(&["SELECT 1", "SELECT 2", "SELECT 3"], 2).assert_no_n_plus_one();
     }
 
@@ -5951,10 +5752,9 @@ mod tests {
 
     #[test]
     fn assert_no_n_plus_one_with_threshold_overrides_default() {
-        // Two identical queries; the configured default threshold (10) does not
-        // fire, but an explicit override of 2 does.
+        // Two identical queries: the configured threshold (10) does not fire, an explicit 2 does.
         let resp = resp_with_queries(&["SELECT 1", "SELECT 1"], 10);
-        resp.assert_no_n_plus_one(); // default threshold 10 -> passes
+        resp.assert_no_n_plus_one();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             resp.assert_no_n_plus_one_with_threshold(2);
         }))
@@ -5967,9 +5767,7 @@ mod tests {
 
     #[test]
     fn default_test_response_inherits_detector_threshold() {
-        // A directly-constructed `TestResponse` must inherit the shared detector
-        // default (5), not a zero-filled `0` — otherwise `..Default::default()`
-        // would silently DISABLE N+1 detection.
+        // `0` would silently disable N+1 detection for `..Default::default()` construction.
         assert_eq!(
             TestResponse::default().n_plus_one_threshold,
             crate::inspector::DEFAULT_N_PLUS_ONE_THRESHOLD,
@@ -5978,10 +5776,8 @@ mod tests {
 
     #[test]
     fn default_constructed_response_catches_n_plus_one() {
-        // Build a response purely via the documented `{ .., ..Default::default() }`
-        // pattern (no explicit threshold). With a zero-filled default this passed
-        // silently (0 == DISABLED); with the detector default (5) it must panic on
-        // the normalized template repeated to the threshold.
+        // The threshold comes only from `..Default::default()`; five normalized repeats must
+        // trip the detector default (5).
         let resp = TestResponse {
             queries: [
                 "SELECT * FROM comments WHERE post_id = $1",

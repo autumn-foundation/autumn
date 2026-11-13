@@ -259,8 +259,7 @@ pub fn note_pin_redirect() {
         if let Some(ref metrics) = pin.inner.metrics {
             metrics.record_read_your_writes_pin();
         }
-        // Emit the trace at most once per request to avoid log spam on
-        // read-heavy handlers where every read is redirected.
+        // Trace once per request: on read-heavy handlers every read is redirected.
         if !pin.inner.pin_traced.swap(true, Ordering::Relaxed) {
             tracing::debug!(
                 target: "autumn::db",
@@ -302,8 +301,8 @@ pub async fn middleware(
 
     let mut response = scope(pin, next.run(req)).await;
 
-    // Session mode: stamp a Set-Cookie if a write occurred so subsequent
-    // requests within the freshness window also route to primary.
+    // In session mode a write sets the cookie, so later requests within the
+    // freshness window also route to the primary.
     stamp_ryw_cookie(&mut response, &settings, &pin_for_response);
 
     response
@@ -399,12 +398,10 @@ where
     fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
         let pin = request_pin_for(&req, &self.settings);
         let pin_for_response = pin.clone();
-        // Built inside the scope, not merely polled inside it: arguments are
-        // evaluated first, so passing `self.inner.call(req)` straight to
-        // `scope_future` would run the synchronous `Service::call` chain beneath
-        // this layer with `PIN` unset. `is_pinned()`/`mark_write()` are public
-        // and synchronous, so an operator's own Tower layer is entitled to call
-        // them from `call`. See `crate::capsule::capture` for the same hazard.
+        // Call `inner` inside the scope, not just poll it there: passing
+        // `self.inner.call(req)` to `scope_future` would run it with `PIN` unset,
+        // and a layer beneath may call `is_pinned()`/`mark_write()` from `call`.
+        // `crate::capsule::capture` has the same hazard.
         let inner = PIN.sync_scope(pin.clone(), || self.inner.call(req));
         ReadYourWritesFuture {
             inner: scope_future(pin, inner),
@@ -436,18 +433,9 @@ fn request_pin_for<B>(
             RequestPin::new_with_metrics(settings.mode, settings.metrics.clone())
         }
         crate::config::ReadYourWrites::Off => {
-            // Unreachable: both call sites gate on `mode != Off`
-            // (`apply_middleware` only builds the layer inside that check, and
-            // `middleware` documents the same precondition). This used to be an
-            // `unreachable!()`; it is a `debug_assert!` plus an INERT pin now,
-            // because turning a caller's misconfiguration into a panic on the
-            // request path is the wrong trade for a middleware whose whole job
-            // is optional. The fallback is `Off`, not `Request`: `Request` is
-            // the *active* mode, so it would silently start pinning reads to
-            // the primary for an app that configured read-your-own-writes off —
-            // contradicting `is_pinned_off_mode_never_pins` below. `Off` is
-            // inert (`is_pinned` is false, no cookie is minted), which is what
-            // the configuration asked for.
+            // Both call sites gate on `mode != Off`. A misconfigured caller gets
+            // an inert `Off` pin, not a request-path panic. Not `Request`: that
+            // would pin reads to the primary for an app that turned this off.
             debug_assert!(
                 false,
                 "read-your-own-writes middleware built in `off` mode; \
@@ -567,7 +555,7 @@ mod tests {
         .await;
     }
 
-    // Cookie parsing tests (use pub(crate) ResolvedSigningKeys directly)
+    // ── cookie parsing ────────────────────────────────────────────────────────
     fn test_keys() -> crate::security::config::ResolvedSigningKeys {
         crate::security::config::ResolvedSigningKeys::new(b"test-key-for-ryw-unit".to_vec(), vec![])
     }
@@ -677,7 +665,6 @@ mod tests {
             "session mode + wrote must produce a cookie value"
         );
         let val = val.unwrap();
-        // Must be parseable as a fresh cookie.
         let fresh_pin = RequestPin::with_session_cookie(&val, &keys, 5);
         assert!(
             fresh_pin.incoming_pin(),
@@ -712,8 +699,7 @@ mod tests {
             note_pin_redirect();
         })
         .await;
-        // Metric increments on every call; trace deduplicated (can't assert trace
-        // but we verify the counter reflects all three calls).
+        // Only the trace is deduplicated; the metric counts every call.
         assert_eq!(metrics.snapshot().read_your_writes_pins_total, 3);
     }
 
@@ -847,7 +833,6 @@ mod tests {
         let metrics = crate::middleware::MetricsCollector::new();
         let keys_clone = keys.clone();
 
-        // Track whether the handler saw a pin via a shared flag.
         let saw_pin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_pin_clone = saw_pin.clone();
         let app = Router::new()

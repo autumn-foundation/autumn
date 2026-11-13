@@ -181,15 +181,9 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "inbound-mail")]
         inbound_mail_router: None,
     };
-    // Strip the edge lane's internal fallthrough-sentinel header from every
-    // outbound response, for every app — not only apps that call
-    // `with_edge_kv`. `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) sets
-    // this header on its 500 so the EDGE CAPSULE runtime knows to fall
-    // through to the origin; the same handler code also runs at the origin,
-    // and a `#[edge(needs(kv))]` route with no `with_edge_kv` call — a wiring
-    // bug — hits that same 500 at the origin. Without this layer the internal
-    // header would leak straight to a real HTTP client. See
-    // `StripEdgeFallthroughSentinelLayer` below.
+    // Installed for every app, not only those that call `with_edge_kv`: a
+    // `#[edge(needs(kv))]` route with no `with_edge_kv` call hits the sentinel 500
+    // at the origin too, and the internal header must not reach the client.
     #[cfg(feature = "edge")]
     let builder = builder.layer(StripEdgeFallthroughSentinelLayer);
     builder
@@ -345,11 +339,10 @@ type ShutdownHook = Box<dyn Fn() -> ShutdownHookFuture + Send + Sync>;
 
 // ── Tier-1 subsystem factories ────────────────────────────────
 //
-// `ConfigLoader` and `DatabasePoolProvider` use RPIT (`-> impl Future + Send`)
-// in their trait methods, so `Box<dyn Trait>` is not dyn-compatible. We store
-// boxed factory closures that capture the concrete impl at the call site and
-// erase its future type via `Pin<Box<dyn Future>>`. `TelemetryProvider`'s
-// `init` is sync, so it's stored as a normal `Box<dyn>`.
+// `ConfigLoader` and `DatabasePoolProvider` return `impl Future` from their trait
+// methods, so they are not dyn-compatible. Store boxed closures that capture the
+// concrete impl and erase the future type instead. `TelemetryProvider::init` is
+// sync, so it is a plain `Box<dyn>`.
 type ConfigLoaderFactory = Box<
     dyn FnOnce() -> Pin<
             Box<dyn Future<Output = Result<AutumnConfig, crate::config::ConfigError>> + Send>,
@@ -2529,11 +2522,9 @@ impl AppBuilder {
 
     // ── Tier-1 subsystem replacement hooks ─────────────────────
     //
-    // Each `with_*` method swaps a framework-default subsystem for a
-    // user-provided trait impl. The defaults preserve current behaviour, so an
-    // app that does not customize sees no change. Plugins chain these in
-    // `build()` to ship a subsystem — an `AwsSecretsConfigPlugin` calling
-    // `app.with_config_loader(...)`. See `docs/guides/extensibility.md`.
+    // Each `with_*` method swaps a framework-default subsystem for a user-provided
+    // trait impl. Plugins call these from `build()` to ship a subsystem. See
+    // `docs/guides/extensibility.md`.
 
     /// Install a custom [`ConfigLoader`],
     /// replacing the default TOML + env loader.
@@ -2840,10 +2831,8 @@ impl AppBuilder {
     #[cfg(feature = "edge")]
     #[must_use]
     pub fn with_edge_kv(self, kv: Arc<dyn autumn_edge::EdgeKv>) -> Self {
-        // `EdgeCache::layer` hands back a ready-made `axum::Extension`, which is
-        // itself a `tower::Layer` and therefore an `IntoAppLayer` — the same
-        // plumbing `install_i18n_bundle_layer` uses. No adapter needed, and the
-        // injection type stays an implementation detail of `autumn-edge`.
+        // `EdgeCache::layer` returns an `axum::Extension`, which is already a
+        // `tower::Layer`, so the injection type stays private to `autumn-edge`.
         self.layer(autumn_edge::EdgeCache::layer(kv))
     }
 
@@ -3592,11 +3581,9 @@ impl AppBuilder {
         }
         if let Some(mut contract) = plugin.contract() {
             Self::enforce_plugin_contract(&contract);
-            // Route attribution keys on `Plugin::name()` while a contract names
-            // the plugin's CRATE; the default `name()` is `type_name`, so a
-            // plugin that declares `env!("CARGO_PKG_NAME")` without overriding
-            // `name()` has two identities. Carry both so
-            // `autumn plugin-check --plugin-name` finds it under either.
+            // Routes are attributed by `Plugin::name()` (default: `type_name`),
+            // while a contract names the crate. Carry both so
+            // `autumn plugin-check --plugin-name` finds the plugin under either.
             contract.registered_as = Some(name.as_ref().to_owned());
             self.plugin_contracts.push(contract);
         }
@@ -3607,8 +3594,7 @@ impl AppBuilder {
         );
         let name_str = name.into_owned();
         self.registered_plugins.insert(name_str.clone());
-        // Save outer plugin context so nested plugin() calls don't permanently
-        // clear it; restore it after this plugin's build() returns.
+        // Restored after `build()` so a nested `plugin()` call does not clear it.
         let outer_plugin = self.current_plugin.replace(name_str);
         let outer_group = self
             .current_group
@@ -3851,12 +3837,9 @@ impl AppBuilder {
         indicator: Arc<dyn crate::actuator::HealthIndicator>,
     ) -> Self {
         let name = name.into();
-        // "db" is a reserved built-in component name. Allowing a custom indicator
-        // under this name would produce an inconsistent response: the custom result
-        // would still gate the aggregate status while the built-in primary ping owns
-        // the components.db / checks.database display. The "db:shard:" prefix and
-        // "db:fleet" are reserved for the framework's per-shard and fleet
-        // indicators for the same reason.
+        // Reserved for the built-in primary, shard and fleet indicators. A custom
+        // "db" indicator would gate the aggregate status while the built-in ping
+        // owns the `components.db` display.
         #[cfg(feature = "db")]
         if name == "db" || name == "db:fleet" || name.starts_with("db:shard:") {
             tracing::warn!(
@@ -4243,37 +4226,30 @@ impl AppBuilder {
     // Large frame is expected: the caller boxes this long-lived future.
     #[allow(clippy::large_stack_frames)]
     pub async fn run(self) {
-        // Remember the binary this process was started from, before a deploy
-        // can replace the file underneath it: an in-place upgrade (#1674) execs
-        // that path, and `/proc/self/exe` reports "… (deleted)" once the file
-        // has been swapped.
+        // Record the startup binary before a deploy can replace it: an in-place
+        // upgrade (#1674) execs that path, and `/proc/self/exe` reports
+        // "… (deleted)" once the file is swapped.
         #[cfg(feature = "upgrade")]
         crate::upgrade::record_startup_exe();
 
-        // ── Build mode ─────────────────────────────────────────────────
-        // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
-        // instead of starting the HTTP server. This is triggered by `autumn build`.
+        // One-shot modes, selected by env vars the `autumn` CLI sets. Each runs
+        // and exits without starting the HTTP server.
+
+        // AUTUMN_BUILD_STATIC=1 (`autumn build`): render static routes to dist/.
         if is_static_build_mode() {
             Box::pin(self.run_build_mode()).await;
             return;
         }
 
-        // ── Route dump mode ────────────────────────────────────────────
-        // When AUTUMN_DUMP_ROUTES=1, print the route listing JSON and exit.
-        // This is triggered by `autumn routes` to introspect the app's
-        // route table without booting the server or connecting to a database.
+        // AUTUMN_DUMP_ROUTES=1 (`autumn routes`): print the route listing JSON.
         if is_dump_routes_mode() {
             self.run_dump_routes_mode().await;
             return;
         }
 
-        // ── OpenAPI spec dump mode ─────────────────────────────────────
-        // When AUTUMN_DUMP_OPENAPI=1, print the generated OpenAPI document
-        // and exit. Triggered by `autumn openapi export`, which needs the
-        // contract without booting the server or connecting to a database.
-        // The guard is deliberately outside the feature gate: a binary built
-        // without `openapi` must report that on the dump protocol rather than
-        // ignore the request and start serving.
+        // AUTUMN_DUMP_OPENAPI=1 (`autumn openapi export`). The check sits outside
+        // the feature gate so a build without `openapi` reports that on the dump
+        // protocol instead of ignoring the request and serving.
         if is_dump_openapi_mode() {
             #[cfg(feature = "openapi")]
             {
@@ -4291,52 +4267,31 @@ impl AppBuilder {
             }
         }
 
-        // ── Cache-coherence manifest dump mode ─────────────────────────
-        // When AUTUMN_DUMP_CACHE_COHERENCE=1, print the cache-coherence
-        // manifest (#1716) and exit. Triggered by `autumn cache audit`, which
-        // needs the whole binary's registrations — every `#[cached]` read and
-        // every `#[repository]` write, across the app AND its plugins — and
-        // link-time `inventory` collection is the only place they all exist
-        // together. Runs before any database or port is touched.
+        // The manifest dumps below run inside the app because only the linked
+        // binary's `inventory` holds every registration, app and plugins alike.
+
+        // AUTUMN_DUMP_CACHE_COHERENCE=1 (`autumn cache audit`, #1716).
         if crate::cache::coherence::is_dump_mode() {
             crate::cache::coherence::print_manifest_dump(&crate::cache::coherence::audit());
             return;
         }
 
-        // ── Data-flow manifest dump mode ───────────────────────────────
-        // When AUTUMN_DUMP_DATA_FLOW=1, print the classified-data flow manifest
-        // (#1654) and exit. Triggered by `autumn data-flow`, which needs the
-        // whole binary's registrations -- every `#[classified]` column and every
-        // declared declassification boundary, across the app AND its plugins --
-        // and link-time `inventory` collection is the only place they all exist
-        // together. Runs before any database or port is touched.
+        // AUTUMN_DUMP_DATA_FLOW=1 (`autumn data-flow`, #1654).
         if crate::classify::manifest::is_dump_mode() {
             crate::classify::manifest::print_manifest_dump(&crate::classify::manifest::audit());
             return;
         }
 
-        // ── Agent-authority manifest dump mode ─────────────────────────
-        // With AUTUMN_DUMP_AGENT_AUTHORITY=1, print the agent-authority manifest
-        // (#1691) and exit. `autumn agents manifest` triggers this because it
-        // needs the whole binary's registrations — every `#[agent_operable]`
-        // action and every `authority_grant!`, across the app and its plugins —
-        // joined against this app's route table: which actions an agent can reach
-        // is a fact about the mounted routes, not the annotations alone. Runs
-        // before any database or port is touched.
+        // AUTUMN_DUMP_AGENT_AUTHORITY=1 (`autumn agents manifest`, #1691). Joined
+        // against the mounted routes: reachability depends on the mount, not only
+        // the annotations.
         if crate::agent_authority::manifest::is_dump_mode() {
             self.run_dump_agent_authority_mode();
             return;
         }
 
-        // ── Architecture-graph dump mode ───────────────────────────────
-        // When AUTUMN_DUMP_GRAPH=1, print the application architecture graph
-        // (#1747) and exit. Triggered by `autumn graph`, which needs the whole
-        // binary's registrations -- every `#[route]`, `#[model]`,
-        // `#[repository]` and `#[job]`, across the app AND its plugins --
-        // joined against this app's mounted route table, because a route's
-        // served path and resolved auth posture are facts about the mount and
-        // not about the annotation alone. Runs before any database or port is
-        // touched.
+        // AUTUMN_DUMP_GRAPH=1 (`autumn graph`, #1747). Joined against the mounted
+        // routes: a route's served path and auth posture depend on the mount.
         #[cfg(feature = "graph")]
         if crate::graph::manifest::is_dump_mode() {
             self.run_dump_graph_mode().await;
@@ -4348,11 +4303,8 @@ impl AppBuilder {
             std::process::exit(2);
         }
 
-        // ── Jobs manifest dump mode ────────────────────────────────────
-        // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
-        // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`
-        // so a topology-aware `autumn doctor` sees exactly what the runtime
-        // drains without booting the server or connecting to a database.
+        // AUTUMN_DUMP_JOBS=1 (`autumn jobs manifest`): print the drained queues as
+        // TOML for `autumn doctor`.
         if is_dump_jobs_mode() {
             self.run_dump_jobs_mode().await;
             return;
@@ -4368,35 +4320,24 @@ impl AppBuilder {
             return;
         }
 
-        // ── Migrate one-shot mode ──────────────────────────────────────
-        // With AUTUMN_MIGRATE=1, apply pending embedded migrations to the
-        // configured databases and exit; never start the HTTP server or bind a
-        // port. `autumn deploy`'s redeploy cutover runs migrations before
-        // flipping traffic (#1607), so a non-zero exit aborts the deploy with the
-        // old release still serving (AC-3). Unlike startup auto-migration this
-        // applies on every profile, because the deploy invokes it explicitly.
+        // AUTUMN_MIGRATE=1: apply pending migrations. `autumn deploy` runs this
+        // before cutover (#1607), so a non-zero exit aborts with the old release
+        // still serving. Unlike startup auto-migration it applies on every profile.
         if is_migrate_only_mode() {
             self.run_migrate_only_mode().await;
             return;
         }
 
-        // ── Retention dry-run mode ──────────────────────────────────────
-        // When AUTUMN_RETENTION_DRY_RUN=1, count (never delete) the rows every
-        // registered `#[repository(..., retention(...))]` policy would sweep,
-        // print the report as JSON, and exit — never starting the HTTP server.
-        // Triggered by `autumn retention --dry-run` (issue #1342).
+        // AUTUMN_RETENTION_DRY_RUN=1 (`autumn retention --dry-run`, #1342): count,
+        // never delete, the rows each retention policy would sweep.
         if is_retention_dry_run_mode() {
             self.run_retention_dry_run_mode().await;
             return;
         }
 
-        // ── Framework data-retention mode ───────────────────────────────
-        // With AUTUMN_DB_RETENTION=report|purge, report or enforce the unified
-        // `[retention]` policy over every framework-owned dataset and exit,
-        // never starting the HTTP server. Triggered by `autumn db retention`
-        // (#1605). It runs inside the app rather than the standalone CLI, so the
-        // report reflects the app's own resolved config, GDPR legal-hold
-        // registrations, and audit sinks — the inputs the scheduled sweep uses.
+        // AUTUMN_DB_RETENTION=report|purge (`autumn db retention`, #1605). Runs in
+        // the app so it sees the same config, legal holds and audit sinks as the
+        // scheduled sweep.
         #[cfg(feature = "data-retention")]
         if let Some(mode) = framework_retention_mode_from_env() {
             self.run_framework_retention_mode(mode).await;
@@ -4410,11 +4351,8 @@ impl AppBuilder {
             std::process::exit(2);
         }
 
-        // ── Data-capsule mode ───────────────────────────────────────────
-        // With AUTUMN_DATA_CAPSULE=export|import|verify, export one subject
-        // to a signed capsule, import a capsule, or verify one, and exit.
-        // Triggered by `autumn data capsule` (issue #1811). It runs inside the
-        // app, so it uses the app's own registry, database, and secret.
+        // AUTUMN_DATA_CAPSULE=export|import|verify (`autumn data capsule`, #1811).
+        // Runs in the app to use its registry, database and secret.
         #[cfg(feature = "gdpr")]
         if let Some(mode) = data_capsule_mode_from_env() {
             self.run_data_capsule_mode(mode).await;
@@ -4426,11 +4364,8 @@ impl AppBuilder {
             std::process::exit(2);
         }
 
-        // ── Capsule replay mode ────────────────────────────────────────
-        // When AUTUMN_REPLAY_CAPSULE=<path> is set, rebuild this application
-        // offline, drive the request the capsule recorded through it, print the
-        // verdict and EXIT — never start the HTTP server, never open a socket
-        // (issue #1598). Triggered by `autumn replay <capsule>`.
+        // AUTUMN_REPLAY_CAPSULE=<path> (`autumn replay`, #1598): replay the
+        // recorded request offline and print the verdict. Never opens a socket.
         if is_replay_mode()
             && let Some(capsule_path) = replay_capsule_from_env()
         {
@@ -4439,9 +4374,7 @@ impl AppBuilder {
                 self.run_replay_mode(capsule_path).await;
                 return;
             }
-            // Capsules are a `reporting`-feature surface; without it there is
-            // nothing to load the document with. Refuse (exit 2) rather than
-            // silently booting a server the operator did not ask for.
+            // Refuse rather than boot a server the operator did not ask for.
             #[cfg(not(feature = "reporting"))]
             {
                 eprintln!(
@@ -4452,11 +4385,9 @@ impl AppBuilder {
             }
         }
 
-        // Register the in-place upgrade signal (#1674) before the long boot —
-        // config, database, migrations — rather than when the watcher task
-        // first runs. Until a handler is installed, `SIGUSR2`'s default
-        // disposition is to *terminate* the process, so a deploy script that
-        // signals a process that is still booting would kill it.
+        // Install the SIGUSR2 upgrade handler (#1674) before the long boot: its
+        // default disposition terminates the process, so a deploy that signals a
+        // still-booting process would kill it.
         #[cfg(all(unix, feature = "upgrade"))]
         let upgrade_signal =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
@@ -4469,8 +4400,7 @@ impl AppBuilder {
                     None
                 }
             };
-        // Without `upgrade` nothing consumes the signal. Catch and log it, so
-        // a deploy script that sends it does not end the process.
+        // Without `upgrade`, catch and log the signal so it does not end the process.
         #[cfg(all(unix, not(feature = "upgrade")))]
         if let Ok(mut signal) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
@@ -4587,19 +4517,15 @@ impl AppBuilder {
             inbound_mail_router,
         } = self;
 
-        // Names of the retention sweeps in `tasks`. The `retention`
-        // capability gates them, not `scheduler`. Names are unique (checked
-        // below), so a name identifies one task.
+        // Retention sweeps in `tasks`, gated by the `retention` capability rather
+        // than `scheduler`. Names are unique (checked below).
         #[cfg_attr(
             not(any(feature = "db", feature = "data-retention")),
             allow(unused_mut)
         )]
         let mut retention_task_names: Vec<String> = Vec::new();
 
-        // #1342: every `#[repository(..., retention(...))]` policy compiled
-        // into this binary auto-registers here — no `tasks![...]` entry
-        // required. `inventory`-collected, so this is a no-op allocation
-        // when no model declares a policy.
+        // Every `#[repository(..., retention(...))]` policy registers itself (#1342).
         #[cfg(feature = "db")]
         append_retention_tasks(
             &mut tasks,
@@ -4607,20 +4533,15 @@ impl AppBuilder {
             crate::retention::collect_retention_tasks(),
         );
 
-        // `collect_retention_tasks()` catches collisions only among
-        // retention-generated names; it cannot see hand-declared `tasks![...]`
-        // entries merged in above. An operator's `#[scheduled]` task sharing a
-        // name with a generated `retention-sweep-<table>` task, or with another
-        // hand-declared task, would silently spawn two competing scheduler loops.
-        // Validate the fully merged list now that every name is visible, rather
-        // than asking operators to avoid the generated namespace by convention.
+        // `collect_retention_tasks()` only sees generated names. A hand-declared
+        // task sharing a name would spawn two competing scheduler loops, so check
+        // the merged list.
         if let Err(error) = crate::task::validate_unique_scheduled_task_names(&tasks) {
             panic!("{error}");
         }
 
         let mut all_routes = routes;
 
-        // 1 & 2. Load configuration and initialize logging/telemetry
         let (mut config, telemetry_guard) = load_config_and_telemetry(
             config_loader_factory,
             telemetry_provider,
@@ -4629,39 +4550,24 @@ impl AppBuilder {
         .await;
         config.warn_on_inert_sections();
 
-        // #1605: the unified framework-owned data-retention sweep. Registered
-        // here rather than with the `#[repository(..., retention(...))]` policies
-        // above, because it is config-driven and the config loads only now.
-        // `framework_retention_task` returns `None` unless at least one
-        // `[retention]` window is set, so an app that never mentions the section
-        // gets no extra scheduler loop.
+        // The framework data-retention sweep (#1605) is config-driven, so it is
+        // registered only once the config has loaded. Empty when no `[retention]`
+        // window is set.
         #[cfg(feature = "data-retention")]
         let retention_tasks = crate::data_retention::framework_retention_tasks(&config.retention);
         #[cfg(feature = "data-retention")]
         if !retention_tasks.is_empty() {
             append_retention_tasks(&mut tasks, &mut retention_task_names, retention_tasks);
-            // Re-validate: the merged-name check above ran before this task
-            // existed, and an app is free to declare a `#[scheduled]` fn
-            // named `autumn-retention-sweep`, which would otherwise spawn two
-            // loops competing for one coordination lock.
+            // Re-validate: an app may declare its own `autumn-retention-sweep`.
             if let Err(error) = crate::task::validate_unique_scheduled_task_names(&tasks) {
                 panic!("{error}");
             }
         }
 
-        // The process role selects which slice of the runtime this replica runs.
         // A split role (web/worker) needs a durable jobs backend both processes
-        // share. Anything else — the in-process `local` queue, a typo, a blank
-        // value — falls through to the per-process local runtime: the web replica
-        // enqueues into an in-memory queue no worker can drain, and a worker
-        // replica's queue starts empty. Reject it here, before any boot work,
-        // rather than in `validate()`, so the doctor can still load the config.
-        // A combined role is always fine. A named role is checked on its base.
-        // Both config-only preconditions, through the same helper the no-boot
-        // export calls — the split-role/durable-backend rule and the merged
-        // scheduled-task-name check. The helper returns the message rather than
-        // exiting, because this path has a database pool to stop on the way out
-        // and the export has none.
+        // share; with a local queue the web replica enqueues work no worker can
+        // drain. Checked here, before any boot work, rather than in `validate()`,
+        // so `autumn doctor` can still load the config.
         if let Err(message) = validate_config_preconditions(&config, &tasks) {
             tracing::error!("{message}");
             #[cfg(feature = "managed-pg")]
@@ -4672,25 +4578,19 @@ impl AppBuilder {
         #[cfg(feature = "mail")]
         apply_mail_builder_overrides(&mut config, mount_unsubscribe_endpoint);
 
-        // Apply builder-level flag: `.idempotent()` enables the middleware when
-        // neither `autumn.toml` nor the environment explicitly disable it.
-        // The env var `AUTUMN_IDEMPOTENCY__ENABLED` is re-checked here so
-        // operators can disable idempotency at runtime (e.g. during a Redis
-        // incident) without code changes, even when `.idempotent()` is called.
+        // `.idempotent()` enables the middleware unless `autumn.toml` or
+        // `AUTUMN_IDEMPOTENCY__ENABLED` explicitly disables it, so operators can
+        // turn it off at runtime (e.g. during a Redis incident).
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
                 .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
-            // Only apply the builder default when neither the env var nor the
-            // loaded config file explicitly sets enabled = false.
             if !env_disabled && config.idempotency.enabled != Some(false) {
                 config.idempotency.enabled = Some(true);
             }
         }
 
-        // Register the embedded `static/` tree (if any) before the router is
-        // built so `/static/*` serves from the binary and `asset_url()` resolves
-        // against the embedded manifest, then prefer embedded locales over disk
-        // auto-loading when no explicit bundle was provided.
+        // Before the router is built, so `/static/*` and `asset_url()` use the
+        // embedded tree.
         #[cfg(feature = "embed-assets")]
         register_embedded_static_dir(embedded_static);
 
@@ -4701,23 +4601,17 @@ impl AppBuilder {
         let i18n_bundle =
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
-        // 3. Validate routes.
-        //
-        // Both of this function's own pre-router checks now run here, through
-        // the same helper the no-boot export calls. The repository-policy audit
-        // used to sit ~140 lines further down; running it here only moves it
-        // ahead of the startup banner, and a refusal is better reported before
-        // announcing a start than after.
+        // Route validation and the `#[repository(api = ...)]` policy audit. Runs
+        // before the startup banner so a refusal is not reported after "starting".
         if let Err(message) =
             validate_pre_router_preconditions(&all_routes, &scoped_groups, &config)
         {
             panic!("{message}");
         }
 
-        // 3b. Keep only the route groups this role mounts (#3544). The graph,
-        // the router, `OpenAPI` and MCP read the filtered lists. The check above
-        // ran on every route, so a narrow role does not fail it.
-        // `validate_config_preconditions` already resolved the role.
+        // Keep only the route groups this role mounts (#3544). The graph, router,
+        // `OpenAPI` and MCP read the filtered lists. `validate_config_preconditions`
+        // already resolved the role, so the fallback is unreachable.
         let mount_role = config
             .resolve_role()
             .unwrap_or_else(|_| crate::config::Role::from(crate::config::ProcessRole::Combined));
@@ -4747,8 +4641,7 @@ impl AppBuilder {
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
-        // A pre-rendered page of an unmounted route leaves the sitemap and
-        // the static layer too.
+        // Drop pre-rendered pages of unmounted routes from the sitemap and static layer.
         let dropped_pages = drop_unmounted_static_routes(
             &mut static_metas,
             &routes_before,
@@ -4760,7 +4653,6 @@ impl AppBuilder {
                 .any(|pattern| crate::route_group::path_matches(pattern, path))
         };
 
-        // 4. Log banner with profile info
         let profile_display = config.profile.as_deref().unwrap_or("none");
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),
@@ -4768,38 +4660,26 @@ impl AppBuilder {
             "Autumn starting"
         );
 
-        // 4b. Startup transparency log (AUTUMN_SHOW_CONFIG=1 or log level <= DEBUG)
         let show_config = std::env::var("AUTUMN_SHOW_CONFIG").as_deref() == Ok("1");
         if show_config {
             log_startup_transparency(&all_routes, &tasks, &scoped_groups, &config);
         }
 
-        // 4c. Fail-fast on invalid session config — but only when no custom
-        // SessionStore was installed via with_session_store(...). Done before
-        // setup_database so a doomed boot doesn't run migrations first.
+        // The fail-fast checks below run before `setup_database`, so a doomed boot
+        // does not run migrations first.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
-        // 4d. Validate signing secret — production must have a stable, private,
-        // entropy-meeting secret before the server binds. Dev/test are exempt.
         fail_fast_on_invalid_signing_secret(&config);
         fail_fast_on_missing_encryption_keys(&config);
         fail_fast_on_invalid_trusted_hosts(&config);
 
-        // 4e. Signed webhook configs must resolve to usable key material
-        // before the app binds. Missing secrets should fail before a real
-        // provider retry loop starts hammering a broken endpoint.
         fail_fast_on_invalid_webhook_config(&config);
 
-        // 4f. Idempotency backend must be production-ready when enabled.
         fail_fast_on_invalid_idempotency_config(&config);
 
-        // 4f. Provision the configured BlobStore before `setup_database`.
-        // `LocalBlobStore::new` does real IO (it creates and canonicalizes the
-        // root) and the storage code may `process::exit(1)` on failure — an
-        // unwritable root, or `storage.backend = "s3"` with no plugin. Running it
-        // before migrations keeps a doomed boot from mutating the DB schema
-        // first. A store installed via `.with_blob_store(...)` bypasses
-        // config-driven instantiation entirely: no IO, no fail-fast.
+        // Provisioning a configured store does IO and may exit (an unwritable root,
+        // or `backend = "s3"` with no plugin), so it also runs before migrations.
+        // A store from `.with_blob_store(...)` skips it.
         #[cfg(feature = "storage")]
         let storage_bootstrap = blob_store.map_or_else(
             || preflight_storage(&config),
@@ -4811,19 +4691,10 @@ impl AppBuilder {
             },
         );
 
-        // 5. Create database pool and run migrations (if configured)
-        //
-        // With `[failure_capture] enabled = true` the pool is built through the
-        // recording factory, so a failing request's database traffic is captured
-        // at the wire (#1598). An app with its own `DatabasePoolProvider` keeps
-        // it, and DB capture stands down.
-        //
-        // This wraps the control topology only. `[[database.shards]]` pools are
-        // built by `create_shard_set` below, outside `setup_database`, and are
-        // not recorded in this slice. So `Db::checkout` notes the gap and marks
-        // the capsule truncated for any request that checks out a shard
-        // connection (`capsule::record_db::note_shard_capture_gap`), and
-        // `maybe_capture_pool_provider` warns at boot when both are configured.
+        // With `[failure_capture] enabled = true` the pool records database traffic
+        // for failure capsules (#1598); a custom `DatabasePoolProvider` disables
+        // that. Only the control topology is recorded: a request that checks out a
+        // shard connection marks its capsule truncated.
         #[cfg(all(feature = "db", feature = "reporting", not(feature = "sqlite")))]
         let pool_provider_factory =
             crate::capsule::record_db::maybe_capture_pool_provider(pool_provider_factory, &config);
@@ -4853,8 +4724,7 @@ impl AppBuilder {
 
         #[cfg(feature = "db")]
         if pool.is_some() || shards.is_some() {
-            // Pool sizes multiply across shards: surface the total so
-            // N-shard deployments notice the aggregate connection count.
+            // Pool sizes multiply across shards, so log the aggregate.
             let mut budget = connection_budget(pool.as_ref(), shards.as_ref());
             // Each `[database.roles]` pool opens its own connections.
             budget.total += crate::db_roles::max_connections(&config.database);
@@ -4888,17 +4758,6 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
-        // 5b. Fail-fast on `#[repository(api = ...)]` endpoints that
-        // were mounted without a paired `policy = ...` argument when
-        // running in `prod` profile and the explicit escape hatch is
-        // off. Hides exactly the footgun called out in the issue:
-        // "a developer who flips the `api =` switch on a
-        // `#[repository]` exposes mutate endpoints that any
-        // authenticated user can call against any record."
-        // (The audit itself now runs above, with the other pre-router
-        // precondition, so the exporter shares both — see
-        // `validate_pre_router_preconditions`.)
-
         // Subsystems whose backend the builder installed do not use the
         // configured Redis, so they get no Redis indicator (#3059).
         #[cfg(feature = "redis")]
@@ -4912,7 +4771,6 @@ impl AppBuilder {
             unused_redis_subsystems.push("channels");
         }
 
-        // 6. Build the router (with optional static-file layer)
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
@@ -4922,7 +4780,6 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
-        // Resolved once. Each subsystem below reads its own field (#3542).
         let capabilities = state.capabilities();
         tracing::info!(
             role = state.role().name(),
@@ -4930,8 +4787,8 @@ impl AppBuilder {
             capabilities = ?capabilities.enabled().map(crate::config::Capability::as_str).collect::<Vec<_>>(),
             "process role resolved"
         );
-        // A `[roles.<name>] capabilities` key names a declared plugin
-        // capability, inside its base (#3545).
+        // A `[roles.<name>] capabilities` key must name a declared plugin
+        // capability within the role's base (#3545).
         match background.validate_roles(&config, state.role().name()) {
             Ok(warnings) => {
                 for warning in warnings {
@@ -4947,7 +4804,6 @@ impl AppBuilder {
         }
         state.insert_extension(crate::background::BackgroundQueues(background.queues()));
 
-        // A build without the `reporting` feature refuses failure capture.
         if let Err(error) = config.failure_capture.check_build() {
             tracing::error!(error = %error, "failure capture cannot start");
             #[cfg(feature = "managed-pg")]
@@ -4955,9 +4811,8 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
-        // Tee clock reads into the capsule of whatever request took them, so a
-        // replayed handler sees the same `now()` sequence the failure did.
-        // Mirrored by `TestApp::build` so test apps exercise the same wiring.
+        // Record clock reads into the request's capsule so a replay sees the same
+        // `now()` sequence. `TestApp::build` mirrors this wiring.
         #[cfg(feature = "reporting")]
         if config.failure_capture.enabled {
             let recording =
@@ -4965,10 +4820,8 @@ impl AppBuilder {
                     as std::sync::Arc<dyn crate::time::ClockSource>;
             state = state.with_clock(recording);
         }
-        // Same for the entropy source (#1634): a handler that mints a session
-        // id, a token or a job id must mint the *recorded* one on replay, or
-        // the identifier in the capsule's SQL binds will not be the one the
-        // replayed code produced.
+        // Same for entropy (#1634): a replayed handler must mint the recorded ids,
+        // or they will not match the capsule's SQL binds.
         #[cfg(feature = "reporting")]
         if config.failure_capture.enabled {
             let recording =
@@ -4977,30 +4830,19 @@ impl AppBuilder {
             state = state.with_entropy(recording);
         }
 
-        // Wire the in-memory log capture buffer from the telemetry guard into the
-        // app state so the `/actuator/logfile` endpoint can serve it.
+        // Served by `/actuator/logfile`.
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
-        // Wire the live-subscriber reload handle into the loggers actuator so
-        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
-        // just an in-memory map (issue #1044).
+        // Lets `PUT /actuator/loggers/{name}` change the running subscriber (#1044).
         if let Some(handle) = telemetry_guard.filter_reload.clone() {
             state.log_levels().attach_reload_handle(handle);
         }
 
-        // Build MaintenanceState, load the flag synchronously, insert it as an
-        // extension, and start the background poller.
-        //
-        // #1621: the flag path comes from `maintenance::resolve_flag_file_path()`,
-        // not the bare cwd-relative const. A deploy-managed slot unit runs with
-        // `WorkingDirectory={release_dir}`, a fresh dir every release, so the
-        // legacy path made a cutover orphan the flag and silently un-maintain the
-        // host. The resolver honours `AUTUMN_MAINTENANCE_FLAG_FILE`, stamped by
-        // `autumn deploy` at the per-app `shared/` dir that survives cutovers, and
-        // falls back to the legacy path when unset, so a non-deploy-managed app is
-        // unaffected. This boot load and the 500 ms poller below use the same
-        // resolver, so they cannot disagree.
+        // Resolve the flag path rather than using a cwd-relative one (#1621): a
+        // deploy-managed unit runs in a fresh release dir, so a relative flag
+        // would be orphaned at cutover. The boot load and the poller share the
+        // resolver so they cannot disagree.
         let maintenance_state = crate::maintenance::MaintenanceState::new();
         let flag_path = crate::maintenance::resolve_flag_file_path();
         if let Ok(Some(cfg)) = crate::maintenance::MaintenanceState::load_from_file(&flag_path) {
@@ -5041,9 +4883,7 @@ impl AppBuilder {
             }
         });
 
-        // Resolve the canary deploy-version label (AUTUMN_DEPLOY_VERSION /
-        // AUTUMN_CANARY) once at startup and publish it so the actuator metrics
-        // endpoint can tag every metric family with version="stable|canary".
+        // The actuator metrics tag every family with this `version="stable|canary"`.
         let canary_state = crate::canary::CanaryState::from_env();
         if canary_state.is_canary() {
             tracing::info!(
@@ -5053,10 +4893,9 @@ impl AppBuilder {
         }
         state.insert_extension(canary_state);
 
-        // A rollback flag present at startup means a controller already retired
-        // this replica. Flip /ready to draining immediately so a supervisor
-        // restart cannot put a rolled-back replica back into the canary cohort;
-        // `canary_rollback_signal` then drives the clean drain → exit.
+        // A rollback flag at startup means a controller already retired this
+        // replica. Report draining at once so a supervisor restart cannot return
+        // it to the canary cohort; `canary_rollback_signal` drives the exit.
         if crate::canary::CanaryState::rollback_flag_present(std::path::Path::new(
             crate::canary::CANARY_ROLLBACK_FLAG_FILE,
         )) {
@@ -5067,18 +4906,10 @@ impl AppBuilder {
             state.begin_shutdown();
         }
 
-        // Clone class: this interceptor-wiring block (mail/job/db/channels,
-        // including the channels -> presence -> collab backend swap, and
-        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
-        // and `run_one_off_task_mode()`. It was born duplicated by #862,
-        // whose own follow-up commit ("fix: wire interceptors into
-        // one-off task mode") is a missed-fix this duplication already
-        // produced once: the one-off task path first shipped without this
-        // block, so its interceptors were silently inert. #1806 later had
-        // to hand-repeat the channels/presence/collab swap in all three
-        // copies again. Change one, change the other two --
-        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
-        // below fails if they drift.
+        // This interceptor wiring is identical in `run()`, `run_build_mode()` and
+        // `run_one_off_task_mode()`. Change all three:
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes` fails
+        // if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -5100,16 +4931,13 @@ impl AppBuilder {
             state.insert_extension(interceptor);
         }
 
-        // Populate the metrics source registry from builder registrations.
-        // Duplicate names were already rejected in `metrics_source()`, so
-        // all entries here are unique.
+        // `metrics_source()` already rejected duplicate names.
         for (name, source) in metrics_sources {
             if let Err(e) = state.metrics_source_registry.register(name, source) {
                 tracing::warn!("{e}");
             }
         }
 
-        // Populate the health indicator registry from builder registrations.
         for (name, group, indicator) in health_indicators {
             if let Err(e) = state
                 .health_indicator_registry
@@ -5119,13 +4947,10 @@ impl AppBuilder {
             }
         }
 
-        // Continuous SQLite replication (#1628). Resolved here, next to the other
-        // indicator registrations, so lag and verification are baked into
-        // `/actuator/health` — and so an indicator that stays non-healthy past
-        // the grace period is escalated by the existing #1610 alerter with no
-        // bespoke alert condition of its own. The destination is built on a
-        // BLOCKING thread: its HTTP client must never be constructed inside the
-        // async runtime. The loop itself is spawned at bind time below.
+        // Continuous SQLite replication (#1628). Its health indicator registers
+        // here so `/actuator/health` and the alerter cover lag and verification.
+        // The destination is built on a blocking thread: its HTTP client must not
+        // be constructed inside the async runtime. The loop is spawned at bind time.
         #[cfg(feature = "db")]
         let mut replication_worker: Option<crate::replication::Replicator> = None;
         #[cfg(feature = "db")]
@@ -5137,10 +4962,8 @@ impl AppBuilder {
                 .or_else(|| config.database.url.clone())
                 .unwrap_or_default();
             let profile = config.profile.clone().unwrap_or_else(|| "dev".to_owned());
-            // Only a genuinely S3-backed app has a blob-storage bucket to clash
-            // with; a leftover `[storage.s3]` bucket on the local backend is
-            // inert and must not trip the distinct-destination guard (the same
-            // rule #1619's offsite upload applies).
+            // Only an S3-backed app has a storage bucket that could clash; a
+            // leftover `[storage.s3]` on the local backend is inert.
             #[cfg(feature = "storage")]
             let storage_destination = (config.storage.backend
                 == crate::storage::StorageBackend::S3)
@@ -5155,9 +4978,8 @@ impl AppBuilder {
                 .flatten();
             #[cfg(not(feature = "storage"))]
             let storage_destination: Option<(String, Option<String>)> = None;
-            // The injected clock, not the wall clock: every artifact the
-            // replicator stamps, and the health indicator's startup grace, are
-            // read from it, so a test that freezes time moves them all (#1797).
+            // The injected clock, so a test that freezes time also freezes the
+            // replicator's timestamps and the indicator's startup grace (#1797).
             let clock = state.clock_arc();
             #[cfg(feature = "sqlite")]
             let fleet_lag_alert_after = replication_config
@@ -5209,10 +5031,7 @@ impl AppBuilder {
                     replication_worker = Some(runtime.replicator);
                 }
                 Ok(Err(crate::replication::SetupError::Disabled)) => {}
-                // A misconfigured durability story must not boot silently
-                // half-working: the operator asked for replication and is not
-                // getting it, which is exactly the situation this feature exists
-                // to prevent.
+                // The operator asked for replication: do not boot without it.
                 Ok(Err(e)) => {
                     tracing::error!("Continuous SQLite replication could not start: {e}");
                     #[cfg(feature = "managed-pg")]
@@ -5228,10 +5047,8 @@ impl AppBuilder {
             }
         }
 
-        // When ACME is configured, register a `HealthOnly` indicator backed by a
-        // shared status the renewal task writes. Built here (before the router)
-        // so it is baked into `/actuator/health`; the same `AcmeStatus` handle is
-        // reused by the renewal task spawned at bind time below.
+        // Registered before the router is built so `/actuator/health` includes it.
+        // The renewal task spawned at bind time writes the same `AcmeStatus`.
         #[cfg(feature = "acme")]
         let acme_status: Option<crate::acme::renewal::AcmeStatus> =
             if let Some(acme_cfg) = config.server.tls.as_ref().and_then(|t| t.acme.as_ref()) {
@@ -5241,9 +5058,7 @@ impl AppBuilder {
                         status.clone(),
                         acme_cfg.renew_before_days,
                     )
-                    // Which challenge is in play (and, for DNS-01, which provider)
-                    // is the first thing an operator needs when issuance is failing
-                    // — and is safe to publish: it names no credential (#1620).
+                    // Safe to publish: the provider name holds no credential (#1620).
                     .with_dns_provider(acme_cfg.dns.as_ref().map(|dns| dns.provider.as_str())),
                 );
                 if let Err(e) = state.health_indicator_registry.register(
@@ -5272,32 +5087,22 @@ impl AppBuilder {
         }
         state.insert_extension(RegisteredApiVersions(api_versions));
 
-        // Capture a clone of the registered reporter chain for the ACME renewal
-        // task (spawned below) so each renewal failure reaches the same
-        // Sentry/etc. sinks a request-path 5xx would. Empty is fine — failures
-        // still log via `tracing` inside the loop.
+        // ACME renewal failures go to the same reporters as a request-path 5xx.
         #[cfg(all(feature = "acme", feature = "error-reporting"))]
         let acme_reporters = error_reporters.clone();
 
-        // Install registered error reporters so the reporting layer (wired in
-        // `apply_middleware`) can deliver panic + 5xx events. Empty is fine —
-        // the layer falls back to the built-in `LogReporter`.
+        // With none registered, the reporting layer falls back to `LogReporter`.
         #[cfg(feature = "error-reporting")]
         if !error_reporters.is_empty() {
             state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
-        // Apply deferred policy / scope registrations onto the live
-        // app state. Done before the router is built so any panic
-        // from double-registration surfaces during startup, not
-        // mid-request.
+        // Before the router is built, so a double-registration panic happens at
+        // startup rather than mid-request.
         for register in policy_registrations {
             register(state.policy_registry());
         }
-        // Now that registrations have been applied, verify that
-        // every `#[repository(policy = X)]`-annotated route has
-        // an X actually registered on the live registry. Catches
-        // the "wired the macro arg, forgot the `.policy(...)`
-        // builder call" footgun before any 500 lands.
+        // Every `#[repository(policy = X)]` route needs X registered via
+        // `.policy(...)`; fail at boot rather than with a 500.
         validate_repository_policies_registered(
             &all_routes,
             &scoped_groups,
@@ -5345,18 +5150,11 @@ impl AppBuilder {
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         #[cfg(feature = "maud")]
         install_story_registry(&state, story_gallery);
-        // Operator alerts: build the built-in mail/webhook channels from
-        // `[alerts]` config, combine with any builder-registered channels, and
-        // start the background evaluation loop. No-op when nothing is
-        // configured. Installed after the mailer so the mail channel can bind
-        // to the live `Mailer` extension.
+        // After the mailer, so the alert mail channel can bind to the `Mailer`.
         #[cfg(feature = "alerts")]
         crate::alerts::install_from_config(&state, &config.alerts, alert_channels);
-        // An MCP endpoint with no audit sink still serves tools; what it does
-        // not do is leave a record that an agent called one. That is a property
-        // of the deployment rather than of any grant, so it is said once, here,
-        // where both are known -- and it is also carried in the agent-authority
-        // manifest's `audit.sink_configured` (#1691 R9).
+        // Without an audit sink, MCP still serves tools but records no agent call.
+        // The agent-authority manifest reports this as `audit.sink_configured`.
         #[cfg(feature = "mcp")]
         if mcp.is_some()
             && !audit_logger
@@ -5377,18 +5175,14 @@ impl AppBuilder {
         let custom_layers =
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
-        // Install the preflighted blob store on the freshly-built
-        // AppState, and remember the serving router so it gets merged
-        // into the user's router below.
         #[cfg(feature = "storage")]
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
         crate::cost::install(&state, &config);
-        // A live-state block that could not be installed is a refusal to start,
-        // not a silent fallback: the previous build is still serving and still
-        // holds the only copy of that state (#1674). Checked here, in async
-        // context, so a managed-Postgres child is stopped rather than orphaned.
+        // Refuse to start if live state could not be installed: the previous
+        // build still holds the only copy (#1674). Checked in async context so a
+        // managed-Postgres child is stopped rather than orphaned.
         #[cfg(feature = "upgrade")]
         if let Some(failure) = state.extension::<crate::upgrade::LiveStateInstallFailure>() {
             tracing::error!("refusing to start: {}", failure.0);
@@ -5398,10 +5192,9 @@ impl AppBuilder {
         }
         finalize_event_bus(listeners, &mut jobs, &state);
 
-        // One `redis:<subsystem>` PING indicator per Redis-backed subsystem
-        // (#3059). Here, the job set is final: with no jobs, no job runtime
-        // starts, so `jobs` gets no indicator. The user indicators are already
-        // registered: if two names are the same, the user indicator stays.
+        // One `redis:<subsystem>` indicator per Redis-backed subsystem (#3059).
+        // Registered after the job set is final (no jobs, no `jobs` indicator)
+        // and after user indicators, which win on a name clash.
         #[cfg(feature = "redis")]
         {
             if jobs.is_empty() {
@@ -5434,34 +5227,24 @@ impl AppBuilder {
             merge_routers.push(router);
         }
 
-        // Static routes are pre-rendered by requesting their single,
-        // unprefixed path — never locale-aware — so they must stay excluded
-        // from locale-prefix routing even when it's enabled (issue #1251).
-        // Must run before both the sitemap generation below and the router
-        // build further down, so the two agree on which paths are excluded.
+        // Static routes are pre-rendered at their unprefixed path, so they stay
+        // out of locale-prefix routing (#1251). Runs before both the sitemap and
+        // the router build so the two agree on the excluded paths.
         exclude_static_routes_from_locale_prefix(&mut config, &static_metas);
-        // `state` already holds an `AutumnConfig` snapshot cloned inside
-        // `build_state` above — captured BEFORE this mutation. Refresh it, or
-        // `tenancy_middleware` (which reads config via
-        // `state.extension::<AutumnConfig>()`) would see a stale copy missing
-        // these auto-excluded static routes and could misjudge whether a
-        // `/{locale}`-look-alike path was ever actually locale-prefixed
-        // (Codex review).
+        // `build_state` snapshotted the config before that mutation. Refresh it,
+        // or `tenancy_middleware` would miss the excluded static routes and
+        // misjudge `/{locale}`-like paths.
         state.insert_extension(config.clone());
         state.insert_extension(crate::aeo::RegisteredAgentSkills(agent_skills));
         state.insert_extension(commerce_docs);
 
-        // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
-        // configuration is present or dynamic sources are registered. With
-        // neither, AEO serves a default `/robots.txt` from the router
-        // fallback, so an application route at that path always wins.
+        // With no SEO config or sources, AEO serves a default `/robots.txt` from
+        // the router fallback, so an app route at that path wins.
         if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
             let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
-            // A static route that declared `seo(robots = "noindex")` must not
-            // be advertised in sitemap.xml — otherwise the app tells crawlers
-            // "here is this URL" and "do not index it" at the same time (#1182).
+            // A `noindex` static route stays out of the sitemap (#1182).
             let static_paths: Vec<&str> = static_metas
                 .iter()
                 .filter(|m| !crate::seo::defaults_exclude_from_sitemap(m.seo))
@@ -5488,24 +5271,14 @@ impl AppBuilder {
                         .iter()
                         .any(|r| is_seo_path(&format!("{prefix}{}", r.path)))
                 })
-                // Declared plugin routes belong in this check for the same reason
-                // as the others. A sandboxed manifest may take `/robots.txt` as
-                // its prefix — a `.` is legal inside a prefix segment — and its
-                // routes nest after this router merges, so the two would overlap
-                // and axum would panic at startup. The declared-route preflight
-                // cannot catch it either: it compares against a claim set built
-                // from config alone, and SEO also mounts when a source is
-                // registered in code. Yielding matches what this site already does
-                // for a custom `#[static_get("/robots.txt")]`, and the operator saw
-                // the prefix on the consent screen before installing it.
+                // A sandboxed plugin manifest may use `/robots.txt` as its prefix
+                // and nest after this merge, which would panic axum. The
+                // declared-route preflight misses it: its claim set is built from
+                // config alone, and SEO also mounts for sources registered in code.
                 || declared_routes.iter().any(|r| {
-                    // Only a GET can clash with the generated GETs: a declared
-                    // POST or HEAD merges cleanly into the same `MethodRouter`
-                    // (verified against axum 0.8.9, the same finding
-                    // `reject_declared_framework_collisions` is written on), and
-                    // a `WS` upgrade mounts as a GET. Yielding to a disjoint
-                    // verb would hand an untrusted plugin a way to suppress
-                    // robots.txt and sitemap.xml without even serving them.
+                    // Only GET (and `WS`, which mounts as a GET) clashes; other
+                    // verbs merge into the same `MethodRouter`. Yielding to them
+                    // would let an untrusted plugin suppress the SEO routes.
                     (r.method.eq_ignore_ascii_case("GET")
                         || r.method.eq_ignore_ascii_case("WS"))
                         && is_seo_path(&r.path)
@@ -5525,10 +5298,8 @@ impl AppBuilder {
             let mut registered_inbound: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
-                // Preflight collision check: if an annotated POST route already
-                // claims this path, merging an opaque router at the same path
-                // would cause Axum to panic at startup.  Warn and skip instead
-                // so the application can still start and the conflict is visible.
+                // Merging onto a path an app POST route already claims would panic
+                // axum at startup. Warn and skip instead.
                 if all_routes
                     .iter()
                     .any(|r| r.method == http::Method::POST && r.path == path)
@@ -5553,8 +5324,7 @@ impl AppBuilder {
                     );
                     continue;
                 }
-                // Also guard against two inbound endpoints sharing the same path,
-                // which would cause the same Axum merge panic.
+                // Two inbound endpoints on one path would panic the same way.
                 if !registered_inbound.insert(path.clone()) {
                     tracing::warn!(
                         path = %path,
@@ -5562,37 +5332,21 @@ impl AppBuilder {
                     );
                     continue;
                 }
-                // Exempt each inbound webhook path from both CSRF and CAPTCHA:
-                // these routes receive provider-signed POST requests that never
-                // carry a CSRF or CAPTCHA token.
+                // Provider-signed POSTs never carry a CSRF or CAPTCHA token.
                 config.security.csrf.exempt_paths.push(path.clone());
                 config.security.captcha_exempt_paths.push(path);
                 merge_routers.push(axum_router);
             }
         }
 
-        // Worker role does not serve user routes: build a probe-only router that
-        // exposes just the framework liveness/readiness probes and the actuator,
-        // so orchestrators can supervise the process and `/actuator/jobs` works.
-        // Web and combined roles build the full application router. All the
-        // route/router-context inputs assembled above are simply dropped in the
-        // worker branch.
-        // Publish the architecture graph this app serves (#1747) before the
-        // router is built, so `/actuator/graph` answers from the first request
-        // rather than after some later warm-up. This is the *serving* path —
-        // the static-build and capsule-replay paths publish their own below.
-        // `graph_installed_before_every_router_build` pins all three, because a
-        // graph installed on only some of them is an endpoint that answers 503
-        // in production while every unit test passes.
+        // Publish the architecture graph (#1747) before the router is built, so
+        // `/actuator/graph` answers from the first request. The static-build and
+        // replay paths publish their own; `graph_installed_before_every_router_build`
+        // checks all three.
         //
-        // A worker serves the probe-only router: it mounts no application route
-        // at all, and drops every raw router the builder collected. Publishing
-        // the full route table there would have `/actuator/graph` — which a
-        // worker can expose — describe endpoints this process does not serve
-        // (Codex round 4). The declared elements are still nodes, because they
-        // are still compiled in; they simply report `mounted: false`, and the
-        // completeness section names them, which is the honest answer to "what
-        // does this process serve".
+        // A worker serves only the probe and actuator router, so its graph reports
+        // the declared routes as `mounted: false` rather than describing endpoints
+        // this process does not serve.
         #[cfg(feature = "graph")]
         let (graph_mounted, graph_opaque) = if capabilities.serves_http {
             (
@@ -5631,18 +5385,16 @@ impl AppBuilder {
                     scoped_groups,
                     merge_routers,
                     nest_routers,
-                    // The sandboxed-plugin manifests (and any other declared plugin
-                    // routes) this builder collected. Handing them to the router build is
-                    // what lets the duplicate-route preflight see inside an otherwise
-                    // opaque `nest` mount and refuse a collision instead of panicking.
+                    // Lets the duplicate-route preflight see inside opaque `nest`
+                    // mounts and refuse a collision instead of panicking.
                     declared_routes,
                     custom_layers,
                     static_gate_layers,
                     #[cfg(feature = "maud")]
                     error_page_renderer,
                     session_store,
-                    // Respect the [openapi] profile gate: if disabled in config,
-                    // suppress the endpoint even when .openapi(...) was called.
+                    // `[openapi]` config can disable the endpoint even when
+                    // `.openapi(...)` was called.
                     #[cfg(feature = "openapi")]
                     openapi: if config.openapi_runtime.enabled {
                         openapi
@@ -5665,22 +5417,9 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 7. Bind and initialize pre-serve runtime dependencies. Start listening
-        // before the startup hooks finish, so `/startup` can report honest
-        // progress.
-        // Bind the configured transport. A `server.unix_socket` path selects a
-        // Unix domain socket (local daemon mode); otherwise bind TCP on
-        // `host:port`. `bound_desc` is the log description, and
-        // `unix_socket_cleanup` is the socket to unlink on clean exit — axum does
-        // not remove it — carried as `(path, dev, inode)` so cleanup can confirm
-        // the file is still the one this process bound.
-        // Load the `[push]` VAPID key once, before binding. A key that is present
-        // but unusable — a typo, an env var that failed to interpolate, a
-        // mismatched public/private pair — is a hard boot failure rather than a
-        // quiet fallback to "push disabled". The failure this guards is an app
-        // that starts cleanly, records subscriptions, and silently delivers
-        // nothing (#1392). An app with no `[push]` block is unaffected. A build
-        // without the `push` feature refuses any `[push]` block here.
+        // An unusable `[push]` VAPID key fails the boot rather than disabling push:
+        // otherwise the app records subscriptions and silently delivers nothing
+        // (#1392). A build without the `push` feature refuses any `[push]` block.
         if let Err(e) = config.validate_push() {
             tracing::error!("Invalid [push] configuration: {e}");
             #[cfg(feature = "managed-pg")]
@@ -5688,18 +5427,10 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
-        // Validate `[server.tls]` wiring before we bind anything, so a
-        // misconfiguration is a clear pre-bind failure. Two cases fail fast:
-        // (1) the section is present but this binary was built without the
-        // `tls` feature — otherwise it would be silently ignored and the app
-        // would serve plain HTTP on a port operators expect to be HTTPS;
-        // (2) TLS is combined with a Unix socket, which the direct-HTTPS path
-        // does not serve over (TLS terminates on `host:port`).
+        // Fail before binding if `[server.tls]` is set but the build lacks `tls`
+        // (it would serve plain HTTP on a port expected to be HTTPS), or if TLS is
+        // combined with a Unix socket (TLS terminates on `host:port`).
         if let Some(tls_cfg) = config.server.tls.as_ref() {
-            // Reject an incoherent `[server.tls]` (both static + ACME, neither,
-            // a half-set cert pair, an empty/wildcard ACME domain set, …) before
-            // binding, with a named message. Pure config validation, so it runs
-            // regardless of build features.
             if let Err(msg) = tls_cfg.validate() {
                 tracing::error!("Invalid [server.tls] configuration: {msg}");
                 #[cfg(feature = "managed-pg")]
@@ -5717,9 +5448,7 @@ impl AppBuilder {
                 crate::managed_pg::emergency_stop_async().await;
                 std::process::exit(1);
             }
-            // `[server.tls.acme]` needs the `acme` feature; otherwise it would be
-            // silently ignored and the app would serve a self-signed placeholder
-            // (or fail) on a port operators expect to serve a real ACME cert.
+            // Without `acme`, the section would be silently ignored.
             #[cfg(all(feature = "tls", not(feature = "acme")))]
             if tls_cfg.acme.is_some() {
                 tracing::error!(
@@ -5743,31 +5472,22 @@ impl AppBuilder {
             }
         }
 
-        // Root shutdown token for all background tasks. Created before the bind
-        // block so the TLS listener's background acceptor task can take a child
-        // token and stop cleanly on shutdown (issue #1603).
+        // Root shutdown token for background tasks. Created before binding so the
+        // TLS acceptor task can take a child token (#1603).
         let server_shutdown = tokio_util::sync::CancellationToken::new();
 
-        // Carries the cert/key reload wiring from the TLS bind path to the
-        // background reload task spawned once `server_shutdown` exists.
         #[cfg(feature = "tls")]
         let mut tls_reload_state: Option<crate::tls::CertReloader> = None;
-        // The mTLS trust-store reloader (#1640), when
-        // `[server.tls.client_auth]` is active. Spawned beside the certificate
-        // reloader below so a CA rotation lands without a restart.
+        // mTLS trust-store reloader (#1640), so a CA rotation needs no restart.
         #[cfg(feature = "tls")]
         let mut client_trust_reload: Option<crate::tls::client_auth::ClientTrustReloader> = None;
 
-        // Carries the ACME challenge listener + renewal task wiring from the TLS
-        // bind path to the sibling tasks spawned once `server_shutdown` exists.
         #[cfg(feature = "acme")]
         let mut acme_bind_state: Option<AcmeBindState> = None;
 
-        // Where the app actually bound, as the readiness protocol spells it
-        // (`<transport> <address>`) — distinct from `bound_desc`, which is a
-        // human-facing log line carrying a scheme and any TLS note. The
-        // supervisor reads this to write its address-discovery file, so it must
-        // be the resolved address, not the configured one.
+        // The resolved address as the readiness protocol spells it
+        // (`<transport> <address>`); the supervisor writes it to its address
+        // discovery file. `bound_desc` is the human-facing log line.
         let bound_endpoint: String;
         let (bound_listener, bound_desc, unix_socket_cleanup): (
             BoundListener,
@@ -5789,15 +5509,9 @@ impl AppBuilder {
                     std::process::exit(1);
                 }
                 // Bind under an owner-only umask so the socket is `0600` from the
-                // start. A plain bind would briefly leave it group- or
-                // other-connectable, and a later `chmod` cannot revoke a
-                // connection already established in that window. This matters for
-                // a user-configured `server.unix_socket` in a shared dir.
-                // `umask` is process-wide, so serialize save/bind/restore: a
-                // concurrent UDS bind in the same process could otherwise
-                // interleave the pairs and either reopen that window or leave
-                // `0177` set permanently. The guard is released before the
-                // `.await` in the error arm below.
+                // start: a later `chmod` cannot revoke a connection made in between.
+                // `umask` is process-wide, so serialize save/bind/restore against
+                // concurrent binds. The guard is released before the `.await` below.
                 let bind_result = {
                     static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
                     let _umask_guard = UMASK_LOCK
@@ -5818,11 +5532,8 @@ impl AppBuilder {
                         std::process::exit(1);
                     }
                 };
-                // Owner-only access, belt-and-suspenders after the umask bind.
-                // Fail *closed* — if we cannot enforce `0600` (chmod error, an ACL
-                // /filesystem that rejects it), refuse to serve rather than expose
-                // a reachable control socket. Remove the socket we just bound so
-                // nothing keeps listening on it.
+                // Fail closed: if `0600` cannot be enforced, remove the socket and
+                // refuse to serve.
                 if let Err(e) =
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 {
@@ -5832,8 +5543,7 @@ impl AppBuilder {
                     crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
                 }
-                // Capture the bound socket's identity so a later successor that
-                // rebinds the same path isn't unlinked by our shutdown.
+                // Lets shutdown skip unlinking a successor that rebound the path.
                 let (dev, ino) = {
                     use std::os::unix::fs::MetadataExt;
                     std::fs::metadata(path).map_or((0, 0), |m| (m.dev(), m.ino()))
@@ -5854,12 +5564,9 @@ impl AppBuilder {
                 std::process::exit(1);
             }
         } else {
-            // A successor that terminates TLS cannot take over a plaintext
-            // listener: the socket it inherited is mid-conversation with HTTP
-            // clients, and wrapping it in rustls fails every one of them while
-            // both builds accept from the shared queue. Refuse the same way an
-            // existing TLS or Unix listener is refused — before binding
-            // anything, so the predecessor's wait ends on this process exiting.
+            // A TLS build cannot take over a plaintext listener: wrapping the
+            // inherited socket in rustls would fail every HTTP client on the shared
+            // queue. Refuse before binding, so the predecessor keeps serving.
             #[cfg(feature = "tls")]
             if config.server.tls.is_some() && crate::upgrade::handoff_requested() {
                 tracing::error!(
@@ -5874,26 +5581,19 @@ impl AppBuilder {
             }
             let configured_addr = format!("{}:{}", config.server.host, config.server.port);
             let listener = bind_or_adopt_tcp_listener(&configured_addr).await;
-            // Report where this process is *actually* listening, not what was
-            // asked for: a socket inherited from a predecessor (#1674) keeps
-            // that process's port, and `server.port = 0` resolves to whichever
-            // ephemeral port the kernel picked.
+            // Report the actual address: an inherited socket (#1674) keeps its
+            // port, and `server.port = 0` resolves to an ephemeral one.
             let addr = listener
                 .local_addr()
                 .map_or(configured_addr, |bound| bound.to_string());
             bound_endpoint = format!("tcp {}", dialable_endpoint(&addr));
-            // When `[server.tls]` is set (and the `tls` feature is built in),
-            // wrap the just-bound TCP listener in a rustls acceptor so the same
-            // host:port serves HTTPS. Fail fast on any cert/key problem — the
-            // pre-bind guard already rejected a Unix-socket combination and a
-            // feature-less build, so reaching here with `tls = Some` means the
-            // feature is on.
+            // With `[server.tls]`, wrap the TCP listener in a rustls acceptor.
+            // Any cert/key problem fails the boot.
             #[cfg(feature = "tls")]
             {
                 if let Some(tls_cfg) = config.server.tls.as_ref() {
-                    // ACME mode: build the resolver from a stored cert if present,
-                    // else a self-signed placeholder so `:443` binds immediately;
-                    // the renewal task swaps the real cert in once issued.
+                    // ACME: start from a stored cert, or a self-signed placeholder
+                    // so the port binds now; the renewal task swaps in the real cert.
                     #[cfg(feature = "acme")]
                     if let Some(acme_cfg) = tls_cfg.acme.as_ref() {
                         let https_port = config.server.port;
@@ -5991,28 +5691,19 @@ impl AppBuilder {
             capabilities.job_workers,
         ) {
             tracing::error!(error = %error, "job runtime initialization failed");
-            // Post-DB failure: `process::exit` skips `on_shutdown`, so stop any
-            // managed Postgres before bailing.
+            // `process::exit` skips `on_shutdown`, so stop managed Postgres first.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
 
-        // Embedded cluster control plane (#1762). Mirrors the
-        // `crate::alerts::install_from_config` precedent — a no-op when
-        // `[cluster]` is disabled — but installed here rather than beside alerts
-        // because it owns a listener and two loops. A cluster that cannot bind or
-        // start is a hard boot failure: a node that silently never joins would
-        // serve its own private view of a counter it claims is cluster-wide.
+        // Embedded cluster control plane (#1762). Failing to start is fatal: a
+        // node that never joins would serve a private view of a cluster-wide
+        // counter.
         //
-        // Its token is deliberately not a child of `server_shutdown`. That token
-        // fires at phase 5, when the listener stops accepting, while in-flight
-        // requests still drain for up to `shutdown_timeout_secs`. A request served
-        // during that drain can still increment a cluster counter, and with the
-        // push loop already departed the increment would land in a document
-        // nothing replicates and die with the process. The cluster is therefore
-        // cancelled after the drain completes (see `cluster_shutdown.cancel()`
-        // below), inside the same budget.
+        // The token is not a child of `server_shutdown`: requests still drain after
+        // that fires and may increment a cluster counter, which would be lost if
+        // the push loop had already left. It is cancelled after the drain instead.
         #[cfg(feature = "cluster")]
         let cluster_shutdown = tokio_util::sync::CancellationToken::new();
         #[cfg(feature = "cluster")]
@@ -6034,13 +5725,9 @@ impl AppBuilder {
             crate::repository_commit_hooks::set_global_channels(state.channels().clone());
         }
 
-        // Draining durable after-commit hook rows is background execution, so gate
-        // it on the `commit_hooks` capability: a `web` replica must not claim or
-        // execute hook rows, while `worker` and `combined` replicas keep running
-        // it. The worker drains rows through a
-        // Postgres queue (in-process kick, polling and row-locked claiming). Under the
-        // `sqlite` feature the runtime pool is a SQLite pool the Postgres worker
-        // cannot drive, so the worker is not spawned.
+        // Draining after-commit hook rows is background work, so a `web` replica
+        // (no `commit_hooks` capability) must not claim them. The worker is
+        // Postgres-only and is not spawned under `sqlite`.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if capabilities.commit_hooks
             && let Some(pool) = state.pool().cloned()
@@ -6060,8 +5747,7 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             );
         }
-        // The outbox relay is background work too: only a process with the
-        // `outbox_relay` capability sends messages (issue #3062).
+        // Only a process with the `outbox_relay` capability sends messages (#3062).
         #[cfg(feature = "db")]
         if capabilities.outbox_relay {
             drop(crate::outbox::start_relay_worker(
@@ -6069,10 +5755,8 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             ));
         }
-        // Repositories built over a shard pool (`with_pool`) enqueue durable
-        // commit hooks into that shard's queue table; drain each one too — again
-        // only with the `commit_hooks` capability, so a web replica leaves shard
-        // hook rows for the worker tier.
+        // Repositories over a shard pool enqueue commit hooks into that shard's
+        // queue table, so drain each shard too.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if capabilities.commit_hooks
             && let Some(shards) = state.shards()
@@ -6091,11 +5775,7 @@ impl AppBuilder {
                 );
             }
         }
-        // SQLite durable commit-hook worker (#1996 item 5): the runtime pool is a
-        // single-node SQLite pool the Postgres queue worker cannot drive, so the
-        // SQLite worker (BEGIN IMMEDIATE claim + in-process Notify kick + poll
-        // fallback) is spawned instead — same `commit_hooks` gate and same
-        // `server_shutdown.child_token()` graceful-drain wiring as the Postgres tier.
+        // Under `sqlite`, the SQLite commit-hook worker replaces the Postgres one.
         #[cfg(all(feature = "db", feature = "sqlite"))]
         if capabilities.commit_hooks
             && let Some(pool) = state.pool().cloned()
@@ -6115,12 +5795,11 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             );
         }
-        // SQLite fleet (ADR 0019): a commit-hook worker per open database, the
-        // idle sweeper and the pending-work sweeper (issue 3234). Like
-        // replication below, the idle sweeper's token is cancelled only after
-        // the request drain, so the final close of every database (and its
-        // last replication ship) comes after the last commit. The pending-work
-        // sweeper stops with the listener, and is awaited before that close.
+        // SQLite fleet (ADR 0019): a commit-hook worker per open database, the idle
+        // sweeper and the pending-work sweeper (#3234). The idle sweeper's token is
+        // cancelled only after the request drain, so each database's final close
+        // and replication ship follow the last commit. The pending-work sweeper
+        // stops with the listener and is awaited before that close.
         #[cfg(feature = "sqlite")]
         let fleet_shutdown = tokio_util::sync::CancellationToken::new();
         #[cfg(feature = "sqlite")]
@@ -6131,25 +5810,18 @@ impl AppBuilder {
         )
         .await;
 
-        // The replication loop runs on a dedicated OS thread, not a
-        // `spawn_blocking` task: it lives for the whole process and does blocking
-        // file, SQLite, and HTTP work, which would pin a thread in tokio's
-        // blocking pool — sized for short tasks — forever. It stops with the
-        // server and ships one final time on the way out.
+        // The replication loop runs on a dedicated OS thread: it lives for the
+        // whole process doing blocking work, which would pin a thread in tokio's
+        // blocking pool forever. It ships one final time on shutdown.
         //
-        // Its token is deliberately not a child of `server_shutdown`, which fires
-        // at phase 5 when the listener stops accepting. Requests keep draining
-        // after that and still commit, so the loop's final tick must come later:
-        // the token is cancelled explicitly below, once the drain finishes. Same
-        // reasoning as the cluster's token, for the same class of dropped write.
+        // As with the cluster token, this is not a child of `server_shutdown`:
+        // draining requests still commit, so it is cancelled after the drain.
         #[cfg(feature = "db")]
         let replication_shutdown = tokio_util::sync::CancellationToken::new();
-        // Signals that `Replicator::run` has returned — i.e. the final flush is
-        // done. A channel rather than a `JoinHandle`: waiting on a join means
-        // blocking, and a blocking wait that times out cannot be cancelled, so a
-        // stuck upload would hold the runtime open past the shutdown budget it
-        // was supposed to be bounded by. Dropping this receiver abandons the
-        // thread instead, which is what the budget expiring is supposed to mean.
+        // Signals that the final flush is done. A channel rather than a
+        // `JoinHandle`: a blocking join cannot be cancelled, so a stuck upload
+        // would outlive the shutdown budget. Dropping the receiver abandons the
+        // thread instead.
         #[cfg(feature = "db")]
         let mut replication_done: Option<tokio::sync::oneshot::Receiver<()>> = None;
         #[cfg(feature = "db")]
@@ -6160,16 +5832,12 @@ impl AppBuilder {
                 .name("autumn-sqlite-replication".to_owned())
                 .spawn(move || {
                     replicator.run(&replication_shutdown);
-                    // The receiver is gone when shutdown stopped waiting; the
-                    // flush still happened, so there is nothing to report.
+                    // The receiver is gone if shutdown stopped waiting.
                     let _ = finished.send(());
                 }) {
                 Ok(_handle) => replication_done = Some(waiter),
-                // Serving on without the replicator is the worst of both
-                // worlds: the pool has already disabled auto-checkpointing for
-                // it, so the -wal would grow until the disk filled, and the
-                // operator would believe they were replicating. Fail loudly
-                // instead.
+                // The pool already disabled auto-checkpointing for the replicator,
+                // so serving without it would grow the WAL until the disk fills.
                 Err(e) => {
                     tracing::error!("Could not start the SQLite replication thread: {e}");
                     #[cfg(feature = "managed-pg")]
@@ -6179,8 +5847,8 @@ impl AppBuilder {
             }
         }
 
-        // Replica lag (issue #3065): measure in the background, so a replica
-        // that falls behind leaves read rotation without waiting for `/ready`.
+        // A replica that falls behind leaves read rotation without waiting for
+        // `/ready` (#3065).
         #[cfg(feature = "db")]
         let _replica_lag_monitor = spawn_replica_lag_monitor(&state, server_shutdown.child_token());
 
@@ -6201,13 +5869,9 @@ impl AppBuilder {
             });
         }
 
-        // TLS certificate hot-reload: poll the cert/key file mtimes on an
-        // interval and swap the served certificate in place on change (e.g.
-        // after a `certbot`/ACME renewal), so a renewal is picked up WITHOUT a
-        // restart. A child of `server_shutdown`, exactly like the presence
-        // sweep above, so it stops cleanly on shutdown. A failed reload logs an
-        // error and keeps serving the previously loaded certificate — a bad
-        // renewal never breaks the listener.
+        // TLS certificate hot-reload: poll the cert/key mtimes and swap the served
+        // certificate on change, so a renewal needs no restart. A failed reload
+        // keeps serving the previous certificate.
         #[cfg(feature = "tls")]
         if let Some(reload) = tls_reload_state.take() {
             let reload_shutdown = server_shutdown.child_token();
@@ -6216,10 +5880,8 @@ impl AppBuilder {
             });
         }
 
-        // mTLS trust-store hot reload (#1640): poll the client-CA bundle and
-        // CRL and swap the verifier when either changes, so a CA rotation — or
-        // a newly published revocation — lands without a restart and without
-        // dropping established connections.
+        // mTLS trust-store hot reload (#1640): a CA rotation or new revocation
+        // lands without a restart or dropping established connections.
         #[cfg(feature = "tls")]
         if let Some(reload) = client_trust_reload.take() {
             let reload_shutdown = server_shutdown.child_token();
@@ -6228,12 +5890,9 @@ impl AppBuilder {
             });
         }
 
-        // ACME (issue #1608): bind the `:80` HTTP-01 challenge + HTTP→HTTPS
-        // redirect listener and spawn the renewal loop, each a child of
-        // `server_shutdown` so they tear down with the main server. The renewal
-        // loop runs on every replica (a pure `web` replica must renew its own
-        // cert) and leader-elects through the scheduler coordinator so only one
-        // replica orders per certificate.
+        // ACME (#1608): the `:80` challenge/redirect listener and the renewal loop.
+        // The loop runs on every replica (a `web` replica renews its own cert) and
+        // leader-elects so only one replica orders per certificate.
         #[cfg(feature = "acme")]
         if let Some(bind_state) = acme_bind_state.take() {
             let AcmeBindState {
@@ -6247,10 +5906,8 @@ impl AppBuilder {
             } = bind_state;
             // Read before `custom_domains` is moved into the spawn below.
             let custom_domains_enabled = custom_domains.is_some();
-            // The mTLS trust store rotates on this arm too (#1640). Spawned
-            // HERE, not hoisted into the slot the static-cert arm fills: that
-            // slot is drained above this block, so an assignment to it would
-            // never be read and the ACME arm's reloader would never run.
+            // Spawned here: the `client_trust_reload` slot was already drained
+            // above, so assigning to it would never run the reloader.
             #[cfg(feature = "tls")]
             if let Some(reload) = acme_client_trust_reload {
                 let reload_shutdown = server_shutdown.child_token();
@@ -6259,29 +5916,18 @@ impl AppBuilder {
                 });
             }
 
-            // The `:80` challenge/redirect listener, bound dual-stack so the CA
-            // can validate HTTP-01 over IPv4 and IPv6 — an AAAA-only host is
-            // otherwise unreachable on `:80`. Preferred: one `[::]` socket with
-            // IPV6_V6ONLY=false; on a platform that refuses it, a separate IPv4
-            // and IPv6 pair, each served below. A bind error under HTTP-01 is
-            // fail-fast: `:80` needs CAP_NET_BIND_SERVICE and validation cannot
-            // succeed without it.
-            //
-            // Under DNS-01 it is only a warning. The CA never connects here —
-            // domain control is proved by a TXT record — so the listener is just
-            // the HTTP→HTTPS redirect. Exiting would kill the deployment #1620
-            // exists to serve: a container without CAP_NET_BIND_SERVICE using
-            // DNS-01 because `:80` is unavailable. `autumn doctor` grades this the
-            // same way, and the runtime must not refuse a config it passes.
+            // Bound dual-stack so the CA can validate HTTP-01 over IPv4 and IPv6
+            // (one `[::]` socket, or an IPv4/IPv6 pair where that is refused). A
+            // bind error is fatal under HTTP-01. Under DNS-01 the listener is only
+            // the HTTPS redirect, so it is a warning: a container without
+            // CAP_NET_BIND_SERVICE must still boot (#1620), matching `autumn doctor`.
             let challenge_listeners =
                 match crate::acme::challenge::bind_challenge_listeners(http_challenge_port).await {
                     Ok(listeners) => listeners,
-                    // Only DNS-01 WITHOUT custom domains can live without this
-                    // listener. Tenant certificates are always ordered over
-                    // HTTP-01 — the record lives in the tenant's zone, where
-                    // this deployment holds no DNS credential — so continuing
-                    // here would verify every tenant domain and then burn its
-                    // issuance budget into permanent backoff, never activating.
+                    // Only DNS-01 without custom domains can do without the
+                    // listener: tenant certificates are always ordered over
+                    // HTTP-01 (no DNS credential for a tenant's zone), so they
+                    // would all fail into backoff.
                     Err(e) if dns01 && !custom_domains_enabled => {
                         tracing::warn!(
                             port = http_challenge_port,
@@ -6324,9 +5970,6 @@ impl AppBuilder {
                 };
             let challenge_router =
                 crate::acme::challenge::challenge_router(tokens.clone(), https_port);
-            // Serve every bound listener (one for dual-stack, two for the split
-            // fallback), each a child of `server_shutdown` so they tear down with
-            // the main server. The router is cheap to clone (shared Arc state).
             for challenge_listener in challenge_listeners {
                 let router = challenge_router.clone();
                 let challenge_shutdown = server_shutdown.child_token();
@@ -6351,17 +5994,10 @@ impl AppBuilder {
                 });
             }
 
-            // Build the coordinator for leader election (whatever the role) and
-            // the reporter callback, then spawn the renewal loop.
-            //
-            // `leadership_degraded` marks the dangerous case: a distributed
-            // backend was configured — multi-replica intent — but
-            // `coordinator_from_config` could not build one (no DB pool, or no
-            // `db` feature here) and fell back to a per-process coordinator. It is
-            // keyed off both the configured backend and the actual fallback, so it
-            // never fires for a genuinely single-replica `in_process` deployment.
-            // When set, the renewal loop refuses to order (see `AcmeRenewalTask`)
-            // rather than let every replica take a local lease and race the CA.
+            // `leadership_degraded`: a distributed scheduler backend was configured
+            // but could not be built, so this fell back to a per-process
+            // coordinator. The renewal loop then refuses to order rather than let
+            // every replica take a local lease and race the CA.
             let mut leadership_degraded = false;
             let coordinator =
                 match crate::scheduler::coordinator_from_config(&config.scheduler, &state) {
@@ -6379,12 +6015,9 @@ impl AppBuilder {
                 };
             renewal_task.leadership_degraded = leadership_degraded;
 
-            // A distributed scheduler backend means several processes serve
-            // this app — a fleet on `postgres`, or processes on one host on
-            // `sqlite`. ACME is not safe across either without care: see
-            // `acme_fleet_warning` for the two hazards, which of them each
-            // backend actually carries, and why DNS-01 retires only one of them
-            // on a fleet. Warn loudly rather than silently mis-serving (#1620).
+            // A distributed scheduler backend means several processes serve this
+            // app, which ACME is not safe across by default. See
+            // `acme_fleet_warning` (#1620).
             if let Some(message) = acme_fleet_warning(config.scheduler.backend, dns01) {
                 tracing::warn!(scheduler_backend = coordinator.backend(), "{message}");
             }
@@ -6393,12 +6026,9 @@ impl AppBuilder {
             let reporter = make_acme_reporter(acme_reporters);
             #[cfg(not(feature = "error-reporting"))]
             let reporter = make_acme_reporter();
-            // Certificate renewal is a framework-scheduled operation, so a
-            // failed issuance/renewal raises #1610's `scheduled_task_failure`
-            // alert — reaching the operator's configured destination (email,
-            // Slack, PagerDuty) rather than only the error-reporting sink. The
-            // renew-before window (default 30 days) means this fires with weeks
-            // of validity left, not at expiry (#1620).
+            // A failed renewal raises the `scheduled_task_failure` alert, not only
+            // an error report. The renew-before window means it fires with weeks
+            // of validity left (#1620).
             let reporter = compose_acme_alert_reporter(reporter, &state);
             renewal_task.recovery = Some(make_acme_alert_recovery(&state));
             let renewal_shutdown = server_shutdown.child_token();
@@ -6409,9 +6039,7 @@ impl AppBuilder {
                     .await;
             });
 
-            // Tenant custom domains (#1635): publish the registry so tenancy
-            // resolution can route a connected `Host`, register the health
-            // indicator and the retention pruner, and spawn the orchestrator.
+            // Tenant custom domains (#1635).
             if let Some(cd) = custom_domains {
                 spawn_custom_domain_task(
                     cd,
@@ -6427,16 +6055,11 @@ impl AppBuilder {
         tracing::info!(bound = %bound_desc, "Listening");
 
         let server_shutdown_wait = server_shutdown.clone();
-        // Wrap the built router with the HTML form method-override layer at the
-        // very edge — outside path and method routing — so a plain browser
-        // `<form method="post">` carrying `_method=PUT|PATCH|DELETE` reaches the
-        // declared handler. In axum 0.8 `Router::layer` applies middleware per
-        // registered method handler, which is too late: the inner `MethodRouter`
-        // returns `405` before a layered service runs. Wrapping the whole router
-        // as a `tower::Service` is the documented way to run middleware before
-        // route matching. `TrustedProxiesLayer` must be outermost, stamped before
-        // `MethodOverrideLayer` reads `ResolvedClientIdentity` for its
-        // same-origin form check.
+        // Method override wraps the whole router so it runs before route matching:
+        // `Router::layer` applies per method handler, and the `MethodRouter` would
+        // return 405 first. `TrustedProxiesLayer` goes outermost because
+        // `MethodOverrideLayer` reads `ResolvedClientIdentity` for its same-origin
+        // check.
         let after_method = tower::Layer::layer(
             &crate::middleware::MethodOverrideLayer::new()
                 .with_max_scan_bytes(config.security.upload.max_request_size_bytes),
@@ -6446,18 +6069,9 @@ impl AppBuilder {
             &crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies),
             after_method,
         );
-        // Spawn the serve task per transport. The arms differ only in the
-        // connect-info type baked into the make-service (`SocketAddr` for TCP,
-        // `UdsConnectInfo` for Unix sockets); the shutdown wiring and resulting
-        // `JoinHandle<io::Result<()>>` are identical. Handlers extracting
-        // `ConnectInfo<SocketAddr>` are unsupported under a Unix socket — daemon
-        // mode is local and loopback-equivalent.
-        // A duplicate of the listening socket is kept aside so a `SIGUSR2`
-        // in-place upgrade (#1674) can hand it to a successor while this process
-        // keeps serving through the original. Only a plain TCP listener can be
-        // handed over in this release. This runs up front, before the match
-        // consumes `bound_listener` to build the (not yet spawned) accept-loop
-        // future below.
+        // Keep a duplicate of the listening socket so a `SIGUSR2` upgrade (#1674)
+        // can hand it to a successor while this process keeps serving. Only a
+        // plain TCP listener can be handed over.
         #[cfg(all(unix, feature = "upgrade"))]
         let mut handoff_socket: Option<crate::upgrade::HandoffSocket> = None;
         #[cfg(all(unix, feature = "upgrade"))]
@@ -6472,30 +6086,9 @@ impl AppBuilder {
             }
         }
 
-        // Build the accept-loop future per transport; when it goes live
-        // depends on how this process started (see below). The arms differ
-        // only in the connect-info type baked into the
-        // make-service (`SocketAddr` for TCP, `UdsConnectInfo` for Unix
-        // sockets); the shutdown wiring and the resulting `io::Result<()>` are
-        // identical. Handlers extracting `ConnectInfo<SocketAddr>` are
-        // unsupported under a Unix socket — daemon mode is local and
-        // loopback-equivalent.
-        //
-        // The deferred half of #2368: adopting the inherited fd still happens
-        // up front (so a failure to adopt aborts early, as today), but during
-        // an in-place upgrade the successor must not compete for connections
-        // before it can actually serve them: every connection it wins in that
-        // window is answered by the startup barrier with a 503 while the
-        // predecessor is right there, healthy. The predecessor keeps serving
-        // for the whole window; the successor's accept loop goes live once
-        // `run_startup_hooks` has returned `Ok`.
-        //
-        // The deferral applies ONLY to an upgrade successor
-        // (`handoff_requested()`): a cold start spawns its accept loop
-        // immediately, as before, so `/live` and `/startup` stay reachable
-        // behind the startup barrier while the hooks run — a hook that
-        // outlasts a probe threshold must not read as a dead pod.
-        // `[server.http]` limits for every listener kind (issue #3065).
+        // Build the accept-loop future per transport. The arms differ only in the
+        // connect-info type. When it goes live depends on how the process started
+        // (see below).
         let http_limits = crate::http_server::HttpLimits::from(&config.server.http);
         let server_future: std::pin::Pin<
             Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
@@ -6528,9 +6121,7 @@ impl AppBuilder {
             #[cfg(unix)]
             BoundListener::Unix(listener) => {
                 // UDS requests carry no TCP peer, so stamp a loopback identity
-                // before `TrustedProxiesLayer` runs — local daemon requests then
-                // resolve a `ClientAddr` (and IP-based maintenance/rate-limit
-                // behavior works) exactly like a localhost TCP connection.
+                // before `TrustedProxiesLayer` runs, as for a localhost TCP client.
                 let service = tower::Layer::layer(
                     &axum::middleware::from_fn(stamp_loopback_connect_info),
                     service,
@@ -6552,14 +6143,10 @@ impl AppBuilder {
                     .await
                 })
             }
-            // HTTPS arm: mirrors the TCP arm. The connect info is
-            // `TlsConnectInfo` rather than a bare `SocketAddr` so the verified
-            // mTLS client identity (#1640) rides along with the peer address;
-            // `ClientIdentityLayer` immediately re-stamps
-            // `ConnectInfo<SocketAddr>` from it, so `TrustedProxiesLayer` /
-            // `ClientAddr` resolution, SSE and wss streaming, rate limiting and
-            // shutdown wiring all behave exactly as on plain TCP. Only the
-            // rustls handshake inside the listener's `accept` differs.
+            // `TlsConnectInfo` carries the verified mTLS client identity (#1640)
+            // with the peer address; `ClientIdentityLayer` re-stamps
+            // `ConnectInfo<SocketAddr>` from it, so everything downstream behaves
+            // as on plain TCP.
             #[cfg(feature = "tls")]
             BoundListener::Tls(mut listener) => {
                 // The listener takes the `max_connections` slots before TCP
@@ -6567,18 +6154,10 @@ impl AppBuilder {
                 let handoff = http_limits
                     .max_connections
                     .and_then(|max| listener.limit_connections(max));
-                // Applied inside the connect-info layer (which
-                // `into_make_service_with_connect_info` installs outermost), so
-                // this sees `ConnectInfo<TlsConnectInfo>` and everything below
-                // it sees `ConnectInfo<SocketAddr>` plus the identity.
-                //
-                // The route-level mTLS requirement (#1640) is deliberately NOT
-                // applied here. It lives inside the router
-                // (`build_client_cert_requirement_layer`), so the MCP dispatch
-                // clone traverses it and a rejection flows through the rest of
-                // the response stack. Only the identity plumbing belongs at
-                // this boundary, because `ConnectInfo<TlsConnectInfo>` exists
-                // nowhere else.
+                // The route-level mTLS requirement is not applied here but inside
+                // the router, so the MCP dispatch clone traverses it too. Only the
+                // identity plumbing belongs here: `ConnectInfo<TlsConnectInfo>`
+                // exists nowhere else.
                 let service =
                     tower::Layer::layer(&crate::tls::client_auth::ClientIdentityLayer, service);
                 let make_service =
@@ -6601,14 +6180,11 @@ impl AppBuilder {
             }
         };
 
-        // Whether this process is the successor half of an in-place upgrade
-        // (#1674). Only a successor shares its listening socket with a live
-        // predecessor, so only a successor defers its accept loop past the
-        // startup hooks (#2368). A cold start spawns immediately, exactly as
-        // before this change.
+        // An upgrade successor shares its socket with a live predecessor, so it
+        // defers accepting until the startup hooks succeed: any connection it won
+        // earlier would get a startup-barrier 503 (#2368). A cold start accepts
+        // at once so `/live` and `/startup` answer while the hooks run.
         let defer_accept_loop = crate::upgrade::handoff_requested();
-        // The accept-loop future while it is not yet live; `None` once it has
-        // been taken to spawn `server_task`.
         let mut pending_accept: Option<
             std::pin::Pin<
                 Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
@@ -6621,28 +6197,22 @@ impl AppBuilder {
             server_task = Some(tokio::spawn(server_future));
         }
 
-        // Cancelled by the in-place upgrade watcher once a successor has taken
-        // over the listening socket; the drain below then runs without the
-        // load-balancer choreography a real shutdown needs (#1674).
+        // Cancelled once an upgrade successor has taken over the socket; the drain
+        // then skips the load-balancer steps a real shutdown needs (#1674).
         let upgrade_cutover = tokio_util::sync::CancellationToken::new();
         let upgrade_cutover_wait = upgrade_cutover.clone();
 
-        // In-place upgrade watcher (#1674): on `SIGUSR2`, hand this process's
-        // listening socket and designated live state to a freshly-execed build
-        // and, once that build is serving, cancel `upgrade_cutover` so the
-        // drain below runs.
+        // On `SIGUSR2`, hand the socket and live state to a freshly execed build,
+        // then cancel `upgrade_cutover` once it serves (#1674).
         #[cfg(all(unix, feature = "upgrade"))]
         {
             let upgrade_config = config.server.upgrade.clone();
             let upgrade_state = state.clone();
             let cutover = upgrade_cutover.clone();
             let socket = handoff_socket.take();
-            // A child of `server_shutdown`, so an ordinary drain ends the
-            // watcher: it drops the duplicated listening socket (which would
-            // otherwise keep the port bound and accepting into a queue nobody
-            // serves for the whole drain), and drops any handoff in flight,
-            // whose cleanup kills the half-started successor and unfreezes the
-            // live state.
+            // An ordinary drain ends the watcher, dropping the duplicate socket
+            // (which would keep accepting into an unserved queue) and any handoff
+            // in flight (killing the half-started successor).
             let watcher_shutdown = server_shutdown.child_token();
             tokio::spawn(async move {
                 tokio::select! {
@@ -6666,34 +6236,28 @@ impl AppBuilder {
         let shutdown_state = state.clone();
         let shutdown_signal_token = server_shutdown.clone();
         let handler_shutdown = state.probes.shutdown_signal().clone();
-        // Clone metrics so the drain-watchdog can record aborted requests.
         let shutdown_metrics = state.metrics.clone();
 
-        // Shared timestamp: set by shutdown_task when the listener is cancelled
-        // (phase 5). Main reads it after server_task completes to measure only
-        // actual drain time for hook budget — not the app's full uptime.
+        // Set when the listener is cancelled (phase 5), so the hook budget counts
+        // only drain time, not uptime.
         let drain_started_at: std::sync::Arc<std::sync::OnceLock<crate::time::MonotonicInstant>> =
             std::sync::Arc::new(std::sync::OnceLock::new());
         let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
-        // The same moment on the real clock. The fleet's final flush bounds
-        // blocking I/O, so it needs a reading a fixed or unadvanced injected
-        // clock cannot freeze.
+        // The same moment on the real clock: the fleet's final flush bounds
+        // blocking I/O, which a frozen injected clock must not stall.
         let drain_started_real: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
             std::sync::Arc::new(std::sync::OnceLock::new());
         let drain_started_real_clone = std::sync::Arc::clone(&drain_started_real);
-        // The shutdown task does not capture `state`, so hand it its own handle
-        // on the injected clock — the drain window is measured on the same
-        // monotonic timeline `hook_budget` is computed from below.
+        // The same clock `hook_budget` is computed from below.
         let drain_clock = state.clock_arc();
         let drain_clock_for_task = std::sync::Arc::clone(&drain_clock);
 
-        // Notified by main just before server_task.await (after startup hooks
-        // complete). If SIGTERM arrives during startup hooks the watchdog waits
-        // here so the drain deadline is always measured from when drain starts.
+        // Notified just before `server_task` is awaited, after the startup hooks.
+        // A SIGTERM during the hooks makes the watchdog wait for it, so the drain
+        // deadline starts when the drain does.
         let drain_phase_notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let drain_phase_notify_for_watchdog = std::sync::Arc::clone(&drain_phase_notify);
-        // Boolean companion so the watchdog can skip the wait when SIGTERM arrives
-        // after startup has already finished (the common case).
+        // Lets the watchdog skip that wait when startup already finished.
         let server_entered_drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server_entered_drain_for_watchdog = std::sync::Arc::clone(&server_entered_drain);
 
@@ -6703,28 +6267,25 @@ impl AppBuilder {
         //   2. /ready → 503  (probe flips before listener closes)
         //   3. prestop_grace elapses  (load-balancer deregistration window)
         //   4. WebSocket sessions receive close frame
-        //   5. TCP listener stops accepting new connections; jobs/scheduler
-        //      stop dequeuing (they share server_shutdown CancellationToken)
-        //   6. In-flight requests drain within shutdown_timeout_secs; past the
+        //   5. listener stops accepting; jobs/scheduler stop dequeuing (they share
+        //      `server_shutdown`)
+        //   6. in-flight requests drain within shutdown_timeout_secs; past the
         //      deadline the watchdog exits with code 1 and records
         //      autumn_shutdown_aborted_requests_total.
         //
-        // Phases 7-9 (on_shutdown hooks, telemetry flush, DB pool close) run in
-        // main after server_task completes, within the remaining part of the same
-        // shutdown_timeout_secs budget — not an additional window.
+        // The later phases (background tasks, fleet and replication flush, cluster
+        // departure, on_shutdown hooks) run after `server_task` completes, within
+        // what is left of the same budget.
         let shutdown_task = tokio::spawn(async move {
-            // Phase 1: Wait for an OS signal — or for an in-place upgrade
-            // (#1674) whose successor is already serving on this same socket.
+            // Phase 1: an OS signal, or an upgrade successor already serving on
+            // this socket (#1674).
             let cause = shutdown_signal(upgrade_cutover_wait).await;
             let upgrade_cutover = matches!(cause, DrainCause::UpgradeCutover);
 
             if upgrade_cutover {
-                // Phases 2 and 3 exist to let a load balancer take this replica
-                // out of rotation before its socket closes. An in-place upgrade
-                // has no such gap to cover: the successor is already accepting
-                // on the *same* listening socket, so flipping `/ready` to 503
-                // would only make a live address look unhealthy, and the
-                // prestop grace would delay the handover for nothing.
+                // Skip phases 2 and 3: the successor already accepts on the same
+                // socket, so a 503 `/ready` would only make a live address look
+                // unhealthy.
                 tracing::info!(
                     phase = "upgrade_cutover",
                     shutdown_timeout_secs = shutdown_timeout,
@@ -6753,9 +6314,8 @@ impl AppBuilder {
             // `ShutdownToken` of running handlers.
             handler_shutdown.cancel();
 
-            // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
-            // Record drain-start before cancelling so main gets the right hook
-            // budget even in the startup-overlap case.
+            // Phase 5: stop the listener and job/scheduler dequeuing. Record the
+            // drain start first, so the hook budget is right even mid-startup.
             let _ = drain_started_clone.set(drain_clock_for_task.monotonic());
             #[allow(
                 clippy::disallowed_methods,
@@ -6764,32 +6324,23 @@ impl AppBuilder {
             let _ = drain_started_real_clone.set(std::time::Instant::now());
             shutdown_signal_token.cancel();
 
-            // Phase 6: drain watchdog. If the in-flight drain exceeds the budget,
-            // record the aborted count and force a non-zero exit before hooks run.
-            //
-            // Always measure the deadline from when the drain actually starts, so
-            // in-flight requests get the full shutdown_timeout_secs window. On a
-            // normal SIGTERM after startup, server_entered_drain is already true:
-            // skip the wait and sleep the full budget. On a SIGTERM during hooks,
-            // wait for the notify first. Without that wait, hooks completing just
-            // before the watchdog fires would let it exit(1) at once, with no
-            // fresh drain window for requests that arrived after the hooks.
+            // Phase 6: drain watchdog. If the drain overruns the budget, record the
+            // aborted count and exit non-zero before hooks run. The deadline starts
+            // when the drain does, so a SIGTERM during startup hooks waits for the
+            // drain phase first.
             if !server_entered_drain_for_watchdog.load(std::sync::atomic::Ordering::Acquire) {
                 tracing::warn!(
                     phase = "signal_during_startup",
                     "shutdown: SIGTERM during startup hooks; waiting for drain phase \
                      to begin before enforcing the drain deadline"
                 );
-                // Suspend until main fires notify_one() at drain start.
-                // Orchestrator hard-kill backstop: if hooks never complete, the
-                // orchestrator's kill_timeout / terminationGracePeriodSeconds kills us.
+                // If the hooks never complete, the orchestrator's kill timeout is
+                // the backstop.
                 drain_phase_notify_for_watchdog.notified().await;
             }
             tokio::time::sleep(std::time::Duration::from_secs(shutdown_timeout)).await;
-            // Guard against the boundary race where server_task completes at
-            // exactly the deadline before main has called shutdown_task.abort().
-            // Zero active requests means drain completed cleanly; return and let
-            // main complete the cleanup path.
+            // The drain may finish exactly at the deadline, before main aborts
+            // this task.
             if shutdown_metrics.snapshot().http.requests_active == 0 {
                 return;
             }
@@ -6802,9 +6353,7 @@ impl AppBuilder {
                 exit_code = 1,
                 "shutdown: in_flight_drain phase exceeded deadline; terminating"
             );
-            // The watchdog's `process::exit` skips the remaining `on_shutdown`
-            // hooks — including a managed-Postgres `stop()` — so a drain that
-            // overruns its budget would orphan the postmaster. Stop it here too.
+            // `process::exit` skips `on_shutdown`; stop managed Postgres first.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
@@ -6812,11 +6361,8 @@ impl AppBuilder {
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
-            // A cold start already spawned the accept loop above, so stop it.
-            // An upgrade successor (#2368) never spawned one, so there is
-            // nothing to abort: the predecessor simply keeps serving through
-            // the adopted socket while this process exits, and no user ever
-            // sees a 503.
+            // An upgrade successor never spawned its accept loop; the predecessor
+            // keeps serving (#2368).
             if let Some(task) = server_task.take() {
                 task.abort();
             }
@@ -6827,18 +6373,12 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
-        // Go live on the accept loop. An upgrade successor (#2368) deferred it
-        // past the hooks; they have now succeeded, so it can serve the
-        // connections it wins on the shared socket — the predecessor has been
-        // serving them until now. A cold start spawned the loop up front, so
-        // `/live` and `/startup` stayed reachable behind the startup barrier
-        // while the hooks ran.
+        // The hooks succeeded, so an upgrade successor's deferred accept loop can
+        // go live (#2368).
         let server_task: tokio::task::JoinHandle<std::io::Result<()>> =
             match (server_task.take(), pending_accept.take()) {
                 (Some(task), _) => task,
                 (None, Some(future)) => tokio::spawn(future),
-                // Unreachable: `pending_accept` is `None` only once it has
-                // been taken to spawn `server_task` on the cold-start path.
                 (None, None) => {
                     unreachable!("accept-loop future consumed without spawning its task")
                 }
@@ -6853,10 +6393,8 @@ impl AppBuilder {
                 &server_shutdown,
                 &config,
             ));
-            // The `scheduler` capability gates app tasks and the `retention`
-            // capability gates retention sweeps. Skipping the scheduler must not
-            // regress readiness: mark_startup_complete and signal_serve_ready
-            // below still run.
+            // `scheduler` gates app tasks and `retention` gates retention sweeps.
+            // With no tasks, readiness below must still be signalled.
             let tasks =
                 scheduled_tasks_for_capabilities(tasks, &retention_task_names, capabilities);
             if !tasks.is_empty() {
@@ -6882,10 +6420,8 @@ impl AppBuilder {
                 }
             }
             state.probes().mark_startup_complete();
-            // Release a predecessor that is waiting on this build (#1674). Only
-            // now, with startup hooks done and the router serving, is it safe
-            // for the old process to stop accepting — and only if this build
-            // actually took over everything it was handed.
+            // Release a waiting predecessor (#1674), only once hooks are done, the
+            // router is serving, and this build took over everything handed to it.
             #[cfg(all(unix, feature = "upgrade"))]
             {
                 if let Err(reason) = crate::upgrade::verify_handover_complete() {
@@ -6895,14 +6431,11 @@ impl AppBuilder {
                     crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
                 }
-                // Publishing readiness is the last thing that can fail, so the
-                // adopted state stays frozen until it succeeds. A readiness signal
-                // that never reaches the predecessor — a full or read-only handoff
-                // filesystem — means the predecessor times out and kills this
-                // process, taking anything acknowledged meanwhile with it.
-                // Refusing here ends that wait when this process exits, in ~20 ms
-                // rather than the readiness timeout, and it resumes writable.
-                // The unfreeze runs under the handoff lock.
+                // The adopted state stays frozen until readiness is published: if
+                // the signal never reaches the predecessor, it times out and kills
+                // this process, losing anything acknowledged meanwhile. Exiting
+                // here ends its wait at once. The unfreeze runs under the handoff
+                // lock.
                 match crate::upgrade::publish_upgrade_readiness(|| {
                     unfreeze_adopted_live_state(&state);
                 }) {
@@ -6930,24 +6463,17 @@ impl AppBuilder {
             );
         }
 
-        // Signal the drain phase. The watchdog checks the flag for the common
-        // case (SIGTERM arrives after startup) and waits on the notify for the
-        // rare case (SIGTERM arrived during startup hooks). Both must be set so
-        // the watchdog never re-enforces the deadline before drain actually starts.
+        // Set both: the watchdog checks the flag when SIGTERM comes after startup,
+        // and waits on the notify when it came during the hooks.
         server_entered_drain.store(true, std::sync::atomic::Ordering::Release);
         drain_phase_notify.notify_one();
 
-        // Wait for the server to drain all in-flight requests.  The drain
-        // watchdog in shutdown_task will force-exit if drain takes too long.
         let server_result = server_task.await.unwrap_or_else(|e| {
             tracing::error!("Server task join error: {e}");
-            // `process::exit` skips the `on_shutdown` hooks, so stop a managed
-            // Postgres child here to avoid orphaning it on an accept-loop/join
-            // failure (direct/foreground runs have no CLI reaper).
+            // `process::exit` skips `on_shutdown`; stop managed Postgres first.
             exit_stop_managed_pg();
             std::process::exit(1);
         });
-        // Drain completed within the deadline; abort the watchdog.
         shutdown_task.abort();
         server_result.unwrap_or_else(|e| {
             tracing::error!("Server error: {e}");
@@ -6955,10 +6481,8 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // How much of `shutdown_timeout_secs` the drain has spent so far,
-        // measured on the injected clock from the instant phase 5 recorded.
-        // Read twice below — once for the departure wait, once for the hook
-        // budget — because everything after the drain shares that one budget.
+        // Time spent since phase 5. Every phase after the drain shares the one
+        // `shutdown_timeout_secs` budget.
         let elapsed_since_drain_start = || {
             drain_started_at
                 .get()
@@ -6968,11 +6492,9 @@ impl AppBuilder {
         };
         let shutdown_budget = std::time::Duration::from_secs(shutdown_timeout);
 
-        // Phase 6 (background): `server_shutdown` fired at phase 5, so each
-        // background task has seen its token (#3545). Wait for the tasks
-        // before the fleet and the hooks close what they use. The tasks get
-        // half of what is left, so a stuck task cannot use up the budget of
-        // the later phases.
+        // Phase 6 (background): wait for background tasks (#3545) before the fleet
+        // and hooks close what they use. They get half of what is left, so a stuck
+        // task cannot consume the later phases' budget.
         if let Some(runtime) = background_runtime.take()
             && runtime.len() > 0
         {
@@ -6985,22 +6507,9 @@ impl AppBuilder {
             }
         }
 
-        // Phase 6a: the replication loop's final flush. Cancelling the token at
-        // phase 5 only wakes that loop; the tick that ships the last committed
-        // frames runs after it, and nothing waits for that tick unless this does.
-        // Requests have drained, so no further transaction can commit and this is
-        // the last flush there will be — the difference between a clean stop that
-        // loses nothing and one that leaves the tail of the WAL only on a machine
-        // that may be about to go away.
-        //
-        // Bounded by what the drain left of `shutdown_timeout_secs`, on the same
-        // budget as the departure and the hooks below: a destination that has gone
-        // away must not hold the process open past what a supervisor allows.
-        // Overrunning it is loud rather than silent — the operator's RPO is at stake.
-        // Phase 6a (fleet): close every open fleet database. Each close waits
-        // for its in-flight connections, then runs the lifecycle hooks — a
-        // fleet replicator ships the database's last frames there. Same budget
-        // and same reasoning as the control replication flush below.
+        // Phase 6a (fleet): close every open fleet database. Each close waits for
+        // its connections, then runs the lifecycle hooks, where a fleet replicator
+        // ships the last frames. Bounded by what the drain left of the budget.
         #[cfg(feature = "sqlite")]
         if let Some(FleetRuntime {
             maintenance,
@@ -7014,8 +6523,7 @@ impl AppBuilder {
                     .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
                 fleet_flush_budget(shutdown_budget, elapsed_since_drain_start(), real_elapsed)
             };
-            // The sweeper's last pass ends before its databases close. It
-            // spends from the same budget.
+            // The sweeper's last pass ends before its databases close.
             if let Some(sweeper) = sweeper {
                 let abort = sweeper.abort_handle();
                 if tokio::time::timeout(flush_budget(), sweeper).await.is_err() {
@@ -7056,8 +6564,9 @@ impl AppBuilder {
 
         #[cfg(feature = "db")]
         if let Some(waiter) = replication_done.take() {
-            // Only now: every request that will ever commit has committed, so
-            // the tick this releases is genuinely the last one.
+            // Phase 6a: the replication loop's final flush. Requests have drained,
+            // so this tick ships the last committed frames. Bounded by what the
+            // drain left of the budget; overrunning it is logged, as RPO is at stake.
             replication_shutdown.cancel();
             let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
             match tokio::time::timeout(wait, waiter).await {
@@ -7068,9 +6577,7 @@ impl AppBuilder {
                     "shutdown: the SQLite replication thread ended without finishing; the \
                      frames committed since the last successful tick may not be offsite"
                 ),
-                // The thread is left running and the process exits without it.
-                // Waiting further is what the budget exists to prevent, and a
-                // blocking join could not be abandoned at all.
+                // The thread is abandoned; the process exits without it.
                 Err(_) => tracing::warn!(
                     timeout_secs = wait.as_secs(),
                     "shutdown: SQLite replication did not finish its final flush within the \
@@ -7079,18 +6586,10 @@ impl AppBuilder {
             }
         }
 
-        // Phase 6b: the cluster departs only now, once no request can still be
-        // running — an increment accepted during the drain must have a push loop
-        // left to replicate it. Ordering, all inside the one
-        // `shutdown_timeout_secs` budget: drain → departure → hooks. The departure
-        // is bounded by `LEAVE_BUDGET` inside the node, and this waits for it, but
-        // only for what the drain left (`cluster_departure_wait`): a supervisor
-        // times the process out on `shutdown_timeout_secs`, and an unconditional
-        // wait after a slow drain would push past it. The hook budget below
-        // subtracts this wait from the same clock reading, so the three phases add
-        // up to the budget rather than budget + `LEAVE_BUDGET`. A departure that is
-        // budgeted away leaves the peer to converge on the suspicion timeout, which
-        // is the actual contract.
+        // Phase 6b: the cluster departs only after the drain, so an increment
+        // accepted during it still has a push loop to replicate it. The wait is
+        // capped by what the drain left of the budget; a departure budgeted away
+        // leaves peers to converge on the suspicion timeout.
         #[cfg(feature = "cluster")]
         if config.cluster.enabled {
             cluster_shutdown.cancel();
@@ -7101,27 +6600,17 @@ impl AppBuilder {
             }
         }
 
-        // Phase 7: run on_shutdown hooks within the *remaining* portion of
-        // shutdown_timeout_secs (drain + departure + hooks share one budget,
-        // not three).
-        // Plugin ordering: plugins register during build() before app hooks,
-        // so app hooks run before plugin hooks (LIFO = last-registered first).
+        // Phase 7: `on_shutdown` hooks get what remains of the budget. They run
+        // LIFO, so app hooks run before the plugin hooks registered earlier.
         let hook_budget = shutdown_budget.saturating_sub(elapsed_since_drain_start());
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
-        // If request drain consumed the whole `shutdown_timeout_secs`, the
-        // managed-Postgres `on_shutdown` hook may have been budgeted away above.
-        // Stop the cluster directly here (idempotent — a no-op once the hook
-        // already stopped it) so a direct/foreground run, which has no CLI
-        // reaper, never leaves the postmaster holding the data dir/port.
+        // The managed-Postgres hook may have been budgeted away. Stopping again is
+        // a no-op, and a foreground run has no CLI reaper to stop it.
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
 
-        // Remove the Unix socket file on clean exit; axum does not unlink it.
-        // (An abnormal force-exit may leave it behind, but the next bind's
-        // `prepare_unix_socket_path` reclaims a stale socket.) Only unlink if the
-        // socket is still the one we bound — a successor that rebound the same
-        // path after we closed has a different inode, and removing it would make
-        // the new server unreachable.
+        // axum does not unlink the Unix socket. Only remove it if it is still the
+        // one we bound: a successor that rebound the path has a different inode.
         #[cfg(unix)]
         if let Some((path, dev, ino)) = &unix_socket_cleanup {
             use std::os::unix::fs::MetadataExt;
@@ -7253,7 +6742,6 @@ impl AppBuilder {
         let _ = &health_indicators;
         let all_routes = routes;
 
-        // Load config (same as normal startup)
         let (mut config, telemetry_guard) = load_config_and_telemetry(
             config_loader_factory,
             telemetry_provider,
@@ -7266,17 +6754,16 @@ impl AppBuilder {
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
                 .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
-            // Only apply the builder default when neither the env var nor the
-            // loaded config file explicitly sets enabled = false.
+            // The builder default yields to an explicit `enabled = false` in the
+            // env var or the config file.
             if !env_disabled && config.idempotency.enabled != Some(false) {
                 config.idempotency.enabled = Some(true);
             }
         }
 
-        // Register the embedded `static/` tree (if any) before the router is
-        // built so `/static/*` serves from the binary and `asset_url()` resolves
-        // against the embedded manifest, then prefer embedded locales over disk
-        // auto-loading when no explicit bundle was provided.
+        // Register the embedded `static/` tree before the router is built, so
+        // `/static/*` and `asset_url()` resolve against the embedded manifest.
+        // Embedded locales win over disk auto-loading when no bundle was given.
         #[cfg(feature = "embed-assets")]
         register_embedded_static_dir(embedded_static);
 
@@ -7287,9 +6774,8 @@ impl AppBuilder {
         let i18n_bundle =
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
-        // Snapshot ApiDocs before all_routes is moved into the router builder.
-        // Includes top-level routes and scoped groups (with prefixed paths) so
-        // the emitted dist/openapi.json matches what the runtime spec serves.
+        // Snapshot the docs before `all_routes` moves into the router. Scoped groups
+        // get their prefixed paths so dist/openapi.json matches the runtime spec.
         #[cfg(feature = "openapi")]
         let api_docs_snapshot: Vec<crate::openapi::ApiDoc> = {
             let mut docs: Vec<crate::openapi::ApiDoc> = all_routes
@@ -7302,9 +6788,8 @@ impl AppBuilder {
                 })
                 .collect();
             for group in &scoped_groups {
-                // Mirror the same normalization as the runtime OpenAPI builder:
-                // use join_nested_path for correct trailing-slash handling, and
-                // merge prefix path params so they appear in the operation.
+                // Same normalization as the runtime OpenAPI builder: `join_nested_path`
+                // handles trailing slashes, and prefix path params join the operation's.
                 let prefix_params = crate::router::extract_path_params(&group.prefix);
                 for route in &group.routes {
                     let mut doc = route.api_doc.clone();
@@ -7342,20 +6827,15 @@ impl AppBuilder {
             std::process::exit(no_static_routes_exit_code(allow_empty));
         }
 
-        // Fail-fast on invalid session config — only when no custom store
-        // was installed. Symmetrical to the same check in run() so static
-        // builds don't run migrations against a doomed boot either.
+        // Same checks as `run()`, so a static build fails before it runs migrations.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
         fail_fast_on_invalid_signing_secret(&config);
         fail_fast_on_missing_encryption_keys(&config);
         fail_fast_on_invalid_trusted_hosts(&config);
 
-        // Preflight the configured BlobStore the same way `run()` does.
-        // Static routes can read presigned URLs out of `BlobStoreState`
-        // during pre-rendering (e.g. `<img src=blob.url()>`); without
-        // the bootstrap they'd 500 during `autumn build` even though
-        // the server path works. A custom store from `.with_blob_store()`
-        // bypasses config-driven instantiation.
+        // Static routes can read presigned URLs from `BlobStoreState` while
+        // pre-rendering, so preflight storage as `run()` does. A store from
+        // `.with_blob_store()` skips the config-driven setup.
         #[cfg(feature = "storage")]
         let storage_bootstrap = blob_store.map_or_else(
             || preflight_storage(&config),
@@ -7367,7 +6847,6 @@ impl AppBuilder {
             },
         );
 
-        // Build state (with DB if configured)
         #[cfg(feature = "db")]
         let database = setup_database(
             &config,
@@ -7404,25 +6883,16 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
-        // Wire the live-subscriber reload handle into the loggers actuator so
-        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
-        // just an in-memory map (issue #1044).
+        // Lets `PUT /actuator/loggers/{name}` change the running subscriber,
+        // not just an in-memory map (#1044).
         if let Some(handle) = telemetry_guard.filter_reload.clone() {
             state.log_levels().attach_reload_handle(handle);
         }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
-        // Clone class: this interceptor-wiring block (mail/job/db/channels,
-        // including the channels -> presence -> collab backend swap, and
-        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
-        // and `run_one_off_task_mode()`. It was born duplicated by #862,
-        // whose own follow-up commit ("fix: wire interceptors into
-        // one-off task mode") is a missed-fix this duplication already
-        // produced once: the one-off task path first shipped without this
-        // block, so its interceptors were silently inert. #1806 later had
-        // to hand-repeat the channels/presence/collab swap in all three
-        // copies again. Change one, change the other two --
-        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
-        // below fails if they drift.
+        // This interceptor wiring is identical in `run()`, `run_build_mode()` and
+        // `run_one_off_task_mode()`. Change all three:
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes` fails
+        // if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -7459,12 +6929,6 @@ impl AppBuilder {
         if !error_reporters.is_empty() {
             state.insert_extension(crate::reporting::RegisteredReporters(error_reporters));
         }
-        // Static-site builds are short-lived and don't run the request loop,
-        // so deliver_later is never invoked. install_mailer_with_factory skips
-        // the queue factory when enforce_durable_guard is false (the factory
-        // may open Redis/Harvest connections unavailable here), and the guard
-        // itself is bypassed too — the Mailer is still installed so static
-        // routes that extract `Mailer` for immediate `send` calls resolve.
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
             state.insert_extension(handle);
@@ -7473,6 +6937,9 @@ impl AppBuilder {
         if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
+        // A static build never calls `deliver_later`. `false` skips the durable guard
+        // and the queue factory, which may open Redis connections unavailable here.
+        // The Mailer is still installed so static routes can `send` immediately.
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
@@ -7489,17 +6956,14 @@ impl AppBuilder {
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         #[cfg(feature = "maud")]
         install_story_registry(&state, story_gallery);
-        // run_build_mode used ProbeState::default(), which does not start as pending
+        // `build_state` starts probes pending, and build mode has no startup phase
+        // to clear them, so swap in the default, already-started state.
         state.fields_mut().probes = crate::probe::ProbeState::default();
         state.apply_health_config(&config.health);
 
-        // Apply deferred policy and scope registrations onto the live app state,
-        // as `run()` does. Static routes can carry `#[authorize]` checks or sit
-        // behind `#[repository(policy = ..., scope = ...)]` index endpoints;
-        // without registering here, every such pre-render call would 500 at build
-        // time with "no policy/scope registered", and `render_static_routes` would
-        // treat that as a build failure even though `.policy(...)`/`.scope(...)`
-        // was configured on the builder.
+        // As in `run()`: static routes can carry `#[authorize]` checks or
+        // `#[repository(policy, scope)]` endpoints, which fail the build with
+        // "no policy/scope registered" if these are not applied.
         for register in policy_registrations {
             register(state.policy_registry());
         }
@@ -7508,79 +6972,53 @@ impl AppBuilder {
         let custom_layers =
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
-        // #2405: render through the pre-layer router — the same layer
-        // composition the ISR regeneration path uses
-        // (`partition_custom_layers_for_static_render`, shared with the SSG
-        // serve path) — so the recorded Content-Type and the body on disk are
-        // the handler's own, not the app layer stack's post-layer output. The
-        // serve path applies the drained layers to the cached response at
-        // request time, outside the static-first middleware, so recording the
-        // post-layer output both double-applies the layers (once at
-        // generation, once per request) and — because ISR's type guard sees
-        // the pre-layer response — refuses every regeneration for an app with
-        // a Content-Type-rewriting layer, freezing the route until the next
-        // build. The drained set is dropped: this process exits after the
-        // render; serving is a separate invocation.
+        // Render through the pre-layer router, as ISR regeneration does (#2405), so
+        // the recorded Content-Type and body are the handler's own. The serve path
+        // applies the drained layers at request time; recording post-layer output
+        // would apply them twice, and ISR's type guard would refuse to regenerate a
+        // route behind a Content-Type-rewriting layer. The drained set is dropped:
+        // this process exits after rendering.
         let (custom_layers, _drained) =
             crate::router::partition_custom_layers_for_static_render(custom_layers);
 
-        // Install the preflighted storage and remember the serving
-        // router so static generation hits the same `/_blobs/...`
-        // routes the server path serves.
+        // Keep the serving router so static generation reaches the same
+        // `/_blobs/...` routes as the server.
         #[cfg(feature = "storage")]
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
         crate::cost::install(&state, &config);
-        // Static generation has no job runtime, so register only sync listeners.
-        // Durable listeners are dropped entirely (not just their jobs) so a
-        // static route publishing such an event is a clean no-op for the durable
-        // side effect rather than a "job runtime not initialized" error.
+        // No job runtime here, so only sync listeners are registered. Dropping the
+        // durable ones makes publishing their event a no-op instead of a
+        // "job runtime not initialized" error.
         let sync_listeners: Vec<_> = listeners
             .into_iter()
             .filter(|listener| listener.mode == crate::events::DispatchMode::Sync)
             .collect();
         finalize_event_bus(sync_listeners, &mut Vec::new(), &state);
 
-        // Build the router for static rendering. Use the inner builder
-        // so the custom session store installed via with_session_store(...)
-        // is honored during static generation — apps that swap in a custom
-        // store specifically to avoid Redis/external backends at build time
-        // would otherwise silently fall back to the config-driven backend.
-        // Custom Tower layers registered via .layer(...) are deliberately
-        // NOT applied here (#2405): they were drained above, so the render
-        // sees the handler's own response — the same pre-layer composition
-        // ISR regeneration uses. The serve path applies those layers to the
-        // cached response at request time, which is what makes the recorded
-        // Content-Type and the body on disk mean "what the handler declared"
-        // rather than "what the layer stack happened to produce".
         #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
         let mut merge_routers: Vec<axum::Router<AppState>> = Vec::new();
         #[cfg(feature = "storage")]
         if let Some(router) = storage_router {
             merge_routers.push(router);
         }
-        // Static routes are pre-rendered by requesting their single,
-        // unprefixed path — never locale-aware — so they must stay excluded
-        // from locale-prefix routing even when it's enabled (issue #1251).
+        // Static routes are pre-rendered at their unprefixed path, so they stay
+        // out of locale-prefix routing (#1251).
         exclude_static_routes_from_locale_prefix(&mut config, &static_metas);
-        // Refresh the AppState-stored config snapshot — see the matching
-        // comment in `run()` (Codex review).
+        // `build_state` snapshotted the config before that mutation; refresh it so
+        // `tenancy_middleware` sees the excluded static routes.
         state.insert_extension(config.clone());
         state.insert_extension(crate::aeo::RegisteredAgentSkills(agent_skills));
         state.insert_extension(commerce_docs);
-        // Publish the architecture graph this app serves (#1747) before the
-        // router is built, so `/actuator/graph` can answer from the first
-        // request rather than after some later warm-up.
-        // The agent documents list the API that `dist/openapi.json` (written
-        // below) describes. The build writes that file at the site root
-        // whatever path the runtime serves it on, and writes no Swagger UI. The
-        // router below always mounts it, so the census sees the same config
-        // with the runtime gate open.
+        // The build writes `dist/openapi.json` at the site root, whatever path the
+        // runtime serves it on, and writes no Swagger UI. The agent documents list it.
         #[cfg(feature = "openapi")]
         let static_openapi = openapi
             .clone()
             .map(|api| api.openapi_json_path("/openapi.json").swagger_ui_path(None));
+        // The router below always mounts the spec, so the census sees the runtime
+        // gate open.
         #[cfg(all(feature = "openapi", feature = "graph"))]
         let census_config = {
             let mut census = config.clone();
@@ -7589,6 +7027,8 @@ impl AppBuilder {
         };
         #[cfg(all(not(feature = "openapi"), feature = "graph"))]
         let census_config = config.clone();
+        // Published before the router is built so `/actuator/graph` answers from the
+        // first request (#1747).
         #[cfg(feature = "graph")]
         crate::graph::install(
             &state,
@@ -7601,9 +7041,8 @@ impl AppBuilder {
                     #[cfg(feature = "openapi")]
                     static_openapi.as_ref(),
                 ),
-                // The static-build path builds its router with no nest mounts and
-                // no declared plugin routes (see the `RouterContext` below), so the
-                // merge count is the whole opaque surface here.
+                // The router below has no nest mounts or declared plugin routes, so
+                // the merge count is the whole opaque surface.
                 omitted_router_count(merge_routers.len(), std::iter::empty::<&str>(), &[]),
             )
             .with_background_tasks(crate::background::graph_entries(&background, &config)),
@@ -7627,6 +7066,8 @@ impl AppBuilder {
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]
                 error_page_renderer: None,
+                // Honors `with_session_store(...)`: an app that swaps in a store to
+                // avoid Redis at build time must not fall back to the config backend.
                 session_store,
                 #[cfg(feature = "openapi")]
                 openapi: static_openapi,
@@ -7692,8 +7133,6 @@ impl AppBuilder {
             }
         }
 
-        // When OpenAPI is configured, write the spec to dist/ so consumers
-        // can retrieve a machine-readable API contract alongside the HTML.
         #[cfg(feature = "openapi")]
         if let Some(mut openapi_config) = openapi {
             openapi_config.api_versions = api_versions;
@@ -7716,25 +7155,23 @@ impl AppBuilder {
             }
         }
 
-        // Write robots.txt and sitemap.xml to dist/ — when SEO is configured,
-        // dynamic sources are registered, or AEO is on; never overwrite files
-        // already produced by a custom #[static_get("/robots.txt")] route.
+        // robots.txt and sitemap.xml are written when SEO is configured, dynamic
+        // sources exist, or AEO is on. A file a custom `#[static_get]` route already
+        // rendered is never overwritten.
         if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) || config.aeo.enabled
         {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
-            // Here for AEO alone, the file is AEO's: it classes profiles as
-            // the server's AEO `robots.txt` does, so a custom production
-            // profile does not ship `Disallow: /`.
+            // With AEO alone the file is AEO's: classify profiles as the server's
+            // AEO `robots.txt` does, so a custom production profile does not ship
+            // `Disallow: /`.
             let aeo_only = seo_sources.is_empty() && !crate::seo::has_seo_config(seo_cfg);
             let profile = if aeo_only {
                 crate::aeo::robots_profile(&config)
             } else {
                 crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all)
             };
-            // A static route that declared `seo(robots = "noindex")` must not
-            // be advertised in sitemap.xml — otherwise the app tells crawlers
-            // "here is this URL" and "do not index it" at the same time (#1182).
+            // A `seo(robots = "noindex")` route stays out of sitemap.xml (#1182).
             let static_paths: Vec<&str> = static_metas
                 .iter()
                 .filter(|m| !crate::seo::defaults_exclude_from_sitemap(m.seo))
@@ -7751,8 +7188,6 @@ impl AppBuilder {
                 &crate::aeo::robots_policy(&config),
             )
             .await;
-            // Write each file only if it wasn't already produced by a
-            // custom #[static_get] route.
             let robots_path = dist_dir.join("robots.txt");
             let sitemap_path = dist_dir.join("sitemap.xml");
             if robots_path.exists() {
@@ -7783,9 +7218,8 @@ impl AppBuilder {
             }
         }
 
-        // Build finished: stop the managed Postgres child `setup_database` may
-        // have started. Build mode discards the app's `on_shutdown` hooks, so
-        // without this even a *successful* `autumn build` would leak the cluster.
+        // Build mode discards `on_shutdown` hooks, so stop the managed Postgres that
+        // `setup_database` may have started, or a successful build leaks it.
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
     }
@@ -7902,22 +7336,20 @@ impl AppBuilder {
     /// the route table and the audit-sink status and touches nothing else, so
     /// there is no database to open and no port to bind.
     fn run_dump_agent_authority_mode(&self) {
-        // Whether agent invocations have anywhere to be recorded is a property
-        // of the deployment, not of any grant, and it belongs in the document
-        // rather than in a startup line nobody reads (#1691 R9).
+        // Whether agent invocations are recorded anywhere is a property of the
+        // deployment, not of any grant, so it belongs in the document (#1691).
         let audit_sink_configured = self
             .audit_logger
             .as_ref()
             .is_some_and(|logger| logger.is_enabled());
-        // The whole-API MCP hatch, when the `mcp` feature is compiled in and
-        // the app opted into it. Without it every route `expose_all_as_mcp()`
-        // exposes would be missing from the document entirely.
+        // Without the whole-API MCP hatch, every route `expose_all_as_mcp()`
+        // exposes would be missing from the document.
         #[cfg(feature = "mcp")]
         let expose_all = self.mcp.as_ref().is_some_and(|rt| rt.expose_all);
         #[cfg(not(feature = "mcp"))]
         let expose_all = false;
-        // The WebMCP hatch, likewise. A WebMCP tool runs in the user's own
-        // session, so the document lists it apart from the `/mcp` tools.
+        // A WebMCP tool runs in the user's own session, so the document lists
+        // it apart from the `/mcp` tools.
         #[cfg(feature = "webmcp")]
         let webmcp_expose_all = self.webmcp.is_some_and(|rt| rt.expose_all);
         #[cfg(not(feature = "webmcp"))]
@@ -7926,11 +7358,9 @@ impl AppBuilder {
             mcp_expose_all: expose_all,
             webmcp_expose_all,
         };
-        // Top-level routes carry their own path; a scoped group's children do
-        // not -- the group's prefix is applied at mount time, so the path on
-        // the `Route` is the child path alone. Passing that through would
-        // record `/items` for a tool an agent calls at `/api/v1/items`, and a
-        // scope rename would then produce no drift at all.
+        // A scoped group's prefix is applied at mount time, so its children's
+        // `Route` paths lack it. Passing them through would record `/items` for
+        // a tool called at `/api/v1/items`, and a scope rename would show no drift.
         let mut routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
             .routes
             .iter()
@@ -7972,7 +7402,6 @@ impl AppBuilder {
             ..
         } = self;
 
-        // Validate that all versioned routes use a registered API version
         let registered_versions: std::collections::HashSet<&str> =
             api_versions.iter().map(|av| av.version.as_str()).collect();
 
@@ -8004,14 +7433,10 @@ impl AppBuilder {
             }
         }
 
-        // Raw Axum routers registered via `.merge()`/`.nest()` are opaque: no
-        // public API enumerates their routes, so they are omitted from the listing
-        // and hard-fail `autumn routes audit`, since their auth posture cannot be
-        // proven. The exception is a `.nest(prefix, router)` whose endpoints were
-        // declared through `declare_plugin_routes`: those are enumerable, folded
-        // into `declared_routes`, and must not count as omitted. Every `.merge()`
-        // is rootless and always counts; a bare `.nest()` with no covering
-        // declaration stays opaque and counts.
+        // Raw `.merge()`/`.nest()` routers cannot be enumerated, so they are
+        // omitted from the listing and hard-fail `autumn routes audit`: their
+        // auth posture cannot be proven. A `.nest()` whose endpoints were declared
+        // through `declare_plugin_routes` is in `declared_routes` and does not count.
         let hidden = omitted_router_count(
             merge_routers.len(),
             nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
@@ -8022,8 +7447,7 @@ impl AppBuilder {
                 "[autumn routes] warning: {hidden} raw router(s) added via \
                  .merge()/.nest() are not enumerable and are omitted from this listing"
             );
-            // Machine-readable marker consumed by `autumn routes audit` to
-            // hard-fail the coverage gate: omitted routes can't be proven.
+            // Read by `autumn routes audit` to hard-fail its coverage gate.
             eprintln!(
                 "{marker}{hidden}",
                 marker = crate::route_listing::OMITTED_ROUTES_MARKER
@@ -8037,10 +7461,9 @@ impl AppBuilder {
         )
         .await;
 
-        // Emit the resolved security configuration for the manifest's `declared`
-        // dimensions (CSRF, security headers). Gated on `AUTUMN_DUMP_SECURITY`
-        // so only `autumn routes audit` sees it — kept off stdout so the
-        // routes-only JSON parse path stays byte-compatible.
+        // The resolved security config (CSRF, security headers) for the audit
+        // manifest. Only `autumn routes audit` asks for it, and it goes to stderr
+        // so the routes JSON on stdout stays byte-compatible.
         if is_dump_security_mode() {
             let security = crate::route_listing::SecurityDump::from_config(&config);
             match serde_json::to_string(&security) {
@@ -8052,11 +7475,8 @@ impl AppBuilder {
             }
         }
 
-        // Emit the plugin compatibility contracts declared by this app's
-        // plugins (issue #1601). Gated on `AUTUMN_DUMP_PLUGIN_CONTRACT` so only
-        // `autumn plugin-check` sees it, and emitted even when the array is
-        // empty: the CLI distinguishes "this binary declares no contracts" from
-        // "this binary predates the marker" by the line's presence.
+        // Emitted even when empty: `autumn plugin-check` tells "declares no
+        // contracts" from "predates the marker" by whether the line is present.
         if is_dump_plugin_contract_mode() {
             match serde_json::to_string(&plugin_contracts) {
                 Ok(json) => eprintln!(
@@ -8181,32 +7601,16 @@ impl AppBuilder {
         )]
         let mut config = load_config_only(config_loader_factory, plugin_config_roots).await;
 
-        // The builder flag must land BEFORE the collision checks below, exactly
-        // as it does on the serving path: it is what decides whether
-        // `/_autumn/unsubscribe` is claimed, and a check run against the
-        // unmodified config would approve a mount that startup rejects.
+        // Must precede the collision checks, as on the serving path: it decides
+        // whether `/_autumn/unsubscribe` is claimed.
         #[cfg(feature = "mail")]
         apply_mail_builder_overrides(&mut config, mount_unsubscribe_endpoint);
 
-        // Run the SERVING PATH'S OWN preflight before emitting anything. An
-        // export that skips a check the router enforces lets `--check` pass for
-        // an application that cannot start — and worse, does so QUIETLY:
-        // `generate_spec` keys operations by (path, method), so a duplicate
-        // silently DROPS the earlier one and the document describes a subset of
-        // the API as though it were the whole of it.
-        //
-        // Every one of these calls the router's own function rather than
-        // re-deriving its rule. A second copy would drift, and a preflight that
-        // disagreed with the router about what it rejects would be worse than
-        // none. The two that used to be inline in `build_router_pre_state` and
-        // `build_openapi_router` were extracted for exactly this, so there is
-        // still one definition per rule.
-        //
-        // Ordered as the serving path orders them, so an app with more than one
-        // problem reports the same first error either way.
-        // The config-only preconditions first, in `run()`'s order: a split role
-        // on a non-durable jobs backend, or a duplicate scheduled task name,
-        // stops startup before anything route-shaped is even looked at.
+        // Run the serving path's own checks, in its order, before emitting
+        // anything. Skipping one lets `--check` pass for an app that cannot
+        // start, and `generate_spec` keys operations by (path, method), so a
+        // duplicate silently drops the earlier one. Each check calls the
+        // router's own function, so the rules cannot drift.
         let tasks = merge_framework_scheduled_tasks(tasks, &config);
         if let Err(message) = validate_config_preconditions(&config, &tasks) {
             return Err((
@@ -8215,9 +7619,6 @@ impl AppBuilder {
             ));
         }
 
-        // `run()`'s own pre-router checks, in its order and on every route: an
-        // app with no routes, or with an unguarded mutating repository API under
-        // a production profile, never reaches router construction at all.
         if let Err(message) = validate_pre_router_preconditions(&routes, &scoped_groups, &config) {
             return Err((
                 1,
@@ -8247,17 +7648,11 @@ impl AppBuilder {
             }
         }
 
-        // `.policy::<R, _>(...)` / `.scope::<R, _>(...)` are DEFERRED closures the
-        // serving path replays onto live state before checking that every
-        // `#[repository(policy = X)]` route actually has an X registered. The
-        // export dropped them and checked only that the macro argument existed,
-        // so an app that declares a policy but forgets the builder call — which
-        // refuses to start under a production profile — still exported a
-        // contract `--check` would approve.
-        //
-        // A throwaway `PolicyRegistry` is enough: the check only ever reads the
-        // registry, and building real `AppState` would open the database this
-        // command promises not to touch.
+        // `.policy::<R, _>(...)` / `.scope::<R, _>(...)` are deferred closures the
+        // serving path replays before checking that every
+        // `#[repository(policy = X)]` route has an X registered. A throwaway
+        // registry is enough: the check only reads it, and a real `AppState`
+        // would open the database.
         let export_registry = crate::authorization::PolicyRegistry::default();
         for register in policy_registrations {
             register(&export_registry);
@@ -8329,9 +7724,8 @@ impl AppBuilder {
         )
         .await;
 
-        // Fold in the synthesized durable-listener jobs exactly as the boot path
-        // does, so the manifest reflects the same effective drained-queue set the
-        // runtime drains (including the `default` queue those jobs land on).
+        // Includes the synthesized durable-listener jobs, as at boot, and the
+        // `default` queue they land on.
         let manifest =
             dump_jobs_manifest(&config.jobs.queues, jobs, listeners, &background.queues());
         print!("{manifest}");
@@ -8387,9 +7781,7 @@ impl AppBuilder {
             ..
         } = self;
 
-        // The telemetry guard is dropped at end of scope; a migrate-only run does
-        // not need tracing wired, but loading config the same way keeps env/profile
-        // resolution identical to a normal boot.
+        // Loaded as a normal boot loads it, so env/profile resolution is identical.
         let (config, _telemetry_guard) = load_config_and_telemetry(
             config_loader_factory,
             telemetry_provider,
@@ -8397,8 +7789,7 @@ impl AppBuilder {
         )
         .await;
 
-        // Fold in the framework migration sets a normal boot would apply, using the
-        // SAME helper as `setup_database`, so the applied set is identical.
+        // The same fold as `setup_database`, so the applied set matches a boot.
         let migrations = Arc::new(migrations_with_repository_framework_migrations(
             migrations,
             crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
@@ -8426,13 +7817,8 @@ impl AppBuilder {
             std::process::exit(0);
         }
 
-        // SQLite migrate-only guard (#1614, PR3). Sharding is Postgres-only, so a
-        // `sqlite:` control target with shards configured, or any `sqlite:` shard
-        // target, fails fast here with the actionable sharding error. It is the
-        // same `sqlite_sharding_unsupported_guard` normal boot applies, so the two
-        // paths cannot drift. A plain `sqlite:` control target with no shards is
-        // not gated: the SQLite apply path in the loop below handles its
-        // migrations. An all-Postgres or empty-shard configuration is never gated.
+        // Sharding is Postgres-only (#1614): a `sqlite:` control target with
+        // shards, or any `sqlite:` shard, fails here with the same guard boot uses.
         #[cfg(feature = "sqlite")]
         {
             let sqlite_guard_shard_urls: Vec<&str> =
@@ -8456,15 +7842,10 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
-        // Computed once, on the FINAL registered set (after the fold above),
-        // so a version collision resolves automatically instead of one
-        // migration silently never applying — see
-        // `compute_migration_disambiguation`. `migration_sets_for_disambiguation`
-        // folds in the two standalone shard control sets too, matching
-        // `run_startup_migrations`, so both paths reach the same decision
-        // regardless of which runs first.
-        // One map per side: a control-only set and a shard-only set never
-        // share a database, so they never rename each other's versions.
+        // Computed on the final set (after the fold), as `run_startup_migrations`
+        // does, so a version collision resolves the same way on both paths
+        // instead of one migration silently never applying. One map per side:
+        // control-only and shard-only sets never share a database.
         let only_database = control_is_only_database(&config);
         let disambiguation_sets = migration_sets_for_disambiguation(
             &migrations,
@@ -8486,11 +7867,8 @@ impl AppBuilder {
         let applied_total = crate::time::spawn_blocking(move || {
             let mut total = 0_usize;
             if let Some(url) = &control_url {
-                // SQLite single-writer control target (issue #1614, PR3): apply with
-                // NO advisory lock via the SQLite harness. Sharding is rejected above,
-                // so a SQLite control target here is always unsharded (shard_targets
-                // is empty). Every non-SQLite target keeps the byte-identical locked
-                // Postgres applier.
+                // SQLite is single-writer, so it applies with no advisory lock
+                // (#1614). Sharding was rejected above, so it is unsharded here.
                 #[cfg(feature = "sqlite")]
                 let is_sqlite_control = crate::config::DatabaseBackend::detect(url)
                     == Some(crate::config::DatabaseBackend::Sqlite);
@@ -8508,10 +7886,8 @@ impl AppBuilder {
                         );
                         std::process::exit(1);
                     }
-                    // A migration this database already ran under a version the
-                    // map now gives a substitute keeps its record, moved to that
-                    // substitute, rather than running twice (same as the CLI's
-                    // SQLite path).
+                    // A migration already applied under a version the map now
+                    // substitutes has its record moved, so it does not run twice.
                     #[cfg(feature = "sqlite")]
                     if let Err(error) = crate::migrate::adopt_sqlite_collision_history(
                         url,
@@ -8546,10 +7922,8 @@ impl AppBuilder {
                     }
                 }
             }
-            // Shards hold tenant data, not the control-plane schema; skip the
-            // control framework set for shard targets (mirrors `run_startup_migrations`).
-            // A `sqlite:` shard is rejected by the guard above, so every shard here
-            // is Postgres.
+            // Shards hold tenant data, not the control-plane schema, so they skip
+            // the control framework set. Every shard here is Postgres.
             for (label, url) in &shard_targets {
                 for (mig, schema) in shard_sets(&migrations) {
                     total += apply_pending_or_exit(
@@ -8619,13 +7993,8 @@ impl AppBuilder {
         } = self;
 
         let model_filter = retention_dry_run_model_filter_from_env();
-        // Resolve/validate the requested policy selection BEFORE connecting
-        // to the database (#1342 review round 9): an app with no
-        // retention(...) policies at all, or a --model that names nothing
-        // registered, can answer without ever opening a connection — every
-        // check here reads only the compile-time-registered descriptor set.
-        // A real database only gets touched once we know a policy actually
-        // needs to be counted.
+        // Resolved before connecting: the descriptor set is compile-time, so no
+        // policies, or a `--model` that names nothing, answers without a database.
         let descriptors =
             match crate::retention::resolve_retention_descriptors(model_filter.as_deref()) {
                 Ok(descriptors) => descriptors,
@@ -8635,19 +8004,10 @@ impl AppBuilder {
                 }
             };
 
-        // `resolve_retention_descriptors` validates collisions only among
-        // retention-generated task names. It cannot see hand-declared `tasks![...]`
-        // entries, which real boot merges in and validates through
-        // `validate_unique_scheduled_task_names`. Without this check a dry run could
-        // report success for a policy whose generated name collides with a
-        // hand-declared task, while real boot panics on that collision. `tasks` is
-        // carried into this mode, rather than discarded via `..`, so this check can
-        // run.
-        //
-        // Merged against every registered retention descriptor, not just the
-        // `descriptors` a `--model` filter narrowed to: real boot has no filter
-        // concept, so a hand-declared task colliding with an unselected policy's
-        // generated name would still panic real boot.
+        // Boot panics when a generated retention task name collides with a
+        // hand-declared `tasks![...]` entry, so the dry run must fail on it too.
+        // Checked against every descriptor, not just the `--model` selection:
+        // boot has no filter.
         if let Err(error) =
             merge_and_validate_task_names(&crate::retention::all_retention_descriptors(), tasks)
         {
@@ -8667,13 +8027,8 @@ impl AppBuilder {
         )
         .await;
 
-        // A `match`, not `.unwrap_or_else` (#1342 review round 15): a
-        // managed-Postgres provider may have already started its postmaster
-        // by the time `setup_database` fails (e.g. `pool_size = 0` failing
-        // the deadpool build in `create_pool`, after the postmaster is up).
-        // `emergency_stop_async()` is async, and `.unwrap_or_else`'s closure
-        // can't `.await` — matching the same restructuring every later exit
-        // in this function already uses (#1342 review round 6).
+        // A `match`, so the error arm can `.await` the managed-Postgres stop:
+        // the postmaster may already be up when `setup_database` fails.
         let database = match setup_database(
             &config,
             migrations,
@@ -8702,11 +8057,8 @@ impl AppBuilder {
             channels_backend,
         );
 
-        // `process::exit` below skips `on_shutdown` — including a managed-Postgres
-        // `stop()` — so every exit from this one-shot would otherwise leave the
-        // postmaster `setup_database` may have started running, with its data
-        // directory locked for later commands (#1342 review round 6). Stop it
-        // explicitly before every exit rather than relying on `on_shutdown`.
+        // `process::exit` skips `on_shutdown`, so stop a managed postmaster before
+        // every exit, or it keeps running with its data directory locked.
         match crate::retention::run_retention_dry_run(&state, model_filter.as_deref()).await {
             Ok(reports) => match serde_json::to_string(&reports) {
                 Ok(json) => {
@@ -8835,21 +8187,15 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
-        // `AppBuilder::with_audit_sink(...)` installs its logger here, not via
-        // a state initializer. Skipping it would leave an on-demand purge with
-        // no audit record at all, and would make
-        // `--dataset audit_archives` a silent no-op for exactly the apps that
-        // use the first-class builder.
+        // `with_audit_sink` installs its logger here, not via a state
+        // initializer. Without it a purge has no audit record and
+        // `--dataset audit_archives` is a silent no-op.
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
-        // Custom domains (#2652): the `custom_domains` retention dataset looks
-        // up the same pruner the server installs, but the TLS bind path that
-        // installs it never runs in a one-shot `run_framework_retention_mode`
-        // — without this the dataset always reported "custom domains are not
-        // enabled". The pruner carries no ACME issuer: pruning only touches
-        // the registry and the certificate store, so no order is placed and
-        // no CA is contacted.
+        // The `custom_domains` dataset needs the pruner the TLS bind path installs,
+        // which never runs here (#2652). It carries no ACME issuer: pruning touches
+        // only the registry and the certificate store, so no CA is contacted.
         #[cfg(feature = "acme")]
         install_custom_domain_retention_pruner(
             config.server.tls.as_ref().and_then(|tls| tls.acme.as_ref()),
@@ -8858,28 +8204,23 @@ impl AppBuilder {
             mode != FrameworkRetentionMode::Report,
         )
         .await;
-        // The app's own state initializers are what install the GDPR registry
-        // a legal hold lives in. Skipping them would make `autumn db
-        // retention` report a sweep the running app would actually refuse.
+        // The initializers install the GDPR registry legal holds live in; without
+        // them the report would show a sweep the running app refuses.
         run_state_initializers(state_initializers, &state);
 
         let options = crate::data_retention::RetentionRunOptions {
             dry_run: mode == FrameworkRetentionMode::Report,
             dataset: dataset_filter.as_deref(),
         };
-        // `process::exit` skips `on_shutdown`, so a managed-Postgres
-        // postmaster `setup_database` may have started must be stopped
-        // explicitly before every exit below.
+        // `process::exit` skips `on_shutdown`: stop a managed postmaster first.
         match crate::data_retention::run_retention(&state, &options).await {
             Ok(reports) => match serde_json::to_string(&reports) {
                 Ok(json) => {
                     println!("{FRAMEWORK_RETENTION_JSON_PREFIX}{json}");
                     #[cfg(feature = "managed-pg")]
                     crate::managed_pg::emergency_stop_async().await;
-                    // A dataset that failed is reported in its own row rather
-                    // than aborting the run, but the command as a whole must
-                    // still exit non-zero so a scripted purge doesn't look
-                    // successful.
+                    // A failed dataset is reported in its row; exit non-zero so a
+                    // scripted purge does not look successful.
                     let exit_code = i32::from(reports.iter().any(|r| r.error.is_some()));
                     std::process::exit(exit_code);
                 }
@@ -9159,10 +8500,9 @@ impl AppBuilder {
         )
         .await;
 
-        // Register the embedded `static/` tree (if any) before the router is
-        // built so `/static/*` serves from the binary and `asset_url()` resolves
-        // against the embedded manifest, then prefer embedded locales over disk
-        // auto-loading when no explicit bundle was provided.
+        // Before the router is built, so `/static/*` serves from the binary and
+        // `asset_url()` resolves against the embedded manifest. Embedded locales
+        // win over disk auto-loading when no explicit bundle was given.
         #[cfg(feature = "embed-assets")]
         register_embedded_static_dir(embedded_static);
 
@@ -9225,24 +8565,15 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
-        // Wire the live-subscriber reload handle into the loggers actuator so
-        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
-        // just an in-memory map (issue #1044).
+        // So `PUT /actuator/loggers/{name}` changes the running subscriber,
+        // not just an in-memory map (#1044).
         if let Some(handle) = telemetry_guard.filter_reload.clone() {
             state.log_levels().attach_reload_handle(handle);
         }
-        // Clone class: this interceptor-wiring block (mail/job/db/channels,
-        // including the channels -> presence -> collab backend swap, and
-        // http) is byte-for-byte identical in `run()`, `run_build_mode()`
-        // and `run_one_off_task_mode()`. It was born duplicated by #862,
-        // whose own follow-up commit ("fix: wire interceptors into
-        // one-off task mode") is a missed-fix this duplication already
-        // produced once: the one-off task path first shipped without this
-        // block, so its interceptors were silently inert. #1806 later had
-        // to hand-repeat the channels/presence/collab swap in all three
-        // copies again. Change one, change the other two --
-        // `optional_interceptor_wiring_matches_across_all_three_run_modes`
-        // below fails if they drift.
+        // This interceptor-wiring block is identical in `run()`, `run_build_mode()`
+        // and `run_one_off_task_mode()`. Change all three:
+        // `optional_interceptor_wiring_matches_across_all_three_run_modes` fails
+        // if they drift.
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -9346,8 +8677,8 @@ impl AppBuilder {
             crate::repository_commit_hooks::set_global_channels(state.channels().clone());
         }
 
-        // Postgres-only durable commit-hook worker; not spawned under sqlite
-        // (the runtime pool is a SQLite pool the Postgres worker cannot drive).
+        // Postgres-only durable commit-hook worker: under `sqlite` the runtime
+        // pool is a SQLite pool it cannot drive.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if let Some(pool) = state.pool().cloned() {
             #[cfg(feature = "ws")]
@@ -9383,8 +8714,7 @@ impl AppBuilder {
                 );
             }
         }
-        // SQLite durable commit-hook worker on the one-off task-runner path
-        // (#1996 item 5); see the server-path spawn above for the rationale.
+        // SQLite durable commit-hook worker (#1996).
         #[cfg(all(feature = "db", feature = "sqlite"))]
         if let Some(pool) = state.pool().cloned() {
             #[cfg(feature = "ws")]
@@ -9445,10 +8775,9 @@ impl AppBuilder {
             }
         }
         run_shutdown_hooks(&shutdown_hooks).await;
-        // If the generated `pg.stop()` hook errored/timed out it keeps the
-        // handle for a retry, but a one-off task then exits — so retry the stop
-        // here (idempotent; a no-op once the hook stopped it cleanly) to avoid
-        // orphaning the postmaster on the data dir/port.
+        // A `pg.stop()` hook that errored or timed out keeps the handle for a
+        // retry, but the process exits next, so retry here (a no-op once stopped)
+        // rather than orphan the postmaster.
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
 
@@ -9556,43 +8885,28 @@ impl AppBuilder {
             mut merge_router_groups,
             mut nest_routers,
             mut nest_router_groups,
-            // Bound rather than dropped with the rest: a nested router is
-            // opaque, so these declarations are the ONLY thing that lets the
-            // collision preflight see inside a sandboxed plugin's mount.
-            // Replaying with the nests but without them would skip the checks
-            // and reach the axum mount panic the preflight exists to replace
-            // with a refusal.
+            // A nested router is opaque, so these declarations are the only way
+            // the collision preflight sees inside a plugin's mount. Without them
+            // replay reaches the axum mount panic instead of a refusal.
             mut declared_routes,
             custom_layers,
             state_initializers,
             config_loader_factory,
             telemetry_provider,
-            // Kept (rather than dropped with the rest of the runtime) so a
-            // *job-entry* capsule can dispatch the recorded job's handler
-            // (#1634). No job runtime, scheduler or backend is started: the
-            // handler is called directly, exactly once, with the recorded
-            // payload — through the application's `JobInterceptor` when it
-            // registered one, since that is part of how the recorded run
-            // executed and dropping it would replay a different path.
+            // A job capsule calls the recorded job's handler directly, once, with
+            // no job runtime (#1634). The `JobInterceptor` is part of how the
+            // recorded run executed, so it is kept too.
             jobs,
             job_interceptor,
-            // F15: deliberately *not* destructured. A store installed with
-            // `with_session_store(...)` outranks `config.session.backend` in
-            // `apply_session_layer`, so forwarding it would let a replay dial —
-            // and mutate — the application's live Redis or database session
-            // backend, or fail 503 when that backend is unreachable. Replay
-            // builds its router with no custom store, so the memory backend
-            // `force_offline_replay_config` sets is what actually applies.
+            // Dropped: a custom store outranks `config.session.backend`, so
+            // forwarding it would let a replay reach the live session backend.
+            // With none, the memory backend `force_offline_replay_config` sets applies.
             session_store: _replay_ignores_custom_session_store,
             policy_registrations,
             #[cfg(feature = "db")]
             db_interceptor,
-            // F15, same reasoning as the session store: a backend installed
-            // with `with_channels_backend(...)` outranks `config.channels`, so
-            // forwarding it would let a replay publish into — and subscribe to
-            // — the application's live Redis fan-out. Replay builds its state
-            // with no custom backend, so the in-process backend
-            // `force_offline_replay_config` selects is what actually applies.
+            // Dropped for the same reason: a custom backend outranks
+            // `config.channels` and would reach the live Redis fan-out.
             #[cfg(feature = "ws")]
                 channels_backend: _replay_ignores_custom_channels_backend,
             #[cfg(feature = "i18n")]
@@ -9619,9 +8933,8 @@ impl AppBuilder {
         #[cfg(feature = "mail")]
         let builder_mail_queue = mail_delivery_queue_factory.is_some();
 
-        // Nothing outside the capsule may be reached from here on: the router
-        // this rebuilds is the real one, with the application's real outbound
-        // HTTP client in its state (AC4).
+        // Nothing outside the capsule may be reached from here on: the rebuilt
+        // router carries the app's real outbound HTTP client.
         #[cfg(feature = "http-client")]
         crate::http_client::block_outbound_for_replay();
         // Egress outside the HTTP client (`capsule::guard_egress`), in every
@@ -9642,20 +8955,12 @@ impl AppBuilder {
             std::process::exit(crate::capsule::print_refusal(&reason, &path));
         }
 
-        // F15: the configured telemetry provider — the default OTLP batch
-        // exporter, or a custom Datadog/Sentry initializer — is replaced with
-        // a logging-only one. An offline replay must not flush spans to a live
-        // collector, and must not abort before its verdict because that
-        // collector is unreachable from the machine doing the replaying.
+        // The telemetry provider is replaced with a logging-only one: a replay
+        // must not flush spans to a live collector or abort when it is unreachable.
         let _replay_ignores_custom_telemetry_provider = telemetry_provider;
-        // A custom config loader is a live service call — the documented
-        // implementations reach AWS Secrets Manager, Vault, Consul, or an HTTP
-        // endpoint — and an offline replay must neither contact production
-        // infrastructure nor abort because it is unreachable. Configuration comes
-        // from the local files and environment instead. The values replay consumes
-        // — routes, middleware, the filter list, the profile — live there, and the
-        // secrets a loader fetches feed subsystems replay forces off or serves from
-        // the capsule.
+        // A custom config loader calls live services (Secrets Manager, Vault,
+        // Consul, HTTP), so config comes from local files and the environment.
+        // What replay reads (routes, middleware, profile) lives there anyway.
         let _replay_ignores_custom_config_loader = config_loader_factory;
         let (mut config, telemetry_guard) = load_config_and_telemetry(
             None,
@@ -9665,11 +8970,8 @@ impl AppBuilder {
         .await;
         force_offline_replay_config(&mut config);
 
-        // A capsule from a *different application* can replay "successfully"
-        // against this one when both expose the same route shape — a verdict
-        // that looks authoritative and is meaningless. Same-name is not
-        // provable (service names drift), so this warns loudly instead of
-        // refusing; the human summary makes the mismatch impossible to miss.
+        // A capsule from another app with the same route shape can "pass" here
+        // meaninglessly. Service names drift, so this warns instead of refusing.
         if let Some(recorded_app) = capsule.app.name.as_deref() {
             let this_app = config.telemetry.service_name.as_str();
             if recorded_app != this_app {
@@ -9711,9 +9013,8 @@ impl AppBuilder {
             None,
         );
 
-        // Time, randomness and the effect seams are all inputs like any other:
-        // serve what the capture took, in order (#1598 for the clock, #1634
-        // for entropy and the effect tape).
+        // Clock, entropy and effects are inputs too: serve what the capture
+        // recorded, in order (#1598, #1634).
         let fixtures = crate::capsule::ReplayFixtures::from_capsule(&capsule);
         state = state.with_clock(fixtures.clock());
         state = state.with_entropy(fixtures.entropy());
@@ -9733,8 +9034,8 @@ impl AppBuilder {
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
-        // In place of the builder's backend, which replay does not build: in
-        // the global cache and the state, as `with_cache_backend` does.
+        // Stands in for the builder's backend, which replay does not build, in
+        // both the global cache and the state, as `with_cache_backend` does.
         state.fields_mut().shared_cache =
             crate::cache::install_replay_cache(cache_backend.is_some());
 
@@ -9758,13 +9059,13 @@ impl AppBuilder {
         #[cfg(feature = "mail")]
         crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
         run_state_initializers(state_initializers, &state);
-        // Again after the initializers, so it replaces a live `Mailer` one of
-        // them installed; before the router state is cloned, so a job replay
-        // gets it too (#2351 item 7).
+        // Again after the initializers, to replace a live `Mailer` one of them
+        // installed, and before the router state is cloned, so a job replay
+        // gets it too (#2351).
         #[cfg(feature = "mail")]
         crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
-        // After the initializers: a cache that only a startup hook installed,
-        // which replay does not run. Production's initializers did not see it.
+        // After the initializers: stands in for a cache only a startup hook
+        // installed, which replay does not run.
         crate::cache::install_late_replay_cache(&state, &capsule.effects);
         crate::cost::install(&state, &config);
         // Durable listeners need the job runtime this path never starts, so —
@@ -9775,13 +9076,12 @@ impl AppBuilder {
             .filter(|listener| listener.mode == crate::events::DispatchMode::Sync)
             .collect();
         finalize_event_bus(sync_listeners, &mut Vec::new(), &state);
-        // Refresh the AppState-stored config snapshot — see the matching
-        // comment in `run()`.
+        // Refresh the config snapshot `build_state` took, as `run()` does.
         state.insert_extension(config.clone());
 
-        // Rebuild the router of the recorded role: only the route groups it
-        // mounts (#3544), as `run()` does. Two groups can own one path, so the
-        // unfiltered lists can fail the duplicate-route check.
+        // Only the route groups the recorded role mounts (#3544), as `run()`
+        // does. Two groups can own one path, so unfiltered lists can fail the
+        // duplicate-route check.
         if let Ok(role) = config.resolve_role() {
             let retained = crate::route_group::MountTargets {
                 routes: &mut routes,
@@ -10102,13 +9402,9 @@ fn graph_mounted_routes(
     config: &crate::config::AutumnConfig,
     #[cfg(feature = "openapi")] openapi: Option<&crate::openapi::OpenApiConfig>,
 ) -> Vec<crate::graph::MountedRoute> {
-    // The framework's own mounts — probes, the actuator, htmx assets, the docs
-    // UI — are served by `router.rs` and belong in the census: the manifest and
-    // the guide both promise a framework endpoint is *named* in
-    // `unmodelled_mounted_routes`, and without them the completeness report
-    // systematically understated the served surface (Codex round 5). Built with
-    // the same helper `autumn routes` uses, so the two cannot disagree about
-    // what the framework mounts.
+    // The framework's own mounts (probes, actuator, htmx assets, docs UI) are
+    // served too and must be named in `unmodelled_mounted_routes`. Built with
+    // the helper `autumn routes` uses, so the two agree.
     let mut framework: Vec<crate::route_listing::RouteInfo> = Vec::new();
     crate::route_listing::append_framework_routes(&mut framework, config);
     // The router merges the `OpenAPI` routes only when the runtime gate is open.
@@ -10184,11 +9480,8 @@ fn graph_declared_route_summary(
             roles,
             scopes,
             policy: route.policy,
-            // A `RouteInfo`'s `classification` already comes from
-            // `route_listing::classify`, which folds a repository's own policy
-            // and scope guard into `Gated` — so unlike the `Route` path above
-            // there is nothing further to recover here, and no separate
-            // repository scope to name.
+            // `classification` already folds a repository's policy and scope
+            // guard into `Gated`, so there is no separate repository scope here.
             repository_scope: false,
             public: route.classification == crate::route_listing::RouteClassification::Public,
         },
@@ -10244,14 +9537,10 @@ fn graph_route_summary(route: &Route, scope_prefix: Option<&str>) -> crate::grap
         ),
         handler: route.name.to_owned(),
         module_path: route.api_doc.module_path.to_owned(),
-        // A repository auto-API route registers its guard on the *repository*,
-        // not on the generated handler, so `ApiDoc` alone reports it as
-        // unauthenticated. `route_listing::classify` — the derivation `autumn
-        // routes audit` proves the posture with — ORs in the repository's own
-        // `has_policy` and treats a registered `scope_check` as gated. The graph
-        // claims to state that same posture, so it has to read the same two
-        // sources; reading `ApiDoc` alone made a `#[repository(api = "...",
-        // policy = ...)]` endpoint serialize as `auth: none`.
+        // A repository auto-API route registers its guard on the repository, not
+        // the generated handler, so `ApiDoc` alone reports it unauthenticated.
+        // Read the repository's policy and `scope_check` too, as
+        // `route_listing::classify` does for `autumn routes audit`.
         auth: crate::graph::RouteAuth {
             secured: route.api_doc.secured,
             roles,
@@ -10308,12 +9597,8 @@ fn agent_authority_route_summary(
     scope_prefix: Option<&str>,
     exposure: AgentExposure,
 ) -> crate::agent_authority::manifest::RouteSummary {
-    // One string, used both for the row and for the predicate, so the two can
-    // never disagree about a route's verb.
     let method = route.method.to_string();
-    // The path an agent actually calls. `join_nested_path` is the same helper
-    // the OpenAPI collector uses for scoped groups, so the manifest and the
-    // spec cannot disagree about where a route lives.
+    // The path an agent calls, joined as the OpenAPI collector joins it.
     let path = scope_prefix.map_or_else(
         || route.path.to_string(),
         |prefix| crate::router::join_nested_path(prefix, route.path),
@@ -10381,12 +9666,9 @@ pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMo
         "report" => Some(FrameworkRetentionMode::Report),
         "purge" => Some(FrameworkRetentionMode::Purge),
         other => {
-            // Warn and fall through to a normal boot rather than exiting.
-            // This var is read on *every* start, so exiting here would let a
-            // stray value in a wrapping script or a shared environment take a
-            // production app down at boot. `AUTUMN_ROLE` is different: an
-            // unknown role stops the boot (#3541), because a wrong role runs
-            // the wrong work.
+            // Warn and boot normally: this var is read on every start, so a
+            // stray value must not take a production app down. (An unknown
+            // `AUTUMN_ROLE` does stop the boot (#3541): it would run the wrong work.)
             eprintln!(
                 "Warning: {FRAMEWORK_RETENTION_ENV}={other:?} is not valid (expected \"report\" \
                  or \"purge\"), ignoring"
@@ -10782,17 +10064,13 @@ fn force_offline_replay_config(config: &mut AutumnConfig) {
     // memory-in-production warning is noise for a one-shot replay.
     config.session.backend = crate::session::SessionBackend::Memory;
     config.session.allow_memory_in_production = true;
-    // Channels in process memory for the same reason: the Redis backend spawns
-    // a publisher and a listener task against the application's live fan-out
-    // the moment the state is built.
+    // The Redis channels backend connects to the live fan-out as soon as the
+    // state is built.
     config.channels.backend = crate::config::ChannelBackend::InProcess;
-    // Every other config-driven store the request path can reach. A replay does
-    // not merely dial these, it writes to them: a rate-limit bucket is
-    // decremented, an idempotency key and its lock are taken, a submit token is
-    // consumed, a webhook replay key is inserted and deleted. Against the recording
-    // deployment's Redis, diagnosing a failure would change production state, and
-    // an unreachable backend would manufacture a 429 or 503 the recorded run never
-    // produced. A replay is a read of the past; it writes nothing anywhere.
+    // The request path writes to these stores (rate-limit buckets, idempotency
+    // keys, submit tokens, webhook replay keys). Against the live Redis a replay
+    // would change production state, and an unreachable one would produce a 429
+    // or 503 the recorded run never saw.
     config.security.rate_limit.backend = crate::security::config::RateLimitBackend::Memory;
     config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
     config.idempotency.allow_memory_in_production = true;
@@ -10804,18 +10082,12 @@ fn force_offline_replay_config(config: &mut AutumnConfig) {
     // A `#[cached]` handler would otherwise read — and populate — the
     // application's shared cache.
     config.cache.backend = crate::config::CacheBackend::Memory;
-    // A handler that enqueues a job would otherwise put it on the real queue,
-    // where a live worker would run it. The replay never starts a job runtime,
-    // so the enqueue lands in a process-local queue nothing drains.
+    // An enqueued job would otherwise land on the real queue for a live worker.
+    // Replay starts no job runtime, so this local queue is never drained.
     "local".clone_into(&mut config.jobs.backend);
-    // No wall-clock deadline. Everything a replay consumes comes from the capsule,
-    // including the clock the handler reads, but the request-timeout layer runs on
-    // real tokio timers — so how long the replay takes is the one thing still
-    // measured in real seconds. That matters as soon as someone attaches a
-    // debugger: a breakpoint held longer than the app's `request_timeout_ms`
-    // cancels the handler mid-replay and prints a mismatch that is an artefact of
-    // the debugging session. A per-route `#[timeout(...)]` override still applies —
-    // it is part of the route table, not the configuration.
+    // The timeout layer runs on real timers, so a debugger breakpoint would cancel
+    // the handler and report a false mismatch. A per-route `#[timeout(...)]` is in
+    // the route table and still applies.
     config.server.timeouts.request_timeout_ms = None;
     // A shadow mirror has its own client and is not a handler effect.
     config.shadow.enabled = false;
@@ -10830,13 +10102,9 @@ fn replay_database_topology(
     divergences: &std::sync::Arc<crate::capsule::DivergenceLog>,
     capsule_path: &std::path::Path,
 ) -> Option<crate::db::DatabaseTopology> {
-    // "This request issued no queries" and "this application has no database" are
-    // different facts, and only the capsule tells them apart. A handler or state
-    // initializer that checks `state.pool()`, or replica availability, before
-    // querying would otherwise meet `None` while replaying an application that had
-    // a pool in production, take a branch it never took, and report a mismatch no
-    // code caused. A capsule recorded before `db_roles` existed carries none and
-    // falls back to the old tape-only behaviour.
+    // "No queries" is not "no database": code that checks `state.pool()` or
+    // replica availability must see the pool the recorded app had, or it takes a
+    // branch it never took. A capsule without `db_roles` falls back to the tape alone.
     if capsule.db.is_none() && capsule.db_roles.is_empty() {
         return None;
     }
@@ -10847,10 +10115,8 @@ fn replay_database_topology(
                 capsule_path,
             ))
         });
-    // Rebuild the topology with the shape the recording had: replica-recorded
-    // tapes get their own stub pool, so a write-then-read request claims each
-    // tape from the role it was recorded on instead of funnelling reads into
-    // the primary stub and diverging on both sides.
+    // Replica-recorded tapes get their own stub pool, so a write-then-read
+    // request claims each tape from the role it was recorded on.
     let replica =
         crate::capsule::replica_pool_from_capsule(capsule, std::sync::Arc::clone(divergences))
             .unwrap_or_else(|error| {
@@ -11105,9 +10371,6 @@ fn send_ws_sys_task_msg(
 ) {
     #[cfg(feature = "ws")]
     {
-        // ⚡ Bolt Optimization:
-        // Use serde_json::json! to avoid multiple String allocations (`.to_string()`)
-        // and repetitive `Map::insert` calls for `sys:tasks` websocket messages.
         let mut msg = serde_json::json!({
             "event": event,
             "task": name,
@@ -11141,9 +10404,8 @@ async fn execute_task_result(
 ) -> Result<u64, (u64, String)> {
     // A tick is work a sim drain must see (issue #2967).
     crate::sim::note_drain_progress();
-    // A fresh span per run so OTLP-enabled deployments see each invocation
-    // as its own trace rather than inheriting whatever was current on the
-    // scheduler thread.
+    // A root span per run, so each invocation is its own trace rather than
+    // inheriting whatever was current on the scheduler thread.
     let task_span = tracing::info_span!(
         parent: None,
         "scheduled_task",
@@ -11698,10 +10960,9 @@ async fn run_cron_task_loop(
                     cursor = scheduled_at;
                     continue;
                 }
-                // Reserve the tick before the lease attempt, whatever the signal
-                // is now: a slow lease must not let the next ticks spawn and
-                // pile up behind a signal that rises meanwhile. The tick clears
-                // the mark when it stops to wait or to take its lease.
+                // Reserve before the lease attempt, whatever the signal is now, so
+                // a slow lease cannot let later ticks pile up behind a signal that
+                // rises meanwhile. The tick clears the mark once it waits or leases.
                 if crate::cost::is_deferrable(crate::cost::WorkKind::Task, &name) {
                     deferring.store(true, std::sync::atomic::Ordering::Release);
                 }
@@ -11875,13 +11136,11 @@ fn install_live_state<T>(
         }
     };
 
-    // A successor installs its state **frozen**. It starts accepting the moment
-    // it adopts the socket — before its startup hooks have run — and until it
-    // signals readiness the upgrade can still be abandoned, at which point the
-    // predecessor resumes from the snapshot it took. A write acknowledged in
-    // that window would die with this process: refuse it instead, so the
-    // client's retry lands on whichever process is actually keeping state.
-    // `unfreeze_adopted_live_state` lifts it at the readiness point.
+    // A successor installs its state frozen. It accepts as soon as it adopts the
+    // socket, but until readiness the upgrade can be abandoned and the
+    // predecessor resumes from its snapshot: a write acknowledged here would be
+    // lost, so it is refused and retried. `unfreeze_adopted_live_state` lifts it
+    // at readiness.
     let handle = if crate::upgrade::handoff_requested() {
         crate::upgrade::LiveStateHandle::new_frozen(value)
     } else {
@@ -12031,9 +11290,7 @@ async fn bind_or_adopt_tcp_listener(addr: &str) -> tokio::net::TcpListener {
             match tokio::net::TcpListener::from_std(inherited) {
                 Ok(listener) => {
                     // The socket is the predecessor's, so a `server.host` /
-                    // `server.port` change in the new build does NOT take
-                    // effect: say so rather than let an operator believe a
-                    // narrowed bind address is live.
+                    // `server.port` change in this build does not take effect.
                     if let Ok(bound) = listener.local_addr()
                         && bound.to_string() != addr
                     {
@@ -12055,11 +11312,10 @@ async fn bind_or_adopt_tcp_listener(addr: &str) -> tokio::net::TcpListener {
                 }
             }
         }
-        // A predecessor handed us a socket and we could not take it: binding
-        // instead would either collide with the process still serving that
-        // address, or — worse, with an ephemeral port — succeed somewhere else
-        // entirely and release the predecessor to drain away from the address
-        // clients are using.
+        // Handed a socket we could not adopt: binding instead would collide with
+        // the predecessor still serving the address, or, with an ephemeral port,
+        // succeed elsewhere and release the predecessor away from the address
+        // clients use.
         if crate::upgrade::handoff_requested() {
             tracing::error!(
                 "refusing to start: this build was handed the previous build's listening \
@@ -12075,8 +11331,7 @@ async fn bind_or_adopt_tcp_listener(addr: &str) -> tokio::net::TcpListener {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!(addr = %addr, "Failed to bind: {e}");
-            // Stop the managed Postgres child started by `setup_database`
-            // before bailing; `process::exit` skips `on_shutdown`.
+            // `process::exit` skips `on_shutdown`: stop a managed postmaster first.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
@@ -12117,9 +11372,8 @@ fn build_tls_listener(
     crate::tls::TlsError,
 > {
     let provider = crate::tls::crypto_provider();
-    // The pre-bind `TlsConfig::validate()` guarantees both paths are set in
-    // static-cert mode (the only mode that reaches this function; ACME mode is
-    // handled separately), so unwrapping here is validated, not hopeful.
+    // Only static-cert mode reaches here, and the pre-bind
+    // `TlsConfig::validate()` guarantees it sets both paths.
     let cert_path = cfg
         .cert_path
         .as_deref()
@@ -12146,8 +11400,7 @@ fn build_tls_listener(
         std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
         client_verifier,
     )?;
-    // A zero handshake timeout would drop every connection instantly; clamp to
-    // at least one second, mirroring the reload-interval clamp above.
+    // A zero handshake timeout would drop every connection; clamp to one second.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
     Ok((listener, reload, client_reload))
@@ -12302,11 +11555,9 @@ async fn build_acme_tls_listener(
 
     let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(initial));
 
-    // Tenant custom domains (#1635): the registry is hydrated from disk before
-    // the listener binds, so a restart routes and serves every connected domain
-    // on the first request rather than after the first orchestrator tick. The
-    // SNI resolver wraps — rather than replaces — the operator's own resolver,
-    // so the deployment's certificate keeps serving its own names unchanged.
+    // Tenant custom domains (#1635): the registry loads from disk before the
+    // listener binds, so a restart serves every connected domain from the first
+    // request. The SNI resolver wraps the deployment's own resolver.
     let custom_domains = match acme_cfg.custom_domains.as_ref() {
         Some(cd_cfg) if cd_cfg.enabled => {
             let reserved = custom_domain_reserved_names(acme_cfg, tenancy_base_domain);
@@ -12323,12 +11574,9 @@ async fn build_acme_tls_listener(
                 // The store logs each record it skipped. `register` then
                 // refuses new domains until the files are fixed (#2654).
                 Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
-                // A registry that cannot be read is not fatal to the
-                // deployment: its own certificate still serves. It IS fatal to
-                // custom domains, though — an index that hydrated nothing
-                // cannot tell whether a hostname is already owned, so
-                // `register` refuses until a load succeeds rather than
-                // overwriting the durable record of whoever holds it.
+                // Not fatal to the deployment, whose own certificate still
+                // serves. An empty index cannot tell whether a hostname is owned,
+                // so `register` refuses until a load succeeds.
                 Err(e) => tracing::error!(
                     "failed to load the tenant custom-domain registry: {e}; connected domains will \
                      not route and no new domain can be connected until this is fixed and the \
@@ -12366,10 +11614,7 @@ async fn build_acme_tls_listener(
                         std::sync::Arc::clone(&cd.registry),
                         std::sync::Arc::clone(&cd.cache),
                     )
-                    // A domain evicted from the bounded cache (or never warmed,
-                    // in a deployment with more domains than the cache holds)
-                    // loads its certificate here rather than stopping being
-                    // served.
+                    // A domain not in the bounded cache loads its certificate here.
                     .with_source(std::sync::Arc::new(
                         crate::acme::tenant_domains::FsSniCertSource::new(
                             std::sync::Arc::clone(&cd.store),
@@ -12379,11 +11624,9 @@ async fn build_acme_tls_listener(
                 )
             },
         );
-    // Client auth is orthogonal to how the SERVER's certificate is provisioned
-    // (#1640), so the ACME arm wires the same verifier the static-cert arm does.
-    // Without this a `[server.tls.client_auth] mode = "required"` deployment on
-    // ACME would boot, report healthy, and never request a certificate — the
-    // one misconfiguration that fails OPEN.
+    // Client auth applies however the server certificate is provisioned
+    // (#1640). Without it, `client_auth mode = "required"` on ACME would never
+    // request a client certificate: it would fail open.
     let (client_verifier, client_reload) =
         build_client_auth(tls_cfg, &provider).map_err(|e| e.to_string())?;
     let server_config = crate::tls::build_server_config_with_client_auth(
@@ -12396,10 +11639,9 @@ async fn build_acme_tls_listener(
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
 
     let tokens = crate::acme::challenge::Http01Tokens::new();
-    // `[server.tls.acme.dns]` selects DNS-01, the only challenge a CA will
-    // validate for a wildcard identifier (#1620). Built here, at bind time, so a
-    // missing or malformed provider credential fails startup with an actionable
-    // message instead of surfacing as a failed order 30 days later.
+    // `[server.tls.acme.dns]` selects DNS-01, the only challenge a CA validates
+    // for a wildcard (#1620). Built at bind time so a bad provider credential
+    // fails startup, not an order 30 days later.
     let dns = build_dns_challenge(acme_cfg, credentials)?;
     let renewal_task = crate::acme::renewal::AcmeRenewalTask {
         resolver,
@@ -12515,9 +11757,8 @@ fn build_dns_challenge(
     };
     let resolvers = dns_cfg.resolver_addrs()?;
     let credential = dns::DnsCredential::resolve(dns_cfg, credentials, &dns::process_env);
-    // One bounded HTTP timeout for the provider API and one for each DNS probe,
-    // so neither can park the renewal loop: the whole propagation wait is
-    // already bounded, and a black-holed provider API must not outlive it.
+    // Bound the provider API and each DNS probe so a black-holed endpoint cannot park the renewal
+    // loop past the already-bounded propagation wait.
     let transport: std::sync::Arc<dyn dns::http::HttpTransport> = std::sync::Arc::new(
         dns::http::ReqwestTransport::new(std::time::Duration::from_secs(30))?,
     );
@@ -12613,21 +11854,12 @@ fn custom_domain_reserved_names(
     acme_cfg: &crate::config::AcmeConfig,
     tenancy_base_domain: Option<&str>,
 ) -> Vec<String> {
-    // Reserve everything this deployment already serves. Without it a
-    // tenant registers another tenant's subdomain — which the
-    // operator's own wildcard already points here, so it verifies and
-    // issues — and every request for that host then resolves to
-    // whoever registered it.
+    // Reserve everything this deployment already serves. The operator's wildcard already points
+    // those hosts here, so a tenant registering one would verify, issue, and capture its traffic.
     let mut reserved = acme_cfg.domains.clone();
     reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
-    // The ingress hostname is the sharpest of the three. It ALREADY
-    // resolves to the ingress addresses, so a tenant who registers it
-    // needs no DNS change at all: verification passes on the first
-    // tick, HTTP-01 validates, and from then on every request to the
-    // deployment's own infrastructure hostname routes to that tenant.
-    // It is not necessarily covered by `domains` — an operator may run
-    // ingress under a separate infrastructure zone — so it is reserved
-    // explicitly rather than by assuming overlap.
+    // The ingress hostname already resolves here, so registering it needs no DNS change at all. It
+    // may live in a separate zone not covered by `domains`, so reserve it explicitly.
     if let Some(cd_cfg) = acme_cfg.custom_domains.as_ref() {
         reserved.extend(cd_cfg.ingress_hostname.clone());
     }
@@ -12679,11 +11911,8 @@ async fn install_custom_domain_retention_pruner(
     };
     match loaded {
         Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
-        // A registry that cannot be read is not fatal to the deployment: its
-        // own certificate still serves. It IS fatal to pruning, though — an
-        // index that hydrated nothing cannot tell whether a hostname is
-        // already owned, so `prune` refuses rather than deleting every stored
-        // key.
+        // Not fatal to the deployment, whose own certificate still serves. `prune` refuses on an
+        // empty index, since it cannot tell which hostnames are owned.
         Err(e) => tracing::error!(
             "failed to load the tenant custom-domain registry: {e}; the custom_domains \
              retention dataset will refuse to prune until this is fixed"
@@ -12795,8 +12024,7 @@ fn spawn_custom_domain_task(
         limiter,
         ingress: config.ingress(),
         renew_before_days: acme.renew_before_days,
-        // A per-domain failure is a framework-scheduled operation failing, so
-        // it raises #1610's alert naming the domain and its tenant.
+        // A per-domain failure raises the scheduled-task alert (#1610) naming the domain and tenant.
         reporter: make_custom_domain_reporter(state),
         recovery: Some(make_custom_domain_recovery(state)),
         coordinator,
@@ -12813,8 +12041,7 @@ fn spawn_custom_domain_task(
         .collect(),
     });
 
-    // The pruner is the retention half of the task, not the task itself: the
-    // same small type the one-shot `autumn db retention` path installs (#2652).
+    // Install only the retention half, the same type `autumn db retention` installs (#2652).
     state.insert_extension(std::sync::Arc::new(task.pruner())
         as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
 
@@ -13060,10 +12287,8 @@ fn signal_serve_ready(drain_budget_secs: u64, bound_endpoint: &str) {
         return;
     }
     let path = std::path::PathBuf::from(path);
-    // Write to a temp sibling and rename into place so the supervisor — which
-    // polls for the file's existence and then reads the budget from it — never
-    // observes a half-written file: it appears atomically with its full
-    // contents. A plain `write` would make the path exist before the bytes land.
+    // Write a temp sibling and rename it into place: the supervisor polls for the path and then
+    // reads it, so the file must appear with its full contents.
     let mut tmp = path.clone();
     tmp.as_mut_os_string().push(".tmp");
     if let Err(e) = std::fs::write(&tmp, serve_ready_payload(drain_budget_secs, bound_endpoint))
@@ -13159,7 +12384,6 @@ fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
             match std::os::unix::net::UnixStream::connect(path) {
-                // A successful connect means another process is listening here.
                 Ok(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
                     format!(
@@ -13168,8 +12392,7 @@ fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
                         path.display()
                     ),
                 )),
-                // `ECONNREFUSED` (no listener) — or the path vanishing — means the
-                // socket is stale; reclaim it.
+                // No listener (`ECONNREFUSED`) or the path vanished: the socket is stale.
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -13178,10 +12401,8 @@ fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
                 {
                     std::fs::remove_file(path)
                 }
-                // `EACCES`/`EPERM` (or any other error): the socket may be a live,
-                // operator-managed listener whose mode/ACL denies us. Connecting
-                // failed, but liveness is unproven — refuse rather than clobber a
-                // possibly-live service.
+                // `EACCES`/`EPERM` or anything else: the socket may be a live listener whose
+                // permissions deny us, so refuse rather than clobber it.
                 Err(e) => Err(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
                     format!(
@@ -13266,8 +12487,7 @@ async fn run_shutdown_hooks_with_timeout(
             break;
         }
         let timeout = remaining.min(per_hook_budget);
-        // Hook overruns are intentionally non-fatal (exit 0 per ADR addendum).
-        // Only drain deadline exhaustion (phase 6) triggers exit(1).
+        // An overrun is non-fatal; only exhausting the drain deadline exits with status 1.
         if tokio::time::timeout(timeout, hook()).await.is_err() {
             tracing::warn!(
                 per_hook_budget_ms = timeout.as_millis(),
@@ -13507,11 +12727,7 @@ fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
         .storage
         .backend_plan(config.profile.as_deref())
         .unwrap_or_else(|error| {
-            // Cover the cases `backend_plan` rejects up front:
-            // `LocalInProduction` (prod + local without ack),
-            // `MissingS3Bucket`/`MissingS3Region`/`S3FeatureDisabled`.
-            // Each is a configuration mistake — fail the boot loudly
-            // rather than running migrations and then dying.
+            // A configuration mistake: fail the boot before migrations run.
             tracing::error!(%error, "invalid storage backend config; aborting startup");
             std::process::exit(1);
         });
@@ -13533,10 +12749,7 @@ fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
             warn_in_production,
         )),
         StorageBackendPlan::S3 { .. } => {
-            // `storage.backend = "s3"` requires the `autumn-storage-s3` plugin.
-            // Construct an `S3BlobStore` and register it with `.with_blob_store()`
-            // before calling `.run()` — when you do, the custom store bypasses
-            // this path entirely and `preflight_storage` is never called.
+            // A store registered with `.with_blob_store()` never reaches this function.
             tracing::error!(
                 "storage.backend=s3 requires the `autumn-storage-s3` plugin. \
                  Add it to your Cargo.toml, build an S3BlobStore from your config, \
@@ -13623,10 +12836,7 @@ fn bootstrap_local_storage(
     ) {
         Ok(store) => store,
         Err(err) => {
-            // The operator explicitly chose `storage.backend = "local"`
-            // — a non-writable root means uploads can't possibly
-            // work, so abort the boot rather than letting upload
-            // handlers serve 500s after deploy.
+            // A non-writable root means uploads cannot work: abort rather than serve 500s.
             tracing::error!(
                 error = %err,
                 root = %root.display(),
@@ -13658,8 +12868,6 @@ async fn load_config_and_telemetry(
 ) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
     let config = load_config_only(config_loader, plugin_config_roots).await;
 
-    // 2. Initialize logging/telemetry via the installed provider, falling
-    //    back to the default `tracing-subscriber + OTLP` initializer.
     let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
         .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
     let telemetry_guard = provider
@@ -13701,15 +12909,8 @@ async fn try_load_config(
     config_loader: Option<ConfigLoaderFactory>,
     plugin_config_roots: BTreeSet<String>,
 ) -> Result<AutumnConfig, crate::config::ConfigError> {
-    // 1. Load configuration via the installed loader, falling back to the
-    //    five-layer TOML + env default.
-    //
-    // A custom `config_loader` factory owns its whole load and strict-config
-    // handling, bypassing the default TOML path, so it does not receive the
-    // declared plugin config roots; it accepts its own plugin-owned sections. The
-    // default `TomlEnvConfigLoader` does get the roots, so `server.strict_config`
-    // treats a plugin-declared `[root]` such as `[media]` as known-and-opaque
-    // rather than an unknown-key hard error.
+    // A custom loader owns its strict-config handling, so only the default loader gets the plugin
+    // config roots: `server.strict_config` then treats a plugin `[root]` such as `[media]` as known.
     let mut config = match config_loader {
         Some(factory) => factory().await,
         None => {
@@ -13720,45 +12921,27 @@ async fn try_load_config(
         }
     }?;
 
-    // A build without the `jwt` feature cannot verify a tenant token. This
-    // runs for every loader, and only on the app's own boot path: a tool built
-    // with other features (the CLI) loads the same config without it.
+    // A build without `jwt` cannot verify a tenant token. Checked on the app's boot path, for every
+    // loader, not in config loading: the CLI loads the same config without `jwt`.
     config.validate_tenancy_source()?;
 
-    // `autumn serve --daemon` binds the app on a private Unix socket and then
-    // discovers/health-probes it by path. A custom `with_config_loader` can
-    // construct its `ServerConfig` from scratch and silently drop the
-    // `AUTUMN_SERVER__UNIX_SOCKET` env override, leaving the daemon on TCP where
-    // the supervisor can't reach it. The CLI therefore also passes the socket
-    // out-of-band via `AUTUMN_SERVE_FORCE_UNIX_SOCKET`, applied here *after* the
-    // loader runs so no loader can drop it.
+    // `autumn serve --daemon` probes the app by socket path. A custom loader can drop the
+    // `AUTUMN_SERVER__UNIX_SOCKET` override, so the CLI also passes the socket here, applied after
+    // the loader runs.
     if let Ok(forced) = std::env::var("AUTUMN_SERVE_FORCE_UNIX_SOCKET")
         && !forced.is_empty()
     {
         config.server.unix_socket = Some(forced);
     }
 
-    // #1605: tighten every TTL-native subsystem knob to its `[retention]`
-    // window before anything is built from the config, so the cap flows into
-    // the idempotency layer's TTL, the session cookie's Max-Age and Redis
-    // TTL, and `autumn_job_tracking.expires_at` without each of those sites
-    // having to know the policy exists. A pure `min`, so a config with no
-    // `[retention]` section is untouched.
+    // Cap every TTL knob to its `[retention]` window before anything is built from the config, so
+    // the subsystems need not know the policy exists (#1605).
     config.apply_retention_caps();
 
-    // Install the `[metrics]` cardinality caps before anything can record
-    // through the call-site facade. The registry is process-global and its
-    // caps are read at each decision rather than baked in at registration, so
-    // this must land before the first `metrics::counter(...)` call — otherwise
-    // an early instrument would be admitted (or refused) under the defaults
-    // and, for `max_labels_per_series`, would canonicalize its label set to a
-    // different series key than every later sample.
-    //
-    // It lives in `load_config_only`, the prefix EVERY mode shares — the
-    // telemetry-initializing path calls it too — so trunk's invariant ("no
-    // path boots with the defaults silently in force") is unchanged, and the
-    // one-shot dump modes gain it as well. Setting caps touches no collector
-    // and opens nothing, so it does not violate what those modes promise.
+    // Install the `[metrics]` caps before the first `metrics::counter(...)` call: an earlier
+    // instrument would be judged under the defaults and, for `max_labels_per_series`, land under a
+    // different series key than later samples. Every mode loads config through here, and setting
+    // caps opens nothing, so the one-shot dump modes are safe too.
     crate::metrics::set_limits(config.metrics.limits());
 
     Ok(config)
@@ -13888,15 +13071,9 @@ fn install_i18n_bundle_layer(
     bundle: Option<Arc<crate::i18n::Bundle>>,
     i18n: &crate::i18n::I18nConfig,
 ) -> Vec<CustomLayerRegistration> {
-    // #1384: install the resolution defaults from config first, before the
-    // no-bundle early return. `locale_prefix_enabled` works without
-    // `.i18n()`/`.i18n_auto()` — the router builds its nests straight from
-    // `I18nConfig` — and in that shape no `Bundle` exists, but column decoding
-    // still needs the app's default locale. Without this, a `default_locale = "fr"`
-    // app attributed every legacy plain-text value to the last-resort "en", so a
-    // `/fr/...` request rendered upgraded content as empty and a later write could
-    // persist it under the wrong locale. A bundle, when present, re-installs the
-    // same values below: it derives them from this same `I18nConfig`.
+    // Install the defaults before the no-bundle return: `locale_prefix_enabled` works without a
+    // `Bundle`, and column decoding still needs the app's default locale rather than the
+    // last-resort "en" (#1384). A bundle re-installs the same values below.
     crate::i18n::install_locale_defaults(&i18n.default_locale, i18n.resolved_fallback_chain());
 
     let Some(bundle) = bundle else {
@@ -13908,15 +13085,10 @@ fn install_i18n_bundle_layer(
         default = bundle.default_locale(),
         "i18n bundle loaded"
     );
-    // #1384: content resolution outside a request (a job worker, a scheduled
-    // task, a CLI command) has no locale scope to read a chain from. Publish
-    // the bundle's resolved chain — the same one UI strings walk — as the
-    // process default so `Translated::resolve` behaves identically there.
+    // Resolution outside a request (a job, a task, a CLI command) has no locale scope, so publish
+    // the bundle's chain as the process default for `Translated::resolve` (#1384).
     crate::i18n::install_locale_defaults(bundle.default_locale(), bundle.fallback_chain().to_vec());
     state.insert_extension::<Arc<crate::i18n::Bundle>>(bundle.clone());
-    // Use the existing IntoAppLayer plumbing so the Extension is visible to
-    // every request. axum::Extension<T> is itself a tower::Layer when T:
-    // Clone + Send + Sync + 'static.
     let ambient_layer = crate::i18n::AmbientLocaleLayer::new(&bundle);
     let ext_layer = axum::Extension(bundle);
     custom_layers.push(CustomLayerRegistration {
@@ -13924,11 +13096,9 @@ fn install_i18n_bundle_layer(
         type_name: std::any::type_name::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
         layer: tower::util::BoxCloneSyncServiceLayer::new(ext_layer),
     });
-    // #1384: publish the negotiated locale as the ambient one for the whole
-    // handler, so a `#[translatable]` field resolves itself with no locale
-    // argument in the signature. Registered AFTER the bundle Extension —
-    // registration order is outermost-first, so this layer runs INSIDE it and
-    // its `Locale` extraction can see the bundle it needs to negotiate against.
+    // Makes the negotiated locale ambient for the handler, so `#[translatable]` fields need no
+    // locale argument (#1384). Registered after the bundle Extension so it runs inside it and can
+    // negotiate against the bundle.
     custom_layers.push(CustomLayerRegistration {
         type_id: TypeId::of::<crate::i18n::AmbientLocaleLayer>(),
         type_name: std::any::type_name::<crate::i18n::AmbientLocaleLayer>(),
@@ -13981,13 +13151,6 @@ async fn resolve_shard_set(
                      the hash router."
                         .to_owned()
                 })?;
-            // Directory routing resolves the tenant→shard key by checking out a
-            // *second* control connection during extraction. A handler that
-            // already holds `Db` (or another control checkout) before extracting
-            // `ShardedDb` / a sharded repository would then deadlock on a control
-            // pool sized to 1 — the first checkout cannot be released until the
-            // handler runs. Require at least 2 control connections so these
-            // mixed control+tenant handlers always make progress.
             let control_max = control_primary.status().max_size;
             if control_max < 2 {
                 return Err(format!(
@@ -14000,8 +13163,7 @@ async fn resolve_shard_set(
                      directory routing to use the hash router."
                 ));
             }
-            // Bound directory lookups with the configured database statement
-            // timeout (capped to Postgres' i32 millisecond range).
+            // Postgres takes the statement timeout as i32 milliseconds.
             let timeout_ms = config.database.statement_timeout.map_or(0, |d| {
                 u64::try_from(d.as_millis())
                     .unwrap_or(i32::MAX as u64)
@@ -14011,24 +13173,15 @@ async fn resolve_shard_set(
                 crate::sharding::DirectoryShardRouter::new(control_primary.clone())
                     .with_statement_timeout_ms(timeout_ms),
             );
-            // Spawn the cache-invalidation listener on the control DB so a re-pin
-            // (e.g. during a slot move) evicts cached tenant→shard mappings fleet-
-            // wide the moment it commits (LISTEN/NOTIFY) rather than waiting out
-            // the TTL. Skipped during a static build (no DB access); needs the
-            // control URL, without one we silently fall back to TTL-only refresh.
+            // LISTEN/NOTIFY evicts cached tenant→shard mappings fleet-wide when a re-pin commits,
+            // rather than after the TTL.
             if spawn_directory_listener {
-                // Prefer the provider-resolved control URL carried on the
-                // topology (managed Postgres has no `database.primary_url` in
-                // config); fall back to the configured URL. Without this a
-                // managed control DB would get no LISTEN/NOTIFY task (absent
-                // URL) or listen on a stale pre-provider URL.
+                // Prefer the provider-resolved URL: managed Postgres has none in config.
                 if let Some(control_url) = topology
                     .and_then(crate::db::DatabaseTopology::migration_url)
                     .or_else(|| config.database.effective_primary_url())
                 {
-                    // Detach: the listener runs for the life of the process;
-                    // dropping the JoinHandle leaves the task running rather than
-                    // aborting it.
+                    // Detached: dropping the JoinHandle leaves the listener running.
                     #[cfg(feature = "postgres")]
                     drop(
                         crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
@@ -14041,15 +13194,6 @@ async fn resolve_shard_set(
                     #[cfg(not(feature = "postgres"))]
                     let _ = control_url;
                 } else {
-                    // Directory routing is active but there is no control URL for
-                    // a dedicated LISTEN connection — a custom
-                    // `DatabasePoolProvider` supplied the control pool without
-                    // `database.primary_url`/`url`. The router still serves lookups
-                    // from that pool, but re-pins are not invalidated fleet-wide on
-                    // commit; they take effect only after the cache TTL expires.
-                    // Warn rather than fall back silently, so an operator relying
-                    // on the directory for slot moves configures a control URL, or
-                    // accepts TTL-only refresh, deliberately.
                     tracing::warn!(
                         "directory shard routing is enabled but no control database URL is \
                          configured (database.primary_url/url is unset, e.g. a custom \
@@ -14069,21 +13213,12 @@ async fn resolve_shard_set(
             let topologies = factory(config.database.clone())
                 .await
                 .map_err(|e| format!("Failed to create shard pools: {e}"))?;
-            // A custom shard provider established shard pools without going
-            // through the built-in `create_shard_topology` factory, which
-            // validates `database.statement_timeout` internally, so enforce the
-            // same fail-closed guard here — but only now that pools were really
-            // established. `resolve_shard_set` already returned early for a
-            // shardless profile, so this Some-gated check never rejects a
-            // no-database path. A shard set establishing SQLite pools under a
-            // nonzero timeout still fails closed.
+            // A custom provider bypasses `create_shard_topology`'s statement-timeout check, so
+            // enforce it here.
             #[cfg(feature = "sqlite")]
             {
-                // Scope the lock-wait wording to a `cache=shared` shard when
-                // any shard is one (issue #2881). Each returned topology pairs
-                // positionally with its configured shard; prefer the target
-                // the provider actually resolved, as the control-pool guard
-                // does.
+                // Name a `cache=shared` shard in the lock-wait wording when there is one (#2881).
+                // Topologies pair positionally with configured shards; prefer the resolved target.
                 let target = topologies
                     .iter()
                     .zip(&config.database.shards)
@@ -14107,8 +13242,6 @@ async fn resolve_shard_set(
 }
 
 #[cfg(feature = "db")]
-// The `sqlite` feature adds a small fail-fast startup-migration guard block
-// (issue #1614) that pushes this orchestration fn just over the line limit.
 #[allow(clippy::too_many_lines)]
 async fn setup_database(
     config: &AutumnConfig,
@@ -14119,16 +13252,13 @@ async fn setup_database(
     directory_shard_router: bool,
     hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
-    // #1628: declare replication BEFORE any pool exists, so every pooled SQLite
-    // connection is created with `wal_autocheckpoint = 0` and the replicator is
-    // the only component that ever checkpoints. The flag latches on and is never
-    // cleared — see `set_sqlite_replication_active`.
+    // Before any pool exists, so every SQLite connection opens with `wal_autocheckpoint = 0` and
+    // only the replicator checkpoints (#1628).
     if config.replication.as_ref().is_some_and(|r| r.enabled) {
         crate::db::set_sqlite_replication_active();
     }
-    // Shared, not copied: `EmbeddedMigrations` cannot be cloned, and a SQLite
-    // fleet (ADR 0019) migrates each tenant database from the same list long
-    // after boot.
+    // `EmbeddedMigrations` cannot be cloned, and a SQLite fleet (ADR 0019) migrates each tenant
+    // database from this list long after boot.
     let migrations = Arc::new(migrations_with_repository_framework_migrations(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
@@ -14136,16 +13266,10 @@ async fn setup_database(
         crate::derivation::has_derivation_descriptors(),
         hook_queue_migration_mode,
     ));
-    // Directory routing is only actually active when the app did NOT supply an
-    // explicit shard router: an explicit `with_shard_router(...)` takes
-    // precedence over `directory_shard_router` in `resolve_shard_set`, so in
-    // that case the `DirectoryShardRouter` is never constructed and the
-    // directory table is never consulted. Gate the migration on the same
-    // condition so an explicit-router app doesn't create `_autumn_shard_directory`
-    // (or warn about a pending directory migration) for a table it won't use.
+    // An explicit `with_shard_router` wins in `resolve_shard_set`, so it never uses the directory
+    // table; do not migrate it either.
     let use_directory_router = shard_router.is_none()
         && (directory_shard_router || config.database.directory_shard_router);
-    // A fleet routes by its mode and path template, never by a router.
     #[cfg(feature = "sqlite")]
     if config.database.fleet.is_some() && shard_router.is_some() {
         tracing::warn!(
@@ -14153,13 +13277,8 @@ async fn setup_database(
              database by fleet mode (ADR 0019)"
         );
     }
-    // The tenant→shard directory table is a CONTROL-plane table: create it at
-    // startup only when directory routing is active (and shards exist), and
-    // only on the control target — not via the shared list above, which is also
-    // applied to every shard. Like the other runtime framework migrations, it is
-    // suppressed during a static build (`autumn build`, AUTUMN_BUILD_STATIC=1):
-    // the build only renders assets and must not touch the database, so it must
-    // not create `_autumn_shard_directory`.
+    // The directory table is control-plane only, so it stays out of the shared list above, which
+    // every shard also applies.
     let directory_migration_required = directory_migration_is_required(
         use_directory_router,
         config.database.has_shards(),
@@ -14175,26 +13294,11 @@ async fn setup_database(
         None => crate::db::create_topology(&config.database),
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
-    // Fail-closed statement-timeout guard, enforced only once a control pool has
-    // actually been established — the provider, built-in or custom, returned
-    // `Some(..)`. The built-in `create_topology`/`create_shard_topology` factories
-    // validate `database.statement_timeout` internally, but a custom
-    // `with_pool_provider` provider can build its own SQLite pool without them:
-    // the default `DatabasePoolProvider::create_topology` only delegates to
-    // `create_pool`, and both factories are overridable, so a custom provider
-    // could otherwise discard the timeout and break the fail-closed guarantee.
-    // Under the `sqlite` feature `RuntimeBackend` is always SQLite, so an
-    // established pool plus a nonzero timeout is exactly the fail-closed
-    // condition. A provider returning `Ok(None)` opts into the supported
-    // no-database mode — no pool or statement needs a timeout — so it must still
-    // boot, matching the built-in path. Gating on `topology.is_some()` preserves
-    // that opt-out. The check is idempotent with the built-in factories' own, and
-    // `resolve_shard_set` applies the same Some-gated guard for shards.
+    // A custom pool provider can bypass the built-in statement-timeout check, so repeat it once a
+    // pool exists. A provider returning `Ok(None)` runs without a database and must still boot.
     #[cfg(feature = "sqlite")]
     if let Some(topology) = topology.as_ref() {
-        // Prefer the provider-resolved target (a custom provider may have no
-        // static URL, or a different one) so the message describes the pool
-        // that was actually built, as the migration path below does.
+        // Prefer the provider-resolved target so the message names the pool actually built.
         let target = topology
             .migration_url()
             .or_else(|| config.database.effective_primary_url())
@@ -14203,8 +13307,7 @@ async fn setup_database(
             .map_err(|e| format!("Failed to create database pool: {e}"))?;
     }
 
-    // Spawn the directory invalidation listener only at real runtime — a static
-    // build must not open control-DB connections.
+    // A static build (`autumn build`) must not touch the database.
     let runtime_boot = hook_queue_migration_mode == RepositoryCommitHookQueueMigrationMode::Runtime;
     let shards = match resolve_shard_set(
         config,
@@ -14218,39 +13321,23 @@ async fn setup_database(
     {
         Ok(shards) => shards,
         Err(e) => {
-            // The (managed) control topology is already up at this point, so a
-            // later setup failure — directory control-pool sizing, shard pool
-            // construction — must stop the managed Postgres child before the
-            // caller's `process::exit` (which skips `on_shutdown`/`Drop`).
-            // No-op when no managed cluster was started.
+            // The control topology is already up, and the caller's `process::exit` skips
+            // `Drop`, so stop any managed Postgres child now.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             return Err(e);
         }
     };
 
-    // Skip migrations when the provider opted out of a database by returning
-    // `Ok(None)`, even with `database.url` configured. Custom providers signal
-    // "this app runs without a DB" that way, and migrating against the URL anyway
-    // would defeat the opt-out.
-    //
-    // A provider may also resolve its primary URL at runtime (managed Postgres)
-    // and carry it on the topology. Prefer that URL, so migrations target the pool
-    // actually built rather than a stale or absent configured one.
+    // A provider may resolve its URL at runtime (managed Postgres); migrations target the pool
+    // actually built. A provider returning `Ok(None)` opts out of migrations too.
     let provider_migration_url = topology
         .as_ref()
         .and_then(|t| t.migration_url())
         .map(str::to_owned);
 
-    // SQLite sharding guard (#1614, PR3). The SQLite startup-migration path applies
-    // registered migrations to a `sqlite://` control target — `run_startup_migrations`
-    // routes them through `crate::migrate::auto_migrate_sqlite` — so registered
-    // migrations no longer fail fast here. Sharding is what remains unsupported:
-    // the directory/shard-map control migrations and per-shard fan-out are
-    // Postgres-specific. So a sqlite control target with sharding enabled fails
-    // fast, as does any `sqlite:` shard `primary_url`, because the shard loop
-    // routes each shard through the Postgres-only harness. Empty when unsharded or
-    // when the shard loop will not run. See `sqlite_sharding_unsupported_guard`.
+    // Sharding is Postgres-only (#1614): a sqlite control target with sharding, or any `sqlite:`
+    // shard, fails fast. Empty when the shard loop will not run.
     #[cfg(feature = "sqlite")]
     let sqlite_guard_shard_urls: Vec<&str> = if shards.is_some() {
         config
@@ -14293,10 +13380,8 @@ async fn setup_database(
     )
     .await;
 
-    // A SQLite fleet (ADR 0019) becomes the shard set: tenant data routes to
-    // per-tenant / per-slot files, each migrated with the non-control sets when
-    // it opens. Built at runtime only — a static build must not create the
-    // fleet directory.
+    // A SQLite fleet (ADR 0019) becomes the shard set: one file per tenant or slot, each migrated
+    // when it opens. Runtime only, so a static build creates no fleet directory.
     #[cfg(feature = "sqlite")]
     let shards = match (runtime_boot, topology.as_ref()) {
         (true, Some(topology)) => {
@@ -14332,13 +13417,9 @@ async fn setup_database(
         _ => shards,
     };
 
-    // Derivations (#1769): the state table exists by now, so reconcile each
-    // declared `#[derivation]` against it and repair whatever changed. A
-    // registry collision stops the boot; a database failure only logs, because
-    // a derivation whose backfill has not run is stale rather than broken and
-    // `/actuator/derivations` reports exactly that.
-    // Needs an explicit `if let` rather than `?`, so the managed-pg child is
-    // stopped before unwinding. `?` would skip the cfg-gated stop call.
+    // Reconcile each `#[derivation]` against its state table (#1769). A registry collision stops
+    // the boot; a database failure only logs, since a stale derivation shows in
+    // `/actuator/derivations`. `if let`, not `?`, so the managed-pg child is stopped first.
     #[allow(clippy::question_mark)]
     if runtime_boot
         && crate::derivation::has_derivation_descriptors()
@@ -14382,10 +13463,8 @@ async fn setup_database(
         check_shard_replica_migration_parity(config, set).await;
     }
 
-    // Boot-time guard: compare the current auto-split slot map against the map
-    // persisted on first boot. Refuses to start if they differ, preventing
-    // silent data misrouting from topology changes. Inert during static builds,
-    // when no control DB is configured, and in explicit-slot mode.
+    // Refuse to boot when the auto-split slot map differs from the one persisted on first boot,
+    // which would silently misroute data.
     #[allow(clippy::question_mark)]
     if let Err(e) = Box::pin(enforce_shard_map_guard(
         config,
@@ -14394,8 +13473,7 @@ async fn setup_database(
     ))
     .await
     {
-        // Needs explicit `if let` (not `?`) so the managed-pg child can be stopped
-        // before unwinding — `?` would skip the cfg-gated emergency stop call.
+        // `if let`, not `?`, so the managed-pg child is stopped first.
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
         return Err(e);
@@ -14557,12 +13635,8 @@ fn spawn_derivation_backfill(
                 break;
             }
             rounds += 1;
-            // A round that left work behind but advanced no checkpoint is
-            // stuck, not slow: nothing a further round would do differently.
-            // A round that advanced one is progress, however many parents are
-            // left (a self-referential derivation sweeps one per batch, so a
-            // large table takes many rounds), and a checkpoint only moves
-            // forward, so the sweep terminates on its own.
+            // A round that ran no batch is stuck: another round would do the same. Any batch
+            // advances a checkpoint that only moves forward, so the loop terminates.
             if report.batches_run == 0 {
                 tracing::warn!(
                     database = %label,
@@ -14627,8 +13701,7 @@ fn apply_pending_or_exit(
                 _ => "migration error",
             };
             eprintln!("autumn migrate: {reason} (target {target})");
-            // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
-            // Postgres child first so a failure doesn't orphan the data dir/port.
+            // `process::exit` skips `Drop`; stop any managed Postgres child so it is not orphaned.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop();
             std::process::exit(1);
@@ -14668,12 +13741,8 @@ fn apply_pending_sqlite_or_exit(
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite> + Send,
     target: &str,
 ) -> usize {
-    // Reject ANY in-memory target (private OR shared-cache) with registered
-    // migrations up front, BEFORE `run_pending_sqlite` (whose `Migration` error
-    // would be redacted to a value-free reason below, hiding the guidance). The
-    // migrated schema never survives to the runtime pool — a private `:memory:`
-    // connection is its own empty database, and a shared in-memory database is
-    // destroyed when its last connection closes (issue #1614 follow-up).
+    // A migrated in-memory schema never reaches the runtime pool, so reject it before
+    // `run_pending_sqlite`, whose error would be redacted below and lose the guidance (#1614).
     if let Some(err) = crate::migrate::reject_in_memory_migrations(database_url, &migrations) {
         eprintln!("autumn migrate: {err} (target {target})");
         std::process::exit(1);
@@ -15139,8 +14208,6 @@ mod sqlite_sharding_unsupported_guard_tests {
 
     #[test]
     fn sqlite_control_target_with_sharding_fails_fast() {
-        // PR3: a sqlite:// control URL with sharding enabled must fail fast with
-        // an actionable, sharding-named boot error — sharding is Postgres-only.
         for url in [
             "sqlite:///var/lib/app.db",
             "sqlite://./relative.db",
@@ -15161,8 +14228,7 @@ mod sqlite_sharding_unsupported_guard_tests {
 
     #[test]
     fn sqlite_control_target_without_sharding_boots() {
-        // PR3 behavior: a sqlite target with registered (non-sharding)
-        // migrations now boots — they are applied by `auto_migrate_sqlite`.
+        // Its migrations are applied by `auto_migrate_sqlite`.
         for url in [
             "sqlite:///var/lib/app.db",
             "sqlite://./relative.db",
@@ -15177,7 +14243,6 @@ mod sqlite_sharding_unsupported_guard_tests {
 
     #[test]
     fn postgres_target_is_unchanged() {
-        // The default Postgres path is untouched, sharding required or not.
         for url in [
             "postgres://u@h/db",
             "postgresql://user:pass@db:5432/app",
@@ -15196,17 +14261,14 @@ mod sqlite_sharding_unsupported_guard_tests {
 
     #[test]
     fn absent_control_url_boots() {
-        // No control URL (no-DB / opt-out provider): nothing to gate.
+        // No control URL: a no-database or opted-out provider.
         assert!(sqlite_sharding_unsupported_guard(None, true, &[]).is_ok());
         assert!(sqlite_sharding_unsupported_guard(None, false, &[]).is_ok());
     }
 
     #[test]
     fn sqlite_shard_target_fails_fast() {
-        // A `sqlite:` shard `primary_url` is sharding-on-SQLite regardless of the
-        // control backend and regardless of migrations — the shard loop routes it
-        // through the Postgres-only harness. It must be rejected with the
-        // actionable sharding error.
+        // Rejected whatever the control backend: the shard loop is Postgres-only.
         for shards in [
             &["sqlite:///var/lib/shard0.db"][..],
             &["sqlite:///var/lib/shard0.db", "postgres://u@h/shard1"][..],
@@ -15226,7 +14288,6 @@ mod sqlite_sharding_unsupported_guard_tests {
 
     #[test]
     fn postgres_shard_targets_are_unchanged() {
-        // All-Postgres shards are never gated, sharding required or not.
         assert!(
             sqlite_sharding_unsupported_guard(
                 Some("postgres://u@h/control"),
@@ -15240,13 +14301,9 @@ mod sqlite_sharding_unsupported_guard_tests {
 
     #[test]
     fn migrate_only_mode_reuses_the_boot_guard_for_sqlite_targets() {
-        // `run_migrate_only_mode` (the `AUTUMN_MIGRATE=1` one-shot) applies the
-        // SAME guard as normal boot BEFORE its migration loop, so the boot and
-        // migrate-only paths cannot drift. A sqlite control/shard target with
-        // sharding still fails fast; a plain sqlite control target now proceeds
-        // (its migrations are applied by the sqlite apply path).
+        // `run_migrate_only_mode` (`AUTUMN_MIGRATE=1`) runs the same guard as boot before its
+        // migration loop, so the two paths cannot drift.
 
-        // A sqlite CONTROL migrate target with sharding → actionable error.
         let err = sqlite_sharding_unsupported_guard(Some("sqlite:///var/lib/app.db"), true, &[])
             .expect_err("sqlite migrate control target with sharding must be rejected");
         assert!(
@@ -15254,7 +14311,6 @@ mod sqlite_sharding_unsupported_guard_tests {
             "migrate-only sqlite control error must be the actionable sharding message: {err}"
         );
 
-        // A sqlite SHARD migrate target → actionable error.
         let shard_err = sqlite_sharding_unsupported_guard(
             Some("postgres://u@h/control"),
             true,
@@ -15266,7 +14322,6 @@ mod sqlite_sharding_unsupported_guard_tests {
             "migrate-only sqlite shard error must be the actionable sharding message: {shard_err}"
         );
 
-        // An all-Postgres migrate configuration (control + shards) is never gated.
         assert!(
             sqlite_sharding_unsupported_guard(
                 Some("postgres://u@h/control"),
@@ -15277,8 +14332,6 @@ mod sqlite_sharding_unsupported_guard_tests {
             "an all-postgres migrate configuration must proceed unchanged"
         );
 
-        // A plain sqlite migrate control target (no sharding) proceeds — its
-        // migrations are applied by the sqlite apply path.
         assert!(
             sqlite_sharding_unsupported_guard(Some("sqlite:///var/lib/app.db"), false, &[]).is_ok(),
             "sqlite control target without sharding must never be gated"
@@ -15378,11 +14431,8 @@ async fn run_startup_migrations(
     shard_map_migration_required: bool,
 ) {
     let control_url = if control_configured {
-        // Prefer a provider-resolved URL (e.g. managed Postgres, whose socket
-        // URL isn't in config) carried on the topology: the runtime pool is
-        // built from it, so embedded startup migrations must target it — even if
-        // a stale `database.url`/`primary_url` is still configured (an existing
-        // app adopting the provider). Fall back to the configured URL otherwise.
+        // The runtime pool is built from the provider-resolved URL, so migrate that one even when
+        // a stale `database.url` is still configured.
         provider_migration_url
             .or_else(|| config.database.effective_primary_url().map(str::to_owned))
     } else {
@@ -15402,13 +14452,9 @@ async fn run_startup_migrations(
     let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
     let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
-    // Computed once, on the FINAL registered set (after `setup_database`'s own
-    // fold added any shard-required sets), so a version collision between ANY
-    // two registered sources is resolved automatically rather than causing
-    // one migration to be silently skipped — see
-    // `compute_migration_disambiguation` and `migration_sets_for_disambiguation`.
-    // One map per side: a control-only set and a shard-only set never share
-    // a database, so they never rename each other's versions.
+    // Computed on the final registered set, so a version collision between any two sources is
+    // renamed rather than one migration silently skipped. One map per side: control-only and
+    // shard-only sets never share a database.
     let only_database = control_is_only_database(config);
     let disambiguation_sets = migration_sets_for_disambiguation(
         &migrations,
@@ -15429,13 +14475,8 @@ async fn run_startup_migrations(
         std::process::exit(1);
     }
     let migration_result = crate::time::spawn_blocking(move || {
-        // SQLite single-writer startup-migration path (#1614, PR3): apply the
-        // registered migrations to a `sqlite://` control target with no advisory
-        // lock. Sharding — directory, shard-map, per-shard fan-out — is
-        // Postgres-only and is rejected upstream in `setup_database` by
-        // `sqlite_sharding_unsupported_guard`, so nothing shard- or
-        // directory-related runs here, and the framework migrations below are
-        // skipped for a SQLite control target.
+        // SQLite is single-writer, so there is no advisory lock (#1614). Sharding was already
+        // rejected by `sqlite_sharding_unsupported_guard`, so no shard work follows.
         #[cfg(feature = "sqlite")]
         if let Some(url) = control_url.as_deref()
             && crate::config::DatabaseBackend::detect(url)
@@ -15453,11 +14494,8 @@ async fn run_startup_migrations(
                 );
                 std::process::exit(1);
             }
-            // Only when this boot applies (the same decision `auto_migrate_sqlite`
-            // makes): a migration this database already ran under a version the
-            // map now gives a substitute keeps its record, moved to that
-            // substitute, rather than running twice. A report-only boot touches
-            // nothing.
+            // A migration already applied under a version the map now renames has its record
+            // moved, so it does not run twice. A report-only boot touches nothing.
             if crate::migrate::should_auto_apply(profile.as_deref(), auto_migrate, auto_in_prod)
                 && let Err(error) = crate::migrate::adopt_sqlite_collision_history(
                     url,
@@ -15500,8 +14538,7 @@ async fn run_startup_migrations(
                     lock_policy,
                 );
             }
-            // The shard directory table lives on the control plane only, so it
-            // is applied here and never to the per-shard targets below.
+            // Control-plane only: never applied to the shard targets below.
             if directory_migration_required {
                 crate::migrate::auto_migrate(
                     &url,
@@ -15516,13 +14553,8 @@ async fn run_startup_migrations(
                     lock_policy,
                 );
             }
-            // The shard-map guard table also lives on the control plane only. It
-            // follows the same resolved, profile-agnostic auto-migrate decision as
-            // the app migrations above (#1903): default-on in dev, opt-in in prod
-            // via `auto_migrate`/`auto_migrate_in_production`, over the same
-            // advisory-locked apply path. Under a report-only decision the missing
-            // table is reported rather than force-applied, so a DB-free or offline
-            // startup never fails fatally on an unreachable control target.
+            // Also control-plane only, under the same auto-migrate decision as the app's sets
+            // (#1903): a report-only boot reports the missing table instead of failing.
             if shard_map_migration_required {
                 crate::migrate::auto_migrate(
                     &url,
@@ -15538,12 +14570,8 @@ async fn run_startup_migrations(
                 );
             }
         }
-        // Shards hold tenant data, not the control-plane schema. If the app
-        // registered the full control `FRAMEWORK_MIGRATIONS` set (as some
-        // examples do), skip it for shard targets — otherwise startup would
-        // create the control tables on every shard and (with auto-migrate off)
-        // keep reporting them as pending, even though `autumn migrate --shard`
-        // applies only the shard-required framework migrations.
+        // `shard_sets` leaves out control-plane sets such as `FRAMEWORK_MIGRATIONS`: shards hold
+        // tenant data, matching what `autumn migrate --shard` applies.
         for (target, url) in &shard_targets {
             for (mig, schema) in shard_sets(&migrations) {
                 crate::migrate::auto_migrate(
@@ -15564,10 +14592,8 @@ async fn run_startup_migrations(
     .await;
     if let Err(e) = migration_result {
         tracing::error!(error = %e, "Migration task panicked");
-        // Same orphan hazard as a migration failure: `process::exit` skips
-        // `on_shutdown`, so stop any managed Postgres before bailing. We are back
-        // on the Tokio runtime here (after the `spawn_blocking` await), so use the
-        // async stop — the sync `emergency_stop` would panic nesting a runtime.
+        // `process::exit` skips `Drop`, so stop any managed Postgres first. Async: the sync
+        // `emergency_stop` would panic nesting a runtime.
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
         std::process::exit(1);
@@ -15586,9 +14612,8 @@ async fn check_shard_replica_migration_parity(
         let Some(replica_url) = shard_config.replica_url.as_deref() else {
             continue;
         };
-        // Remember the URLs so the per-shard health indicator can re-run
-        // the parity comparison on later readiness probes, and claim the
-        // recheck throttle slot for the check that runs right here.
+        // The shard's health indicator re-runs this check on later probes; claim its throttle
+        // slot for the check below.
         shard
             .runtime()
             .configure_migration_check(shard_config.primary_url.clone(), replica_url.to_owned());
@@ -15733,9 +14758,8 @@ pub async fn run_shard_map_guard(
 
     crate::config::check_stored_slot_map(auto_split, computed, stored_opt)?;
 
-    // First boot: persist the current map so future boots can compare against it.
-    // Wrapped in a transaction so a mid-loop failure leaves no partial rows —
-    // partial rows would cause a spurious mismatch error on the next boot attempt.
+    // First boot: persist the map in one transaction, since partial rows would fail the next
+    // boot with a spurious mismatch.
     if stored.is_empty() {
         use diesel_async::AsyncConnection as _;
         let assignments: Vec<_> = computed.to_vec();
@@ -15768,11 +14792,7 @@ pub async fn run_shard_map_guard(
 /// - no shards configured,
 /// - no control database topology, or
 /// - the slot map uses explicit `slots` declarations (auto-split is inactive).
-// Sharding (the shard-map guard, auto-split, and control-DB shard map) is a
-// Postgres-only feature: `run_shard_map_guard` drives Postgres `sql_query`
-// against a `Pool<AsyncPgConnection>` control pool. Under the `sqlite` feature
-// the runtime topology's pool is a SQLite pool that cannot feed it, and SQLite
-// deployments are single-node/unsharded, so the guard is a no-op.
+// Under `sqlite` the guard is a no-op: it runs Postgres SQL, and SQLite deployments are unsharded.
 #[cfg(all(feature = "db", feature = "sqlite"))]
 #[allow(clippy::unused_async)]
 async fn enforce_shard_map_guard(
@@ -15843,10 +14863,6 @@ fn migrations_with_repository_framework_migrations(
             None,
         ));
     }
-    // The derivation state table follows the same rule as the two above: it is a
-    // shard-applied set, it is appended only when the binary actually links a
-    // `#[derivation]`, and never during a static build, which renders assets
-    // and must not touch the database.
     if derivations_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
         && !shard_applied_sets_include(&migrations, DERIVATION_MIGRATION)
@@ -16098,28 +15114,16 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
         mcp_mount_path,
     } = ctx;
 
-    // `run()`'s own pre-router checks (no routes, an unguarded repository API)
-    // run in the caller, on every route, before the role mount filters the
-    // lists. `run()` runs them there too.
+    // The pre-router checks (no routes, an unguarded repository API) run in the caller, as in
+    // `run()`.
 
-    // Everything below describes the application router, and a `worker` (or any
-    // other non-HTTP) role never builds one: `run()` takes the probe-only branch
-    // and none of these six rules execute. Enforcing them here would REJECT a
-    // deployment that starts perfectly well — a route legitimately owning
-    // `/openapi.json` under a worker profile, say — which is the same
-    // disagreement with the serving path as being too lax, pointing the other
-    // way, and the more expensive of the two because it blocks correct work.
-    //
-    // The document itself is still exported. A worker mounts no route group, so
-    // the caller does not filter its routes: the document is the one a role
-    // without `mount` serves.
+    // The checks below describe the application router, which a non-HTTP role never builds, so
+    // they would reject a deployment that starts fine. The document is still exported.
     if config.resolve_role().is_ok_and(|role| !role.serves_http()) {
         return Ok(());
     }
 
-    // What the ROUTER would see for OpenAPI, resolved once and used by every
-    // mount-sensitive check below, so the three cannot disagree about
-    // whether the endpoint is mounted.
+    // What the router sees for OpenAPI, shared by every mount-sensitive check below.
     let mounted_openapi = config.openapi_runtime.enabled.then_some(openapi_config);
 
     let registered_versions: std::collections::HashSet<&str> =
@@ -16140,15 +15144,8 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
         )
     })
     .and_then(|()| {
-        // The `[openapi]` profile gate decides whether the endpoint is
-        // MOUNTED. `run()` hands `None` to the router when it is off, so
-        // neither the path validation nor the collision check runs and an
-        // application route may legitimately occupy `/openapi.json`.
-        // Validating unconditionally made the exporter STRICTER than
-        // startup — rejecting an app that boots fine — which is the same
-        // class of disagreement as being laxer, just pointing the other
-        // way. The document itself is still exported: the gate governs
-        // serving, not whether the contract can be written down.
+        // When the `[openapi]` gate is off the endpoint is not mounted, so an app route may
+        // own `/openapi.json`. The gate governs serving; the document is still exported.
         mounted_openapi.map_or(Ok(()), crate::router::validate_openapi_mount_paths)
     })
     .and_then(|()| {
@@ -16162,8 +15159,7 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
         )
     })
     .and_then(|()| {
-        // The plugin-route half of the router's own mount check. `run()` hands
-        // the router the SAME gated OpenAPI value and the MCP path.
+        // The plugin-route half of the router's mount check, with the same values `run()` passes.
         crate::router::reject_declared_routes_on_context_mounts(
             declared_routes,
             mounted_openapi,
@@ -16171,22 +15167,15 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
         )
     });
 
-    // MCP is part of the same preflight, not a separate concern: an app that
-    // mounts MCP at a malformed path, or at one a user/OpenAPI route already
-    // owns, is rejected by `build_router_pre_state` at startup. An export
-    // that skipped these would certify a router that cannot be built — the
-    // exact failure the four rules above exist to prevent, one subsystem
-    // over. Both call the router's own function, so there is still one
-    // definition per rule.
+    // `build_router_pre_state` rejects a malformed or colliding MCP path at startup, so the
+    // export must too, through the router's own functions.
     #[cfg(feature = "mcp")]
     let preflight = preflight.and_then(|()| {
         let Some(path) = mcp_mount_path else {
             return Ok(());
         };
         crate::router::validate_mcp_mount_path(path).and_then(|()| {
-            // The SAME gated value: `reject_mcp_path_collisions` reserves
-            // the OpenAPI paths as claimed GETs, which they are not when the
-            // endpoint is not mounted.
+            // The gated value: an unmounted OpenAPI endpoint claims no paths.
             crate::router::reject_mcp_path_collisions(
                 path,
                 routes,
@@ -16285,10 +15274,8 @@ fn validate_config_preconditions(
         ));
     }
 
-    // The sqlite queue backs a split role only because both processes open
-    // the same file. Against an in-memory target each gets its own private
-    // database, so the web replica would enqueue where no worker can ever
-    // look — the same silent stranding, one step further in (issue #1907).
+    // A split role shares the sqlite queue only through a file: an in-memory database is private
+    // to each process (#1907).
     if crate::config::split_role_requires_file_backed_sqlite(
         base,
         &config.jobs.backend,
@@ -16550,8 +15537,7 @@ mod agent_authority_route_summary_tests {
             mcp_tool,
             ..crate::openapi::ApiDoc::default()
         };
-        // The exposure rule is JSON-out gated, so a route with no response
-        // schema is never a tool no matter what it is tagged with. Give it one.
+        // Only a route with a JSON response schema can be a tool.
         api_doc.response = Some(crate::openapi::SchemaEntry {
             name: "Item",
             kind: crate::openapi::SchemaKind::Ref,
@@ -16576,10 +15562,7 @@ mod agent_authority_route_summary_tests {
 
     #[test]
     fn a_scoped_route_records_the_path_an_agent_actually_calls() {
-        // A scoped group's children carry only the child path -- the prefix is
-        // applied at mount time. Recording `/items` for a tool served at
-        // `/api/v1/items` would make the manifest wrong about where the agent
-        // surface is, and a scope rename would produce no drift at all.
+        // A scoped child carries only its own path; the prefix is applied at mount time.
         let route = route_with("/items", true);
         let summary =
             agent_authority_route_summary(&route, Some("/api/v1"), AgentExposure::default());
@@ -16587,15 +15570,13 @@ mod agent_authority_route_summary_tests {
         assert_eq!(summary.method, "GET");
         assert!(summary.mcp_tool);
 
-        // A top-level route has no prefix and is unchanged.
         let top = agent_authority_route_summary(&route, None, AgentExposure::default());
         assert_eq!(top.path, "/items");
     }
 
     #[test]
     fn a_scoped_root_route_joins_the_way_the_openapi_collector_does() {
-        // Delegated to `join_nested_path` rather than string concatenation, so
-        // the manifest and the spec cannot disagree about trailing slashes.
+        // Trailing slashes must join exactly as `join_nested_path` does for the spec.
         let root = route_with("/", true);
         let summary = agent_authority_route_summary(&root, Some("/api"), AgentExposure::default());
         assert_eq!(
@@ -17751,8 +16732,7 @@ mod validate_repository_api_policies_tests {
 
     #[test]
     fn registry_check_flags_routes_missing_their_policy_registration() {
-        // Macro emits `policy = X` but no `.policy::<TestPost, _>(...)`
-        // call on the builder — registry has nothing.
+        // The route declares `policy = X`, but the builder never called `.policy::<TestPost, _>`.
         let registry = PolicyRegistry::default();
         let routes = vec![build_route(
             http::Method::POST,
@@ -17780,10 +16760,7 @@ mod validate_repository_api_policies_tests {
 
     #[test]
     fn registry_check_skips_routes_without_policy_check_fn() {
-        // Routes mounted without `policy = ...` carry
-        // `policy_check: None` and are not subject to this check —
-        // they're handled by `validate_repository_api_policies` which
-        // looks at `has_policy` instead.
+        // Routes without `policy = ...` are checked by `validate_repository_api_policies` instead.
         let registry = PolicyRegistry::default();
         let routes = vec![build_route(
             http::Method::POST,
@@ -17911,9 +16888,7 @@ mod validate_repository_api_policies_tests {
         assert!(!is_production_profile("staging"));
         assert!(!is_production_profile("test"));
         assert!(!is_production_profile("default"));
-        // Case-sensitive (matches the framework's elsewhere
-        // matching pattern in app.rs::run_build_mode and
-        // migrate.rs).
+        // Case-sensitive, like the framework's other profile checks.
         assert!(!is_production_profile("Prod"));
         assert!(!is_production_profile("Production"));
     }
@@ -17964,10 +16939,7 @@ mod validate_repository_api_policies_tests {
 
     #[test]
     fn collect_unguarded_walks_scoped_groups() {
-        // The scoped-group path catches `#[repository(api = ...)]`
-        // mounts that live inside `.scoped(prefix, layer, routes)`.
-        // Without walking them, the prod-mode guard would silently
-        // miss those routes.
+        // `#[repository(api = ...)]` mounts inside `.scoped(...)` must not escape the prod guard.
         let group_route = build_route(
             http::Method::POST,
             "/api/posts",
@@ -18336,9 +17308,8 @@ async fn watch_for_in_place_upgrade(
             );
             continue;
         }
-        // Documented as incompatible, and refused rather than attempted: the
-        // successor would start a second postmaster over the same data
-        // directory, and this process's drain would stop the cluster under it.
+        // Refused, not attempted: besides the second postmaster, this process's drain would stop
+        // the cluster under the successor.
         #[cfg(feature = "managed-pg")]
         if crate::managed_pg::is_supervising() {
             let error = crate::upgrade::UpgradeError::Unsupported(
@@ -18434,11 +17405,8 @@ fn external_shutdown_path_from(value: Option<&std::ffi::OsStr>) -> Option<std::p
     if trimmed.is_empty() {
         return None;
     }
-    // Trim before building the path, not just before testing for emptiness: a
-    // value with stray whitespace would otherwise resolve to a sibling path the
-    // parent never writes, and the failure would be silent — every reload
-    // stalling the full budget and hard-killing, which is the bug this exists
-    // to fix.
+    // Build from the trimmed value: stray whitespace would name a path the parent never writes,
+    // and every reload would silently stall for the full budget.
     Some(std::path::PathBuf::from(trimmed))
 }
 
@@ -18463,10 +17431,8 @@ async fn external_shutdown_signal(path: Option<std::path::PathBuf>) {
     };
     let interval = std::time::Duration::from_millis(100);
     loop {
-        // `is_file`, not "exists": `metadata` succeeds on a directory, so a
-        // variable pointed at one would drain the app on every boot — bind,
-        // drain, exit 0 — which a supervisor reads as a healthy restart loop
-        // rather than the misconfiguration it is.
+        // `is_file`, not "exists": a variable pointed at a directory would drain every boot and
+        // exit 0, which a supervisor reads as a healthy restart loop.
         if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
             return;
         }
@@ -18505,29 +17471,11 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         tracing::info!("Received SIGTERM, starting graceful shutdown");
     };
 
-    // Windows has no `SIGTERM`. What a supervisor, a service host, or the OS
-    // itself actually delivers is a console control event, and every one of them
-    // means the same thing `SIGTERM` means: this process is going away, drain
-    // now. Handling them is what makes a supervisor-stopped Windows server run
-    // its readiness flip, prestop grace, in-flight drain and `on_shutdown` hooks
-    // instead of dying mid-request (#1639).
-    //
-    // How much time each event actually buys differs, and the difference
-    // matters enough to be exact about:
-    //
-    // * `CTRL_C` and `CTRL_BREAK` do not terminate the process at all. The drain
-    //   runs to completion.
-    // * `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN` are told-not-asked: the
-    //   OS-imposed budget is how long the *handler routine* may run, and tokio's
-    //   handler returns immediately (which is what lets this future wake), so
-    //   the drain then races process termination. It is best-effort, and on a
-    //   long budget it will lose.
-    //
-    // That is why a supervisor should stop an Autumn app through
-    // `autumn serve stop` or the Service Control Manager, both of which wait for
-    // the app's own recorded budget. `docs/guide/daemon.md` says so where an
-    // operator will read it. These arms are still worth having: they turn the
-    // common console cases into a real drain, and cost nothing in the rest.
+    // Windows has no `SIGTERM`; console control events mean the same thing (#1639).
+    // `CTRL_C` and `CTRL_BREAK` do not terminate the process, so the drain completes.
+    // `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN` bound only the handler routine, which tokio
+    // returns from at once, so the drain races termination. Supervisors should stop the app with
+    // `autumn serve stop` or the Service Control Manager, which wait for the recorded budget.
     #[cfg(windows)]
     let terminate = async {
         use tokio::signal::windows;
@@ -18559,15 +17507,9 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         tracing::info!("Canary rollback signalled, starting graceful shutdown");
     };
 
-    // A supervising parent with no `SIGTERM` to send — `autumn dev` on Windows —
-    // can request this exact drain by creating a file (#1616).
-    //
-    // Deliberately `cfg`-gated to the platforms that need it, rather than armed
-    // everywhere and left inert by an unset variable. Autumn deploys to Linux,
-    // where this would be a production drain trigger reachable by anything that
-    // can create a configured path, with no authentication and no benefit, since
-    // `SIGTERM` already exists. The helpers stay compiled and unit-tested
-    // everywhere.
+    // A parent with no `SIGTERM` to send (`autumn dev` on Windows) requests the drain by creating
+    // a file (#1616). Not armed on Unix, where it would be an unauthenticated drain trigger for
+    // anything able to create the path, and `SIGTERM` already exists.
     #[cfg(not(unix))]
     let external_stop = async {
         let path =
@@ -18804,10 +17746,8 @@ mod tests {
 
     // ── omitted-router accounting for `autumn routes audit` ──────────────────
 
-    // #1974 item 7: a plugin declares a top-level config section from its
-    // `build()` via `config_section`, so `server.strict_config` treats that root
-    // as known-and-opaque. Prove the declaration lands on the builder and that
-    // the registry is fail-closed (an undeclared root is not registered).
+    // #1974: a plugin declares a top-level config section from `build()`, so
+    // `server.strict_config` treats that root as known. An undeclared root stays unknown.
     #[test]
     fn plugin_declares_config_section_via_build() {
         struct DummyMediaPlugin;
@@ -18862,18 +17802,12 @@ mod tests {
             ..Default::default()
         }];
 
-        // The plain documented pattern: nest the raw router, then declare its
-        // covering route metadata. No dedicated `nest_declared` bookkeeping.
         let builder = app().nest("/admin", raw).declare_plugin_routes(declared);
 
-        // The raw router is still mounted (serving path is unchanged) …
         assert_eq!(builder.nest_routers.len(), 1);
-        // … and its declared metadata was folded into `declared_routes`.
         assert_eq!(builder.declared_routes.len(), 1);
 
-        // ⇒ zero omitted routers: the declared route `/admin/ping` falls under
-        // the `/admin` nest prefix, so the mount is covered and the audit gate
-        // must NOT fire.
+        // `/admin/ping` falls under the `/admin` prefix, so the nest is covered.
         assert_eq!(
             omitted_for(&builder),
             0,
@@ -18895,7 +17829,6 @@ mod tests {
 
         assert_eq!(builder.nest_routers.len(), 1);
         assert_eq!(builder.merge_routers.len(), 1);
-        // Nothing was declared, so nothing covers the nest.
         assert!(builder.declared_routes.is_empty());
 
         assert_eq!(
@@ -18986,9 +17919,7 @@ mod tests {
 
     #[test]
     fn is_dump_jobs_mode_only_true_for_exactly_one() {
-        // `autumn jobs manifest` sets AUTUMN_DUMP_JOBS=1 to select the manifest
-        // dump path in `run()`. Any other value (or an unset var) must fall
-        // through to the normal boot path.
+        // `autumn jobs manifest` sets AUTUMN_DUMP_JOBS=1.
         temp_env::with_var("AUTUMN_DUMP_JOBS", Some("1"), || {
             assert!(is_dump_jobs_mode(), "`1` must select the jobs-dump path");
         });
@@ -19008,9 +17939,7 @@ mod tests {
 
     #[test]
     fn is_retention_dry_run_mode_only_true_for_exactly_one() {
-        // `autumn retention --dry-run` sets AUTUMN_RETENTION_DRY_RUN=1 to
-        // select the dry-run path in `run()`. Any other value (or an unset
-        // var) must fall through to the normal boot path (issue #1342).
+        // `autumn retention --dry-run` sets AUTUMN_RETENTION_DRY_RUN=1 (#1342).
         temp_env::with_var("AUTUMN_RETENTION_DRY_RUN", Some("1"), || {
             assert!(
                 is_retention_dry_run_mode(),
@@ -19057,13 +17986,9 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn merge_and_validate_task_names_rejects_collision_with_hand_declared_task() {
-        // `resolve_retention_descriptors` validates collisions only among
-        // retention-generated task names; it cannot see hand-declared `tasks![...]`
-        // entries, which real boot merges in through `AppBuilder::build`'s
-        // `tasks.extend(...)` and `validate_unique_scheduled_task_names`. Without
-        // this check a dry run could report success for a policy whose generated
-        // name collides with a hand-declared task, while real boot panics on that
-        // same collision.
+        // `resolve_retention_descriptors` checks collisions only among generated names.
+        // Real boot also merges hand-declared `tasks![...]` and panics on a collision,
+        // so a dry run must check the merged set or it reports success for a broken app.
         fn dry_run_stub(
             _state: AppState,
         ) -> std::pin::Pin<
@@ -19161,10 +18086,8 @@ mod tests {
 
     #[test]
     fn retention_dry_run_one_shot_dispatches_before_server_start() {
-        // Mirrors `migrate_only_one_shot_applies_and_exits_without_serving`:
-        // AUTUMN_RETENTION_DRY_RUN=1 must be handled BEFORE the `let Self {`
-        // destructure that begins the serving path, so a dry-run never binds
-        // a port (issue #1342).
+        // The dry run is dispatched before the `let Self {` destructure that starts
+        // serving, so it never binds a port (#1342).
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let run_start = source.find("pub async fn run(self)").expect("run() exists");
         let run_end = source
@@ -19192,13 +18115,9 @@ mod tests {
 
     #[test]
     fn dump_jobs_manifest_includes_synthesized_durable_listener_default_queue() {
-        // Regression (#1802, Codex P2): an app that registers a durable listener
-        // and configures `[jobs.queues]` WITHOUT `default` still drains `default`
-        // at runtime — `finalize_event_bus` synthesizes a `default`-queue
-        // `JobInfo` for each durable listener before the runtime starts. The
-        // `AUTUMN_DUMP_JOBS=1` manifest must reflect that same set through the
-        // shared `synthesize_durable_listener_jobs` seam, or a topology-aware
-        // `autumn doctor` would accept a fleet where no tier drains those jobs.
+        // #1802: `finalize_event_bus` gives each durable listener a `default`-queue job,
+        // so the app drains `default` even when `[jobs.queues]` omits it. The manifest
+        // must list it, or `autumn doctor` would accept a fleet where no tier drains it.
         fn listener_handler(
             _state: AppState,
             _payload: serde_json::Value,
@@ -19218,9 +18137,6 @@ mod tests {
         };
         let cfg = crate::config::JobQueuesConfig::strict_list(["critical"]);
 
-        // The dump path holds no builder-registered jobs, only the durable
-        // listener; the manifest must still surface `default` (where that
-        // listener's synthesized job runs) alongside the configured `critical`.
         let manifest = dump_jobs_manifest(&cfg, Vec::new(), vec![durable], &[]);
         assert_eq!(manifest, "queues = [\"critical\", \"default\"]\n");
     }
@@ -19329,25 +18245,21 @@ mod tests {
 
     // ── Serve readiness payload (#1639) ────────────────────────────────────
     //
-    // The supervisor learns two things from this file: how long the app will
-    // drain for, and where it actually bound. The second is what lets
-    // `autumn serve --daemon` write an address-discovery file on a platform
+    // The supervisor reads the drain budget and the bound address from this file.
+    // The address lets `autumn serve --daemon` write a discovery file on a platform
     // with no Unix socket to name in advance.
 
     #[test]
     fn a_wildcard_bind_is_published_as_a_dialable_loopback_address() {
-        // The production smart default binds `0.0.0.0`, and `local_addr()`
-        // faithfully reports it. Publishing that in `serve.addr` would hand a
-        // thin client an address nothing can dial while the start reported
-        // success — the same trap `[cluster] advertise_addr` already rejects.
+        // Production binds `0.0.0.0` by default. Publishing that would hand a thin
+        // client an address nothing can dial after a start that reported success.
         assert_eq!(dialable_endpoint("0.0.0.0:3000"), "127.0.0.1:3000");
         assert_eq!(dialable_endpoint("[::]:3000"), "[::1]:3000");
     }
 
     #[test]
     fn a_specific_bind_is_published_exactly_as_bound() {
-        // Rewriting one would be worse than the bug: the supervisor would
-        // advertise an interface the app is not on.
+        // Rewriting a specific bind would advertise an interface the app is not on.
         assert_eq!(dialable_endpoint("192.168.1.10:3000"), "192.168.1.10:3000");
         assert_eq!(dialable_endpoint("127.0.0.1:8080"), "127.0.0.1:8080");
         assert_eq!(dialable_endpoint("[::1]:8080"), "[::1]:8080");
@@ -19355,8 +18267,7 @@ mod tests {
 
     #[test]
     fn the_resolved_port_survives_the_rewrite() {
-        // The port is the half the supervisor could not have known — `port = 0`
-        // resolves in the kernel — so losing it would defeat the whole report.
+        // `port = 0` resolves in the kernel, so the supervisor cannot know the port itself.
         assert_eq!(dialable_endpoint("0.0.0.0:49152"), "127.0.0.1:49152");
     }
 
@@ -19435,11 +18346,9 @@ mod tests {
 
     // ── Cooperative external shutdown (#1616) ──────────────────────────────
     //
-    // On Windows there is no SIGTERM: `autumn dev` could only stop the app with
-    // `TerminateProcess`, which skips `on_shutdown` hooks — so a managed
-    // Postgres child was orphaned on every hot reload. These cover the runtime
-    // half of the fix: an opt-in, env-named flag file that drains the app
-    // through the *same* graceful path a signal takes.
+    // Windows has no SIGTERM, and `TerminateProcess` skips `on_shutdown` hooks, which
+    // orphaned a managed Postgres child on every `autumn dev` reload. An opt-in,
+    // env-named flag file drains the app through the same graceful path a signal takes.
 
     #[test]
     fn external_shutdown_path_is_none_when_the_env_var_is_absent() {
@@ -19463,12 +18372,8 @@ mod tests {
 
     #[test]
     fn external_shutdown_path_trims_surrounding_whitespace() {
-        // A value that only *looks* blank is rejected above; one with real
-        // content and stray whitespace must resolve to the path the parent
-        // actually wrote, not to a sibling with a leading space that will
-        // never match. Getting this wrong is silent: on Windows every reload
-        // would stall the full budget and hard-kill, reintroducing the
-        // orphaned-cluster bug this seam exists to fix.
+        // A path with a leading space never matches the file the parent writes, so on
+        // Windows every reload would silently stall the full budget and hard-kill.
         assert_eq!(
             external_shutdown_path_from(Some(std::ffi::OsStr::new("  /tmp/autumn-stop  "))),
             Some(std::path::PathBuf::from("/tmp/autumn-stop"))
@@ -19558,9 +18463,8 @@ mod tests {
 
     #[test]
     fn external_shutdown_env_var_is_the_name_the_cli_writes() {
-        // `autumn-cli` mirrors this constant (it cannot depend on autumn-web's
-        // private items); a rename on either side breaks the dev loop silently,
-        // so pin the wire name here.
+        // `autumn-cli` mirrors this constant; a rename on either side silently breaks
+        // the dev loop.
         assert_eq!(SHUTDOWN_SIGNAL_FILE_ENV, "AUTUMN_SHUTDOWN_SIGNAL_FILE");
     }
 
@@ -19569,7 +18473,6 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("canary-rollback.json");
 
-        // Flag is absent at boot; writing it after start must resolve the signal.
         let writer_path = path.clone();
         let writer = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -19612,15 +18515,8 @@ mod tests {
         );
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url`, which
-    // SQLite refuses at both layers — `database_backend_consistency` at config
-    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
-    // only a replica naming the same file as its primary. That replica is the
-    // blocker; the shards some of these fixtures also declare are refused at
-    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
-    // builder, so they would not fail here on their own. Gated rather than
-    // swapped, so the test never asserts a configuration production refuses;
-    // same treatment `db::`'s replica tests got.
+    // Postgres only: SQLite refuses a distinct `replica_url` at config validation and at
+    // topology build. Gated rather than rewritten, so no test asserts a refused config.
     #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[test]
@@ -19653,8 +18549,7 @@ mod tests {
     fn build_state_exposes_resolved_process_role() {
         use crate::config::ProcessRole;
 
-        // Default config resolves to the combined role: existing single-process
-        // apps see no behavior change and get both HTTP + workers.
+        // The default is the combined role: HTTP and workers in one process.
         let mut config = AutumnConfig::default();
         let state = build_state(
             &config,
@@ -19669,8 +18564,7 @@ mod tests {
         assert_eq!(state.role().name(), "combined");
         assert_eq!(state.capabilities(), ProcessRole::Combined.capabilities());
 
-        // A worker-role config flows through the exact same resolution the
-        // framework uses to gate the job runtime, reachable via `state.role()`.
+        // `state.role()` goes through the same resolution that gates the job runtime.
         config.role = ProcessRole::Worker.into();
         let state = build_state(
             &config,
@@ -19806,15 +18700,8 @@ mod tests {
         assert!(err.contains("critcal"), "{err}");
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url`, which
-    // SQLite refuses at both layers — `database_backend_consistency` at config
-    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
-    // only a replica naming the same file as its primary. That replica is the
-    // blocker; the shards some of these fixtures also declare are refused at
-    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
-    // builder, so they would not fail here on their own. Gated rather than
-    // swapped, so the test never asserts a configuration production refuses;
-    // same treatment `db::`'s replica tests got.
+    // Postgres only: SQLite refuses a distinct `replica_url` at config validation and at
+    // topology build. Gated rather than rewritten, so no test asserts a refused config.
     #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[tokio::test]
@@ -19885,28 +18772,13 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // The fail-closed `statement_timeout` guard must fire once a custom
-    // provider has actually established a pool. A custom provider can build
-    // its own SQLite pool without the built-in `create_topology`/`create_pool`
-    // factories — the default `create_topology` only delegates to
-    // `create_pool`, and both are overridable — so `setup_database` enforces
-    // the guard at dispatch. It must run only for an established pool
-    // (`Some(..)`), not before the provider returns: a provider returning
-    // `Ok(None)` opts into the supported no-database mode and must still boot
-    // even with a nonzero `statement_timeout`, matching the built-in path.
-    // CI's sqlite job runs the named integration targets, not `--lib`, and
-    // `setup_database` and the shared guard are crate-private, so this
-    // boundary is reachable only from a unit test.
-    //
-    // Case (a): a custom provider that establishes a real in-memory SQLite
-    // pool (`Ok(Some(..))`) under a nonzero `statement_timeout` must fail
-    // closed with the actionable error. A custom provider must not bypass the
-    // guard.
+    // A custom provider can build a SQLite pool without the built-in factories, so
+    // `setup_database` enforces the `statement_timeout` guard at dispatch. It runs only for
+    // an established pool: `Ok(None)` is the supported no-database mode and must still boot.
+    // `setup_database` and the guard are crate-private, so only a unit test reaches them.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn custom_pool_provider_with_established_sqlite_pool_fails_closed_on_statement_timeout() {
-        // Builds a real in-memory SQLite pool WITHOUT routing the timeout through
-        // the built-in factory — the exact F2 bypass a custom provider could use.
         struct RealSqlitePoolProvider;
 
         impl crate::db::DatabasePoolProvider for RealSqlitePoolProvider {
@@ -19919,10 +18791,8 @@ mod tests {
                 >,
                 crate::db::PoolError,
             > {
-                // Clear `statement_timeout` locally so the built-in `create_pool`
-                // guard does not fire inside the provider — this provider hands
-                // back a live SQLite pool that silently dropped the timeout, which
-                // is exactly the fail-closed condition the dispatch guard closes.
+                // Drop the timeout so the built-in `create_pool` guard does not fire here:
+                // the provider returns a live pool that ignores it, which dispatch must catch.
                 let mut relaxed = config.clone();
                 relaxed.statement_timeout = None;
                 crate::db::create_pool(&relaxed)
@@ -19959,10 +18829,8 @@ mod tests {
         );
     }
 
-    // Case (b) — the exact regression Codex flagged: a custom provider that opts
-    // into no-database mode (`Ok(None)`) must STILL boot even with a nonzero
-    // `database.statement_timeout`, because no pool/statement exists to bound. The
-    // Some-gated guard must not reject this the way the pre-dispatch guard did.
+    // No-database mode (`Ok(None)`) boots with a nonzero `statement_timeout`: there is no
+    // statement to bound.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn custom_pool_provider_no_database_mode_boots_with_statement_timeout() {
@@ -19978,13 +18846,12 @@ mod tests {
                 >,
                 crate::db::PoolError,
             > {
-                // Explicit no-database opt-out.
                 Ok(None)
             }
         }
 
         let mut config = AutumnConfig::default();
-        // A URL may even be configured; the provider's `Ok(None)` still wins.
+        // The provider's `Ok(None)` wins over a configured URL.
         config.database.primary_url = Some("sqlite::memory:".to_owned());
         config.database.statement_timeout = Some(std::time::Duration::from_secs(30));
         let AppBuilder {
@@ -20044,15 +18911,8 @@ mod tests {
         config
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url`, which
-    // SQLite refuses at both layers — `database_backend_consistency` at config
-    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
-    // only a replica naming the same file as its primary. That replica is the
-    // blocker; the shards some of these fixtures also declare are refused at
-    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
-    // builder, so they would not fail here on their own. Gated rather than
-    // swapped, so the test never asserts a configuration production refuses;
-    // same treatment `db::`'s replica tests got.
+    // Postgres only: SQLite refuses a distinct `replica_url` at config validation and at
+    // topology build. Gated rather than rewritten, so no test asserts a refused config.
     #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[tokio::test]
@@ -20103,20 +18963,12 @@ mod tests {
         );
         let state_shards = state.shards().expect("state should expose shards");
         assert_eq!(state_shards.len(), 2);
-        // Routing works end-to-end through state-held shards.
         let routed = state_shards.route("tenant-1").await.expect("route");
         assert!(["shard0", "shard1"].contains(&routed.name()));
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url`, which
-    // SQLite refuses at both layers — `database_backend_consistency` at config
-    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
-    // only a replica naming the same file as its primary. That replica is the
-    // blocker; the shards some of these fixtures also declare are refused at
-    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
-    // builder, so they would not fail here on their own. Gated rather than
-    // swapped, so the test never asserts a configuration production refuses;
-    // same treatment `db::`'s replica tests got.
+    // Postgres only: SQLite refuses a distinct `replica_url` at config validation and at
+    // topology build. Gated rather than rewritten, so no test asserts a refused config.
     #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[tokio::test]
@@ -20466,8 +19318,7 @@ mod tests {
         let server_start = source
             .find("pub async fn run(self)")
             .expect("normal server path should exist");
-        // Bounded at the next path so the search cannot match this test's own
-        // source, which necessarily quotes the strings it is looking for.
+        // End at the next fn so the search cannot match this test's own quoted strings.
         let build_mode_start = source
             .find("async fn run_build_mode(self)")
             .expect("static build path should follow server path");
@@ -20491,8 +19342,7 @@ mod tests {
             "the final flush must be triggered AND awaited AFTER the request drain \
              (spawn={spawn}, drain={drain}, wait={wait}, cancel={cancel})"
         );
-        // The token that releases the final tick must not fire with the
-        // listener: that is the whole bug this ordering exists to prevent.
+        // The token that releases the final tick must not fire when the listener closes.
         assert!(
             server_source
                 .contains("let replication_shutdown = tokio_util::sync::CancellationToken::new();"),
@@ -20526,8 +19376,7 @@ mod tests {
         let server_start = source
             .find("pub async fn run(self)")
             .expect("normal server path should exist");
-        // Bounded at the next path so the search cannot match this test's own
-        // source, which necessarily quotes the strings it is looking for.
+        // End at the next fn so the search cannot match this test's own quoted strings.
         let build_mode_start = source
             .find("async fn run_build_mode(self)")
             .expect("static build path should follow server path");
@@ -20625,10 +19474,8 @@ mod tests {
             "an overrun drain must saturate, not wrap into a fresh wait"
         );
 
-        // The property the finding is about: drain, departure and hooks are one
-        // budget. `hook_budget` is `budget - elapsed` measured *after* the
-        // departure wait, so whatever the drain leaves over has to cover both
-        // of the phases that follow it — never budget + LEAVE_BUDGET.
+        // Drain, departure and hooks share one budget. `hook_budget` is measured after
+        // the departure wait, so departure plus hooks must fit in what the drain left.
         for elapsed_ms in [0_u64, 250, 29_800, 29_999, 30_000, 45_000] {
             let drained = Duration::from_millis(elapsed_ms);
             let departure = cluster_departure_wait(budget, drained);
@@ -20715,8 +19562,7 @@ mod tests {
         let server_start = source
             .find("pub async fn run(self)")
             .expect("normal server path should exist");
-        // Bounded at the next path so the search cannot match this test's own
-        // source, which necessarily quotes the strings it is looking for.
+        // End at the next fn so the search cannot match this test's own quoted strings.
         let build_mode_start = source
             .find("async fn run_build_mode(self)")
             .expect("static build path should follow server path");
@@ -20753,7 +19599,6 @@ mod tests {
             server_source.contains("if let Some(task) = server_task.take()"),
             "the hook-failure path must abort the cold-start accept loop"
         );
-        // The old shapes must not come back.
         assert!(
             !server_source.contains("let server_task = match bound_listener"),
             "the accept loop must not be spawned from the bound-listener match"
@@ -20808,14 +19653,9 @@ mod tests {
 
     #[test]
     fn optional_interceptor_wiring_matches_across_all_three_run_modes() {
-        // See the clone-class comment above the `mail_interceptor` arm in
-        // each of the three functions: this exact block (mail/job/db/
-        // channels+presence+collab/http) is meant to stay byte-for-byte
-        // identical across `run()`, `run_build_mode()` and
-        // `run_one_off_task_mode()`. #862's own history shows what drift
-        // here costs (a silently-inert one-off-task interceptor), so pin
-        // the invariant rather than rely on reviewers to notice a divergent
-        // copy-paste.
+        // The interceptor block (mail/job/db/channels+presence+collab/http) must stay
+        // byte-for-byte identical across the three run modes. A divergent copy once left
+        // one-off-task interceptors silently inert (#862).
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let start_marker =
             "#[cfg(feature = \"mail\")]\n        if let Some(interceptor) = mail_interceptor {";
@@ -20927,13 +19767,9 @@ mod tests {
 
     #[test]
     fn graph_installed_before_every_router_build() {
-        // The architecture graph (#1747) is published by whichever path is
-        // about to build a router, and `/actuator/graph` answers from what was
-        // published. Codex round 1 found the install wired into the
-        // static-build and capsule-replay paths but NOT into `run()` — so every
-        // unit test passed while a normally running app answered 503 forever.
-        // A structural assertion, because the serving path ends in `serve()`
-        // and cannot be driven from a unit test.
+        // `/actuator/graph` answers from the graph published before a router build
+        // (#1747); a path that skips the install answers 503 forever. Checked on source
+        // because the serving path ends in `serve()` and cannot be driven from a unit test.
         let whole = include_str!("app.rs").replace("\r\n", "\n");
         // Only the non-test source: this test names both strings itself.
         let source = whole
@@ -20943,8 +19779,7 @@ mod tests {
         let builds: Vec<usize> = source
             .match_indices("crate::router::try_build_router")
             .map(|(i, _)| i)
-            // Skip doc-comment and test references; only real call sites are
-            // followed by an open paren on the same expression.
+            // Keep only call sites: a builder variant name followed by `(`.
             .filter(|i| source[*i..].starts_with("crate::router::try_build_router"))
             .filter(|i| {
                 let tail = &source[*i..*i + 80];
@@ -20968,7 +19803,6 @@ mod tests {
             "every path that builds an application router must publish the graph \
              it is about to serve"
         );
-        // Each install precedes a router build with no other install between.
         for install in &installs {
             assert!(
                 builds.iter().any(|build| build > install),
@@ -21556,13 +20390,8 @@ mount = ["service"]
 
     #[test]
     fn migrate_only_one_shot_applies_and_exits_without_serving() {
-        // The runtime effect (applying against Postgres, exiting without binding a
-        // port) needs a DB + a subprocess harness because `run()` ends in
-        // `process::exit`; that live apply is exercised by the shared
-        // `run_pending_locked` engine's own DB-backed tests. Here we lock the
-        // *dispatch decision* and the *reuse/exit contract* structurally: with
-        // AUTUMN_MIGRATE=1 the migrate-and-exit path is chosen and the
-        // server-start path is NOT taken.
+        // `run()` ends in `process::exit`, so this checks the dispatch and the exit
+        // contract on source. The live apply is covered by `run_pending_locked`'s DB tests.
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let run_start = source.find("pub async fn run(self)").expect("run() exists");
         let run_end = source
@@ -21570,9 +20399,8 @@ mount = ["service"]
             .expect("build mode follows run()");
         let run_body = &source[run_start..run_end];
 
-        // The AUTUMN_MIGRATE=1 dispatch is an early one-shot: it sits BEFORE the
-        // server-start machinery (the `let Self {` destructure that begins the
-        // serving path) and returns, so a migrate run never binds a port.
+        // Dispatched before the `let Self {` destructure that starts serving, so a
+        // migrate run never binds a port.
         let dispatch = run_body
             .find("if is_migrate_only_mode() {")
             .expect("run() dispatches the migrate one-shot");
@@ -21590,7 +20418,6 @@ mount = ["service"]
             "the migrate one-shot must run then return before server start"
         );
 
-        // The handler applies per target and exits — never starting the server.
         let handler_start = source
             .find("async fn run_migrate_only_mode(self)")
             .expect("migrate handler exists");
@@ -21607,11 +20434,9 @@ mount = ["service"]
             "the migrate handler exits after applying"
         );
 
-        // Issue #1614, PR3: the migrate one-shot must apply the SAME SQLite
-        // sharding guard as normal boot BEFORE its migration loop, so a sharded
-        // `sqlite:` target exits with the actionable sharding error instead of a
-        // generic `PgConnection` failure — and the two paths cannot drift because
-        // both call `sqlite_sharding_unsupported_guard`.
+        // #1614: the same SQLite sharding guard as normal boot runs before the migration
+        // loop, so a sharded `sqlite:` target gets the actionable error rather than a
+        // generic `PgConnection` failure.
         let guard_call = handler
             .find("sqlite_sharding_unsupported_guard(")
             .expect("migrate handler applies the SQLite sharding guard");
@@ -21628,9 +20453,8 @@ mount = ["service"]
             "the migrate one-shot must not start the server"
         );
 
-        // The per-target applier reuses `run_pending_locked_with_policy` (the
-        // exact engine `auto_migrate` drives — no duplicated migration logic) and exits
-        // non-zero on failure so a bad migration aborts before cutover (AC-3).
+        // The applier reuses the engine `auto_migrate` drives, and exits non-zero on
+        // failure so a bad migration aborts before cutover.
         let helper_start = source
             .find("fn apply_pending_or_exit(")
             .expect("apply_pending_or_exit exists");
@@ -21666,12 +20490,9 @@ mount = ["service"]
     #[cfg(feature = "reporting")]
     #[test]
     fn replay_one_shot_runs_before_server_start() {
-        // `AUTUMN_REPLAY_CAPSULE=<path>` (set by `autumn replay`) must select an
-        // early one-shot: rebuild the app, replay the recorded request, print a
-        // verdict, exit. The runtime effect ends in `process::exit`, so — like
-        // the migrate one-shot above — the *dispatch decision* and the
-        // *offline contract* are locked structurally here, and the behaviour is
-        // exercised end-to-end by `failure_capsule_end_to_end`.
+        // `autumn replay` sets `AUTUMN_REPLAY_CAPSULE=<path>`. The handler ends in
+        // `process::exit`, so the dispatch and the offline contract are checked on source;
+        // `failure_capsule_end_to_end` covers the behaviour.
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let run_start = source.find("pub async fn run(self)").expect("run() exists");
         let run_end = source
@@ -21710,9 +20531,8 @@ mount = ["service"]
             "the replay one-shot must never start the server"
         );
 
-        // It rebuilds the real thing: same router builder, same state
-        // initializers, same policy registrations as the serving path — a
-        // replay against a stripped-down router would not be a replay (R6).
+        // A replay against a stripped-down router would not be a replay: it rebuilds the
+        // serving path's router, state initializers and policy registrations.
         assert!(
             handler.contains("crate::capsule::load_capsule(")
                 && handler.contains("crate::capsule::execute(")
@@ -21726,9 +20546,7 @@ mount = ["service"]
             "the replay handler must rebuild the app's real router and state"
         );
 
-        // F15: replay is offline. No migrations, no job runtime, no scheduler,
-        // no external session/cache backend — and it must not arm capture
-        // against the stub pool.
+        // Replay is offline, and must not arm capture against the stub pool.
         assert!(
             !handler.contains("setup_database(")
                 && !handler.contains("initialize_job_runtime")
@@ -21796,9 +20614,7 @@ mount = ["service"]
         let forcer_start = source
             .find("fn force_offline_replay_config(")
             .expect("the offline-knob helper exists");
-        // Wide enough for the whole helper: it forces every config-driven
-        // store the request path can reach, so the window has to outgrow the
-        // list rather than the list being trimmed to the window.
+        // Wide enough for the whole helper; widen it as the helper grows.
         let forcer = source
             .get(forcer_start..forcer_start.saturating_add(6_000))
             .unwrap_or_default();
@@ -21810,8 +20626,7 @@ mount = ["service"]
             forcer.contains("config.server.timeouts.request_timeout_ms = None;"),
             "replay must clear the wall-clock request deadline"
         );
-        // #2351 item 1: a shadow mirror has its own client and is not a
-        // handler effect.
+        // #2351: a shadow mirror has its own client and is not a handler effect.
         assert!(
             forcer.contains("config.shadow.enabled = false;"),
             "replay must not mirror traffic to a shadow target"
@@ -21831,9 +20646,9 @@ mount = ["service"]
             handler.contains(install),
             "the replay handler must install the tape-backed mailer"
         );
-        // Codex review on #3222: production installs the mailer before the
-        // state initializers, so an initializer can read it. Replay does too,
-        // and again after them, to replace a live one an initializer installed.
+        // Production installs the mailer before the state initializers, so an initializer
+        // can read it. Replay does too, and again after them, to replace a live one an
+        // initializer installed.
         let initializers = handler
             .find("run_state_initializers(state_initializers, &state);")
             .expect("the replay handler runs the state initializers");
@@ -21841,8 +20656,8 @@ mount = ["service"]
         let last = handler.rfind(install).expect("installed");
         assert!(first < initializers, "installed before the initializers");
         assert!(last > initializers, "and again after them");
-        // Codex review on #3222: with `outbox.enabled`, production's mailer
-        // has the outbox's queue. Replay counts it before the first install.
+        // With `outbox.enabled`, production's mailer has the outbox's queue. Replay counts
+        // it before the first install.
         #[cfg(feature = "db")]
         {
             let outbox = handler
@@ -21882,8 +20697,7 @@ mount = ["service"]
         config.session.backend = crate::session::SessionBackend::Redis;
         config.channels.backend = crate::config::ChannelBackend::Redis;
         config.server.timeouts.request_timeout_ms = Some(30_000);
-        // Every remaining config-driven store the request path can reach, set
-        // the way a production recording would have had them.
+        // Every other config-driven store the request path can reach, as production sets it.
         config.security.rate_limit.backend = crate::security::config::RateLimitBackend::Redis;
         config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
         config.security.submit_token.backend = Some(crate::config::IdempotencyBackend::Redis);
@@ -21912,8 +20726,7 @@ mount = ["service"]
             "a deterministic offline replay has no wall-clock deadline — and a \
              breakpoint held in a debugger must not cancel the handler"
         );
-        // The middleware stores. Each of these is *written* by a replayed
-        // request, so leaving any of them pointed at the recording
+        // A replayed request writes to each middleware store, so leaving one on the
         // deployment's Redis would make diagnosing a failure mutate live state.
         assert_eq!(
             config.security.rate_limit.backend,
@@ -21975,8 +20788,7 @@ mount = ["service"]
     #[cfg(feature = "reporting")]
     #[test]
     fn replay_never_invokes_a_custom_config_loader() {
-        // Normalized like the other source assertions: a Windows checkout
-        // (`core.autocrlf`) hands `include_str!` CRLF line endings, and the
+        // A Windows checkout (`core.autocrlf`) has CRLF line endings, which the
         // `\n`-embedding pattern below would never match.
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let handler = replay_mode_source(&source);
@@ -22143,14 +20955,13 @@ mount = ["service"]
     fn directory_migration_required_only_at_runtime_with_shards_and_routing() {
         use RepositoryCommitHookQueueMigrationMode::{Runtime, StaticBuild};
 
-        // The happy path: routing on, shards present, real runtime boot.
+        // Routing on, shards present, runtime boot.
         assert!(directory_migration_is_required(true, true, Runtime));
 
-        // A static build must never create the directory table, even with
-        // routing enabled and shards configured.
+        // A static build never creates the table, even with routing and shards.
         assert!(!directory_migration_is_required(true, true, StaticBuild));
 
-        // Routing disabled, or no shards, means no directory table at all.
+        // Routing off, or no shards.
         assert!(!directory_migration_is_required(false, true, Runtime));
         assert!(!directory_migration_is_required(true, false, Runtime));
     }
@@ -22159,13 +20970,13 @@ mount = ["service"]
     fn shard_map_migration_required_only_at_runtime_with_shards() {
         use RepositoryCommitHookQueueMigrationMode::{Runtime, StaticBuild};
 
-        // The happy path: shards present, real runtime boot.
+        // Shards present, runtime boot.
         assert!(shard_map_migration_is_required(true, Runtime));
 
-        // A static build must never create the shard-map table.
+        // A static build never creates the table.
         assert!(!shard_map_migration_is_required(true, StaticBuild));
 
-        // No shards means no shard-map table.
+        // No shards.
         assert!(!shard_map_migration_is_required(false, Runtime));
     }
 
@@ -22279,9 +21090,8 @@ mount = ["service"]
         assert!(crate::migrate::is_control_framework_set(
             &crate::migrate::FRAMEWORK_MIGRATIONS
         ));
-        // ...but the standalone shard-required sets are kept (not flagged),
-        // even though their migrations are duplicated into the control
-        // `migrations/` directory.
+        // ...but the standalone shard-required sets are kept, even though the control
+        // set duplicates their migrations.
         assert!(!crate::migrate::is_control_framework_set(
             &crate::version_history::VERSION_HISTORY_MIGRATIONS
         ));
@@ -22299,12 +21109,8 @@ mount = ["service"]
         use diesel::migration::{Migration, MigrationSource as _};
         use diesel::pg::Pg;
 
-        // A sharded app that registers the full control FRAMEWORK_MIGRATIONS and
-        // also uses commit hooks + versioning. The hook-queue / version-history
-        // migrations are present *inside* the control set, but that set is
-        // stripped from shard targets by `is_control_framework_set`, so
-        // the standalone shard-required sets must still be appended — otherwise
-        // shards never get those tables.
+        // The control set contains the hook-queue and version-history migrations but is
+        // stripped from shards, so the standalone sets must still be appended for shards.
         let migrations = migrations_with_repository_framework_migrations(
             vec![(
                 "app",
@@ -22318,8 +21124,7 @@ mount = ["service"]
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
 
-        // The migration names the shard apply loop will actually run: every set
-        // that is not the control framework set (which gets stripped on shards).
+        // What the shard apply loop runs: every set except the control framework set.
         let shard_names: Vec<String> = migrations
             .iter()
             .filter(|(_, set, _, _)| !crate::migrate::is_control_framework_set(set))
@@ -22465,7 +21270,7 @@ mount = ["service"]
         assert!(std::ptr::eq(shards[0].0, std::ptr::from_ref(&scoped[1].1)) && shards.len() == 1);
         assert_eq!((control[0].1, shards[0].1), (None, Some("tenant")));
 
-        // The same two sets for every database collide, as before.
+        // Unscoped, the same two sets collide.
         let everywhere = vec![
             ("app", CONTROL, MigrationScope::Everywhere, None),
             ("app", SHARDS, MigrationScope::Everywhere, None),
@@ -22605,15 +21410,10 @@ mount = ["service"]
     #[cfg(feature = "db")]
     #[test]
     fn plugin_migrations_registration_never_panics_on_version_collision() {
-        // The shape this guards against: an app's own first migration and a
-        // plugin's migration both using the placeholder version
-        // (`00000000000000`) with different content — exactly what
-        // `examples/todo-app` hits against the framework's legacy
-        // `create_api_tokens` migration. Registration must always succeed; the
-        // collision is resolved at apply time instead (see
-        // `compute_migration_disambiguation`'s own tests). Rejecting it here would
-        // leave an app unable to use a plugin until someone renamed a migration in
-        // a dependency they may not control.
+        // An app and a plugin migration share the placeholder version `00000000000000`
+        // with different content. Registration must succeed: the collision is resolved at
+        // apply time, and rejecting it here would block the plugin until someone renamed
+        // a migration in a dependency they may not control.
         const APP_MIGRATIONS: crate::migrate::EmbeddedMigrations =
             diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
         const COLLIDING_PLUGIN_MIGRATIONS: crate::migrate::EmbeddedMigrations =
@@ -22637,10 +21437,8 @@ mount = ["service"]
     #[cfg(feature = "db")]
     #[test]
     fn plugin_migrations_does_not_panic_on_identical_resubmission() {
-        // Registering the exact same set twice (e.g. two plugins that both
-        // depend on a shared migrations bundle) reuses the same versions
-        // AND full names — the intentional, harmless duplication case, not a
-        // collision.
+        // The same set twice (two plugins sharing a migrations bundle) is harmless
+        // duplication, not a collision.
         const PLUGIN_MIGRATIONS: crate::migrate::EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
 
@@ -22649,15 +21447,8 @@ mount = ["service"]
             .plugin_migrations("plugin-b", PLUGIN_MIGRATIONS);
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url`, which
-    // SQLite refuses at both layers — `database_backend_consistency` at config
-    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
-    // only a replica naming the same file as its primary. That replica is the
-    // blocker; the shards some of these fixtures also declare are refused at
-    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
-    // builder, so they would not fail here on their own. Gated rather than
-    // swapped, so the test never asserts a configuration production refuses;
-    // same treatment `db::`'s replica tests got.
+    // Postgres only: SQLite refuses a distinct `replica_url` at config validation and at
+    // topology build. Gated rather than rewritten, so no test asserts a refused config.
     #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[test]
@@ -22699,15 +21490,8 @@ mount = ["service"]
         assert_eq!(check.replica_url, "postgres://localhost/replica");
     }
 
-    // Postgres-only fixture: it configures a distinct `replica_url`, which
-    // SQLite refuses at both layers — `database_backend_consistency` at config
-    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
-    // only a replica naming the same file as its primary. That replica is the
-    // blocker; the shards some of these fixtures also declare are refused at
-    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
-    // builder, so they would not fail here on their own. Gated rather than
-    // swapped, so the test never asserts a configuration production refuses;
-    // same treatment `db::`'s replica tests got.
+    // Postgres only: SQLite refuses a distinct `replica_url` at config validation and at
+    // topology build. Gated rather than rewritten, so no test asserts a refused config.
     #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[tokio::test]
@@ -22835,12 +21619,11 @@ mount = ["service"]
         assert!(builder.i18n_auto_load);
     }
 
-    // ── exclude_static_routes_from_locale_prefix (issue #1251, Codex review) ──
+    // ── exclude_static_routes_from_locale_prefix (#1251) ──────────────────
     //
-    // `#[static_get]` pre-rendering requests each route's single, unprefixed
-    // path and rejects any non-2xx response; without this exclusion,
-    // enabling `locale_prefix_enabled` would replace that path with a 308
-    // redirect and break `autumn build` for every app with a static route.
+    // Pre-rendering requests each `#[static_get]` path unprefixed and rejects a non-2xx.
+    // Without the exclusion, `locale_prefix_enabled` would turn that into a 308 and break
+    // `autumn build` for every app with a static route.
 
     #[cfg(feature = "i18n")]
     fn static_meta(path: &'static str) -> crate::static_gen::StaticRouteMeta {
@@ -22940,13 +21723,12 @@ mount = ["service"]
         let mut config = AutumnConfig::default();
         config.i18n.locale_prefix_enabled = true;
         let state = crate::state::AppState::for_test();
-        // Simulates `build_state`'s clone, captured BEFORE the exclusion.
+        // `build_state`'s snapshot, taken before the exclusion.
         state.insert_extension(config.clone());
 
         let metas = vec![static_meta("/about")];
         exclude_static_routes_from_locale_prefix(&mut config, &metas);
-        // The fix: re-insert the mutated config so the stored snapshot
-        // matches what the router was actually built with.
+        // Re-insert so the snapshot matches the config the router was built with.
         state.insert_extension(config.clone());
 
         let stored = state
@@ -23002,12 +21784,9 @@ mount = ["service"]
                   that would release it."
     )]
     async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
-        // `load_config_and_telemetry` installs the `[metrics]` section, so
-        // calling it here resets the process-global metric limits as a side
-        // effect. Take the same lock the metrics tests use, or this can land
-        // between a limits test raising a cap and the loop that depends on it
-        // — dropping samples at the default while that test expects the
-        // raised value. See `metrics::LIMITS_TEST_LOCK`.
+        // `load_config_and_telemetry` resets the process-global metric limits. Hold the
+        // metrics tests' lock so this cannot land inside a test that raised a cap.
+        // See `metrics::LIMITS_TEST_LOCK`.
         let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -23074,8 +21853,8 @@ mount = ["service"]
             "fr",
             "the configured default must reach column decoding without a bundle"
         );
-        // A legacy plain-text column is now attributed to `fr`, so a `/fr/...`
-        // request resolves it instead of rendering empty.
+        // A legacy plain-text column is attributed to `fr`, so a `/fr/...` request
+        // resolves it instead of rendering empty.
         let legacy = crate::i18n::Translated::decode_column(
             "Bonjour le monde",
             &crate::i18n::default_locale_snapshot(),
@@ -23189,16 +21968,12 @@ mount = ["service"]
         }
     }
 
-    // ── The origin never leaks the edge lane's internal sentinel (issue
-    //    #2244, item 4) ────────────────────────────────────────────────────
+    // ── The origin never leaks the edge fallthrough sentinel (#2244) ──────
     //
-    // `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) answers with the
-    // fallthrough sentinel header so the EDGE CAPSULE runtime knows to fall
-    // through to the origin. The same handler code also runs at the origin —
-    // `extract.rs` cannot special-case which substrate it is on — so an app
-    // that forgets to call `with_edge_kv` (a wiring bug) hits this same 500
-    // at the origin, and a real HTTP client must never see the internal
-    // header.
+    // `EdgeCacheUnavailable` sets the fallthrough sentinel header so the edge runtime
+    // falls through to the origin. The same extractor runs at the origin, so an app that
+    // never calls `with_edge_kv` hits this 500 there, and a real client must not see
+    // the internal header.
     #[cfg(feature = "edge")]
     #[tokio::test]
     async fn an_uninjected_edge_seam_never_leaks_the_fallthrough_sentinel_to_a_real_client() {
@@ -23206,8 +21981,7 @@ mount = ["service"]
             "never reached: extraction fails first"
         }
 
-        // The real `app()` entry point, `with_edge_kv` NEVER called — the
-        // wiring bug this test is about.
+        // `with_edge_kv` is never called.
         let custom_layers = app().custom_layers;
 
         let router = crate::router::try_build_router_inner(
@@ -23261,9 +22035,7 @@ mount = ["service"]
             .expect("request");
         let response = router.oneshot(request).await.expect("response");
 
-        // Existing behavior, unchanged: still a 500 with an actionable body.
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        // The fix: the internal sentinel never reaches a real client.
         assert!(
             !response
                 .headers()
@@ -23454,27 +22226,13 @@ mount = ["service"]
         assert_eq!(html, "Home");
     }
 
-    // ── Warden 2026-09-04: `#[static_get]` × multi-tenancy fails closed ──────
+    // ── `#[static_get]` × multi-tenancy fails closed ───────────────────────
     //
-    // Hypothesis: an app with documented multi-tenancy (`[tenancy] enabled =
-    // true`, any `source`) pre-renders a `#[static_get]` route that reads
-    // tenant-scoped state — a per-tenant storefront via the `Tenant` extractor, or
-    // a `#[repository]` query scoped by `CURRENT_TENANT`. `autumn build` or ISR
-    // regeneration might silently resolve a missing or default tenant and bake
-    // that tenant's response into the single `dist/` file every tenant then
-    // shares: a cross-tenant read through a first-class feature composition, with
-    // no app-level analogue.
-    //
-    // It does not happen. `render_static_routes` (`autumn build`) and ISR's
-    // `regenerate_page` (`static_gen/middleware.rs`) both send a bare synthetic
-    // request through the full router — path only, no `Host`, no tenant header, no
-    // session, no `Authorization` — and every tenancy `source` in `tenancy.rs`
-    // (`extract_tenant_from_parts_inner`) rejects with a non-2xx `AutumnError`
-    // when its required signal is absent, rather than resolving a default tenant.
-    // A non-2xx is `BuildError::NonSuccessStatus` to the build/ISR caller, so the
-    // handler's output never reaches disk. Asserted per tenancy source, so a
-    // future change that makes any one of them fail open is caught rather than
-    // silently shipping a cross-tenant static-file leak.
+    // `autumn build` and ISR send a bare synthetic request (path only: no `Host`, tenant
+    // header, session or `Authorization`). Every tenancy `source` rejects a request that
+    // lacks its signal instead of resolving a default tenant, and the non-2xx fails the
+    // render, so no tenant's response lands in the `dist/` file every tenant shares.
+    // Checked per source, so one that starts failing open is caught.
     #[tokio::test]
     async fn static_get_route_reading_tenant_fails_closed_for_every_tenancy_source() {
         async fn tenant_page(tenant: crate::tenancy::Tenant) -> String {
@@ -23485,17 +22243,9 @@ mount = ["service"]
             let mut config = AutumnConfig::default();
             config.tenancy.enabled = true;
             config.tenancy.source = source.to_owned();
-            // Exempt the route from `tenancy_middleware` itself (Codex review,
-            // PR #2505) so the request reaches `tenant_page` and the assertion
-            // below exercises `Tenant::from_request_parts`'s own fallback call to
-            // `extract_tenant_from_parts`, not just the middleware's earlier call
-            // to the same function. Without this, every synthetic build/ISR
-            // request is non-public and `tenancy_middleware` rejects it before the
-            // handler runs, so a regression making the extractor's fallback fail
-            // open would go undetected on a route listed in
-            // `[tenancy].public_paths` whose handler still reads `Tenant`
-            // directly. The `#[public]` macro attribute is a compile-time
-            // route-audit marker and has no effect on `tenancy_middleware`.
+            // A public path skips `tenancy_middleware`, so the request reaches the handler
+            // and this exercises the `Tenant` extractor's own fallback. (`#[public]` would
+            // not do: it only marks the route for the audit.)
             config.tenancy.public_paths = vec!["/storefront".to_owned()];
 
             let state = AppState::for_test();
@@ -23576,29 +22326,14 @@ mount = ["service"]
         }
     }
 
-    // ── Warden 2026-09-04 (Codex review, PR #2505): a failed rebuild does NOT
-    // invalidate a pre-existing static file ──────────────────────────────────
+    // ── A failed rebuild leaves an existing static file in place ───────────
     //
-    // The test above starts from an empty `dist/`, so "no file is written on
-    // failure" proves only that a fresh build never bakes in a cross-tenant
-    // response. It says nothing about a `dist/<route>/index.html` left from an
-    // earlier successful render. `render_static_routes` stages into a sibling
-    // `dist.staging` directory and swaps it in only once every route rendered
-    // successfully: the loop over `results` in `build.rs` returns on the first
-    // `Err`, before the atomic remove-and-rename, so a failure leaves the existing
-    // file untouched. ISR's `regenerate_page` has the same shape — it returns
-    // `Err` before any `std::fs::write`/`rename` on a non-2xx response — so a
-    // repeatedly-failing revalidation serves the same stale file forever, which is
-    // the documented stale-while-revalidate contract.
+    // `render_static_routes` stages into `dist.staging` and swaps it in only once every
+    // route rendered; ISR's `regenerate_page` returns before writing on a non-2xx. A
+    // failing render keeps serving the old file (stale-while-revalidate).
     //
-    // This does not reopen the cross-tenant hypothesis: nothing in Autumn writes a
-    // tenant-scoped response into `dist/` without a resolved tenant (see the sweep
-    // above). The realistic way a tenant-mismatched file lands there is
-    // operational — building with a different `[tenancy]` config than the one
-    // serving requests. But once such a file exists, this test shows Autumn has no
-    // mechanism to detect, invalidate, or expire it: a later tenant-resolution
-    // failure preserves it indefinitely, with no operator-visible signal beyond a
-    // log line. Documented as a known limitation rather than left implicit.
+    // Known limitation: a tenant-mismatched file (built with a different `[tenancy]`
+    // config than the one serving) is never detected or expired; only a log line shows it.
     #[tokio::test]
     async fn failed_rebuild_leaves_preexisting_static_file_untouched() {
         async fn tenant_page(tenant: crate::tenancy::Tenant) -> String {
@@ -23661,11 +22396,7 @@ mount = ["service"]
         let tmp = tempfile::tempdir().expect("dist parent");
         let dist = tmp.path().join("dist");
 
-        // Seed `dist/` as if an earlier, successful build/regeneration had
-        // captured tenant A's response (the operationally-realistic route:
-        // a build/serve `[tenancy]` config mismatch, not anything this
-        // framework's own request handling can produce — see the sweep
-        // above).
+        // Seed `dist/` as if an earlier successful build had captured tenant A's response.
         std::fs::create_dir_all(dist.join("storefront")).expect("mkdir storefront");
         let sentinel = "tenant-a-sentinel-warden-2026-09-04";
         std::fs::write(dist.join("storefront/index.html"), sentinel).expect("seed stale file");
@@ -23753,12 +22484,9 @@ mount = ["service"]
             .mail_delivery_queue_factory
             .expect("with_mail_delivery_queue should store a factory on the builder");
 
-        // Invoke the trivial wrapper closure built by with_mail_delivery_queue
-        // and verify it returns the wrapped queue successfully.
         let state = AppState::for_test();
         let queue = factory(&state).expect("trivial factory should produce the queue");
         assert!(Arc::strong_count(&queue) >= 1);
-        // Cover the enqueue method body by invoking it once.
         queue
             .enqueue(test_mail())
             .await
@@ -24283,7 +23011,6 @@ mount = ["service"]
         let config = AutumnConfig::default();
         let router = crate::router::build_router(route_list, &config, AppState::for_test());
 
-        // GET /admin should return "list"
         let resp = router
             .clone()
             .oneshot(
@@ -24300,7 +23027,7 @@ mount = ["service"]
             .unwrap();
         assert_eq!(&body[..], b"list");
 
-        // POST /admin should return "created" (not 405!)
+        // The second method on the same path is routed, not a 405.
         let resp = router
             .oneshot(
                 Request::builder()
@@ -24508,7 +23235,6 @@ mount = ["service"]
     async fn build_router_serves_static_files_for_unmatched_paths() {
         use std::collections::HashMap;
 
-        // Create a temp dist/ with a static page
         let tmp = tempfile::tempdir().expect("tempdir");
         let dist = tmp.path().join("dist");
         std::fs::create_dir_all(dist.join("docs")).expect("mkdir");
@@ -24535,8 +23261,7 @@ mount = ["service"]
             Some(dist.as_path()),
         );
 
-        // GET /docs/ should serve the pre-built HTML via static-first
-        // middleware (manifest lookup with trailing-slash normalization).
+        // The manifest lookup normalizes the trailing slash.
         let response = router
             .oneshot(
                 Request::builder()
@@ -24753,10 +23478,8 @@ mount = ["service"]
 
     #[tokio::test]
     async fn build_router_mounts_dev_reload_script_endpoint_when_enabled() {
-        // The injected <script src="/__autumn/live-reload.js"> tag only works
-        // under the default CSP (`script-src 'self'`) if the framework
-        // actually serves the JS at that path. This guards against the
-        // regression where the script endpoint is forgotten.
+        // The injected `<script src="/__autumn/live-reload.js">` works under the default
+        // CSP (`script-src 'self'`) only if the framework serves the JS at that path.
         let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
         std::fs::write(reload_file.path(), r#"{"version":0,"kind":"full"}"#).expect("write");
         temp_env::async_with_vars(
@@ -24897,8 +23620,7 @@ mount = ["service"]
 
     #[test]
     fn project_dir_defaults_to_subdir() {
-        // When AUTUMN_MANIFEST_DIR is not set, project_dir returns the
-        // subdir name as-is (relative to cwd).
+        // Without AUTUMN_MANIFEST_DIR the subdir stays relative to the cwd.
         let env = crate::config::MockEnv::new();
         let dir = super::project_dir("dist", &env);
         assert_eq!(dir, std::path::PathBuf::from("dist"));
@@ -25022,12 +23744,9 @@ mount = ["service"]
 
     #[tokio::test]
     async fn build_router_with_static_skips_without_manifest() {
-        // When dist/ exists but has no manifest.json, fall back to
-        // the app router without the static layer.
         let tmp = tempfile::tempdir().expect("tempdir");
         let dist = tmp.path().join("dist");
         std::fs::create_dir_all(&dist).expect("mkdir");
-        // No manifest.json — just an empty dist/
 
         let config = AutumnConfig::default();
         let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
@@ -25050,7 +23769,6 @@ mount = ["service"]
 
     #[tokio::test]
     async fn build_router_with_static_none_dist() {
-        // When dist_dir is None, return the app router directly.
         let config = AutumnConfig::default();
         let state = crate::state::AppState::from_inner(crate::state::AppStateInner {
             health_detailed: true,
@@ -25135,7 +23853,6 @@ mount = ["service"]
         assert!(output.contains("SecurityHeaders"));
         assert!(output.contains("Session (in-memory)"));
         assert!(output.contains("Metrics"));
-        // CORS and CSRF should not be present with defaults
         assert!(!output.contains("CORS"));
         assert!(!output.contains("CSRF"));
     }
@@ -25180,27 +23897,20 @@ mount = ["service"]
 
     #[test]
     fn mask_database_url_edge_cases() {
-        // Special chars in password
-        // The url crate parses `p@ssw:rd!` where `@` creates problems if unencoded,
-        // but url crate seems to treat `user:p` as auth and `@ssw:rd!` as host if it's poorly formed,
-        // let's stick to valid URL formats for testing.
-
-        // URL encoded characters
+        // Percent-encoded password.
         let masked2 = mask_database_url("postgres://user:p%40ssw%3Ard%21@localhost:5432/mydb", 10);
         assert!(masked2.contains("****"));
         assert!(!masked2.contains("p%40ssw%3Ard%21"));
         assert!(masked2.contains("postgres://user:****@localhost:5432/mydb"));
 
-        // No user, just password
+        // Password with no user.
         let masked3 = mask_database_url("postgres://:secret@localhost:5432/mydb", 10);
         assert!(masked3.contains("****"));
         assert!(!masked3.contains("secret"));
         assert!(masked3.contains("postgres://:****@localhost:5432/mydb"));
     }
-    // The point of routing this through the shared redactor: a SQLite operator
-    // reads their own path back out of the boot summary, and a Postgres
-    // operator keeps the connection policy they debug TLS with — while the
-    // shapes that carry a secret still go.
+    // A SQLite operator reads their path back from the boot summary and a Postgres operator
+    // keeps the TLS settings they debug with; only the parts that carry a secret are masked.
     #[test]
     fn mask_database_url_keeps_the_diagnostic_parts_of_a_target() {
         let sqlite = mask_database_url("sqlite:///var/lib/app.db", 1);
@@ -25279,9 +23989,7 @@ mount = ["service"]
 
     #[test]
     fn log_startup_transparency_runs_without_panic() {
-        // Exercises the tracing::info! calls inside log_startup_transparency.
-        // No subscriber installed, so output is discarded -- we just verify
-        // the function doesn't panic.
+        // No subscriber is installed, so this only checks that logging does not panic.
         let routes = vec![test_get_route("/", "index")];
         let tasks = vec![crate::task::TaskInfo {
             name: "cleanup".into(),
@@ -25312,13 +24020,11 @@ mount = ["service"]
 
         let task = crate::task::TaskInfo {
             name: "test_broadcaster".into(),
-            // 1ms delay so it fires immediately
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
             coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         };
 
-        // Start scheduler in background so we don't block
         let state_clone = state.clone();
         tokio::spawn(async move {
             super::start_task_scheduler(
@@ -25328,7 +24034,6 @@ mount = ["service"]
             );
         });
 
-        // First message should be "started"
         let msg1 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("timeout waiting for start event")
@@ -25337,7 +24042,6 @@ mount = ["service"]
         assert_eq!(json1["event"], "started");
         assert_eq!(json1["task"], "test_broadcaster");
 
-        // Second message should be "success"
         let msg2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("timeout waiting for success event")
@@ -25376,10 +24080,9 @@ mount = ["service"]
             );
         });
 
-        // First message: started
+        // Skip the "started" event.
         let _ = rx.recv().await.unwrap();
 
-        // Second message: failure
         let msg2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("timeout waiting for failure event")
@@ -25399,7 +24102,6 @@ mount = ["service"]
             super::execute_task_result(&state, handler, start, "test_task", "fixed_delay", false)
                 .await;
         assert!(result.is_ok(), "expected Ok from successful handler");
-        // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
     }
 
@@ -25948,7 +24650,6 @@ mount = ["service"]
         }
     }
 
-    // Issue #3052: a fixed-delay tick stays claimed for its whole delay.
     #[tokio::test]
     async fn fixed_delay_task_claims_its_tick_for_the_delay() {
         let coordinator = std::sync::Arc::new(PeriodRecordingCoordinator {
@@ -26024,7 +24725,6 @@ mount = ["service"]
         assert!(super::in_process_fleet_warning(&coordinated, &fleet, &crowd).is_none());
     }
 
-    // Issue #3052: the handler reads its tick and fencing token.
     #[tokio::test]
     async fn scheduled_handler_sees_its_tick_and_fencing_token() {
         let state = cron_test_state();
@@ -26676,14 +25376,14 @@ mount = ["service"]
         let fr = Arc::clone(&fast_ran);
 
         let hooks: Vec<ShutdownHook> = vec![
-            // hook 0 (first registered → runs LAST in LIFO): fast
+            // Registered first, so it runs last (LIFO).
             Box::new(move || {
                 let fr = Arc::clone(&fr);
                 Box::pin(async move {
                     fr.store(true, Ordering::SeqCst);
                 })
             }),
-            // hook 1 (last registered → runs FIRST in LIFO): slow, exceeds per-hook budget
+            // Runs first and overruns the per-hook budget.
             Box::new(|| {
                 Box::pin(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -26691,8 +25391,8 @@ mount = ["service"]
             }),
         ];
 
-        // Per-hook budget = 50 ms (hook 0 will overrun).
-        // Total budget = 1 s (ample for hook 1 after the overrun is cut short).
+        // Per-hook budget 50 ms (the slow hook overruns it); total 1 s, enough for the fast
+        // hook after the overrun is cut short.
         run_shutdown_hooks_with_timeout(
             &hooks,
             std::time::Duration::from_millis(50),
@@ -26706,8 +25406,7 @@ mount = ["service"]
         );
     }
 
-    // Verify that build_state registers a SharedReqwestClient so that
-    // Client::from_state can reuse the shared connection pool on every request.
+    // `Client::from_state` reuses this client's connection pool on every request.
     #[cfg(feature = "http-client")]
     #[test]
     fn build_state_registers_shared_reqwest_client() {
@@ -26729,8 +25428,8 @@ mount = ["service"]
         );
     }
 
-    // #3400 gap 1: a plugin adds its own stories. A second
-    // `with_story_gallery` call merges; it does not replace.
+    // #3400: a plugin adds its own stories. A second `with_story_gallery` call merges;
+    // it does not replace.
     #[cfg(feature = "maud")]
     #[test]
     fn with_story_gallery_accumulates_across_calls() {
@@ -26758,8 +25457,8 @@ mount = ["service"]
         assert_eq!(gallery.stylesheets(), ["/pack.css"]);
     }
 
-    // #3400 gap 1: the merge keeps the duplicate-slug panic. It fires when
-    // the registry is installed.
+    // #3400: the merge keeps the duplicate-slug panic. It fires when the registry is
+    // installed.
     #[cfg(feature = "maud")]
     #[test]
     #[should_panic(expected = "duplicate story slug")]
@@ -26877,10 +25576,8 @@ mount = ["service"]
         );
     }
 
-    // AC5 plumbing (#1526): `with_story_gallery` stores the gallery on the
-    // builder, and `install_story_registry` — the single install step shared
-    // by both the run and build/SSG state-construction paths — publishes it
-    // as the StoryRegistry extension the `/_stories` handlers read.
+    // #1526: `install_story_registry`, shared by the run and build/SSG paths, publishes the
+    // stored gallery as the `StoryRegistry` extension the `/_stories` handlers read.
     #[cfg(feature = "maud")]
     #[test]
     fn with_story_gallery_installs_story_registry_extension() {
@@ -26911,8 +25608,7 @@ mount = ["service"]
             "every registered story must reach the state extension"
         );
 
-        // Without a registered gallery no extension is installed: the
-        // handlers fall back to the empty default and serve the empty state.
+        // Without a gallery nothing is installed; the handlers serve the empty default.
         let bare_state = build_state(
             &config,
             #[cfg(feature = "db")]
@@ -27024,9 +25720,8 @@ mod unix_socket_tests {
             toml::from_str(&toml).expect("test ACME config parses")
         }
 
-        // Enabled custom domains: the pruner is installed. It carries no ACME
-        // issuer — pruning only touches the registry and the certificate
-        // store, so no order is placed and no CA is contacted.
+        // Custom domains enabled: the pruner is installed without an ACME issuer. Pruning
+        // touches only the registry and the certificate store, so no CA is contacted.
         let state = crate::state::AppState::for_test();
         super::install_custom_domain_retention_pruner(
             Some(&acme_with_custom_domains(true)),

@@ -320,10 +320,7 @@ pub fn negotiate<'a>(requested: &str, supported: &'a [String]) -> Option<&'a str
 /// in the header among equal `q`. Returns `None` if no entry matches.
 #[must_use]
 pub fn parse_accept_language<'a>(header: &str, supported: &'a [String]) -> Option<&'a str> {
-    // One pass, no buffer: the answer is the supported match with the highest
-    // `q`, and among equal `q` the earliest in the header — exactly what a
-    // stable descending sort followed by a first-match scan picks. This runs
-    // on most first-visit requests, so it should not allocate.
+    // One pass with no allocation: this runs on most first-visit requests.
     let mut best: Option<(f32, &'a str)> = None;
     for raw in header.split(',') {
         let mut parts = raw.split(';');
@@ -342,8 +339,7 @@ pub fn parse_accept_language<'a>(header: &str, supported: &'a [String]) -> Optio
         if q.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             continue;
         }
-        // Strictly greater only: an equal `q` later in the header loses the
-        // tie, so it need not even be negotiated.
+        // An equal `q` later in the header loses the tie, so skip negotiating it.
         if best.is_some_and(|(best_q, _)| q <= best_q) {
             continue;
         }
@@ -403,8 +399,7 @@ impl Bundle {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                // Treat missing dir as "no translations yet" so the
-                // missing-default-file branch produces a clear error.
+                // Report a missing directory as a missing default-locale file.
                 return Err(LoadError::MissingDefaultLocale {
                     locale: config.default_locale.clone(),
                     path: dir.join(format!("{}.ftl", config.default_locale)),
@@ -616,10 +611,9 @@ impl Bundle {
         self.miss_count.fetch_add(1, Ordering::Relaxed);
         let now = crate::time::ambient_instant();
         let should_warn = {
-            // Default a missing entry far enough in the past that the first
-            // miss warns immediately; saturating_sub guards against a
-            // hypothetical very-early Instant on platforms where the boot
-            // reference is small.
+            // A pair with no entry defaults to before the window, so its first miss warns.
+            // When `now` is too close to the clock's origin the default is `now`, and the
+            // first miss does not warn.
             let stale = now
                 .checked_sub(self.warn_dedup_window + Duration::from_secs(1))
                 .unwrap_or(now);
@@ -721,7 +715,6 @@ fn parse_ftl(src: &str, path: &Path) -> Result<HashMap<String, String>, LoadErro
             });
         }
 
-        // New entry — flush any previous one.
         flush(&mut messages, &mut current_key, &mut current_value);
 
         let Some((raw_key, raw_value)) = trimmed.split_once('=') else {
@@ -756,7 +749,6 @@ fn interpolate(template: &str, args: &[(&str, &str)]) -> String {
         out.push_str(&remaining[..open]);
         let after_open = &remaining[open + 1..];
         let Some(close_rel) = after_open.find('}') else {
-            // Unterminated `{` — emit the rest verbatim and stop.
             out.push_str(&remaining[open..]);
             return out;
         };
@@ -768,14 +760,12 @@ fn interpolate(template: &str, args: &[(&str, &str)]) -> String {
                 if let Some((_, val)) = args.iter().find(|(k, _)| *k == var) {
                     out.push_str(val);
                 } else {
-                    // Unknown var — preserve the original placeable literally.
                     out.push('{');
                     out.push_str(&after_open[..close_rel]);
                     out.push('}');
                 }
             }
             _ => {
-                // Not a `$name` placeable — pass through verbatim.
                 out.push('{');
                 out.push_str(&after_open[..close_rel]);
                 out.push('}');
@@ -794,23 +784,13 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Negotiation only reads the request, and every source it consults
-        // lives as long as the request does: borrow them instead of copying
-        // the supported list and the default on every extraction (this runs
-        // once in `AmbientLocaleLayer` and again per handler `Locale`).
+        // Borrow the supported list and default instead of copying them: this runs once in
+        // `AmbientLocaleLayer` and again per handler `Locale`.
         let parts: &Parts = parts;
-        // Pull bundle from request extensions if a previous middleware
-        // installed one. (Bundles are normally registered as an AppState
-        // extension and threaded through via a layer; for tests we build
-        // [`Locale`] directly via [`Locale::new`] / [`Locale::with_bundle`].)
         let bundle = parts.extensions.get::<Arc<Bundle>>();
-        // Read the router's `LocaleRoutingConfig` (issue #1251) regardless of
-        // whether a bundle is installed: when locale-prefix routing is on,
-        // the router's nests/redirects are built entirely from `I18nConfig`,
-        // so that config — not an independently-constructed `Bundle` — must
-        // be authoritative for which locales are actually reachable and
-        // what the fallback default is. The bundle stays authoritative only
-        // for `t()`/`t_with()` translation lookups (see `with_bundle` below).
+        // The router's `LocaleRoutingConfig` (#1251) outranks the bundle for negotiation:
+        // locale-prefix routes are built from `I18nConfig`, so it decides which locales are
+        // reachable and the default. The bundle still serves `t()`/`t_with()` lookups.
         let routing_config = parts.extensions.get::<LocaleRoutingConfig>();
         let supported: &[String] = routing_config
             .map(|c| c.supported_locales.as_slice())
@@ -821,9 +801,8 @@ where
             .or_else(|| bundle.map(|b| b.default_locale.as_str()))
             .unwrap_or("en");
 
-        // Resolution order: URL locale prefix (issue #1251, when the router's
-        // locale-prefix nesting matched) → query → session (signed cookie) →
-        // plain cookie (legacy / sessions-off) → Accept-Language → default.
+        // Resolution order: URL locale prefix (#1251) → query → session (signed cookie) →
+        // plain cookie (sessions off) → Accept-Language → default.
         let mut resolved = parts
             .extensions
             .get::<UriPrefixedLocale>()
@@ -842,13 +821,10 @@ where
         }
         let resolved = resolved.unwrap_or(default);
 
-        // #1384: publish this answer onto the ambient scope, if one is in
-        // effect. `AmbientLocaleLayer` runs the same resolution, but on some
-        // paths it sits outside middleware this extractor reads — most visibly
-        // the session on the SSG/ISG lane, where registered layers are applied
-        // outside the static-first middleware and so outside `SessionLayer`.
-        // Refining here keeps a `#[translatable]` field and a hand-taken
-        // `Locale` parameter from ever disagreeing. A no-op outside a scope.
+        // Publish onto the ambient scope, if any (#1384). `AmbientLocaleLayer` resolves too,
+        // but on some paths it sits outside middleware this extractor reads (on the SSG/ISG
+        // lane it runs outside `SessionLayer`). Refining here keeps a `#[translatable]` field
+        // and a `Locale` parameter in agreement.
         publish_ambient_locale(resolved);
 
         let mut locale = Self::new(resolved);
@@ -963,9 +939,8 @@ where
     }
 
     fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
-        // `Service::call` may be invoked on a clone that was never `poll_ready`
-        // -ed, so swap in the ready `self.inner` and keep the clone (the
-        // standard tower `Clone` dance).
+        // `call` may run on a clone that was never `poll_ready`-ed: take the ready
+        // `self.inner` and leave the clone in its place.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let chain = Arc::clone(&self.chain);
@@ -974,23 +949,17 @@ where
             let (mut parts, body) = req.into_parts();
             // Infallible rejection: the extractor always yields a locale.
             let Ok(locale) = Locale::from_request_parts(&mut parts, &()).await;
-            // Move the negotiated tag in and hand over the chain and default
-            // locale this layer snapshotted at construction: nothing is copied,
-            // and the process-wide defaults are not read.
+            // Use the chain and default snapshotted at construction, not the process-wide
+            // defaults.
             let scope = LocaleScope::from_shared(locale.tag, chain, default_locale);
             let req = axum::http::Request::from_parts(parts, body);
-            // Build the inner future INSIDE the scope as well as polling it
-            // there (the `HttpInterceptorService` pattern), so a nested layer
-            // that refines this scope from its own `call` — see
-            // [`LocalePrefixScopeLayer`] — finds it already established.
+            // Build the inner future inside the scope too, so a nested layer that refines the
+            // scope from its own `call` (`LocalePrefixScopeLayer`) finds it established.
             let inner_future = with_locale_scope_sync(scope.clone(), || inner.call(req));
             let response = with_locale_scope(scope.clone(), inner_future).await?;
-            // A deferred or streaming body (SSE, `Body::from_stream`, a chunked
-            // download) is polled AFTER the handler future resolves, outside
-            // the task-local scope — so a `Translated` rendered per frame would
-            // fall back to the default locale mid-response. Re-enter the same
-            // scope on every frame poll, exactly as `CurrentActorBody` and
-            // `TenantPropagatingBody` do for their own request-scoped values.
+            // A streaming body is polled after the handler future resolves, outside the
+            // task-local scope. Re-enter the scope on every frame poll so a `Translated`
+            // rendered per frame keeps the request's locale.
             Ok(response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope))))
         })
     }
@@ -1132,9 +1101,8 @@ where
         let default_locale = Arc::clone(&self.default_locale);
         Box::pin(async move {
             if let Some(scope) = ambient_locale_scope() {
-                // Refine in place: the app-wide layer's chain is authoritative,
-                // and the prefix outranks whatever it negotiated. Copied into
-                // the scope's existing buffer rather than a fresh `String`.
+                // Refine in place: the app-wide layer's chain is authoritative, and the
+                // prefix outranks whatever it negotiated.
                 scope.refine_tag(&locale);
                 let response = inner.call(req).await?;
                 return Ok(
@@ -1215,10 +1183,8 @@ fn resolve_query_override<'a>(parts: &Parts, supported: &'a [String]) -> Option<
 }
 
 async fn resolve_from_session<'a>(parts: &Parts, supported: &'a [String]) -> Option<&'a str> {
-    // Session is published into request extensions by SessionLayer. When it
-    // isn't (e.g. session feature disabled or layer not installed), this
-    // simply falls through. Reading is async because the session uses an
-    // RwLock under the hood — but no I/O happens here.
+    // Falls through when no `SessionLayer` published a session. The read is async only
+    // because of the session's lock; it does no I/O.
     let session = parts.extensions.get::<crate::session::Session>().cloned()?;
     let value = session.get(LOCALE_SESSION_KEY).await?;
     negotiate(&value, supported)
@@ -1572,7 +1538,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("en.ftl"), "hi = Hi\n").unwrap();
         std::fs::write(tmp.path().join("es.ftl"), "hi = Hola\n").unwrap();
-        // README.md should be ignored.
+        // Non-`.ftl` files are ignored.
         std::fs::write(tmp.path().join("README.md"), "ignore me").unwrap();
         let cfg = cfg("en", &["en", "es"]);
         let bundle = Bundle::load_from_dir(tmp.path(), &cfg).unwrap();
@@ -1655,8 +1621,7 @@ mod tests {
             let _ = bundle.translate("en", "missing", &[]);
         }
         assert_eq!(bundle.miss_count(), 5);
-        // No assertion on warn output (handled by subscriber); the public
-        // contract is that misses are counted.
+        // Warn output goes to the subscriber; the contract checked here is the miss count.
     }
 
     #[test]
@@ -1673,7 +1638,6 @@ mod tests {
     fn translate_leaves_unknown_args_visible() {
         let cfg = cfg("en", &["en"]);
         let bundle = bundle_with(&[("en", &[("greeting", "Hello, { $name }!")])], &cfg);
-        // No matching arg → keep template form, so the bug is loud.
         let out = bundle.translate("en", "greeting", &[]);
         assert!(out.contains("{ $name }"), "got: {out}");
     }
@@ -1903,7 +1867,6 @@ mod tests {
 
     #[tokio::test]
     async fn locale_extractor_resolution_order_is_query_then_cookie() {
-        // Query wins over cookie.
         let cfg = cfg("en", &["en", "es"]);
         let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
         let mut parts = build_parts(
@@ -1944,20 +1907,18 @@ mod tests {
         let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
         let mut parts = build_parts("/?locale=es", &[]);
         parts.extensions.insert(bundle.clone());
-        // Defensive: a bogus/unsupported injected value must not be trusted
-        // blindly — it should fall through to the next resolution step.
+        // An unsupported injected prefix is not trusted: resolution falls through.
         parts.extensions.insert(UriPrefixedLocale("zz".to_owned()));
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(locale.tag(), "es");
     }
 
-    // ── LocaleRoutingConfig fallback (issue #1251, Codex review) ──
+    // ── LocaleRoutingConfig fallback (issue #1251) ──
 
     #[tokio::test]
     async fn locale_routing_config_negotiates_without_a_bundle() {
-        // No Bundle installed — only a router-installed LocaleRoutingConfig,
-        // as happens when an app enables `locale_prefix_enabled` without
-        // calling `.i18n()`/`.i18n_auto()`.
+        // No bundle, only the router's `LocaleRoutingConfig`: an app that enables
+        // `locale_prefix_enabled` without `.i18n()`/`.i18n_auto()`.
         let mut parts = build_parts("/", &[(header::ACCEPT_LANGUAGE.as_str(), "fr-CA,fr;q=0.9")]);
         parts.extensions.insert(LocaleRoutingConfig {
             supported_locales: vec!["fr".to_owned(), "en".to_owned()],
@@ -2001,14 +1962,7 @@ mod tests {
 
     #[tokio::test]
     async fn locale_routing_config_takes_precedence_over_bundle_for_negotiation() {
-        // Both installed (e.g. app calls .i18n_auto() AND enables
-        // locale_prefix_enabled) — the router's `LocaleRoutingConfig` must
-        // win for NEGOTIATION, since the router's nests/redirects are built
-        // entirely from `I18nConfig`: a locale the bundle "supports" but the
-        // router doesn't route is unreachable anyway, and a locale the
-        // router routes but the bundle doesn't list must still negotiate
-        // successfully (see `bundle_translation_lookup_still_works_when_locale_routing_config_wins`
-        // for confirmation the bundle remains authoritative for `t()`).
+        // Both installed: `.i18n_auto()` plus `locale_prefix_enabled`.
         let cfg = cfg("en", &["en", "es"]);
         let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
         let mut parts = build_parts("/", &[(header::ACCEPT_LANGUAGE.as_str(), "fr-CA,fr;q=0.9")]);
@@ -2028,9 +1982,8 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_translation_lookup_still_works_when_locale_routing_config_wins() {
-        // Negotiation lands on "es" via LocaleRoutingConfig even though the
-        // bundle's own supported_locales/default_locale disagree — but the
-        // bundle itself must still be attached, so `t()` keeps working.
+        // Negotiation follows `LocaleRoutingConfig`, not the bundle's own locales, but the
+        // bundle stays attached so `t()` works.
         let cfg = cfg("en", &["en", "es"]);
         let bundle = Arc::new(bundle_with(
             &[

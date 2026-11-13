@@ -214,23 +214,20 @@ async fn discover(
     lookup: &dyn DnsLookup,
 ) -> Vec<SocketAddr> {
     use futures::{FutureExt as _, StreamExt as _};
-    // The `_acme-challenge` label stays on: it can itself be a delegated zone
-    // with its own NS records, which is a recommended way to give an ACME
-    // client credentials that reach nothing else. Stripping it skipped that
-    // zone and asked the PARENT's nameservers, which answer a referral rather
-    // than the TXT value — so a correctly published record could only ever time
-    // out. It is simply the most specific candidate, tried first (issue #1620).
+    // Keep the `_acme-challenge` label: it can be a delegated zone of its own, and
+    // the parent's nameservers would answer a referral rather than the TXT value,
+    // so the record could never be seen (#1620).
     let base = normalize_name(fqdn);
     let labels: Vec<&str> = base.split('.').filter(|l| !l.is_empty()).collect();
     let zones: Vec<String> = (0..labels.len().saturating_sub(1))
         .map(|start| labels[start..].join("."))
         .collect();
-    // Candidate zones are asked `MAX_ZONE_PROBES` at a time, most specific
-    // first, so a hostname with many labels cannot start a lookup for each at
-    // once. A resolver that fails a query is not asked again, so one that
-    // drops packets costs one query timeout in total (#2642).
-    // Boxed first: a lazily mapped iterator here makes the future not `Send`
-    // for every lifetime, which the spawned tasks need.
+    // Candidate zones are asked `MAX_ZONE_PROBES` at a time, most specific first,
+    // so a long hostname cannot start a lookup per label at once. A failed
+    // resolver is not asked again, so one that drops packets costs one timeout
+    // in total (#2642).
+    // Boxed first: a lazily mapped iterator makes the future not `Send` for every
+    // lifetime, which the spawned tasks need.
     let probes: Vec<BoxFuture<'_, Vec<String>>> = zones
         .iter()
         .map(|zone| {
@@ -874,9 +871,8 @@ pub fn parse_response(id: u16, name: &str, msg: &[u8]) -> Result<DnsAnswer, Stri
             .ok_or_else(|| "an answer record's RDATA is truncated".to_owned())?;
         let rdata = match rtype {
             QTYPE_TXT => Rdata::Txt(decode_txt_rdata(&msg[header_end..rdata_end])?),
-            // An NS target is a domain name in the message, so it may be
-            // compressed against an earlier one — decode it against the WHOLE
-            // message rather than the RDATA slice.
+            // NS and CNAME targets may be compressed against earlier names, so
+            // decode against the whole message, not the RDATA slice.
             QTYPE_NS | QTYPE_CNAME => Rdata::Name(read_name(msg, header_end)?.0),
             QTYPE_A if rdlength == 4 => Rdata::A(std::net::Ipv4Addr::new(
                 msg[header_end],
@@ -1121,9 +1117,8 @@ pub async fn wait_for_propagation(
         return Ok(());
     }
     let wanted = group_by_name(records);
-    // Checked per name rather than once: a name can only be confirmed if
-    // *something* answers for it, and with per-zone targets one name having no
-    // server is possible while another has several.
+    // Checked per name: with per-zone targets, one name can have no server while
+    // another has several.
     if let Some((fqdn, _)) = wanted
         .iter()
         .find(|(fqdn, _)| targets.for_name(fqdn).0.is_empty())
@@ -1143,12 +1138,10 @@ pub async fn wait_for_propagation(
         'round: for (fqdn, expected) in &wanted {
             let (servers, authoritative) = targets.for_name(fqdn);
             for resolver in servers {
-                // Recursion is desired only on the FALLBACK path. An
-                // authoritative server answers for its own zone without it, and
-                // asking it to recurse is meaningless. A recursive resolver
-                // asked with RD=0 answers purely from cache, so a name it has
-                // never looked up comes back empty or REFUSED no matter how
-                // long the wait runs — the fallback must ask it to resolve.
+                // Recursion only on the fallback path: an authoritative server
+                // answers for its zone without it, and a recursive resolver asked
+                // with RD=0 answers only from cache, so a name it never looked up
+                // stays empty or REFUSED however long the wait runs.
                 let (missing, observed) = match lookup
                     .query(*resolver, fqdn, QTYPE_TXT, !authoritative)
                     .await
@@ -1163,9 +1156,8 @@ pub async fn wait_for_propagation(
                         };
                         (missing, observed)
                     }
-                    // A resolver error is a not-yet, not a hard failure: a
-                    // freshly-created name often SERVFAILs while the zone
-                    // catches up. It is recorded so the timeout can report it.
+                    // A resolver error is a not-yet: a fresh name often SERVFAILs
+                    // while the zone catches up. It is kept for the timeout report.
                     Err(e) => (expected.clone(), e),
                 };
                 if !missing.is_empty() {
@@ -1174,9 +1166,8 @@ pub async fn wait_for_propagation(
                         missing,
                         resolver: resolver.to_string(),
                         observed,
-                        // Filled in below with the ELAPSED time; the loop may
-                        // run one round past the deadline, so the configured
-                        // budget would systematically understate the wait.
+                        // Set below to the elapsed time: the loop can run one
+                        // round past the deadline, so the budget understates it.
                         waited_secs: 0,
                     });
                     all_visible = false;
@@ -1193,9 +1184,8 @@ pub async fn wait_for_propagation(
         if now >= deadline {
             break;
         }
-        // Loop back for another round even when the sleep crossed the deadline:
-        // the budget is spent on probing, and the deadline check at the top of
-        // the next iteration is what ends the wait.
+        // Probe once more even if the sleep crossed the deadline; the check after
+        // that round ends the wait.
         tokio::time::sleep(poll_interval.min(deadline - now)).await;
     }
 
@@ -1326,8 +1316,7 @@ mod tests {
         assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), FLAG_RECURSION_DESIRED);
         assert_eq!(u16::from_be_bytes([msg[4], msg[5]]), 1, "QDCOUNT");
         assert_eq!(query_name(&msg), "_acme-challenge.myapp.com");
-        // QTYPE/QCLASS sit right after the root label, BEFORE the EDNS0 OPT
-        // record the query now appends (see `a_query_advertises_an_edns0_buffer`).
+        // QTYPE/QCLASS follow the root label, before the 11-byte EDNS0 OPT record.
         let qtype_at = msg.len() - 11 - 4;
         assert_eq!(&msg[qtype_at..qtype_at + 4], &[0, 16, 0, 1], "TXT/IN");
         // A trailing dot is the same name.
@@ -1424,10 +1413,9 @@ mod tests {
         assert!(decode_txt_rdata(&[5, b'a']).is_err());
     }
 
-    // EDNS0 (RFC 6891): without an OPT record advertising a bigger buffer, a
-    // server caps the answer at 512 bytes and sets TC — which the propagation
-    // wait would then retry for its whole budget against a record that IS
-    // published.
+    // EDNS0 (RFC 6891): without an OPT record a server caps the answer at 512
+    // bytes and sets TC, and the wait would retry a published record for its
+    // whole budget.
     #[test]
     fn a_query_advertises_an_edns0_buffer() {
         let msg = encode_txt_query(0x1234, "_acme-challenge.myapp.com").expect("encodes");
@@ -1652,9 +1640,8 @@ mod tests {
         }
     }
 
-    // The whole point of the authoritative probe: the zone's own nameservers are
-    // found from the challenge FQDN, with the `_acme-challenge` label dropped and
-    // the NS names resolved to addresses.
+    // The zone's own nameservers are found from the challenge FQDN, and their NS
+    // names resolved to addresses.
     #[tokio::test]
     async fn authoritative_discovery_finds_the_zones_nameservers() {
         let lookup = DiscoveryLookup::new(
@@ -1677,9 +1664,8 @@ mod tests {
                 SocketAddr::from(([198, 51, 100, 7], 53)),
             ]
         );
-        // The challenge name is TRIED first — it can itself be a delegated zone
-        // (#1620) — and when it is not, the walk asks about the zone that
-        // actually holds the record.
+        // The challenge name is tried first, since it can be a delegated zone
+        // (#1620); when it is not, the walk reaches the zone that holds the record.
         let asked = lookup.asked.lock().unwrap().clone();
         assert!(
             asked.contains(&("myapp.com".to_owned(), QTYPE_NS)),
@@ -2184,8 +2170,8 @@ mod tests {
         }
     }
 
-    // Codex review on #2936: a resolver that drops packets costs one timeout
-    // for the whole CNAME chain, not one per hop.
+    // #2936: a resolver that drops packets costs one timeout for the whole
+    // CNAME chain, not one per hop.
     #[tokio::test(start_paused = true)]
     async fn a_dead_resolver_costs_one_timeout_across_cname_hops() {
         let values = txt_values(
@@ -2248,8 +2234,8 @@ mod tests {
         }
     }
 
-    // Codex review on #2936: a CNAME target is asked at once, not after every
-    // nameserver of the current hop has answered.
+    // #2936: a CNAME target is asked at once, not after every nameserver of the
+    // current hop has answered.
     #[tokio::test(start_paused = true)]
     async fn a_cname_target_is_asked_without_waiting_for_a_silent_nameserver() {
         let values = txt_values(
@@ -2308,9 +2294,8 @@ mod tests {
         }
     }
 
-    // Codex review on #2936: a resolver that drops packets costs discovery one
-    // timeout in total, not one per zone candidate, so the zone's nameserver
-    // is still reached inside the deadline.
+    // #2936: a resolver that drops packets costs discovery one timeout in total, not one per zone
+    // candidate, so the zone's nameserver is still reached inside the deadline.
     #[tokio::test(start_paused = true)]
     async fn a_dead_resolver_does_not_stall_discovery_past_the_deadline() {
         let started = tokio::time::Instant::now();
@@ -2394,8 +2379,8 @@ mod tests {
         }
     }
 
-    // Codex review on #2936: an answer that arrived before the deadline counts,
-    // even when another authoritative server is still silent at the deadline.
+    // #2936: an answer that arrived before the deadline counts, even when another authoritative
+    // server is still silent at the deadline.
     #[tokio::test(start_paused = true)]
     async fn answers_in_before_the_deadline_survive_a_silent_nameserver() {
         let values = txt_values(
@@ -2561,8 +2546,7 @@ mod tests {
         );
     }
 
-    // Codex review on #2936: a zone whose nameservers have only IPv6
-    // addresses is still found.
+    // #2936: a zone whose nameservers have only IPv6 addresses is still found.
     #[tokio::test]
     async fn discovery_finds_ipv6_only_nameservers() {
         let lookup = TableLookup::new(
@@ -2582,8 +2566,8 @@ mod tests {
         );
     }
 
-    // Codex review on #2936: a hostname with many labels does not start an NS
-    // lookup for every candidate zone at once.
+    // #2936: a hostname with many labels does not start an NS lookup for
+    // every candidate zone at once.
     #[tokio::test(start_paused = true)]
     async fn discovery_caps_how_many_zones_it_asks_at_once() {
         let lookup = TableLookup::new(
@@ -2598,9 +2582,8 @@ mod tests {
         assert!(peak <= MAX_ZONE_PROBES, "{peak} NS lookups at once");
     }
 
-    // Codex review on #2936: a resolver that drops packets is not asked
-    // again, so a hostname with many labels still reaches its zone's
-    // nameserver after one query timeout.
+    // #2936: a resolver that drops packets is not asked again, so a hostname with many labels still
+    // reaches its zone's nameserver after one query timeout.
     #[tokio::test(start_paused = true)]
     async fn a_dead_resolver_costs_one_timeout_for_a_long_hostname() {
         let started = tokio::time::Instant::now();
@@ -2615,8 +2598,7 @@ mod tests {
         );
     }
 
-    // Codex review on #2936: a large NS set does not start an address lookup
-    // for every name.
+    // #2936: a large NS set does not start an address lookup for every name.
     #[tokio::test]
     async fn discovery_caps_how_many_nameservers_it_resolves() {
         const NAMES: [&str; 40] = [
@@ -2683,8 +2665,7 @@ mod tests {
         assert!(asked <= 2 * MAX_NAMESERVERS, "{asked} address lookups");
     }
 
-    // Codex review on #2936: a dual-stack nameserver keeps both addresses,
-    // even when the A answer comes first.
+    // #2936: a dual-stack nameserver keeps both addresses, even when the A answer comes first.
     #[tokio::test(start_paused = true)]
     async fn discovery_keeps_both_addresses_of_a_dual_stack_nameserver() {
         let mut lookup = TableLookup::new(
@@ -2754,8 +2735,8 @@ mod tests {
         }
     }
 
-    // Codex review on #2936: an empty AAAA answer from one resolver does not
-    // stop the wait for another resolver's AAAA records.
+    // #2936: an empty AAAA answer from one resolver does not stop the wait for
+    // another resolver's AAAA records.
     #[tokio::test(start_paused = true)]
     async fn an_empty_answer_does_not_cut_off_the_other_address_family() {
         let found = authoritative_resolvers(
@@ -2801,8 +2782,6 @@ mod tests {
         assert_eq!(lookup.call_count(), 2);
     }
 
-    // AC5: "a bounded, documented wait for TXT record propagation whose timeout
-    // error names the exact record that failed to propagate."
     #[tokio::test]
     async fn a_timeout_names_the_record_the_value_and_the_resolver() {
         let lookup = ScriptedLookup::new(Vec::new()); // every resolver: NXDOMAIN

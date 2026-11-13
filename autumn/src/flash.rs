@@ -348,11 +348,9 @@ pub fn flash_messages_with(
                     role=(role) aria-live=(live) {
                     span class="autumn-flash__body" { (msg.message) }
                     @if config.dismissible {
-                        // The checkbox stays in tab order (visually hidden but
-                        // focusable via `.autumn-flash__dismiss-toggle`, never
-                        // `hidden`/`display:none`) so keyboard and screen-reader
-                        // users can dismiss; the accessible name is on the
-                        // control itself.
+                        // The checkbox stays in tab order (visually hidden by its class, never
+                        // `hidden` or `display:none`) so keyboard and screen-reader users can
+                        // dismiss.
                         label class="autumn-flash__dismiss" {
                             input type="checkbox" class="autumn-flash__dismiss-toggle"
                                 aria-label="Dismiss this message";
@@ -430,10 +428,8 @@ mod tests {
         assert_eq!(messages[1].level, FlashLevel::Error);
         assert_eq!(messages[1].message, "Failed!");
 
-        // Still there after peek
         assert_eq!(flash.peek().await.len(), 2);
 
-        // Consume removes them
         let consumed = flash.consume().await;
         assert_eq!(consumed.len(), 2);
         assert_eq!(flash.peek().await.len(), 0);
@@ -450,21 +446,18 @@ mod tests {
     #[tokio::test]
     async fn should_not_remove_key_when_consuming_empty_flash() -> Result<(), String> {
         let session = Session::new_for_test("test_id".to_string(), HashMap::new());
-        // Insert a dummy key to verify the session remains untouched and "dirty" flag logic
+        // Consuming an empty flash must leave the rest of the session untouched.
         session.insert("dummy", "val").await;
 
         let flash = Flash::new(session.clone());
         let messages = flash.consume().await;
 
-        // No messages were present
         assert_eq!(messages.len(), 0);
 
-        // "dummy" key is still there
         assert_eq!(
             session.get("dummy").await.ok_or("missing key dummy")?,
             "val"
         );
-        // Flash key shouldn't be added or touched
         assert!(!session.contains_key(FLASH_SESSION_KEY).await);
         Ok(())
     }
@@ -472,7 +465,6 @@ mod tests {
     #[tokio::test]
     async fn should_handle_invalid_json_gracefully() {
         let session = Session::new_for_test("test_id".to_string(), HashMap::new());
-        // Insert broken JSON manually
         session
             .insert(FLASH_SESSION_KEY, "{ invalid_json: true")
             .await;
@@ -480,7 +472,6 @@ mod tests {
         let flash = Flash::new(session);
         let messages = flash.peek().await;
 
-        // It should gracefully fall back to an empty vector rather than panicking
         assert_eq!(messages.len(), 0);
     }
 
@@ -522,13 +513,11 @@ mod tests {
             "missing container: {markup}"
         );
         assert!(markup.contains("aria-live=\"polite\""));
-        // Per-message level classes and text.
         assert!(markup.contains("flash flash-success"));
         assert!(markup.contains("Saved!"));
         assert!(markup.contains("flash flash-error"));
         assert!(markup.contains("Oops"));
-        // Styling is class-based (served stylesheet), not inline — keeps it
-        // compatible with a strict `style-src 'self'` CSP / nonce mode.
+        // Class-based styling only, so a strict `style-src 'self'` CSP still applies it.
         assert!(
             !markup.contains("style="),
             "must not emit inline styles: {markup}"
@@ -536,7 +525,7 @@ mod tests {
         // A plain full-page render is not an out-of-band swap.
         assert!(!markup.contains("hx-swap-oob"));
 
-        // render() consumes — the next render is empty.
+        // render() consumes.
         assert_eq!(flash.peek().await.len(), 0);
     }
 
@@ -546,8 +535,7 @@ mod tests {
         let session = Session::new_for_test("test_id".to_string(), HashMap::new());
         let flash = Flash::new(session);
 
-        // No messages pushed — the container must still render so htmx OOB
-        // swaps have a stable target on subsequent requests.
+        // The empty container stays as the target of later htmx OOB swaps.
         let markup = flash.render().await.into_string();
         assert!(
             markup.contains("id=\"flash\""),
@@ -580,7 +568,6 @@ mod tests {
     #[test]
     #[cfg(feature = "maud")]
     fn flash_messages_empty_slice_renders_nothing() {
-        // No container, no empty live region.
         assert_eq!(flash_messages(&[]).into_string(), "");
         assert_eq!(
             flash_messages_with(&[], &FlashMessagesConfig::new().dismissible(true)).into_string(),
@@ -591,7 +578,6 @@ mod tests {
     #[test]
     #[cfg(feature = "maud")]
     fn flash_messages_maps_severity_to_live_region() {
-        // Success/Info are polite; Error/Warning are assertive.
         for (level, role, live) in [
             (FlashLevel::Success, "status", "polite"),
             (FlashLevel::Info, "status", "polite"),
@@ -640,7 +626,7 @@ mod tests {
             level: FlashLevel::Success,
             message: "Saved!".into(),
         }];
-        // Class-based styling only — CSP `style-src 'self'` / nonce-mode safe.
+        // Inline styles would break under a strict `style-src 'self'` CSP.
         assert!(!flash_messages(&msg).into_string().contains("style="));
     }
 
@@ -651,13 +637,11 @@ mod tests {
             level: FlashLevel::Info,
             message: "Heads up".into(),
         }];
-        // Default: no dismiss control.
         assert!(
             !flash_messages(&msg)
                 .into_string()
                 .contains("autumn-flash__dismiss")
         );
-        // Opt-in: a checkbox-hack control, no JS attributes.
         let dismissible =
             flash_messages_with(&msg, &FlashMessagesConfig::new().dismissible(true)).into_string();
         assert!(
@@ -667,9 +651,7 @@ mod tests {
         assert!(dismissible.contains(r#"type="checkbox""#), "{dismissible}");
         assert!(!dismissible.contains("onclick"), "{dismissible}");
         assert!(!dismissible.contains("<script"), "{dismissible}");
-        // WCAG 2.1.1: the toggle must NOT be `hidden` (that removes it from tab
-        // order) — it stays focusable via the sr-only toggle class, with the
-        // accessible name on the control itself.
+        // WCAG 2.1.1: `hidden` would take the toggle out of tab order.
         assert!(
             !dismissible.contains(r#"autumn-flash__dismiss-toggle" hidden"#),
             "toggle must not be `hidden`: {dismissible}"

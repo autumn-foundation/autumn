@@ -238,8 +238,6 @@ macro_rules! sometimes {
 mod tests {
     use super::{SometimesRegistry, reset_sometimes_registry, sometimes_snapshot};
 
-    // The pure registry: observe records observed; satisfied only when the flag
-    // is set; unsatisfied is exactly observed − satisfied, sorted.
     #[test]
     fn registry_tracks_observed_and_satisfied() {
         let mut reg = SometimesRegistry::new();
@@ -256,7 +254,7 @@ mod tests {
             reg.satisfied().iter().cloned().collect::<Vec<_>>(),
             vec!["a", "c"]
         );
-        // Sorted, stable: only "b" was seen but never satisfied.
+        // Only "b" was seen but never satisfied.
         assert_eq!(
             reg.unsatisfied().into_iter().collect::<Vec<_>>(),
             vec!["b".to_owned()]
@@ -273,8 +271,7 @@ mod tests {
         assert!(reg.unsatisfied().is_empty());
     }
 
-    // The thread-local plumbing: this test owns its thread (libtest runs each
-    // `#[test]` on its own thread), so resetting first keeps it hermetic.
+    // libtest runs each `#[test]` on its own thread, so resetting first keeps this hermetic.
     #[test]
     fn thread_local_snapshot_reflects_observations() {
         reset_sometimes_registry();

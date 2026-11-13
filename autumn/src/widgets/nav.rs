@@ -180,10 +180,8 @@ fn nav_link_is_active(current_path: &str, href: &str, mode: NavLinkMatch) -> boo
             if current_path == href {
                 return true;
             }
-            // Normalize a trailing slash so "/posts/" behaves the same as
-            // "/posts", but preserve a bare "/" rather than trimming it to an
-            // empty prefix — same convention as tenancy::is_public_path, since
-            // an empty prefix would otherwise match every absolute path.
+            // "/posts/" matches like "/posts", but a bare "/" is kept: an empty prefix would
+            // match every path.
             let href = if href.len() > 1 {
                 href.trim_end_matches('/')
             } else {
@@ -1355,9 +1353,7 @@ mod tests {
     fn breadcrumb_last_crumb_is_not_a_link() {
         let crumbs = [Crumb::link("Home", "/"), Crumb::current("Current Page")];
         let html = breadcrumb(&crumbs).into_string();
-        // "Current Page" must not be wrapped in an <a>; it carries aria-current="page" instead.
         assert!(html.contains("Current Page"), "{html}");
-        // The current page span must not itself be a link.
         assert!(!html.contains("<a href=\"\">Current Page"), "{html}");
         assert!(html.contains("aria-current=\"page\""), "{html}");
         assert!(html.contains("autumn-breadcrumb__current"), "{html}");
@@ -1367,7 +1363,7 @@ mod tests {
     fn breadcrumb_single_crumb_no_leading_separator() {
         let crumbs = [Crumb::current("Only Page")];
         let html = breadcrumb(&crumbs).into_string();
-        // No separator before the first (and only) item
+        // Separators are aria-hidden, and none precedes the first item.
         assert!(!html.contains("aria-hidden"), "{html}");
         assert!(html.contains("Only Page"), "{html}");
     }
@@ -1387,7 +1383,6 @@ mod tests {
             Crumb::current("Current"),
         ];
         let html = breadcrumb(&crumbs).into_string();
-        // Every separator must carry aria-hidden="true"
         assert!(html.contains(r#"aria-hidden="true""#), "{html}");
     }
 
@@ -1428,15 +1423,13 @@ mod tests {
 
     #[test]
     fn breadcrumb_non_last_crumb_without_href_renders_span_not_bare_text() {
-        // A Crumb with href:None in a non-last position must still be wrapped
-        // in a <span> so it has an accessible element, not invisible bare text.
+        // An unlinked crumb before the last still gets a `<span>`, not bare text.
         let crumbs = [Crumb::current("Unlinked Middle"), Crumb::current("Current")];
         let html = breadcrumb(&crumbs).into_string();
         assert!(
             html.contains("<span class=\"autumn-breadcrumb__text\">Unlinked Middle</span>"),
             "{html}"
         );
-        // Only the last item carries aria-current
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
     }
 
@@ -1478,7 +1471,6 @@ mod tests {
 
     #[test]
     fn nav_link_prefix_mode_rejects_false_positive() {
-        // "/admin/postsX" must NOT match "/admin/posts" as a prefix.
         let html = nav_link_matched(
             "/admin/postsX",
             "/admin/posts",
@@ -1504,7 +1496,6 @@ mod tests {
 
     #[test]
     fn nav_link_prefix_mode_trailing_slash_href_still_matches() {
-        // href with a trailing slash must behave the same as without one.
         let html = nav_link_matched(
             "/admin/posts/3/edit",
             "/admin/posts/",
@@ -1517,7 +1508,6 @@ mod tests {
 
     #[test]
     fn nav_link_prefix_mode_empty_href_never_matches() {
-        // An empty href must never act as a wildcard that matches every path.
         let html = nav_link_matched("/admin/posts/3/edit", "", "Posts", NavLinkMatch::Prefix)
             .into_string();
         assert!(!html.contains("active"), "{html}");
@@ -1526,8 +1516,6 @@ mod tests {
 
     #[test]
     fn nav_link_prefix_mode_root_href_does_not_match_every_path() {
-        // href="/" must not wildcard-match every path either; only an exact "/"
-        // current_path is active.
         let html =
             nav_link_matched("/admin/posts", "/", "Home", NavLinkMatch::Prefix).into_string();
         assert!(!html.contains("active"), "{html}");
@@ -1796,9 +1784,7 @@ mod tests {
 
     #[test]
     fn nav_item_constructors_accept_owned_strings_without_extra_copy() {
-        // href/label should accept `impl Into<String>` (like Cta::primary),
-        // not force callers with an already-owned String (e.g. from
-        // format!()) through an extra borrow-then-reallocate round trip.
+        // `impl Into<String>` moves an owned `String` in instead of borrowing and copying it.
         let post_id = 3;
         let href: String = format!("/posts/{post_id}");
         let label: String = "Posts".to_string();

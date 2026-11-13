@@ -675,9 +675,8 @@ impl NodeIds {
 /// `-<hash>` suffix and the `<rev>` are dropped too: the rev changes at every
 /// dependency update.
 pub(crate) fn location(file: &str, line: u32) -> String {
-    // Separators first: on Windows `file!()` yields backslashes, so a graph
-    // committed from Linux would otherwise read as drift on every node, and the
-    // registry shortening below would not match at all.
+    // On Windows `file!()` yields backslashes. Unnormalized, every node would read as drift
+    // against a graph committed from Linux, and the registry shortening would never match.
     let file = file.replace('\\', "/");
     let normalized = shorten_dependency_path(&file);
     format!("{normalized}:{line}")
@@ -826,11 +825,8 @@ fn resolve_edges(
                     symbol: (*symbol).to_owned(),
                 };
                 match edges.get_mut(&key) {
-                    // A signature edge outranks a body edge for the same pair:
-                    // an extractor is a stronger statement than a name in the
-                    // body, and the report should say the stronger one. The
-                    // access still merges: a write through any symbol is a
-                    // write to the target.
+                    // A signature edge (an extractor) outranks a body edge for the same pair.
+                    // Access still merges: a write through any symbol writes the target.
                     Some(existing) if existing.provenance <= candidate.provenance => {
                         if candidate.access == Access::Write {
                             existing.access = Access::Write;
@@ -1008,33 +1004,25 @@ fn add_repository_nodes<'a>(
                 job: None,
             },
         );
-        // `#[repository(Post)]` states its model outright, so this edge is a
-        // declaration rather than a name match. It is resolved through the
-        // symbol index all the same, so a repository over a model no `#[model]`
-        // declared produces no dangling edge.
+        // `#[repository(Post)]` declares its model, but the edge only targets a model that a
+        // `#[model]` declared, so a repository over an undeclared model gets no dangling edge.
+        // The model's relations are included at the same strength: `#[votable]` and
+        // `#[commentable]` put their methods on this repository, so a route holding it reaches
+        // those edge tables without naming them.
         //
-        // The model's declared *relations* are folded in for the same reason
-        // and at the same strength: `#[votable]` and `#[commentable]` put their
-        // generated methods on this repository, so a route holding it reaches
-        // those edge tables too — without ever naming them.
+        // The model is picked by (name, table): name alone also matched another crate's model
+        // of the same name (#2520). A repository that overrides its table matches no pair and
+        // falls back to the name, so no edge is lost.
         //
-        // The repository carries its resolved table, so the model is picked by
-        // (name, table). Name alone also picked up another crate's model of the
-        // same name (#2520). Only a repository that overrides the table finds
-        // no such pair; it falls back to the name, so no edge is lost.
-        //
-        // Two versions of one crate can each declare the model. The repository
-        // uses the model of its own crate and crate version. If no model
-        // matches, it keeps all of them (#2520 item 14). This step comes
-        // before the table step, so a table of the other version cannot hide
-        // the own model.
+        // When two versions of one crate each declare the model, the repository uses the one
+        // from its own crate version, or all of them if none matches. This runs before the
+        // table step, so a table of the other version cannot hide the repository's own model.
         let mine = |m: &ModelGraphDescriptor| {
             crate_root(m.module_path) == crate_root(repo.module_path)
                 && m.crate_version == repo.crate_version
         };
-        // A model of the repository's crate in another version is dropped,
-        // also when that version moved it to another module. A model of
-        // another crate stays.
+        // Drops a model of the repository's crate in another version, even one moved to
+        // another module. Models of other crates stay.
         let own_version = |found: Vec<&'a ModelGraphDescriptor>| {
             let has_mine = found.iter().any(|m| mine(m));
             found
@@ -1140,12 +1128,9 @@ fn add_route_nodes(
         paths.sort();
         paths.dedup();
         let hit = hits.first().copied();
-        // A route's access is read off its *declared method*, and not off any
-        // mutation evidence in its tokens. A page that renders `hx-delete=(…)`
-        // on a link names `delete` in its body while being a read-only GET, and
-        // reporting it as a writer would make the write set useless. The method
-        // is the declaration: a GET that mutates is a bug in the handler, not a
-        // fact for this document to launder.
+        // Access comes from the declared method, not from mutation words in the tokens: a
+        // read-only GET that renders `hx-delete=(…)` names `delete` in its body. A GET that
+        // mutates is a handler bug, not a fact for the graph to report.
         let access = method_access(route.method);
         nodes.insert(
             id.clone(),
@@ -1299,10 +1284,8 @@ fn add_auto_api_nodes(
     nodes: &mut BTreeMap<String, GraphNode>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
 ) -> MountedSurface {
-    // `#[repository(api = "/api/posts")]` mounts a CRUD surface no `#[route]`
-    // declares. The mount prefix is declared, so attributing these routes to
-    // their repository is a declaration too — and without them a query for the
-    // routes touching a table would miss its entire REST surface.
+    // `#[repository(api = "/api/posts")]` mounts CRUD routes no `#[route]` declares. Without
+    // them, a query for the routes touching a table would miss its whole REST surface.
     let mut generated_routes = 0usize;
     let mut unmodelled: BTreeSet<String> = BTreeSet::new();
     let mut declared: BTreeMap<(String, String), RouteAuth> = BTreeMap::new();
@@ -1310,16 +1293,11 @@ fn add_auto_api_nodes(
         if matched_mounted.contains(&(route.method.clone(), route.path.clone())) {
             continue;
         }
-        // Ownership is *declared*, not inferred: the route carries the
-        // `api = "..."` prefix of the repository that generated it. Matching on
-        // the served path instead got two cases wrong — a CRUD surface mounted
-        // inside `.scoped("/v1", …)` no longer starts with the declared prefix
-        // and was dropped, and a hand-written route under an API prefix was
-        // claimed as generated (Codex round 5).
-        // The route carries the prefix and the model name, so two repositories
-        // that share a prefix but sit over different models are told apart
-        // (#2520). Two that share both (two versions of one crate, say) tie.
-        // Each one gets an edge, so no `impact` answer loses the route. The
+        // The route carries the `api` prefix and model of the repository that generated it.
+        // Matching on the served path would drop CRUD routes mounted under `.scoped(...)` and
+        // claim hand-written routes under an API prefix. The model name tells apart
+        // repositories that share a prefix (#2520). Repositories that share both (two
+        // versions of one crate) each get an edge, so no `impact` answer loses the route; the
         // first by node id names the node.
         let mut owners: Vec<(String, &RepositoryGraphDescriptor)> = route
             .repository_api
@@ -1908,11 +1886,9 @@ mod tests {
 
     #[test]
     fn a_repository_also_declares_its_models_relation_tables() {
-        // `#[votable(by = User)]` on `Post` puts `react`/`reaction_of` on
-        // `PgPostRepository`, and those write the `votes` edge table. A route
-        // holding the repository can reach `votes` without ever naming it, so
-        // without this edge `autumn graph touches votes` misses the upvote and
-        // downvote routes entirely.
+        // `#[votable(by = User)]` on `Post` puts `react`/`reaction_of` on `PgPostRepository`,
+        // which write `votes`. Without this edge `autumn graph touches votes` misses the
+        // vote routes, which hold the repository but never name `votes`.
         let mut post = model("Post", "app::models::Post", "posts");
         post.relations = &["votes"];
         let graph = build(
@@ -1997,9 +1973,7 @@ mod tests {
 
     #[test]
     fn markup_that_merely_names_a_mutation_does_not_make_a_get_a_write() {
-        // A maud template writes `hx-delete=(...)` on a link. The route is a
-        // GET: its declared method is the contract, and reading `delete` out of
-        // an attribute name would report a read-only page as a writer.
+        // A GET whose template writes `hx-delete=(...)` stays a read: the declared method wins.
         let graph = build(
             &[],
             0,
@@ -2179,9 +2153,7 @@ mod tests {
 
     #[test]
     fn a_repository_auto_api_route_is_attributed_to_its_repository() {
-        // `#[repository(api = "/api/posts")]` mounts CRUD routes that no
-        // `#[route]` declares. Leaving them out would mean `autumn graph
-        // touches posts` missed the entire REST surface of the table.
+        // `#[repository(api = "/api/posts")]` mounts CRUD routes no `#[route]` declares.
         let graph = build(
             &[
                 mounted_by_repository("GET", "/api/posts", "/api/posts"),
@@ -2255,10 +2227,9 @@ mod tests {
 
     #[test]
     fn a_ws_mount_under_an_api_prefix_is_not_claimed_as_an_auto_api_route() {
-        // A `#[ws("/api/posts/live")]` handler is in the mounted table and has
-        // no route descriptor, but it is not a CRUD route the repository
-        // generated. Claiming it would report a read-only socket as a REST
-        // endpoint that writes `posts`.
+        // A `#[ws("/api/posts/live")]` handler is mounted under the prefix with no route
+        // descriptor, but the repository did not generate it. Claiming it would report a
+        // read-only socket as a REST endpoint that writes `posts`.
         let graph = build(
             &[mounted("WS", "/api/posts/live", "live")],
             0,
@@ -2282,11 +2253,8 @@ mod tests {
 
     #[test]
     fn a_scoped_auto_api_route_is_still_attributed_to_its_repository() {
-        // Mounted inside `.scoped("/v1", …)` the CRUD surface is served at
-        // `/v1/api/posts`, which does not start with the declared prefix.
-        // Inferring ownership from the path dropped these routes entirely
-        // (Codex round 5); the route carries its own repository, so nothing
-        // has to be guessed.
+        // Under `.scoped("/v1", …)` the CRUD surface is served at `/v1/api/posts`, outside the
+        // declared prefix. The route carries its repository, so it is still attributed.
         let graph = build(
             &[mounted_by_repository("GET", "/v1/api/posts", "/api/posts")],
             0,
@@ -2332,9 +2300,8 @@ mod tests {
 
     #[test]
     fn a_handler_mounted_twice_accounts_for_both_mounts() {
-        // The same handler in a top-level `routes![]` and in a scoped group.
-        // Reporting the second mount as "no macro declaration" would send a
-        // reader hunting for a handler that is right there.
+        // The same handler in a top-level `routes![]` and in a scoped group: the second mount
+        // must not be reported as undeclared.
         let graph = build(
             &[
                 mounted("GET", "/posts", "index"),
@@ -2404,9 +2371,7 @@ mod tests {
 
     #[test]
     fn an_uppercase_raw_sql_table_still_resolves() {
-        // PostgreSQL folds unquoted identifiers, so `FROM POSTS` is the `posts`
-        // table. Dropping the edge would be a false negative in an impact
-        // answer — the one failure this feature cannot afford.
+        // PostgreSQL folds unquoted identifiers, so `FROM POSTS` is the `posts` table.
         let graph = build(
             &[],
             0,
@@ -2435,9 +2400,7 @@ mod tests {
 
     #[test]
     fn a_rust_type_named_like_a_table_does_not_resolve_to_it() {
-        // A DTO called `Posts` is a type-shaped candidate, not a SQL word.
-        // Folding every candidate made it resolve to the `posts` table — a
-        // false dependency the graph would then report forever.
+        // A DTO called `Posts` is a Rust name, not a SQL word, so it must not fold to `posts`.
         let graph = build(
             &[],
             0,

@@ -81,9 +81,8 @@ const STATE_TABLE: &str = "_autumn_derivations";
 /// one statement serves both.
 const NOW: &str = "CURRENT_TIMESTAMP";
 
-// Backend-forked placeholder. Postgres numbers its binds, `SQLite` does not;
-// binds are pushed in the same order on both, so one template with swapped
-// placeholder text serves both.
+// Bind placeholder. Postgres numbers its binds and `SQLite` does not. Binds are
+// pushed in the same order on both, so one SQL template serves both.
 #[cfg(not(feature = "sqlite"))]
 fn ph(n: usize) -> String {
     format!("${n}")
@@ -100,10 +99,8 @@ const IS_DISTINCT_FROM: &str = "IS DISTINCT FROM";
 #[cfg(all(test, feature = "sqlite"))]
 const IS_DISTINCT_FROM: &str = "IS NOT";
 
-// Row lock on the state row. On Postgres `FOR UPDATE` blocks any other
-// transaction that wants the same row. On `SQLite` the enclosing
-// `BEGIN IMMEDIATE` already excludes every other writer in the database, so the
-// clause degrades to nothing and the read is a cheap indexed lookup.
+// Row lock on the state row. On `SQLite` the enclosing `BEGIN IMMEDIATE`
+// already excludes every other writer, so no clause is needed.
 #[cfg(not(feature = "sqlite"))]
 const FOR_UPDATE: &str = " FOR UPDATE";
 #[cfg(feature = "sqlite")]
@@ -521,12 +518,11 @@ fn source_columns(def: &DerivationDef) -> Vec<&'static str> {
 fn check_source_columns(defs: &[&DerivationDef], claims: &[CounterCacheClaim]) -> AutumnResult<()> {
     for def in defs {
         let sources: Vec<String> = source_columns(def).into_iter().map(ident_key).collect();
-        // The table whose columns are this derivation's sources: the child's.
         let source_table = ident_key(def.child_table);
-        // Onto its own table, the column a derivation maintains is a column of
-        // its source rows. The macro refuses the spelled-out case; this is the
-        // same rule under the backend's identifier semantics, where `Nodes`
-        // and `nodes` (or `Score` and `score`) are one name on `SQLite`.
+        // Onto its own table, the maintained column is a column of its source
+        // rows. The macro refuses the literal case; this repeats the rule under
+        // the backend's identifier folding (`Nodes` and `nodes` are one name on
+        // `SQLite`).
         if ident_key(def.parent_table) == source_table && sources.contains(&ident_key(def.column)) {
             return Err(AutumnError::from(std::io::Error::other(format!(
                 "derivation `{}` on {}::{} onto its own table reads the column it maintains, \
@@ -880,12 +876,10 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Vec<&'static str>> {
     let defs = registered_derivations();
     check_registry(&defs)?;
-    // One transaction holding the state table for the whole reconciliation:
-    // replicas booting together take turns, so each one's snapshot is the
-    // truth for as long as it acts on it. Without that, two replicas parking
-    // the same swapped rows could leave one enqueuing fresh rows into the
-    // names the other had just emptied, and the finished backfills the winner
-    // then discards in favour of the loser's pending ones.
+    // Hold the state table for the whole reconciliation so replicas booting
+    // together take turns and each acts on a snapshot that stays true. Two
+    // replicas parking the same swapped rows would otherwise discard finished
+    // backfills in favour of freshly enqueued ones.
     scoped_immediate_transaction::<Vec<&'static str>, AutumnError, _>(conn, move |conn| {
         async move {
             lock_state_table(conn).await?;
@@ -975,10 +969,8 @@ async fn reconcile(
     let mut enqueued = Vec::new();
     for (def, hash, parked) in pending {
         if parked {
-            // Whatever still sits under the destination carries a definition
-            // this derivation no longer has (a row parked by another
-            // derivation is already gone); enqueuing would have overwritten
-            // it anyway.
+            // Whatever still sits under the destination has a definition this
+            // derivation no longer has; enqueuing would overwrite it anyway.
             delete_stale_state(conn, def.name, hash).await?;
             if rename_state(conn, &parking_name(def.name), def.name, hash).await? {
                 continue;
@@ -1276,10 +1268,8 @@ pub async fn run_backfill(
     conn: &mut RuntimeConnection,
     options: &BackfillOptions,
 ) -> AutumnResult<BackfillReport> {
-    // A runtime check, not an assertion: `LIMIT 0` returns an empty page, and
-    // an empty page is how a sweep learns it has reached the end of the table,
-    // so a zero batch would mark every derivation complete having repaired
-    // nothing.
+    // `LIMIT 0` returns an empty page, which a sweep reads as the end of the
+    // table, so a zero batch would mark every derivation complete.
     if options.batch_size <= 0 {
         return Err(AutumnError::from(std::io::Error::other(format!(
             "a backfill batch must hold at least one parent row; `batch_size` is {}",
@@ -1321,12 +1311,11 @@ pub async fn run_backfill(
                 report.in_progress.push(def.name.to_owned());
                 break;
             }
-            // A self-referential derivation (a comment's `reply_count`) has
-            // rows that are children and parents at once. A mutation holds
-            // its child row and then wants the parent; a batch of several
-            // parents holds the first and then wants the next, which may be
-            // that child. One parent per batch takes one lock and never a
-            // second, so the sweep cannot be one side of that cycle.
+            // In a self-referential derivation (a comment's `reply_count`) a
+            // row is child and parent at once. A mutation locks its child row,
+            // then the parent; a multi-parent batch locks one parent, then the
+            // next, which may be that child. One parent per batch takes a
+            // single lock, so the sweep cannot join that deadlock cycle.
             let batch_size = if def.child_table == def.parent_table {
                 1
             } else {
@@ -1491,10 +1480,9 @@ pub async fn derivation_status(
     check_registry(&defs)?;
 
     // A binary with no derivation never applies the state-table migration
-    // (see `has_derivations`), so an app that never had one has no table to
-    // read: that is an empty report. An app whose last derivation was removed
-    // still has the table, and its leftover rows are exactly what an operator
-    // needs to see, so only the missing table is forgiven, and only then.
+    // (see `has_derivations`), so a missing table is an empty report. An app
+    // whose last derivation was removed still has the table, and its leftover
+    // rows are reported.
     let state = match load_state(conn).await {
         Ok(state) => state,
         Err(error) if defs.is_empty() && is_missing_state_table(&error) => return Ok(Vec::new()),
@@ -1611,17 +1599,14 @@ mod tests {
     fn the_definition_hash_tracks_every_part_of_the_lowered_shape() {
         let base = count_def().definition_hash();
 
-        // The filter is the whole point: dropping it changes which rows count.
         let mut unfiltered = count_def();
         unfiltered.filter_sql = "";
         assert_ne!(unfiltered.definition_hash(), base, "filter_sql");
 
-        // The contribution decides the weight.
         let mut weighted = count_def();
         weighted.contrib_sql = "{c}.\"score\"";
         assert_ne!(weighted.definition_hash(), base, "contrib_sql");
 
-        // The output column and the aggregate are both part of the shape.
         let mut renamed_column = count_def();
         renamed_column.column = "other_count";
         assert_ne!(renamed_column.definition_hash(), base, "column");
@@ -1630,7 +1615,6 @@ mod tests {
         summed.transform = "sum(score)";
         assert_ne!(summed.definition_hash(), base, "transform");
 
-        // So are the tables it reads and the tenant it is confined to.
         let mut tenanted = count_def();
         tenanted.tenant_column = Some("tenant_id");
         assert_ne!(tenanted.definition_hash(), base, "tenant_column");
@@ -1753,8 +1737,7 @@ mod tests {
     #[test]
     fn two_derivations_on_one_parent_column_are_rejected() {
         // Both would apply their own delta on every mutation, so the column
-        // would count twice. That is data corruption, not staleness, which is
-        // why the boot path refuses to start on it.
+        // would count twice.
         let first = count_def();
         let mut second = count_def();
         second.name = "dv_posts.published_comment_count_again";
@@ -1784,10 +1767,9 @@ mod tests {
     #[cfg(not(feature = "sqlite"))]
     #[test]
     fn postgres_ident_key_truncates_to_63_bytes_on_a_char_boundary() {
-        // Postgres truncates every identifier to `NAMEDATALEN - 1` (63 on a
-        // stock build) bytes; quoting does not exempt it. The registry key
-        // must be the physical spelling, or two names that agree on their
-        // first 63 bytes look distinct here and collide in the database.
+        // Postgres truncates every identifier, quoted or not, to
+        // `NAMEDATALEN - 1` (63) bytes. The key must be that physical spelling,
+        // or two names sharing their first 63 bytes would look distinct here.
         let long_a = format!("{}{}", "a".repeat(63), "x");
         let long_b = format!("{}{}", "a".repeat(63), "y");
         assert_eq!(postgres_ident_key(&long_a), "a".repeat(63));
@@ -1795,8 +1777,7 @@ mod tests {
         // Short names and names exactly at the bound are untouched.
         assert_eq!(postgres_ident_key("score"), "score");
         assert_eq!(postgres_ident_key(&"a".repeat(63)), "a".repeat(63));
-        // A multi-byte character at the boundary is not split: the key keeps
-        // whole characters up to the byte limit.
+        // A multi-byte character at the boundary is not split.
         let multi = format!("{}{}", "é".repeat(31), "éé"); // 33 é = 66 bytes
         let key = postgres_ident_key(&multi);
         assert!(key.len() <= 63, "key is {key:?}");
@@ -1807,9 +1788,7 @@ mod tests {
     #[cfg(not(feature = "sqlite"))]
     #[test]
     fn overlong_derivation_columns_that_share_63_bytes_are_rejected() {
-        // Issue #2664: on Postgres these two spellings are one column, so the
-        // boot-time guard must refuse the pair instead of letting both
-        // maintainers double-apply deltas to the same physical column.
+        // On Postgres these two spellings are one column (#2664).
         let mut first = count_def();
         first.column = Box::leak(format!("{}{}", "a".repeat(63), "x").into_boxed_str());
         let mut second = count_def();
@@ -1833,9 +1812,8 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_has_no_63_byte_identifier_limit_so_long_names_coexist() {
-        // The mirror of the Postgres truncation above: SQLite identifiers have
-        // no physical length cap, so the full spellings are compared and two
-        // names that differ only past byte 63 are two columns there.
+        // SQLite identifiers have no length cap, so names that differ only
+        // past byte 63 are two columns.
         let mut first = count_def();
         first.column = Box::leak(format!("{}{}", "a".repeat(63), "x").into_boxed_str());
         let mut second = count_def();
@@ -2186,10 +2164,9 @@ mod tests {
     #[test]
     fn a_derivation_on_a_plain_counter_cache_column_is_rejected() {
         // A plain `counter_cache` has no `DerivationDef`, so without its claim
-        // the column check would see one derivation and pass. Both would then
-        // apply their own delta, and the derivation's backfill would overwrite
-        // the counter cache's rows with a total over the derivation's source
-        // alone: corruption on every boot, not a stale figure.
+        // the check would pass. Both would apply their own delta, and the
+        // backfill would overwrite the counter cache with a total over the
+        // derivation's source alone.
         let def = count_def();
         let claim = CounterCacheClaim {
             model: "DvLike",
@@ -2217,8 +2194,8 @@ mod tests {
         };
         check_unique_columns(&[&def], &[other]).expect("different columns coexist");
 
-        // A `#[commentable(counter_cache = ...)]` parent's column is a claim of
-        // the same kind, spelled by its descriptor rather than by `#[model]`.
+        // A `#[commentable(counter_cache = ...)]` column is the same kind of
+        // claim.
         let commentable = CounterCacheClaim {
             model: "app::models::DvPost",
             child_table: "comments",

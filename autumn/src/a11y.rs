@@ -673,9 +673,8 @@ fn with_hx_attrs(element: Markup, hx: &[(String, String)]) -> Markup {
             continue;
         }
         attrs.push_str(" hx-");
-        // `name` is validated to the safe `[a-z0-9-]` alphabet, so it needs no
-        // escaping (mirroring `links::push_attr`, which pushes the validated
-        // name verbatim); the value keeps maud's attribute escaping.
+        // `name` is validated to `[a-z0-9-]`, so it needs no escaping; the value
+        // keeps maud's attribute escaping.
         attrs.push_str(name);
         attrs.push_str("=\"");
         let _ = write!(Escaper::new(&mut attrs), "{value}");
@@ -991,12 +990,8 @@ impl<State> TextField<State> {
 
 impl Render for TextField<Labeled> {
     fn render(&self) -> Markup {
-        // `label` is always `Some` in the `Labeled` state — it is set on every
-        // transition out of `NoLabel` — but match defensively rather than
-        // unwrap. The label source only changes the label wiring (a preceding
-        // `<label for=…>` vs an `aria-label`/`aria-labelledby` on the input);
-        // every other attribute is shared, so compute the label bits once and
-        // emit a single `<input>`.
+        // `label` is always `Some` in the `Labeled` state; `None` renders
+        // unlabeled rather than panicking.
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
             label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let input = html! {
@@ -1900,9 +1895,8 @@ impl<State> FileField<State> {
 
 impl Render for FileField<Labeled> {
     fn render(&self) -> Markup {
-        // With a visible label we deliberately emit NO `aria-label`: the
-        // `<label for=…>` is the caller-controlled accessible name. This is the
-        // fix for the derived-aria-label precedence caveat (issue #1933).
+        // With a visible label, emit no `aria-label`: the `<label for=…>` is the
+        // accessible name, and an `aria-label` would override it (#1933).
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
             label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let input = html! {
@@ -2288,10 +2282,8 @@ impl Render for RadioGroup<Labeled> {
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
             label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let ids = radio_option_ids(self.id_prefix.as_deref(), &self.name, &self.options);
-        // A group holds one selection: more than one `checked` control is a
-        // document-conformance error, and a browser would keep only the last,
-        // so the rendered state would disagree with what the user sees. Only
-        // the first checked choice renders as checked.
+        // Only the first checked choice renders as checked: more than one is a
+        // conformance error, and a browser would keep only the last.
         let checked_at = self.options.iter().position(|o| o.checked);
         let controls = html! {
             @for (index, (option, id)) in self.options.iter().zip(&ids).enumerate() {
@@ -2572,7 +2564,6 @@ mod tests {
 
     #[test]
     fn is_valid_hx_suffix_accepts_safe_alphabet_only() {
-        // Valid suffixes: lowercase letters, digits, and '-', non-empty.
         assert!(is_valid_hx_suffix("post"));
         assert!(is_valid_hx_suffix("trigger"));
         assert!(is_valid_hx_suffix("on-2"));
@@ -2618,7 +2609,6 @@ mod tests {
             markup.contains("<legend>Shipping speed</legend>"),
             "{markup}"
         );
-        // Every option carries its own input/label pair, associated by id.
         assert!(
             markup.contains(r#"id="speed-standard""#) && markup.contains(r#"for="speed-standard""#),
             "{markup}"
@@ -2646,7 +2636,6 @@ mod tests {
         // An aria-named group renders no competing visible legend.
         assert!(!markup.contains("<legend"), "{markup}");
         assert!(!markup.contains("<fieldset"), "{markup}");
-        // …and still renders its controls, each paired with its own label.
         assert_eq!(markup.matches(r#"type="radio""#).count(), 1, "{markup}");
         assert!(
             markup.contains(r#"id="speed-standard""#) && markup.contains(r#"for="speed-standard""#),
@@ -2718,8 +2707,8 @@ mod tests {
 
     #[test]
     fn radio_group_ids_do_not_collide_across_groups() {
-        // Groups `a-b`/`c` and `a`/`b-c` once gave the same id. A group cannot
-        // see the ids of another group. The id rule itself must keep them apart.
+        // Groups `a-b`/`c` and `a`/`b-c` must not share an id. A group cannot see
+        // another group's ids, so the id rule itself must keep them apart.
         let one = RadioGroup::new("a-b", RadioOption::new("c", "C"))
             .label("One")
             .render()

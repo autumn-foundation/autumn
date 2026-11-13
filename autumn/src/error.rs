@@ -183,18 +183,11 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(err: E) -> Self {
-        // #2423: Postgres refuses an embedded NUL byte in a TEXT/VARCHAR column
-        // (SQLSTATE 22021). That is malformed client input reaching the
-        // database, not a server bug, so it takes the 422 a `#[validate(...)]`
-        // rejection would have produced had a validator been able to see the
-        // byte. Handled first and by returning, so this classification has one
-        // unambiguous precedence rather than depending on where it sits among
-        // the status overrides below.
+        // #2423: Postgres refuses a NUL byte in a TEXT/VARCHAR column (SQLSTATE 22021). That is
+        // malformed client input, so it takes 422. Returned first so no override below applies.
         //
-        // The error is re-wrapped rather than merely restatused: the 422 page
-        // renders the message verbatim where the 500 page redacts it, so
-        // downgrading alone would put a raw Postgres message on screen. The
-        // original stays reachable as `source()`.
+        // Re-wrapped rather than restatused: the 422 page renders the message verbatim, so the raw
+        // Postgres message would reach the screen. The original stays reachable as `source()`.
         #[cfg(feature = "db")]
         if error_chain_is_pg_nul_rejection(&err) {
             return Self {
@@ -231,49 +224,36 @@ where
             }
         }
 
-        // A failed service-to-service call (#1755) is a dependency fault, not
-        // a client one, so `?` on one in a handler produces 502 rather than
-        // blaming the caller for an upstream 404.
+        // A failed service-to-service call (#1755) is a dependency fault: 502, not upstream's 404.
         #[cfg(feature = "http-client")]
         if let Some(wire_err) = any_err.downcast_ref::<crate::wire::WireError>() {
             status = wire_err.status();
         }
 
-        // Web Push (#1392) distinguishes client-fault failures (a malformed
-        // browser subscription, an endpoint already claimed) from server-fault
-        // ones, so an app calling `push.subscribe(…).await?` from its own
-        // handler gets the same status the built-in push router would return
-        // rather than a blanket 500.
+        // Web Push (#1392) separates client faults from server faults, so `?` in a handler gets
+        // the status the built-in push router returns rather than a blanket 500.
         #[cfg(feature = "push")]
         if let Some(push_err) = any_err.downcast_ref::<crate::push::PushError>() {
             status = push_err.status();
         }
 
-        // A Constela document that fails to parse, validate or render is
-        // malformed input, not a server fault: `?` on one in a handler should
-        // produce the same 422 a `#[validate(...)]` rejection does rather than
-        // a 500. Mapped here, by downcast, because `AutumnError`'s blanket
-        // `From<E: Error>` impl above forecloses a dedicated `From` impl on
-        // any concrete error type in this crate.
+        // A Constela document that fails to parse, validate or render is malformed input (422).
+        // Mapped by downcast because this blanket `From<E: Error>` impl rules out a dedicated
+        // `From` impl for any concrete error type.
         #[cfg(feature = "constela")]
         if let Some(constela_err) = any_err.downcast_ref::<crate::constela::ConstelaError>() {
             status = constela_err.http_status();
         }
 
-        // Money (#1837). A value that cannot be built or combined, and a
-        // posting the double-entry rules refuse, are malformed input rather
-        // than a server fault, so they take 422. A reused idempotency key and
-        // a refused negative balance are state conflicts, so they take 409.
-        // An overflow is a value the server built and could not hold, so it
-        // stays a 500. Mapped by downcast for the reason on the Constela arm.
-        // A fleet (ADR 0019): an unusable tenant id is the client's
-        // fault (400), an unknown tenant database is 404, a pending migration
-        // is 503. Mapped by downcast for the reason on the Constela arm.
+        // Fleet (ADR 0019): an unusable tenant id is 400, an unknown tenant database 404, a
+        // pending migration 503.
         #[cfg(feature = "db")]
         if let Some(fleet_err) = any_err.downcast_ref::<crate::db::fleet::FleetError>() {
             status = fleet_err.http_status();
         }
 
+        // Money (#1837): an invalid value or a posting the double-entry rules refuse is 422; a
+        // reused idempotency key or a refused negative balance is 409; an overflow stays 500.
         #[cfg(feature = "money")]
         if let Some(money_err) = any_err.downcast_ref::<crate::money::MoneyError>() {
             status = money_err.http_status();
@@ -283,8 +263,8 @@ where
             status = ledger_err.http_status();
         }
 
-        // Issue #3394: a form body that does not decode is the client's fault.
-        // 422 for a repeated single-value field, 400 for the rest.
+        // #3394: an undecodable form body is the client's fault. 422 for a repeated single-value
+        // field, 400 for the rest.
         if let Some(form_err) = any_err.downcast_ref::<crate::form::FormDecodeError>() {
             status = form_err.status();
         }
@@ -310,8 +290,7 @@ where
             }
         }
 
-        // A per-tenant memory quota breach is a soft, retryable resource limit,
-        // so it maps to 503 Service Unavailable rather than a 500.
+        // A per-tenant memory quota breach is a retryable resource limit, so 503.
         if any_err
             .downcast_ref::<crate::tenant_cell::QuotaExceeded>()
             .is_some()
@@ -322,10 +301,9 @@ where
             status = StatusCode::SERVICE_UNAVAILABLE;
         }
 
-        // The request deadline stopped an upstream call or a
-        // `deadline::bounded` call (#3058), here or in a wrapped error. Last,
-        // so it wins over a wrapper's own status (a typed service call's
-        // `WireError::Transport` is a 502).
+        // The request deadline stopped an upstream or `deadline::bounded` call (#3058), here or in
+        // a wrapped error. Checked last so it wins over a wrapper's own status (e.g. a 502
+        // `WireError::Transport`).
         if chain_has_deadline_stop(&err, false) {
             status = StatusCode::GATEWAY_TIMEOUT;
         }
@@ -1326,10 +1304,8 @@ impl std::fmt::Display for AutumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.inner)?;
 
-        // Fold the field map in, so `err.to_string()` says which field failed
-        // off the HTTP path. Sorted, so the rendering is stable across runs.
-        // The problem+json `detail` renders the wrapped error alone and is
-        // unaffected.
+        // Fold in the field map so `err.to_string()` names the failing field off the HTTP path.
+        // Sorted for stable output. The problem+json `detail` renders the wrapped error alone.
         let mut fields: Vec<_> = self
             .details
             .iter()
@@ -1610,8 +1586,7 @@ impl IntoResponse for AutumnError {
         #[cfg(feature = "idempotency")]
         let cache_idempotency_response = self.cache_idempotency_response;
 
-        // Stash error metadata for exception filters to inspect without
-        // parsing the response body.
+        // Exception filters read this instead of parsing the body.
         let error_info = crate::middleware::AutumnErrorInfo {
             status,
             message: message.clone(),
@@ -1655,8 +1630,7 @@ impl IntoResponse for AutumnError {
                 .extensions_mut()
                 .insert(crate::idempotency::IdempotencyCacheCommittedErrorResponse);
         }
-        // A handler the deadline stopped may leave partial session state,
-        // as one the timeout layer cancelled would, so the session layer
+        // A handler the deadline stopped may leave partial session state, so the session layer
         // must not save it.
         if deadline_stop {
             response
@@ -2451,14 +2425,9 @@ mod tests {
 
         // ── SQLite fallback (issue #2698) ────────────────────────────────────
         //
-        // Diesel boxes a SQLite `DatabaseErrorInformation` as a bare `String`
-        // whose `constraint_name()` is always `None`, so these fake it the
-        // same way — `FakeDbErrorInfo` above always names a constraint, which
-        // is exactly what real SQLite errors never do. A real SQLite engine
-        // exercising this same fallback lives in
-        // `autumn/tests/sqlite_unique_violation_field.rs`, since a diesel
-        // `String` box can't be constructed outside diesel's own sqlite
-        // backend code.
+        // Diesel boxes a SQLite error as a bare `String` whose `constraint_name()` is always
+        // `None`; these fakes do the same. `autumn/tests/sqlite_unique_violation_field.rs` covers
+        // a real SQLite engine, since that box cannot be built outside diesel's sqlite backend.
 
         #[derive(Debug)]
         struct FakeSqliteDbErrorInfo {
@@ -2551,10 +2520,8 @@ mod tests {
 
         #[test]
         fn recovers_diesel_error_through_repository_style_blanket_from() {
-            // Mirrors a generated repository method's `.execute(...).await?`
-            // -- the diesel error is converted to `AutumnError` via the
-            // blanket `From` impl before `unique_violation_field` ever sees
-            // it, same as `repo.save(...).await?`'s already-mapped error.
+            // As in a generated repository method, `?` converts the diesel error through the
+            // blanket `From` impl before `unique_violation_field` sees it.
             fn insert() -> Result<(), diesel::result::Error> {
                 Err(unique_violation(Some("idx_users_email_unique")))
             }
@@ -2657,9 +2624,8 @@ mod tests {
 
     #[test]
     fn display_field_order_does_not_follow_the_map() {
-        // A two-field map lands sorted by chance about four runs in ten, so a
-        // dropped sort survives that test. Five fields, rebuilt each round,
-        // fail every run instead.
+        // Two fields land sorted by chance often enough to hide a dropped sort. Five fields,
+        // rebuilt each round, catch it every run.
         let fields: &[(&str, &[&str])] = &[
             ("title", &["e"]),
             ("email", &["e"]),
@@ -2696,8 +2662,8 @@ mod tests {
 
     #[test]
     fn message_is_not_redacted_for_a_server_error() {
-        // The doc caveat, pinned: outside a dev profile the response replaces
-        // a 5xx `detail`, but `message` still returns the wrapped error.
+        // Outside a dev profile the response replaces a 5xx `detail`, but `message` still returns
+        // the wrapped error.
         let err = AutumnError::internal_server_error_msg("password=hunter2 in dsn");
         assert_eq!(err.message(), "password=hunter2 in dsn");
 
@@ -2740,11 +2706,8 @@ mod tests {
     #[tokio::test]
     async fn json_errors_skip_a_field_with_no_messages_like_display_does() -> Result<(), axum::Error>
     {
-        // `display_falls_back_to_the_title_without_field_messages` pins this
-        // for `Display`; the `errors` array in the JSON body must agree
-        // rather than emitting a `{"field":"title","messages":[]}` entry that
-        // names a field as failing without ever saying why (issue #2587
-        // follow-up).
+        // The JSON `errors` array must agree with `Display`: no entry for a field that has no
+        // message to explain why it failed.
         let err = AutumnError::validation(details_map(&[("title", &[])]));
         let response = err.into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
@@ -2785,10 +2748,8 @@ mod tests {
 
     #[test]
     fn the_assigned_status_is_not_a_redaction_guard() {
-        // `status()` is the assigned status. The renderer reclassifies a
-        // cancelled statement to a redacted 503, so a caller that gates on
-        // `status()` being a 4xx would publish a message the response hides.
-        // `message()` documents this rather than recommending that gate.
+        // The renderer reclassifies a cancelled statement to a redacted 503, so gating on
+        // `status()` being 4xx would publish a message the response hides.
         let err = AutumnError::bad_request_msg(
             "db: canceling statement due to statement timeout (dsn password=hunter2)",
         );

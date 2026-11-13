@@ -194,9 +194,7 @@ pub(crate) fn persist_pinned(
 
     let path = dir.join(file_name(&capsule));
     let _retention = RETENTION.lock();
-    // Make room *first*, so the capsule about to be written is not a candidate
-    // for the deletion that makes room for it, and a zero cap cannot mean
-    // "record the failure, then immediately throw it away".
+    // Prune before writing so the new capsule is never a deletion candidate, even under a zero cap.
     prune(
         &dir,
         retained_before_write(settings.max_capsules),
@@ -227,37 +225,25 @@ pub(crate) fn persist_pinned(
 /// scope — there is nothing replayable to write.
 fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     let raw = scope.raw_request()?;
-    // The head was snapshotted when the request arrived; the body was copied
-    // as the handler read it, so it is only final now.
+    // The body is copied as the handler reads it, so it is only final now.
     let raw_body = scope.captured_body();
     if let Some(note) = scope.body_note() {
-        // A body the handler did not read to its end — a prefix, or nothing at
-        // all — is *not* the body the failing request carried. Replaying it
-        // would drive the handler with shorter input than production had, and
-        // code that reads the remainder would hit EOF and answer differently:
-        // a `mismatch`, which the guide tells operators to read as "the bug is
-        // gone". Mark the capsule incomplete so replay refuses it instead,
-        // through the same path a skipped body already takes. The note says
-        // which case this was.
+        // A body the handler did not read to its end is not the body the request carried.
+        // Replaying it would hit EOF early and report a false `mismatch`, so mark the capsule
+        // truncated and let replay refuse it.
         scope.note(note);
         scope.mark_truncated();
     }
-    // The scheme the URI already carries, captured before the request record
-    // is built: a resolved scheme equal to it did not come from a header.
+    // Taken before `raw` is consumed: a resolved scheme equal to it did not come from a header.
     let uri_scheme = raw.uri.scheme_str().map(ToOwned::to_owned);
     let (mut request, mut redacted, body_notes) =
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
-    // The effect tape is masked through the *same* filter, and into the same
-    // echo set, before anything else is scrubbed: a secret a handler sent to a
-    // third party, or wrote into a cache value, must be gone from the outcome
-    // and the SQL binds too. Recording raw and masking here (rather than at
-    // each seam) keeps redaction's cost off requests that never fail.
+    // Effects and job arguments are masked through the same filter and into the same echo set
+    // as the request, before the outcome and SQL binds are scrubbed, so a secret sent to a third
+    // party is masked there too. Masking here rather than at each seam keeps the cost off
+    // requests that never fail.
     let mut effects = scope.effects_snapshot();
     effects.state_cache = scope.had_state_cache();
-    // A job capsule's entry point is a payload like any other: it is the job's
-    // *arguments*, and they carry tokens and PII exactly the way a request body
-    // does. Redacted alongside the effect tape, through the same filter and
-    // into the same echo set.
     let mut job = scope.job_entry();
     let mut effect_keys = literal_placeholder_keys(&effects);
     crate::capsule::redact::redact_effects(
@@ -272,29 +258,13 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     request.redacted_keys.dedup();
     request.peer_addr = scope.peer_addr();
     if let Some(identity) = scope.client_identity() {
-        // The resolved identity is *derived from* headers, so it must obey the
-        // same filter those headers do. An operator who adds
-        // `x-forwarded-host` to `[log] filter_parameters` sees it masked in
-        // `headers` — and would otherwise find the very same
-        // `private-tenant.example` sitting in cleartext in `client_host`,
-        // which defeats the filter through a side door rather than honoring
-        // it. Each field is dropped when *any* header it could have been
-        // resolved from is filtered: which one the resolver actually used
-        // depends on the trust configuration and the request, and recording
-        // the value only when it happened to come from an unfiltered header
-        // would leak on exactly the requests where the filtered one won.
+        // The resolved identity is derived from headers, so it obeys their filter: a field is
+        // dropped when any header it could have come from is filtered, since which one the
+        // resolver used is not knowable here. The header lists are exactly what `ProxyResolver`
+        // reads; it never reads `Forwarded`.
         //
-        // The lists are exactly what `ProxyResolver` reads — `x-forwarded-*`,
-        // `x-real-ip`, `Host` — and nothing else. `Forwarded` is *not* among
-        // them, and naming it here suppressed all three fields, and refused
-        // the capsule, over a header the resolver never looks at.
-        //
-        // A value that did not come from a header at all is exempt, and not as
-        // a courtesy: the address then came from the peer socket and the
-        // scheme from the request URI, both of which this capsule records
-        // unfiltered a few lines either side. Suppressing a copy of a value
-        // that is already written down in the clear protects nothing and
-        // costs a refusal.
+        // A value from the peer socket or the request URI is exempt: the capsule already
+        // records both unfiltered.
         let filter = scope.filter();
         let mut suppressed = false;
         let addr_from_peer =
@@ -316,15 +286,9 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
         } else {
             request.client_scheme.clone_from(&identity.scheme);
         }
-        // Suppression protects the operator's filter, but it does not leave a
-        // *faithful* capsule: replay pre-inserts the recorded identity whole
-        // whenever any field survives, and `TrustedProxiesLayer` honors it
-        // rather than re-resolving — so a handler reading `ClientHost` would
-        // meet a `None` production never gave it and answer differently. That
-        // is a `mismatch` the guide tells operators to read as "the bug is
-        // gone". Refusing is the honest outcome, and it fires only when a
-        // filtered source actually supplied a value: filtering a header the
-        // request never carried costs nothing.
+        // A suppressed field makes the capsule unfaithful: replay pre-inserts the recorded
+        // identity whole and `TrustedProxiesLayer` honors it, so the handler would see a `None`
+        // production never gave it. Refuse only when a filtered source actually supplied a value.
         if suppressed {
             scope.note(IDENTITY_FILTERED_NOTE);
             scope.mark_truncated();
@@ -345,14 +309,10 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
                 .chain(tape.exchanges.iter_mut())
             {
                 crate::capsule::redact::mask_binds(&mut exchange.binds, &redacted);
-                // A backend error message is free-form text that quotes the
-                // statement's own values back: a unique-violation `DETAIL`
-                // names the conflicting key, a check-constraint failure names
-                // the row. That is the one place a masked bind reappears in
-                // the clear, so it is scrubbed like the outcome. (The raw
-                // response frames are left byte-verbatim — replay writes them
-                // back to a real driver, which would reject a rewritten
-                // `ErrorResponse` — and the capsule documentation says so.)
+                // Backend error text quotes bind values back (a unique-violation `DETAIL` names
+                // the key), so it is scrubbed like the outcome. The raw response frames stay
+                // byte-verbatim: replay feeds them to a real driver, which would reject a
+                // rewritten `ErrorResponse`.
                 if let Some(error) = exchange.error.as_mut() {
                     *error = crate::capsule::redact::mask_echoes(error, &redacted);
                 }
@@ -369,9 +329,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
         app: AppInfo {
             name: settings.app_name.clone(),
             profile: settings.profile.clone(),
-            // The build that *recorded* is by definition the build that ran,
-            // so this is read here rather than configured: replay compiles
-            // the same way and `cfg(debug_assertions)` code paths line up.
+            // The build that recorded is the build that ran, so this is read, not configured.
             debug_assertions: Some(cfg!(debug_assertions)),
         },
         request,
@@ -427,8 +385,8 @@ pub(crate) fn scrub_outcome(outcome: CapsuleOutcome, redacted: &RedactedValues) 
         } => CapsuleOutcome::Status {
             code,
             message: mask_echoes(&message, redacted),
-            // A problem type is a stable URI naming a *class* of failure, not
-            // request content; masking it would only break the link.
+            // A problem type URI names a class of failure, not request content; masking it would
+            // only break the link.
             problem_type,
         },
         CapsuleOutcome::Panic {
@@ -525,9 +483,8 @@ fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
     names.sort();
     let excess = names.len().saturating_sub(keep);
     let mut allowance = grace_allowance(keep);
-    // Walk the excess newest-first so the bounded allowance goes to the most
-    // recently written files; everything past the allowance is deleted even
-    // when it is within the grace window.
+    // Newest-first, so the bounded allowance spares the most recent files; past the allowance,
+    // files are deleted even within the grace window.
     for path in names.into_iter().take(excess).rev() {
         if is_pinned_for_reporting(&path) {
             continue;
@@ -634,8 +591,7 @@ mod tests {
     #[test]
     fn a_pinned_capsule_survives_pruning_past_the_grace_window() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Names old enough that the grace window has long lapsed; only the
-        // pin can save the first one.
+        // Long past the grace window: only the pin can save the first one.
         let pinned = dir.path().join("20200101T000000.000000-000001-aaa.json");
         let prunable = dir.path().join("20200101T000001.000000-000002-bbb.json");
         std::fs::write(&pinned, b"{}").expect("write");
@@ -667,8 +623,7 @@ mod tests {
     fn a_sub_minute_storm_cannot_grow_the_directory_unbounded() {
         let dir = tempfile::tempdir().expect("tempdir");
         let now = Utc::now();
-        // Twenty capsules all stamped within the last few seconds — the
-        // storm case where the old unbounded grace spared every one.
+        // Twenty capsules stamped within the last few seconds.
         let stamp = (now - TimeDelta::seconds(5)).format("%Y%m%dT%H%M%S%.6f");
         for sequence in 0..20 {
             let name = format!("{stamp}-{sequence:06}-storm.json");
@@ -750,10 +705,8 @@ mod tests {
             filtered.request.client_host, None,
             "a filtered identity header must not reappear as `client_host`"
         );
-        // Replay pre-inserts the recorded identity whole whenever any field
-        // survives, so a suppressed host reaches the handler as `None` rather
-        // than not at all. That is not a faithful capsule, and claiming it is
-        // would report a false `mismatch`.
+        // Replay pre-inserts the recorded identity whole, so a suppressed host would reach the
+        // handler as `None` and report a false `mismatch`.
         assert!(
             filtered.truncated,
             "a capsule that cannot reproduce the identity must be refused, not replayed"
@@ -769,8 +722,7 @@ mod tests {
             "nor the scheme, which `x-forwarded-host` cannot resolve"
         );
 
-        // `Forwarded` is not a source: `ProxyResolver` never reads it, so
-        // filtering it must suppress nothing and refuse nothing.
+        // `ProxyResolver` never reads `Forwarded`, so filtering it suppresses nothing.
         let forwarded = build(&["forwarded".to_owned()]);
         assert_eq!(
             forwarded.request.client_host.as_deref(),
@@ -786,8 +738,7 @@ mod tests {
             "a header the resolver never reads must not refuse the capsule"
         );
 
-        // `X-Real-IP` is a fallback source for the address, so filtering it
-        // suppresses the address too.
+        // `X-Real-IP` is a fallback address source.
         let real_ip = build(&["x-real-ip".to_owned()]);
         assert_eq!(real_ip.request.client_addr, None);
         assert_eq!(
@@ -947,8 +898,7 @@ mod tests {
             is_pinned_for_reporting(&reference.path),
             "the file must already be pinned when persist_pinned returns"
         );
-        // A concurrent failure's prune — zero retention, grace long lapsed
-        // (simulated by pruning far in the future) — must not take it.
+        // A concurrent prune with zero retention, an hour past the grace window.
         prune(dir.path(), 0, Utc::now() + TimeDelta::hours(1));
         assert!(
             reference.path.exists(),
@@ -1044,9 +994,8 @@ mod tests {
             route: Some("/boom".to_owned()),
         });
 
-        // `reporting::dispatch` hands persistence to `spawn_blocking`, so the
-        // whole scope has to survive the trip to another thread and the write
-        // has to land there — not just when it runs inline on the worker.
+        // `reporting::dispatch` persists on `spawn_blocking`, so the write must work from
+        // another thread.
         let written = crate::time::spawn_blocking(move || {
             persist(
                 &scope,
@@ -1166,8 +1115,7 @@ mod tests {
         use crate::log::filter::ParameterFilter;
 
         let root = tempfile::tempdir().expect("tempdir");
-        // A directory that does not exist yet, so `write_atomically` creates it
-        // under whatever umask this process happens to have.
+        // Not created yet, so `write_atomically` creates it under the process umask.
         let dir = root.path().join("capsules");
         let scope = Arc::new(CaptureScope::new(
             "req-perms".to_owned(),

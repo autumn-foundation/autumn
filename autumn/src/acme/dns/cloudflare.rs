@@ -125,9 +125,8 @@ impl DnsProvider for CloudflareProvider {
     fn upsert_txt<'a>(&'a self, record: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let zone = self.zone_id(&record.fqdn).await?;
-            // If this exact (name, value) is already present — a retried order,
-            // or a leftover from an interrupted run — adding it again is a 400.
-            // Treat "already there" as success.
+            // A retried order or an interrupted run can leave this exact (name, value)
+            // in place, and adding it again is a 400, so "already there" is success.
             let listed = self
                 .send(
                     HttpRequest::new("GET", list_url(&zone, record)),
@@ -216,12 +215,9 @@ fn urlencode(value: &str) -> String {
 /// ACME DNS-01 zone-discovery rule (issue #1620) — `zone_candidates_match_cloudflare`
 /// in `route53.rs` fails the build if the two drift.
 fn zone_candidates(fqdn: &str) -> Vec<String> {
-    // The `_acme-challenge` label is NOT stripped: delegating
-    // `_acme-challenge.example.com` to a zone of its own (so an ACME client
-    // needs credentials for nothing else) is a supported and recommended
-    // setup, and stripping the label would skip that zone and write the
-    // record into the parent, where nothing answers for it (issue #1620).
-    // It is simply the most specific candidate, tried first.
+    // Keep the `_acme-challenge` label: delegating `_acme-challenge.<name>` to its
+    // own zone is a recommended way to scope an ACME credential, and stripping the
+    // label would write the record into the parent, where nothing answers (#1620).
     let name = fqdn.trim().trim_end_matches('.');
     let labels: Vec<&str> = name.split('.').filter(|l| !l.is_empty()).collect();
     // A zone always has at least two labels (`myapp.com`); stopping there also
@@ -346,9 +342,8 @@ mod tests {
     /// the record exists, answers nowhere, and every renewal times out.
     #[tokio::test]
     async fn a_cached_parent_zone_does_not_shadow_a_delegated_child() {
-        // Two zone lookups, in the order a correct implementation makes them:
-        // `example.com` for the first name, then `sub.example.com` for the
-        // second — NOT the cached parent.
+        // Two zone lookups: `example.com` for the first name, then
+        // `sub.example.com` for the second, not the cached parent.
         let transport = RecordingTransport::new(&[(
             ZONE_LOOKUP,
             r#"{"success":true,"errors":[],"result":[{"id":"zone-parent","name":"example.com"}]}"#,
@@ -456,13 +451,11 @@ mod tests {
             !calls.iter().any(|c| c.starts_with("DELETE")),
             "publishing must never delete the sibling value: {calls:?}"
         );
-        // The zone is looked up once and cached for the second record.
         assert_eq!(
             calls.iter().filter(|c| *c == ZONE_LOOKUP).count(),
             1,
             "the zone id must be cached: {calls:?}"
         );
-        // Each create carries its own value.
         let created: Vec<&str> = transport
             .sent()
             .iter()
@@ -648,7 +641,6 @@ mod tests {
                 "myapp.com".to_owned(),
             ]
         );
-        // Never asks Cloudflare about a bare TLD.
         assert!(!zone_candidates("_acme-challenge.myapp.com").contains(&"com".to_owned()));
     }
 
@@ -688,8 +680,8 @@ mod tests {
         let url = list_url("zone123", &record);
         assert!(url.contains("type=TXT"), "{url}");
         assert!(url.contains("name=_acme-challenge.myapp.com"), "{url}");
-        // The value is percent-encoded, so a base64url value with `-`/`_` and a
-        // padded `=` cannot break out of the query string.
+        // `+`, `/` and `=` are percent-encoded, so the value cannot break out of
+        // the query string.
         assert!(url.contains("content=abc%2B%2F%3Ddef"), "{url}");
     }
 
@@ -734,9 +726,8 @@ mod tests {
         assert!(parse_api_response(&response, "x", "https://api/y", &[]).is_err());
     }
 
-    // The error message is surfaced to operators through logs, health details and
-    // the alert payload — the query string can carry the challenge value but must
-    // never carry credentials, so the URL is truncated at the `?`.
+    // The error reaches logs, health details and alerts, so the URL is truncated
+    // at the `?` and the query string never reaches them.
     #[test]
     fn api_errors_drop_the_query_string() {
         let response = HttpResponse {

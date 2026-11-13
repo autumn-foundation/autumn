@@ -263,8 +263,6 @@ mod tests {
 
     #[test]
     fn is_exempt_path_rejects_bare_prefix_without_boundary() {
-        // Exempting `/webhooks/stripe` must not also exempt an adjacent route
-        // that merely starts with the same characters.
         let exempt = vec!["/webhooks/stripe".to_string()];
         assert!(!is_exempt_path("/webhooks/stripe-admin", &exempt));
     }

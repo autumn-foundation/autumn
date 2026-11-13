@@ -405,9 +405,8 @@ impl FlagStore for InMemoryFlagStore {
     ) -> Result<(), FlagStoreError> {
         self.upsert(key, |f| {
             if !f.enabled {
-                // Re-enabling from a kill-switch via allowlist: reset rollout to 0
-                // so only the explicitly listed actors gain access, not everyone
-                // who happened to be in the previous (e.g. 100%) rollout cohort.
+                // Re-enabling a killed flag through the allowlist starts at 0% rollout, so
+                // only listed actors get it, not the old rollout cohort.
                 f.rollout_pct = 0;
             }
             f.enabled = true;
@@ -426,7 +425,7 @@ impl FlagStore for InMemoryFlagStore {
     fn add_group(&self, key: &str, group: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
         self.upsert(key, |f| {
             if !f.enabled {
-                // Same targeted-enable semantics as allow_actor.
+                // As in `allow_actor`: re-enable a killed flag for the listed group only.
                 f.rollout_pct = 0;
             }
             f.enabled = true;
@@ -1141,8 +1140,8 @@ pub mod pg {
         ) -> Result<(), FlagStoreError> {
             self.write(key, &format!("allowed_actor={actor_id}"), actor, |conn| {
                 diesel::sql_query(format!(
-                    // Re-enabling from kill-switch via allowlist resets rollout_pct to 0
-                    // so only listed actors gain access, not the previous global cohort.
+                    // A killed flag re-enables at 0% rollout: listed actors only, not the
+                    // old rollout cohort.
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, \
                          rollout_pct = CASE WHEN NOT enabled THEN 0 ELSE rollout_pct END, \
@@ -1170,7 +1169,7 @@ pub mod pg {
         ) -> Result<(), FlagStoreError> {
             self.write(key, &format!("added_group={group}"), actor, |conn| {
                 diesel::sql_query(format!(
-                    // Re-enabling from kill-switch via group allowlist resets rollout_pct.
+                    // A killed flag re-enables at 0% rollout: listed groups only.
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, \
                          rollout_pct = CASE WHEN NOT enabled THEN 0 ELSE rollout_pct END, \
@@ -1701,24 +1700,21 @@ impl FeatureFlagService {
     }
 
     fn evaluate(&self, flag: &FlagConfig, actor_id: Option<&str>) -> bool {
-        // Kill switch: enabled=false overrides all other gates.
+        // Kill switch: overrides every other gate.
         if !flag.enabled {
             return false;
         }
 
-        // Globally on: rollout_pct=100 enables everyone without per-actor check.
         if flag.rollout_pct >= 100 {
             return true;
         }
 
-        // Actor allowlist.
         if let Some(actor) = actor_id
             && flag.actor_allowlist.iter().any(|a| a.as_str() == actor)
         {
             return true;
         }
 
-        // Named groups.
         if let (Some(actor), Some(resolver)) = (actor_id, &self.group_resolver) {
             for group in &flag.group_allowlist {
                 if resolver(actor, group) {
@@ -1727,7 +1723,6 @@ impl FeatureFlagService {
             }
         }
 
-        // Percent rollout (1–99%).
         if flag.rollout_pct > 0
             && let Some(actor) = actor_id
         {
@@ -1965,7 +1960,6 @@ impl axum::extract::FromRequestParts<crate::AppState> for Flags {
                 )
             })?;
 
-        // Resolve actor_id from session if available (best-effort, non-blocking).
         let actor_id = if let Some(session) = parts.extensions.get::<crate::session::Session>() {
             session.get(state.auth_session_key()).await
         } else {
@@ -1982,13 +1976,11 @@ impl axum::extract::FromRequestParts<crate::AppState> for Flags {
 mod tests {
     use super::*;
 
-    // ─────────────── RED PHASE: tests written before full implementation ──────
-
     fn make_svc() -> FeatureFlagService {
         FeatureFlagService::new(Arc::new(InMemoryFlagStore::new()))
     }
 
-    // AC-1: service resolves flag to bool ─────────────────────────────────────
+    // ── Resolving a flag ─────────────────────────────────────────────────────
 
     #[test]
     fn unknown_flag_returns_false() {
@@ -2014,7 +2006,7 @@ mod tests {
         assert!(!svc.is_enabled("my_flag", None));
     }
 
-    // AC-2: evaluation modes ──────────────────────────────────────────────────
+    // ── Evaluation modes ─────────────────────────────────────────────────────
 
     #[test]
     fn actor_allowlist_enables_specific_actor() {
@@ -2028,7 +2020,6 @@ mod tests {
     fn group_resolver_enables_group_members() {
         let svc = FeatureFlagService::new(Arc::new(InMemoryFlagStore::new())).with_group_resolver(
             Arc::new(|actor_id: &str, group: &str| {
-                // "staff" group contains actor IDs starting with "staff:"
                 group == "staff" && actor_id.starts_with("staff:")
             }),
         );
@@ -2041,7 +2032,6 @@ mod tests {
     fn percent_rollout_at_0_disables_for_all_actors() {
         let svc = make_svc();
         svc.set_rollout("gradual", 0, None).unwrap();
-        // With 0% rollout and no other gates, every actor should be disabled.
         for i in 0..50_u32 {
             let actor = format!("user:{i}");
             assert!(
@@ -2071,14 +2061,13 @@ mod tests {
         let enabled_count = (0..200_u32)
             .filter(|i| svc.is_enabled("rollout_flag", Some(&format!("user:{i}"))))
             .count();
-        // With 200 actors and 50% rollout, expect 80–120 enabled (±20%).
         assert!(
             (80..=120).contains(&enabled_count),
             "expected ~100 enabled actors, got {enabled_count}"
         );
     }
 
-    // AC-3: determinism ───────────────────────────────────────────────────────
+    // ── Determinism ──────────────────────────────────────────────────────────
 
     #[test]
     fn rollout_bucket_is_stable_across_calls() {
@@ -2089,8 +2078,6 @@ mod tests {
 
     #[test]
     fn rollout_bucket_differs_for_different_actors() {
-        // Ensure we don't always get the same bucket (birthday collision at
-        // 100 buckets is essentially impossible with our FNV-1a implementation).
         let buckets: std::collections::HashSet<u8> = (0..50_u32)
             .map(|i| rollout_bucket("flag", &format!("user:{i}")))
             .collect();
@@ -2209,7 +2196,7 @@ mod tests {
         }
     }
 
-    // AC-7: FlagStore trait + InMemoryFlagStore ────────────────────────────────
+    // ── FlagStore trait + InMemoryFlagStore ──────────────────────────────────
 
     #[test]
     fn in_memory_store_returns_none_for_unknown_flag() {
@@ -2261,7 +2248,7 @@ mod tests {
         assert_eq!(flag.group_allowlist.len(), 1);
     }
 
-    // AC-10: audit trail ──────────────────────────────────────────────────────
+    // ── Audit trail ──────────────────────────────────────────────────────────
 
     #[test]
     fn mutations_are_recorded_in_history() {
@@ -2331,7 +2318,7 @@ mod tests {
         assert_eq!(store.get("f").unwrap().unwrap().rollout_pct, 100);
     }
 
-    // AC-1 kill-switch: disable() must override rollout and allowlists ─────────
+    // ── Kill switch ──────────────────────────────────────────────────────────
 
     #[test]
     fn disable_kills_flag_even_when_rollout_is_100_percent() {
@@ -2363,20 +2350,16 @@ mod tests {
         let svc = make_svc();
         svc.set_rollout("roll_flag", 50, None).unwrap();
         svc.disable("roll_flag", None).unwrap();
-        // Re-enable globally — disable() preserves rollout_pct=50 in the store,
-        // but enable() resets it to 100 (globally on).
+        // `disable` keeps rollout_pct=50, but `enable` sets it to 100, so an anonymous
+        // request passes too.
         svc.enable("roll_flag", None).unwrap();
         assert!(svc.is_enabled("roll_flag", None));
         assert!(svc.is_enabled("roll_flag", Some("user:1")));
     }
 
-    // AC-1 allow_actor after kill-switch must not restore global rollout ────────
-
     #[test]
     fn allow_actor_after_kill_switch_does_not_restore_global_rollout() {
-        // Scenario: enable globally → disable (kill-switch) → allow_actor for
-        // one tester. The flag must be visible only to the allowlisted actor,
-        // NOT to everyone (which would happen if rollout_pct=100 were preserved).
+        // Without the reset to 0%, the re-enable would bring back rollout_pct=100 for everyone.
         let svc = make_svc();
         svc.enable("targeted", None).unwrap(); // rollout_pct = 100
         svc.disable("targeted", None).unwrap(); // kill-switch, rollout_pct still 100
@@ -2386,7 +2369,6 @@ mod tests {
             svc.is_enabled("targeted", Some("user:42")),
             "allowlisted actor must see the flag"
         );
-        // All non-allowlisted actors should NOT see it (rollout was reset to 0).
         for i in [1_u32, 5, 10, 99] {
             let actor = format!("user:{i}");
             assert!(
@@ -2398,13 +2380,10 @@ mod tests {
 
     #[test]
     fn allow_actor_on_active_rollout_preserves_rollout_pct() {
-        // When the flag is already enabled (no kill-switch), adding an actor to the
-        // allowlist must NOT reset the existing rollout percentage.
         let svc = make_svc();
         svc.set_rollout("staged", 50, None).unwrap(); // enabled=true, rollout=50%
         svc.allow_actor("staged", "user:42", None).unwrap();
 
-        // rollout_pct should still be 50, not reset to 0.
         let store = InMemoryFlagStore::new();
         store.set_rollout("staged", 50, None).unwrap();
         store.allow_actor("staged", "user:42", None).unwrap();
@@ -2497,7 +2476,6 @@ mod tests {
         boxed.allow_actor("h", "user:1", None).unwrap();
         boxed.add_group("h", "staff", None).unwrap();
         let flags = boxed.list().unwrap();
-        // f, g, h are present
         assert_eq!(flags.len(), 3);
         let hist = boxed.history("f", 5).unwrap();
         assert_eq!(hist[0].mutation, "enabled");
@@ -2532,8 +2510,7 @@ mod tests {
 
     #[test]
     fn rollout_with_no_actor_returns_false() {
-        // When actor_id is None and there are no allowlists, a percent rollout
-        // must not enable the flag (there's no actor to compute a bucket for).
+        // With no actor there is no bucket to compute.
         let svc = make_svc();
         svc.set_rollout("gradual", 99, None).unwrap();
         assert!(
@@ -2547,7 +2524,7 @@ mod tests {
         let svc = FeatureFlagService::new(Arc::new(InMemoryFlagStore::new()))
             .with_group_resolver(Arc::new(|_: &str, _: &str| true));
         svc.add_group("f", "everyone", None).unwrap();
-        // No actor — group check must be skipped, not panic.
+        // The resolver accepts everyone, so this proves the group check needs an actor.
         assert!(!svc.is_enabled("f", None));
     }
 
@@ -2581,7 +2558,6 @@ mod tests {
 
     #[test]
     fn flags_enabled_delegates_to_service() {
-        // Test the Flags::enabled() method via FeatureFlagService directly.
         let svc = make_svc();
         svc.enable("active", None).unwrap();
         assert!(svc.is_enabled("active", Some("any_user")));
@@ -2599,7 +2575,7 @@ mod tests {
 
         let mut data = HashMap::new();
         data.insert("custom_user_id".to_owned(), "user:123".to_owned());
-        data.insert("user_id".to_owned(), "user:999".to_owned()); // distracter
+        data.insert("user_id".to_owned(), "user:999".to_owned()); // the default key: must be ignored
         let session = crate::session::Session::new_for_test("session_id".to_owned(), data);
 
         let mut req = axum::http::Request::builder().body(()).unwrap();
@@ -2992,11 +2968,9 @@ mod tests {
 
     // ── Backend screening on the Postgres-only store ──────────────────────
 
-    // `PgFlagStore` opens a `diesel::PgConnection` and writes through
-    // `pg_notify` — it cannot serve any other backend. Building one from a
-    // SQLite target used to succeed and fail on first use with a driver-level
-    // connection error naming Postgres, which is not a diagnosis an operator
-    // who configured `sqlite://` can act on.
+    // `PgFlagStore` opens a `PgConnection` and writes through `pg_notify`, so it cannot serve
+    // another backend. A non-Postgres target is refused at build, not at first use with a
+    // driver error naming Postgres.
     #[cfg(feature = "db")]
     #[test]
     fn pg_flag_store_refuses_a_non_postgres_target() {

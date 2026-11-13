@@ -133,9 +133,8 @@ impl Negotiate {
         match self.resolve() {
             Resolution::Html => Format::Html,
             Resolution::Json => Format::Json,
-            // Both formats are forbidden; there is no acceptable representation.
-            // Collapse onto the default for this lossy view — `respond` emits a
-            // real `406` for this case instead.
+            // Both formats are forbidden. This lossy view falls back to the default; `respond`
+            // emits a real `406` instead.
             Resolution::NotAcceptable => self.default,
         }
     }
@@ -165,12 +164,8 @@ impl Negotiate {
     ///   format if the default itself is forbidden.
     /// * If **both** formats are forbidden → [`Resolution::NotAcceptable`].
     fn resolve(&self) -> Resolution {
-        // Media-range precedence per RFC 7231 §5.3.2: `type/subtype` beats
-        // `type/*` beats `*/*`. `.or()` chaining picks the most-specific slot
-        // that is present, and because a present slot short-circuits even when
-        // it is `Some(0.0)`, a more-specific `q=0` exclusion (e.g. `text/html;q=0`
-        // or `text/*;q=0`) still forbids the format regardless of a permissive
-        // less-specific range below it.
+        // RFC 7231 §5.3.2: `type/subtype` beats `type/*` beats `*/*`. A present `Some(0.0)` stops
+        // the `.or()` chain, so a specific `q=0` forbids the format despite a broader range.
         let html_eff = self
             .qualities
             .html
@@ -185,21 +180,18 @@ impl Negotiate {
         let html_forbidden = matches!(html_eff, Some((q, _)) if q <= 0.0);
         let json_forbidden = matches!(json_eff, Some((q, _)) if q <= 0.0);
 
-        // No representation is acceptable to the client.
         if html_forbidden && json_forbidden {
             return Resolution::NotAcceptable;
         }
 
-        // Positive candidates: listed (directly or via `*/*`) with q > 0.
         let html_pos = html_eff.filter(|&(q, _)| q > 0.0);
         let json_pos = json_eff.filter(|&(q, _)| q > 0.0);
 
         match (html_pos, json_pos) {
             (Some((hq, hidx)), Some((jq, jidx))) => {
                 if (hq - jq).abs() < f32::EPSILON {
-                    // Equal effective q: earlier list entry wins. Equal index
-                    // means both sides resolved to the *same* `*/*` entry, i.e.
-                    // no concrete preference — fall back to the default.
+                    // Earlier list entry wins. An equal index means both came from the same
+                    // `*/*` entry: no concrete preference, so use the default.
                     match hidx.cmp(&jidx) {
                         std::cmp::Ordering::Less => Resolution::Html,
                         std::cmp::Ordering::Greater => Resolution::Json,
@@ -216,8 +208,7 @@ impl Negotiate {
             // The other side is forbidden or unmentioned; the positive one wins.
             (Some(_), None) => Resolution::Html,
             (None, Some(_)) => Resolution::Json,
-            // Neither is a positive candidate, but they are not both forbidden,
-            // so at least one is non-forbidden and unmentioned: use the default.
+            // Not both forbidden, so at least one is unmentioned: use the default.
             (None, None) => self.default_resolution(html_forbidden, json_forbidden),
         }
     }
@@ -309,9 +300,8 @@ where
             )
                 .into_response(),
         };
-        // Append (never insert) so any existing Vary values are preserved. This
-        // is done on every arm, including the `406`, so shared caches still key
-        // the negotiated representations separately.
+        // Append, not insert, to keep existing Vary values. Every arm gets it, the `406` too, so
+        // shared caches key each negotiated representation separately.
         response
             .headers_mut()
             .append(VARY, HeaderValue::from_static("Accept"));
@@ -338,8 +328,7 @@ mod tests {
 
     #[test]
     fn wildcard_q_beats_demoted_html() {
-        // Codex P2 case: text/html is explicitly demoted to q=0.1 while */*;q=1
-        // covers application/json at q=1, so JSON must win.
+        // text/html is demoted to q=0.1 while */*;q=1 covers application/json, so JSON wins.
         assert_eq!(
             negotiate(Some("text/html;q=0.1, */*;q=1")).format(),
             Format::Json,
@@ -348,7 +337,6 @@ mod tests {
 
     #[test]
     fn html_wins_on_higher_q() {
-        // Acceptance-criteria case: html has the higher q-value and must win.
         assert_eq!(
             negotiate(Some("application/json;q=0.9, text/html;q=1.0")).format(),
             Format::Html,
@@ -396,8 +384,7 @@ mod tests {
 
     #[test]
     fn text_star_forbidden_falls_through_to_wildcard_json() {
-        // `text/*;q=0` forbids every text format (including text/html); `*/*;q=1`
-        // still covers JSON, so JSON is served rather than HTML resurfacing.
+        // `text/*;q=0` forbids text/html; `*/*;q=1` still covers JSON.
         assert_eq!(
             negotiate(Some("text/*;q=0, */*;q=1")).format(),
             Format::Json,
@@ -406,8 +393,7 @@ mod tests {
 
     #[test]
     fn application_star_forbidden_not_resurrected_by_json_default() {
-        // `application/*;q=0` forbids JSON via the subtype wildcard; even a JSON
-        // default must not serve it, so HTML is served instead.
+        // `application/*;q=0` forbids JSON; even a JSON default must not serve it.
         assert_eq!(
             negotiate(Some("application/*;q=0"))
                 .default_format(Format::Json)
@@ -418,22 +404,18 @@ mod tests {
 
     #[test]
     fn text_star_positive_serves_html() {
-        // `text/*;q=1` lifts HTML (via the subtype wildcard) with nothing to beat
-        // it, so HTML wins.
         assert_eq!(negotiate(Some("text/*;q=1")).format(), Format::Html);
     }
 
     #[test]
     fn application_star_positive_serves_json() {
-        // `application/*;q=1` lifts JSON (via the subtype wildcard) with nothing
-        // to beat it, so JSON wins.
         assert_eq!(negotiate(Some("application/*;q=1")).format(), Format::Json);
     }
 
     #[test]
     fn concrete_type_beats_type_wildcard_forbidding_html() {
-        // Concrete `text/html;q=0` is more specific than `text/*;q=1`, so HTML is
-        // forbidden; JSON is unmentioned and non-forbidden, so it is served.
+        // `text/html;q=0` is more specific than `text/*;q=1`, so HTML is forbidden and the
+        // unmentioned JSON is served.
         assert_eq!(
             negotiate(Some("text/html;q=0, text/*;q=1")).resolve(),
             Resolution::Json,
@@ -448,8 +430,7 @@ mod tests {
 
     #[test]
     fn forbidden_html_falls_through_to_wildcard_json() {
-        // `text/html;q=0` forbids HTML; `*/*;q=1` still covers JSON, so JSON is
-        // served rather than the default resurrecting the rejected HTML.
+        // `*/*;q=1` still covers JSON, so the default does not resurrect the rejected HTML.
         assert_eq!(
             negotiate(Some("text/html;q=0, */*;q=1")).resolve(),
             Resolution::Json,
@@ -458,8 +439,7 @@ mod tests {
 
     #[test]
     fn forbidden_json_not_resurrected_by_default() {
-        // JSON is explicitly forbidden; even a JSON default must not serve it,
-        // so the non-forbidden HTML is served instead.
+        // Even a JSON default must not serve a forbidden JSON.
         assert_eq!(
             negotiate(Some("application/json;q=0"))
                 .default_format(Format::Json)
@@ -494,8 +474,7 @@ mod tests {
 
     #[test]
     fn unlisted_type_is_not_an_exclusion() {
-        // Naming only an unrelated type leaves HTML and JSON unmentioned (not
-        // forbidden): fall back to the default, never a 406.
+        // HTML and JSON are unmentioned, not forbidden: the default applies, never a 406.
         assert_eq!(
             negotiate(Some("application/xml")).resolve(),
             Resolution::Html,
@@ -510,8 +489,7 @@ mod tests {
 
     #[test]
     fn demoted_but_positive_html_still_loses_to_wildcard() {
-        // Regression: `q=0.1` is a demotion, not an exclusion, and JSON (lifted
-        // by `*/*;q=1`) still wins on effective q.
+        // `q=0.1` is a demotion, not an exclusion; JSON via `*/*;q=1` wins on effective q.
         assert_eq!(
             negotiate(Some("text/html;q=0.1, */*;q=1")).resolve(),
             Resolution::Json,
@@ -522,9 +500,8 @@ mod tests {
 
     #[test]
     fn problem_json_alone_uses_html_default() {
-        // `application/problem+json` is an error-path (Problem Details) signal,
-        // not the success `application/json` body. Alone it leaves both HTML and
-        // JSON unmentioned, so the HTML default applies — it must NOT select JSON.
+        // problem+json signals the error (Problem Details) body, not success JSON. Alone it
+        // leaves both formats unmentioned, so the HTML default applies.
         assert_eq!(
             negotiate(Some("application/problem+json")).resolve(),
             Resolution::Html,
@@ -537,9 +514,7 @@ mod tests {
 
     #[test]
     fn problem_json_alone_uses_json_default_via_default_not_match() {
-        // With a JSON default, problem+json alone still falls through to the
-        // default (both formats unmentioned) — JSON is served *because it is the
-        // default*, not because problem+json matched the success JSON slot.
+        // JSON is served because it is the default, not because problem+json matched it.
         assert_eq!(
             negotiate(Some("application/problem+json"))
                 .default_format(Format::Json)
@@ -556,7 +531,6 @@ mod tests {
 
     #[test]
     fn plain_json_serves_json() {
-        // Regression: the success `application/json` type still negotiates JSON.
         assert_eq!(
             negotiate(Some("application/json")).resolve(),
             Resolution::Json,
@@ -566,8 +540,6 @@ mod tests {
 
     #[test]
     fn json_and_problem_json_serves_json() {
-        // `application/json` is present (alongside the problem+json error
-        // signal), so the success JSON body is negotiated.
         assert_eq!(
             negotiate(Some("application/json, application/problem+json")).resolve(),
             Resolution::Json,
@@ -580,8 +552,7 @@ mod tests {
 
     #[test]
     fn problem_json_with_html_serves_html() {
-        // problem+json does not lift the JSON tier, and text/html is present, so
-        // HTML wins outright.
+        // problem+json does not lift JSON, so text/html wins outright.
         assert_eq!(
             negotiate(Some("application/problem+json, text/html")).resolve(),
             Resolution::Html,
@@ -594,8 +565,6 @@ mod tests {
 
     #[test]
     fn resolve_matches_format_for_non_forbidden_cases() {
-        // The lossy `format()` view agrees with `resolve()` whenever a
-        // representation is actually acceptable.
         for accept in [
             Some("text/html"),
             Some("application/json"),

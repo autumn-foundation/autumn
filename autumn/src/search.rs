@@ -294,12 +294,9 @@ impl IndexDefinition {
                 self.name
             ));
         }
-        // "all" is the magic value `AUTUMN_SEARCH_BACKFILL=all` (and `autumn
-        // search reindex --index all`) use to mean "every registered index".
-        // An index actually named `all` would make that request ambiguous —
-        // and, resolved as "every index", silently reindex (or with
-        // `--purge`, empty) every index instead of the one requested. Reject
-        // it at registration so the ambiguity can never reach a backfill.
+        // "all" selects every index in `AUTUMN_SEARCH_BACKFILL` and `autumn search reindex
+        // --index`. An index named `all` would be read as that, so a reindex (or `--purge`) of it
+        // would hit every index.
         if self.name.eq_ignore_ascii_case("all") {
             return invalid(format!(
                 "search index name {:?} is reserved: \"all\" selects every index in \
@@ -616,9 +613,6 @@ mod tests {
 
     #[test]
     fn definition_rejects_the_reserved_all_name() {
-        // "all" is the AUTUMN_SEARCH_BACKFILL / `--index` sentinel for "every
-        // index" — an index actually named `all` would make a request for it
-        // ambiguous with a request to rebuild (or purge) everything.
         for name in ["all", "All", "ALL"] {
             let mut d = def();
             d.name = name;
@@ -704,11 +698,8 @@ mod tests {
 
     #[test]
     fn a_document_serializes_to_the_shape_an_external_engine_receives() {
-        // `Serialize` only, deliberately: the index and field names are
-        // `&'static str` derived from the model's own attributes, so there is
-        // nothing meaningful to deserialize them back into. The type that
-        // crosses a process boundary is `ReindexArgs` (owned `String` index),
-        // not this.
+        // `Serialize` only: the names are `&'static str` from the model's attributes, so there is
+        // nothing to deserialize into. `ReindexArgs` is the type that crosses a process boundary.
         let doc = SearchDocument::new("articles", 9)
             .with_field("title", 'A', "Hi")
             .with_embed_text("Hi")

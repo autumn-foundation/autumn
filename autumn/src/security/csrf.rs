@@ -389,12 +389,8 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     // Constant-time length check — no early exit.
     let len_eq = a.len().ct_eq(&b.len());
 
-    // Iterate over `a` (the trusted stored token) so the loop count is fixed
-    // at the server-side token length, regardless of what the caller submits
-    // as `b`.  Callers pass the attacker-controlled value as `b`, so iterating
-    // over `a` ensures every submission — short or long — executes the same
-    // amount of work.  Out-of-range positions in `b` use the sentinel 0xFF,
-    // which can never match a valid ASCII/UTF-8 token byte.
+    // Iterate over `a`, the trusted stored token, so the work does not depend on the length of
+    // the attacker-controlled `b`. Past the end of `b`, 0xFF never matches a UTF-8 token byte.
     let mut bytes_eq = Choice::from(1u8);
     for (i, &a_byte) in a.iter().enumerate() {
         let b_byte = *b.get(i).unwrap_or(&0xFF);
@@ -424,9 +420,7 @@ fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Opt
             }
 
             if found_token.is_some() {
-                // Multiple cookies with the same name found.
-                // This indicates a potential Cookie Tossing attack!
-                // Reject by returning None.
+                // A duplicate cookie of this name suggests cookie tossing: reject.
                 return None;
             }
 
@@ -453,11 +447,8 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        // Match exemptions against the normalized path so dot-segment tricks
-        // like `/api/../submit` (or percent-encoded `%2e%2e` variants) cannot
-        // satisfy an `/api/` exemption prefix while targeting another route.
-        // With no exemptions configured (the default) nothing can match, so the
-        // normalized copy of the path is not built.
+        // Match the normalized path so `/api/../submit` (or `%2e%2e`) cannot use an `/api/`
+        // exemption to reach another route.
         let is_exempt = !self.settings.exempt_paths.is_empty() && {
             let clean = crate::security::path::clean_path(req.uri().path());
             crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths)
@@ -469,16 +460,12 @@ where
             || crate::security::is_websocket_connect(&req)
             || req.extensions().get::<CsrfNotApplicable>().is_some();
 
-        // When signing is active, discard any cookie that fails HMAC verification
-        // (unsigned pre-upgrade cookies, removed-key cookies, etc.) so a fresh signed
-        // token is minted and the Set-Cookie header refreshes the browser value.
-        // `validate_cookie_token_hmac` is `true` when signing is inactive.
+        // Drop a cookie that fails HMAC verification (unsigned, or signed by a removed key) so a
+        // fresh signed token is minted and set. Without signing every cookie passes.
         let cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name)
             .filter(|tok| validate_cookie_token_hmac(tok, &self.settings));
 
-        // Only a mutating request reads the cookie token again (to compare the
-        // submitted token against it), so only it keeps a copy. Every other
-        // request moves the cookie value straight into `CsrfToken`.
+        // Only a mutating request compares against the cookie token later, so only it keeps a copy.
         let verify_against = if is_safe { None } else { cookie_token.clone() };
 
         // Reuse the cookie's token, or mint one and the cookie that sets it.
@@ -501,8 +488,6 @@ where
             |token| (token, None),
         );
 
-        // Insert CsrfToken, the configured form field name, and the configured
-        // token header name into request extensions.
         req.extensions_mut().insert(CsrfToken(token));
         req.extensions_mut()
             .insert(CsrfFormField(self.settings.form_field.clone()));
@@ -513,7 +498,7 @@ where
         let settings = Arc::clone(&self.settings);
         let mut inner = self.inner.clone();
 
-        // Swap to ensure correct poll_ready semantics
+        // Swap so the call uses the service that was polled ready.
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
@@ -528,9 +513,8 @@ where
                     let instance = Some(req.uri().path().to_owned());
                     let prefers_problem = wants_problem_details(req.headers());
 
-                    // Missing/invalid token (including a token beyond the scanned
-                    // prefix) → 403. Genuinely oversized bodies stream through and
-                    // are rejected downstream by the real body / upload limits.
+                    // A token beyond the scanned prefix counts as missing. Oversized bodies
+                    // themselves are rejected downstream by the body and upload limits.
                     let message = CSRF_FORBIDDEN_MESSAGE;
 
                     if prefers_problem {
@@ -547,7 +531,6 @@ where
                 }
             }
 
-            // Validation passed (or method is safe)
             let mut response = inner.call(req).await?;
 
             if let Some(cookie) = set_cookie
@@ -619,7 +602,6 @@ async fn verify_csrf_token(
 ) -> CsrfVerdict {
     let mut token_found = false;
 
-    // 1. Check header
     let header_token = req
         .headers()
         .get(&settings.token_header)
@@ -637,7 +619,6 @@ async fn verify_csrf_token(
         return CsrfVerdict::Valid;
     }
 
-    // 1b. Check query parameter (e.g. `_csrf`) before falling back to body
     let query_token = req.uri().query().and_then(|q| {
         url::form_urlencoded::parse(q.as_bytes())
             .find(|(key, _)| key == "_csrf" || key == settings.form_field.as_str())
@@ -656,7 +637,6 @@ async fn verify_csrf_token(
         return CsrfVerdict::Valid;
     }
 
-    // 2. Check form field (if not found in header)
     let content_type = req
         .headers()
         .get(http::header::CONTENT_TYPE)
@@ -665,29 +645,17 @@ async fn verify_csrf_token(
 
     let is_urlencoded =
         crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
-    // Parse the boundary with `multer::parse_boundary` — the exact parser
-    // `axum::extract::Multipart` uses downstream (via `mime`) — so this CSRF
-    // guard and the extractor can never disagree about the boundary, and it
-    // matches the sibling `submit_token` replay guard. A hand-rolled
-    // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
-    // quoted parameter value, so `boundary="x;y"` parses to the boundary `x;y`
-    // in the real extractor while a split truncates it to `x`, so the `_csrf`
-    // field is never located and a legitimate form is wrongly rejected (403).
-    // `parse_boundary` is case-insensitive on the media type / `boundary` param
-    // NAME and preserves the boundary VALUE's case (RFC 2046); it returns `Err`
-    // for a non-multipart type, so `.ok()` yields `None`.
+    // `multer::parse_boundary` is the parser `axum::extract::Multipart` uses, so the guard and the
+    // extractor agree on the boundary, including a quoted one with `;` (`boundary="x;y"`). It
+    // returns `Err` for a non-multipart type.
     let multipart_boundary = multer::parse_boundary(content_type).ok();
-    // NLL: content_type borrow ends here; req.body_mut() is safe to call below.
 
     if !is_urlencoded && multipart_boundary.is_none() {
         return CsrfVerdict::Missing;
     }
 
-    // Take the body, buffer at most `max_scan_bytes` of it into a scan prefix,
-    // and reconstruct the full, unmodified body so downstream handlers still
-    // receive every byte. When the body is larger than the cap, the tail is
-    // *streamed* through rather than buffered — the CSRF layer never forces a
-    // large upload into memory.
+    // Buffer at most `max_scan_bytes` to scan; the rest streams through, so a large upload is
+    // never held in memory.
     let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
 
     let (prefix, rebuilt) = match collect_body_prefix(body, settings.max_scan_bytes).await {
@@ -697,11 +665,8 @@ async fn verify_csrf_token(
         }
         CollectedBody::Oversized { prefix, body } => (prefix, body),
         CollectedBody::Errored(err) => {
-            // The body stream errored mid-read (e.g. a client disconnect). We
-            // cannot losslessly reconstruct it, and a token cannot be confirmed,
-            // so we preserve the pre-existing behavior of treating an unreadable
-            // body as a missing token (→ 403). The request is rejected and the
-            // handler never runs, so the discarded body is immaterial.
+            // A body that errored mid-read (e.g. a client disconnect) cannot be rebuilt or
+            // confirmed, so it counts as a missing token. The handler never runs.
             tracing::debug!(error = %err, "CSRF token scan: body read error, treating as missing token");
             return CsrfVerdict::Missing;
         }
@@ -735,8 +700,7 @@ async fn verify_csrf_token(
         }
     }
 
-    // Restore the full body so downstream handlers (e.g. the Multipart
-    // extractor) read it intact — identical bytes and framing.
+    // Downstream extractors read the full body with identical bytes and framing.
     *req.body_mut() = rebuilt;
 
     if token_found {
@@ -776,19 +740,13 @@ async fn collect_body_prefix(body: Body, limit: usize) -> CollectedBody {
             Some(Ok(chunk)) => {
                 let remaining = limit.saturating_sub(buf.len());
                 if chunk.len() > remaining {
-                    // Fill the scan prefix up to `limit` with the leading bytes
-                    // of the over-limit chunk, so a token at the front of the
-                    // form is still found even when the FIRST chunk already
-                    // exceeds the cap (e.g. an upstream middleware rebuilt the
-                    // body as one `Body::from(bytes)`, leaving `buf` empty here).
+                    // Fill the prefix from the over-limit chunk, so a leading token is found even
+                    // when the first chunk alone exceeds the cap (a body built by `Body::from`).
                     let mut prefix_buf = buf.clone();
                     prefix_buf.extend_from_slice(&chunk[..remaining]);
                     let prefix = Bytes::from(prefix_buf);
-                    // Replay the FULL body unchanged: the buffered prefix bytes
-                    // followed by the *complete* over-limit chunk (not just its
-                    // scanned head) and the rest of the stream. The prefix is
-                    // only for locating the token; the handler must receive every
-                    // byte, and the tail streams through unbuffered.
+                    // Replay the whole body: the buffered bytes, the complete over-limit chunk
+                    // (not just its scanned head), then the unbuffered rest of the stream.
                     let mut leading = Vec::with_capacity(2);
                     if !buf.is_empty() {
                         leading.push(Ok::<Bytes, axum::Error>(Bytes::from(buf)));
@@ -1418,9 +1376,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_with_large_urlencoded_body_token_first_streams_and_passes() {
-        // A urlencoded body far larger than the scan prefix, with `_csrf` FIRST.
-        // The token is located in the prefix (→ pass) and the full body still
-        // reaches the handler intact — the tail streams through unbuffered.
+        // The token is found in the prefix, and the handler still receives the full body.
         async fn echo_len(body: Body) -> String {
             let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
             bytes.len().to_string()
@@ -1528,10 +1484,7 @@ mod tests {
 
     #[test]
     fn with_max_scan_bytes_clamps_effective_scan_cap_below_prefix() {
-        // Operator lowered the global body limit (64 KiB) below the CSRF prefix
-        // cap (2 MiB default). The router clamps the effective scan cap to
-        // min(token_scan_bytes, max_request_size_bytes) = 64 KiB, so the CSRF
-        // layer never buffers more than the global body limit.
+        // A global body limit below the scan cap bounds it: CSRF never buffers more than that.
         let token_scan_bytes = default_csrf_config().token_scan_bytes; // 2 MiB
         let max_request_size_bytes = 64 * 1024; // 64 KiB
         let effective = token_scan_bytes.min(max_request_size_bytes);
@@ -1543,9 +1496,7 @@ mod tests {
 
     #[test]
     fn with_max_scan_bytes_preserves_small_prefix_in_normal_case() {
-        // Normal/high-upload case: a large max_request_size_bytes (32 MiB
-        // default) must NOT raise the effective cap — the small token_scan_bytes
-        // prefix (2 MiB) stays the primary bound via `min`.
+        // A large body limit does not raise the scan cap.
         let token_scan_bytes = default_csrf_config().token_scan_bytes; // 2 MiB
         let max_request_size_bytes = 32 * 1024 * 1024; // 32 MiB
         let effective = token_scan_bytes.min(max_request_size_bytes);
@@ -1566,7 +1517,7 @@ mod tests {
         assert_eq!(layer.settings.token_header.as_str(), "x-csrf-token");
     }
 
-    // ── Signed CSRF tokens (RED phase) ────────────────────────────────────
+    // ── Signed CSRF tokens ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn csrf_token_is_hmac_signed_when_keys_set() {
@@ -1626,7 +1577,6 @@ mod tests {
             .route("/", post(|| async { "created" }))
             .layer(layer);
 
-        // Mint a valid signed token
         let config = SigningSecretConfig {
             secret: Some("k".repeat(32)),
             previous_secrets: vec![],
@@ -1778,8 +1728,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_multipart_csrf_field_after_other_field_passes() {
-        // Regression: skipping a non-matching part must not advance pos past
-        // the next part's headers (the +2 fix in scan_multipart_field).
+        // Skipping a non-matching part must not advance past the next part's headers.
         let token = "test-csrf-token-uuid-after";
         let boundary = "----WebKitFormBoundaryORDER";
         let body = multipart_body(boundary, &[("name", "alice"), ("_csrf", token)]);
@@ -2073,14 +2022,9 @@ mod tests {
 
     #[tokio::test]
     async fn post_mixed_case_multipart_content_type_with_valid_token_passes() {
-        // Media types are case-insensitive (RFC 9110 8.3.1); the Multipart
-        // extractor accepts `Multipart/Form-Data` with a `Boundary=` parameter.
-        // A valid `_csrf` field in such a body must be scanned and the request
-        // ACCEPTED — a case-sensitive `starts_with("multipart/form-data")` gate
-        // wrongly rejects it (403). The weird-case boundary VALUE is identical in
-        // the header and the body delimiters, which also proves the boundary
-        // VALUE stays case-sensitive (RFC 2046) while the media type / param NAME
-        // are matched case-insensitively.
+        // The media type and parameter name match case-insensitively (RFC 9110 8.3.1), as the
+        // Multipart extractor does. The mixed-case boundary value also appears verbatim in the
+        // body, so its case is preserved (RFC 2046).
         let token = "test-csrf-token-uuid-mixedmp";
         let boundary = "BoUnDaRy-XyZ-123";
         let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
@@ -2110,11 +2054,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_mixed_case_urlencoded_content_type_with_valid_token_passes() {
-        // Media types are case-insensitive (RFC 9110 8.3.1). A urlencoded form
-        // POST carrying a valid `_csrf` field with an upper/mixed-case
-        // Content-Type (`Application/x-www-form-urlencoded`) must be ACCEPTED — a
-        // case-sensitive `starts_with("application/x-www-form-urlencoded")` gate
-        // wrongly rejects it (403), skipping body scanning entirely.
+        // Media types are case-insensitive (RFC 9110 8.3.1), so a mixed-case urlencoded type is
+        // still scanned.
         let token = "test-csrf-token-uuid-mixeduenc";
         let app = Router::new()
             .route("/submit", post(|| async { "created" }))
@@ -2139,13 +2080,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_multipart_quoted_boundary_with_semicolon_passes() {
-        // `mime` permits a `;` inside a QUOTED boundary parameter value, so
-        // `boundary="x;y"` parses to the boundary `x;y` in the real Multipart
-        // extractor (via `multer`). A hand-rolled `split(';')` truncates it to
-        // `x`, so the `_csrf` field is never located and the request is wrongly
-        // rejected (403). Parsing with `multer::parse_boundary` — the exact
-        // parser the extractor uses — keeps the guard and the extractor in
-        // agreement, so the valid token is found and the request ACCEPTED.
+        // A quoted boundary may contain `;`: the extractor reads `boundary="x;y"` as `x;y`, and so
+        // must the guard.
         let token = "test-csrf-token-uuid-quotedsemi";
         let boundary = "x;y";
         let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);

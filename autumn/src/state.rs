@@ -877,20 +877,9 @@ impl AppState {
             );
         }
         self.fields_mut().started_at = clock.monotonic();
-        // A registry's queue gauges compare ready-at marks against a clock, and
-        // the marks come from the job runtime started off *this* state — so the
-        // registry has to be the one this state's clock governs, and only that
-        // one. Hence a fresh registry rather than re-clocking the existing one:
-        //
-        // * re-clocking only this handle leaves a clone's runtime stamping on
-        //   the old clock while the shared gauges judge on the new one, and
-        // * re-clocking through a shared cell inverts it — the *other* handle
-        //   then stamps with its own clock into gauges moved out from under it.
-        //
-        // Detaching gives every state one clock and one registry that agree,
-        // whichever order states are cloned and re-clocked in. Before a runtime
-        // starts — the only point at which this builder is meaningful, checked
-        // above — the registry is empty, so nothing is dropped.
+        // A fresh registry rather than a re-clocked shared one, so each state's gauges judge
+        // ready-at marks on the same clock its runtime stamps them with, however states are
+        // cloned and re-clocked. Before a runtime starts the registry is empty, so nothing is lost.
         self.fields_mut().job_registry =
             actuator::JobRegistry::new().with_clock(Arc::clone(&clock));
         self.fields_mut().clock = clock;
@@ -1485,11 +1474,9 @@ impl crate::actuator::ProvideActuatorState for AppState {
     {
         self.replica_pool.as_ref()
     }
-    // a11y_posture() uses the trait default (all-false) intentionally: AppState
-    // cannot know whether the application's layout is accessible.  Override this
-    // method on your own state type — or in a custom ProvideActuatorState impl —
-    // once you have verified that your pages include lang, a skip link, and
-    // landmark regions.  See docs/guide/accessibility.md for details.
+    // `a11y_posture` keeps the all-false trait default: `AppState` cannot know whether the app's
+    // layout is accessible. Override it on your own state type once your pages include `lang`, a
+    // skip link and landmark regions (docs/guide/accessibility.md).
 
     #[cfg(feature = "http-client")]
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
@@ -1554,10 +1541,9 @@ impl AppStateInner {
     /// struct-update syntax (`AppStateInner { field: ..., ..AppStateInner::test_default_fields() }`)
     /// rather than repeating the other twenty-odd fields.
     pub(crate) fn test_default_fields() -> Self {
-        // One registry and one tracker across all three fields, for the
-        // reason `detached()` gives: a hub wired to a different `Channels`
-        // than `state.channels()` publishes where nobody is listening, and a
-        // test asserting on either would pass vacuously.
+        // One registry and one tracker across all three fields, as in `detached()`: a hub
+        // wired to a different `Channels` publishes where nobody listens, and a test
+        // asserting on either would pass vacuously.
         #[cfg(feature = "ws")]
         let channels = crate::channels::Channels::new(32);
         #[cfg(feature = "presence")]
@@ -1795,10 +1781,8 @@ mod tests {
             "the state that stamped the mark must judge it as scheduled"
         );
 
-        // The clone kept the real clock, so it must also have kept its own
-        // registry — otherwise its runtime would stamp real-time deadlines into
-        // gauges now judged against 2020, and every one of them would read as
-        // scheduled for years.
+        // The clone kept the real clock, so it must keep its own registry too, or
+        // its real-time deadlines would be judged against 2020.
         let clone_snapshot = cloned_before.job_registry().queue_snapshot();
         assert!(
             !clone_snapshot.contains_key("default"),
@@ -2021,7 +2005,6 @@ mod tests {
     fn app_state_accessors() {
         let state = AppState::for_test();
 
-        // Exercise the new getters to ensure they compile and return the expected types
         let _metrics = state.metrics();
         let _log_levels = state.log_levels();
         let _task_registry = state.task_registry();

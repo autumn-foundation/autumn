@@ -211,16 +211,9 @@ fn missing_asset_markup(name: &str) -> maud::Markup {
 
 // ── Embedded assets (feature = "embed-assets") ──────────────────────────────
 //
-// When the app registers an embedded `static/` tree via
-// [`AppBuilder::embedded_static`](crate::app::AppBuilder::embedded_static),
-// the binary is fully self-contained: `asset_url`/`is_manifest_asset` resolve
-// against the manifest baked into the binary (no disk read) and `/static/*`
-// is served from the embedded bytes. Both the manifest and the files come from
-// the *same* build, so fingerprint-vs-manifest drift is impossible.
-//
-// The embedded path is active regardless of `debug_assertions`: it engages only
-// once a dir is registered, so dev builds (which never register one) are
-// unaffected and keep serving from disk for hot-reload.
+// Once `AppBuilder::embedded_static` registers a dir, URLs resolve against the manifest baked into
+// the binary and `/static/*` serves the embedded bytes, so manifest and files cannot drift. This
+// holds in debug builds too; dev builds never register a dir and keep serving from disk.
 
 /// A `static/` directory embedded into the binary at compile time.
 ///
@@ -328,11 +321,8 @@ pub fn asset_url(path: &str) -> String {
 /// [`asset_url`] for a file in the app's own `static/` tree: the manifest
 /// lookup alone, without the compiled-asset lookup.
 fn app_asset_url(path: &str) -> String {
-    // When an embedded `static/` tree is registered (single-binary build), the
-    // embedded manifest is the *only* source of truth — assets are served from
-    // the binary, so a miss means the asset isn't fingerprinted and should use
-    // the plain embedded path. Never fall through to a disk sidecar manifest,
-    // which could otherwise point at a hashed file that was never baked in.
+    // With an embedded tree, a manifest miss means the asset is not fingerprinted. Never fall
+    // through to a disk manifest: it could name a hashed file that was never baked in.
     #[cfg(feature = "embed-assets")]
     {
         if embedded_static_dir().is_some() {
@@ -371,9 +361,7 @@ pub(crate) fn is_manifest_asset(rel_path: &str) -> bool {
     if is_compiled_fingerprint(rel_path) {
         return true;
     }
-    // When an embedded `static/` tree is registered, its manifest is the sole
-    // authority for the immutable-cache decision (and is reachable in debug
-    // builds too); never consult a disk sidecar manifest in that case.
+    // With an embedded tree, its manifest alone decides immutability, in debug builds too.
     #[cfg(feature = "embed-assets")]
     {
         if embedded_static_dir().is_some() {
@@ -872,7 +860,6 @@ mod tests {
         assert_eq!(content_type_for("img/logo.png"), "image/png");
         assert_eq!(content_type_for("fonts/inter.woff2"), "font/woff2");
         assert_eq!(content_type_for("favicon.ico"), "image/x-icon");
-        // Unknown / extensionless fall back to octet-stream.
         assert_eq!(content_type_for("data.bin"), "application/octet-stream");
         assert_eq!(content_type_for("LICENSE"), "application/octet-stream");
     }
@@ -946,8 +933,7 @@ mod cache_control_service_tests {
     #[tokio::test]
     async fn leaves_non_static_routes_alone() {
         assert_eq!(cache_control_for("/ping", StatusCode::OK).await, None);
-        // `/static` without the trailing slash is NOT an asset path — the
-        // predicate is a `/static/` prefix, matching the original `starts_with`.
+        // The predicate is a `/static/` prefix, so `/static` alone is not an asset path.
         assert_eq!(cache_control_for("/static", StatusCode::OK).await, None);
         assert_eq!(cache_control_for("/staticky/x", StatusCode::OK).await, None);
     }

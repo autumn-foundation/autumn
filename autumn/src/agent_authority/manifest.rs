@@ -237,17 +237,17 @@ pub fn mcp_exposure(input: &McpExposureInput<'_>) -> Option<McpExposedBy> {
             None
         }
     };
-    // A streaming tool returns an SSE body, so it has no JSON response schema
-    // by nature and is eligible purely on its opt-in (or the hatch).
+    // A streaming tool returns an SSE body and has no JSON response schema, so
+    // only its opt-in (or the hatch) decides.
     if input.mcp_stream {
         if input.mcp_tool {
             return Some(McpExposedBy::Attribute);
         }
         return hatch();
     }
-    // JSON-out only: a response schema is the structural signal that this is a
-    // JSON endpoint rather than an HTML/Maud route. A status whose body is
-    // empty *by contract* (204/205) stays eligible.
+    // JSON-out only: a response schema marks a JSON endpoint rather than an
+    // HTML/Maud route. A status whose body is empty by contract (204/205) stays
+    // eligible.
     if !input.has_response_schema && !has_empty_body_contract(input.success_status) {
         return None;
     }
@@ -653,9 +653,8 @@ impl AgentAuthorityManifest {
             );
         }
 
-        // Declared envelopes, including the ones nothing uses: an envelope with
-        // no action is either dead code or a handler that lost its annotation,
-        // and dropping it would hide both.
+        // Keep grants nothing uses: an unused one is dead code or a handler that
+        // lost its annotation, and dropping it would hide either.
         for grant in grants {
             all_grants.insert((grant.name, grant.location), grant);
         }
@@ -686,8 +685,8 @@ impl AgentAuthorityManifest {
 
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
-            // The document as a whole is what the compiler proved; a single row
-            // says for itself when a human's word was taken instead.
+            // The document as a whole is compiler-proved; a row marks itself
+            // `declared` when it rests on a human's word.
             provenance: "provable".to_string(),
             audit: AuditStatus {
                 sink_configured: audit_sink_configured,
@@ -896,18 +895,15 @@ impl AgentAuthorityManifest {
 fn route_for_actions(
     routes: &[RouteSummary],
 ) -> BTreeMap<(&'static str, &'static str), &RouteSummary> {
-    // Which route reaches which action, keyed on the authority's own
-    // identity rather than on pointer equality: a route carries the very
-    // `&'static AgentAuthority` the descriptor published, and naming the
-    // join in data keeps it checkable.
+    // Joined on the authority's identity, not pointer equality, so the join is
+    // plain data and checkable.
     //
-    // Tool exposure (MCP, then WebMCP) wins over first-come. One handler can
-    // be mounted twice -- a plain HTTP route for people and an MCP route for
-    // agents -- and if the HTTP one merely registered first, taking it would
-    // label the action `http-route`, hide it from `non_reversible_actions()`,
-    // and let `--check` pass with no sink on an action an agent really can
-    // call. Among routes of equal exposure the first still wins, so the
-    // choice stays stable against link order.
+    // Tool exposure (MCP, then WebMCP) wins over registration order. One handler
+    // can be mounted as both a plain HTTP route and an MCP tool; picking the HTTP
+    // one would label the action `http-route`, hide it from
+    // `non_reversible_actions()` and let `--check` pass with no audit sink on an
+    // action an agent can call. Among routes of equal exposure the first wins, so
+    // the choice is stable.
     let mut route_for: BTreeMap<(&str, &str), &RouteSummary> = BTreeMap::new();
     for route in routes {
         if let Some(authority) = route.agent_authority {
@@ -1197,8 +1193,7 @@ const fn exposure_of(route: Option<&RouteSummary>) -> &'static str {
         // Eligible, but the projector keeps only the first route per name.
         Some(route) if route.duplicate_operation_id => "not-exposed",
         Some(_) => "http-route",
-        // Registered but unreachable: a plugin may register an action the host
-        // does not mount. Reported, never a failure.
+        // A plugin may register an action the host does not mount.
         None => "not-exposed",
     }
 }
@@ -1426,8 +1421,7 @@ mod tests {
             operation_id: handler,
             module_path,
             mcp_tool,
-            // The fixtures speak in terms of "is a tool"; how it got that way
-            // is the hatch tests' business, and they set it explicitly.
+            // The hatch tests set `exposed_by` explicitly.
             exposed_by: mcp_tool.then_some(McpExposedBy::Attribute),
             duplicate_operation_id: false,
             webmcp_tool: false,
@@ -1570,8 +1564,8 @@ mod tests {
 
     #[test]
     fn the_audit_sink_status_is_recorded_in_the_document() {
-        // A deployment with no sink still builds and still serves tools; the
-        // manifest is where that shows up, not a startup line nobody reads.
+        // A deployment with no sink still builds and serves tools; the manifest
+        // is where that shows up.
         let with_sink = AgentAuthorityManifest::from_parts(&[], &[], &[], true);
         assert!(with_sink.audit.sink_configured);
         let without = AgentAuthorityManifest::from_parts(&[], &[], &[], false);
@@ -1598,10 +1592,9 @@ mod tests {
 
     #[test]
     fn the_last_marker_line_wins() {
-        // `AppBuilder::run` prints one line, but a plugin (or a test harness
-        // wrapping the binary) could print an earlier one. The last is the one
-        // this process produced, and picking the first would silently certify
-        // somebody else's document.
+        // A plugin or a wrapping test harness could print an earlier marker line;
+        // the last one is this process's, and taking the first would certify
+        // someone else's document.
         let first = AgentAuthorityManifest::from_parts(&[], &[], &[], false);
         let last = AgentAuthorityManifest::from_parts(
             &[&DRAFT_REFUND],
@@ -1619,9 +1612,8 @@ mod tests {
 
     #[test]
     fn a_marker_in_the_middle_of_a_line_still_parses() {
-        // The scan splits on the marker rather than requiring it at column
-        // zero, so a log prefix (a timestamp, a `tracing` target) in front of
-        // it does not lose the manifest.
+        // A log prefix (timestamp, `tracing` target) before the marker must not
+        // lose the manifest.
         let manifest = AgentAuthorityManifest::from_parts(&[], &[], &[], true);
         let stdout = format!(
             "2026-09-02T00:00:00Z INFO app: {}\n",
@@ -1632,9 +1624,8 @@ mod tests {
 
     #[test]
     fn a_trailing_carriage_return_does_not_break_the_parse() {
-        // A binary run through a pipe on Windows, or any CRLF-emitting shim,
-        // leaves a `\r` that `lines()` does not strip. The parse trims it, so
-        // a manifest is not silently "missing" on one platform.
+        // A CRLF-emitting pipe (Windows) leaves a `\r` that `lines()` does not
+        // strip.
         let manifest = AgentAuthorityManifest::from_parts(&[], &[], &[], true);
         let stdout = format!("{}\r\n", manifest.to_dump_line());
         assert_eq!(parse_manifest_dump(&stdout).expect("parses"), manifest);
@@ -1642,11 +1633,9 @@ mod tests {
 
     #[test]
     fn two_routes_reaching_one_action_keep_the_first() {
-        // A handler mounted at two paths is still one action. Among routes of
-        // the *same* exposure the choice is arbitrary, so it must at least be
-        // stable: the routes are visited in order and the first wins, or
-        // `--check` would report link-order churn as drift. (When the
-        // exposures differ, the MCP one wins instead -- see below.)
+        // A handler mounted at two paths is one action. Among routes of equal
+        // exposure the first wins, so link order cannot show up as drift in
+        // `--check`. (When exposures differ the MCP one wins; see below.)
         let manifest = AgentAuthorityManifest::from_parts(
             &[&DRAFT_REFUND],
             &[&REFUND_GRANT],
@@ -1672,11 +1661,8 @@ mod tests {
 
     #[test]
     fn an_mcp_route_wins_the_join_over_a_plain_http_one_registered_first() {
-        // One handler, mounted twice: a plain HTTP route for people and an MCP
-        // route for agents. If mere registration order decided, the HTTP row
-        // would label the action `http-route`, `non_reversible_actions()`
-        // would skip it, and `--check` would pass with no sink on an action an
-        // agent really can call.
+        // Were registration order to decide, the HTTP route would label the
+        // action `http-route` and hide an agent-callable action from the gate.
         let http_first = AgentAuthorityManifest::from_parts(
             &[&DRAFT_REFUND],
             &[&REFUND_GRANT],
@@ -1769,9 +1755,8 @@ mod tests {
             true,
         );
         let row = find(&manifest, "draft_refund");
-        // The fixture registers the same write twice: link order is
-        // unspecified, so an un-deduplicated list would show up as spurious
-        // drift in `--check`.
+        // The fixture registers the same write twice. Link order is unspecified,
+        // so effects are deduplicated and sorted to keep `--check` stable.
         assert_eq!(row.effects.len(), 2, "{:?}", row.effects);
         let mut sorted = row.effects.clone();
         sorted.sort();
@@ -1838,8 +1823,8 @@ mod tests {
         );
         assert!(exposed.route.as_ref().expect("route").mcp_tool);
 
-        // Registered but unreachable: a warning, never a failure — a plugin
-        // may register an action the host does not mount.
+        // A warning, never a failure: a plugin may register an action the host
+        // does not mount.
         let orphan = find(&manifest, "sweep_drafts");
         assert_eq!(orphan.exposure, "not-exposed");
         assert!(orphan.route.is_none());
@@ -1878,8 +1863,7 @@ mod tests {
     #[test]
     fn an_asserted_effect_free_site_downgrades_the_row_provenance() {
         // `#[agent_effect(none, reason = "…")]` discharges an opaque statement
-        // on a human's word. The row is no longer something the compiler
-        // proved on its own, and the manifest must not claim otherwise.
+        // on a human's word, so the row is no longer compiler-proved.
         static DISCHARGED: AgentAuthority = AgentAuthority {
             action: "discharged",
             module_path: "billing::discharged",
@@ -1899,11 +1883,9 @@ mod tests {
 
     #[test]
     fn each_asserted_effect_free_site_reaches_the_row_with_its_reason() {
-        // The whole value of the hatch is that a reviewer can weigh the claim,
-        // so both halves have to be in the artefact reviewers read. Before
-        // this, a row already carrying one `Declared` effect could gain a
-        // `#[agent_effect(none, ...)]` over a statement that really did charge
-        // a card, and `--check` reported no drift at all (#1691 P2-5).
+        // A reviewer must be able to weigh each claim, so every site and its
+        // reason reach the row. Otherwise a row already `declared` could gain a
+        // new `#[agent_effect(none, ...)]` with no drift in `--check` (#1691).
         static HATCHED: AgentAuthority = AgentAuthority {
             action: "hatched",
             module_path: "billing::hatched",
@@ -1937,8 +1919,8 @@ mod tests {
                 },
             ]
         );
-        // And it survives the round trip a committed manifest makes, or the
-        // drift gate would never see it.
+        // It must survive the committed manifest's round trip for the drift
+        // gate to see it.
         let json = manifest.to_json();
         assert!(json.contains("pure formatting helper"), "{json}");
         let parsed: AgentAuthorityManifest = serde_json::from_str(&json).expect("round trip");
@@ -1955,9 +1937,8 @@ mod tests {
 
     #[test]
     fn a_manifest_written_before_the_hatch_list_existed_still_parses() {
-        // `#[serde(default)]` earns its place: a committed manifest from
-        // before this field would otherwise fail `--check` with a parse error
-        // rather than a drift report.
+        // An older committed manifest must report drift in `--check`, not fail
+        // to parse.
         let json = r#"{
             "schema_version": 1,
             "provenance": "provable",
@@ -1983,18 +1964,15 @@ mod tests {
         let parsed: AgentAuthorityManifest = serde_json::from_str(json).expect("parses");
         assert!(parsed.actions[0].asserted_effect_free.is_empty());
         assert!(parsed.unregistered_authorities.is_empty());
-        // The audit posture, though, is NOT defaulted -- see the test below.
+        // `audit` is never defaulted; see the next test.
         assert!(parsed.audit.sink_configured);
     }
 
     #[test]
     fn a_manifest_missing_its_audit_posture_is_rejected_not_defaulted() {
-        // Every field added since v1 defaults, so an older committed manifest
-        // loads and shows drift rather than dying on a parse error. `audit`
-        // deliberately does not: it has been required since v1, so a document
-        // without it is not an older manifest, it is a malformed one -- and
-        // silently reading it as `sink_configured: false` would turn "this file
-        // is broken" into a confident claim about a deployment.
+        // `audit` has been required since v1, so a document without it is
+        // malformed, not old. Defaulting it to `sink_configured: false` would
+        // turn a broken file into a claim about the deployment.
         let json = r#"{
             "schema_version": 1,
             "provenance": "provable",
@@ -2010,10 +1988,8 @@ mod tests {
 
     #[test]
     fn an_ungoverned_tool_is_named_by_its_operation_id_not_its_handler() {
-        // `#[api_doc(operation_id = "...")]` renames the tool without renaming
-        // the handler, and the tool name is what an MCP client calls. A row
-        // keyed only on the handler would describe a tool by a name that
-        // appears nowhere in the agent's view of the API.
+        // `#[api_doc(operation_id = "...")]` renames the tool, not the handler,
+        // and the tool name is what an MCP client calls.
         let mut renamed = route(
             "POST",
             "/widgets",
@@ -2095,8 +2071,7 @@ mod tests {
                     true,
                     None,
                 ),
-                // Not an MCP tool: an ordinary HTTP route is not an agent's to
-                // call, so it is not this document's business.
+                // Not an MCP tool, so not listed.
                 route(
                     "POST",
                     "/internal/sync",
@@ -2302,11 +2277,9 @@ mod tests {
 
     #[test]
     fn a_used_webhook_topic_is_not_reported_unused() {
-        // The proved subject of a `Webhook` effect is the bare topic, exactly
-        // as the grant entry spells it (#1691 S1.1). A prefixed subject would
-        // never match its own entry, so every webhook a handler really fires
-        // would be reported as granted-but-unused -- advice to take away
-        // authority the code is actively using.
+        // The proved subject of a `Webhook` effect is the bare topic, as the
+        // grant entry spells it (#1691). A prefixed subject would never match,
+        // so every fired webhook would be reported as unused.
         static FIRES_WEBHOOK: AgentAuthority = AgentAuthority {
             action: "fire_webhook",
             module_path: "billing::hooks",
@@ -2330,7 +2303,7 @@ mod tests {
         );
     }
 
-    // ── The MCP exposure rule (#1691 P2-6) ───────────────────────────
+    // ── The MCP exposure rule (#1691) ────────────────────────────────
 
     fn doc(method: &str) -> McpExposureInput<'_> {
         McpExposureInput {
@@ -2347,9 +2320,8 @@ mod tests {
 
     #[test]
     fn the_whole_api_hatch_exposes_read_only_verbs_and_nothing_else() {
-        // `expose_all_as_mcp()` sweeps in GETs nobody annotated. They are
-        // agent-callable exactly like an annotated route, and reporting them
-        // as "not a tool" left the read-only agent surface unenumerable.
+        // `expose_all_as_mcp()` sweeps in unannotated GETs. They are as
+        // agent-callable as an annotated route.
         let hatch = |method| {
             mcp_exposure(&McpExposureInput {
                 expose_all: true,
@@ -2360,9 +2332,7 @@ mod tests {
         assert_eq!(hatch("HEAD"), Some(McpExposedBy::Hatch));
         assert_eq!(hatch("POST"), None);
         assert_eq!(hatch("DELETE"), None);
-        // Fail-closed on a verb nobody has heard of, exactly as
-        // `method_is_mutating` does: the hatch is the one place an unrecognised
-        // verb must not be waved through as "probably a read".
+        // Fail closed on an unknown verb, as `method_is_mutating` does.
         assert_eq!(hatch("FROBNICATE"), None);
     }
 
@@ -2398,10 +2368,8 @@ mod tests {
 
     #[test]
     fn an_html_route_tagged_mcp_is_not_reported_as_a_tool() {
-        // The JSON-out gate. A Maud route someone tagged `#[api_doc(mcp)]`
-        // never becomes a tool, so reporting it as an ungoverned one was noise
-        // a reviewer would have to learn to ignore -- and a gate people learn
-        // to ignore is not a gate.
+        // The JSON-out gate: a Maud route tagged `#[api_doc(mcp)]` never becomes
+        // a tool.
         assert_eq!(
             mcp_exposure(&McpExposureInput {
                 mcp_tool: true,
@@ -2460,8 +2428,7 @@ mod tests {
     fn replicated_predicate_matches_the_mcp_projector() {
         use crate::openapi::{ApiDoc, SchemaEntry, SchemaKind};
 
-        // Any response schema will do -- the rule reads only whether one is
-        // present, never what it says.
+        // Any schema will do: the rule reads only whether one is present.
         const THING: SchemaEntry = SchemaEntry {
             name: "Thing",
             kind: SchemaKind::Ref,
@@ -2511,15 +2478,14 @@ mod tests {
         }
     }
 
-    // ── Routes naming an authority nothing registered (#1691 P3-1) ───
+    // ── Routes naming an authority nothing registered (#1691) ────────
 
     #[test]
     fn a_route_whose_authority_never_registered_is_surfaced_not_lost() {
-        // Cannot happen through the macros -- `#[agent_operable]` emits the
-        // static and its `inventory::submit!` together -- but a hand-written
-        // pair produces exactly this, and it lands in neither `actions` (built
-        // from `inventory`) nor `ungoverned_tools` (which filters on *no*
-        // authority). A tool in no list is a tool in no gate.
+        // `#[agent_operable]` emits the static and its `inventory::submit!`
+        // together, but a hand-written pair can omit the submit. Such a route
+        // lands in neither `actions` nor `ungoverned_tools`, so it needs its
+        // own list.
         let manifest =
             AgentAuthorityManifest::from_parts(&[], &[&REFUND_GRANT], &[governed_route()], true);
         assert!(manifest.actions.is_empty());
@@ -2552,13 +2518,11 @@ mod tests {
         assert_eq!(manifest.actions.len(), 1);
     }
 
-    // ── The audit gate's inputs (#1691 P1-2) ─────────────────────────
+    // ── The audit gate's inputs (#1691) ──────────────────────────────
 
     #[test]
     fn unaudited_and_unrecoverable_needs_both_halves() {
-        // A missing sink is survivable when everything is reversible; a
-        // non-reversible action is survivable when it is recorded. Only the
-        // conjunction is the state nothing can catch at runtime.
+        // Neither a missing sink nor a non-reversible action trips it alone.
         let non_reversible = |sink| {
             AgentAuthorityManifest::from_parts(
                 &[&DRAFT_REFUND],
@@ -2571,15 +2535,14 @@ mod tests {
         assert!(non_reversible(false), "compensable tool, no sink");
         assert!(!non_reversible(true), "compensable tool, sink present");
 
-        // Reversible and unaudited is fine: nothing is lost that cannot be put
-        // back.
+        // Reversible and unaudited is fine.
         let reversible =
             AgentAuthorityManifest::from_parts(&[&EDIT_NOTE], &[&REVERSIBLE_GRANT], &[], false);
         assert!(!reversible.unaudited_and_unrecoverable());
         assert!(reversible.non_reversible_actions().is_empty());
 
-        // ...until an ungoverned mutating tool joins it. Nothing declares what
-        // that one may do, so nothing promises it can be undone either.
+        // ...until an ungoverned mutating tool joins it: nothing promises that
+        // one can be undone.
         let with_tool = AgentAuthorityManifest::from_parts(
             &[&EDIT_NOTE],
             &[&REVERSIBLE_GRANT],
@@ -2598,12 +2561,9 @@ mod tests {
 
     #[test]
     fn only_an_agent_reachable_action_trips_the_audit_gate() {
-        // The gate exists because an *agent* can take an action nothing
-        // records. A linked plugin can register an action this binary never
-        // mounts, or mounts as a plain HTTP route -- no agent can call either,
-        // so neither can produce the unrecorded agent invocation this is
-        // about. Failing on them would make an unrelated app's dependency
-        // everybody's `--allow-unaudited`.
+        // The gate is about unrecorded *agent* calls. A plugin's action that is
+        // unmounted, or mounted only as a plain HTTP route, cannot be called by
+        // an agent and must not trip it.
         let gate = |routes: &[RouteSummary]| {
             AgentAuthorityManifest::from_parts(&[&DRAFT_REFUND], &[&REFUND_GRANT], routes, false)
         };
@@ -2614,8 +2574,7 @@ mod tests {
         assert!(unmounted.non_reversible_actions().is_empty());
         assert!(!unmounted.unaudited_and_unrecoverable());
 
-        // Mounted, but only for humans over HTTP. Requests there have their
-        // own audit story; this document is about the agent surface.
+        // Mounted only as a plain HTTP route.
         let http_only = gate(&[route(
             "POST",
             "/refunds",
@@ -2643,9 +2602,7 @@ mod tests {
 
     #[test]
     fn every_excluded_dimension_says_whether_it_could_ever_be_proved() {
-        // "Not enforced yet" and "not enforceable here" are different claims,
-        // and a reader who cannot tell them apart will read a rate cap as a
-        // weaker proof rather than as a different kind of statement.
+        // "Not enforced yet" and "not enforceable here" are different claims.
         let excluded = excluded_dimensions();
         for entry in &excluded {
             assert!(
@@ -2672,10 +2629,8 @@ mod tests {
 
     #[test]
     fn the_hatch_caveat_describes_what_the_document_actually_does() {
-        // It used to promise that `expose_all_as_mcp` tools "surface under
-        // `ungoverned_tools`" while the summary derived tool-ness from the
-        // attribute alone, so they surfaced nowhere. The text and the
-        // behaviour now agree; this pins them together.
+        // The caveat says `expose_all_as_mcp` tools surface under
+        // `ungoverned_tools`; this checks that they do.
         let caveat = excluded_dimensions()
             .into_iter()
             .find(|e| e.dimension == "generated_repository_tools")

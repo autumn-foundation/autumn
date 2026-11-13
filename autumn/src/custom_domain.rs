@@ -901,9 +901,8 @@ impl CustomDomainStore for FsCustomDomainStore {
                 let bytes = tokio::fs::read(&path).await?;
                 match serde_json::from_slice::<CustomDomain>(&bytes) {
                     Ok(domain) => out.records.push(domain),
-                    // One corrupt record must not stop the other 999 domains
-                    // from serving. The caller learns of it, and the registry
-                    // then refuses new registrations (#2654).
+                    // One corrupt record must not stop the other domains from serving. The
+                    // caller learns of it, and the registry refuses new registrations (#2654).
                     Err(e) => {
                         tracing::error!(
                             path = %path.display(),
@@ -1174,15 +1173,12 @@ impl CustomDomainRegistry {
             .iter()
             .find(|pattern| {
                 pattern.strip_prefix("*.").map_or_else(
-                    // A bare name reserves itself AND everything under it: an
-                    // operator listing `myapp.com` means the whole zone, not
-                    // just the apex.
+                    // A bare name reserves itself and everything under it: `myapp.com`
+                    // means the whole zone.
                     || host == *pattern || host.ends_with(&format!(".{pattern}")),
-                    // `host == suffix` is intentional: a wildcard reserves its
-                    // own apex too. Wider than the certificate `*.myapp.com`
-                    // covers, and that is the point — the operator owns the
-                    // zone, so a tenant must not be able to claim `myapp.com`
-                    // just because only the wildcard was listed.
+                    // A wildcard reserves its own apex too, wider than the certificate
+                    // covers: the operator owns the zone, so `*.myapp.com` keeps a tenant
+                    // from claiming `myapp.com`.
                     |suffix| host == suffix || host.ends_with(&format!(".{suffix}")),
                 )
             })
@@ -1235,19 +1231,12 @@ impl CustomDomainRegistry {
         let mut index = write_lock(&self.index);
         index.clear();
         for record in records {
-            // A reservation can appear AFTER a domain was connected: the
-            // operator adds a tenancy base domain, another name to the
-            // deployment certificate, or an ingress hostname. `register`
-            // refuses a reserved name, but the record written before that
-            // change is still in the store, and hydrating it hands the
-            // deployment's own hostname to whoever registered it first —
-            // custom-domain lookup runs ahead of ordinary subdomain tenancy,
-            // so the stale record wins every request from the restart on.
+            // A reservation can be added after a domain was connected. Loading that record
+            // would hand the deployment's own hostname to the tenant: custom-domain lookup
+            // runs ahead of subdomain tenancy, so it would win every request.
             //
-            // Quarantined, not deleted: the record stays in the store, so
-            // reverting the configuration restores the domain, while the
-            // retention prune clears the certificate of a hostname the
-            // registry no longer knows.
+            // Skipped, not deleted: reverting the configuration restores the domain, and the
+            // retention prune clears the certificate of a hostname the registry no longer knows.
             if let Some(pattern) = self.reserved_match(&record.hostname) {
                 tracing::error!(
                     hostname = %record.hostname,
@@ -1279,10 +1268,8 @@ impl CustomDomainRegistry {
         let (loaded, legacy) = self.hydrate_index(report.records);
         self.hydrated
             .store(true, std::sync::atomic::Ordering::Release);
-        // A record stored before ownership tokens, and not yet serving, has
-        // proved nothing that stops a dangling-DNS takeover. Give it a token
-        // now, so the tenant sees the TXT record from the first screen after
-        // the upgrade. A failure here is retried by the orchestrator.
+        // A record stored without an ownership token has proved nothing that stops a
+        // dangling-DNS takeover. Give it one now; the orchestrator retries a failure.
         let now = now_unix();
         for hostname in legacy {
             if let Err(e) = self.adopt_verification_token(&hostname, now).await {
@@ -1428,12 +1415,9 @@ impl CustomDomainRegistry {
                 "{host} is too long to carry its {VERIFICATION_LABEL} TXT record"
             )));
         }
-        // An index that never hydrated knows nothing, and the store keys its
-        // files by a hash of the hostname: registering here would report
-        // success, overwrite the record of whoever durably owns the hostname,
-        // and hand it to this tenant at the next restart. A transient read
-        // error at boot must not cost a tenant their domain, so mutations wait
-        // for a load that succeeded.
+        // The store keys files by a hash of the hostname, so registering before a successful
+        // load could overwrite the durable owner's record and hand the domain to this tenant
+        // at the next restart.
         if !self.is_hydrated() {
             return Err(RegisterError::NotReady);
         }
@@ -1445,10 +1429,8 @@ impl CustomDomainRegistry {
             return Err(RegisterError::Incomplete { files: skipped });
         }
 
-        // Refuse a full registry BEFORE creating this hostname's write gate.
-        // The authoritative check is inside the gate below; this one exists so
-        // that a tenant-facing endpoint hammered with unique hostnames cannot
-        // mint a gate per attempt while every attempt is refused anyway.
+        // Refuse a full registry before creating a write gate, so a flood of unique hostnames
+        // cannot mint a gate per refused attempt. The authoritative check is under the gate.
         let full = {
             let index = read_lock(&self.index);
             index.len() >= self.max_domains && !index.contains_key(&host)
@@ -1459,19 +1441,14 @@ impl CustomDomainRegistry {
             });
         }
 
-        // Taken BEFORE the index is inspected, so the whole registration —
-        // claim and save — is serialised against an offboard of the same
-        // hostname. Claiming first and gating afterwards let a concurrent
-        // `remove` erase the fresh entry and delete nothing, after which this
-        // save still landed: the domain was absent from the running process but
-        // came back at the next restart.
+        // Taken before the index is inspected, so claim and save are serialised against an
+        // offboard of the same hostname. Otherwise a concurrent `remove` could erase the
+        // fresh entry, after which this save lands and the domain returns at the next restart.
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
 
-        // Claim the hostname in the index FIRST, under one write lock, and only
-        // then persist. Writing the store first let a losing racer's record
-        // reach disk anyway: the winner served in memory while the loser's
-        // tenant came back after a restart, silently taking the hostname over.
+        // Claim the hostname in the index first, then persist. Saving first would let a losing
+        // racer's record reach disk and take the hostname over at the next restart.
         let record = {
             let mut index = write_lock(&self.index);
             if let Some(existing) = index.get(&host) {
@@ -1496,9 +1473,7 @@ impl CustomDomainRegistry {
         };
 
         if let Err(e) = self.store.save(&record).await {
-            // Roll the claim back: a hostname that is not durable must not
-            // route, or it would disappear on the next restart with no record
-            // of why.
+            // A hostname that is not durable must not route: it would vanish at the next restart.
             write_lock(&self.index).remove(&host);
             return Err(RegisterError::Store(e.to_string()));
         }
@@ -2106,13 +2081,9 @@ impl CustomDomainRegistry {
         let Ok(host) = normalize_hostname(hostname) else {
             return Ok(false);
         };
-        // Delete from the store first: a crash between the two leaves a record
-        // that `load` re-hydrates, which is recoverable — the reverse leaves a
-        // hostname that routes but has no durable record.
-        //
-        // Under the same gate as every other write for this hostname, so an
-        // in-flight save cannot land after the delete and resurrect the record
-        // at the next restart.
+        // Delete from the store before the index: a crash between the two leaves a record
+        // that `load` re-hydrates, while the reverse leaves a hostname that routes with no
+        // durable record. The gate keeps an in-flight save from resurrecting the record.
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
         self.remove_if_locked(&host, guard).await
@@ -2153,11 +2124,8 @@ impl CustomDomainRegistry {
             .collect();
         let mut removed = 0;
         for hostname in hostnames {
-            // Re-assert the tenant per hostname: the list is a snapshot and
-            // each removal awaits, so a hostname freed early can be
-            // re-registered by ANOTHER tenant before a later one runs. An
-            // unconditional removal would delete that tenant's record and stop
-            // routing a domain that was never part of this teardown.
+            // Re-check the tenant per hostname: the list is a snapshot, and another tenant can
+            // re-register a hostname while earlier removals await.
             if self
                 .remove_if(&hostname, |current| current.tenant == tenant)
                 .await?
@@ -2225,13 +2193,9 @@ impl CustomDomainRegistry {
         guard: impl FnOnce(&CustomDomain) -> bool,
         f: impl FnOnce(&mut CustomDomain),
     ) -> io::Result<bool> {
-        // Apply to a COPY, persist, and only then publish. Mutating the live
-        // index first left a state the store had rejected routing and serving
-        // anyway: `record_active` reported failure while the domain went on
-        // being served from it, and the state then vanished at the next
-        // restart with nothing to explain either half. Every writer for this
-        // hostname holds this same gate, so nothing can change the record
-        // between the copy and the publish.
+        // Apply to a copy, persist, then publish, so a state the store rejected never routes.
+        // Every writer for this hostname holds this gate, so the record cannot change between
+        // the copy and the publish.
         let Some(current) = read_lock(&self.index).get(host).cloned() else {
             return Ok(false);
         };
@@ -2242,9 +2206,7 @@ impl CustomDomainRegistry {
         f(&mut updated);
         self.store.save(&updated).await?;
         let mut index = write_lock(&self.index);
-        // An offboard cannot interleave under the gate, but the index is the
-        // routing table: if the record is gone, leave it gone rather than
-        // resurrecting a hostname nothing owns.
+        // If the record is gone, leave it gone rather than resurrect a hostname nothing owns.
         Ok(index.get_mut(host).is_some_and(|slot| {
             *slot = updated;
             true
@@ -2518,11 +2480,8 @@ impl IssuanceLimiter {
     /// reason reported is the most specific one.
     #[must_use]
     pub fn check(&self, hostname: &str, now_unix: i64) -> IssuanceDecision {
-        // Both windows are read under ONE guard, then the guard is released
-        // before any decision is built: a caller must not hold the lock while
-        // formatting a message, and the two counts must come from the same
-        // instant or a domain could pass its own budget against a global count
-        // taken after another thread spent it.
+        // Both counts come from one guard so they describe the same instant. The guard is
+        // released before the decision and its message are built.
         let (domain_hits, global_hits) = {
             let attempts = read_lock(&self.attempts);
             let domain_hits = attempts
@@ -3144,9 +3103,7 @@ mod sni {
             if self.base_covers(&name) {
                 return Some(self.base.current());
             }
-            // The registry check comes BEFORE any I/O: an unregistered name
-            // must cost nothing but a hash lookup, however many are thrown at
-            // the listener.
+            // Checked before any I/O: an unregistered name costs only a hash lookup.
             if !self.registry.is_servable(&name) {
                 return None;
             }
@@ -3191,8 +3148,7 @@ mod sni {
     impl ResolvesServerCert for SniCertResolver {
         fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
             client_hello.server_name().map_or_else(
-                // No SNI at all (an IP-address client, or an old one): serve the
-                // operator's certificate, exactly as before custom domains.
+                // No SNI (an IP-address client, or an old one): serve the operator's certificate.
                 || Some(self.base.current()),
                 |name| self.certificate_for(name),
             )

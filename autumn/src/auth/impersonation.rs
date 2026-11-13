@@ -687,12 +687,9 @@ async fn swap_identity(
     stash_identity_keys(session, extra).await;
     session.insert(IMPERSONATED_SESSION_KEY, target_id).await;
     stash(session, ROLE_SESSION_KEY, IMPERSONATOR_ROLE_SESSION_KEY).await;
-    // `last_strong_auth_at` is a bare timestamp with no identity bound to it,
-    // so carrying it across the swap would let a `#[step_up]` route run a
-    // destructive action *on the target's account* on the strength of the
-    // operator's re-authentication — impersonation laundering a credential
-    // check. Every other identity transition in the framework drops this key
-    // for the same reason.
+    // `last_strong_auth_at` has no identity bound to it. Carried across the swap, the operator's
+    // re-authentication would satisfy `#[step_up]` routes on the target's account. Every identity
+    // transition drops it.
     stash(
         session,
         crate::step_up::STEP_UP_SESSION_KEY,
@@ -702,10 +699,8 @@ async fn swap_identity(
 
     session.insert(auth_key, target_id).await;
     set_or_remove(session, ROLE_SESSION_KEY, target_role).await;
-    // Privilege change ⇒ new session id (no fixation). Bind the record to the
-    // generation this rotation mints, so the next rotation — a login, an
-    // account switch — retires the record instead of letting whoever comes next
-    // inherit it.
+    // New session id on a privilege change (no fixation). The record is bound to this generation,
+    // so the next rotation (a login, an account switch) retires it.
     session.rotate_id().await;
     session
         .insert(IMPERSONATION_SESSION_ID_KEY, session.id().await)
@@ -796,12 +791,9 @@ async fn check_begin_preconditions(
     target_id: &str,
 ) -> crate::AutumnResult<(String, String)> {
     let auth_key = state.auth_session_key().to_owned();
-    // A configured auth key that collides with one of this module's own keys
-    // makes the swap self-destructive: writing the target through `auth_key`
-    // would overwrite the record it just wrote, so attribution would follow the
-    // target and the revert could not restore the operator. Refuse the
-    // misconfiguration rather than corrupting the session — checked before the
-    // session is read at all, so the error names the real cause.
+    // An auth key equal to one of this module's keys would overwrite the impersonation record
+    // with the target id, so the revert could not restore the operator. Refuse it before reading
+    // the session, so the error names the real cause.
     if is_reserved_session_key(&auth_key) {
         return Err(reserved_auth_key_error(&auth_key));
     }
@@ -818,10 +810,8 @@ async fn check_begin_preconditions(
         ));
     }
 
-    // No nesting: an already-impersonated session cannot start a second hop,
-    // so impersonation can never be chained into an escalation. Uses the
-    // validated form, so a *stale* record (one describing a user this session
-    // no longer resolves as) does not permanently wedge the session at 409.
+    // No nesting, so impersonation cannot be chained into an escalation. The validated check
+    // ignores a stale record, which would otherwise wedge the session at 409.
     if is_impersonating(state, session).await {
         return Err(crate::AutumnError::conflict_msg(
             "already impersonating; stop the current impersonation first",
@@ -886,10 +876,8 @@ pub async fn begin_impersonation(
     session: &Session,
     target: impl Into<ImpersonationTarget>,
 ) -> crate::AutumnResult<ImpersonationState> {
-    // Normalize ONCE, before anything sees the target. The policy, the audit
-    // event, and the session write must all reason about the same string: if the
-    // gate were handed a raw `" root "` while the session received `"root"`, a
-    // policy denying `"root"` would authorize an id it never approved.
+    // Normalize once, so the policy, the audit event and the session write see the same id: a
+    // policy denying `"root"` must not approve a raw `" root "` that is later stored as `"root"`.
     let target = target.into().normalized();
     let target_id = target.user_id();
     let (auth_key, real_id) = check_begin_preconditions(state, session, target_id).await?;
@@ -919,8 +907,7 @@ pub async fn begin_impersonation(
         ));
     }
 
-    // Check the extra keys before any write. A bad key then fails the begin
-    // and leaves the session unchanged.
+    // Check the extra keys before any write, so a bad key leaves the session unchanged.
     let extra = match gate.as_deref() {
         Some(gate) => gate.policy().target_session_values(&ctx, &target).await,
         None => Vec::new(),
@@ -935,13 +922,9 @@ pub async fn begin_impersonation(
         )));
     }
 
-    // Fail closed on a *missing* sink, not just a failing one.
-    // `audit::write_from_state` deliberately returns `Ok(())` when no
-    // `AuditLogger` is installed, so without this check an app that enabled
-    // impersonation but never configured a sink would swap identities with no
-    // record at all — precisely the outcome this module exists to prevent.
-    // Checked after the authorization gate so an unauthorized caller still gets
-    // a plain `403` and learns nothing about the app's audit configuration.
+    // Fail closed on a missing sink too: `audit::write_from_state` returns `Ok(())` with no
+    // `AuditLogger`, which would swap identities with no record. Checked after the policy gate so
+    // an unauthorized caller gets a plain 403 and learns nothing about the audit setup.
     let audit_enabled = state
         .extension::<crate::audit::AuditLogger>()
         .is_some_and(|logger| logger.is_enabled());
@@ -954,9 +937,7 @@ pub async fn begin_impersonation(
         ));
     }
 
-    // Audit *before* the swap, and fail closed: an identity swap that cannot be
-    // recorded must not take effect. The worst case is an over-recorded event,
-    // never a silent one.
+    // Audit before the swap and fail closed: a swap that cannot be recorded must not happen.
     crate::audit::write_from_state(
         state,
         AuditEvent::new(
@@ -974,10 +955,8 @@ pub async fn begin_impersonation(
         ))
     })?;
 
-    // Resolve the impersonated role server-side only. An explicit role on the
-    // target wins (a trusted, in-process caller decided it); otherwise the
-    // policy resolves it from the app's own user store; otherwise the session
-    // carries no role at all — never the admin's.
+    // Server-side only: the target's explicit role (set by in-process code), else the policy's
+    // lookup, else no role. Never the operator's.
     let target_role = match target.role() {
         Some(role) => Some(role.to_owned()),
         None => match gate.as_deref() {
@@ -996,14 +975,8 @@ pub async fn begin_impersonation(
     )
     .await;
 
-    // The remainder of *this* request is the impersonator's work too — but only
-    // seed the actor if nothing stronger already resolved one, matching the
-    // "first/outermost resolver wins" rule the three session seams follow. On
-    // every session-authenticated path the actor is already this same
-    // `real_id` by now (the seam, or the `PolicyContext` built above, seeded
-    // it), so this changes nothing there; it matters when an API-token bearer
-    // or an explicit `with_actor(...)` scope resolved the principal first, and
-    // clobbering that would misattribute the rest of the handler's writes.
+    // The rest of this request is the operator's work. Seed the actor only if none is set: the
+    // first resolver wins, and an API token or `with_actor(...)` scope must not be clobbered.
     if Current::actor().is_none() {
         Current::set_actor(real_id.clone());
     }
@@ -1039,11 +1012,8 @@ pub async fn end_impersonation(
         return Err(reserved_auth_key_error(&auth_key));
     }
     let Some(active) = impersonation_state(state, session).await else {
-        // Either there is no record, or there is a *stale* one describing a user
-        // this session no longer resolves as — an operator walked away without
-        // reverting and somebody else logged in on the same session. Honoring
-        // that record would hand the new user the operator's identity and role
-        // with no credential, so drop it instead of restoring it.
+        // No record, or a stale one for a user this session no longer resolves as (someone else
+        // logged in). Restoring it would hand that user the operator's identity, so drop it.
         clear(session).await;
         return Err(crate::AutumnError::bad_request_msg("not impersonating"));
     };
@@ -1077,9 +1047,8 @@ pub async fn end_impersonation(
     session.remove(IMPERSONATION_SESSION_ID_KEY).await;
     restore_identity_keys(session).await;
     stash(session, IMPERSONATOR_ROLE_SESSION_KEY, ROLE_SESSION_KEY).await;
-    // Put the operator's own step-up claim back exactly as it was, and discard
-    // anything the impersonated session accrued — that freshness belonged to
-    // the target's credential, not the operator's.
+    // Restore the operator's own step-up claim. Discard any the impersonated session accrued: that
+    // freshness is not the operator's.
     stash(
         session,
         IMPERSONATOR_STEP_UP_SESSION_KEY,
@@ -1197,12 +1166,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_live_step_up_key_is_reserved() {
-        // The swap stashes the operator's live step-up claim aside and then
-        // writes the target id through the configured auth key. With
-        // `[auth].session_key = "last_strong_auth_at"` those are the same
-        // entry, and a numeric target id in the neighbourhood of current
-        // epoch seconds would satisfy step-up with no reauthentication — so
-        // the reserved-key check refuses the configuration instead.
+        // With `[auth].session_key = "last_strong_auth_at"`, the swap would write the target id
+        // into the step-up key, and a numeric id near the current epoch seconds would satisfy
+        // step-up with no reauthentication.
         assert!(is_reserved_session_key(crate::step_up::STEP_UP_SESSION_KEY));
         assert_eq!(crate::step_up::STEP_UP_SESSION_KEY, "last_strong_auth_at");
         assert_eq!(RESERVED_SESSION_KEYS.len(), 8);

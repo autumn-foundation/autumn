@@ -148,7 +148,7 @@ fn join_split(hi: i64, lo: i64) -> Result<i64, LedgerError> {
     i64::try_from(total).map_err(|_| LedgerError::Money(MoneyError::Overflow))
 }
 
-// Backend-forked placeholder. Postgres numbers its binds, `SQLite` does not.
+// Bind placeholder: Postgres numbers its binds, `SQLite` does not.
 #[cfg(not(feature = "sqlite"))]
 fn ph(n: usize) -> String {
     format!("${n}")
@@ -158,17 +158,12 @@ fn ph(_n: usize) -> String {
     "?".to_owned()
 }
 
-// Row lock on one account row.
+// On Postgres `FOR UPDATE` holds the account row until the transaction ends, which serializes
+// two posts over one account.
 //
-// On Postgres `FOR UPDATE` holds the row until the enclosing transaction ends,
-// which is what serializes two posts over one account.
-//
-// `SQLite` has no row lock, so the clause is empty there. `Db::tx` opens a
-// DEFERRED transaction, so two concurrent posts read the same snapshot and the
-// second one to write gets `SQLITE_BUSY_SNAPSHOT` — an error the busy handler
-// does not queue. A `SQLite` app that posts concurrently must therefore retry
-// the whole transaction. `post` refuses to run outside a transaction on either
-// backend, so the read and the write are at least always one unit.
+// `SQLite` has no row lock. `Db::tx` opens a DEFERRED transaction, so of two concurrent posts the
+// second to write gets `SQLITE_BUSY_SNAPSHOT`, which the busy handler does not queue: a `SQLite`
+// app that posts concurrently must retry the whole transaction.
 #[cfg(not(feature = "sqlite"))]
 const FOR_UPDATE: &str = " FOR UPDATE";
 #[cfg(feature = "sqlite")]
@@ -564,7 +559,7 @@ impl Posting {
         }
         match self.side {
             Side::Debit => Ok(minor),
-            // Safe: `minor` is at or above zero, so its negation exists.
+            // `minor >= 0`, so its negation cannot overflow.
             Side::Credit => minor
                 .checked_neg()
                 .ok_or(LedgerError::Money(MoneyError::Overflow)),
@@ -736,8 +731,8 @@ impl Transaction {
         let Some(currency) = currency else {
             return Err(LedgerError::PostingCount { count: 0 });
         };
-        // Not reachable with both totals zero: every line is non-zero and
-        // there are at least two, so one side always has something in it.
+        // Every line is non-zero, so at least one total is too: this catches all-debit or
+        // all-credit transactions.
         if debits == 0 || credits == 0 {
             return Err(LedgerError::OneSided);
         }
@@ -1142,10 +1137,8 @@ pub async fn ensure_account(
 ) -> Result<Account, LedgerError> {
     check_text("account id", &account.id, MAX_ACCOUNT_ID)?;
 
-    // Read first. An account that already exists needs no INSERT, and on SQLite
-    // the REPLACE guard would otherwise abort the statement before
-    // `ON CONFLICT DO NOTHING` could apply — turning the `AccountCurrency`
-    // answer below into a database error for an account that holds postings.
+    // Read first: on SQLite the REPLACE guard aborts the INSERT before `ON CONFLICT DO NOTHING`
+    // applies, which would turn the `AccountCurrency` error below into a database error.
     if let Some(stored) = load_account(conn, &account.id).await? {
         if stored.currency != account.currency {
             return Err(LedgerError::AccountCurrency {
@@ -1405,9 +1398,8 @@ pub async fn post(
         }
     }
 
-    // Already posted? Then the money moved once and this call is the retry.
-    // Read before writing anything, so the checks below cannot refuse a
-    // transaction that is already in the books.
+    // Already posted means this call is a retry. Read before writing anything, so the checks
+    // below cannot refuse a transaction that is already in the books.
     if let Some(existing) = load_transaction(conn, transfer.key().as_str()).await? {
         if existing.request_hash != *checked.request_hash() {
             return Err(LedgerError::KeyReuse {
@@ -1423,17 +1415,11 @@ pub async fn post(
     // if the caller drops this future before the postings go in.
     store_summed_balances(conn, &accounts, &balances).await?;
 
-    // The postings go in BEFORE the transaction row they belong to.
-    //
-    // That looks backwards, and it is what makes this cancellation-safe. The
-    // foreign key is `DEFERRABLE INITIALLY DEFERRED`, so a posting may name a
-    // transaction row that does not exist yet and the database checks that it
-    // does at COMMIT. If this future is dropped part-way — a caller racing
-    // `post` against a timeout inside its own transaction — the enclosing
-    // transaction is left holding postings with no parent and cannot commit.
-    // Written the other way round, a drop between the two could commit a
-    // transaction row with no postings, and the tables being append-only would
-    // make that unbalance permanent.
+    // Postings go in BEFORE their transaction row, for cancellation safety. The foreign key is
+    // `DEFERRABLE INITIALLY DEFERRED`, so it is checked at COMMIT: if this future is dropped
+    // part-way, the enclosing transaction holds orphan postings and cannot commit. The other
+    // order could commit a transaction row with no postings, a permanent unbalance in
+    // append-only tables.
     let id = uuid::Uuid::new_v4().to_string();
     write_postings(conn, &id, transfer).await?;
 
@@ -1458,13 +1444,9 @@ pub async fn post(
         .await?;
 
     if inserted == 0 {
-        // Someone took the key between the read above and here. The account
-        // locks serialize every poster over these accounts, so this is a
-        // poster that shares the key but not the accounts — or a snapshot
-        // above READ COMMITTED that could not see the row. Either way our
-        // postings are orphans now, so this transaction must not commit: both
-        // arms return an error, and the caller's retry replays cleanly off the
-        // read above.
+        // Another poster took the key since the read above: one sharing the key but not the
+        // locked accounts, or a snapshot above READ COMMITTED that could not see the row. Our
+        // postings are orphans, so both arms return an error and the caller's retry replays.
         if let Some(existing) = load_transaction(conn, transfer.key().as_str()).await?
             && existing.request_hash != *checked.request_hash()
         {
@@ -1477,8 +1459,7 @@ pub async fn post(
         });
     }
 
-    // Read the row back, so the caller gets what the ledger stored: the
-    // database's own timestamp and the postings as written.
+    // Read back for the database's own timestamp and the postings as stored.
     let stored = load_transaction(conn, transfer.key().as_str())
         .await?
         .ok_or(LedgerError::Database(diesel::result::Error::NotFound))?;
@@ -1507,9 +1488,7 @@ async fn write_postings(
     transfer: &Transaction,
 ) -> Result<(), LedgerError> {
     let postings = transfer.postings();
-    // Bounded by `MAX_POSTINGS`, already enforced by `Transaction::validate`
-    // (which `post` calls before this), so the string this builds is bounded
-    // too.
+    // `post` has already run `Transaction::validate`, so the count is bounded by `MAX_POSTINGS`.
     let mut values = String::with_capacity(postings.len().saturating_mul(24));
     for i in 0..postings.len() {
         if i > 0 {
@@ -1570,13 +1549,9 @@ fn check_resulting_balances(
     transfer: &Transaction,
 ) -> Result<(), LedgerError> {
     for StoredAccount { account, .. } in accounts.values() {
-        // Sum this transaction's own postings for the account first, in `i128`,
-        // and apply the net delta once. Adding them to the stored balance one
-        // at a time would make the range check depend on the order the postings
-        // were listed in: an account near the `i64` boundary with an offsetting
-        // pair of lines would pass one way round and overflow the other. The
-        // request hash normalizes that order away, so two submissions of the
-        // same money must not disagree here either.
+        // Apply the net delta once. Adding postings one at a time would make the range check
+        // order-dependent: near the `i64` boundary an offsetting pair could pass one way round
+        // and overflow the other, while the request hash treats both orders as the same.
         let mut delta: i128 = 0;
         for posting in transfer.postings() {
             if posting.account_id() == account.id {

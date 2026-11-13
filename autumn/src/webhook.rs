@@ -977,10 +977,9 @@ impl FromRequest<crate::AppState> for SignedWebhook {
                     "webhook body could not be read: {err}"
                 ))
             })?;
-        // The ambient clock: real time outside a `Sim`, as the provider signs
-        // with real time, and the sim clock inside one (issue #2967). Not the
-        // app clock: a test that pins `TestApp::with_clock` still signs with
-        // real time.
+        // The ambient clock: real time, as the provider signs with, or the sim clock inside a `Sim`
+        // (#2967). Not the app clock: a test that pins `TestApp::with_clock` still signs with real
+        // time.
         let received_at = crate::time::ambient_system_time();
         verify_request(&registry, &endpoint, &parts.headers, body, received_at)
             .await
@@ -1172,10 +1171,8 @@ where
 
     fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
         let cell: ReplayStoreCell = std::sync::Arc::new(std::sync::Mutex::new(None));
-        // Built inside the scope, not merely polled inside it — see
-        // `crate::capsule::capture` for why the argument form would run the
-        // synchronous `Service::call` chain beneath this layer with the
-        // task-local unset.
+        // Call the inner service inside the scope, not only poll it there: its synchronous
+        // `Service::call` chain needs the task-local too (see `crate::capsule::capture`).
         let inner = WEBHOOK_REPLAY_KEY.sync_scope(cell.clone(), || self.inner.call(req));
         WebhookReplayCleanupFuture::Serving {
             inner: WEBHOOK_REPLAY_KEY.scope(cell.clone(), inner),
@@ -1234,14 +1231,13 @@ where
                     let response = match std::task::ready!(inner.poll(cx)) {
                         Ok(response) => response,
                         Err(error) => {
-                            // The inner service failed rather than responding.
-                            // Leave `completed` false so the guard's `Drop`
-                            // releases the keys, matching the panic/cancel path.
+                            // Leave `completed` false so the guard's `Drop` releases the keys,
+                            // as on panic or cancel.
                             return std::task::Poll::Ready(Err(error));
                         }
                     };
-                    // The handler ran to completion: the guard's drop-time
-                    // release must not fire, whatever the status was.
+                    // The handler completed: the guard must not release on drop, whatever
+                    // the status.
                     guard.completed = true;
                     match release_keys_on_server_error(cell, response.status()) {
                         None => return std::task::Poll::Ready(Ok(response)),
@@ -1321,14 +1317,12 @@ async fn verify_request(
                     inserted_keys.push(key);
                 }
                 Ok(false) => {
-                    // Rollback already inserted keys for this request
                     for inserted in inserted_keys {
                         let _ = registry.replay_store.remove(&inserted).await;
                     }
                     return Err(WebhookVerifyError::DuplicateDelivery);
                 }
                 Err(error) => {
-                    // Rollback already inserted keys for this request
                     for inserted in inserted_keys {
                         let _ = registry.replay_store.remove(&inserted).await;
                     }

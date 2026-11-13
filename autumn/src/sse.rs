@@ -223,16 +223,13 @@ pub fn stream_resumable(
         epoch,
     } = state.channels().resume(topic, last_event_id);
 
-    // A live-only backend (Redis fan-out, or any backend without a replay
-    // buffer) cannot honour a `Last-Event-ID`: it has no history to replay. When
-    // a client reconnects asking to resume, surface the same `gap` sentinel the
-    // local backend emits on overflow so the client learns replay was
-    // unavailable instead of silently losing the events it missed.
+    // A live-only backend (e.g. Redis fan-out) has no history to replay, so a
+    // resume request gets the same `gap` sentinel the local backend emits on
+    // overflow rather than silently losing the missed events.
     let missed_on_live_only = !resumable && last_event_id.is_some();
 
-    // Prefix: an optional gap sentinel, then each replayed event in order. Every
-    // id is formatted `"{epoch}.{seq}"` so a client that later echoes it back
-    // resumes against the right epoch.
+    // Ids carry the epoch so a client that echoes one back resumes against the
+    // right epoch.
     let mut prefix: Vec<Result<Event, Infallible>> = Vec::with_capacity(replay.len() + 1);
     if gap || missed_on_live_only {
         prefix.push(Ok(Event::default().event(GAP_EVENT).data(GAP_MARKER)));
@@ -247,18 +244,15 @@ pub fn stream_resumable(
             .data(sequenced.message.into_string())));
     }
 
-    // Live tail: assign seqs from `next_live_id` upward, formatting each id as
-    // `"{epoch}.{seq}"`. On a broadcast lag, advance the counter by the number
-    // of skipped messages (seqs are dense) and surface a gap sentinel so clients
-    // can react.
+    // On a broadcast lag, advance the seq by the number skipped so ids stay
+    // dense, and emit a gap sentinel.
     let live = futures::stream::unfold(
         (subscriber, next_live_id, String::new()),
         move |(mut subscriber, next_seq, mut id)| async move {
             match subscriber.recv().await {
                 Ok(msg) => {
-                    // One buffer for the stream's lifetime: `Event::id` copies
-                    // its argument, so a fresh `String` per event was
-                    // formatted only to be copied and dropped.
+                    // `Event::id` copies its argument, so one buffer is reused
+                    // for the stream's lifetime.
                     id.clear();
                     let _ = write!(
                         id,
@@ -358,8 +352,7 @@ mod tests {
     #[test]
     fn test_keep_alive_default() {
         let ka = keep_alive();
-        // Since KeepAlive fields are private in axum, we just ensure it constructs successfully.
-        // We can format it to string using debug, to verify it's properly initialized.
+        // axum keeps `KeepAlive`'s fields private, so only check it constructs.
         let debug_str = format!("{ka:?}");
         assert!(debug_str.contains("KeepAlive"));
     }
@@ -394,8 +387,7 @@ mod tests {
         bad.insert("last-event-id", "not-a-number".parse().unwrap());
         assert_eq!(last_event_id(&bad), None);
 
-        // A legacy bare-integer id (from before ids were epoch-tagged) is
-        // malformed → None → treated as a cold connection.
+        // A bare-integer id lacks the epoch, so it is treated as a cold connection.
         let mut legacy = axum::http::HeaderMap::new();
         legacy.insert("last-event-id", "42".parse().unwrap());
         assert_eq!(last_event_id(&legacy), None);
@@ -481,9 +473,8 @@ mod tests {
         }
     }
 
-    // Fix #2: a live-only backend (no replay) that receives a `Last-Event-ID`
-    // cannot replay the missed events, so `stream_resumable` must lead with a
-    // `gap` sentinel instead of silently dropping them.
+    // A live-only backend cannot replay, so a resume request must lead with a
+    // `gap` sentinel.
     #[cfg(feature = "ws")]
     #[tokio::test]
     async fn stream_resumable_live_only_backend_signals_gap_on_resume_request() {
@@ -493,8 +484,6 @@ mod tests {
         state.fields_mut().channels =
             Channels::with_backend(LiveOnlyBackend(LocalChannelsBackend::new(32)));
 
-        // Reconnect *with* a Last-Event-ID against a backend that keeps no
-        // history: the client must be told replay was unavailable.
         let sse = stream_resumable(&state, "feed", Some(EventId { epoch: 1, seq: 7 }));
         let body = axum::response::IntoResponse::into_response(sse).into_body();
         let raw = collect_body(body, Duration::from_millis(150)).await;
@@ -518,9 +507,8 @@ mod tests {
         );
     }
 
-    // Fix #5: a live subscriber that falls behind the broadcast buffer receives
-    // `RecvError::Lagged`; `stream_resumable` must surface a `gap` sentinel and
-    // keep the post-lag ids dense and matching the real published ids.
+    // A lagged live subscriber must get a `gap` sentinel, and post-lag ids must
+    // stay dense and match the real published ids.
     #[cfg(feature = "ws")]
     #[tokio::test]
     async fn stream_resumable_live_lag_emits_gap_and_keeps_ids_dense() {
@@ -549,9 +537,7 @@ mod tests {
             .unwrap_or_else(|| panic!("a broadcast lag must emit a gap sentinel: {raw:?}"));
         assert!(raw[gap_pos..].contains("\"gap\":true"));
 
-        // Post-lag frames keep dense seqs (9, 10) matching the real published
-        // ids. Ids are now epoch-tagged (`"{epoch}.{seq}"`), so match the
-        // `.{seq}` suffix (the `.` only appears in an epoch-tagged id).
+        // Ids are `"{epoch}.{seq}"`, so match the `.{seq}` suffix.
         let id9 = raw
             .find(".9")
             .unwrap_or_else(|| panic!("post-lag seq 9 must appear: {raw:?}"));
@@ -567,9 +553,8 @@ mod tests {
             "post-lag payloads must match the real published ids: {raw:?}"
         );
 
-        // The live tail formats every id into one reused buffer. Each `id:`
-        // line must be exactly one epoch-tagged id: a buffer not cleared
-        // between events would emit `E.9E.10`, which does not parse.
+        // The live tail reuses one id buffer: if it were not cleared between
+        // events, the second line would read `E.9E.10` and fail to parse.
         let seqs: Vec<u64> = raw
             .lines()
             .filter_map(|line| line.strip_prefix("id: "))

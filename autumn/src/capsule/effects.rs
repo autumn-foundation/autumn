@@ -458,18 +458,9 @@ impl ReplayEffects {
     /// Build the tape a capsule's recorded effects describe.
     #[must_use]
     pub fn new(effects: CapsuleEffects) -> Self {
-        // Seeded from the recorded **reads** only, and from the *first* read of
-        // each key.
-        //
-        // Folding writes in as well would break the commonest cache shape
-        // there is: a handler that misses, computes, fills, and (later, or on
-        // the next request) hits. The recorded `Get{value: None}` and the
-        // `Insert{…}` that followed it would collapse into one pre-seeded hit,
-        // the replayed handler would take the hit branch its recording never
-        // took, and the capsule would report a mismatch caused entirely by
-        // replay. A write the replayed run performs is applied by
-        // `cache_insert` at the moment it happens, which is what makes
-        // fill-then-read-back work with the recorded ordering intact.
+        // Seeded from the first recorded read of each key only. Seeding writes would turn a
+        // recorded miss-then-fill into a pre-seeded hit and send the handler down a branch the
+        // recording never took. Replayed writes are applied by `cache_insert` as they happen.
         let mut cache: BTreeMap<String, CacheSlot> = BTreeMap::new();
         for entry in &effects.cache {
             if let CacheEffect::Get { key, value } = entry {
@@ -573,8 +564,7 @@ impl ReplayEffects {
     pub(crate) fn next_http(&self, request: &OutboundRequest<'_>) -> Option<HttpEffect> {
         let (method, raw_url) = (request.method, request.url);
         self.observe_live_userinfo(raw_url);
-        // The URL parser ignores ASCII tab/CR/LF, so two spellings that differ
-        // only by those are one URL: compare and report the parser's view.
+        // The URL parser ignores ASCII tab/CR/LF, so compare and report the parser's view.
         let live = crate::capsule::redact::parser_view(raw_url);
         let url = live.as_ref();
         let Ok(mut seam) = self.http.lock() else {
@@ -620,10 +610,8 @@ impl ReplayEffects {
             });
             return None;
         }
-        // Same endpoint, different message. Serving the recorded response here
-        // would hide the change *and* leave the audit nothing to notice, so an
-        // unchanged final failure would read as a reproduction of a run that
-        // sent something else entirely.
+        // Same endpoint, different message. Serving the recorded response would hide the change
+        // and grade an unchanged failure as reproduced.
         if !headers_match_redacted(&next.request_headers, request.headers)
             || !body_matches_redacted(&next.request_body, request.body)
         {
@@ -631,8 +619,7 @@ impl ReplayEffects {
             let changed = describe_request_mismatch(next, request);
             let recorded_url = next.url.clone();
             drop(seam);
-            // The URL matched: learn what its masked values stood for before
-            // the report prints the live URL.
+            // Learn what the URL's masked values stood for before the report prints it.
             self.observe_url(&recorded_url, url);
             let actual = describe_http(method, url);
             self.diverge(EffectDivergence {
@@ -702,23 +689,17 @@ impl ReplayEffects {
             });
             return EnqueueVerdict::Diverged;
         };
-        // Each schedule is compared on its own terms. A relative enqueue is
-        // compared by delay; an absolute one by its deadline, because the delay
-        // recorded for it is `deadline - now` and would differ between capture
-        // and replay purely because time passed. `Immediate` states nothing
-        // about timing, so there is nothing to compare — an entry point that
-        // takes no schedule cannot have changed one.
+        // A relative enqueue is compared by delay, an absolute one by deadline: its recorded
+        // delay is `deadline - now`, which changes as time passes.
         let schedule_diverged = match schedule {
-            // A plain enqueue states no timing, so it needs an entry that ran
-            // at once: no positive delay and no future deadline (#2351 item
-            // 17). A zero delay is still immediate.
+            // A plain enqueue needs an entry that ran at once: no positive delay and no
+            // deadline (#2351).
             crate::job::EnqueueSchedule::Immediate => {
                 next.delay_secs.is_some_and(|delay| delay > 0)
                     || next.due_at.is_some()
                     || next.requested_due_at.is_some()
             }
-            // Capture rounds a sub-second remainder up. A v3 capture cut it
-            // off, so a v3 capsule is compared the way it was recorded.
+            // Capture rounds a sub-second remainder up; v3 truncated it.
             crate::job::EnqueueSchedule::After(delay) => {
                 let recorded = if self.legacy_v3 {
                     i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)
@@ -732,9 +713,8 @@ impl ReplayEffects {
                     && next.requested_due_at.is_none();
                 next.delay_secs != Some(recorded) && !ran_at_once
             }
-            // Capture runs a past deadline at once and records `due_at: None`.
-            // It keeps the deadline the caller gave in `requested_due_at`, so
-            // replay compares that one (#2351 item 18).
+            // Capture runs a past deadline at once with `due_at: None` and keeps the requested
+            // deadline in `requested_due_at`, so replay compares that one.
             crate::job::EnqueueSchedule::At(deadline) => {
                 next.due_at != Some(deadline)
                     && !(next.due_at.is_none() && next.requested_due_at == Some(deadline))
@@ -811,11 +791,9 @@ impl ReplayEffects {
             self.observe_text(&recorded_key, key);
         }
         if !was_read {
-            // The recording wrote this key and never read it. A read here is a
-            // new cache dependency, not a read-back (#2351 item 15). The run's
-            // own write is still served, as production would serve it.
-            // The slot can hold the run's own unrecorded key, which no
-            // recorded identifier masks, so the key is not printed.
+            // The recording wrote this key and never read it, so a read here is a new cache
+            // dependency (#2351). The run's own write is still served, as production would. The
+            // slot can hold the run's unmasked key, so the key is not printed.
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Cache,
                 kind: EffectDivergenceKind::Unrecorded,
@@ -1176,23 +1154,15 @@ impl ReplayEffects {
             });
             return MailVerdict::Diverged;
         }
-        // Same envelope, different letter. Consuming the send here would hand
-        // back the recorded success for a message whose contents — or whose
-        // sender — the code now gets wrong, and the run would grade clean.
-        // The sender is compared only when the replayed run produced one. A
-        // message that sets no `from` inherits `[mail] from` at send time, so
-        // the recorded address is deployment *configuration* rather than
-        // handler behaviour — and a replay deliberately boots without mail
-        // config. Reading that absence as "the code changed its sender" is the
-        // same false signal as reporting a subsystem replay never booted. A
-        // sender the run did choose, and chose differently, is a real change.
+        // Same envelope, different letter: serving the recorded success would grade the run
+        // clean. The sender is compared only when the replayed run set one, since an unset
+        // `from` inherits `[mail] from`, which is config and absent on replay.
         let changed = mail_change(next, sent);
         if let Some(changed) = changed {
             let expected = describe_mail(&next.to, &next.subject);
             let (recorded_to, recorded_subject) = (next.to.clone(), next.subject.clone());
             drop(seam);
-            // The envelope matched: learn what its masked values stood for
-            // before the report prints the live subject and domains.
+            // Learn what the envelope's masked values stood for before the report prints them.
             for (recorded, actual) in recorded_to.iter().zip(to.iter()) {
                 self.observe_text(recorded, actual);
             }
@@ -1614,8 +1584,7 @@ pub fn body_bytes(body: &CapsuleBody) -> Vec<u8> {
 fn describe_http(method: &str, url: &str) -> String {
     let path = url.split_once('?').map_or(url, |(head, _)| head);
     let elided = if path.len() < url.len() { "?…" } else { "" };
-    // The live URL's userinfo is a credential, and this text reaches replay's
-    // JSON and terminal output, so it is dropped like the query string is.
+    // Userinfo is a credential, and this text reaches replay's output.
     let path = crate::capsule::redact::hide_url_userinfo(path);
     format!("{method} {path}{elided}")
 }
@@ -1656,11 +1625,8 @@ fn mail_change(next: &MailEffect, sent: &SentMail<'_>) -> Option<&'static str> {
             .as_deref()
             .is_some_and(|recorded| matches_redacted(recorded, actual))
     });
-    // Everything a recipient would notice, not only what addresses the
-    // envelope: an invoice removed, an HTML template rewritten under an
-    // untouched text fallback, an unsubscribe header dropped. Each is a
-    // materially different email, and serving the recorded success for one
-    // would leave the final audit nothing to catch.
+    // Compare everything a recipient would notice, not only the envelope: a dropped attachment,
+    // a rewritten HTML body, a removed header.
     if !sender_match {
         Some("its sender")
     } else if !body_matches_redacted(&next.body, sent.body) {
@@ -1744,7 +1710,6 @@ fn redacted_spans<'a>(recorded: &str, actual: &'a str) -> Option<Vec<(&'a str, b
     }
     let (segments, encoded) = split_placeholders(recorded);
     if encoded.is_empty() {
-        // No placeholder and not equal: an ordinary difference.
         return None;
     }
     let mut spans = Vec::new();
@@ -1760,15 +1725,13 @@ fn redacted_spans<'a>(recorded: &str, actual: &'a str) -> Option<Vec<(&'a str, b
     while let Some((segment, encoded)) = segments.next() {
         let last = segments.peek().is_none();
         if segment.is_empty() {
-            // Back-to-back placeholders, or one at the very end: nothing to
-            // anchor on. At the end, the placeholder takes what remains.
+            // Adjacent placeholders, or one at the end, which takes what remains.
             if last {
                 push(rest, encoded);
                 rest = "";
             }
         } else if last {
-            // The final literal segment has to be the *tail*, or a recorded
-            // `?a=1` would match an actual `?a=1&b=2`.
+            // The last literal must be the tail, or recorded `?a=1` would match `?a=1&b=2`.
             let head = rest.strip_suffix(segment)?;
             push(head, encoded);
             rest = "";
@@ -1880,9 +1843,7 @@ fn body_matches_redacted(recorded: &CapsuleBody, actual: &CapsuleBody) -> bool {
     }
     match (recorded, actual) {
         (CapsuleBody::Absent, CapsuleBody::Absent) => true,
-        // Absent and empty are different facts on the wire — a POST with no
-        // body is not a POST with a zero-length one — so they are not folded
-        // together here.
+        // A POST with no body is not a POST with a zero-length one.
         (CapsuleBody::Absent, _) | (_, CapsuleBody::Absent) => false,
         _ => bytes_match_redacted(&body_bytes(recorded), &body_bytes(actual)),
     }
@@ -2136,9 +2097,7 @@ mod tests {
 
     #[test]
     fn a_redacted_recording_still_matches_the_call_the_handler_makes() {
-        // The capsule holds the *masked* spelling; the replayed handler
-        // produces the real one. Comparing literally would report a divergence
-        // on the first outbound call of every capsule that redacted anything.
+        // The capsule holds the masked spelling; the replayed handler produces the real one.
         let tape = ReplayEffects::new(CapsuleEffects {
             http: vec![http(
                 "GET",
@@ -2279,9 +2238,7 @@ mod tests {
 
     #[test]
     fn a_recorded_call_the_replay_never_made_is_a_divergence_too() {
-        // Symmetric with the database tape's `UnconsumedExchanges`: reaching
-        // the recorded outcome without the recorded effects is not a
-        // reproduction.
+        // Reaching the recorded outcome without the recorded effects is not a reproduction.
         let tape = ReplayEffects::new(CapsuleEffects {
             http: vec![http("GET", "https://a.example/one", 200)],
             ..CapsuleEffects::default()
@@ -2333,8 +2290,6 @@ mod tests {
 
     #[test]
     fn a_rescheduled_enqueue_is_a_divergence() {
-        // A job that used to run immediately and now runs in an hour is a
-        // behaviour change the capsule can see.
         let tape = ReplayEffects::new(CapsuleEffects {
             jobs: vec![JobEffect {
                 name: "send_receipt".to_owned(),
@@ -2385,7 +2340,7 @@ mod tests {
         // v3 cut it off: 500 ms was recorded as 0 s.
         let v3 = |secs| ReplayEffects::new(recorded(secs)).for_format_version(3);
         assert_eq!(verdict(&v3(0), 500), EnqueueVerdict::Queued);
-        // Codex review on #3222: a whole-second change is still a change in v3.
+        // A whole-second change is still a change in v3.
         assert_eq!(verdict(&v3(5), 6_000), EnqueueVerdict::Diverged);
         assert_eq!(verdict(&v3(5), 5_000), EnqueueVerdict::Queued);
     }
@@ -2491,8 +2446,7 @@ mod tests {
             "{:?}",
             tape.divergences()
         );
-        // A plain enqueue is not the recorded `enqueue_at` (Codex review on
-        // #3222).
+        // A plain enqueue is not the recorded `enqueue_at`.
         let tape = ReplayEffects::new(CapsuleEffects {
             jobs: vec![recorded.clone()],
             ..CapsuleEffects::default()
@@ -2800,9 +2754,7 @@ mod tests {
 
     #[test]
     fn a_recorded_miss_replays_as_a_miss_even_when_the_run_filled_the_key() {
-        // The commonest cache shape there is: miss, compute, fill. Folding the
-        // recorded write into the initial map would pre-seed a hit and send the
-        // replayed handler down a branch the recording never took.
+        // Miss, compute, fill: seeding the recorded write would pre-seed a hit.
         let tape = ReplayEffects::new(CapsuleEffects {
             cache: vec![
                 CacheEffect::Get {
@@ -2833,9 +2785,8 @@ mod tests {
 
     #[test]
     fn an_ambiguous_masked_cache_key_is_treated_as_unrecorded() {
-        // `user:[FILTERED]:profile` matches every subject's entry; serving the
-        // first would hand a handler that read the *wrong* subject's entry the
-        // recorded value and report no divergence.
+        // `user:[FILTERED]:profile` matches every subject's entry; serving the first would hand
+        // a read of the wrong subject the recorded value.
         let tape = ReplayEffects::new(CapsuleEffects {
             cache: vec![
                 CacheEffect::Get {
@@ -2853,8 +2804,7 @@ mod tests {
             tape.cache_get("user:alice:a"),
             CachedValue::Hit(b"1".to_vec())
         );
-        // A key that matches both recorded patterns is refused rather than
-        // guessed.
+        // A key that matches both recorded patterns is refused, not guessed.
         let tape = ReplayEffects::new(CapsuleEffects {
             cache: vec![
                 CacheEffect::Get {
@@ -2930,9 +2880,7 @@ mod tests {
 
     #[test]
     fn a_changed_outbound_body_diverges_rather_than_being_served_the_old_response() {
-        // Same endpoint, different message. Serving the recorded response here
-        // would hide the change and leave the final audit nothing to notice,
-        // so an unchanged failure would grade `reproduced`.
+        // Serving the recorded response would grade an unchanged failure `reproduced`.
         let mut recorded = http("POST", "https://payments.example/charge", 502);
         recorded.request_body = CapsuleBody::Text("{\"amount\":10}".to_owned());
         let tape = ReplayEffects::new(CapsuleEffects {
@@ -3109,8 +3057,7 @@ mod tests {
 
     #[test]
     fn a_changed_mail_attachment_or_alternate_body_diverges() {
-        // The envelope, subject, sender and preferred body all match; only the
-        // parts a recipient would still plainly notice have changed.
+        // Envelope, subject, sender and preferred body match; only other visible parts change.
         let recorded = MailEffect {
             to: vec!["a@example.com".to_owned()],
             from: Some("billing@shop.example".to_owned()),
@@ -3184,8 +3131,8 @@ mod tests {
         });
         let to = ["a@example.com".to_owned()];
         let body = CapsuleBody::Text("thanks".to_owned());
-        // The kind travels with the text, so the caller can rebuild the very
-        // variant a handler branches on rather than a catch-all.
+        // The kind travels with the text, so the caller can rebuild the variant a handler
+        // branches on.
         assert_eq!(
             tape.next_mail(&sent(&to, "Receipt", &body)),
             MailVerdict::Failed(
@@ -3316,8 +3263,6 @@ mod tests {
 
     #[test]
     fn a_cache_write_the_code_dropped_is_a_divergence() {
-        // A recorded write nobody performs must not ride along under an
-        // unchanged response.
         let tape = ReplayEffects::new(CapsuleEffects {
             cache: vec![CacheEffect::Insert {
                 key: "widgets".to_owned(),
@@ -3349,8 +3294,7 @@ mod tests {
 
     #[test]
     fn a_read_of_a_key_the_recording_only_wrote_diverges() {
-        // #2351 item 15: the recording wrote the key and did not read it. A
-        // new read is a new cache dependency, not a read-back.
+        // The recording wrote the key and never read it: a new read is a new dependency (#2351).
         let tape = ReplayEffects::new(CapsuleEffects {
             cache: vec![CacheEffect::Insert {
                 key: "widgets".to_owned(),
@@ -3401,8 +3345,7 @@ mod tests {
 
     #[test]
     fn a_recorded_invalidate_is_consumed_and_the_next_read_misses() {
-        // #2351 item 2: an invalidate is a write. Replay consumes it and
-        // never reaches a backend.
+        // An invalidate is a write: replay consumes it and never reaches a backend (#2351).
         let tape = ReplayEffects::new(CapsuleEffects {
             cache: vec![
                 CacheEffect::Get {
@@ -3541,9 +3484,7 @@ mod tests {
 
     #[test]
     fn a_recorded_tenant_the_replayed_run_never_read_is_a_divergence() {
-        // A router whose updated code no longer resolves a tenant would
-        // otherwise leave the recording untouched and still report a clean
-        // reproduction on an unchanged response.
+        // A router that no longer resolves a tenant must not report a clean reproduction.
         let tape = ReplayEffects::new(CapsuleEffects {
             tenant: Some(TenantEffect {
                 id: Some("acme".to_owned()),

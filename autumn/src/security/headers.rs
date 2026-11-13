@@ -230,24 +230,15 @@ impl ComputedHeaders {
             }
         }
 
-        // Determine whether to use per-request nonce injection for CSP.
-        //
-        // Nonce injection is active when:
-        //   1. `csp_nonce.enabled = true`, AND
-        //   2. The CSP string is the framework default (not user-overridden).
-        //
-        // Apps that set an explicit `content_security_policy` opt out automatically:
-        // their custom value is used verbatim and the nonce is still generated
-        // (for the extractor) but not written into the header.
+        // The nonce goes into the header only with `csp_nonce.enabled` and the default CSP. A
+        // custom `content_security_policy` is sent verbatim; the nonce is still generated for the
+        // extractor.
         let using_default_csp = config.content_security_policy == default_content_security_policy();
-        // Single source of truth for the resolved CSP string (nonce-aware
-        // template when injection is active, configured value otherwise); the
-        // manifest dump reuses this same resolution.
+        // Shared with the manifest dump, so both report the same CSP.
         let resolved_csp = resolved_content_security_policy(config);
         let nonce_csp_template = if config.csp_nonce.enabled && using_default_csp {
             Some(Arc::from(resolved_csp.as_str()))
         } else {
-            // Static CSP (either custom, or nonce disabled).
             if !resolved_csp.is_empty()
                 && let Ok(val) = HeaderValue::from_str(&resolved_csp)
             {
@@ -328,9 +319,6 @@ where
     }
 
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
-        // When nonce injection is active: generate a nonce, insert it into
-        // request extensions (so handlers can extract it), and pass it along
-        // to the response future where it will be substituted into the CSP.
         let nonce = if self.headers.csp_nonce_enabled {
             let n = generate_nonce();
             req.extensions_mut().insert(CspNonce(n.clone()));
@@ -371,7 +359,6 @@ where
                     for (name, value) in &computed.static_pairs {
                         resp_headers.insert(name.clone(), value.clone());
                     }
-                    // Inject the per-request nonce into the CSP template.
                     if let (Some(nonce), Some(template)) =
                         (this.nonce.take(), &computed.nonce_csp_template)
                     {
@@ -424,14 +411,12 @@ mod tests {
             response.headers().get("referrer-policy").unwrap(),
             "strict-origin-when-cross-origin"
         );
-        // HSTS not present by default
         assert!(
             response
                 .headers()
                 .get("strict-transport-security")
                 .is_none()
         );
-        // CSP present by default with htmx-compatible policy
         let csp = response
             .headers()
             .get("content-security-policy")
@@ -445,10 +430,8 @@ mod tests {
 
     #[tokio::test]
     async fn default_csp_allows_htmx_to_function() {
-        // htmx and Autumn's htmx CSRF helper are served from /static/js/
-        // (same origin), operate via addEventListener, and issue hx-* requests
-        // to the same origin. The default CSP must allow all of that without
-        // requiring inline scripts.
+        // htmx and the CSRF helper load from /static/js/, use addEventListener and request the
+        // same origin, so the default CSP must allow that without inline scripts.
         let config = HeadersConfig::default();
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
@@ -467,17 +450,14 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        // htmx script loads from same origin
         assert!(
             csp.contains("script-src 'self'"),
             "csp must allow same-origin scripts for htmx: {csp}"
         );
-        // htmx XHR/fetch requests go to same origin
         assert!(
             csp.contains("connect-src 'self'"),
             "csp must allow same-origin connects for htmx swaps: {csp}"
         );
-        // No eval required for htmx standard operation
         assert!(
             !csp.contains("'unsafe-eval'"),
             "default csp should not weaken script-src with unsafe-eval: {csp}"
@@ -696,7 +676,7 @@ mod tests {
         );
     }
 
-    // ── CSP nonce tests (RED phase) ───────────────────────────────────────────
+    // ── CSP nonce tests ───────────────────────────────────────────────────────
 
     use super::super::config::CspNonceConfig;
 
@@ -1031,7 +1011,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 1. Verify custom CSP header is sent unmodified
+        // A custom CSP is sent unmodified.
         let csp = response
             .headers()
             .get("content-security-policy")
@@ -1040,7 +1020,7 @@ mod tests {
             .unwrap();
         assert_eq!(csp, "default-src 'self'; script-src 'self'");
 
-        // 2. Verify CspNonce extractor gets a valid nonce
+        // The extractor still gets a nonce.
         let (_, body) = response.into_parts();
         let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let nonce_val = std::str::from_utf8(&body_bytes).unwrap();

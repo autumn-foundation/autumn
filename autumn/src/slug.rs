@@ -207,9 +207,8 @@ mod tests {
 
     #[test]
     fn slugify_never_returns_an_empty_string() {
-        // The premise `contains_letter_or_number` exists for: every `is_empty()`
-        // test on a `slugify` result is dead code, so a caller that wants to
-        // *reject* content-free input cannot ask `slugify`.
+        // Any `is_empty()` check on a `slugify` result is dead code, so rejecting
+        // content-free input needs `contains_letter_or_number` instead.
         for input in ["", "   ", "***", "!!!???...:::", "🎉🔥💯", "---", "日本語"] {
             assert!(
                 !slugify(input).is_empty(),
@@ -230,9 +229,8 @@ mod tests {
 
     #[test]
     fn text_in_any_script_holds_a_letter_or_number() {
-        // Deliberately broader than "slugify produced a real slug": a non-Latin
-        // title has no ASCII fold and slugifies to the fallback token, but it
-        // is a real title, not junk.
+        // Broader than "slugify produced a real slug": a non-Latin title has no
+        // ASCII fold and slugifies to the fallback token, but it is not junk.
         for input in ["Ferris arrives", "42", "Café", "日本語", "Привет", "!a!"] {
             assert!(
                 contains_letter_or_number(input),
@@ -249,10 +247,8 @@ mod tests {
 
     #[test]
     fn numeric_characters_outside_the_ascii_digits_count() {
-        // `char::is_alphanumeric` is `is_alphabetic() || is_numeric()`, so the
-        // `Nl`/`No` categories pass. Documented rather than incidental: these
-        // are numbers a reader would call numbers, and they still take
-        // `slugify`'s fallback for their URL segment.
+        // `char::is_alphanumeric` includes the `Nl`/`No` categories. These are
+        // numbers, yet they still take `slugify`'s fallback for their URL segment.
         for input in ["½", "Ⅻ", "①"] {
             assert!(
                 contains_letter_or_number(input),

@@ -63,9 +63,8 @@ pub fn url_needs_tls_crypto_provider(url: &str) -> bool {
 pub fn ensure_tls_crypto_provider(url: &str) {
     if url_needs_tls_crypto_provider(url) && rustls::crypto::CryptoProvider::get_default().is_none()
     {
-        // Errors only if another thread won the race to install one, which
-        // satisfies the requirement just as well. `ring` matches the backend
-        // every other rustls call site in this workspace already pins.
+        // Errors only if another thread installed one first, which is just as
+        // good. `ring` matches the backend every other rustls call site pins.
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }
@@ -102,31 +101,23 @@ pub fn ensure_tls_crypto_provider(url: &str) {
 /// for a credential costs an ugly log line; missing one costs the credential.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
-    // A well-formed delimiter splits scheme from the rest; a malformed or
-    // absent one is not grounds to give up — the credential is still in
-    // there, so treat the whole string as potentially carrying userinfo.
+    // Without a `://` the credential is still in there, so the whole string is
+    // treated as possible userinfo.
     let (scheme_prefix, rest) = url
         .split_once("://")
         .map_or(("", url), |(scheme, rest)| (&url[..scheme.len() + 3], rest));
-    // Userinfo is everything before the LAST `@` in the authority, since a
-    // password may itself contain one. The authority runs to the first `/`,
-    // `?` or `#` — but for a URL that failed to parse, that terminator may
-    // itself be an un-encoded character *inside* the password, so fall back to
-    // the last `@` anywhere in the remainder rather than concluding there is
-    // no credential to hide.
+    // Userinfo ends at the last `@` in the authority (a password may contain
+    // one). In a URL that failed to parse, an un-encoded `/`, `?` or `#` in the
+    // password can end the authority early, so fall back to the last `@` anywhere.
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let Some(at) = rest[..authority_end].rfind('@').or_else(|| rest.rfind('@')) else {
-        // No `@` at all: nothing shaped like a credential to hide.
         return url.to_owned();
     };
-    // `rest_from_at` keeps the `@` and everything after it (host, port, path).
     let (userinfo, rest_from_at) = rest.split_at(at);
     let userinfo = match userinfo.split_once(':') {
-        // Split on the FIRST colon, not the last: a password may contain one,
-        // and cutting at the last would leave part of it in the clear.
+        // Split on the first colon: a password may contain one.
         Some((user, _)) => format!("{user}:***"),
-        // A bare username carries no secret; inventing a `:***` would imply
-        // a password that is not there.
+        // A bare username carries no secret.
         None => userinfo.to_owned(),
     };
     format!("{scheme_prefix}{userinfo}{rest_from_at}")
@@ -189,29 +180,23 @@ mod tests {
 
     #[test]
     fn valkeys_urls_also_claim_the_tls_provider() {
-        // Regression: `redis::Client::open` (via the `url` crate, which
-        // lowercases the scheme while parsing) treats both `rediss://` and
-        // Valkey's `valkeys://` as TLS — a literal `starts_with("rediss://")`
-        // check missed `valkeys://` entirely, so such a connection could
-        // reach `ClientConfig::builder()` with no provider installed.
+        // `redis::Client::open` treats Valkey's `valkeys://` as TLS too, so it
+        // reaches `ClientConfig::builder()` and needs the provider.
         assert!(url_needs_tls_crypto_provider("valkeys://127.0.0.1:6380/"));
     }
 
     #[test]
     fn tls_scheme_matching_is_case_insensitive() {
-        // Regression: a literal `starts_with("rediss://")` also missed a
-        // case-variant scheme such as `REDISS://` — valid per URL parsing
-        // (schemes are normalized to lowercase) and accepted the same way by
-        // `redis::Client::open`, but invisible to a case-sensitive check.
+        // URL parsing lowercases the scheme, so `redis::Client::open` accepts
+        // `REDISS://` as TLS.
         assert!(url_needs_tls_crypto_provider("REDISS://127.0.0.1:6380/"));
         assert!(url_needs_tls_crypto_provider("Valkeys://127.0.0.1:6380/"));
     }
 
     #[test]
     fn a_scheme_that_merely_starts_with_a_tls_scheme_is_not_tls() {
-        // `redisstore://` shares the `rediss` prefix but is not a Redis
-        // scheme at all; a prefix match would have claimed the provider for
-        // it. `redis`'s parser rejects it outright, so it is not TLS.
+        // `redisstore://` shares the `rediss` prefix but is not a Redis scheme;
+        // `redis`'s parser rejects it.
         assert!(!url_needs_tls_crypto_provider("redisstore://host:6379/"));
     }
 
@@ -255,8 +240,7 @@ mod tests {
 
     #[test]
     fn redact_url_is_not_fooled_by_an_at_sign_in_the_password() {
-        // The LAST `@` in the authority separates userinfo from host, so a
-        // password containing one still redacts whole.
+        // The last `@` in the authority separates userinfo from host.
         assert_eq!(
             redact_url("rediss://user:p@ss@host:6380/0"),
             "rediss://user:***@host:6380/0"
@@ -265,13 +249,9 @@ mod tests {
 
     #[test]
     fn redact_url_hides_a_key_whose_own_slash_broke_the_url() {
-        // The regression this helper exists for. An Azure access key is
-        // base64, whose alphabet includes `/`. Pasted un-encoded, that `/`
-        // terminates the authority early — which is exactly why `redis`
-        // rejects the URL and why the log line that leaks it gets reached.
-        // An authority-scoped search would find no `@` here and hand the key
-        // to the log verbatim; widening to the last `@` in the remainder
-        // hides it.
+        // An Azure access key is base64, which includes `/`. Pasted un-encoded,
+        // that `/` ends the authority early, so `redis` rejects the URL and it
+        // reaches the error log. An authority-scoped search would find no `@`.
         let leaked = "rediss://:8kQz+Ab/CdEfGh=@my-cache.redis.cache.windows.net:6380";
         let redacted = redact_url(leaked);
         assert!(
@@ -283,10 +263,8 @@ mod tests {
 
     #[test]
     fn redact_url_hides_a_key_behind_a_mistyped_scheme_delimiter() {
-        // Regression (Codex P1 on #2410): a value missing or mistyping `://`
-        // is rejected by `open_client` and therefore lands on the very log
-        // line this helper guards — so bailing out on a missing delimiter
-        // reproduced the whole secret verbatim.
+        // A missing or mistyped `://` is rejected by `open_client`, so the value
+        // lands on the very log line this helper guards (#2410).
         for malformed in [
             "rediss:/:8kQz-secret@cache.redis.cache.windows.net:6380",
             "rediss:8kQz-secret@cache",
@@ -315,10 +293,9 @@ mod tests {
 
     #[test]
     fn redact_url_over_redacts_rather_than_leaking() {
-        // An `@` in the path of a credential-free URL makes the widened
-        // search treat the text before it as userinfo. Over-redaction is the
-        // deliberate trade: an ugly log line beats a leaked key. Nothing is
-        // rewritten when there is no colon to hide a password behind.
+        // An `@` in the path makes the widened search treat the text before it
+        // as userinfo: an ugly log line beats a leaked key. Without a colon
+        // there is no password, so nothing is rewritten.
         assert_eq!(redact_url("redis://host/a@b"), "redis://host/a@b");
         assert_eq!(redact_url("redis://host:6379/db@1"), "redis://host:***@1");
     }
@@ -370,7 +347,7 @@ mod tests {
 
         let mut offenders = Vec::new();
         for file in files {
-            // This module *is* the guard: the one place allowed to call it.
+            // The one module allowed to call it.
             if file.file_name().is_some_and(|name| name == "redis_tls.rs") {
                 continue;
             }
@@ -453,8 +430,6 @@ mod tests {
             assert_provider_installed("the Redis session store");
         }
 
-        // `channels` is `ws`-gated, so this scenario only exists in builds
-        // that compile the Redis pub/sub backend at all.
         #[cfg(feature = "ws")]
         #[test]
         fn channels_backend_installs_the_tls_provider() {

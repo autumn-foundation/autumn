@@ -350,7 +350,6 @@ impl RootKey {
         use base64::Engine as _;
 
         let mut seal_key = self.derive(b"autumn:confidential:seal:v1:", ctx);
-        // Infallible: the key is always 32 bytes, which is what `Key` names.
         let cipher = Aes256Gcm::new(&seal_key.into());
         seal_key.zeroize();
 
@@ -395,7 +394,6 @@ impl RootKey {
         let ciphertext = &raw[HEADER_LEN..];
 
         let mut seal_key = self.derive(b"autumn:confidential:seal:v1:", ctx);
-        // Infallible: the key is always 32 bytes, which is what `Key` names.
         let cipher = Aes256Gcm::new(&seal_key.into());
         seal_key.zeroize();
 

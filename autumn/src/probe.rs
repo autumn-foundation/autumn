@@ -1045,11 +1045,9 @@ async fn readiness<S: ProvideProbeState + Sync>(state: &S) -> (StatusCode, Json<
 
     #[cfg(feature = "db")]
     {
-        // Run all checks at the same time: the wall time is one ping budget,
-        // not the sum.
-        // With `health.db_readiness = false` the primary ping does not gate
-        // `/ready`, so do not wait for it: a hung primary must not delay the
-        // probe. `/actuator/health` still reports it.
+        // Run all checks at the same time: the wall time is one ping budget, not the sum. With
+        // `health.db_readiness = false` the primary ping does not gate `/ready`, so skip it: a
+        // hung primary must not delay the probe. `/actuator/health` still reports it.
         let primary_gates = state.probes().primary_gates_readiness();
         let primary_check = async {
             if primary_gates {
@@ -2020,9 +2018,8 @@ mod tests {
         #[cfg(not(feature = "sqlite"))]
         #[tokio::test]
         async fn ready_is_ok_when_pool_is_saturated_and_primary_answers() {
-            // A pool of 1 whose only slot hangs in connect, and one request
-            // that waits for a slot: `available == 0` and `waiting > 0`. The
-            // old rule `available > 0 || waiting == 0` gave `503` here.
+            // A pool of 1 whose only slot hangs in connect, and one request waiting for a slot:
+            // `available == 0` and `waiting > 0`. A saturated pool alone must not fail `/ready`.
             let (addr, server) = black_hole().await;
             let ping = FakePing::new(Duration::ZERO, Ok(()));
             let probes = ProbeState::with_primary_ping(ping);

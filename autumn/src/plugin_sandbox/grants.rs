@@ -235,10 +235,8 @@ impl CapabilityGrants {
                     max: MAX_GRANT_ENTRIES,
                 });
             }
-            // Scanned in place against the entries already seen rather than
-            // into a set sized from `list.len()`: the length is the manifest
-            // author's to choose, and the ceiling above is checked first so
-            // this scan is bounded by `MAX_GRANT_ENTRIES²` regardless.
+            // Scanned in place rather than into a set sized from `list.len()`, which the
+            // manifest author chooses. The ceiling above bounds this at `MAX_GRANT_ENTRIES²`.
             for (at, entry) in list.iter().enumerate() {
                 let legal = match kind {
                     EntryKind::Host => is_grantable_host(entry),
@@ -290,29 +288,19 @@ pub fn is_grantable_host(host: &str) -> bool {
     if host.is_empty() || host.len() > MAX_HOST_LEN {
         return false;
     }
-    // A single label is legal DNS but is never a public upstream, and accepting
-    // one invites `localhost` into an allow-list whose whole purpose is to name
-    // somewhere else.
+    // A single label is legal DNS but never a public upstream, and would admit `localhost`.
     if !host.contains('.') {
         return false;
     }
-    // An IPv4 literal is refused for the same reason `host_of` refuses an IPv6
-    // one: a literal address is not a name, so a *name* allow-list can neither
-    // grant nor deny one honestly. Enforcing it for one family and not the
-    // other was the gap — `169.254.169.254` is all digits and dots, so it
-    // passed the label rules below and put the cloud metadata endpoint on a
-    // consent screen as though it were a hostname.
+    // A literal address is not a name, so a name allow-list cannot grant one honestly
+    // (`host_of` refuses IPv6 literals for the same reason). `169.254.169.254` would otherwise
+    // pass the label rules and show the cloud metadata endpoint as a hostname.
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return false;
     }
-    // …and every other spelling that a URL parser reads as an address. Rust's
-    // `Ipv4Addr` accepts only dotted-quad, but WHATWG and POSIX resolvers also
-    // accept short and non-decimal forms — `127.1`, `127.0.1`, `0177.0.0.1`,
-    // `0x7f.1` — each of which reached loopback while passing the label rules
-    // below as though it were a name. The rule those parsers actually use is
-    // that a host is an address when its *last* label is a number, so that is
-    // the rule here: it catches every short form, and it still admits
-    // `1.example.com`, whose last label is not.
+    // `Ipv4Addr` accepts only dotted-quad, but WHATWG and POSIX resolvers also read short and
+    // non-decimal forms (`127.1`, `0177.0.0.1`, `0x7f.1`) as addresses. Their rule is that a
+    // host is an address when its last label is a number; `1.example.com` stays a name.
     if host.rsplit('.').next().is_some_and(looks_like_number) {
         return false;
     }
@@ -507,8 +495,7 @@ impl CapabilityQuotas {
             "db_reads" | "db_writes" | "db_rows" => Some(SandboxCapability::Db),
             "job_enqueues" => Some(SandboxCapability::Jobs),
             "render_bytes" => Some(SandboxCapability::Render),
-            // `calls` and `calls_per_second` bound the capability channel as a
-            // whole, so they mean something whatever is granted.
+            // `calls` and `calls_per_second` bound the whole channel, whatever is granted.
             _ => None,
         }
     }
@@ -602,8 +589,7 @@ impl ConsentDelta {
         }
         let mut out =
             String::from("This upgrade asks for authority the installed version did not:\n");
-        // `write!` to a `String` is infallible; results are dropped rather than
-        // unwrapped so this stays panic-free by construction.
+        // `write!` to a `String` cannot fail; results are dropped rather than unwrapped.
         for capability in &self.added_capabilities {
             let _ = writeln!(
                 out,
@@ -667,11 +653,7 @@ mod tests {
         for host in [
             "",
             "localhost",
-            // A literal address is not a name, so a *name* allow-list can
-            // neither grant nor deny one honestly. Enforcing that for IPv6 and
-            // not IPv4 was the gap: `169.254.169.254` is all digits and dots,
-            // so it passed every label rule and put the cloud metadata endpoint
-            // on a consent screen as though it were a hostname.
+            // IPv4 literals pass the label rules but are addresses, not names.
             "169.254.169.254",
             "127.0.0.1",
             "10.0.0.1",
@@ -725,8 +707,7 @@ mod tests {
     fn a_grantable_name_allows_the_hyphen_an_author_would_write() {
         for name in ["order-summary", "send-receipt", "reindex"] {
             assert!(is_grantable_name(name), "{name}");
-            // Hyphens are the only thing a name allows that an identifier does
-            // not, so the two agree everywhere else.
+            // A name differs from an identifier only in allowing hyphens.
             assert_eq!(is_grantable_ident(name), !name.contains('-'), "{name}");
         }
         for name in ["-lead", "Order-Summary", "order summary", ""] {
@@ -756,8 +737,7 @@ mod tests {
             );
         }
         assert!(!grants.allows(SandboxCapability::Db, "orders_secret"));
-        // A capability with no list of its own matches nothing, rather than
-        // everything.
+        // A capability with no list of its own matches nothing, not everything.
         assert!(!grants.allows(SandboxCapability::Kv, "anything"));
         assert!(grants.list_for(SandboxCapability::Kv).is_none());
     }
@@ -772,14 +752,13 @@ mod tests {
 
     #[test]
     fn every_quota_field_is_checked_by_validate() {
-        // The one list, read by validation, the consent screen and the upgrade
-        // diff alike — so a quota that is enforced but never displayed cannot
-        // exist.
+        // `fields()` is the one list validation, the consent screen and the upgrade diff read,
+        // so an enforced quota is always displayed.
         let defaults = CapabilityQuotas::default();
         assert!(defaults.validate().is_ok());
         for (index, (field, _)) in defaults.fields().into_iter().enumerate() {
             let mut broken = defaults;
-            // Zero out exactly one field by rebuilding through the same list.
+            // Indexes follow `fields()` order; a new field hits the `panic!` until it has a case.
             match index {
                 0 => broken.kv_reads = 0,
                 1 => broken.kv_writes = 0,
@@ -829,10 +808,8 @@ mod tests {
 
     #[test]
     fn no_spelling_of_an_address_is_grantable_as_a_host() {
-        // `Ipv4Addr::parse` accepts only dotted-quad, but a URL parser accepts
-        // short and non-decimal forms and resolves every one of these to
-        // loopback or to the cloud metadata endpoint. Each passed the label
-        // rules as though it were a name.
+        // A URL parser resolves each of these short or non-decimal forms to loopback or the
+        // cloud metadata endpoint, though `Ipv4Addr::parse` accepts only dotted-quad.
         for spelling in [
             "127.0.0.1",
             "127.1",
@@ -848,7 +825,7 @@ mod tests {
                 "{spelling} is an address, not a name"
             );
         }
-        // And a name whose last label is not a number is still a name.
+        // A name whose last label is not a number is still a name.
         for name in [
             "api.example.com",
             "1.example.com",

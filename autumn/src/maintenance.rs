@@ -269,8 +269,6 @@ const fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
 mod tests {
     use super::*;
 
-    // ── MaintenanceState ──────────────────────────────────────────────────────
-
     #[test]
     fn maintenance_state_default_is_off() {
         let state = MaintenanceState::new();
@@ -311,11 +309,9 @@ mod tests {
         let state = MaintenanceState::new();
         let clone = state.clone();
         state.enable(MaintenanceConfig::default());
-        // Clone shares the underlying Arc
+        // Clones share the underlying Arc.
         assert!(clone.is_active());
     }
-
-    // ── File operations ───────────────────────────────────────────────────────
 
     #[test]
     fn load_from_file_returns_none_when_missing() {
@@ -372,15 +368,8 @@ mod tests {
         assert!(c.bypass_header.is_none());
     }
 
-    // ── Flag-file path resolution (issue #1621) ───────────────────────────────
-
     #[test]
     fn flag_file_path_honors_the_env_override() {
-        // #1621 R1: a deploy-managed slot unit stamps
-        // `Environment=AUTUMN_MAINTENANCE_FLAG_FILE={app_dir}/shared/…` so the flag
-        // lives OUTSIDE the per-release WorkingDirectory a cutover replaces. Without
-        // this the flag is orphaned on every deploy and the host silently
-        // un-maintains itself.
         assert_eq!(
             flag_file_path_from(Some("/srv/autumn/shop/shared/autumn-maintenance.json")),
             PathBuf::from("/srv/autumn/shop/shared/autumn-maintenance.json"),
@@ -389,8 +378,6 @@ mod tests {
 
     #[test]
     fn flag_file_path_without_override_is_the_legacy_cwd_relative_path() {
-        // Unset → byte-for-byte pre-#1621 behaviour, so every app that does not go
-        // through `autumn deploy` is unaffected.
         assert_eq!(
             flag_file_path_from(None),
             PathBuf::from(MAINTENANCE_FLAG_FILE),
@@ -399,8 +386,8 @@ mod tests {
 
     #[test]
     fn flag_file_path_treats_a_blank_override_as_unset() {
-        // An empty/whitespace value is what a half-written unit line produces;
-        // resolving it to "" would make every poll silently miss the flag.
+        // A half-written unit line yields an empty value; resolving it to "" would make
+        // every poll silently miss the flag.
         assert_eq!(
             flag_file_path_from(Some("")),
             PathBuf::from(MAINTENANCE_FLAG_FILE),
@@ -413,9 +400,8 @@ mod tests {
 
     #[test]
     fn resolve_flag_file_path_reads_the_documented_env_var() {
-        // The env-reading wrapper is a one-liner over `flag_file_path_from`; pin the
-        // variable NAME (it is a deploy-unit contract) and the unset default. Guarded
-        // rather than mutating process env, which is `unsafe` in edition 2024.
+        // The variable name is a deploy-unit contract. The default is checked only when
+        // unset: mutating process env is `unsafe` in edition 2024.
         assert_eq!(MAINTENANCE_FLAG_FILE_ENV, "AUTUMN_MAINTENANCE_FLAG_FILE");
         if std::env::var(MAINTENANCE_FLAG_FILE_ENV).is_err() {
             assert_eq!(
@@ -428,17 +414,13 @@ mod tests {
     #[test]
     fn maintenance_flag_basename_is_the_tail_of_the_legacy_path() {
         // The deploy CLI composes `{app_dir}/shared/{BASENAME}` and
-        // `{release_dir}/{MAINTENANCE_FLAG_FILE}`; both must name the same file, or a
-        // host deployed before #1621 and one deployed after would read different
-        // files under the same command.
+        // `{release_dir}/{MAINTENANCE_FLAG_FILE}`; both must name the same file.
         assert!(MAINTENANCE_FLAG_FILE.ends_with(MAINTENANCE_FLAG_BASENAME));
         assert_eq!(
             Path::new(MAINTENANCE_FLAG_FILE).file_name().unwrap(),
             MAINTENANCE_FLAG_BASENAME,
         );
     }
-
-    // ── IP allow-list ─────────────────────────────────────────────────────────
 
     #[test]
     fn ip_in_allow_list_exact_ipv4_match() {
@@ -494,7 +476,6 @@ mod tests {
     #[test]
     fn ip_in_allow_list_mixed_family_no_match() {
         let ipv4: IpAddr = "127.0.0.1".parse().unwrap();
-        // IPv6 loopback in allow list should not match IPv4 loopback
         assert!(!ip_in_allow_list(&ipv4, &["::1".into()]));
     }
 
@@ -508,7 +489,6 @@ mod tests {
     #[test]
     fn ip_in_allow_list_invalid_entry_skipped() {
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        // Invalid CIDR entries are silently skipped; only valid ones checked
         assert!(!ip_in_allow_list(
             &ip,
             &["not-an-ip".into(), "999.999.999.999".into()]

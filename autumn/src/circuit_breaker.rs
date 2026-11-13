@@ -918,16 +918,13 @@ mod tests {
         let breaker = CircuitBreaker::new("test", policy);
         assert_eq!(breaker.state(), CircuitState::Closed);
 
-        // Run 5 failing calls
         for _ in 0..5 {
             let res: Result<(), _> = breaker.run(async { Err("error") }).await;
             assert!(matches!(res, Err(CircuitBreakerError::Execution("error"))));
         }
 
-        // The failure ratio is 100%, and we have 5 samples, so it should trip.
         assert_eq!(breaker.state(), CircuitState::Open);
 
-        // Subsequent calls should fail fast with CircuitBreakerError::Open
         let mut executed = false;
         let res: Result<(), CircuitBreakerError<&'static str>> = breaker
             .run(async {
@@ -976,16 +973,13 @@ mod tests {
 
         let mut svc = CircuitBreakerLayer::new(breaker.clone()).layer(DummyService);
 
-        // Run 5 failing calls
         for _ in 0..5 {
             let res = svc.call("fail").await;
             assert!(matches!(res, Err(CircuitBreakerError::Execution("failed"))));
         }
 
-        // Breaker should be Open
         assert_eq!(breaker.state(), CircuitState::Open);
 
-        // Subsequent call should fail fast
         let res = svc.call("ok").await;
         assert!(matches!(res, Err(CircuitBreakerError::Open)));
     }
@@ -1020,11 +1014,9 @@ mod tests {
             },
         };
 
-        // defaults check
         let policy_default = CircuitBreakerPolicy::from_config(&rc, "some-other-host");
         assert_eq!(policy_default.half_open_trial_count, 1);
 
-        // host override check
         let policy_override = CircuitBreakerPolicy::from_config(&rc, "override-zero");
         assert_eq!(policy_override.half_open_trial_count, 1);
     }
@@ -1042,7 +1034,6 @@ mod tests {
         };
         let breaker = CircuitBreaker::new("tower_cancel_test", policy);
 
-        // Put the breaker in HalfOpen state
         {
             let mut inner = breaker.inner.lock().unwrap();
             inner.state = CircuitState::HalfOpen;
@@ -1069,15 +1060,13 @@ mod tests {
 
         let mut svc = CircuitBreakerLayer::new(breaker.clone()).layer(PendingService);
 
-        // Call the service: this will increment half_open_in_flight since it's HalfOpen
+        // Calling while HalfOpen takes a half-open slot; dropping the future must free it.
         let fut = svc.call("ok");
         let in_flight_before = breaker.inner.lock().unwrap().half_open_in_flight;
         assert_eq!(in_flight_before, 1);
 
-        // Drop the future (cancellation)
         drop(fut);
 
-        // half_open_in_flight should be decremented back to 0!
         let in_flight_after = breaker.inner.lock().unwrap().half_open_in_flight;
         assert_eq!(in_flight_after, 0);
     }
@@ -1118,7 +1107,6 @@ mod tests {
         };
         let breaker = CircuitBreaker::new("fallback_test", policy);
 
-        // Test fallback on execution error
         let fallback_result = breaker
             .run_with_fallback(
                 async { Err::<&'static str, &'static str>("failed") },
@@ -1130,7 +1118,6 @@ mod tests {
             .await;
         assert_eq!(fallback_result, Ok("fallback_success"));
 
-        // Force open by exceeding threshold
         let _ = breaker
             .run(async { Err::<(), &'static str>("fail1") })
             .await;
@@ -1139,7 +1126,6 @@ mod tests {
             .await;
         assert_eq!(breaker.state(), CircuitState::Open);
 
-        // Test fallback on Open state
         let fallback_result_open = breaker
             .run_with_fallback(
                 async { Ok::<&'static str, &'static str>("won't run") },
@@ -1194,8 +1180,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_survives_panic_during_state_transition() {
-        // A tracing subscriber that panics on every event, simulating a
-        // user-provided subscriber panicking inside `transition_to`'s log.
+        // Simulates a user subscriber panicking inside `transition_to`'s log.
         struct PanickingSubscriber;
         impl tracing::Subscriber for PanickingSubscriber {
             fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -1221,20 +1206,12 @@ mod tests {
             half_open_trial_count: 1,
             ..CircuitBreakerPolicy::default()
         };
-        // Panic mid-transition (Closed -> Open) while holding the lock; this
-        // both poisons the mutex and interrupts `transition_to`.
+        // Panic mid-transition (Closed -> Open) while holding the lock: this poisons the mutex
+        // and interrupts `transition_to`.
         //
-        // `tracing` callsite `Interest` is a single value cached per callsite
-        // across the WHOLE PROCESS, combined from every concurrently active
-        // dispatcher. `cargo test` runs this alongside thousands of other
-        // unit tests in the same binary, dozens of which install their own
-        // scoped subscribers, so the transition callsite can occasionally be
-        // (re-)cached as "not interested" in the narrow window between this
-        // thread's dispatcher registering and the event firing -- and then
-        // the subscriber never runs and nothing panics. Rebuilding the cache
-        // and re-firing on a fresh breaker converges almost immediately in
-        // practice (the same remedy `router.rs`'s access-log test uses), so
-        // retry a few times rather than flake.
+        // `tracing` caches callsite `Interest` process-wide across all dispatchers, so a
+        // concurrent test's scoped subscriber can cache this callsite as "not interested" and
+        // the event never reaches ours. Rebuild the cache and retry on a fresh breaker.
         let mut breaker = None;
         for attempt in 1..=5 {
             let candidate = CircuitBreaker::new("transition_panic_test", policy.clone());
@@ -1256,10 +1233,8 @@ mod tests {
         let breaker = breaker.expect("a poisoned breaker");
         assert!(breaker.inner.is_poisoned());
 
-        // The interrupted transition must still be complete: `open_until` was
-        // set before `transition_to`, so the breaker recovers to HalfOpen
-        // (instantly, since open_duration is zero) instead of being stuck
-        // permanently Open with `open_until == None`.
+        // `open_until` was set before `transition_to`, so the breaker recovers to HalfOpen
+        // (at once: open_duration is zero) instead of staying Open with `open_until == None`.
         assert_eq!(breaker.state(), CircuitState::HalfOpen);
         assert!(breaker.before_call().is_ok());
         breaker.after_call(true);

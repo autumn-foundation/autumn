@@ -196,10 +196,8 @@ impl std::fmt::Display for LockError {
 
 impl std::error::Error for LockError {}
 
-// `LockError` converts into `AutumnError` through the blanket
-// `impl<E: std::error::Error> From<E>` in `crate::error`, which special-cases
-// `LockError::PoolUnavailable` / `LockError::Timeout` / `LockError::LeaseLost`
-// to a `503 Service Unavailable` status (see `crate::error`).
+// `LockError` converts into `AutumnError` through the blanket `From` in `crate::error`, which
+// maps `PoolUnavailable`, `Timeout` and `LeaseLost` to 503 Service Unavailable.
 
 /// Default poll interval used by the blocking, timed acquire
 /// ([`Lock::lock_timeout`]).
@@ -283,8 +281,7 @@ mod db_impl {
         /// connection).
         fn recycle(mut self) {
             self.armed = false;
-            // `self.conn` (still `Some`) drops as a pooled `Object` here,
-            // returning the connection to the pool.
+            // `self.conn` drops here as a pooled `Object` and returns to the pool.
         }
 
         /// Success: disarm and hand the still-pooled `Object` to the
@@ -303,9 +300,8 @@ mod db_impl {
             if self.armed
                 && let Some(obj) = self.conn.take()
             {
-                // Force-close: detach from the pool and drop the raw session
-                // so the socket closes and PostgreSQL releases any advisory
-                // lock it had already granted on this connection.
+                // Detach and drop the raw session so the socket closes and PostgreSQL
+                // releases any advisory lock it already granted on it.
                 let _ = Object::take(obj);
             }
         }
@@ -361,14 +357,8 @@ mod db_impl {
             state: &S,
             name: impl Into<String>,
         ) -> Result<Self, LockError> {
-            // Advisory locks are a Postgres-only primitive (`pg_advisory_lock`);
-            // SQLite has no server-side, cross-connection analog. Under the
-            // `sqlite` feature `state.pool()` yields a `Pool<RuntimeConnection>`
-            // that is a SQLite pool, which cannot satisfy `Lock`'s Postgres
-            // connection type — and even if it could, there is no lock to take.
-            // Refuse (documented-unsupported) rather than silently pretend to
-            // hold a distributed lock; single-node SQLite boot does not need
-            // cross-instance advisory locking.
+            // Advisory locks are Postgres-only. This module is not compiled under `sqlite`
+            // (`sqlite_impl` serves `Lock` there), so the `sqlite` branch below never builds.
             #[cfg(feature = "sqlite")]
             {
                 let _ = (state, name);
@@ -434,11 +424,9 @@ mod db_impl {
         /// Returns [`LockError`] if a connection could not be obtained or the
         /// database query failed.
         pub async fn try_lock(&self) -> Result<Option<LockGuard>, LockError> {
-            // The `AcquireConn` guard owns the connection across the query
-            // `await`. If this future is cancelled after PostgreSQL grants the
-            // lock but before we detach — or the query errors via `?` — the
-            // guard's drop force-closes the session, releasing the lock instead
-            // of recycling a lock-bearing connection back into the pool.
+            // `AcquireConn` owns the connection across the await: if this future is cancelled
+            // after PostgreSQL grants the lock, or the query errors, it force-closes the session
+            // instead of pooling a lock-bearing connection.
             let mut ac = AcquireConn::new(self.checkout().await?);
             let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
@@ -447,14 +435,9 @@ mod db_impl {
                 .map_err(|e| LockError::Database(e.to_string()))?
                 .acquired;
             if acquired {
-                // Acquired: hand the still-pooled connection to the guard, which
-                // holds it (counted against pool capacity) and recycles it to
-                // the pool on clean release.
                 let conn = ac.into_pooled();
                 Ok(Some(LockGuard::new(conn, self.key, self.name.clone())))
             } else {
-                // Not acquired: recycle the healthy `Object` back to the pool
-                // (we lost the race, not the connection).
                 ac.recycle();
                 Ok(None)
             }
@@ -471,19 +454,13 @@ mod db_impl {
         /// Returns [`LockError`] if a connection could not be obtained or the
         /// database query failed.
         pub async fn lock(&self) -> Result<LockGuard, LockError> {
-            // Held by an `AcquireConn` across the blocking `pg_advisory_lock`
-            // await: cancelling this future (or a query error) force-closes the
-            // session on drop, so a lock granted just before cancellation is
-            // released rather than leaked back into the pool.
+            // `AcquireConn` makes the blocking wait cancel-safe, as in `try_lock`.
             let mut ac = AcquireConn::new(self.checkout().await?);
             diesel::sql_query("SELECT pg_advisory_lock($1)")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
                 .execute(ac.as_mut())
                 .await
                 .map_err(|e| LockError::Database(e.to_string()))?;
-            // Acquired: hand the still-pooled connection to the guard, which
-            // holds it (counted against pool capacity) and recycles it to the
-            // pool on clean release.
             let conn = ac.into_pooled();
             Ok(LockGuard::new(conn, self.key, self.name.clone()))
         }
@@ -508,36 +485,22 @@ mod db_impl {
         /// `timeout`, or another [`LockError`] on connection/query failure.
         pub async fn lock_timeout(&self, timeout: Duration) -> Result<LockGuard, LockError> {
             let start = crate::time::ambient_instant();
-            // Bound the initial pool checkout by the same deadline: under pool
-            // pressure deadpool's own wait could otherwise block far past
-            // `timeout`, returning `PoolUnavailable` instead of honoring the
-            // requested budget. Checkout time is debited from the deadline, so a
-            // small `lock_timeout` returns `Timeout` on time even when the pool
-            // is exhausted.
+            // The checkout counts against the budget: deadpool's own wait can run far past
+            // `timeout`, so an exhausted pool must still return `Timeout` on time.
             let checked_out = tokio::time::timeout(timeout, self.checkout())
                 .await
                 .map_err(|_| LockError::Timeout {
                     name: self.name.clone(),
                     waited: crate::time::ambient_instant().saturating_duration_since(start),
                 })??;
-            // Hold that one connection (via one `AcquireConn`) for every poll
-            // iteration — no per-poll churn. The guard also makes the whole wait
-            // cancel-safe: dropping this future during a poll query or the sleep
-            // force-closes the session, releasing any just-granted lock instead
-            // of recycling a lock-bearing connection to the pool.
+            // One connection serves every poll, and `AcquireConn` keeps the whole wait,
+            // sleeps included, cancel-safe.
             let mut ac = AcquireConn::new(checked_out);
             loop {
-                // Recheck the deadline before every poll so the bounded acquire
-                // is actually bounded. The final sleep below only ever consumes
-                // the remaining budget, so without this top-of-loop check the
-                // loop would issue one more `pg_try_advisory_lock` past the
-                // deadline and could return `Ok` after `timeout` had already
-                // elapsed. On a normal positive `timeout` the first iteration's
-                // elapsed is ~0, so at least one poll always runs.
+                // Check before every poll: the last sleep ends at the deadline, so without this
+                // the loop would poll once more after `timeout` and could succeed late.
                 let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                 if elapsed >= timeout {
-                    // Timed out: recycle the healthy `Object` back to the pool
-                    // (the lock was never acquired on it).
                     ac.recycle();
                     return Err(LockError::Timeout {
                         name: self.name.clone(),
@@ -551,18 +514,12 @@ mod db_impl {
                     .map_err(|e| LockError::Database(e.to_string()))?
                     .acquired;
                 if acquired {
-                    // Acquired: hand the still-pooled connection to the guard,
-                    // which holds it (counted against pool capacity) and
-                    // recycles it to the pool on clean release.
                     let conn = ac.into_pooled();
                     return Ok(LockGuard::new(conn, self.key, self.name.clone()));
                 }
                 let remaining = timeout.saturating_sub(
                     crate::time::ambient_instant().saturating_duration_since(start),
                 );
-                // Clamp the effective poll interval to a small minimum so a
-                // zero (or sub-millisecond) interval cannot busy-spin, but never
-                // sleep past the remaining budget.
                 let poll = self
                     .poll_interval
                     .max(MIN_LOCK_POLL_INTERVAL)
@@ -699,15 +656,9 @@ mod db_impl {
             let Some(obj) = self.conn.take() else {
                 return Ok(());
             };
-            // Own the connection in an *armed* `AcquireConn` for the duration of
-            // the unlock `await`. If this future is cancelled mid-`await` (e.g. a
-            // timeout or shutdown wrapping `release`, including a
-            // `with`/`try_with` auto-release), the guard's drop force-closes the
-            // session — so a lock whose `pg_advisory_unlock` had not yet
-            // completed is released by closing the connection rather than riding
-            // a recycled, possibly-still-locked connection back into the shared
-            // pool. Mirrors the acquire-side cancellation safety. `self.conn` is
-            // now `None`, so `LockGuard`'s own `Drop` is a no-op.
+            // An armed `AcquireConn` force-closes the session if this future is cancelled
+            // before the unlock completes, so a possibly-locked connection never returns to
+            // the pool. `self.conn` is now `None`, so `LockGuard`'s `Drop` does nothing.
             let mut rc = AcquireConn::new(obj);
             let result = diesel::sql_query("SELECT pg_advisory_unlock($1) AS released")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
@@ -716,25 +667,19 @@ mod db_impl {
             match result {
                 Ok(row) => {
                     if !row.released {
-                        // Unlock returned false: the lock was not held, so the
-                        // session is still clean.
+                        // The lock was not held, so the session is still clean.
                         tracing::warn!(
                             lock_name = %self.name,
                             lock_key = self.key,
                             "distributed lock unlock returned false (lock was not held)"
                         );
                     }
-                    // Definitive unlock result: recycle the healthy pooled
-                    // connection back to the pool (no churn).
                     rc.recycle();
                     Ok(())
                 }
                 Err(e) => {
-                    // Unlock errored: we cannot prove the session no longer
-                    // holds the lock. Dropping the still-armed `rc` here
-                    // force-closes the session (detach + drop the raw
-                    // connection) rather than recycling a possibly-lock-bearing
-                    // connection.
+                    // The session may still hold the lock: dropping the armed `rc`
+                    // force-closes it.
                     Err(LockError::Database(e.to_string()))
                 }
             }
@@ -754,13 +699,8 @@ mod db_impl {
     impl Drop for LockGuard {
         fn drop(&mut self) {
             if let Some(conn) = self.conn.take() {
-                // Released implicitly (early return without `release`, panic
-                // unwind, or a cancelled future): we cannot run the async
-                // `pg_advisory_unlock` here, so force-close the session — detach
-                // it from the pool and drop the raw connection so the socket
-                // closes and PostgreSQL releases every session-scoped advisory
-                // lock it held. Never recycle a still-lock-bearing connection
-                // back into the shared pool.
+                // `Drop` cannot run the async unlock, so close the session instead: PostgreSQL
+                // then releases every session-scoped advisory lock it held.
                 let _ = Object::take(conn);
                 tracing::debug!(
                     lock_name = %self.name,
@@ -1074,10 +1014,7 @@ mod sqlite_impl {
                     });
                 }
                 let remaining = timeout.saturating_sub(elapsed);
-                // Bound the checkout by the remaining budget (see the doc
-                // comment above): an unbounded `pool.get()` here is what let
-                // pool pressure turn a bounded wait into a seconds-long
-                // `PoolUnavailable` (issue #2585).
+                // Bound the checkout by the remaining budget too (#2585).
                 let conn = tokio::time::timeout(remaining, self.conn())
                     .await
                     .map_err(|_| LockError::Timeout {
@@ -1267,17 +1204,12 @@ mod sqlite_impl {
                     .execute(&mut *conn)
                     .await;
                     match renewed {
-                        // Renewed: keep going.
                         Ok(rows) if rows > 0 => {}
-                        // Zero rows is the one definitive answer — the lease is
-                        // no longer ours, so there is nothing left to renew.
+                        // Zero rows: the lease is no longer ours.
                         Ok(_) => return,
-                        // An error is not an answer. Writer contention is
-                        // ordinary on SQLite, and giving up here would let the
-                        // lease expire under a guard whose critical section is
-                        // still running — two holders, which is the one thing
-                        // this lock exists to prevent. Try again next tick; the
-                        // guard's drop stops this task.
+                        // Writer contention is ordinary on SQLite. Giving up would let the
+                        // lease expire while the section still runs, so retry next tick;
+                        // the guard's drop stops this task.
                         Err(error) => {
                             tracing::debug!(
                                 error = %error,
@@ -1344,9 +1276,8 @@ mod sqlite_impl {
             if self.released {
                 return;
             }
-            // Released implicitly (early return without `release`, a panic
-            // unwind, or a cancelled future). `Drop` cannot await, so delete the
-            // row on the runtime; if there is none, the lease expiry releases it.
+            // `Drop` cannot await, so delete the row on the runtime. Without a runtime, the
+            // lease expiry releases it.
             let (pool, key, owner) = (self.pool.clone(), self.key, self.owner.clone());
             if tokio::runtime::Handle::try_current().is_ok() {
                 tokio::spawn(async move {
@@ -1365,11 +1296,8 @@ mod sqlite_impl {
     mod tests {
         use super::*;
 
-        // Issue #2585 item 6: `lock_timeout`'s per-poll checkout ran
-        // unbounded, so under pool pressure deadpool's own wait (the pool's
-        // `connect_timeout`, in seconds) blew a small budget and surfaced
-        // `PoolUnavailable` instead of `Timeout`. The checkout is now bounded
-        // by the remaining deadline.
+        // Deadpool's own wait (`connect_timeout`, in seconds) must not outlast a small
+        // `lock_timeout` budget or turn `Timeout` into `PoolUnavailable` (#2585).
         #[tokio::test]
         async fn lock_timeout_bounds_the_pool_checkout_by_the_deadline() {
             let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
@@ -1381,8 +1309,7 @@ mod sqlite_impl {
                     .runtime(deadpool::Runtime::Tokio1)
                     .build()
                     .expect("test pool builds without connecting");
-            // Exhaust the single slot: no checkout in the test can succeed
-            // while this is held.
+            // Hold the only slot, so every checkout in the test waits.
             let _held = pool.get().await.expect("checkout the only connection");
 
             let lock = Lock::new(pool, "checkout-bounded-by-deadline");
@@ -1403,10 +1330,7 @@ mod sqlite_impl {
     }
 }
 
-// Gated on `db`: several assertions reference `db`-only namespacing helpers
-// (`crate::migrate::MIGRATION_ADVISORY_LOCK_KEY`,
-// `crate::repository::repository_upsert_advisory_lock_key`), so this module must
-// not compile with the `db` feature off.
+// Gated on `db`: the assertions use `db`-only key helpers from `migrate` and `repository`.
 #[cfg(all(test, feature = "db"))]
 mod tests {
     use super::*;
@@ -1429,14 +1353,10 @@ mod tests {
 
     #[test]
     fn key_is_namespaced_away_from_other_keyspaces() {
-        // The domain prefix keeps app lock keys out of the keyspaces the
-        // scheduler, migrations, ISR, and repository upserts already use, even
-        // for identical input strings.
         let name = "cleanup";
         let app = distributed_lock_key(name);
 
-        // Scheduler keys are SHA256 of (prefix, task, tick) with different
-        // framing; a same-named app lock must not land on a scheduler key.
+        // Scheduler keys are SHA256 of (prefix, task, tick) with different framing.
         assert_ne!(
             app,
             crate::scheduler::advisory_lock_key("autumn:scheduler", name, name)

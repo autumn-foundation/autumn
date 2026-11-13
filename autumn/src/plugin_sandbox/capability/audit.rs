@@ -208,9 +208,8 @@ impl PluginActivityLog {
             if state.entries.len() >= MAX_LOG_EVENTS
                 && let Some(((at, _), (who, _))) = state.entries.pop_first()
             {
-                // An evicted event is a call the summary can no longer show.
-                // It is recorded under its own time, so a drop that has aged
-                // out of the window stops being reported with it.
+                // Count the evicted event as a drop at its own time, so it leaves the
+                // window when the event would have.
                 state.note_dropped(at, at, &who, 1);
             }
             state.seq = state.seq.wrapping_add(1);
@@ -361,9 +360,9 @@ impl LogState {
             folded.0 = folded.0.max(oldest);
             folded.1 = folded.1.saturating_add(count);
         }
-        // Bounded like the other ledgers. Past this the oldest hour goes, which
-        // takes thousands of plugin-hours of overflow to reach. Keep the newest
-        // shed time. A summary then says its counts are incomplete.
+        // Bounded like the other ledgers: past this the oldest hour goes (thousands of
+        // plugin-hours of overflow). The newest shed time lets a summary say its counts
+        // are incomplete.
         while self.folded.len() > MAX_LOG_EVENTS {
             let Some(oldest) = self.folded.keys().min_by_key(|(_, hour)| *hour).cloned() else {
                 break;
@@ -427,15 +426,12 @@ impl ActivitySummary {
         let counter = bucket.entry(event.operation).or_default();
         *counter = counter.saturating_add(1);
 
-        // The by-target breakdowns cover the three surfaces an operator asks
-        // about by name. KV keys are deliberately absent: a plugin's key space
-        // is chosen by the plugin and is unbounded, so a per-key breakdown would
-        // be both useless and the log's own growth channel. The per-operation
-        // counts above already answer "how much KV".
-        // "Reached" rather than "allowed": a call whose answer was discarded
-        // for being over a byte ceiling, or whose backend errored, still *left
-        // the host*. Filing those under "refused" would make "hosts called"
-        // undercount exactly the calls an operator most wants to see.
+        // Per-target breakdowns cover hosts, tables and job types. KV keys are left out:
+        // the plugin chooses them, so a per-key map would be unbounded. The per-operation
+        // counts already answer "how much KV".
+        //
+        // `allowed` means the call left the host: one whose answer was over a byte ceiling,
+        // or whose backend errored, still counts as a host called, not a refused target.
         let allowed = matches!(
             event.outcome,
             CapabilityOutcome::Allowed
@@ -445,7 +441,7 @@ impl ActivitySummary {
                         | DenialReason::BackendError
                 )
         );
-        // The call ran and the host refused its answer.
+        // The call took effect: allowed, or performed and its answer refused.
         let ran = matches!(
             event.outcome,
             CapabilityOutcome::Allowed
@@ -453,23 +449,16 @@ impl ActivitySummary {
                     DenialReason::ResponseTooLarge | DenialReason::ResultRejected
                 )
         );
-        // Jobs are the exception to "reached the host counts": `job_types` is
-        // rendered as *jobs enqueued*, and a sink that refused — a queue at its
-        // depth ceiling — enqueued nothing. Counting it would put a job in the
-        // report that no runner will ever run, which is the one number an
-        // operator reading this would act on.
-        // A rejected result still ran: the queue took the job.
+        // `job_types` renders as "jobs enqueued", and a sink that errored (a queue at its
+        // depth ceiling) enqueued nothing. A rejected result still counts: the queue took it.
         let enqueued = ran;
-        // Tables are the other exception: `StoreError::Backend` means the read
-        // or write did not happen, so only a call that ran is a table touched.
+        // `StoreError::Backend` means the read or write did not happen, so it touched no table.
         let touched = ran;
         let bucket = match (event.capability, allowed) {
             (SandboxCapability::HttpOutbound, true) => Some(&mut self.hosts),
             (SandboxCapability::Db, true) if touched => Some(&mut self.tables),
             (SandboxCapability::Jobs, true) if enqueued => Some(&mut self.job_types),
-            // Every remaining scoped call — refused outright, or a `jobs` call
-            // that reached a sink which would not take it — is a target the
-            // plugin *named* and did not get.
+            // Every other scoped call is a target the plugin named and did not get.
             (
                 SandboxCapability::HttpOutbound | SandboxCapability::Db | SandboxCapability::Jobs,
                 _,
@@ -499,8 +488,7 @@ impl ActivitySummary {
     fn write_report(&self, out: &mut String) {
         use std::fmt::Write as _;
 
-        // `write!` to a `String` is infallible; results are dropped rather than
-        // unwrapped so this stays panic-free by construction.
+        // `write!` to a `String` is infallible; results are dropped, not unwrapped.
         let _ = writeln!(
             out,
             "sandboxed plugin `{plugin}` — last {secs}s",
@@ -613,8 +601,8 @@ mod tests {
 
     #[test]
     fn a_request_s_drops_count_while_its_last_drop_is_in_the_window() {
-        // #2523. The span of one request's drops is known, not the
-        // time of each drop. Key the record at the last drop: never under-report.
+        // #2523. Only the span of one request's drops is known, so the record is keyed
+        // at the last drop: it may over-report, never under-report.
         use std::sync::Arc;
 
         use chrono::TimeZone as _;
@@ -676,8 +664,7 @@ mod tests {
         assert_eq!(shop.allowed.get("kv-get").copied(), Some(1));
         assert!(!shop.allowed.contains_key("kv-set"), "{shop:?}");
 
-        // A zero-length window covers nothing, which is the same filter the
-        // "last hour" in the acceptance criterion rests on.
+        // A zero-length window covers nothing.
         assert!(log.summary("shop", Duration::ZERO).is_empty());
         assert!(log.summary("nobody", Duration::from_secs(3600)).is_empty());
         assert_eq!(log.plugins(), vec!["other".to_owned(), "shop".to_owned()]);
@@ -714,10 +701,8 @@ mod tests {
 
     #[test]
     fn an_event_the_ring_evicted_is_reported_as_dropped_rather_than_forgotten() {
-        // The ring holds the recent end, which is right. What was wrong was
-        // saying nothing about the rest: a plugin busy enough to fill 4,096
-        // entries in twenty seconds got a "last hour" summary showing twenty
-        // seconds, with counts presented as the hour's.
+        // The ring keeps the recent end and must report what it evicted. Otherwise a busy
+        // plugin's "last hour" shows only its last few seconds, presented as the hour.
         let log = PluginActivityLog::new();
         for _ in 0..MAX_LOG_EVENTS + 100 {
             log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
@@ -737,11 +722,8 @@ mod tests {
 
     #[test]
     fn a_plugin_visible_only_as_drops_is_still_enumerated() {
-        // The ring is shared, so a busy plugin evicts a quiet one's every
-        // event while the drop ledger keeps the count. Enumerating only the
-        // ring then hides the quiet plugin from any operator surface that
-        // walks `plugins()` asking each for a summary — even though
-        // `summary("quiet", …)` has something to say about it.
+        // The ring is shared, so a busy plugin can evict a quiet one's every event while
+        // the drop ledger keeps the count. `plugins()` must still name the quiet one.
         let log = PluginActivityLog::new();
         log.ingest_dropped("quiet", 7);
         for _ in 0..MAX_LOG_EVENTS {
@@ -763,10 +745,8 @@ mod tests {
 
     #[test]
     fn a_dropped_count_leaves_the_window_with_the_calls_it_describes() {
-        // A lifetime total attached itself to every later summary. An operator
-        // asking about a window that ended before the overflow was told the
-        // window was incomplete — permanently, and about calls that were not in
-        // it.
+        // Drops are windowed like events. A lifetime total would mark every later window
+        // incomplete, even one that ended before the overflow.
         let log = PluginActivityLog::new();
         log.ingest_dropped("shop", 9);
         assert_eq!(log.summary("shop", Duration::from_secs(3600)).dropped, 9);
@@ -784,9 +764,8 @@ mod tests {
 
     #[test]
     fn the_dropped_ledger_is_itself_bounded() {
-        // It reports unbounded growth, so it must not be the growth. Coalescing
-        // is what keeps one record per plugin per bucket rather than one per
-        // evicted event.
+        // It reports unbounded growth, so it must not be the growth. Coalescing keeps one
+        // record per plugin per bucket, not one per evicted event.
         let log = PluginActivityLog::new();
         for _ in 0..MAX_LOG_EVENTS * 3 {
             log.ingest("shop", [event("kv-get", CapabilityOutcome::Allowed)]);
@@ -806,10 +785,8 @@ mod tests {
 
     #[test]
     fn a_refused_enqueue_is_not_reported_as_a_job() {
-        // `job_types` renders as "jobs enqueued". A sink at its depth ceiling
-        // enqueued nothing, so counting it puts a job in the operator's report
-        // that no runner will ever run — and that count is the number they
-        // would act on.
+        // `job_types` renders as "jobs enqueued", and a sink at its depth ceiling enqueued
+        // nothing.
         let log = PluginActivityLog::new();
         log.ingest(
             "shop",
@@ -957,9 +934,8 @@ mod tests {
         );
         log.ingest_dropped("shop", 1);
 
-        // Window: only the recent records. All 4096 + 1 are in it; the evicted
-        // old events are not.
-        // The recent window holds every recent record and nothing old.
+        // The recent window holds every recent record (MAX_LOG_EVENTS + 1) and none of the
+        // evicted old events.
         let recent = log.summary("shop", Duration::from_hours(3));
         assert_eq!(recent.dropped, MAX_LOG_EVENTS as u64 + 1);
         // A wider window adds the old events the ring evicted.
@@ -1076,8 +1052,8 @@ mod tests {
             log.ingest_dropped("shop", 1);
             clock.advance(Duration::from_secs(2));
         }
-        // The first batch folded away, ten hours back. It is not in the last
-        // two hours, though the second batch is.
+        // The first batch folded away, ten hours back. It is not in the last three hours;
+        // the second batch is.
         let recent = log.summary("shop", 3 * hour);
         assert_eq!(recent.dropped, MAX_LOG_EVENTS as u64, "{}", recent.dropped);
         let all = log.summary("shop", 100 * hour);

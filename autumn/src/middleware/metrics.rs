@@ -556,15 +556,9 @@ impl MetricsCollector {
         let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let status_class = status_class_index(status);
 
-        // ⚡ Bolt Optimization:
-        // Format the key into a stack-allocated buffer to avoid a heap allocation
-        // on every request. Fall back to allocating a String only if the route
-        // is exceptionally long (which is rare) or if it's a new route missing
-        // from the metrics map.
+        // Compose the key on the stack so a route already in the map costs no allocation. A key
+        // over 256 bytes leaves `written == 0` and takes the owned path below.
         let mut buf = [0u8; 256];
-        // `Cursor::position` reports the bytes written directly, so the filled
-        // prefix is read back without deriving a length from the remaining
-        // slice (`256 - cursor.len()`).
         let written = {
             let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
             if std::io::Write::write_fmt(&mut cursor, format_args!("{method} {route}")).is_ok() {
@@ -633,8 +627,7 @@ impl MetricsCollector {
                 DbSeries::Query => &mut shard.by_query,
                 DbSeries::Hold => &mut shard.holds,
             };
-            // Probe by borrow first: every sample after a key's first sighting
-            // finds its entry without building an owned key just to drop it.
+            // Probe by borrow so only a key's first sample allocates.
             if let Some(entry) = map.get_mut(key) {
                 entry.observe_query(latency_ms);
             } else {
@@ -675,9 +668,6 @@ impl MetricsCollector {
         key: std::fmt::Arguments<'_>,
         latency_ms: u64,
     ) {
-        // Same stack-buffer composition as `record_route`: `Cursor::position`
-        // reports the bytes written, so the filled prefix is read back without
-        // deriving a length from the remaining slice.
         let mut buf = [0u8; 256];
         let written = {
             let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
@@ -977,7 +967,6 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
         return Percentiles::default();
     }
 
-    // Pre-allocate to exact capacity and use fast slice copying instead of iterating
     let mut data = Vec::with_capacity(len);
     let (slice1, slice2) = latencies.as_slices();
     data.extend_from_slice(slice1);
@@ -989,10 +978,10 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
     let p95_idx = len.saturating_sub(1).min(len.saturating_mul(95) / 100);
     let p99_idx = len.saturating_sub(1).min(len.saturating_mul(99) / 100);
 
-    // Use select_nth_unstable to find percentiles in O(N) time instead of O(N log N) sort
+    // `select_nth_unstable` is O(N), against O(N log N) for a sort.
     let (_, &mut p99, _) = data.select_nth_unstable(p99_idx);
 
-    // We only need to search the left partition for p95 since p95_idx <= p99_idx
+    // p95_idx <= p99_idx, so only the left partition is searched.
     let p95 = if p95_idx == p99_idx {
         p99
     } else {
@@ -1000,7 +989,7 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
         p95_val
     };
 
-    // We only need to search the left partition for p50 since p50_idx <= p95_idx
+    // p50_idx <= p95_idx, so only the left partition is searched.
     let p50 = if p50_idx == p95_idx {
         p95
     } else {
@@ -1268,9 +1257,7 @@ mod tests {
 
     #[test]
     fn route_counter_saturates_at_the_ceiling() {
-        // A long-lived process can in principle drive a per-route counter to
-        // `u64::MAX`; the bump must stick there rather than overflow-panic the
-        // request path in a debug build.
+        // At `u64::MAX` the bump must saturate, not overflow-panic the request path in debug.
         let collector = MetricsCollector::new();
         collector.record_route("GET", "/saturating", 200, Duration::from_millis(5));
         pin_counter_at_ceiling(&collector, "/saturating", "GET /saturating");
@@ -1534,7 +1521,6 @@ mod tests {
         use std::task::{Context, Poll};
         use tower::{Service, ServiceExt};
 
-        // A custom service that fails instead of returning a response
         #[derive(Clone)]
         struct FailingService;
 
@@ -1555,7 +1541,6 @@ mod tests {
         let collector = MetricsCollector::new();
         let mut svc = MetricsLayer::new(collector.clone()).layer(FailingService);
 
-        // Active should be 0 initially
         assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
 
         let request = Request::builder()
@@ -1564,11 +1549,10 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        // We know it will error
         let result = svc.ready().await.unwrap().call(request).await;
         assert!(result.is_err());
 
-        // Ensure that even though it errored, the active connection count was decremented
+        // The error path decrements the active count too.
         assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
     }
 
@@ -1582,12 +1566,11 @@ mod tests {
         let snap = collector.snapshot();
         assert_eq!(snap.http.requests_total, 1);
 
-        // Let's verify the route was recorded correctly.
         let key = format!("GET {long_route}");
         let route_snap = snap.http.by_route.get(&key).unwrap();
         assert_eq!(route_snap.count, 1);
 
-        // Record again to hit the other path
+        // The second sample takes the existing-entry path.
         collector.record("GET", &long_route, 200, 20);
         let snap2 = collector.snapshot();
         let route_snap2 = snap2.http.by_route.get(&key).unwrap();

@@ -262,10 +262,8 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Manual parse rather than `Query::<Self>::from_request_parts` so
-        // that unparseable values (`?page=abc`, `?size=`, duplicate keys,
-        // percent-encoding errors) fall back to defaults instead of
-        // rejecting the whole request with a 400.
+        // Not `Query<Self>`: malformed values (`?page=abc`, `?size=`, duplicate keys, bad
+        // percent-encoding) fall back to defaults instead of rejecting with a 400.
         Ok(parts.uri.query().map_or_else(Self::default, parse_query))
     }
 }
@@ -493,8 +491,7 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Best-effort parse, mirroring `PageRequest`: a list endpoint must
-        // never 400 on a malformed sort/filter parameter.
+        // Best-effort, like `PageRequest`: never 400 on a malformed sort or filter.
         Ok(parts
             .uri
             .query()
@@ -590,13 +587,11 @@ impl<T> Page<T> {
         let page = request.page();
         let total_elements = u64::try_from(total).unwrap_or(0);
 
-        // ceil(total / size), minimum 1 so an empty result still
-        // reports `total_pages = 1` — callers don't have to branch on
-        // "no rows" when rendering a pager.
+        // At least 1, so a pager need not special-case an empty result.
         let total_pages = if total_elements == 0 {
             1
         } else {
-            // size() is always >= 1, so this division is safe.
+            // size() is always >= 1.
             u32::try_from(total_elements.div_ceil(u64::from(size))).unwrap_or(u32::MAX)
         };
 
@@ -695,8 +690,7 @@ fn page_link_header_value(page: u32, size: u32, total_pages: u32, has_next: bool
     if has_next {
         links.push(rel(page + 1, "next"));
     }
-    // For an empty collection `total_pages` is 0; clamp to 1 so the `last`
-    // link stays a valid 1-indexed page rather than `page=0`.
+    // Clamp so `last` stays a valid 1-indexed page even when `total_pages` is 0.
     let last_page = total_pages.max(1);
     links.push(rel(last_page, "last"));
     links.join(", ")
@@ -707,7 +701,6 @@ where
     T: Serialize,
 {
     fn into_response(self) -> Response {
-        // Snapshot the nav counters before `self` is moved into `Json`.
         let (page, size, total_pages, has_next) =
             (self.page, self.size, self.total_pages, self.has_next);
         let mut response = axum::Json(self).into_response();
@@ -725,8 +718,7 @@ where
     T: Serialize,
 {
     fn into_response(self) -> Response {
-        // Only a `next` link is meaningful for keyset pagination — there is no
-        // cheap way back to `first`/`prev`/`last` without a full scan.
+        // Keyset pagination has no cheap way to `first`/`prev`/`last`, so only `next`.
         let next_link = self
             .next_cursor
             .as_ref()
@@ -748,12 +740,9 @@ where
 
 // ── Cursor encoding ─────────────────────────────────────────────────
 //
-// Cursor tokens are base64url-encoded JSON. base64url is used (rather
-// than the standard alphabet) so that tokens are safe to embed in a
-// URL without percent-encoding, and padding (`=`) is omitted to keep
-// them tidy. Tokens are *opaque* to clients — encoding the structure
-// keeps callers from forging cursors but, more importantly, lets the
-// server change the schema without breaking the wire contract.
+// Cursor tokens are unpadded base64url JSON, so they embed in a URL without
+// percent-encoding. Clients treat them as opaque, so the server can change the payload
+// shape. Encoding alone does not stop forgery; `Cursor::encode_signed` does.
 
 const BASE64URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -924,7 +913,6 @@ impl Cursor {
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
-    // `Hmac::new_from_slice` accepts any key length.
     let mut mac =
         <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
@@ -1173,16 +1161,13 @@ impl<T> CursorPage<T> {
             items.truncate(limit);
         }
         let next_cursor = if has_next {
-            // The boundary row is the last one we kept. Encoding from
-            // it (rather than the popped row) means the next query
-            // can use a strict inequality and still see every row,
-            // even under concurrent inserts that land between pages.
+            // Encode from the last kept row, not the overfetched one, so the next query
+            // can use a strict inequality without skipping a row.
             items.last().map(cursor_fn).and_then(encode)
         } else {
             None
         };
-        // If encoding failed for some reason, don't claim a next page
-        // we can't actually serve.
+        // If encoding failed, do not claim a next page we cannot serve.
         let has_next = has_next && next_cursor.is_some();
         Self {
             content: items,
@@ -1394,9 +1379,7 @@ mod tests {
 
     // ── Malformed input handling ───────────────────────────────
     //
-    // A list endpoint should never 400 because of a malformed pager.
-    // These cases used to reject through `Query::from_request_parts` —
-    // they now fall back to defaults.
+    // A malformed pager falls back to defaults; a list endpoint never 400s on it.
 
     #[tokio::test]
     async fn extractor_ignores_non_numeric_page() {
@@ -1449,7 +1432,7 @@ mod tests {
         assert_eq!(SortDir::from_param("desc"), SortDir::Desc);
         assert_eq!(SortDir::from_param("DESC"), SortDir::Desc);
         assert_eq!(SortDir::from_param("asc"), SortDir::Asc);
-        // Anything unrecognized falls back to Asc — never an error.
+        // Anything unrecognized falls back to Asc.
         assert_eq!(SortDir::from_param(""), SortDir::Asc);
         assert_eq!(SortDir::from_param("descending"), SortDir::Asc);
         assert_eq!(SortDir::from_param("id;DROP TABLE"), SortDir::Asc);
@@ -1505,9 +1488,8 @@ mod tests {
 
     #[test]
     fn list_query_carries_injection_payload_verbatim() {
-        // The extractor does NOT sanitize — it faithfully carries the raw
-        // request. The *allowlist* in the generated `list()` is what makes
-        // this inert (the key is not a column, so it never reaches SQL).
+        // The extractor does not sanitize. The column allowlist in the generated `list()`
+        // keeps this from reaching SQL.
         let q = parse_list_query("sort=id;DROP%20TABLE%20users");
         assert_eq!(q.sort(), Some("id;DROP TABLE users"));
     }
@@ -1537,7 +1519,6 @@ mod tests {
 
     #[tokio::test]
     async fn list_query_extractor_never_400s_on_garbage() {
-        // Malicious/garbage input is carried verbatim, request still 200s.
         let (status, body) = fetch_list("/items?sort=id;DROP+TABLE&dir=%00&filter[x]=1").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "id;DROP TABLE:asc:x=1");
@@ -1554,7 +1535,7 @@ mod tests {
 
     #[test]
     fn base64url_encode_known_vectors() {
-        // RFC 4648 §10 vectors, with `=` padding stripped (we use base64url-no-pad).
+        // RFC 4648 §10 vectors without `=` padding.
         assert_eq!(base64url_encode(b""), "");
         assert_eq!(base64url_encode(b"f"), "Zg");
         assert_eq!(base64url_encode(b"fo"), "Zm8");
@@ -1566,8 +1547,7 @@ mod tests {
 
     #[test]
     fn base64url_uses_url_safe_alphabet() {
-        // Bytes 0xFB, 0xEF would produce `+` and `/` in standard base64.
-        // The url-safe alphabet uses `-` and `_` instead.
+        // These bytes produce `+` and `/` in standard base64.
         let encoded = base64url_encode(&[0xFB, 0xEF, 0xFF]);
         assert!(!encoded.contains('+'));
         assert!(!encoded.contains('/'));
@@ -1619,14 +1599,12 @@ mod tests {
 
     #[test]
     fn cursor_token_is_url_safe() {
-        // Pick a payload that contains JSON characters which would
-        // otherwise need percent-encoding (`{`, `}`, `:`, `"`).
+        // The JSON holds `{`, `}`, `:` and `"`, which would need percent-encoding.
         let key = PostKey {
             created_at: "2026-04-27T12:00:00Z".to_string(),
             id: 1,
         };
         let token = Cursor::encode(&key).unwrap();
-        // Only chars from the base64url alphabet — no `+`, `/`, `=`, `{`, `:`.
         assert!(
             token
                 .bytes()
@@ -1636,14 +1614,12 @@ mod tests {
 
     #[test]
     fn cursor_decode_returns_none_for_garbage() {
-        // Not base64url at all.
         let decoded: Option<PostKey> = Cursor::decode("!!!not a token!!!");
         assert!(decoded.is_none());
     }
 
     #[test]
     fn cursor_decode_returns_none_for_wrong_schema() {
-        // Valid base64url, valid JSON, but doesn't match the target type.
         let other = serde_json::json!({"unrelated": "value"});
         let token = Cursor::encode(&other).unwrap();
         let decoded: Option<PostKey> = Cursor::decode(&token);
@@ -1718,7 +1694,7 @@ mod tests {
     #[test]
     fn cursor_page_signals_no_next_at_exact_limit() {
         let req = CursorRequest::new(None, 3);
-        // Caller fetched limit+1 = 4, but only got 3 — last page.
+        // Fetched limit+1 = 4 but got 3: last page.
         let items = vec![1_i32, 2, 3];
         let page = CursorPage::from_overfetched(items, &req, |&n| serde_json::json!({"id": n}));
         assert_eq!(page.content.len(), 3);
@@ -1729,17 +1705,13 @@ mod tests {
     #[test]
     fn cursor_page_truncates_overflow_and_emits_next_cursor() {
         let req = CursorRequest::new(None, 3);
-        // Caller fetched limit+1 = 4 rows.
         let items = vec![1_i32, 2, 3, 4];
         let page = CursorPage::from_overfetched(items, &req, |&n| serde_json::json!({"id": n}));
-        // Only `size` items kept.
         assert_eq!(page.content, vec![1, 2, 3]);
         assert!(page.has_next);
         let token = page.next_cursor.as_ref().expect("next cursor present");
-        // Cursor encodes the *last kept* row (id=3), not the popped row (id=4).
-        // This matters: the next page filters with a strict inequality
-        // against this id, which keeps zero-duplicate behaviour even
-        // if a new row gets inserted between page boundaries.
+        // The cursor is the last kept row (id=3), not the overfetched one (id=4): the next
+        // page filters with a strict inequality against it.
         let decoded: serde_json::Value = Cursor::decode(token).unwrap();
         assert_eq!(decoded, serde_json::json!({"id": 3}));
     }
@@ -1859,12 +1831,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
 
-        // Exact MAX_PAGE_SIZE
         let (status, body) = fetch_cursor(&format!("/feed?cursor=t&size={MAX_PAGE_SIZE}")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
 
-        // MAX_PAGE_SIZE + 1
         let size = MAX_PAGE_SIZE + 1;
         let (status, body) = fetch_cursor(&format!("/feed?cursor=t&size={size}")).await;
         assert_eq!(status, StatusCode::OK);
@@ -1873,7 +1843,7 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_extractor_ignores_empty_cursor() {
-        // Empty `cursor=` should be treated as "no cursor", not as `Some("")`.
+        // Empty `cursor=` means no cursor, not `Some("")`.
         let (status, body) = fetch_cursor("/feed?cursor=&size=10").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "-|10|11");
@@ -1891,8 +1861,7 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_extractor_handles_percent_encoded_token() {
-        // base64url tokens never need percent-encoding, but a paranoid
-        // client might do it anyway. `%2D` decodes to `-`.
+        // Tokens never need percent-encoding, but a client may apply it anyway.
         let (status, body) = fetch_cursor("/feed?cursor=ab%2Dcd&size=2").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ab-cd|2|3");
@@ -1900,15 +1869,11 @@ mod tests {
 
     // ── Concurrent-insert simulation ───────────────────────────
     //
-    // The story's success metric is "zero duplicate items during
-    // concurrent inserts". This test simulates a feed where a new row
-    // arrives between the first and second page request, and verifies
-    // the keyset filter still returns every original row exactly once.
+    // A row inserted between two page requests must not cause duplicates.
 
     #[test]
     fn concurrent_inserts_do_not_cause_duplicates() {
-        // Sort by (created_at desc, id desc) — this is the recommended
-        // tie-breaker pattern from the docs.
+        // Sorted by (created_at desc, id desc), the documented tie-breaker pattern.
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct Row {
             id: i64,
@@ -1926,10 +1891,8 @@ mod tests {
                 created_at: 1_000 - id, // older as id grows
             })
             .collect();
-        // Sort newest-first so id=1 is first.
         table.sort_by_key(|r| std::cmp::Reverse((r.created_at, r.id)));
 
-        // First request: no cursor, size=2.
         let req1 = CursorRequest::new(None, 2);
         let fetch1 = usize::try_from(req1.fetch_limit()).unwrap();
         let fetched1: Vec<Row> = table.iter().take(fetch1).cloned().collect();
@@ -1940,10 +1903,7 @@ mod tests {
         let cursor1 = page1.next_cursor.clone().expect("page 1 has next");
         assert_eq!(page1.content.len(), 2);
 
-        // ── Concurrent insert lands BEFORE the next request ──────
-        // A new row is inserted with the highest created_at, so it
-        // would appear on a fresh page 1 — but our cursor pagination
-        // is keyset-based, so the second request must skip it.
+        // A newer row lands before the next request; the keyset filter must skip it.
         table.insert(
             0,
             Row {
@@ -1952,14 +1912,11 @@ mod tests {
             },
         );
 
-        // Second request: cursor from page 1, size=2.
         let req2 = CursorRequest::new(Some(cursor1), 2);
         let key: Key = req2.decode().unwrap();
         let fetch2 = usize::try_from(req2.fetch_limit()).unwrap();
 
-        // Apply the keyset filter: rows that come *after* the cursor
-        // in the (created_at desc, id desc) ordering, then take the
-        // overfetch window.
+        // Rows after the cursor in (created_at desc, id desc) order.
         let fetched2: Vec<Row> = table
             .iter()
             .filter(|r| {
@@ -1973,9 +1930,6 @@ mod tests {
             id: r.id,
         });
 
-        // Combine the two pages. No row should appear twice, and the
-        // newly-inserted id=99 must NOT show up (the user already
-        // scrolled past where it would have appeared).
         let mut all: Vec<Row> = page1.content;
         all.extend(page2.content);
         let mut ids: Vec<i64> = all.iter().map(|r| r.id).collect();
@@ -2006,7 +1960,6 @@ mod tests {
             cursor_id: 7,
         };
         let token = Cursor::encode_signed(&payload, TEST_KEY).unwrap();
-        // Token shape: <payload>.<sig>
         assert!(token.contains('.'));
         let decoded: ScopedCursor = Cursor::decode_signed(&token, TEST_KEY).unwrap();
         assert_eq!(decoded, payload);
@@ -2019,8 +1972,7 @@ mod tests {
             cursor_id: 7,
         };
         let token = Cursor::encode_signed(&payload, TEST_KEY).unwrap();
-        // Forge: re-encode a payload with tenant_id=99 but reuse the
-        // original signature.
+        // A new payload with the original signature.
         let forged_payload = ScopedCursor {
             tenant_id: 99,
             cursor_id: 7,
@@ -2045,8 +1997,6 @@ mod tests {
 
     #[test]
     fn signed_cursor_rejects_unsigned_token() {
-        // A plain (unsigned) token should not verify against the
-        // signed decoder — even though it's structurally valid JSON.
         let payload = ScopedCursor {
             tenant_id: 42,
             cursor_id: 7,
@@ -2061,7 +2011,6 @@ mod tests {
 
     #[test]
     fn signed_cursor_rejects_missing_signature_segment() {
-        // Token without a `.` separator.
         let decoded: Option<ScopedCursor> = Cursor::decode_signed("just-some-bytes", TEST_KEY);
         assert!(decoded.is_none());
     }
@@ -2102,20 +2051,17 @@ mod tests {
         assert!(page.has_next);
         let token = page.next_cursor.as_ref().unwrap();
         assert!(token.contains('.'), "signed token format is payload.sig");
-        // Round-trip through the signed decoder.
         let key: ScopedCursor = Cursor::decode_signed(token, TEST_KEY).unwrap();
         assert_eq!(key.cursor_id, 2); // boundary = last kept item
-        // Plain decoder must NOT happen to extract a structurally
-        // valid value, because the token contains the signature suffix.
+        // The signature suffix makes the token unreadable to the plain decoder.
         let mishandled: Option<ScopedCursor> = Cursor::decode(token);
         assert!(mishandled.is_none());
     }
 
     #[test]
     fn signed_cursor_signature_is_constant_time_compared() {
-        // Smoke test: same key, same input → identical sig. Different
-        // key → different sig. (Constant-time-ness itself is not
-        // observable from this test; we're just exercising the path.)
+        // Timing is not observable here; this checks the signature is deterministic and
+        // depends on the key.
         let p = ScopedCursor {
             tenant_id: 1,
             cursor_id: 1,
@@ -2139,7 +2085,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(extracted.page(), 1);
-        assert_eq!(extracted.size(), 20); // Default is 20
+        assert_eq!(extracted.size(), 20);
     }
 
     #[tokio::test]
@@ -2153,21 +2099,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(extracted.size(), 20); // Default is 20
+        assert_eq!(extracted.size(), 20);
         assert!(extracted.cursor.is_none());
     }
 
     #[test]
     fn base64url_encode_pad_branch() {
-        // 2 byte string leads to rem.len() == 2, which exercises the second padding path.
+        // Two bytes leave a remainder of 2.
         let encoded = base64url_encode(b"ab");
         assert_eq!(encoded, "YWI");
     }
 
     #[test]
     fn base64url_decode_pad_branch() {
-        // Try to decode exactly a length that produces rem 3.
-        // YWI decodes to 'ab' (2 bytes)
+        // Three chars leave a trailing group of 3.
         let decoded = base64url_decode("YWI").unwrap();
         assert_eq!(decoded, b"ab");
     }
@@ -2273,8 +2218,6 @@ mod tests {
 
     #[test]
     fn empty_page_last_link_clamps_to_one() {
-        // An empty collection has `total_pages == 0`. The `last` link must
-        // still target a valid 1-indexed page (`page=1`), never `page=0`.
         let link = page_link_header_value(1, 20, 0, false);
         assert!(
             link.contains("<?page=1&size=20>; rel=\"last\""),

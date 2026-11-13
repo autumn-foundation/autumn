@@ -195,23 +195,18 @@ pub struct MailConfig {
 /// `https://`, `https:///path`, and bases carrying `?`/`#` (the unsubscribe
 /// path/token is appended afterwards, so a query/fragment base would not route).
 fn is_valid_https_base_url(url: &str) -> bool {
-    // Reject characters that are unsafe inside an RFC 2369 angle-bracket URI or
-    // would survive into the raw header: `Url::parse` percent-encodes a space or
-    // `<`/`>` in the path, but the *original* string is what gets rendered as
-    // `<…?token=…>`, so a raw `<`/`>`/whitespace/control char would close or
-    // corrupt the `List-Unsubscribe` value.
+    // The raw string, not the parsed URL, is rendered into `List-Unsubscribe` as
+    // `<…?token=…>`. `Url::parse` would percent-encode these characters, so check
+    // the original: they would close or corrupt the RFC 2369 angle-bracket value.
     if url
         .chars()
         .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
     {
         return false;
     }
-    // Require the raw input to be literally `https://<authority>…`. `url::Url`
-    // normalizes a missing/short authority (`https:`, `https:app.example.com`,
-    // `https:/app.example.com`, `https:///path`) into a valid HTTPS URL with a
-    // host, but the *original* malformed string is what gets rendered into the
-    // header — so reject anything that isn't `https://` followed by a non-`/`
-    // authority character.
+    // `Url::parse` normalizes a missing or short authority (`https:x.com`,
+    // `https:/x.com`, `https:///path`) into a valid URL, but the raw string is
+    // what gets rendered, so require a literal `https://<authority>`.
     match url.strip_prefix("https://") {
         Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {}
         _ => return false,
@@ -219,11 +214,9 @@ fn is_valid_https_base_url(url: &str) -> bool {
     let Ok(parsed) = ::url::Url::parse(url) else {
         return false;
     };
-    // Require an absolute https:// URL with a real host and a valid authority.
-    // Parsing (rather than splitting on `/`) rejects malformed authorities like
-    // `https://app.example.com:abc` (bad port) or `https://@/base` (empty host).
-    // No credentials in the link, and no query/fragment — either would break the
-    // appended `?token=…`.
+    // Parsing rejects malformed authorities such as a bad port
+    // (`https://x.com:abc`) or an empty host (`https://@/base`). A query or
+    // fragment would break the appended `?token=…`.
     parsed.scheme() == "https"
         && parsed.host_str().is_some_and(|h| !h.is_empty())
         && parsed.username().is_empty()
@@ -235,11 +228,9 @@ fn is_valid_https_base_url(url: &str) -> bool {
 /// Whether `value` is a usable unsubscribe mailbox — a bare `local@domain` or a
 /// `mailto:local@domain` URI, with non-empty parts and no whitespace.
 fn is_valid_mailto_address(value: &str) -> bool {
-    // Reject control characters and RFC 2369 delimiters anywhere in the value
-    // (including inside a `?subject=…` query): the value is rendered verbatim
-    // inside `<mailto:…>`, so a control char (CRLF injection, e.g. an extra
-    // `Bcc:`) or a `<`/`>`/`,` (which would close the entry and inject an extra
-    // `List-Unsubscribe` target) must not pass.
+    // Checked over the whole value, `?query` included, because it is rendered
+    // inside `<mailto:…>`: a control char allows CRLF header injection, and
+    // `<`/`>`/`,` would close the entry and add another `List-Unsubscribe` target.
     if value
         .chars()
         .any(|c| c.is_control() || matches!(c, '<' | '>' | ','))
@@ -250,7 +241,6 @@ fn is_valid_mailto_address(value: &str) -> bool {
         .trim()
         .strip_prefix("mailto:")
         .unwrap_or_else(|| value.trim());
-    // Drop any `?subject=…` parameters before validating the address itself.
     let address = address.split('?').next().unwrap_or("");
     match address.split_once('@') {
         Some((local, domain)) => {
@@ -258,9 +248,8 @@ fn is_valid_mailto_address(value: &str) -> bool {
                 && !domain.is_empty()
                 && domain.contains('.')
                 && !address.contains(char::is_whitespace)
-                // Reject any other URI scheme (e.g. `https://unsub@example.com`):
-                // `:` / `/` here mean the value is not a bare mailbox, and it
-                // would otherwise render as a bogus `<mailto:https://…>` header.
+                // `:` or `/` means another URI scheme (`https://unsub@x.com`),
+                // which would render as a bogus `<mailto:https://…>`.
                 && !address.contains([':', '/'])
         }
         None => false,
@@ -463,8 +452,8 @@ fn html_is_full_document(html: &str) -> bool {
 /// before body content. If the expected shape is absent, the input is returned
 /// unchanged rather than risking corruption.
 fn unwrap_synthetic_document(doc: &str) -> String {
-    // html5ever emits these exact byte sequences, lowercased and without
-    // attributes or whitespace, for the wrappers it synthesizes.
+    // html5ever emits the synthesized wrappers as these exact lowercase,
+    // attribute-free byte sequences.
     let inner = doc
         .strip_prefix("<html>")
         .and_then(|rest| rest.strip_suffix("</html>"))
@@ -472,7 +461,6 @@ fn unwrap_synthetic_document(doc: &str) -> String {
     let (head, after_head) = match inner.strip_prefix("<head>") {
         Some(rest) => match rest.split_once("</head>") {
             Some(split) => split,
-            // Malformed/unexpected shape: don't risk corrupting the body.
             None => return doc.to_owned(),
         },
         None => ("", inner),
@@ -513,47 +501,35 @@ fn unwrap_synthetic_document(doc: &str) -> String {
 /// Returns [`MailError::CssInline`] if the body cannot be parsed/inlined, rather
 /// than returning a silently corrupted body.
 fn inline_css_html(html: &str) -> Result<String, MailError> {
-    // Fast path: nothing to inline. Keeps text-like, fragment, and
-    // already-inlined bodies byte-identical and makes re-inlining idempotent.
+    // The inliner reserializes its input, so a body with nothing to inline skips
+    // it and stays byte-identical.
     if !html_contains_style_block(html) {
         return Ok(html.to_owned());
     }
     let inliner = css_inline::CSSInliner::options()
-        // Retain `<style>` so un-inlinable rules survive…
+        // Keep `<style>` and its at-rules (dropped by default) so `@media` rules
+        // still reach clients that honor them, but remove the inlined rules so a
+        // second pass is a no-op.
         .keep_style_tags(true)
-        // …including `@media`/other at-rules (dropped by default), so responsive
-        // tweaks still work in clients that honor them.
         .keep_at_rules(true)
-        // …but drop the rules we did inline, leaving only the un-inlinable ones
-        // in the retained block (also what makes a second pass a no-op).
         .remove_inlined_selectors(true)
-        // Never reach out to the network for `<link>`ed stylesheets.
+        // Linked stylesheets are not fetched, so keep the `<link>` tags (dropped by
+        // default) for clients that load them.
         .load_remote_stylesheets(false)
-        // …but since we do NOT fetch them, keep the `<link rel="stylesheet">`
-        // tags in the body (dropped by default) so the linked CSS still reaches
-        // clients rather than being silently discarded from the delivered body.
         .keep_link_tags(true)
-        // Also emit the presentational HTML `width`/`height` attributes (from the
-        // inlined CSS dimensions) on `table`/`td`/`th`/`img` — both default off.
-        // Outlook-family clients ignore CSS `width`/`height`, so without these
-        // attributes those elements lose their intended sizing there.
+        // Outlook-family clients ignore CSS `width`/`height`; emit the HTML
+        // attributes on `table`/`td`/`th`/`img` too.
         .apply_width_attributes(true)
         .apply_height_attributes(true)
         .build();
-    // Inline in document mode. Its fragment mode would avoid the `<html>`/`<body>`
-    // wrapping but drops retained `@media`/at-rules (it re-homes them to `<head>`,
-    // which a fragment lacks) — breaking AC5. So document-inline unconditionally,
-    // then, for a fragment body, strip the synthetic wrappers back off so the
-    // MIME body stays a fragment. Full documents keep their structure as-is.
+    // Always inline in document mode: fragment mode drops retained at-rules (it
+    // moves them to a `<head>` the fragment lacks). A fragment body then has the
+    // synthetic wrappers stripped back off.
     let is_fragment = !html_is_full_document(html);
     let rendered = inliner
         .inline(html)
-        // Defensive / effectively unreachable: with remote-stylesheet loading
-        // disabled above and no file loader configured, `css-inline` only errors
-        // on IO/network — both compiled out here. It is fully lenient toward
-        // malformed CSS/HTML (garbage `<style>` bodies inline to an unchanged
-        // fragment, never an error). We still surface the typed error rather than
-        // `expect`ing, to keep the API stable if those loaders are ever enabled.
+        // Unreachable in practice: with no remote or file loader, `css-inline` only
+        // errors on IO, and it is lenient toward malformed CSS/HTML.
         .map_err(|error| MailError::CssInline(error.to_string()))?;
     Ok(if is_fragment {
         unwrap_synthetic_document(&rendered)
@@ -638,10 +614,8 @@ pub struct Mail {
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
 //
-// The `capsule` module is behind the `reporting` feature, so each seam helper
-// has a no-op twin for builds without it. Shims rather than `#[cfg]` at the
-// call sites: the seam is then one line in `send`, whatever the feature set,
-// and a future reader cannot miss it among conditional compilation.
+// `capsule` is behind the `reporting` feature, so each seam helper has a no-op
+// twin. That keeps the seam one unconditional line in `send`.
 
 /// Answer a mail send from the capsule's effect tape, when one is serving this
 /// task.
@@ -655,8 +629,8 @@ fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
     use crate::capsule::effects::MailVerdict;
 
     let Some(tape) = crate::capsule::effects::current_tape() else {
-        // Startup code (a state initializer) runs with no tape. In a
-        // replaying process it must not reach a live transport.
+        // Startup code (a state initializer) runs with no tape; in a replaying
+        // process it must still not reach a live transport.
         return crate::capsule::boundary::replaying().then(|| {
             Err(MailError::RuntimeUnavailable(format!(
                 "mail to {} recipient(s) was sent during a capsule replay outside the replayed \
@@ -665,8 +639,7 @@ fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
             )))
         });
     };
-    // Derived by `capsule_body`, the same rule the recorder applies, so the
-    // comparison is like with like.
+    // Same derivation the recorder uses, so the comparison is like with like.
     let body = capsule_body(mail);
     let alternate_body = capsule_alternate_body(mail);
     let attachments: Vec<_> = mail.attachments.iter().map(attachment_effect).collect();
@@ -683,15 +656,11 @@ fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
     };
     Some(match tape.next_mail(&sent) {
         MailVerdict::Sent => Ok(()),
-        // A recorded delivery *failure* is reproduced as one. A handler whose
-        // bug is that it does not handle a suppressed recipient or an SMTP
-        // refusal has to meet that error again, not a synthesized success.
-        // Rebuilt as the variant and text the recorded send produced: a
-        // handler that branches on `AllRecipientsSuppressed`, or propagates the
-        // error into its response, must see what production saw.
+        // Reproduce a recorded failure with its original variant and text, so a
+        // handler that mishandles e.g. `AllRecipientsSuppressed` meets the same
+        // error it met in production.
         MailVerdict::Failed(error, kind) => Err(rebuild_mail_error(kind, error)),
-        // `next_mail` already logged the divergence; the send fails closed
-        // rather than reaching a transport.
+        // `next_mail` already logged the divergence; fail closed.
         MailVerdict::Diverged => Err(MailError::RuntimeUnavailable(format!(
             "the replayed run sent mail ({:?} to {} recipient(s)) the capsule has no \
              recording for; nothing was delivered",
@@ -777,9 +746,8 @@ fn mail_effect(mail: &Mail, error: Option<&MailError>) -> crate::capsule::MailEf
 /// untouched text fallback.
 #[cfg(feature = "reporting")]
 fn capsule_alternate_body(mail: &Mail) -> crate::capsule::CapsuleBody {
-    // `capsule_body` prefers text, so the alternate is html — unless there was
-    // no text at all, in which case html was already taken as the primary and
-    // there is no second body to record.
+    // `capsule_body` prefers text, so the alternate is html. With no text, html
+    // is already the primary and there is no alternate.
     let alternate = if mail.text.is_some() {
         mail.html.as_ref()
     } else {
@@ -1223,17 +1191,15 @@ impl MailBuilder {
                 )));
             }
         }
-        // A layout is only applied when the corresponding body is present.
-        // If only one of html/text is set, the other layout half is intentionally
-        // skipped rather than erroring — a text-only mailer may legitimately pass
-        // an html_layout that has no effect, and vice-versa.
+        // A layout without its body is ignored, not an error: a text-only mailer
+        // may pass an html_layout, and vice versa.
         let html = match (self.html, self.html_layout) {
             (Some(body), Some(layout)) => Some(compose_layout(&layout, &body)),
-            (html, _) => html, // layout without a body: silently unused (by design)
+            (html, _) => html,
         };
         let text = match (self.text, self.text_layout) {
             (Some(body), Some(layout)) => Some(compose_layout(&layout, &body)),
-            (text, _) => text, // layout without a body: silently unused (by design)
+            (text, _) => text,
         };
         Ok(Mail {
             from: self.from,
@@ -1579,14 +1545,12 @@ pub mod unsubscribe {
         let nonce =
             <&Nonce<_>>::try_from(&blob[1..=NONCE_LEN]).map_err(|_| TokenError::Malformed)?;
         let ciphertext = &blob[1 + NONCE_LEN..];
-        // Try the current key first, then any rotation-grace `previous` keys. A
-        // wrong key (or any tampering) fails AES-GCM authentication.
+        // A wrong key or any tampering fails AES-GCM authentication.
         let payload = std::iter::once(&keys.current)
             .chain(keys.previous.iter())
             .find_map(|signing_key| {
                 let key = derive_key(signing_key);
-                // The derived key is always 32 bytes, so construction never fails;
-                // `.ok()?` keeps this panic-free regardless.
+                // The derived key is always 32 bytes; `.ok()?` stays panic-free.
                 let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
                 cipher.decrypt(nonce, ciphertext).ok()
             })
@@ -1801,11 +1765,8 @@ impl UnsubscribeRuntime {
             entries.push(format!("<{}>", unsubscribe::unsubscribe_url(base, &token)));
         }
         if let Some(mailto) = self.mailto.as_deref().filter(|s| !s.trim().is_empty()) {
-            // Accept both a bare address and a full `mailto:` URI without
-            // double-prefixing the scheme. Render only the bare mailbox (drop any
-            // configured `?query`) before appending the canonical subject, so a
-            // value like `mailto:u@x?subject=a\r\nBcc: v@x` can't inject extra
-            // headers into the raw `List-Unsubscribe` value.
+            // Render only the bare mailbox: dropping any configured `?query` stops
+            // a value like `mailto:u@x?subject=a\r\nBcc: v@x` injecting headers.
             let trimmed = mailto.trim();
             let address = trimmed.strip_prefix("mailto:").unwrap_or(trimmed);
             let address = address.split('?').next().unwrap_or(address);
@@ -1984,23 +1945,14 @@ impl Mailer {
     pub async fn send(&self, mail: Mail) -> Result<(), MailError> {
         let mail = mail.with_defaults(&self.defaults);
 
-        // Failure-capsule seam (#1634). A replay asserts the send against the
-        // recording and returns without touching a transport — the check sits
-        // ahead of suppression, CSS inlining and the list-mail branch because
-        // all three consult live state (a suppression store, an unsubscribe
-        // runtime) a replay does not have.
+        // Failure-capsule seam (#1634). Replay is checked before suppression, CSS
+        // inlining and list mail, which consult live state a replay lacks.
         if let Some(answer) = replayed_send(&mail) {
             return answer;
         }
-        // Two-phase, for two reasons that pull in opposite directions. The
-        // tape *position* is taken before the send, so two messages a handler
-        // sends concurrently land in initiation order — the order replay
-        // consumes them in — rather than in whichever order their transports
-        // happened to finish. The *content* is filled in afterwards, error
-        // included, because a handler whose bug is "we do not handle
-        // `AllRecipientsSuppressed`" must meet that error again on replay, and
-        // recording up front would tell the capsule the message went out when
-        // it never did.
+        // The tape position is reserved before the send so concurrent sends are
+        // recorded in initiation order, the order replay consumes them. The
+        // content is filled in afterwards so a failed send is recorded as failed.
         let slot = reserve_mail_slot();
         let recorded = mail.clone();
         let result = self.send_inner(mail).await;
@@ -2012,27 +1964,20 @@ impl Mailer {
     async fn send_inner(&self, mail: Mail) -> Result<(), MailError> {
         let mut mail = mail;
 
-        // Inline `<style>` CSS into element `style="…"` attributes before
-        // transport, so every transport (SMTP, file, log, preview) delivers the
-        // inlined body and it renders styled in clients that strip
-        // `<head>`/`<style>`. Doing it here — ahead of the list-mail branch that
-        // clones per recipient — inlines exactly once regardless of path.
+        // Inlined here, ahead of the per-recipient list-mail clones, so every
+        // transport gets the inlined body and the work happens once.
         self.apply_css_inlining(&mut mail)?;
 
-        // Consult the bounce/complaint suppression list *before* transport.
-        // Suppressed recipients are dropped from `to` (skipped, not an error)
-        // unless the message opts out via `Mail::ignore_suppression`. When every
-        // recipient is suppressed we return `AllRecipientsSuppressed` rather than
-        // reporting a phantom success.
+        // Bounce/complaint suppression: suppressed recipients are skipped. If none
+        // remain, fail with `AllRecipientsSuppressed` rather than a phantom success.
         if !mail.ignore_suppression
             && let Some(store) = self.suppression.as_ref()
             && !mail.to.is_empty()
         {
             let mut kept: Vec<String> = Vec::with_capacity(mail.to.len());
             for recipient in &mail.to {
-                // The store canonicalizes internally, so pass the raw recipient
-                // and only canonicalize on the (rare) suppressed path for the
-                // log line — no allocation for delivered recipients.
+                // The store canonicalizes internally; canonicalize here only for
+                // the log line, so delivered recipients cost no allocation.
                 if store.is_suppressed(recipient).await? {
                     suppression::note_skip(&canonical_subscriber(recipient));
                 } else {
@@ -2049,9 +1994,8 @@ impl Mailer {
             if let Some(runtime) = self.unsubscribe.clone() {
                 return self.send_list_mail(mail, list_id, &runtime).await;
             }
-            // Opted into a list (e.g. via MailBuilder::list_unsubscribe) but no
-            // unsubscribe runtime is wired — send without headers/suppression,
-            // but make the compliance gap loud rather than silent.
+            // No unsubscribe runtime: send without headers, but warn about the
+            // compliance gap.
             tracing::warn!(
                 target: "mail",
                 list_id = %list_id,
@@ -2083,8 +2027,6 @@ impl Mailer {
                 Ok(())
             }
             Err(error) => {
-                // Leave `mail.html` as the original body (not corrupted) and make
-                // the failure loud rather than silently shipping broken HTML.
                 tracing::warn!(
                     target: "mail",
                     error = %error,
@@ -2123,25 +2065,14 @@ impl Mailer {
         list_id: String,
         runtime: &UnsubscribeRuntime,
     ) -> Result<(), MailError> {
-        // Resolve every recipient — address validity AND suppression decision —
-        // before delivering anything. The delivery loop below sends one message
-        // per recipient; if validation or a suppression-store lookup failed
-        // mid-loop it could deliver to earlier recipients and then return an
-        // error, so a caller retrying the send would duplicate those earlier
-        // deliveries. Non-list mail builds and validates the full message before
-        // any send — match that atomicity here.
+        // Validate every address and resolve suppression before delivering
+        // anything: a failure mid-loop would leave earlier recipients delivered,
+        // and a retry would send to them twice.
         //
-        // Each entry is `(recipient_display, canonical_subscriber)`. The canonical
-        // bare address is used for the suppression / token key so a formatted
-        // `Ada <ada@example.com>` recipient matches an opt-out recorded as
-        // `ada@example.com`; the display string is preserved for actual delivery.
-        //
-        // Validate every recipient's address format first (in order, so a
-        // malformed address still fails fast the same way it always has),
-        // then resolve suppression for the whole batch in one call instead of
-        // one store round trip per recipient — `is_suppressed_many` is the
-        // only DB-backed lookup in this function's hot path, and it used to
-        // scale linearly with the recipient count.
+        // Entries are `(recipient_display, canonical_subscriber)`. The canonical
+        // bare address keys suppression and tokens, so `Ada <ada@example.com>`
+        // matches an opt-out recorded as `ada@example.com`. Suppression is one
+        // batched store call for all recipients.
         let mut candidates: Vec<(String, String)> = Vec::with_capacity(mail.to.len());
         for recipient in &mail.to {
             parse_mailbox(recipient)?;
@@ -2176,11 +2107,8 @@ impl Mailer {
             let mut per_recipient = mail.clone();
             per_recipient.to = vec![recipient];
             if let Some(value) = runtime.list_unsubscribe_header(&subscriber, &list_id) {
-                // A migration to `#[mailer(list_unsubscribe)]` replaces, not
-                // duplicates, any header the template set by hand: drop an existing
-                // List-Unsubscribe / List-Unsubscribe-Post first so the generated
-                // per-recipient one-click header is authoritative (otherwise a
-                // stale manual header would suppress RFC 8058 compliance).
+                // The generated per-recipient header replaces any the template
+                // set by hand, so a stale manual one cannot break RFC 8058.
                 per_recipient.extra_headers.retain(|(name, _)| {
                     !name.eq_ignore_ascii_case("List-Unsubscribe")
                         && !name.eq_ignore_ascii_case("List-Unsubscribe-Post")
@@ -2188,8 +2116,8 @@ impl Mailer {
                 per_recipient
                     .extra_headers
                     .push(("List-Unsubscribe".to_owned(), value));
-                // `List-Unsubscribe-Post` is only valid with an HTTPS one-click
-                // URL; a mailto-only header is plain RFC 2369.
+                // `List-Unsubscribe-Post` requires an HTTPS URL; mailto-only is
+                // plain RFC 2369.
                 if runtime.supports_one_click() {
                     per_recipient.extra_headers.push((
                         "List-Unsubscribe-Post".to_owned(),
@@ -2271,13 +2199,12 @@ impl Mailer {
         }
         let mail = self.prepare_deferred(mail);
 
-        // When inside a db.tx, push the spawn as an after-commit callback so
-        // the mail only fires if the transaction commits successfully.
+        // Inside a `db.tx`, deliver from an after-commit callback so a rollback
+        // drops the mail.
         #[cfg(feature = "db")]
         if crate::db::AFTER_COMMIT_REGISTRY.try_with(|_| ()).is_ok() {
-            // Failure-capsule seam (#2351 item 3). The callback runs on a
-            // detached task with no capture scope and no replay tape, so the
-            // seam is the registration, on this task.
+            // Failure-capsule seam (#2351). The callback runs on a detached task
+            // with no capture scope or replay tape, so the seam is here.
             if let Some(answer) = replayed_send(&mail) {
                 return answer;
             }
@@ -2285,9 +2212,8 @@ impl Mailer {
             let mailer = self.clone();
             let deferred = mail.clone();
             let mut f_opt: Option<(Self, Mail)> = Some((mailer, deferred));
-            // Capture the caller's span now; the after-commit callback runs in a
-            // fresh task with no request span, so spawn_mail_delivery would see an
-            // empty span and lose trace correlation without this.
+            // The after-commit callback runs with no request span; capture the
+            // caller's now to keep trace correlation.
             let deliver_span = tracing::Span::current();
 
             crate::db::AFTER_COMMIT_REGISTRY
@@ -2323,12 +2249,10 @@ impl Mailer {
                 .ok();
 
             if f_opt.is_none() {
-                // Successfully registered for after-commit; skip the eager spawn.
                 return Ok(());
             }
         }
 
-        // Outside a transaction (or `db` feature not enabled) — spawn immediately.
         self.spawn_mail_delivery(mail)
     }
 
@@ -2353,18 +2277,12 @@ impl Mailer {
     }
 
     fn spawn_mail_delivery(&self, mail: Mail) -> Result<(), MailError> {
-        // Failure-capsule seam (#1634). Deferred delivery is the one mail path
-        // that leaves the request's task, and a task-local tape does not cross
-        // `tokio::spawn` — so a replayed handler that called `deliver_later`
-        // would send *for real* from the spawned task, where the seam in
-        // `send` can no longer see a tape. The check has to happen here, on the
-        // calling task, before anything is spawned.
+        // Failure-capsule seam (#1634). The task-local tape and capture scope do
+        // not cross `tokio::spawn`, so replay and recording happen here, on the
+        // calling task; otherwise a replay would send for real.
         if let Some(answer) = replayed_send(&mail) {
             return answer;
         }
-        // Recorded here for the same reason: the spawned task carries no
-        // capture scope either, so a `deliver_later` would otherwise be missing
-        // from the capsule and then report an unrecorded-effect divergence.
         record_send(&mail, None);
         self.spawn_unrecorded_delivery(mail)
     }
@@ -2404,9 +2322,6 @@ impl Mailer {
 
     /// Spawn delivery of mail the seam already answered or recorded.
     fn spawn_unrecorded_delivery(&self, mail: Mail) -> Result<(), MailError> {
-        // Honor the disabled-transport contract: if the operator turned mail off
-        // for this profile, deliver_later must drop the message just like
-        // immediate `send` does — even when a queue is attached.
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             MailError::RuntimeUnavailable(
                 "deliver_later requires an active Tokio runtime".to_owned(),
@@ -2824,7 +2739,6 @@ fn base64_wrap76(bytes: &[u8]) -> String {
     if encoded.len() <= 76 {
         return encoded;
     }
-    // One newline between each pair of 76-column chunks.
     let newlines = encoded.len().div_ceil(76).saturating_sub(1);
     let mut wrapped = String::with_capacity(encoded.len().saturating_add(newlines));
     for chunk in encoded.as_bytes().chunks(76) {
@@ -2888,11 +2802,8 @@ fn render_eml(mail: &Mail) -> String {
     if mail.attachments.is_empty() {
         render_eml_bodies(mail, &mut out);
     } else {
-        // Random per-message boundary: text/html bodies are caller-controlled
-        // and may legitimately contain a line matching a fixed boundary
-        // (e.g. `--autumn-mixed`), which would truncate or split the
-        // rendered MIME structure. A boundary the caller cannot predict in
-        // advance can't collide with body content.
+        // Random per message: a caller-controlled body could contain a line
+        // matching a fixed boundary and split the MIME structure.
         use std::fmt::Write as _;
         let boundary = format!("autumn-mixed-{}", uuid::Uuid::new_v4().simple());
         let _ = write!(
@@ -3059,12 +2970,9 @@ fn show_template_preview(state: &AppState, mailer: &str, method: &str) -> Respon
     match preview.render() {
         Ok(mail) => {
             let mut mail = apply_preview_unsubscribe_headers(state, mailer, mail);
-            // Match Mailer::send: inline <style> CSS so the preview reflects what
-            // strict clients (Gmail/Outlook) actually receive. Reuses the send-time
-            // decision (per-message override vs. the mailer's inline_css_default).
+            // Inline CSS as `Mailer::send` would, so the preview shows what is sent.
             if let Some(m) = state.extension::<Mailer>() {
-                // Dev preview: degrade gracefully on inliner error (leaves html un-inlined)
-                // rather than failing the preview; the inliner is effectively infallible here.
+                // On inliner error the preview shows the un-inlined body.
                 let _ = m.apply_css_inlining(&mut mail);
             }
             let raw = render_eml(&mail);
@@ -3093,9 +3001,8 @@ fn apply_preview_unsubscribe_headers(state: &AppState, mailer_label: &str, mut m
         || "subscriber@example.com".to_owned(),
         |to| canonical_subscriber(to),
     );
-    // Use the configured runtime when present, otherwise a sample with an
-    // ephemeral key purely for display. Compute the header inside each branch so
-    // the sample need not outlive this expression.
+    // The header is computed inside each branch so the sample runtime need not
+    // outlive this expression.
     let (header, one_click) = state.extension::<UnsubscribeRuntime>().map_or_else(
         || {
             let sample = UnsubscribeRuntime {
@@ -3120,8 +3027,7 @@ fn apply_preview_unsubscribe_headers(state: &AppState, mailer_label: &str, mut m
         },
     );
     if let Some(value) = header {
-        // Mirror send: the generated header replaces, not duplicates, any header
-        // the preview author set by hand, so the preview reflects what is sent.
+        // As in `send`, the generated header replaces any set by hand.
         mail.extra_headers.retain(|(name, _)| {
             !name.eq_ignore_ascii_case("List-Unsubscribe")
                 && !name.eq_ignore_ascii_case("List-Unsubscribe-Post")
@@ -3348,11 +3254,8 @@ fn parse_multipart_mixed(
 fn split_mime_params(value: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut rest = value;
-    // Peel one parameter off the front at a time. Quote/escape state is always
-    // "outside a quoted string" at an unquoted `;`, so restarting the scan on
-    // the remainder is equivalent to carrying the state across the whole
-    // string — and it keeps every boundary a `split_at_checked` result rather
-    // than hand-computed index arithmetic.
+    // At an unquoted `;` the scan is always outside a quoted string, so
+    // restarting it on the remainder is equivalent to one scan of the whole.
     while let Some(sep) = unquoted_semicolon(rest) {
         let Some((param, after)) = rest.split_at_checked(sep) else {
             break;
@@ -3721,9 +3624,8 @@ fn lettre_attachment_part(attachment: &MailAttachment) -> Result<SinglePart, Mai
             attachment.filename, attachment.content_type
         ))
     })?;
-    // Force base64 regardless of content: lettre's automatic encoder picks
-    // `7bit` for short ASCII byte buffers, but attachments must always carry
-    // a `base64` Content-Transfer-Encoding per the framework's contract.
+    // Force base64: lettre's automatic encoder picks `7bit` for short ASCII
+    // buffers, but attachments always carry base64.
     #[allow(
         clippy::expect_used,
         reason = "infallible: base64 encoding is always valid for any byte buffer"
@@ -3812,20 +3714,18 @@ impl MailTransport for InterceptedMailTransport {
 /// A send that reaches the transport ran with no tape, and is refused.
 #[cfg(feature = "reporting")]
 pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig, builder_queue: bool) {
-    // A state initializer can install its own mailer. Its defaults, CSS
-    // inlining and `is_disabled()` apply before the seam, so the replay
-    // mailer keeps them. Only the transport changes. With no installed
-    // mailer, the app's config gives these values. The production durability
-    // guard is not copied: replay answers its recorded refusal from the tape.
+    // Defaults, CSS inlining and `is_disabled()` apply before the seam, so keep
+    // those of a mailer a state initializer installed, else take them from config.
+    // Only the transport changes. The production durability guard is not copied:
+    // replay answers its recorded refusal from the tape.
     let installed = state.extension::<Mailer>();
     let disabled = installed.as_ref().map_or_else(
         || config.transport == Transport::Disabled,
         |mailer| mailer.is_disabled(),
     );
-    // `has_durable_delivery_queue()` is observable too. Production gets a
-    // queue from the builder (`with_mail_delivery_queue`) or from a handle in
-    // the state. The replay queue refuses, so the live queue is never reached.
-    // Production attaches a queue only when the transport sends mail.
+    // `has_durable_delivery_queue()` is observable, so mirror production: a queue
+    // from the builder or a state handle, attached only when the transport sends
+    // mail. The replay queue refuses, so the live queue is never reached.
     let durable = installed.as_ref().map_or_else(
         || !disabled && (builder_queue || state.extension::<MailDeliveryQueueHandle>().is_some()),
         |mailer| mailer.has_durable_delivery_queue(),
@@ -3872,8 +3772,7 @@ impl MailTransport for ReplayTransport {
         &'a self,
         mail: Mail,
     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
-        // The subject is not printed: it can hold a code or other personal
-        // data, and this send matched no recorded effect.
+        // The subject is not printed: it can hold a code or other personal data.
         Box::pin(async move {
             Err(MailError::RuntimeUnavailable(format!(
                 "mail to {} recipient(s) was sent outside the capsule's replay scope; nothing was \
@@ -3929,9 +3828,8 @@ pub(crate) fn install_mailer(
     let in_production = matches!(state.profile(), "prod" | "production");
     let transport_sends_mail = config.transport != Transport::Disabled;
 
-    // Honor the disabled transport contract: if the operator turned mail off
-    // for this profile (tests, review apps, etc.), `deliver_later` must also
-    // be a no-op — even when a durable queue was registered globally.
+    // With mail turned off, `deliver_later` must stay a no-op even when a durable
+    // queue was registered.
     if transport_sends_mail {
         let queue_handle = state.extension::<MailDeliveryQueueHandle>();
         if let Some(handle) = queue_handle.as_ref() {
@@ -3942,10 +3840,8 @@ pub(crate) fn install_mailer(
     if enforce_durable_guard && in_production && transport_sends_mail {
         let has_durable_queue = mailer.delivery_queue.is_some();
         if !has_durable_queue && !config.allow_in_process_deliver_later_in_production {
-            // Issue #2142: don't hard-fail app boot over an unused code path.
-            // Apps that only call `send()` are never affected; apps that do
-            // call `deliver_later` in this state find out at the call site
-            // (see `Mailer::try_deliver_later`), not by crashing at startup.
+            // Warn rather than fail boot (#2142): apps that only call `send()` are
+            // unaffected, and `deliver_later` fails at the call site instead.
             tracing::warn!(
                 "mail.deliver_later has no durable backend in prod: deliver_later/deliver_later_eager will fail if called; \
                  register a MailDeliveryQueueHandle on AppState, or set mail.allow_in_process_deliver_later_in_production = true \
@@ -3972,8 +3868,6 @@ pub(crate) fn install_mailer(
         .filter(|s| !s.is_empty());
     let unsubscribe_configured = base_url.is_some() || mailto.is_some();
 
-    // Resolve the suppression backend: an explicitly registered handle wins;
-    // otherwise auto-wire a Diesel-backed store when a DB pool is available.
     let suppression: Option<Arc<dyn SuppressionStore>> = {
         let explicit = state
             .extension::<SuppressionStoreHandle>()
@@ -3989,10 +3883,9 @@ pub(crate) fn install_mailer(
         resolved
     };
 
-    // Fail closed: any mailer that declares `list_unsubscribe` needs a place to
-    // point the unsubscribe link/mailto, or Gmail/Yahoo will reject the mail.
-    // Skipped when the transport is disabled — no list mail is emitted, so the
-    // disabled-transport contract (review apps, tests) can boot without it.
+    // Fail closed: a `list_unsubscribe` mailer needs an unsubscribe link or mailto,
+    // or Gmail/Yahoo reject the mail. A disabled transport emits no mail, so it
+    // boots without one.
     if transport_sends_mail
         && unsubscribe_config_fail_closed(
             enforce_durable_guard,
@@ -4006,9 +3899,8 @@ pub(crate) fn install_mailer(
         ));
     }
 
-    // Fail closed: when we will actually emit one-click links (active transport,
-    // a list mailer, and a base URL), the endpoint must be able to record
-    // opt-outs — otherwise a successful unsubscribe POST is a silent no-op.
+    // Fail closed: once one-click links go out, the endpoint must be able to
+    // record opt-outs, or a successful unsubscribe POST does nothing.
     if enforce_durable_guard
         && in_production
         && transport_sends_mail
@@ -4021,9 +3913,8 @@ pub(crate) fn install_mailer(
         ));
     }
 
-    // Warn (don't fail — a custom route is a valid choice) when one-click links
-    // will be advertised but the built-in endpoint is not opted in. We can't see
-    // app-registered routes here, so this is a heads-up, not a hard gate.
+    // Warn, not fail: the app may serve the path from its own route, which is
+    // not visible here.
     if in_production
         && transport_sends_mail
         && has_list_unsubscribe_mailers()
@@ -4052,10 +3943,8 @@ pub(crate) fn install_mailer(
             ttl_days,
             suppression: suppression.clone(),
         };
-        // Always share the wiring with the endpoint handler (mounted whenever an
-        // unsubscribe destination is configured, independent of transport) so a
-        // live unsubscribe link never 404s. Only the *sender* skips when the
-        // transport is intentionally a no-op.
+        // The endpoint gets the runtime regardless of transport, so a link already
+        // sent never 404s. Only the sender skips it when mail is off.
         state.insert_extension(make_runtime());
         if transport_sends_mail {
             mailer.unsubscribe = Some(Arc::new(make_runtime()));
@@ -4063,16 +3952,10 @@ pub(crate) fn install_mailer(
     }
 
     // ── Bounce/complaint suppression wiring (issue #1247) ────────────────────
-    // Zero-config: default to an in-memory store so the detect→suppress loop
-    // works out of the box on a single instance. An explicitly registered
-    // handle (e.g. a Postgres-backed `PgSuppressionStore` via
-    // `AppBuilder::with_mail_suppression_store`) wins. Unlike List-Unsubscribe
-    // suppression, no db-backed store is auto-wired: `send()` consults this on
-    // *every* message, so silently pointing it at a table that may not exist
-    // would break all outbound mail — durable backends are opt-in.
-    //
-    // The resolved handle is registered on `AppState` so inbound bounce/complaint
-    // handlers can share the exact store the `Mailer` consults.
+    // Defaults to an in-memory store; a registered handle wins. No DB store is
+    // auto-wired: `send()` consults this on every message, so a missing table
+    // would break all outbound mail. The handle goes on `AppState` so inbound
+    // bounce/complaint handlers share the store the `Mailer` consults.
     if transport_sends_mail {
         let handle = state
             .extension::<suppression::SuppressionStoreHandle>()
@@ -4116,9 +3999,8 @@ pub(crate) fn install_mailer_with_factory<F>(
 where
     F: FnOnce(&AppState) -> AutumnResult<Arc<dyn MailDeliveryQueue>>,
 {
-    // Honor the disabled transport contract: a profile that turned mail off
-    // (tests, review apps, etc.) must not open queue infrastructure either,
-    // since all sends — immediate and deferred — are supposed to be no-ops.
+    // With mail turned off, every send is a no-op, so do not open queue
+    // infrastructure.
     let transport_sends_mail = config.transport != Transport::Disabled;
     if enforce_durable_guard
         && transport_sends_mail
@@ -4158,8 +4040,7 @@ async fn unsubscribe_post_handler(
     body: String,
 ) -> Response {
     // RFC 8058 §3.1: the one-click POST carries `List-Unsubscribe=One-Click`.
-    // Requiring it avoids recording opt-outs from arbitrary POSTs to the URL
-    // (e.g. link scanners that don't send the body).
+    // Requiring it keeps arbitrary POSTs (e.g. link scanners) from unsubscribing.
     if !is_one_click_body(&body) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -4177,8 +4058,7 @@ async fn unsubscribe_post_handler(
     match unsubscribe::verify_token(&runtime.signing_keys, &params.token, current_unix_time()) {
         Ok(decoded) => {
             let Some(store) = runtime.suppression.as_ref() else {
-                // No backend to record the opt-out — never confirm an unsubscribe
-                // we cannot actually honor.
+                // Never confirm an unsubscribe that cannot be recorded.
                 tracing::error!(
                     target: "mail",
                     "unsubscribe POST received but no suppression backend is configured"
@@ -4544,9 +4424,8 @@ pub mod suppression {
         email: &crate::inbound_mail::InboundEmail,
     ) -> Result<(), MailError> {
         if email.is_bounce {
-            // Only the provider-reported bounced address is the failed
-            // recipient; `email.to` on a bounce webhook is the app's own
-            // inbound address, so never suppress that.
+            // `email.to` on a bounce webhook is the app's own inbound address;
+            // only `bounced_address` is the failed recipient.
             if let Some(addr) = email.bounced_address.as_deref() {
                 store.suppress(addr, SuppressionReason::HardBounce).await?;
             } else {
@@ -4557,10 +4436,9 @@ pub mod suppression {
             }
             return Ok(());
         }
-        // Complaint / FBL: suppress the genuine complainant only. Never fall
-        // back to `email.to`. autumn's `on_spam` is an inbound spam verdict, not
-        // an outbound complaint, so `complained_address` is `None` there and we
-        // log rather than suppress the wrong address.
+        // Complaint / FBL: suppress only the complainant, never `email.to`. An
+        // inbound spam verdict is not an outbound complaint, so it has no
+        // `complained_address` and is only logged.
         if let Some(addr) = email.complained_address.as_deref() {
             store.suppress(addr, SuppressionReason::Complaint).await?;
         } else if email
@@ -4682,9 +4560,7 @@ pub mod suppression {
                         })
                         .on_conflict(mail_suppressions::address)
                         .do_update()
-                        // Refresh both the reason and the timestamp so a
-                        // re-suppression (e.g. an old hard bounce now also a
-                        // complaint) reflects the latest event, not stale data.
+                        // A re-suppression records the latest event's reason and time.
                         .set((
                             mail_suppressions::reason.eq(reason_str),
                             mail_suppressions::suppressed_at.eq(diesel::dsl::now),
@@ -4734,10 +4610,8 @@ pub mod db_suppression {
 
     use super::{MailError, SuppressionStore};
 
-    // The column type follows the runtime backend.
-    // Postgres uses TIMESTAMPTZ. SQLite uses TEXT.
-    // `Timestamptz` has no SQLite impl.
-    // The `postgres` feature can be on when SQLite is the runtime.
+    // Postgres stores TIMESTAMPTZ, SQLite TEXT; `Timestamptz` has no SQLite impl.
+    // Keyed on `sqlite` because `postgres` can be on with SQLite as the runtime.
     #[cfg(not(feature = "sqlite"))]
     type UnsubscribedAt = diesel::sql_types::Timestamptz;
     #[cfg(feature = "sqlite")]
@@ -4812,34 +4686,17 @@ pub mod db_suppression {
                     + 'a,
             >,
         > {
-            // Chunked, not one unbounded `= ANY(...)`, as a backstop against a
-            // truly pathological single send (hundreds of thousands of
-            // recipients) binding an unbounded array into one statement.
+            // Chunked so a pathological send cannot bind an unbounded array.
             //
-            // On Postgres, `eq_any` binds the whole array as ONE parameter
-            // (`= ANY($n)`), so `CHUNK_SIZE` is deliberately large, not
-            // tight: measured against a production-shaped
-            // `mail_unsubscribes` fixture, `subscriber = ANY(...)` keeps
-            // using the `(subscriber, list_id)` index up to a few thousand
-            // array elements, then the planner switches to a `Parallel Seq
-            // Scan` of the whole table — a plan whose cost is ~flat per
-            // statement regardless of how many more elements are in the
-            // array (it's already paying for the full scan). A chunk size
-            // near that crossover would needlessly re-pay the full-scan cost
-            // once per chunk; staying well above it keeps ordinary sends —
-            // even a full-list newsletter blast — in one statement. See
-            // docs/reports/2026-08-15-ledger-mail-suppression-batch/README.md
-            // for the measurements behind the Postgres number.
+            // Postgres binds the whole array as one `= ANY($n)` parameter. Past a
+            // few thousand elements the planner drops the `(subscriber, list_id)`
+            // index for a full seq scan whose cost is flat per statement, so a
+            // large chunk keeps even a full-list send in one statement. See
+            // docs/reports/2026-08-15-ledger-mail-suppression-batch/README.md.
             //
-            // SQLite has no array bind type: Diesel lowers `eq_any` to
-            // `IN (?, ?, ...)`, one bind parameter per element, so a
-            // 50,000-element chunk plus the `list_id` parameter would blow
-            // past `SQLITE_MAX_VARIABLE_NUMBER` (32,766 by default) and fail
-            // the whole send with "too many SQL variables". Reuse
-            // `repository::MAX_BIND_PARAMS` — the same backend-aware limit
-            // generated bulk-write code already chunks against — minus one
-            // for the `list_id` parameter, so this never depends on a second
-            // hand-picked constant drifting out of sync with that one.
+            // SQLite binds one parameter per element and caps them at
+            // `SQLITE_MAX_VARIABLE_NUMBER`, so use `MAX_BIND_PARAMS` minus one for
+            // `list_id`.
             #[cfg(not(feature = "sqlite"))]
             const CHUNK_SIZE: usize = 50_000;
             #[cfg(feature = "sqlite")]
@@ -4978,13 +4835,10 @@ mod tests {
 
     #[test]
     fn inline_css_applies_class_style_to_anchor() {
-        // AC1: a `<style>` block + a class-styled `<a>` yields an equivalent
-        // inline `style="…"` on the anchor.
         let html = r#"<style>.btn{color:#fff;background:#06c}</style><a class="btn">Go</a>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
-        // Inspect the `<a …>` opening tag specifically so every assertion is
-        // discriminating: `#fff`/`#06c` also appear in the retained `<style>`
-        // block, so a no-op would pass a bare `out.contains(...)`.
+        // Check the `<a …>` tag itself: the colors also appear in the retained
+        // `<style>` block, so a no-op would pass a bare `out.contains(...)`.
         let anchor = out
             .split("<a")
             .nth(1)
@@ -5006,7 +4860,6 @@ mod tests {
 
     #[test]
     fn inline_css_applies_class_style_to_table() {
-        // AC7: a class-styled `<table>` gains the expected inline style.
         let html = r#"<style>.wrap{width:600px;background:#eee}</style><table class="wrap"><tr><td>x</td></tr></table>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
         let table = out
@@ -5026,9 +4879,8 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     fn inline_css_emits_outlook_width_height_attributes() {
-        // Outlook-family clients ignore CSS `width`/`height`, so the inliner must
-        // also emit the presentational HTML `width`/`height` attributes on the
-        // supported elements (`table`/`td`/`th`/`img`) — not only the CSS `style=`.
+        // Outlook-family clients ignore CSS `width`/`height`, so the HTML
+        // attributes must be emitted alongside the inline style.
         let html = r#"<style>table{width:600px}img{height:40px}</style><table><tr><td><img src="/x.png"></td></tr></table>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
 
@@ -5039,7 +4891,6 @@ mod tests {
                 .expect("a <table> tag is present in the output");
             &table[..table.find('>').expect("table tag closes")]
         };
-        // Discriminating: the CSS style must be present AND the HTML attribute too.
         assert!(
             table_open.contains("style=") && table_open.contains("600px"),
             "table must still carry the inline CSS width; got tag: {table_open}"
@@ -5068,7 +4919,6 @@ mod tests {
 
     #[test]
     fn inline_css_passthrough_without_style_block_is_byte_identical() {
-        // AC3: bodies already fully inlined (no `<style>`) pass through unchanged.
         let html = r#"<p style="color:red">Hello</p><a href="/x">link</a>"#;
         let out = inline_css_html(html).expect("no-op inlining succeeds");
         assert_eq!(out, html, "no-<style> body must be returned unchanged");
@@ -5080,11 +4930,8 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     fn inline_css_retains_link_stylesheet_tags() {
-        // We never fetch `<link>` stylesheets, so the `<link rel="stylesheet">`
-        // tag must survive inlining rather than being silently dropped from the
-        // delivered body — otherwise a message combining an embedded `<style>`
-        // with a linked stylesheet would lose the linked CSS. The embedded rule
-        // is still inlined onto the element.
+        // Linked stylesheets are never fetched, so the `<link>` tag must survive
+        // or the linked CSS is lost.
         let html = r#"<style>.x{color:red}</style><link rel="stylesheet" href="https://example.com/app.css"><p class="x">Hi</p>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
         assert!(
@@ -5112,7 +4959,6 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     fn inline_css_is_idempotent() {
-        // AC3: inlining twice equals inlining once.
         let html = r#"<style>.btn{color:#fff}p{margin:0}</style><a class="btn">Go</a><p>hi</p>"#;
         let once = inline_css_html(html).expect("first pass");
         let twice = inline_css_html(&once).expect("second pass");
@@ -5125,15 +4971,12 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     fn inline_css_retains_uninlinable_media_queries() {
-        // AC5: `@media` rules that cannot be inlined survive in a retained
-        // `<style>` block rather than being dropped.
         let html = r#"<style>.btn{color:#fff}@media (max-width:600px){.btn{color:#000}}</style><a class="btn">Go</a>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
         assert!(
             out.contains("@media") && out.contains("max-width"),
             "the @media rule must be preserved in a retained <style> block; got: {out}"
         );
-        // And the inlinable rule was still applied to the element.
         assert!(
             out.contains("<a") && out.contains("style="),
             "the inlinable rule must still be inlined onto the anchor; got: {out}"
@@ -5146,10 +4989,8 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     fn inline_css_fragment_body_stays_a_fragment() {
-        // A no-layout FRAGMENT body must stay a fragment after inlining:
-        // opting into CSS inlining must not promote it into a full document by
-        // introducing synthetic `<html>`/`<head>`/`<body>` wrappers. The class
-        // rule is still inlined onto the element. See issue #1254 / PR #1681.
+        // Inlining must not add synthetic `<html>`/`<head>`/`<body>` wrappers to
+        // a fragment body.
         let html = r#"<style>.x{color:red}</style><p class="x">Hi</p>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
         assert!(
@@ -5175,11 +5016,8 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     fn inline_css_fragment_body_retains_media_query_without_wrapping() {
-        // AC5 + fragment: a FRAGMENT body with an un-inlinable `@media` rule
-        // must stay a fragment (no synthetic wrappers) yet still carry the
-        // retained `@media` block. Document-mode inlining hoists that retained
-        // `<style>` into the synthetic `<head>`; the unwrap must fold it back
-        // into the fragment rather than dropping it. See PR #1681.
+        // Document-mode inlining hoists the retained `<style>` into the synthetic
+        // `<head>`; the unwrap must fold it back into the fragment, not drop it.
         let html = r#"<style>.btn{color:#fff}@media (max-width:600px){.btn{color:#000}}</style><a class="btn">Go</a>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
         assert!(
@@ -5209,8 +5047,6 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     fn inline_css_full_document_body_stays_a_document() {
-        // A FULL-DOCUMENT body keeps document-mode handling: its authored
-        // `<html>`/`<body>` structure survives and the class rule is inlined.
         let html = r#"<html><head><style>.x{color:red}</style></head><body><p class="x">Hi</p></body></html>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
         assert!(
@@ -5231,14 +5067,10 @@ mod tests {
 
     #[test]
     fn inline_css_stripped_style_renders_same_computed_styling() {
-        // AC7: a `<style>`-stripped copy of the inlined output renders the same
-        // computed styling — i.e. the visual styling lives in the inline
-        // `style="…"` attribute, independent of any `<head>`/`<style>` the
-        // client might drop.
         let html = r#"<style>.btn{color:#fff;padding:8px}</style><a class="btn">Go</a>"#;
         let inlined = inline_css_html(html).expect("inlining succeeds");
 
-        // Strip every <style>…</style> block (what Gmail/Outlook effectively do).
+        // Strip every <style>…</style> block, as Gmail/Outlook effectively do.
         let mut stripped = String::new();
         let mut rest = inlined.as_str();
         while let Some(start) = rest.to_ascii_lowercase().find("<style") {
@@ -5252,7 +5084,6 @@ mod tests {
         }
         stripped.push_str(rest);
 
-        // The anchor's inline style survives the strip, so styling is unchanged.
         let anchor = stripped
             .split("<a")
             .nth(1)
@@ -5305,8 +5136,6 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     async fn preview_inlines_style_block_when_inlining_enabled() {
-        // A preview whose Mail opts into inlining must reflect what strict
-        // clients receive: the `.btn` class rule inlined onto the anchor.
         let preview = MailPreview::new("test", "styled", || {
             Mail::builder()
                 .to("user@example.com")
@@ -5335,8 +5164,6 @@ mod tests {
         reason = "CSS rule braces are literal HTML, not format placeholders"
     )]
     async fn preview_leaves_style_block_raw_when_inlining_disabled() {
-        // The discriminating counterpart: with inlining off the anchor keeps no
-        // inline style and the raw `<style>` block survives untouched.
         let preview = MailPreview::new("test", "styled", || {
             Mail::builder()
                 .to("user@example.com")
@@ -5401,12 +5228,9 @@ mod tests {
 
     // ── Attachments (issue #1256): pinning tests ──────────────────────────
     //
-    // These prove attachment support introduces zero byte-for-byte regression
-    // to attachment-less mail. `pinned_render_eml_no_attachments` is a frozen
-    // copy of `render_eml`'s pre-attachment body captured before any
-    // attachment code was added. Do not "fix" drift here — a diff against
-    // this function IS the regression signal (AC: "pure additive, no
-    // regression to existing email output").
+    // `pinned_render_eml_no_attachments` is a frozen copy of `render_eml` from
+    // before attachments existed. Attachment-less mail must render byte-identical
+    // to it; do not "fix" drift here, a diff is the regression signal.
 
     fn pinned_render_eml_no_attachments(mail: &Mail) -> String {
         let mut out = String::new();
@@ -5683,10 +5507,8 @@ mod tests {
 
     #[test]
     fn render_eml_boundary_is_unpredictable_and_body_cannot_forge_it() {
-        // A fixed boundary (e.g. a literal `"autumn-mixed"`) lets a body
-        // containing a `--autumn-mixed` line be mistaken for a real MIME
-        // delimiter, truncating or splitting the message. The boundary must
-        // vary per render and not be derivable from body content alone.
+        // A fixed boundary would let a body line like `--autumn-mixed--` split
+        // the message, so the boundary must vary per render.
         let mail = Mail::builder()
             .from("from@example.com")
             .to("user@example.com")
@@ -5789,9 +5611,8 @@ mod tests {
 
     #[test]
     fn render_eml_blocks_filename_header_injection() {
-        // Hand-built Mail bypasses `build()`'s validation entirely — a `Mail`
-        // can also arrive via `Deserialize` from a durable queue, so the
-        // render layer must be injection-proof independent of the builder.
+        // A `Mail` can arrive via `Deserialize` from a durable queue, bypassing
+        // `build()`, so rendering must block injection on its own.
         let mail = Mail {
             from: Some("from@example.com".to_owned()),
             reply_to: None,
@@ -5819,10 +5640,8 @@ mod tests {
 
     #[test]
     fn render_eml_blocks_header_injection_in_all_deserialized_fields() {
-        // Same threat model as `render_eml_blocks_filename_header_injection`,
-        // but for the pre-existing `subject`/`to`/`from`/`reply_to`/
-        // `extra_headers` fields — these are just as reachable via an
-        // untrusted `Deserialize`d `Mail` as the attachment filename is.
+        // Same threat as `render_eml_blocks_filename_header_injection`, for the
+        // header fields.
         let mail = Mail {
             from: Some("from@example.com\r\nX-From-Injected: 1".to_owned()),
             reply_to: Some("reply@example.com\r\nX-Reply-Injected: 1".to_owned()),
@@ -5854,9 +5673,8 @@ mod tests {
 
     #[test]
     fn render_eml_falls_back_to_octet_stream_for_invalid_content_type() {
-        // A `Mail` bypassing `build()` could carry a syntactically invalid
-        // content type; the file transport must not write it verbatim, to
-        // stay consistent with the SMTP transport (which rejects it).
+        // A `Mail` bypassing `build()` can carry an invalid content type; like
+        // the SMTP transport, the file transport must not write it verbatim.
         let mail = Mail {
             from: Some("from@example.com".to_owned()),
             reply_to: None,
@@ -6166,10 +5984,8 @@ mod tests {
 
     #[test]
     fn mail_deserializes_from_pre_attachments_json_shape() {
-        // `Mail::attachments` must default on a missing key so a `Mail`
-        // serialized by an older binary (before this field existed) still
-        // deserializes from a durable delivery queue during a rolling
-        // deploy.
+        // A `Mail` queued by an older binary has no `attachments` key and must
+        // still deserialize during a rolling deploy.
         let json = r#"{"from":null,"reply_to":null,"to":["a@example.com"],"subject":"hi","html":null,"text":"hello","list_unsubscribe":null,"extra_headers":[]}"#;
         let mail: Mail =
             serde_json::from_str(json).expect("pre-attachments JSON should deserialize");
@@ -6231,7 +6047,7 @@ mod tests {
         assert_eq!(Transport::default(), Transport::Disabled);
     }
 
-    // ── List-Unsubscribe: Mail surface (Component 1) ─────────────────────────
+    // ── List-Unsubscribe: Mail surface ───────────────────────────
 
     #[test]
     fn mail_defaults_have_no_unsubscribe_or_extra_headers() {
@@ -6263,7 +6079,7 @@ mod tests {
         );
     }
 
-    // ── List-Unsubscribe: token signing (Component 2) ────────────────────────
+    // ── List-Unsubscribe: token signing ──────────────────────────
 
     fn test_keys() -> crate::security::config::ResolvedSigningKeys {
         crate::security::config::ResolvedSigningKeys::new(
@@ -6283,8 +6099,7 @@ mod tests {
             !token.contains("ada@example.com"),
             "raw subscriber must not appear in the token: {token}"
         );
-        // The address is encrypted, not merely base64-encoded: its base64url form
-        // (which the old signed-token format embedded) must not appear either.
+        // Encrypted, not merely encoded: the base64url form must not appear either.
         assert!(
             !token.contains(&engine.encode("ada@example.com")),
             "base64 of subscriber must not appear — the payload must be encrypted: {token}"
@@ -6301,7 +6116,7 @@ mod tests {
         let keys = test_keys();
         let token =
             unsubscribe::sign_token(&keys, "ada@example.com", "weekly_digest", 4_000_000_000);
-        // Flip a bit in the trailing GCM tag: AES-GCM authentication must reject it.
+        // Flip a bit in the trailing GCM tag.
         let mut blob = engine.decode(&token).expect("token is base64");
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
@@ -6310,7 +6125,6 @@ mod tests {
             unsubscribe::verify_token(&keys, &tampered, 1_000),
             Err(unsubscribe::TokenError::BadSignature)
         );
-        // Expired (now > expiry).
         let short = unsubscribe::sign_token(&keys, "ada@example.com", "weekly_digest", 100);
         assert_eq!(
             unsubscribe::verify_token(&keys, &short, 200),
@@ -6338,7 +6152,7 @@ mod tests {
         assert_eq!(url, "https://app.example.com/_autumn/unsubscribe?token=TOK");
     }
 
-    // ── List-Unsubscribe: suppression store (Component 3) ────────────────────
+    // ── List-Unsubscribe: suppression store ──────────────────────
 
     #[tokio::test]
     async fn in_memory_suppression_transitions() {
@@ -6351,7 +6165,7 @@ mod tests {
         assert!(!store.is_suppressed("b@x.com", "list").await.unwrap());
     }
 
-    // ── List-Unsubscribe: header emission + send (Component 4) ───────────────
+    // ── List-Unsubscribe: header emission + send ─────────────────
 
     #[test]
     fn render_eml_emits_extra_headers() {
@@ -6441,9 +6255,6 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::significant_drop_tightening)]
     async fn send_replaces_manual_list_unsubscribe_with_generated_one_click() {
-        // A template that opts into list_unsubscribe but also set a hand-rolled
-        // List-Unsubscribe must end up with the generated per-recipient one-click
-        // header (replace, not suppress), so RFC 8058 compliance isn't lost.
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let transport = CapturingTransport { sent: sent.clone() };
         let mailer = Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(None));
@@ -6460,8 +6271,6 @@ mod tests {
         let captured = sent.lock().unwrap();
         assert_eq!(captured.len(), 1);
         let headers = &captured[0].extra_headers;
-        // Exactly one List-Unsubscribe, and it's the generated one-click (not the
-        // stale manual value).
         let unsub: Vec<&String> = headers
             .iter()
             .filter(|(n, _)| n == "List-Unsubscribe")
@@ -6482,8 +6291,8 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let transport = CapturingTransport { sent: sent.clone() };
         let mailer = Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(None));
-        // Second recipient is syntactically invalid. The send must fail before
-        // delivering to the first, so a retry cannot duplicate that send.
+        // The second recipient is invalid. Nothing may be delivered, or a retry
+        // would send to the first twice.
         let mail = Mail::builder()
             .from("from@example.com")
             .to("good@example.com")
@@ -6503,7 +6312,6 @@ mod tests {
 
     #[tokio::test]
     async fn send_list_mail_suppression_error_fails_before_any_delivery() {
-        // A suppression store that errors for one specific subscriber.
         struct FailingStore {
             fail_for: String,
         }
@@ -6540,9 +6348,8 @@ mod tests {
         });
         let mailer =
             Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(Some(store)));
-        // The second recipient's suppression lookup errors. The whole send must
-        // fail before the first recipient is delivered, so a retry can't duplicate
-        // that delivery.
+        // The second recipient's lookup errors. Nothing may be delivered, or a
+        // retry would send to the first twice.
         let mail = Mail::builder()
             .from("from@example.com")
             .to("first@example.com")
@@ -6593,10 +6400,8 @@ mod tests {
     async fn send_list_mail_resolves_suppression_in_one_batched_call() {
         use std::sync::atomic::AtomicUsize;
 
-        // A store that counts how many times each trait method is invoked, so
-        // this test proves `send_list_mail` calls `is_suppressed_many` once
-        // for the whole recipient batch instead of `is_suppressed` once per
-        // recipient (the N+1 this change eliminates).
+        // Counts trait calls to prove one `is_suppressed_many` for the batch, not
+        // one `is_suppressed` per recipient.
         struct CountingStore {
             is_suppressed_calls: AtomicUsize,
             is_suppressed_many_calls: AtomicUsize,
@@ -7023,7 +6828,7 @@ mod tests {
         );
     }
 
-    // ── List-Unsubscribe: startup fail-closed (Component 6) ──────────────────
+    // ── List-Unsubscribe: startup fail-closed ────────────────────
 
     #[test]
     fn fail_closed_only_in_prod_with_mailers_and_no_config() {
@@ -7057,7 +6862,7 @@ mod tests {
             ..MailConfig::default()
         };
         assert!(!with(None, None).unsubscribe_base_url_set());
-        // mailto-only is not a base URL (RFC 2369, not one-click).
+        // mailto-only is plain RFC 2369, not one-click.
         assert!(!with(None, Some("u@example.com")).unsubscribe_base_url_set());
         assert!(with(Some("https://x"), None).unsubscribe_base_url_set());
         assert!(!with(Some("   "), None).unsubscribe_base_url_set());
@@ -7070,10 +6875,8 @@ mod tests {
             mount_unsubscribe_endpoint: opt_in,
             ..MailConfig::default()
         };
-        // base URL alone does not mount — opt-in is required.
         assert!(!cfg(Some("https://x"), false).should_mount_unsubscribe_endpoint());
         assert!(cfg(Some("https://x"), true).should_mount_unsubscribe_endpoint());
-        // opt-in without a base URL does not mount.
         assert!(!cfg(None, true).should_mount_unsubscribe_endpoint());
     }
 
@@ -7090,13 +6893,11 @@ mod tests {
         );
         assert!(cfg("not-an-email").validate(Some("prod")).is_err());
         assert!(cfg("unsub@example.com").validate(Some("prod")).is_ok());
-        // a full mailto: URI is accepted too.
         assert!(
             cfg("mailto:unsub@example.com")
                 .validate(Some("prod"))
                 .is_ok()
         );
-        // dev is lenient.
         assert!(cfg("whatever").validate(Some("dev")).is_ok());
     }
 
@@ -7116,9 +6917,7 @@ mod tests {
                 .validate(Some("prod"))
                 .is_ok()
         );
-        // dev allows http for local testing.
         assert!(cfg("http://localhost:3000").validate(Some("dev")).is_ok());
-        // https prefix without a real host is rejected in prod.
         assert!(cfg("https://").validate(Some("prod")).is_err());
         assert!(cfg("https:///path").validate(Some("prod")).is_err());
         // query/fragment bases would break the appended ?token=… link.
@@ -7280,15 +7079,11 @@ mod tests {
 
     #[test]
     fn smtp_password_env_error_never_embeds_the_secret_value() {
-        // `std::env::VarError::NotUnicode` carries the raw contents of the
-        // environment variable — i.e. the SMTP password itself. Formatting
-        // that error directly (`{error}` or `{error:?}`) would leak the
-        // secret into startup logs, so the redacting helper must map it to a
-        // static reason instead.
+        // `VarError::NotUnicode` carries the variable's raw value, here the SMTP
+        // password, so formatting it would leak the secret into startup logs.
         let secret = "hunter2-super-secret-password";
         let error = std::env::VarError::NotUnicode(std::ffi::OsString::from(secret));
-        // Sanity check: the raw VarError does expose the value, which is
-        // exactly why it must never be formatted into a MailError.
+        // The raw error does expose the value.
         assert!(error.to_string().contains(secret));
         assert!(format!("{error:?}").contains(secret));
 
@@ -7303,8 +7098,7 @@ mod tests {
             !debugged.contains(secret),
             "Debug output leaked the SMTP password: {debugged}"
         );
-        // The env var *name* is ordinary configuration and stays in the
-        // message so operators can tell which variable is misconfigured.
+        // The variable name is not secret and tells operators what to fix.
         assert!(displayed.contains("APP_SMTP_PASSWORD"));
         assert!(displayed.contains("environment variable contains non-unicode data"));
     }
@@ -7439,9 +7233,7 @@ mod tests {
 
     #[test]
     fn install_mailer_boots_in_prod_without_ack_but_blocks_deliver_later() {
-        // Issue #2142: a missing durable queue + ack must not crash app
-        // startup — only the `deliver_later` call path should fail, and only
-        // if the app actually reaches it.
+        // #2142: only `deliver_later` fails, not app boot.
         let state = crate::AppState::for_test().with_profile("prod");
         let config = sample_smtp_config();
 
@@ -7651,10 +7443,8 @@ mod tests {
             .expect("queue should receive within 1s")
             .expect("queue should receive the mail");
 
-        // The deferred path freezes the originating mailer's CSS-inlining default
-        // onto the message before enqueue (issue #1254); this mailer defaults
-        // inlining off, so the enqueued job carries `Some(false)` where the
-        // source had `None`. Everything else (notably attachments) is untouched.
+        // Enqueue freezes the mailer's inlining default (off here) onto the
+        // message; nothing else changes.
         let mut expected = mail;
         expected.inline_css = Some(false);
         assert_eq!(received, expected);
@@ -7662,12 +7452,9 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_enqueue_freezes_originating_inline_css_default() {
-        // A mailer whose config defaults CSS inlining ON must record that
-        // decision on the persisted job when the message carries no explicit
-        // override, so a worker consuming the durable queue (with a possibly
-        // different/off default) still inlines. Only the flag is frozen — the
-        // body is left un-inlined so the single inline pass happens once at the
-        // consumer's send() (issue #1254).
+        // A worker with a different default must still inline, so the flag is
+        // frozen on the job. The body stays un-inlined: the consumer's `send()`
+        // inlines it once.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
         let mailer = Mailer::builder()
             .inline_css(true)
@@ -7711,8 +7498,6 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_enqueue_preserves_explicit_inline_css_override() {
-        // An explicit per-message `inline_css(false)` opt-out must survive the
-        // durable-queue handoff and never be clobbered by the mailer default.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
         let mailer = Mailer::builder()
             .inline_css(true)
@@ -7748,8 +7533,6 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_later_without_queue_sends_via_transport_directly() {
-        // When no delivery queue is configured, `spawn_mail_delivery` falls back to
-        // calling `mailer.send()` in a background task.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7781,8 +7564,6 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn deferred_deliver_later_without_queue_sends_after_commit() {
-        // After-commit callback with no queue falls back to `spawn_mail_delivery`
-        // which calls `mailer.send()` in a spawned task.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7827,7 +7608,6 @@ mod tests {
             !mailer.has_durable_delivery_queue(),
             "with_transport should default to no durable queue"
         );
-        // Exercise NoopTransport::send so its body is also covered.
         mailer
             .send(sample_mail())
             .await
@@ -7846,10 +7626,6 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_later_is_noop_when_transport_disabled_even_with_queue() {
-        // The Mailer-level builder lets callers attach a queue *and* pick
-        // Transport::Disabled. The disabled-transport contract requires
-        // deliver_later to drop the message in that case — the queue must
-        // not persist mail when the operator has turned mail off entirely.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
         let mailer = Mailer::builder()
             .transport(Transport::Disabled)
@@ -7861,7 +7637,7 @@ mod tests {
             .try_deliver_later(sample_mail())
             .expect("disabled transport should succeed as a no-op");
 
-        // Wait briefly for any spawn that might erroneously fire to land.
+        // Give an erroneous spawn time to land.
         let received = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
         assert!(
             received.is_err(),
@@ -7871,8 +7647,6 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_later_uses_in_process_fallback_when_no_queue() {
-        // The default Mailer has no durable queue, so deliver_later should
-        // still spawn the in-process Tokio task and not call any queue.
         let mailer = Mailer::builder().build().expect("mailer should build");
 
         mailer
@@ -7930,8 +7704,6 @@ mod tests {
 
     #[test]
     fn install_mailer_warns_but_succeeds_with_explicit_ack_in_prod() {
-        // Same as the explicit-ack test, but also asserts the mailer was
-        // actually inserted and has no durable queue attached.
         let state = crate::AppState::for_test().with_profile("prod");
         let config = MailConfig {
             allow_in_process_deliver_later_in_production: true,
@@ -8033,10 +7805,8 @@ mod tests {
 
     #[test]
     fn install_mailer_with_factory_skips_factory_when_transport_disabled() {
-        // Even when enforce_durable_guard=true (normal server path), a
-        // profile with transport=disabled must not run the factory: the
-        // factory might open Redis/Harvest/DB connections, but all mail in
-        // this profile is supposed to be a no-op.
+        // The factory may open queue connections, which a profile with mail
+        // off must not do, even on the enforced server path.
         let state = crate::AppState::for_test().with_profile("dev");
         let config = MailConfig::default(); // transport = Disabled
         let factory_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -8070,9 +7840,7 @@ mod tests {
 
     #[test]
     fn install_mailer_does_not_run_factory_when_not_enforced_and_no_handle() {
-        // Mirrors run_build_mode: queue factory is intentionally skipped, so
-        // no MailDeliveryQueueHandle is on AppState. install_mailer must
-        // tolerate this and not try to enforce or warn about a missing queue.
+        // Mirrors `run_build_mode`, which skips the queue factory.
         let state = crate::AppState::for_test().with_profile("prod");
         let config = sample_smtp_config();
 
@@ -8090,11 +7858,8 @@ mod tests {
 
     #[test]
     fn install_mailer_skips_production_guard_when_not_enforced() {
-        // Static-site builds (run_build_mode) call install_mailer with
-        // enforce_durable_guard=false because they don't run the request
-        // loop and don't actually defer mail. Even with a prod profile,
-        // an active SMTP transport, no queue, and no ack flag, install
-        // must succeed in this mode.
+        // Static-site builds (`run_build_mode`) never defer mail, so they skip
+        // the guard even in prod with SMTP, no queue and no ack.
         let state = crate::AppState::for_test().with_profile("prod");
         let config = sample_smtp_config();
 
@@ -8130,10 +7895,8 @@ mod tests {
             .expect("mailer with queue should build");
         let mail = sample_mail();
 
-        // The subscriber must remain active for the entire duration — spanning
-        // both the enqueue call and the spawned task's execution — so that
-        // `tracing::Span::current()` inside the task sees the same span tree
-        // that was active when `try_deliver_later` was called.
+        // The subscriber must stay active across both the enqueue and the spawned
+        // task, so the task's `Span::current()` sees the caller's span tree.
         tracing::subscriber::with_default(tracing_subscriber::registry(), || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -8219,10 +7982,6 @@ mod tests {
 
     #[test]
     fn install_mailer_does_not_attach_queue_when_transport_disabled() {
-        // When mail.transport = "disabled" the operator has explicitly turned
-        // mail off for this profile (tests, review apps, etc.). A globally
-        // registered queue must not turn deliver_later back into a durable
-        // persist; it should remain a no-op.
         let state = crate::AppState::for_test().with_profile("dev");
         state.insert_extension(MailDeliveryQueueHandle::new(NoopQueue));
         let config = MailConfig::default(); // transport = Disabled
@@ -8315,16 +8074,15 @@ mod tests {
         let breaker =
             crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
 
-        // Ensure it is closed initially
         assert_eq!(
             breaker.state(),
             crate::circuit_breaker::CircuitState::Closed
         );
 
-        // Build an SMTP transport pointing to a bogus localhost port so it fails
+        // Nothing listens on this port, so every send fails.
         let config = SmtpConfig {
             host: Some("127.0.0.1".to_string()),
-            port: Some(9999), // Bogus port
+            port: Some(9999),
             tls: TlsMode::Disabled,
             username: None,
             password_env: None,
@@ -8339,7 +8097,7 @@ mod tests {
             .build()
             .unwrap();
 
-        // Send 3 times — all should fail and trip the breaker
+        // `minimum_sample_count` failures trip the breaker.
         for _ in 0..3 {
             let res = transport.send(mail.clone()).await;
             assert!(res.is_err());
@@ -8347,7 +8105,6 @@ mod tests {
 
         assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
 
-        // 4th send should fail fast with a circuit breaker error
         let res = transport.send(mail.clone()).await;
         assert!(res.is_err());
         let err_str = res.err().unwrap().to_string();
@@ -8369,7 +8126,6 @@ mod tests {
         };
         assert!(cfg.validate(Some("prod")).is_err());
         assert!(cfg.validate(Some("production")).is_err());
-        // allow flag lifts the restriction.
         let allowed = MailConfig {
             transport: Transport::Log,
             allow_log_in_production: true,
@@ -8403,15 +8159,13 @@ mod tests {
         assert!(!is_valid_https_base_url("https://app.example.com:abc"));
         assert!(!is_valid_https_base_url("https://@/base"));
         assert!(!is_valid_https_base_url("https://user@app.example.com"));
-        // A valid explicit port is fine.
         assert!(is_valid_https_base_url("https://app.example.com:8443"));
         // Characters unsafe inside an RFC 2369 angle-bracket URI are rejected,
         // even though `Url::parse` would percent-encode them.
         assert!(!is_valid_https_base_url("https://example.com/<x>"));
         assert!(!is_valid_https_base_url("https://example.com/a b"));
         assert!(!is_valid_https_base_url("https://example.com/a\r\nb"));
-        // Missing/short authority that `Url::parse` would normalize to a valid
-        // host — rejected so prod can't advertise an unusable one-click URL.
+        // Missing or short authorities that `Url::parse` would normalize.
         assert!(!is_valid_https_base_url("https:/app.example.com"));
         assert!(!is_valid_https_base_url("https:app.example.com"));
     }
@@ -8449,9 +8203,8 @@ mod tests {
 
     #[test]
     fn unsubscribe_header_mailto_drops_configured_query_no_injection() {
-        // Even if a malformed value slipped past validation (e.g. set outside
-        // prod), the rendered header must carry only the bare mailbox plus the
-        // canonical subject — never an injected CRLF/Bcc.
+        // Validation is skipped outside prod, so rendering must also strip an
+        // injected CRLF/Bcc, keeping only the bare mailbox and canonical subject.
         let runtime = UnsubscribeRuntime {
             base_url: None,
             mailto: Some("mailto:u@example.com?subject=x\r\nBcc: v@x.com".to_owned()),

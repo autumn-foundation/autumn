@@ -235,9 +235,8 @@ fn build_storage_key(
     push_storage_key_component(&mut hasher, "target", target.as_bytes());
     push_storage_key_component(&mut hasher, "scope-header-count", b"0");
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
-    // Pushed only when the request carried a bearer credential, so a
-    // session-only app keeps the exact keys it had before, like the tenant
-    // component below.
+    // Pushed only when the request carried a bearer credential, so a session-only app keeps
+    // its existing keys.
     match bearer {
         Some(BearerScope::Verified(principal_id)) => {
             push_storage_key_component(&mut hasher, "bearer-principal", principal_id.as_bytes());
@@ -247,9 +246,8 @@ fn build_storage_key(
         }
         Some(BearerScope::Header(_)) | None => {}
     }
-    // Pushed only when a tenant was resolved, so an app that does not use
-    // tenancy keeps the exact keys it had before — no cache-wide miss, and no
-    // duplicate execution of a mutation retried across an upgrade.
+    // Pushed only when a tenant was resolved, so an app without tenancy keeps its existing
+    // keys: no cache-wide miss, and no rerun of a mutation retried across an upgrade.
     if let Some(tenant) = tenant {
         push_storage_key_component(&mut hasher, "tenant", tenant.as_bytes());
     }
@@ -293,9 +291,9 @@ fn extract_replay_headers_with_policy(
     headers: &HeaderMap,
     include_set_cookie: bool,
 ) -> Vec<(String, Vec<u8>)> {
-    // Headers that must not be cached or replayed.
-    // `set-cookie` is replayed only for finalized session-mutating responses
-    // so lost successful mutations can deliver the session state they created.
+    // Headers that must not be cached or replayed. `set-cookie` is replayed only for
+    // finalized session-mutating responses, so a lost successful mutation still delivers
+    // the session state it created.
     const SKIP: &[&str] = &[
         "connection",
         "transfer-encoding",
@@ -651,8 +649,7 @@ impl MemoryIdempotencyStore {
             },
         );
         drop(in_flight);
-        // Periodically evict expired entries to bound memory growth for
-        // long-running processes. O(N) scan is amortised over every 128 writes.
+        // Evict expired entries every 128 writes to bound memory in long-running processes.
         let n = self.write_count.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(128) {
             entries.retain(|_, v| v.entry.expires_at > now);
@@ -666,14 +663,12 @@ impl MemoryIdempotencyStore {
             .in_flight
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        // Check only the requested key's active in-flight marker.
         if let Some(lock) = in_flight.get(key)
             && lock.expires_at > now
         {
-            return false; // still in flight
+            return false;
         }
-        // Not locked: acquire until the handler finishes, unlocks, or the
-        // safety TTL expires after cancellation.
+        // Held until the handler unlocks, or until the TTL expires after a cancellation.
         let ttl = if lock_ttl.is_zero() {
             Duration::from_secs(1)
         } else {
@@ -1163,8 +1158,7 @@ where
         if let Some(replay) = req.extensions_mut().remove::<IdempotencyReplayResponse>() {
             return futures::future::Either::Left(std::future::ready(Ok(replay.into_response())));
         }
-        // Almost no request has a replay marker. Only the capsule replay
-        // driver sets one.
+        // Only the capsule replay driver sets a replay marker.
         futures::future::Either::Right(self.inner.call(req))
     }
 }
@@ -1315,9 +1309,8 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        // Clone-and-swap: the instance that was polled ready becomes `inner`
-        // for this call; `self.inner` is replaced with a fresh clone for the
-        // next call. This preserves Tower backpressure semantics.
+        // Call the instance that was polled ready, which keeps tower backpressure intact;
+        // leave a fresh clone for the next call.
         let clone = self.inner.clone();
         let inner = std::mem::replace(&mut self.inner, clone);
         let config = IdempotencyRequestConfig {
@@ -1766,12 +1759,9 @@ fn in_flight_lock_owner(entropy: &dyn crate::entropy::Entropy) -> String {
     entropy.uuid_v4().to_string()
 }
 
-// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
-// 128 bytes — that is `axum::response::Response`'s own size, not something this
-// crate chose. Returning a ready-made rejection response IS the idiom here, and
-// boxing it would add an allocation to every rejection path to satisfy a size
-// heuristic. Allowed at the site rather than workspace-wide so the lint stays
-// armed for error types we do control.
+// `clippy::result_large_err` flags the 128-byte `axum::response::Response` in `Err`.
+// Returning a ready-made rejection is the idiom here, and boxing it would allocate on every
+// rejection. Allowed per site so the lint stays on for error types this crate defines.
 #[allow(clippy::result_large_err)]
 async fn prepare_idempotency_request(
     idempotency_key: String,
@@ -2394,8 +2384,7 @@ where
         .await?;
     let (mut resp_parts, resp_body) = response.into_parts();
 
-    // Collect up to the cache cap; stream oversized bodies through without
-    // buffering to avoid materialising large responses in memory.
+    // Buffer up to the cache cap; a larger body streams through uncached.
     let resp_bytes = match collect_response_for_cache(resp_body).await {
         CollectedResponseBody::StreamError(passthrough_body) => {
             lock.release().await;
@@ -2408,7 +2397,6 @@ where
         CollectedResponseBody::TooLarge {
             passthrough_body, ..
         } => {
-            // Body exceeded MAX_CACHEABLE_RESPONSE_BODY — stream through.
             lock.release().await;
             tracing::debug!(
                 idempotency.key = %idempotency_key,
@@ -2484,7 +2472,7 @@ where
 
     metrics.inspect(|m| m.record_idempotency_miss());
 
-    // Reconstruct from original parts — preserves set-cookie and extensions.
+    // The original parts keep `set-cookie` and the extensions.
     Ok(Response::from_parts(resp_parts, Body::from(resp_bytes)))
 }
 
@@ -2631,12 +2619,9 @@ fn response_from_record(record: IdempotencyRecord) -> Response<Body> {
     for (name, value) in &record.headers {
         builder = builder.header(name.as_str(), value.as_slice());
     }
-    // The status, header names/values, and body all originate from the
-    // idempotency store, which may be a custom or corrupted backend. An
-    // invalid stored status (e.g. `0` or `> 999`) or invalid header bytes
-    // makes the builder stash an error that surfaces here. A corrupted replay
-    // record must not crash request handling: fall back to an internal-error
-    // response instead of panicking.
+    // The record comes from the store, which may be custom or corrupted. An invalid status
+    // (`0`, `> 999`) or invalid header bytes surface as a builder error here: answer 500
+    // instead of panicking.
     match builder
         .header(X_IDEMPOTENT_REPLAYED, "true")
         .body(Body::from(record.body))
@@ -2700,10 +2685,8 @@ mod tests {
                 "same seed ⇒ identical lock-owner stream"
             );
         }
-        // The owner is a well-formed v4 UUID string.
         let owner = in_flight_lock_owner(&SeededEntropy::new(1));
         assert!(uuid::Uuid::parse_str(&owner).is_ok());
-        // A different seed diverges.
         assert_ne!(
             in_flight_lock_owner(&SeededEntropy::new(1)),
             in_flight_lock_owner(&SeededEntropy::new(2)),
@@ -2771,9 +2754,7 @@ mod tests {
 
         let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
 
-        // Simulate a request handler that panics while holding one of the
-        // store's internal locks, poisoning it. Without poison recovery this
-        // would make every later request that touches `entries` panic too.
+        // Poison `entries`. Without recovery, every later request that touches it would panic.
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _guard = store
                 .entries
@@ -2787,9 +2768,8 @@ mod tests {
             "holding the write lock across a panic must poison it",
         );
 
-        // A subsequent normal store round-trip must still succeed, proving the
-        // `unwrap_or_else(PoisonError::into_inner)` recovery keeps shared state
-        // usable for later requests (AC4 lock-poisoning recovery contract).
+        // A later round-trip still succeeds: `PoisonError::into_inner` recovery keeps the store
+        // usable.
         let record = IdempotencyRecord {
             status: 200,
             headers: Vec::new(),
@@ -3058,11 +3038,9 @@ mod tests {
 
     #[test]
     fn in_flight_lock_held_when_dropped_without_release() {
-        // Simulates the inner handler future being cancelled (by the outer
-        // request-timeout layer) or unwound by a panic: the lock is dropped
-        // without any of the explicit completion paths calling `release`.
-        // The lock must stay held so a retry carrying the same Idempotency-Key
-        // cannot re-run a mutation whose side effect may already have committed.
+        // A handler cancelled by the request timeout, or unwound by a panic, drops the lock
+        // without `release`. It stays held so a retry cannot re-run a mutation that may have
+        // committed.
         let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
         assert!(memory.try_lock_now("key", "owner-a", Duration::from_secs(60)));
 
@@ -3081,8 +3059,6 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_lock_release_frees_the_key() {
-        // The normal completion paths call `release`, which must free the key
-        // at once so a subsequent distinct request can proceed.
         let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
         assert!(memory.try_lock_now("key", "owner-a", Duration::from_secs(60)));
 
@@ -3103,9 +3079,8 @@ mod tests {
 
     #[test]
     fn set_with_extreme_ttl_does_not_panic() {
-        // Regression: `Instant::now() + ttl` panics when the sum is not
-        // representable. A pathological TTL (configured or attacker-influenced)
-        // must clamp rather than crash the process. See saturating_deadline.
+        // `Instant::now() + ttl` panics when the sum overflows. An extreme TTL (configured or
+        // attacker-influenced) must clamp instead; see `saturating_deadline`.
         let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
         let record = IdempotencyRecord {
             status: 200,
@@ -3117,7 +3092,6 @@ mod tests {
         // Both of these overflow `Instant + Duration` on the underlying clock.
         for extreme in [Duration::from_secs(u64::MAX), Duration::MAX] {
             store.set_now("extreme-ttl-key", "", record.clone(), Vec::new(), extreme);
-            // Entry must be retrievable and (far-future) unexpired.
             assert!(
                 store.get_now("extreme-ttl-key").is_some(),
                 "entry stored with an extreme TTL should be present and unexpired"
@@ -3127,7 +3101,6 @@ mod tests {
         // The in-flight lock path uses the same arithmetic and must not panic.
         assert!(store.try_lock_now("lock-key", "owner", Duration::MAX));
 
-        // saturating_deadline itself clamps to a representable far future.
         let deadline = saturating_deadline(Duration::MAX);
         assert!(deadline > Instant::now());
     }
@@ -3337,10 +3310,7 @@ mod tests {
 
     #[test]
     fn corrupted_stored_record_does_not_panic_on_replay() {
-        // A store backend (custom or corrupted) can hand back a record whose
-        // stored status is out of the valid HTTP range and whose headers carry
-        // invalid bytes. Replaying it must not panic — it must surface an
-        // internal-error response instead.
+        // A custom or corrupted store can return an out-of-range status and invalid header bytes.
         let corrupted = IdempotencyRecord {
             status: 1000,
             headers: vec![("inv\nalid".to_owned(), vec![0x00, 0x0a])],
@@ -3363,8 +3333,7 @@ mod tests {
 
     #[test]
     fn invalid_stored_status_alone_does_not_panic_on_replay() {
-        // Even with otherwise-valid headers, an out-of-range status byte must
-        // not crash replay handling.
+        // Valid headers, out-of-range status.
         let corrupted = IdempotencyRecord {
             status: 0,
             headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],

@@ -124,15 +124,14 @@ fn request_builder<E: Endpoint>(http: &Client, url: &str) -> Option<RequestBuild
         "PUT" => http.put(url),
         "PATCH" => http.patch(url),
         "DELETE" => http.delete(url),
-        // Unreachable from generated code: `#[endpoint]` accepts exactly these
-        // five route attributes. Kept so adding a sixth there is a 502 with a
-        // named cause rather than a silently wrong request.
+        // Unreachable from generated code: `#[endpoint]` accepts only these five
+        // methods. A sixth added there becomes a 502 with a named cause, not a
+        // silently wrong request.
         _ => return None,
     };
     // A typed RPC call has one destination. Following a `Location` would let a
-    // compromised or confused callee steer the caller at an arbitrary host —
-    // the SSRF guard cannot help, because an internal service legitimately
-    // lives on a private address.
+    // compromised callee steer the caller at any host, and the SSRF guard cannot
+    // stop it because internal services legitimately live on private addresses.
     Some(builder.no_redirect())
 }
 

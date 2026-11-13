@@ -365,10 +365,8 @@ mod tests {
             routes,
         };
 
-        // Serialize to JSON
         let json = serde_json::to_string(&manifest).expect("serialize");
 
-        // Write to a temp file, then load back via StaticManifest::load
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("manifest.json");
         {
@@ -419,9 +417,8 @@ mod tests {
 
     #[test]
     fn legacy_manifest_without_content_type_deserializes_to_none() {
-        // A `dist/` built by a pre-#1832 Autumn has no `content_type` key.
-        // It must keep loading, with the field defaulting to `None` so the
-        // serve path falls back to its derivation instead of failing.
+        // A `dist/` built before #1832 has no `content_type` key. It must still load,
+        // with `None` so the serve path falls back to deriving the type.
         let json = r#"{
             "generated_at": "2026-03-27T12:00:00Z",
             "autumn_version": "0.3.0",
@@ -441,8 +438,8 @@ mod tests {
 
     #[test]
     fn manifest_entry_omits_absent_content_type_from_json() {
-        // Keep the on-disk manifest readable by older runtimes (and small):
-        // an entry with nothing recorded serializes without the key at all.
+        // An entry with nothing recorded omits the key, keeping the manifest small
+        // and its shape stable.
         let entry = ManifestEntry::new("about/index.html".to_owned());
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(
@@ -469,8 +466,7 @@ mod tests {
              they had before #1832, got {json}"
         );
 
-        // `content_type` is a new key, so omitting it when absent keeps a
-        // manifest byte-identical to what pre-#1832 `autumn build` wrote.
+        // Omitting the absent key keeps the manifest identical to a pre-#1832 build.
         assert!(
             !json.contains("content_type"),
             "absent content_type must still be omitted, got {json}"
@@ -531,7 +527,7 @@ mod tests {
         };
         let copy = meta.clone();
         assert_eq!(copy.content_type, Some("text/plain"));
-        // Use original after clone to prove it's a real copy, not a move
+        // Using `meta` after the clone proves it was copied, not moved.
         assert_eq!(meta.path, copy.path);
         assert_eq!(copy.name, "test_handler");
         assert_eq!(copy.revalidate, Some(60));

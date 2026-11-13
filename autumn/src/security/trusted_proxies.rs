@@ -256,11 +256,9 @@ impl ProxyResolver {
             return peer_ip;
         }
 
-        // Hop-count mode: peel exactly N entries from the right regardless of
-        // peer IP ranges.  The operator explicitly declared the number of proxy
-        // hops to skip, so no range membership check is needed (and would break
-        // mixed topologies like a dynamic ALB peer plus CDN ranges in the XFF
-        // chain).  parse_forwarded_ip normalises entries that carry a port suffix.
+        // Hop-count mode peels exactly N entries regardless of peer ranges: the operator declared
+        // the hop count, and a range check would break mixed topologies (a dynamic ALB peer plus
+        // CDN ranges in the chain).
         if let Some(hops) = self.trusted_hops {
             if let Some(xff) = Self::x_forwarded_for(req) {
                 let mut entries = xff
@@ -276,9 +274,8 @@ impl ProxyResolver {
             return peer_ip;
         }
 
-        // Range-based resolution: honour forwarding headers only when the
-        // immediate peer is trusted.  "No ranges configured" means trust all
-        // peers.  "Ranges configured but all invalid" means trust no peers.
+        // Range mode: honour forwarding headers only from a trusted peer. No ranges configured
+        // trusts every peer; ranges configured but all invalid trust none.
         let peer_is_trusted = peer_ip.is_some_and(|ip| self.is_trusted_ip(ip))
             || (!self.ranges_configured && peer_ip.is_none());
 
@@ -299,8 +296,8 @@ impl ProxyResolver {
                 return peer_ip;
             }
 
-            // No ranges, no hop count: use rightmost entry, but skip if it equals
-            // the peer (i.e. the proxy appended itself).
+            // No ranges, no hop count: use the rightmost entry, skipping it if it is the peer
+            // (the proxy appended itself).
             let mut entries = xff
                 .rsplit(',')
                 .map(str::trim)
@@ -317,7 +314,7 @@ impl ProxyResolver {
             }
         }
 
-        // XFF absent or empty — fall through to X-Real-IP, then peer IP.
+        // No usable XFF: fall back to X-Real-IP, then the peer.
         if let Some(real_ip) = req
             .headers()
             .get("x-real-ip")
@@ -350,9 +347,8 @@ impl ProxyResolver {
         }
 
         let peer_ip = Self::peer_ip(req);
-        // Hop-count mode: only trust the forwarded host when the XFF chain
-        // contains enough parseable IP entries.  A direct client or a proxy
-        // that omits XFF cannot satisfy the count, preventing header spoofing.
+        // Hop-count mode trusts the forwarded host only when XFF has more valid entries than the
+        // hop count, so a direct client or a proxy that omits XFF cannot spoof it.
         let peer_is_trusted = self.trusted_hops.map_or_else(
             || peer_ip.is_some_and(|ip| self.is_trusted_ip(ip)) || !self.ranges_configured,
             |hops| {
@@ -422,8 +418,7 @@ impl ProxyResolver {
                     .get("x-forwarded-proto")
                     .and_then(|v| v.to_str().ok())
             {
-                // Multiple values are comma-separated; the leftmost is the
-                // client-facing scheme.
+                // Multiple proxies may comma-append; the leftmost is the client-facing scheme.
                 let outermost = proto.split(',').next().unwrap_or(proto).trim();
                 if !outermost.is_empty() {
                     return Some(outermost.to_ascii_lowercase());
@@ -484,11 +479,7 @@ impl ProxyResolver {
 }
 
 // ── Fuzzing seams ───────────────────────────────────────────────────────────
-// These `#[cfg(fuzzing)]` wrappers expose the private trusted-proxy parsing
-// surface (`CidrRange::parse`, `ProxyResolver::parse_forwarded_ip`, and the
-// full `X-Forwarded-*` resolver) to the `fuzz/` crate. They are compiled out of
-// every normal build (including `cargo package`), so the published crate is
-// byte-identical. See `fuzz/fuzz_targets/headers.rs`.
+// Expose the private parsers to `fuzz/fuzz_targets/headers.rs`. Normal builds compile them out.
 
 /// Fuzzing seam: parse a single `[security.trusted_proxies]` range/IP entry.
 #[cfg(fuzzing)]
@@ -612,12 +603,9 @@ where
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
-        // An identity already present was put there by in-process code —
-        // extensions never arrive off the wire — today only the capsule
-        // replay driver, restoring the resolution the failing request had.
-        // Honor it rather than re-resolving against a synthetic peer that
-        // would (correctly, but uselessly) distrust the recorded forwarded
-        // headers (issue #1598).
+        // Extensions never arrive off the wire, so an existing identity was set in-process: the
+        // capsule replay driver restoring the original resolution. Re-resolving against its
+        // synthetic peer would distrust the recorded forwarded headers (#1598).
         if req.extensions().get::<ResolvedClientIdentity>().is_none() {
             let identity = ResolvedClientIdentity {
                 addr: self.resolver.resolve_client_addr(&req),
@@ -627,20 +615,10 @@ where
             req.extensions_mut().insert(identity);
         }
 
-        // A failure capsule records the *resolved* client identity, so replay
-        // can restore `ClientAddr`/`ClientHost`/`ClientScheme` without
-        // re-running trust evaluation against a peer socket it does not have
-        // (issue #1598).
-        //
-        // Recorded from the request's extensions rather than from the branch
-        // above, because the two are not the same instance. `App::run` wraps
-        // the finished router in an *outer* `TrustedProxiesLayer`, which
-        // resolves before the capture scope exists — so by the time this inner
-        // instance runs inside the scope, the identity is already present and
-        // the branch above is skipped. Recording only what this instance
-        // resolved would therefore leave every capsule written by the real
-        // server without a client identity, while the test harness (which has
-        // no outer layer) recorded one.
+        // Record the resolved identity so capsule replay can restore it without a peer socket
+        // (#1598). Read it from the extensions, not the branch above: `App::run` wraps the router
+        // in an outer `TrustedProxiesLayer` that resolves before the capture scope exists, so on
+        // a real server this inner instance skips that branch.
         #[cfg(feature = "reporting")]
         if let Some(scope) = crate::capsule::current_scope()
             && let Some(identity) = req.extensions().get::<ResolvedClientIdentity>()
@@ -652,8 +630,7 @@ where
             });
         }
 
-        // All work above is synchronous. Thus the inner future is the future
-        // of this service, with no box and no clone (issue #2830).
+        // Everything above is synchronous, so the inner future needs no box or clone (#2830).
         self.inner.call(req)
     }
 }
@@ -680,7 +657,7 @@ mod tests {
         req
     }
 
-    // ── TrustedProxy parsing ───────────────────────────────────────────────
+    // ── CidrRange parsing ──────────────────────────────────────────────────
 
     #[test]
     fn trusted_proxy_parse_exact_ipv4() {
@@ -715,13 +692,11 @@ mod tests {
         assert!(!proxy_exact.contains("2001:db8::2".parse().unwrap()));
     }
 
-    // ── AC (a): attacker-controlled leading value rejected with trusted_hops=1 ──
+    // ── Hop count ignores an attacker-controlled leading value ────────────────
 
     #[test]
     fn trusted_hops_one_rejects_attacker_controlled_leading_value() {
-        // X-Forwarded-For: <attacker-injected>, <real-client>, <alb>
-        // With trusted_hops=1 we peel 1 entry from the right (the ALB).
-        // The real client is at position 1, NOT the attacker-injected value at 0.
+        // XFF: <attacker-injected>, <real-client>, <alb>. Peeling one hop yields the real client.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: Vec::new(),
             trusted_hops: Some(1),
@@ -729,8 +704,6 @@ mod tests {
         });
 
         let req = req_with_xff("1.2.3.4, 5.6.7.8, 10.0.0.1");
-        // Peel 1 from right (10.0.0.1). Next is 5.6.7.8 (real client).
-        // Attacker-injected 1.2.3.4 is NOT returned.
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(addr, "5.6.7.8".parse::<IpAddr>().unwrap());
     }
@@ -748,39 +721,33 @@ mod tests {
         assert_eq!(addr, "5.6.7.8".parse::<IpAddr>().unwrap());
     }
 
-    // ── AC (a2): hop-count with ranges list works even when peer not in ranges ─
+    // ── Hop count does not require the peer to be in ranges ───────────────────
 
     #[test]
     fn trusted_hops_with_ranges_does_not_require_peer_in_ranges() {
-        // Dynamic ALB (10.0.1.200) is NOT in the CDN CIDR range, but trusted_hops
-        // should bypass the peer-range check and peel exactly 1 hop regardless.
+        // The dynamic ALB peer (10.0.1.200) is outside the CDN range; hop count skips the check.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: vec!["203.0.113.0/24".to_owned()],
             trusted_hops: Some(1),
             trust_forwarded_headers: true,
         });
 
-        // Peer is 10.0.1.200 (dynamic ALB, not in ranges). XFF: real-client, ALB.
         let req = req_with_peer_and_xff("10.0.1.200", "192.0.2.1, 10.0.1.200");
-        // Peel 1 from right (10.0.1.200). The next entry is the real client.
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(addr, "192.0.2.1".parse::<IpAddr>().unwrap());
     }
 
-    // ── AC (b): two-hop CDN + ALB correctly identifies real client ────────────
+    // ── Two-hop CDN + ALB chain ──────────────────────────────────────────────
 
     #[test]
     fn two_hop_cdn_alb_chain_identifies_real_client() {
-        // CDN (203.0.113.10) -> ALB (10.0.1.100) -> app
-        // X-Forwarded-For: <real-client>, 203.0.113.10, 10.0.1.100
-        // Trusted ranges: CDN range + ALB range
+        // CDN (203.0.113.10) -> ALB (10.0.1.100) -> app, with both ranges trusted.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: vec!["203.0.113.0/24".to_owned(), "10.0.0.0/8".to_owned()],
             trusted_hops: None,
             trust_forwarded_headers: true,
         });
 
-        // Peer is the ALB (the immediate upstream of the app)
         let req = req_with_peer_and_xff("10.0.1.100", "192.0.2.1, 203.0.113.10, 10.0.1.100");
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(
@@ -790,7 +757,7 @@ mod tests {
         );
     }
 
-    // ── AC (c): trust_forwarded_headers=false ignores all X-Forwarded-* ──────
+    // ── trust_forwarded_headers = false ignores all X-Forwarded-* ────────────
 
     #[test]
     fn trust_forwarded_headers_false_ignores_xff() {
@@ -800,8 +767,6 @@ mod tests {
             trust_forwarded_headers: false,
         });
 
-        // Peer is 10.0.0.1 (trusted range), but trust_forwarded_headers=false
-        // so the XFF chain must be ignored; we return the peer IP.
         let req = req_with_peer_and_xff("10.0.0.1", "192.0.2.1, 203.0.113.10");
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(
@@ -859,7 +824,6 @@ mod tests {
             trust_forwarded_headers: true,
         });
 
-        // Multiple proxies — leftmost (client-facing) is https
         let req = Request::builder()
             .header("x-forwarded-proto", "https, http")
             .body(())
@@ -889,7 +853,6 @@ mod tests {
 
     #[test]
     fn resolve_host_returns_leftmost_when_chained() {
-        // Proxy chain appended to X-Forwarded-Host; leftmost is client-facing.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: Vec::new(),
             trusted_hops: None,
@@ -927,9 +890,8 @@ mod tests {
 
     #[test]
     fn trusted_hops_with_ranges_resolves_forwarded_host() {
-        // Dynamic ALB peer (10.0.1.200) not in CDN ranges; hop-count should still
-        // trust X-Forwarded-Host when XFF chain has enough entries.
-        // trusted_hops=1 requires count > 1 (i.e., at least 2 XFF entries).
+        // The ALB peer is outside the CDN range, but hop count still trusts X-Forwarded-Host
+        // once XFF has more valid entries than `trusted_hops`.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: vec!["203.0.113.0/24".to_owned()],
             trusted_hops: Some(1),
@@ -939,7 +901,7 @@ mod tests {
         let mut req = Request::builder()
             .header("host", "internal.cluster.local")
             .header("x-forwarded-host", "public.example.com")
-            // XFF: real-client, ALB — 2 entries satisfies count > 1
+            // Two valid entries: more than `trusted_hops`.
             .header("x-forwarded-for", "192.0.2.1, 10.0.1.200")
             .body(())
             .unwrap();
@@ -952,8 +914,7 @@ mod tests {
 
     #[test]
     fn trusted_hops_with_no_xff_does_not_trust_forwarded_host() {
-        // When XFF chain is absent, a direct client could inject X-Forwarded-Host.
-        // The resolver must fall back to the Host header.
+        // With no XFF, the request may come from a direct client that set X-Forwarded-Host.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: vec!["203.0.113.0/24".to_owned()],
             trusted_hops: Some(1),
@@ -982,7 +943,7 @@ mod tests {
 
         let mut req = Request::builder()
             .header("x-forwarded-proto", "https")
-            // XFF: real-client, ALB — 2 entries satisfies count > 1
+            // Two valid entries: more than `trusted_hops`.
             .header("x-forwarded-for", "192.0.2.1, 10.0.1.200")
             .body(())
             .unwrap();
@@ -997,7 +958,6 @@ mod tests {
 
     #[test]
     fn trusted_hops_with_no_xff_does_not_trust_forwarded_scheme() {
-        // Without an XFF chain, X-Forwarded-Proto must not be trusted.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: vec!["203.0.113.0/24".to_owned()],
             trusted_hops: Some(1),
@@ -1026,9 +986,7 @@ mod tests {
             trust_forwarded_headers: true,
         });
 
-        // Peer is 203.0.113.1 which is NOT in trusted ranges.
         let req = req_with_peer_and_xff("203.0.113.1", "192.0.2.1");
-        // Must return the peer IP, not the XFF value.
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(addr, "203.0.113.1".parse::<IpAddr>().unwrap());
     }
@@ -1037,8 +995,7 @@ mod tests {
 
     #[test]
     fn no_peer_ip_with_trust_enabled_falls_back_to_xff() {
-        // When no ConnectInfo (no peer known), and ranges is empty (trust all peers),
-        // use XFF.
+        // No ConnectInfo and no ranges configured: every peer is trusted, so XFF is used.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: Vec::new(),
             trusted_hops: None,
@@ -1046,8 +1003,6 @@ mod tests {
         });
 
         let req = req_with_xff("192.0.2.1, 10.0.0.1");
-        // No ConnectInfo; no peer to skip; no ranges configured -> trust any peer.
-        // Rightmost is 10.0.0.1.
         let addr = resolver.resolve_client_addr(&req);
         assert!(addr.is_some());
     }
@@ -1058,7 +1013,6 @@ mod tests {
     fn loopback_only_trusts_loopback_xff() {
         let resolver = ProxyResolver::loopback_only();
         let req = req_with_peer_and_xff("127.0.0.1", "192.0.2.1");
-        // Peer is loopback (trusted), so XFF is honoured.
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(addr, "192.0.2.1".parse::<IpAddr>().unwrap());
     }
@@ -1067,7 +1021,6 @@ mod tests {
     fn loopback_only_ignores_xff_from_non_loopback_peer() {
         let resolver = ProxyResolver::loopback_only();
         let req = req_with_peer_and_xff("10.0.0.1", "192.0.2.1");
-        // Peer is NOT loopback; XFF must be ignored.
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(addr, "10.0.0.1".parse::<IpAddr>().unwrap());
     }
@@ -1090,7 +1043,7 @@ mod tests {
             trust_forwarded_headers: true,
         });
 
-        // Proxy emitted "client:port, alb:port" — both carry port suffixes.
+        // Both entries carry a port suffix.
         let req = req_with_xff("192.0.2.1:54321, 10.0.1.200:80");
         let addr = resolver.resolve_client_addr(&req).unwrap();
         assert_eq!(addr, "192.0.2.1".parse::<IpAddr>().unwrap());
@@ -1114,7 +1067,6 @@ mod tests {
 
     #[test]
     fn trusted_hops_with_junk_xff_does_not_trust_forwarded_host() {
-        // Non-IP XFF entries must not count toward the hop threshold.
         let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
             ranges: Vec::new(),
             trusted_hops: Some(1),
@@ -1124,7 +1076,7 @@ mod tests {
         let mut req = Request::builder()
             .header("host", "real.example.com")
             .header("x-forwarded-host", "attacker.example.com")
-            // Two entries, but both are junk — count of valid IPs is 0, not > 1.
+            // Two entries, but no valid IP, so the count is 0.
             .header("x-forwarded-for", "junk, more-junk")
             .body(())
             .unwrap();
@@ -1209,9 +1161,8 @@ mod tests {
 
     #[test]
     fn split_xff_lines_resolve_exactly_like_one_joined_line() {
-        // Regression guard for the borrowed single-line fast path: whatever
-        // the trust mode, a chain split over several lines must resolve the
-        // same addr, host and scheme as the same chain sent on one line.
+        // Guards the borrowed single-line path: in every trust mode, a chain split over several
+        // lines resolves exactly like the same chain on one line.
         let configs = [
             TrustedProxiesConfig {
                 ranges: Vec::new(),

@@ -46,8 +46,7 @@
 //! }
 //! ```
 
-// Replay-time module (offline replays and generated regression tests, never
-// the serving path).
+// Replay-time code (offline replays and generated regression tests), never the serving path.
 #![cfg_attr(
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing,)
@@ -80,8 +79,6 @@ pub struct RegressionCase {
 pub struct RegressionContext<'a> {
     capsule: &'a Capsule,
     fixtures: &'a ReplayFixtures,
-    // Read only by `db_pool`, which is feature-gated; a `--no-default-features`
-    // build has no reader for it.
     #[cfg_attr(
         not(all(feature = "db", not(feature = "sqlite"))),
         allow(dead_code, reason = "only `db_pool` reads it, and that is gated")
@@ -204,9 +201,8 @@ impl RegressionCase {
         if let Some(reason) = crate::capsule::refusal_reason(&self.capsule) {
             panic!("capsule {} cannot be replayed: {reason}", self.capsule.id);
         }
-        // A job capsule has no request to drive; putting one through a router
-        // would 404 and report a `mismatch`, which the guide tells operators to
-        // read as "the bug is gone".
+        // A job capsule has no request to drive. Through a router it would 404 and report a
+        // `mismatch`, which operators read as "the bug is gone".
         assert!(
             self.capsule.job.is_none(),
             "capsule {} records a failure inside job {:?}, not a request, so it cannot be \

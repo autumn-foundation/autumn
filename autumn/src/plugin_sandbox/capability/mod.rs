@@ -90,8 +90,7 @@ pub use audit::{
     ActivitySummary, CapabilityEvent, CapabilityOutcome, DroppedCalls, MAX_LOG_EVENTS,
     PluginActivityLog,
 };
-// Aliased for use *inside* this module only, so the `pub use` above can carry
-// the real names without shadowing itself.
+// Short aliases for use inside this module; the `pub use` above exports the real names.
 use audit::{CapabilityEvent as Event, CapabilityOutcome as Outcome};
 pub use db::{MemoryPluginStore, PluginStore, QueryPage, Scope, StoreError};
 pub use jobs::MemoryJobSink;
@@ -262,12 +261,9 @@ where
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
             let mut out = Vec::new();
-            // Read, then charge -- not the other way round. Charging first
-            // meant the probe that discovers the *end* of the sequence was
-            // itself charged, so a vector holding exactly the budget was
-            // refused for being one over it. An element's own children are
-            // charged as they are read, inside this same call, so the tree is
-            // still bounded while it is built rather than after.
+            // Read, then charge: charging first would count the probe that finds the end of the
+            // sequence, refusing a vector of exactly the budget. Children are charged as they
+            // are read, so the tree is bounded while it is built.
             while let Some(node) = seq.next_element()? {
                 let spent = FRAGMENT_NODE_BUDGET.with(|budget| {
                     let left = budget.get();
@@ -328,8 +324,7 @@ where
         }
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            // `size_hint` is a hint from the input and not to be trusted with an
-            // allocation, so it is clamped to what will be accepted anyway.
+            // `size_hint` comes from untrusted input, so clamp it before allocating.
             let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(LIMIT));
             while let Some(item) = seq.next_element()? {
                 if out.len() >= LIMIT {
@@ -374,26 +369,16 @@ where
         }
 
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            // One over the column ceiling, deliberately. `db-get` hands the row
-            // back with the host's `row_id` on it, and the documented
-            // read-modify-write is to change a field and send that map to
-            // `db-update` — so a row stored at exactly `MAX_ROW_COLUMNS`
-            // arrives here with 33 entries. Refusing it *here* would fail the
-            // whole frame as malformed before `validated_row` could strip the
-            // column the host itself added, which is the bug this subsystem
-            // already fixed once at the dispatch layer and this parse bound
-            // reintroduced one layer earlier.
-            //
-            // The real limit is still enforced, after stripping, by
-            // `validated_row`. This is only a bound on what is *allocated*, and
-            // thirty-three entries bounds it exactly as well as thirty-two.
+            // One over the column ceiling on purpose. `db-get` returns the row with the host's
+            // `row_id` added, and read-modify-write sends that map to `db-update`, so a row
+            // stored at exactly `MAX_ROW_COLUMNS` arrives with one more entry. `validated_row`
+            // strips `row_id` and enforces the real limit; this only bounds allocation.
             const PARSE_CEILING: usize = MAX_ROW_COLUMNS + 1;
 
             let mut out = PluginRow::new();
             while let Some((column, value)) = map.next_entry::<String, PluginValue>()? {
-                // Counted on the map, not on entries read: a frame repeating one
-                // column name collapses to a single entry, and refusing it for
-                // its *reads* would reject a legal row written wastefully.
+                // Count distinct columns, not entries read: a repeated column name collapses to
+                // one entry and must not push a legal row over the ceiling.
                 if out.len() >= PARSE_CEILING && !out.contains_key(&column) {
                     return Err(A::Error::custom(format!(
                         "more than {PARSE_CEILING} columns"
@@ -442,8 +427,7 @@ pub fn encoded_text_len(text: &str) -> usize {
 ///
 /// Counted rather than formatted: `weight` runs per value on the write path.
 const fn decimal_len(value: i64) -> usize {
-    // `i64::MIN` has no positive counterpart, so it cannot be negated to be
-    // counted. It is also the longest, which makes the special case the answer.
+    // `i64::MIN` cannot be negated; it is also the longest value at 20 characters.
     if value == i64::MIN {
         return 20;
     }
@@ -470,21 +454,12 @@ impl PluginValue {
     pub fn weight(&self) -> usize {
         match self {
             Self::Text(text) => encoded_text_len(text),
-            // Measured, not assumed. A flat eight bytes for every scalar was
-            // wrong in the direction that matters: `i64::MIN` encodes as
-            // twenty, so a `kv_value_bytes` of eight admitted a value the
-            // operator's ceiling forbade — on the way in *and* on the way back
-            // out, since reads are checked against the same number.
-            // `null` and `true` are both four characters; `false` is five.
+            // Measured per value: a flat size would under-count `i64::MIN` (20 characters).
             Self::Null | Self::Bool(true) => 4,
             Self::Bool(false) => 5,
             Self::Int(value) => decimal_len(*value),
-            // A bound rather than a measurement, and deliberately: the shortest
-            // round-trip form of an `f64` is at most twenty-four characters
-            // (`-2.2250738585072014e-308`), so this can never *under*-count,
-            // which is the only direction a ceiling may not be wrong in.
-            // Formatting one to find out would allocate on a path that runs per
-            // value.
+            // An upper bound: the shortest round-trip `f64` form is at most 24 characters
+            // (`-2.2250738585072014e-308`). Formatting to measure would allocate per value.
             Self::Float(_) => 24,
         }
     }
@@ -607,12 +582,10 @@ pub fn bounded_rows(rows: Vec<PluginRow>) -> (Vec<PluginRow>, bool) {
     let mut total = 0_usize;
     let mut truncated = false;
     for row in rows {
-        // JSON syntax counts too. Else many narrow rows exceed the reply room.
+        // Count JSON framing too, or many narrow rows overrun the reply.
         let weight = row_weight(&row).saturating_add(row_framing(&row));
-        // No "but keep the first one" exemption. Letting an empty `kept` skip
-        // the ceiling meant one corrupt or oversized row from an embedder's
-        // store was serialized in full — and a single row can be arbitrarily
-        // large when it did not come through `check_row`.
+        // The first row gets no exemption: a row from an embedder's store never passed
+        // `check_row` and can be arbitrarily large.
         if total.saturating_add(weight) > MAX_RESULT_BYTES {
             truncated = true;
             break;
@@ -812,12 +785,9 @@ impl CapabilityCall {
             Self::KvGet { key, .. } | Self::KvSet { key, .. } | Self::KvDelete { key, .. } => {
                 key.clone()
             }
-            // The *authority* it reached for, even when `host_of` refuses the
-            // URL — because the refusals are the interesting ones. Recording a
-            // placeholder would put every userinfo, backslash and scheme-
-            // confusion attempt under one label, so `attacker.test` in
-            // `https://api.example.com@attacker.test/` would never appear in the
-            // one surface built to show what a plugin reached for.
+            // Record the attempted authority even when `host_of` refuses the URL, so a
+            // userinfo trick like `https://api.example.com@attacker.test/` shows `attacker.test`
+            // in the audit surface instead of a placeholder.
             Self::HttpFetch { url, .. } => {
                 outbound::host_of(url).unwrap_or_else(|| outbound::attempted_authority(url))
             }
@@ -854,7 +824,6 @@ impl CapabilityCall {
             Self::KvGet { .. } => kv_value_bytes.saturating_add(4096),
             Self::DbGet { .. } => MAX_RESULT_BYTES + ROW_FRAMING + 4096,
             Self::DbQuery { limit, .. } => {
-                // The page the call can return: its own limit, within the quota.
                 let asked = *limit as usize;
                 let rows = if asked == 0 || asked > db_rows {
                     db_rows
@@ -864,7 +833,7 @@ impl CapabilityCall {
                 let reserve = MAX_RESULT_BYTES
                     .saturating_add(rows.saturating_mul(ROW_FRAMING))
                     .saturating_add(4096);
-                // Never more than the reply queue holds, or no query could run.
+                // Cap at the reply queue's size, or no query could ever be admitted.
                 if reserve > super::host::MAX_QUEUED_REPLY_BYTES {
                     super::host::MAX_QUEUED_REPLY_BYTES
                 } else {
@@ -1070,8 +1039,8 @@ impl CallResult {
         Self::Denied {
             id,
             reason,
-            // Escaped as well as bounded: this reaches a `tracing` line and the
-            // rendered operator summary, which a terminal interprets.
+            // Escaped as well as bounded: it reaches a `tracing` line and the operator summary,
+            // which a terminal interprets.
             detail: super::manifest::rejected(&kept),
         }
     }
@@ -1423,9 +1392,8 @@ impl CapabilityRuntime {
         let reserve =
             call.reply_reserve_for(quotas.kv_value_bytes as usize, quotas.db_rows as usize);
         match call {
-            // The body is at most `outbound_response_bytes`, and one byte
-            // escapes to at most six. Smaller than `MAX_RESULT_BYTES` when the
-            // plugin asks for small replies.
+            // The body is at most `outbound_response_bytes`, and one byte escapes to at most
+            // six, so a plugin with a small quota reserves less than `MAX_RESULT_BYTES`.
             CapabilityCall::HttpFetch { .. } => {
                 let body = (quotas.outbound_response_bytes as usize).saturating_mul(6);
                 reserve.saturating_sub(MAX_RESULT_BYTES.saturating_sub(body))
@@ -1472,27 +1440,16 @@ impl CapabilityRuntime {
     ) -> CallResult {
         let id = call.id();
         let capability = call.capability();
-        // What the call *names*, computed before any check, so every refusal
-        // records what was reached for rather than a dash. The operator surface
-        // is built from these, and "this plugin tried to read `users`" is the
-        // half of the answer a validated-target-only ledger would drop.
-        //
-        // Bounded on the way in: `record` truncates and neutralises it, because
-        // a KV key is a guest-chosen string that ends up in a log line and in
-        // the rendered summary.
+        // Computed before any check so every refusal records what the call reached for.
+        // `record` truncates and neutralises it: a KV key is guest-chosen and reaches logs.
         let named = call.target_excerpt();
 
-        // The shared `calls` budget is charged first, for every dispatch —
-        // including one that is about to be refused. A refusal is cheaper than
-        // a call but it is not free: it costs a grant scan, an encoded reply, a
-        // ledger entry and a log line, and leaving refusals unmetered let a
-        // plugin with a generous fuel budget emit ~10^5 warn lines per request
-        // against a `calls` quota of 128. Fuel alone is the wrong ceiling for
-        // work whose cost is a log write.
+        // Charge the shared `calls` budget first, even for calls about to be refused: a
+        // refusal still costs a grant scan, a reply, a ledger entry and a log line, and fuel
+        // alone would let a plugin emit thousands of warnings per request.
         //
-        // The *per-capability* counters stay where they are, below, so a call
-        // refused before it could reach a backend does not spend the budget
-        // that bounds backend work.
+        // Per-capability counters are charged below, so a call refused before reaching a
+        // backend does not spend the budget that bounds backend work.
         if let Err(field) = self.quotas.charge_call() {
             return self.record(
                 call,
@@ -1505,9 +1462,8 @@ impl CapabilityRuntime {
             );
         }
 
-        // Then the capability, before the scope: a plugin that was never
-        // granted `db` must learn *that*, not that some table is not in a list
-        // it does not have.
+        // Capability before scope: a plugin never granted `db` should learn that, not that a
+        // table is missing from a list it does not have.
         if !self.is_granted(capability) {
             return self.record(
                 call,
@@ -1520,17 +1476,15 @@ impl CapabilityRuntime {
             );
         }
 
-        // Scope before the per-capability charge: an out-of-scope target never
-        // reaches a backend, so spending the budget that bounds backend work on
-        // it would let one manifest mistake starve the calls the plugin is
-        // entitled to make.
+        // Scope before the per-capability charge: an out-of-scope target never reaches a
+        // backend, so charging it would let one manifest mistake starve legitimate calls.
         let target = match self.target_of(call) {
             Ok(target) => target,
             Err(result) => return self.record(call, &named, result),
         };
 
-        // Room for the answer, before anything is charged or committed: once a
-        // write has happened its reply can no longer be refused.
+        // Check reply room before anything is charged or committed: once a write has
+        // happened its reply can no longer be refused.
         let reserve = self.reply_reserve(call);
         if reply_room < reserve {
             return self.record(
@@ -1557,10 +1511,8 @@ impl CapabilityRuntime {
             );
         }
 
-        // Shape before the per-capability charge, for the same reason: a call
-        // refused for its own malformed content never reaches a backend, and
-        // charging `db_writes` for it would deny a valid call that follows.
-        // The shared `calls` budget was already charged above.
+        // Shape before the per-capability charge, for the same reason: a malformed call never
+        // reaches a backend, and charging `db_writes` for it would deny a valid call after it.
         if let Err(result) = self.validate(call) {
             return self.record(call, &target, result);
         }
@@ -1577,10 +1529,8 @@ impl CapabilityRuntime {
             );
         }
 
-        // The rate ceiling last of the three, and after the per-request charge:
-        // it is the only one that depends on what *other* requests did, so a
-        // plugin reading its denials sees "I asked too much" before "everyone
-        // asked too much at once", which is the order the two are fixable in.
+        // Rate ceiling last: it is the only check that depends on other requests, so a plugin
+        // sees its own over-use before contention it cannot fix alone.
         if self
             .rate
             .as_ref()
@@ -1613,10 +1563,8 @@ impl CapabilityRuntime {
             CapabilityCall::KvGet { key, .. }
             | CapabilityCall::KvSet { key, .. }
             | CapabilityCall::KvDelete { key, .. } => {
-                // The one identifier a guest chooses freely, so it is the one
-                // with a shape rule of its own. Control characters are refused
-                // because the key is printed in the audit surface an operator
-                // reads.
+                // The one identifier a guest chooses freely, so it gets its own shape rule.
+                // Control characters are refused because the key is printed in the audit surface.
                 if key.is_empty() || key.len() > MAX_KV_KEY_BYTES {
                     return Err(CallResult::denied(
                         id,
@@ -1715,13 +1663,9 @@ impl CapabilityRuntime {
     /// Every exit from `dispatch` goes through here, so there is no path that
     /// answers the guest without also telling the operator.
     fn record(&mut self, call: &CapabilityCall, target: &str, result: CallResult) -> CallResult {
-        // Bounded and neutralised once, here, rather than at each of the six
-        // exits. A KV key is the one identifier a guest chooses freely, a table
-        // or job type is bounded only by the wire, and from here both go into a
-        // `tracing` line and the rendered operator summary — which a terminal
-        // renders. `MAX_TARGET_CHARS` is far below what `rejected` would allow,
-        // because a ledger this deep with 512-character entries is megabytes the
-        // footprint never budgeted.
+        // Bounded and neutralised once for every exit: guest-chosen names reach a `tracing`
+        // line and the operator summary, which a terminal renders. `MAX_TARGET_CHARS` is far
+        // below what `rejected` allows, to keep the ledger's memory small.
         let target = super::manifest::rejected(&bounded_target(target));
         let outcome = match result.denial() {
             None => Outcome::Allowed,
@@ -1741,15 +1685,9 @@ impl CapabilityRuntime {
             .iter()
             .any(|(operation, seen)| *operation == call.operation() && *seen == outcome)
         {
-            // Already said, this request. Deduplicated by `(operation,
-            // outcome)` exactly as `HostState::deny` deduplicates a refused
-            // import, and for the same reason: a guest that calls in a loop
-            // must not be able to turn the evidence of it into the operator's
-            // log-storage problem. The ledger below still counts every one, so
-            // nothing is lost — only repeated.
+            // Already warned this request. Deduplicated by `(operation, outcome)` so a guest
+            // calling in a loop cannot flood the logs; the ledger below still counts each one.
         } else {
-            // Denials are warned, once, at the point they happen — whoever is
-            // driving the host should not have to remember to log it.
             tracing::warn!(
                 plugin = self.plugin,
                 capability = call.capability().as_str(),
@@ -1758,8 +1696,7 @@ impl CapabilityRuntime {
                 outcome = %outcome,
                 "sandboxed plugin was refused a capability call"
             );
-            // Bounded by the vocabulary: at most one entry per (operation,
-            // outcome) pair, and both sets are closed.
+            // At most one entry per (operation, outcome) pair, and both sets are closed.
             if self.warned.len() < MAX_WARNED {
                 self.warned.push((call.operation(), outcome));
             }
@@ -1774,15 +1711,11 @@ impl CapabilityRuntime {
                 at,
             });
         } else {
-            // Counted rather than dropped silently. The ledger is bounded
-            // because a guest chooses how many entries it makes, but an
-            // operator reading "12 db-inserts" off a truncated ledger would be
-            // reading a number the plugin chose. `MAX_EVENTS` is not
-            // unreachable: the quotas that would bound it live in the plugin's
-            // own manifest, so the plugin sets them.
+            // Count what the bounded ledger drops, so an operator never reads a truncated count
+            // as the total. The plugin's own quotas can make this reachable.
             //
-            // Keep the time too. The log ingests the request when it ends. A
-            // slow request must not make an old drop look recent (#2523).
+            // Keep the times too: the log ingests the request when it ends, and a slow request
+            // must not make an old drop look recent (#2523).
             self.dropped = Some(self.dropped.map_or(
                 DroppedCalls {
                     count: 1,
@@ -1958,8 +1891,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_stored_row_over_the_row_ceiling_is_not_served() {
-        // Between `MAX_ROW_BYTES` and `MAX_RESULT_BYTES`: `bounded_rows` let it
-        // through although the host would refuse the same row on insert.
+        // Between `MAX_ROW_BYTES` and `MAX_RESULT_BYTES`: `bounded_rows` alone would pass it,
+        // although the host refuses the same row on insert.
         let mut fat = row(&[("row_id", "r1")]);
         for column in 0..5 {
             fat.insert(
@@ -2072,8 +2005,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_call_refused_for_its_shape_spends_no_backend_quota() {
-        // Default `db_writes` is 32 and `calls` is 128: 40 malformed inserts
-        // would have spent the first and denied the valid one that follows.
+        // Default `db_writes` is 32 and `calls` is 128: if malformed inserts were charged,
+        // 40 of them would deny the valid one that follows.
         let mut fixture = fixture(&everything(), Some("alpha"));
         let fat: PluginRow = (0..=MAX_ROW_COLUMNS)
             .map(|index| (format!("c{index}"), PluginValue::Int(1)))
@@ -2141,7 +2074,8 @@ path = "/shop/panel"
     #[test]
     fn a_row_exactly_at_the_ceiling_is_served_and_one_byte_over_is_not() {
         let at_ceiling = |extra: usize| {
-            // 3 names ("c0".."c2", "row_id" excluded from the count) + values.
+            // Names and values of "c0".."c3" sum to `MAX_ROW_BYTES + extra`; `row_id` is not
+            // counted.
             let mut stored = row(&[("row_id", "r1")]);
             let mut left = MAX_ROW_BYTES + extra;
             for column in 0..4 {
@@ -2253,7 +2187,7 @@ path = "/shop/panel"
             });
             assert_eq!(result.denial(), Some(DenialReason::QuotaExceeded));
         }
-        // 40 refusals, `kv_writes` is 32: a valid write still succeeds.
+        // 40 refusals against a `kv_writes` of 32: a valid write still succeeds.
         let ok = fixture.runtime.dispatch(&CapabilityCall::KvSet {
             id: 2,
             key: "cart".to_owned(),
@@ -2284,8 +2218,7 @@ path = "/shop/panel"
 
     #[test]
     fn a_refusal_records_what_was_reached_for_not_a_dash() {
-        // "What did this plugin do" includes what it *tried* to do. A ledger
-        // that named only the targets that passed would answer the easy half.
+        // The ledger names what a refused call tried to reach, not only targets that passed.
         let mut granted = fixture(&everything(), Some("alpha"));
         let _ = granted.runtime.dispatch(&CapabilityCall::HttpFetch {
             id: 1,
@@ -2314,8 +2247,7 @@ path = "/shop/panel"
             .collect();
         assert_eq!(targets, vec!["attacker.test", "users", "drain-accounts"]);
 
-        // And it is neutralised on the way in: the one identifier a guest
-        // chooses freely ends up in a log line and in the operator summary.
+        // A guest-chosen key is neutralised before it reaches logs and the operator summary.
         let mut hostile = fixture(&[SandboxCapability::HttpRequest], None);
         let _ = hostile.runtime.dispatch(&CapabilityCall::KvGet {
             id: 4,
@@ -2332,9 +2264,8 @@ path = "/shop/panel"
 
     #[test]
     fn an_ungranted_call_cannot_spend_the_shared_call_budget() {
-        // The order of the checks is load-bearing: if a call to an ungranted
-        // capability charged the shared `calls` quota first, a plugin could be
-        // starved of the surface it *was* granted by one it was not.
+        // `dispatch_checked` charges the shared `calls` budget even for ungranted calls, but
+        // that budget belongs to one runtime (one request).
         let mut ungranted = fixture(&[SandboxCapability::HttpRequest], None);
         for id in 0..1_000 {
             let _ = ungranted.runtime.dispatch(&CapabilityCall::KvGet {
@@ -2342,8 +2273,7 @@ path = "/shop/panel"
                 key: "cart".to_owned(),
             });
         }
-        // The ledger is bounded, but nothing was ever charged: a granted call
-        // on a fresh runtime with the same quotas still succeeds.
+        // A fresh runtime with the same quotas starts with a full budget.
         let mut granted = fixture(&everything(), None);
         assert!(
             granted
@@ -2379,10 +2309,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_kv_backend_outage_reaches_the_guest_as_a_failure_not_a_miss() {
-        // `found: false` is an answer about the *data*; an outage is an answer
-        // about the *backend*. Collapsing the second into the first tells a
-        // plugin its cart is empty when the truth is that nobody could look,
-        // and the audit ledger then records a read that never happened.
+        // `found: false` describes the data; an outage describes the backend. Reporting an
+        // outage as a miss tells the plugin its cart is empty when nobody could look.
         let manifest = manifest(&everything());
         let mut runtime = CapabilityRuntime::new(
             &manifest,
@@ -2409,8 +2337,8 @@ path = "/shop/panel"
             "an unreachable store must deny, not report an absent key: {result:?}"
         );
 
-        // And a delete that did not happen must not read as `Done` either: a
-        // plugin releasing a lock would carry on over a value still there.
+        // A delete that did not happen must not read as `Done`: a plugin releasing a lock
+        // would carry on over a value still there.
         let result = runtime.dispatch(&CapabilityCall::KvDelete {
             id: 2,
             key: "cart".to_owned(),
@@ -2430,15 +2358,9 @@ path = "/shop/panel"
 
     #[test]
     fn an_overlong_outbound_method_is_refused_without_being_copied() {
-        // The method was `to_ascii_uppercase`d before anything decided it was
-        // a method, so a frame carrying a megabyte of "method" was copied for
-        // the fold and again for the denial — ahead of the check that refuses
-        // it, and outside `outbound_request_bytes`, which is measured later
-        // and does not count the method. The match is now allocation-free and
-        // length-first, so this is refused in constant time.
-        // A client has to be wired, or the call is refused as `Unavailable`
-        // before the method is looked at — which would have made this test pass
-        // for the wrong reason. It caught exactly that on its first run.
+        // `outbound_request_bytes` does not count the method, so a megabyte "method" must be
+        // refused without being copied. A client is wired so the call is not refused as
+        // `Unavailable` before the method is examined.
         let manifest = manifest(&everything());
         let http = RecordingHttp::new();
         let mut runtime = CapabilityRuntime::new(
@@ -2469,7 +2391,7 @@ path = "/shop/panel"
             "an overlong method is not a method: {result:?}"
         );
 
-        // And the match stays case-insensitive, which is what the fold was for.
+        // The method match is still case-insensitive.
         let lowercase = runtime.dispatch(&CapabilityCall::HttpFetch {
             id: 2,
             method: "post".to_owned(),
@@ -2528,9 +2450,8 @@ path = "/shop/panel"
 
     #[test]
     fn no_tenant_key_can_be_spelled_to_reach_another_tenants_namespace() {
-        // The escape a naive `format!("{plugin}:{tenant}:{key}")` would allow:
-        // tenant `a` asking for the key `b:cart` lands where tenant `b` writes
-        // `cart`. Both segments are escaped, so the two keys stay distinct.
+        // With a naive `format!("{plugin}:{tenant}:{key}")`, tenant `a` asking for key `b:cart`
+        // would land where tenant `b` writes `cart`. Both segments are escaped.
         let store = MemoryKvStore::new();
         let manifest = manifest(&everything());
         let services = |tenant: &str| {
@@ -2568,8 +2489,7 @@ path = "/shop/panel"
 
     #[test]
     fn a_tenant_id_carrying_the_separator_cannot_collide_with_another() {
-        // Tenant ids are the application's, not the manifest's: they come from
-        // a header or a subdomain, and nothing validates their charset.
+        // Tenant ids come from the application (a header or subdomain) with no charset rule.
         assert_ne!(
             kv::namespaced_key("shop", Some("b%3Ax"), "k"),
             kv::namespaced_key("shop", Some("b"), "%3Ax:k")
@@ -2590,12 +2510,8 @@ path = "/shop/panel"
 
     #[test]
     fn no_tenant_is_not_a_tenant_that_could_be_named() {
-        // A tenant id has no charset restriction, so the single-tenant sentinel
-        // must be a segment no tenant could also be. It used to be `_`, which a
-        // deployment can name a tenant — and then that tenant shared a
-        // namespace with every request that arrived without one, reachable in a
-        // tenancy migration or with the router mounted outside the tenancy
-        // middleware.
+        // A tenant id has no charset restriction, so the single-tenant sentinel must be a
+        // segment no tenant can produce; otherwise that tenant shares the no-tenant namespace.
         for spelling in [NO_TENANT, "_", "", "-", "t", "t-"] {
             assert_ne!(
                 tenant_segment(Some(spelling)),
@@ -2608,17 +2524,13 @@ path = "/shop/panel"
                 "{spelling:?}"
             );
         }
-        // And distinct tenants stay distinct, which is the property the marker
-        // must not have broken.
         assert_ne!(tenant_segment(Some("a")), tenant_segment(Some("b")));
     }
 
     #[test]
     fn a_stored_value_over_the_current_ceiling_is_refused_on_the_way_out() {
-        // Lowering `kv_value_bytes` is meant to reduce authority, but the store
-        // keeps what the old ceiling allowed. Serving it anyway would make the
-        // tightened quota cosmetic, and a large enough value would overrun the
-        // reply queue and fail the request rather than being refused.
+        // The store keeps values an older, larger `kv_value_bytes` allowed. Serving them would
+        // make a tightened quota cosmetic and could overrun the reply queue.
         let kv = MemoryKvStore::new();
         let manifest = manifest(&everything());
         let key = kv::namespaced_key(&manifest.name, Some("alpha"), "cart");
@@ -2648,11 +2560,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_query_filter_may_not_carry_the_row_id_that_would_widen_it() {
-        // `validated_row` strips `row_id` on a write, which is right: a row read
-        // back carries its id and echoing it means nothing. On a *filter* the
-        // same strip turns "the row with this id" into "every row this tenant
-        // has" — narrowing that silently widens, which is the one direction a
-        // containment bug can go and still look like it worked.
+        // `validated_row` strips `row_id` on a write. Stripping it from a filter would turn
+        // "the row with this id" into "every row this tenant has", so a filter refuses it.
         let mut fixture = fixture(&everything(), Some("alpha"));
         for sku in ["A-1", "A-2", "A-3"] {
             let inserted = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
@@ -2674,9 +2583,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_truncated_page_can_be_continued_from_where_it_stopped() {
-        // A ceiling the guest is told about and cannot act on is worse than no
-        // ceiling: `truncated` would say "there is more" while the same filter
-        // returned the same prefix forever.
+        // `truncated` is only useful if the guest can continue: without a cursor the same
+        // filter would return the same prefix forever.
         let mut fixture = fixture(&everything(), Some("alpha"));
         for sku in ["A-1", "A-2", "A-3", "A-4"] {
             let inserted = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
@@ -2714,8 +2622,7 @@ path = "/shop/panel"
             .expect("every returned row carries its id");
         let second = page(&mut fixture.runtime, Some(last));
         assert_eq!(second.len(), 2, "{second:?}");
-        // Disjoint, which is the whole property: a cursor that returned the
-        // same rows again would page forever without advancing.
+        // Disjoint pages: a cursor returning the same rows would never advance.
         for row in &second {
             assert!(!first.contains(row), "{row:?} came back twice");
         }
@@ -2723,12 +2630,9 @@ path = "/shop/panel"
 
     #[test]
     fn a_row_at_the_column_ceiling_survives_a_read_modify_write() {
-        // The documented pattern: read a row, change a field, send it back. The
-        // row comes back carrying the `row_id` the host added, so a row stored
-        // at exactly `MAX_ROW_COLUMNS` arrived at `db-update` with one column
-        // too many — refused for a column the guest never wrote. The ceilings
-        // must be a function of what the plugin stored, not of where the row
-        // had been.
+        // Read a row, change a field, send it back. The row carries the host-added `row_id`,
+        // so a row stored at exactly `MAX_ROW_COLUMNS` reaches `db-update` with one extra
+        // column, which must not count against the ceiling.
         let mut fixture = fixture(&everything(), Some("alpha"));
         let full: PluginRow = (0..MAX_ROW_COLUMNS)
             .map(|index| {
@@ -2787,11 +2691,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_page_cut_by_the_row_quota_says_so_too() {
-        // `truncated` is the guest's only signal that more rows exist. A page
-        // cut by `db_rows` looked complete, and with `limit: 0` the guest is
-        // never told the quota — so a full page and a finished table were
-        // indistinguishable, and the cursor documented for continuing was never
-        // reached.
+        // `truncated` is the guest's only signal that more rows exist. With `limit: 0` the guest
+        // never sees the `db_rows` quota, so a page it cut must say so.
         let base = manifest(&everything());
         let mut quotas = base.quotas;
         quotas.db_rows = 2;
@@ -2834,14 +2735,9 @@ path = "/shop/panel"
 
     #[test]
     fn a_read_modify_write_echo_still_parses_at_the_column_ceiling() {
-        // The round-trip this asserts was already fixed once, at the dispatch
-        // layer, and the parse-time column bound reintroduced it one layer
-        // earlier — where the existing test could not see it, because that one
-        // builds a `CapabilityCall` directly instead of parsing a frame.
-        //
-        // `db-get` returns the row plus the host's `row_id`, so a row stored at
-        // exactly `MAX_ROW_COLUMNS` comes back with one more entry than a row
-        // may have, and sending it to `db-update` is the documented workflow.
+        // Parses a frame rather than building a `CapabilityCall`, so the parse-time column
+        // bound is exercised. `db-get` returns the row plus the host's `row_id`, so a row
+        // stored at exactly `MAX_ROW_COLUMNS` comes back with one extra entry.
         let columns = (0..MAX_ROW_COLUMNS)
             .map(|index| format!(r#""c{index}":"v""#))
             .chain(std::iter::once(r#""row_id":"r1""#.to_owned()))
@@ -2856,7 +2752,7 @@ path = "/shop/panel"
             "the echo of a full row must survive parsing: {parsed:?}"
         );
 
-        // And one genuine column past the ceiling is still refused while read.
+        // One genuine column past the ceiling is still refused while read.
         let columns = (0..=MAX_ROW_COLUMNS)
             .map(|index| format!(r#""c{index}":"v""#))
             .chain(std::iter::once(r#""row_id":"r1""#.to_owned()))
@@ -2873,9 +2769,8 @@ path = "/shop/panel"
 
     #[test]
     fn the_root_of_a_fragment_is_bounded_like_its_branches() {
-        // The branches were bounded first and the root was left open, which
-        // made bounding the branches pointless: `render` applies `MAX_NODES` to
-        // a tree serde has already built, and the host then clones it.
+        // An unbounded root would make bounding the branches pointless: `render` applies
+        // `MAX_NODES` only to a tree serde has already built.
         let nodes = (0..=render::MAX_NODES)
             .map(|_| r#"{"node":"text","text":""}"#)
             .collect::<Vec<_>>()
@@ -2899,11 +2794,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_guest_collection_is_refused_while_it_is_read_not_after() {
-        // The distinction this asserts is invisible from the outside if you
-        // only check that an oversized frame is refused: the *old* code also
-        // refused it, having first allocated the whole thing. What is being
-        // tested is that the refusal comes from the parser, so nothing larger
-        // than the ceiling is ever held.
+        // The refusal must come from the parser, so nothing larger than the ceiling is ever
+        // held; a later check would also refuse the frame, but only after allocating it.
         let pairs = (0..=MAX_OUTBOUND_HEADERS)
             .map(|_| r#"["",""]"#)
             .collect::<Vec<_>>()
@@ -2918,8 +2810,7 @@ path = "/shop/panel"
             "the parser should say why: {err}"
         );
 
-        // And exactly at the ceiling still parses, so the bound is not off by
-        // one in the direction that breaks a legal call.
+        // Exactly at the ceiling still parses.
         let pairs = (0..MAX_OUTBOUND_HEADERS)
             .map(|_| r#"["a","b"]"#)
             .collect::<Vec<_>>()
@@ -3008,10 +2899,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_redirect_off_the_granted_host_is_refused_after_the_fact() {
-        // Checking the URL the guest wrote bounds the first hop and nothing
-        // else. A client that follows redirects — which most do by default —
-        // would otherwise send the body to a host the manifest never named and
-        // record one allowed call to the granted one.
+        // Checking the guest's URL bounds only the first hop. A client following redirects
+        // would otherwise send the body to an ungranted host and record an allowed call.
         let mut fixture = fixture(&everything(), Some("alpha"));
         fixture
             .http
@@ -3029,8 +2918,7 @@ path = "/shop/panel"
             "{result:?}"
         );
 
-        // …and the operator sees where it ended up, not just that something
-        // was refused.
+        // The refused hop is recorded in the audit ledger.
         let events = fixture.runtime.events();
         assert!(
             events
@@ -3069,9 +2957,8 @@ path = "/shop/panel"
 
     #[test]
     fn an_upstream_that_answered_counts_as_a_host_that_was_called() {
-        // A response discarded for being over a byte ceiling still *left the
-        // host*. Filing it under "refused" would make the audit surface
-        // undercount exactly the calls an operator most wants to see.
+        // A response discarded for size still means the request left the host, so the audit
+        // surface counts the host as called, not refused.
         let mut manifest = manifest(&everything());
         manifest.quotas.outbound_response_bytes = 4;
         let http = RecordingHttp::new();
@@ -3104,7 +2991,7 @@ path = "/shop/panel"
 
     #[test]
     fn the_same_host_on_another_port_is_the_granted_host() {
-        // The grant is about where the bytes go, and the name decides that.
+        // A grant names a host; the port does not change where the bytes go.
         assert_eq!(
             outbound::host_of("https://api.example.com:8443/v1"),
             Some("api.example.com".to_owned())
@@ -3150,10 +3037,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_row_no_reply_could_carry_is_refused_where_it_goes_in() {
-        // `MAX_VALUE_TEXT_BYTES` bounds one column and 32 of them bounds a row
-        // at 2 MiB — twice what one reply may be. Accepting such a row would
-        // store something `db-get` could never hand back, so the ceiling that
-        // makes a read answerable belongs on the write.
+        // Per-column limits alone allow a row larger than one reply, which `db-get` could never
+        // hand back, so `MAX_ROW_BYTES` is enforced on the write.
         let mut fixture = fixture(&everything(), Some("alpha"));
         let fat: PluginRow = (0..8)
             .map(|index| {
@@ -3178,19 +3063,13 @@ path = "/shop/panel"
 
     #[test]
     fn a_query_is_bounded_by_bytes_and_says_when_it_was_cut() {
-        // The finding: `db_rows` defaults to 500 and a row may be
-        // `MAX_ROW_BYTES`, so a granted plugin could make the host materialise,
-        // encode and hold a hundred megabytes per request against a quota its
-        // own manifest sets. The budget now reaches the store, and the guest is
-        // told its answer was cut rather than reading a short page as the end
-        // of the table.
+        // `db_rows` (500 by default) times `MAX_ROW_BYTES` is over a hundred megabytes per
+        // request, so the byte budget reaches the store and the guest is told the page was cut.
         let mut fixture = fixture(&everything(), Some("alpha"));
         let wide = "x".repeat(MAX_VALUE_TEXT_BYTES);
         for index in 0..16 {
             let mut row = row(&[("kind", "wide")]);
-            // Three, not four: four maxed-out columns plus the names is over
-            // `MAX_ROW_BYTES`, and a row that cannot be stored cannot
-            // demonstrate an answer that is too big to return.
+            // Three columns: four maxed-out ones exceed `MAX_ROW_BYTES` and could not be stored.
             for column in 0..3 {
                 row.insert(format!("c{column}"), PluginValue::Text(wide.clone()));
             }
@@ -3228,11 +3107,8 @@ path = "/shop/panel"
 
     #[test]
     fn an_upstream_cannot_answer_with_unbounded_headers() {
-        // The allow-list says which response headers come back and nothing
-        // about their size, and every one of them is the *upstream's* choice
-        // rather than the plugin's or the host's. A legal body plus megabytes
-        // of `etag` is an oversized allocation the host makes and then fails
-        // the plugin's request over.
+        // The allow-list limits which response headers come back, not their size, and the
+        // upstream chooses them. Megabytes of `etag` must not reach the reply.
         let mut fixture = fixture(&everything(), Some("alpha"));
         let mut answer = OutboundResponse::from_url("https://api.example.com/", 200, "ok");
         answer.headers = (0..64)
@@ -3267,11 +3143,8 @@ path = "/shop/panel"
 
     #[test]
     fn an_outbound_request_body_is_bounded_like_the_response_is() {
-        // The quota table bounded what an upstream may *return* and said nothing
-        // about what the plugin may *send*. A body is guest-chosen, so its only
-        // bound was the stdout frame it arrived in — megabytes by default. An
-        // operator granting a hostname agreed to calls, not to unbounded egress
-        // through them.
+        // A request body is guest-chosen; without `outbound_request_bytes` its only bound would
+        // be the stdout frame it arrived in. Granting a host does not grant unbounded egress.
         let mut fixture = fixture(&everything(), Some("alpha"));
         let ceiling = fixture.runtime.quotas().outbound_request_bytes as usize;
         fixture.http.answer(
@@ -3300,9 +3173,8 @@ path = "/shop/panel"
 
     #[test]
     fn an_outbound_requests_headers_count_against_its_byte_quota() {
-        // Bounding the body alone left the quota sidesteppable: the allow-list
-        // caps how *many* headers may be set and says nothing about their size,
-        // so one `user-agent` could carry what a body was just refused for.
+        // The allow-list caps how many headers may be set, not their size, so headers count
+        // against the same quota as the body.
         let mut fixture = fixture(&everything(), Some("alpha"));
         let ceiling = fixture.runtime.quotas().outbound_request_bytes as usize;
         fixture.http.answer(
@@ -3330,9 +3202,8 @@ path = "/shop/panel"
 
     #[test]
     fn the_in_memory_kv_store_is_bounded_by_bytes_not_only_by_keys() {
-        // A key count is not a memory bound: the default capacity at the
-        // default `kv_value_bytes` is hundreds of megabytes, and gigabytes at
-        // the largest legal quota.
+        // A key count is not a memory bound: at the largest legal `kv_value_bytes` it allows
+        // gigabytes.
         let store = MemoryKvStore::with_capacities(10_000, 4096);
         // Well inside the key ceiling, well past the byte one.
         let mut refused = false;
@@ -3351,7 +3222,7 @@ path = "/shop/panel"
             "and it refused long before the key ceiling"
         );
 
-        // A replacement is checked too: no new key, but more bytes.
+        // A replacement adds no key but more bytes, so it is checked too.
         let small = MemoryKvStore::with_capacities(10_000, 4096);
         assert!(small.set("k", PluginValue::Text("x".repeat(64))).is_ok());
         assert!(
@@ -3362,10 +3233,8 @@ path = "/shop/panel"
 
     #[test]
     fn every_in_memory_backend_is_bounded_by_bytes_not_only_by_count() {
-        // The same defect in three places, so it is asserted in one test: a
-        // count ceiling times the largest legal entry is gigabytes for the row
-        // store, hundreds of megabytes for the job queue. Whatever the count
-        // allows, the byte ceiling has to stop first when entries are large.
+        // A count ceiling times the largest legal entry is gigabytes, so each in-memory backend
+        // must hit its byte ceiling first when entries are large.
         let scope = db::Scope {
             table: "plugin_shop__orders".to_owned(),
             tenant: tenant_segment(Some("alpha")),
@@ -3385,10 +3254,8 @@ path = "/shop/panel"
             "and refused far below its row ceiling"
         );
 
-        // Replacement is the path that adds no entry and still grows the store,
-        // so every backend that has one is asserted here rather than left to be
-        // found a round later: `db-update` was bounded only on insert, while
-        // `kv-set` already accounted for it.
+        // Replacement adds no entry but still grows the store, so it is checked for every
+        // backend that supports it.
         let roomy = db::MemoryPluginStore::with_capacities(10_000, 8192);
         let small = roomy
             .insert(&scope, row(&[("blob", "x")]))
@@ -3446,10 +3313,8 @@ path = "/shop/panel"
             panic!("the insert should have succeeded: {inserted:?}")
         };
 
-        // The physical row landed under the derived name, never under a name
-        // the guest chose.
-        // Derived, never spelled: a literal here is a test that silently stops
-        // testing anything the moment the derivation changes.
+        // The row landed under the derived physical name. The name is derived here, not
+        // spelled, so the test keeps testing if the derivation changes.
         let orders = db::physical_table("shop", "orders").expect("derivable");
         assert_eq!(
             fixture.db.keys(),
@@ -3501,23 +3366,17 @@ path = "/shop/panel"
 
     #[test]
     fn the_node_ceiling_counts_the_whole_tree_not_each_vector() {
-        // Third pass over this ground, and the one that makes the count mean
-        // what it says. Bounding each `children` vector at `MAX_NODES`
-        // separately still admitted many such vectors, so a frame well inside
-        // the stdout budget deserialized far more than `MAX_NODES` nodes and
-        // was refused only afterwards, on the aggregate, by `render` — after
-        // `serde_json` had built the whole tree.
+        // Bounding each `children` vector separately still admits many vectors, so the budget
+        // is shared by the whole tree.
         //
-        // Wide and shallow on purpose. Deep nesting is refused by
-        // `serde_json`'s own recursion limit long before any of this is
-        // reached, so a deep tree would pass whether or not the budget is
-        // shared — which is exactly what the first version of this test did.
+        // Wide and shallow on purpose: `serde_json`'s recursion limit refuses deep nesting on
+        // its own, so a deep tree would pass whether or not the budget is shared.
         let leaves = std::iter::repeat_n(r#"{"node":"text","text":"x"}"#, 8)
             .collect::<Vec<_>>()
             .join(",");
         let branch = format!(r#"{{"node":"element","tag":"p","children":[{leaves}]}}"#);
-        // 128 branches of 9 nodes each: every vector is inside `MAX_NODES`, and
-        // the tree is over four times it.
+        // 128 branches of 9 nodes each: every vector is inside `MAX_NODES`, the tree is over
+        // four times it.
         let wide = std::iter::repeat_n(branch.as_str(), 128)
             .collect::<Vec<_>>()
             .join(",");
@@ -3530,8 +3389,7 @@ path = "/shop/panel"
             "a tree past the node ceiling must be refused while it is read, not after"
         );
 
-        // A tree inside the ceiling still parses, so the budget is not simply
-        // refusing anything with children.
+        // A tree inside the ceiling still parses.
         let small = std::iter::repeat_n(branch.as_str(), 4)
             .collect::<Vec<_>>()
             .join(",");
@@ -3544,8 +3402,7 @@ path = "/shop/panel"
             "a fragment inside the ceiling must still parse"
         );
 
-        // Twice on the same thread: the budget is thread-local, so the failed
-        // parse above must not have left this one poorer.
+        // Again on the same thread: the thread-local budget must be restored after each parse.
         assert!(
             crate::plugin_sandbox::wire::from_line::<crate::plugin_sandbox::wire::GuestFrame>(
                 &line
@@ -3557,10 +3414,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_page_of_rows_encodes_within_the_result_ceiling() {
-        // `row_weight` counts names and values, not the quotes, colons and
-        // commas around them. Many narrow rows then encoded well past
-        // `MAX_RESULT_BYTES`, and a reply the reserve had promised to fit was
-        // refused after the read.
+        // `row_weight` ignores JSON framing, so many narrow rows would encode past
+        // `MAX_RESULT_BYTES` unless `bounded_rows` counts it.
         let row: PluginRow = (0..MAX_ROW_COLUMNS)
             .map(|i| (format!("c{i:02}"), PluginValue::Text("v".to_owned())))
             .collect();
@@ -3588,11 +3443,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_scalar_weighs_what_it_encodes_to() {
-        // A flat eight bytes for every non-text scalar was wrong in the one
-        // direction a ceiling may not be wrong in: `i64::MIN` encodes as
-        // twenty, so a `kv_value_bytes` of eight admitted a value the operator
-        // forbade — on the write, and again on the read, which is checked
-        // against the same number.
+        // A scalar must never weigh less than it encodes to, or a ceiling admits values the
+        // operator forbade.
         assert_eq!(PluginValue::Int(i64::MIN).weight(), 20);
         assert_eq!(PluginValue::Int(i64::MAX).weight(), 19);
         assert_eq!(PluginValue::Int(0).weight(), 1);
@@ -3603,8 +3455,7 @@ path = "/shop/panel"
         assert_eq!(PluginValue::Bool(true).weight(), 4);
         assert_eq!(PluginValue::Bool(false).weight(), 5);
 
-        // Against the encoder rather than against arithmetic, so the two cannot
-        // drift: no scalar may weigh less than it serializes to.
+        // Checked against the encoder itself, so weight and encoding cannot drift apart.
         for value in [
             PluginValue::Null,
             PluginValue::Bool(true),
@@ -3628,16 +3479,12 @@ path = "/shop/panel"
 
     #[test]
     fn an_oversized_first_row_is_refused_by_the_store_too() {
-        // `bounded_rows` dropped its "keep the first one" exemption a while
-        // back; the store's own query loop kept its copy of the same
-        // exemption, so an oversized row was cloned in full under the store's
-        // mutex on every query that matched it and only then discarded a layer
-        // up. The clone was the cost, and a guest could repeat it at will.
+        // The store must not exempt the first row from the budget either: that would clone an
+        // oversized row under the store's mutex on every matching query.
         let store = db::MemoryPluginStore::new();
         let orders = db::physical_table("shop", "orders").expect("derivable");
         let tenant = tenant_segment(Some("alpha"));
-        // Seeded past what `check_row` would accept, which is the only way such
-        // a row exists at all.
+        // Seeded directly: `check_row` would refuse this row on insert.
         let huge = "x".repeat(super::MAX_RESULT_BYTES + 1);
         store.seed(&orders, &tenant, "r1", row(&[("blob", huge.as_str())]));
 
@@ -3665,12 +3512,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_generated_row_id_never_lands_on_a_seeded_one() {
-        // `seed` places a row at an id of the caller's choosing and cannot
-        // advance the insert counter, because that id need not be a number. So
-        // a store seeded with `r1` handed `r1` back out on its first insert:
-        // `HashMap::insert` replaced the seeded row while both weights had been
-        // charged, losing a row with no error and leaving bytes charged against
-        // capacity that nothing occupies.
+        // `seed` places a row at a caller-chosen id without advancing the insert counter, so the
+        // next generated id can be `r1`. The insert must not overwrite the seeded row.
         let store = db::MemoryPluginStore::new();
         let orders = db::physical_table("shop", "orders").expect("derivable");
         let tenant = tenant_segment(Some("alpha"));
@@ -3696,8 +3539,6 @@ path = "/shop/panel"
             "the insert must succeed: {inserted:?}"
         );
 
-        // Both rows must still be there. The seeded one disappearing is the
-        // defect; counting them is what proves it did not.
         let keys = store.keys();
         assert_eq!(
             keys.len(),
@@ -3721,9 +3562,8 @@ path = "/shop/panel"
             "u1",
             row(&[("email", "ceo@example.com")]),
         );
-        // Derived, not hard-coded: a literal here turns the whole test vacuous
-        // the moment the derivation changes, because beta's row would land in a
-        // table alpha was never going to reach anyway.
+        // Derived, not hard-coded: with a stale literal, beta's row would land in a table alpha
+        // never reaches and the test would pass vacuously.
         let orders = db::physical_table("shop", "orders").expect("derivable");
         store.seed(
             &orders,
@@ -3780,10 +3620,8 @@ path = "/shop/panel"
             },
         ] {
             let result = alpha.dispatch(&call);
-            // Each call gets the *specific* answer it should, rather than
-            // "anything except a populated row": a loop that accepts a denial
-            // or an empty read for every operation passes even if `db-delete`
-            // started returning `Done` after deleting beta's row.
+            // Assert each call's specific answer: accepting any denial or empty read would pass
+            // even if `db-delete` returned `Done` after deleting beta's row.
             let expected_empty = matches!(call, CapabilityCall::DbGet { .. });
             if expected_empty {
                 assert_eq!(
@@ -3805,7 +3643,6 @@ path = "/shop/panel"
                 );
             }
         }
-        // Untouched, in every sense.
         assert_eq!(
             store.keys(),
             vec![
@@ -3832,12 +3669,9 @@ path = "/shop/panel"
 
     #[test]
     fn a_row_id_echoed_back_is_stripped_rather_than_refused() {
-        // `db-get` stamps `row_id` onto the row it hands back, so the obvious
-        // read-modify-write echoes it. Refusing that would make the obvious
-        // code the wrong code; the id is the row's address and travels in its
-        // own field, so a value for it in the row conveys nothing and can
-        // override nothing. `tenant_id` stays a hard refusal above, because a
-        // row that could set *that* would choose its own tenant.
+        // `db-get` adds `row_id` to the row it returns, so a read-modify-write echoes it. The id
+        // travels in its own field, so the echoed value is ignored. `tenant_id` stays a hard
+        // refusal: a row that could set it would choose its own tenant.
         let mut fixture = fixture(&everything(), Some("alpha"));
         let inserted = fixture.runtime.dispatch(&CapabilityCall::DbInsert {
             id: 1,
@@ -3872,7 +3706,7 @@ path = "/shop/panel"
             "the row comes back addressed by the id the store assigned"
         );
 
-        // …and that same row writes straight back.
+        // The same row writes straight back.
         let updated = fixture.runtime.dispatch(&CapabilityCall::DbUpdate {
             id: 3,
             table: "orders".to_owned(),
@@ -3884,16 +3718,14 @@ path = "/shop/panel"
 
     #[test]
     fn two_plugins_can_never_be_named_onto_one_physical_table() {
-        // The collision that matters is not punctuation, it is the *separator*:
-        // a hostile author picks a plugin name that shifts the boundary onto a
-        // victim's table. Both manifests validate, both consent screens are
-        // truthful, and `AppBuilder` sees two distinct plugin names.
+        // A hostile author can pick a plugin name that shifts the separator onto a victim's
+        // table; both names validate and look distinct to `AppBuilder`.
         let victim = db::physical_table("shop", "orders_v2");
         let attacker = db::physical_table("shop_orders", "v2");
         assert!(victim.is_some() && attacker.is_some());
         assert_ne!(victim, attacker, "a boundary shift must not collide");
 
-        // Punctuation and case are the same bug one variation along.
+        // Punctuation and case variants must not collide either.
         let names = ["my-shop", "my.shop", "my_shop", "My_Shop", "MY.SHOP"];
         let derived: Vec<String> = names
             .iter()
@@ -3905,7 +3737,7 @@ path = "/shop/panel"
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "collision in {derived:?}");
 
-        // And the derived name is still a bare, unquoted SQL identifier.
+        // The derived name is still a bare, unquoted SQL identifier.
         for name in &derived {
             assert!(
                 name.starts_with("plugin_")
@@ -3919,10 +3751,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_truncated_ledger_says_so_rather_than_reporting_a_smaller_number() {
-        // `MAX_EVENTS` is reachable: the quotas that would bound it live in the
-        // plugin's own manifest, so the plugin sets them. An operator reading
-        // "12 db-inserts" off a truncated ledger would be reading a number the
-        // plugin chose.
+        // `MAX_EVENTS` is reachable because the plugin's own manifest sets the quotas that
+        // would bound it.
         let mut manifest = manifest(&everything());
         manifest.quotas.calls = MAX_QUOTA;
         manifest.quotas.kv_reads = MAX_QUOTA;
@@ -3954,8 +3784,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_dropped_call_keeps_its_own_time_not_the_time_of_ingest() {
-        // #2523. The log ingests a request when it ends. A slow
-        // request must not make its old drops look recent.
+        // #2523: the log ingests a request when it ends, and a slow request must not make its
+        // old drops look recent.
         use chrono::TimeZone as _;
 
         use crate::time::{TickingClock, install_ambient};
@@ -4016,7 +3846,7 @@ path = "/shop/panel"
             body: String::new(),
         };
         let fixture = fixture(&everything(), Some("alpha"));
-        // The default quota escapes past `MAX_RESULT_BYTES`, so that bound holds.
+        // At the default quota the escaped body exceeds `MAX_RESULT_BYTES`, so that bound holds.
         assert_eq!(fixture.runtime.reply_reserve(&post), post.reply_reserve());
         let mut manifest = manifest(&everything());
         manifest.quotas.outbound_response_bytes = 4096;
@@ -4117,8 +3947,8 @@ path = "/shop/panel"
             .first()
             .map(|event| event.target.clone())
             .unwrap_or_default();
-        // `rejected` expands a hostile character to as many as ten bytes, so
-        // the bound has to be on characters and has to be applied first.
+        // `rejected` expands a hostile character to up to ten bytes, so the bound is on
+        // characters and applied first.
         assert!(
             recorded.len() <= MAX_TARGET_CHARS * 10 + 8,
             "{} bytes: {recorded}",
@@ -4128,9 +3958,8 @@ path = "/shop/panel"
 
     #[test]
     fn the_in_memory_stores_refuse_rather_than_growing_without_a_ceiling() {
-        // A plugin declares its own `kv_writes` and `db_writes`, and both may
-        // legally be `MAX_QUOTA`. A shipped store with no ceiling of its own
-        // turns that into the host's memory.
+        // A plugin's own manifest may set `kv_writes` and `db_writes` to `MAX_QUOTA`, so the
+        // shipped stores need ceilings of their own.
         let kv = MemoryKvStore::with_capacity(2);
         assert!(kv.set("a", PluginValue::Int(1)).is_ok());
         assert!(kv.set("b", PluginValue::Int(1)).is_ok());
@@ -4175,9 +4004,8 @@ path = "/shop/panel"
             db::physical_table("shop", "orders"),
             Some("plugin_shop__orders".to_owned())
         );
-        // A plugin name's charset is wider than SQL's, so it is escaped
-        // injectively rather than folded: `.` is `_2e` and `-` is `_2d`, and
-        // `__` — which no escape can produce — is the separator.
+        // A plugin name's charset is wider than SQL's, so it is escaped injectively: `.` is
+        // `_2e`, `-` is `_2d`, and `__`, which no escape produces, is the separator.
         assert_eq!(
             db::physical_table("my.shop-v2", "orders"),
             Some("plugin_my_2eshop_2dv2__orders".to_owned())
@@ -4190,9 +4018,8 @@ path = "/shop/panel"
             ("shop", ""),
             ("", "orders"),
             ("shop", &"o".repeat(64)),
-            // Long, but each half is legal: the *derived* name is what cannot
-            // fit, and `SandboxManifest::validate` refuses this at load so an
-            // operator never approves a capability that can only be denied.
+            // Each half is legal but the derived name is too long; `SandboxManifest::validate`
+            // refuses this at load.
             (&"p".repeat(40), &"t".repeat(30)),
         ] {
             assert_eq!(db::physical_table(plugin, table), None, "{plugin}/{table}");
@@ -4259,8 +4086,7 @@ path = "/shop/panel"
         });
         assert_eq!(over.denial(), Some(DenialReason::QuotaExceeded));
 
-        // A different capability is untouched: quotas are per surface, so
-        // running out of reads does not cost the plugin its ability to enqueue.
+        // Quotas are per capability: running out of reads does not block enqueues.
         let job = fixture.runtime.dispatch(&CapabilityCall::JobEnqueue {
             id: 1000,
             job_type: "reindex".to_owned(),
@@ -4346,10 +4172,8 @@ path = "/shop/panel"
     #[test]
     fn a_calls_per_second_ceiling_is_shared_across_requests_and_kept_per_capability() {
         let manifest = manifest(&everything());
-        // One token per second, not two: the assertion below needs the bucket
-        // to still be empty when it runs, and a `per_second` of 2 gave it only
-        // 500 ms of slack — enough for a loaded debug-build runner to refill
-        // one token between the take and the check and flip this green to red.
+        // One token per second: the bucket must still be empty at the check below, and a
+        // faster refill can land a token in between on a loaded runner.
         let rate = Arc::new(quota::CapabilityRateLimiter::new(1));
         let services = CapabilityServices {
             kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
@@ -4367,7 +4191,7 @@ path = "/shop/panel"
                 .denial()
                 .is_none()
         );
-        // A *second request* of the same plugin shares the bucket.
+        // A second request of the same plugin shares the bucket.
         let mut second = CapabilityRuntime::new(&manifest, services);
         assert_eq!(
             second
@@ -4378,8 +4202,7 @@ path = "/shop/panel"
                 .denial(),
             Some(DenialReason::QuotaExceeded)
         );
-        // A different capability has its own bucket, so a busy cache does not
-        // cost the plugin its ability to enqueue.
+        // Each capability has its own bucket.
         assert!(
             second
                 .dispatch(&CapabilityCall::JobEnqueue {
@@ -4438,9 +4261,8 @@ path = "/shop/panel"
 
     #[test]
     fn a_response_header_a_plugin_may_not_see_never_reaches_it() {
-        // The response side of the outbound allow-list. Nothing exercised it,
-        // so deleting the filter left the suite green — and `set-cookie` from
-        // an upstream is a cookie the *plugin* then learns.
+        // The response side of the outbound allow-list: an upstream's `set-cookie` must not
+        // reach the plugin.
         let mut fixture = fixture(&everything(), Some("alpha"));
         fixture.http.answer(
             "https://api.example.com/v1",
@@ -4512,8 +4334,6 @@ path = "/shop/panel"
 
     #[test]
     fn every_byte_ceiling_a_quota_names_is_actually_applied() {
-        // Four ceilings that had no test between them, so four `if` statements
-        // nothing reached.
         let mut manifest = manifest(&everything());
         manifest.quotas.kv_value_bytes = 8;
         manifest.quotas.db_rows = 2;
@@ -4612,9 +4432,6 @@ path = "/shop/panel"
 
     #[test]
     fn a_full_job_queue_is_a_denial_the_guest_can_read() {
-        // `MemoryJobSink::bounded` existed with no caller — test-support API
-        // written for a test that was never written, which is the same thing as
-        // an untested `BackendError` arm.
         let sink = jobs::MemoryJobSink::bounded(1);
         let mut runtime = CapabilityRuntime::new(
             &manifest(&everything()),
@@ -4639,16 +4456,9 @@ path = "/shop/panel"
 
     #[test]
     fn the_zero_configuration_job_queue_is_finite() {
-        // `MemoryJobSink::new()` used to be unbounded, and this slice ships no
-        // consumer that removes a queued job — so an application that wired the
-        // exported default gave a granted plugin a way to grow the host without
-        // limit. The quotas slow that and never stop it. There is no unbounded
-        // spelling any more; a default that must be tightened to be safe is a
-        // default that will be shipped as it is.
-        //
-        // Driven against the sink rather than through `dispatch`: the per-request
-        // quotas would refuse long before the queue filled, and it is the queue
-        // that outlives the request.
+        // Nothing here consumes queued jobs, so the default sink must have a finite depth;
+        // per-request quotas only slow growth. Driven against the sink directly because those
+        // quotas would refuse long before the queue filled.
         let sink = jobs::MemoryJobSink::new();
         let job = || PluginJob {
             plugin: "shop".to_owned(),

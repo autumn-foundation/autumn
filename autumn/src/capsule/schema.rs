@@ -1023,8 +1023,8 @@ pub mod test_support {
     pub const fn connection_tape(id: u64, exchanges: Vec<Exchange>) -> ConnectionTape {
         ConnectionTape {
             id,
-            // `String::new()` is const; an empty role reads as primary
-            // everywhere a role is consulted, matching pre-role capsules.
+            // An empty role reads as primary wherever a role is consulted, as in capsules
+            // recorded before roles existed.
             role: String::new(),
             prologue: Vec::new(),
             statements: Vec::new(),

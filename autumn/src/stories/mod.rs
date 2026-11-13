@@ -514,15 +514,8 @@ where
             ),
         )
         .route(STORIES_DEMO_SAVE_PATH, axum::routing::get(demo_save));
-    // Demo backends for the two typeahead stories (Active search,
-    // Autocomplete) — see `demo_search`/`demo_tag_search` below for why
-    // these two specifically get real handlers where every other
-    // story's action URL stays a synthetic 404-on-submit (already the
-    // documented pattern for e.g. Confirm action / Avatar). Namespaced
-    // under `/_stories/demo/*`, the same convention `confirm_action`'s
-    // story already uses (`/_stories/demo/delete-post`), so a real app's
-    // own routes can never collide with these. A family's demo routes
-    // exist only when its feature is on (#3408).
+    // Demo backends for stories that need a live response. They live under `/_stories/demo/*`
+    // so they cannot collide with app routes, and exist only when their feature is on (#3408).
     #[cfg(feature = "widgets-search")]
     let router = router
         .route(STORIES_DEMO_SEARCH_PATH, axum::routing::get(demo_search))
@@ -1020,27 +1013,23 @@ mod tests {
         Story::new(group, name, demo_markup, r#"maud::html! { p { "demo" } }"#)
     }
 
-    // U1 (AC1): slug derivation folds case, joins alphanumeric runs with `-`,
-    // and treats punctuation/whitespace/non-ASCII as separators.
     #[test]
     fn slugify_handles_spaces_punctuation_unicode() {
         assert_eq!(slugify("Data table"), "data-table");
         assert_eq!(slugify("Nav / Links!"), "nav-links");
         assert_eq!(slugify("HERO"), "hero");
-        // Non-ASCII acts as a separator and never leaks into the URL.
+        // Non-ASCII is a separator and never leaks into the URL.
         assert_eq!(slugify("Δ delta"), "delta");
         assert_eq!(slugify("  Stat   Card  "), "stat-card");
     }
 
-    // U1 (AC1): a name that slugifies to nothing is a programmer error caught
-    // loudly at construction time, not a broken route.
+    // A name that slugifies to nothing is caught at construction, not as a broken route.
     #[test]
     #[should_panic(expected = "slug")]
     fn story_new_panics_on_name_that_slugifies_to_empty() {
         let _ = Story::new("Display", "!!!", demo_markup, "demo()");
     }
 
-    // U2 (AC1): lookup is by slug.
     #[test]
     fn registry_find_matches_slug() {
         let registry = StoryRegistry::new(vec![
@@ -1056,8 +1045,7 @@ mod tests {
         assert!(registry.find("nope").is_none());
     }
 
-    // U2 (AC1, R7): duplicate slugs would let one story shadow another in
-    // routing — refuse them at registry construction.
+    // A duplicate slug would let one story shadow another in routing.
     #[test]
     #[should_panic(expected = "duplicate")]
     fn registry_new_panics_on_duplicate_slug() {
@@ -1067,8 +1055,6 @@ mod tests {
         ]);
     }
 
-    // U3 (AC1, R17): index grouping is deterministic — groups in first-seen
-    // order, stories in registration order within a group.
     #[test]
     fn grouped_preserves_first_seen_group_and_registration_order() {
         let registry = StoryRegistry::new(vec![
@@ -1083,8 +1069,6 @@ mod tests {
         assert_eq!(display_names, ["Data table", "Card"]);
     }
 
-    // U4 (AC7): builder-side gallery — builtin-free constructor, seeded
-    // constructor, and extend with a custom `story!`.
     #[test]
     fn gallery_new_is_empty_builtin_is_seeded_extend_appends() {
         assert!(
@@ -1119,8 +1103,7 @@ mod tests {
         panic!("story exploded on purpose")
     }
 
-    // U5 (AC8, R4): a panicking story surfaces as an error, it does not
-    // unwind through the gallery.
+    // A panicking story surfaces as an error; it does not unwind through the gallery.
     #[test]
     fn story_render_catches_panic() {
         let boom = Story::new("Display", "Boom", panicking_story, "panicking_story()");
@@ -1136,8 +1119,6 @@ mod tests {
         assert!(fine.render().is_ok());
     }
 
-    // U6 (AC4): the index page links the framework widget stylesheet, loads
-    // the widget runtime script, and lists stories grouped in the sidebar.
     #[test]
     fn index_page_links_widgets_css_and_groups_stories() {
         assert_eq!(STORIES_PATH, "/_stories");
@@ -1187,8 +1168,6 @@ mod tests {
         );
     }
 
-    // U7 (AC4): the detail page shows the live render plus Source and
-    // Rendered HTML tabs (dogfooding the `tabs` widget).
     #[test]
     fn detail_page_has_live_render_source_tab_and_html_tab() {
         let story = crate::stories::story! {
@@ -1312,8 +1291,7 @@ mod tests {
         }
     }
 
-    // U8 (AC4/AC5, R12): enabled-but-unregistered renders a helpful empty
-    // state pointing at AppBuilder::with_story_gallery, not a 500/blank page.
+    // An enabled gallery with no stories explains how to register them, not a blank page.
     #[test]
     fn index_empty_state_mentions_with_story_gallery() {
         let page = render_story_index(&StoryRegistry::default(), None).into_string();
@@ -1325,11 +1303,9 @@ mod tests {
 
     // ── Strict balanced-HTML check over the gallery chrome ──────────────
     //
-    // The integration harness (tests/integration/stories.rs) runs this
-    // discipline over each story *fragment*; the full index/detail pages can
-    // only be rendered here (`render_story_*` are private), so a minimal
-    // copy of the strict checker lives in this module too. Unlike the
-    // lenient `crate::test_html` parser, it refuses auto-closing.
+    // tests/integration/stories.rs checks each story fragment. The full pages can only be
+    // rendered here (`render_story_*` are private), so this module keeps its own copy of the
+    // strict checker. Unlike `crate::test_html`, it refuses auto-closing.
 
     /// Panics when `html` is not well-formed (mismatched, unclosed, or
     /// stray-closed tags).
@@ -1435,8 +1411,7 @@ mod tests {
         );
     }
 
-    // Guard the duplicated checker itself: a broken checker must not
-    // green-light rotten gallery chrome.
+    // A broken checker would pass broken gallery chrome.
     #[test]
     fn balanced_html_checker_rejects_malformed_markup() {
         assert_balanced_html(
@@ -1449,9 +1424,6 @@ mod tests {
         }
     }
 
-    // U9 (AC4/AC8): the gallery chrome itself — grouped index, empty-state
-    // index, and every builtin detail page — is strictly balanced HTML, not
-    // just the story fragments the integration harness checks.
     #[test]
     fn gallery_index_and_detail_pages_render_balanced_html() {
         let registry = builtin();
@@ -1474,10 +1446,8 @@ mod tests {
         }
     }
 
-    // U10 (review follow-up): when the security layer's per-request CSP nonce
-    // is active, `style-src` drops `'unsafe-inline'`, so the gallery's inline
-    // stylesheet must carry the request nonce or browsers block it. Without
-    // the layer no nonce attribute is emitted.
+    // With a per-request CSP nonce, `style-src` drops `'unsafe-inline'`, so the inline
+    // stylesheet must carry the nonce or browsers block it.
     #[test]
     fn story_pages_apply_csp_nonce_to_inline_style() {
         let nonce = crate::security::CspNonce::new_for_tests("test-nonce-value");
@@ -1504,11 +1474,8 @@ mod tests {
         );
     }
 
-    // U16 (interactivity follow-up): htmx injects its own default loading-
-    // indicator <style> at startup; under nonce-mode CSP it needs that
-    // nonce told to it via an htmx-config meta tag (its documented
-    // mechanism), or the tag it injects has none and gets blocked the same
-    // way the reported CSP violation did.
+    // htmx injects its own indicator <style> at startup. Under a nonce CSP it learns the nonce
+    // from the htmx-config meta tag, or its style is blocked.
     #[cfg(feature = "htmx")]
     #[test]
     fn story_pages_tell_htmx_the_csp_nonce_via_meta_tag() {
@@ -1530,11 +1497,8 @@ mod tests {
         );
     }
 
-    // U11, reworked by #3396: every story page has a scheme switcher
-    // (System / Light / Dark) and a density switcher (Compact / Comfortable /
-    // Spacious). Each radio id matches a `:root:has(#… :checked)` rule in
-    // `STORY_GALLERY_CSS`, so a switch needs no JavaScript and no inline
-    // script or event handler (strict `script-src` CSP).
+    // #3396: each scheme and density radio id matches a `:root:has(#… :checked)` rule in
+    // `STORY_GALLERY_CSS`, so switching needs no JavaScript (strict `script-src` CSP).
     #[test]
     fn theme_and_density_switchers_are_radios_wired_to_css() {
         let registry = StoryRegistry::new(vec![demo_story("Display", "Card")]);
@@ -1623,11 +1587,8 @@ mod tests {
         );
     }
 
-    // U12 (interactivity follow-up): every hx-*-driven widget stayed inert
-    // because htmx.min.js was never loaded, only the framework's own
-    // data-*-hook runtime was. Both must load, htmx first (both `defer`, so
-    // document order fixes execution order — autumn-widgets.js's
-    // autocomplete wiring can assume htmx is already present).
+    // Both scripts are `defer`, so document order is execution order; autumn-widgets.js
+    // assumes htmx is already loaded.
     #[cfg(feature = "htmx")]
     #[test]
     fn story_page_loads_htmx_before_the_widgets_runtime() {
@@ -1645,12 +1606,8 @@ mod tests {
         );
     }
 
-    // U13 (interactivity follow-up): the two typeahead stories point at real
-    // demo backends now (not the synthetic 404-on-submit URLs most other
-    // stories use), and since the URL is a plain string literal in the
-    // story's own source — not a reference to the route const, which would
-    // show up literally in the public "Source" tab — nothing else catches
-    // the two drifting apart. Guard it here instead.
+    // A story's URL is a string literal (a const would show up by name in the "Source" tab),
+    // so only this test catches it drifting from the registered demo route.
     #[cfg(feature = "widgets-search")]
     #[test]
     fn typeahead_stories_point_at_their_registered_demo_routes() {
@@ -1692,9 +1649,6 @@ mod tests {
         );
     }
 
-    // U14 (interactivity follow-up): the demo handlers backing those routes
-    // actually filter, case-insensitively, and fall back to the same empty
-    // states the stories document.
     #[cfg(feature = "widgets-search")]
     #[tokio::test]
     async fn demo_search_filters_case_insensitively_with_empty_state_fallback() {
@@ -1738,8 +1692,8 @@ mod tests {
         );
     }
 
-    // The "Tags input" demo (#3410): the value of each option is its name,
-    // and a "create" entry follows when no tag has the exact name.
+    // #3410: each option's value is its name, and a "create" entry follows when no tag has the
+    // exact name.
     #[cfg(feature = "widgets-search")]
     #[tokio::test]
     async fn demo_tag_suggest_lists_matches_then_a_create_entry() {
@@ -1798,8 +1752,7 @@ mod tests {
         );
     }
 
-    // U15 (interactivity follow-up): the feed demo must terminate (no
-    // further sentinel) — otherwise it would just keep auto-firing.
+    // A further sentinel would keep auto-firing forever.
     #[cfg(feature = "widgets-social")]
     #[tokio::test]
     async fn demo_infinite_feed_returns_a_terminal_page_with_no_further_sentinel() {

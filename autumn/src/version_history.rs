@@ -418,9 +418,8 @@ pub fn compute_diff_owned(
     let serde_json::Value::Object(after_obj) = after else {
         return vec![];
     };
-    // A non-object `before` (JSON `null` from a missing prior row, a scalar
-    // from a hand-rolled `VersionedRecord`) is treated as "no prior values",
-    // matching `compute_diff`, which resolves `before.as_object()` to `None`.
+    // A non-object `before` (`null` for a missing prior row, or a scalar) means no prior values,
+    // as in `compute_diff`.
     let mut before_obj = match before {
         serde_json::Value::Object(obj) => Some(obj),
         _ => None,
@@ -428,20 +427,14 @@ pub fn compute_diff_owned(
 
     let mut changes = Vec::new();
     for (col, after_val) in after_obj {
-        // `remove` both reads the prior value and takes ownership of it. Only
-        // the `after` map is being iterated, so mutating `before` here is
-        // sound, and a JSON object cannot repeat a key — each column is
-        // removed at most once.
+        // `remove` moves the prior value out instead of cloning it. JSON object keys are unique,
+        // so each column is removed at most once.
         let before_val = before_obj.as_mut().and_then(|obj| obj.remove(&col));
         let did_change = before_val.as_ref() != Some(&after_val);
         if !did_change {
             continue;
         }
-        // `remove` above already moved the prior value into `before_val`, so
-        // this decides only where it goes next: a redacted column's secret is
-        // never cloned and never reaches the entry — it is dropped when
-        // `before_val` falls out of scope at the end of this iteration, along
-        // with the `after` value beside it.
+        // A sensitive column's values are dropped here, never cloned into the entry.
         if sensitive.contains(&col.as_str()) {
             changes.push(ColumnChange::sensitive(col));
         } else {
@@ -566,19 +559,11 @@ impl VersionTenantIdValue for Option<String> {
     }
 }
 
-// ── Runtime append (issue #2309 follow-up) ───────────────────────────
+// ── Runtime append (#2309) ───────────────────────────────────────────
 //
-// `#[repository(versioned)]` emits a version-history INSERT at ~30 distinct
-// mutation sites (every insert/update/delete path, single and bulk, hooked and
-// unhooked, plus the dependent-cascade and restore paths). Inlining the
-// statement at each of them expanded the same two backend-forked `sql_query`
-// bind chains 30 times into every versioned repository, for no gain: the write
-// is fully monomorphic — `RuntimeConnection` is a concrete type alias, every
-// bound value is a primitive, and nothing here depends on the model's columns.
-//
-// Hoisting it here compiles it **once** for the whole program instead of once
-// per generated repository. The generated code keeps only the model-specific
-// part (computing the column diff) and calls this.
+// `#[repository(versioned)]` writes history from ~30 mutation sites. The write does not depend on
+// the model (concrete connection type, primitive binds), so it lives here and compiles once for
+// the program instead of once per generated repository. The generated code only computes the diff.
 
 /// One version-history row, as the generated repository has computed it.
 ///
@@ -857,10 +842,8 @@ mod tests {
             "the Postgres write names seven columns: {PG_INSERT_SQL}"
         );
 
-        // SQLite stores JSON as TEXT, so the cast goes; and because the DDL's
-        // `DEFAULT CURRENT_TIMESTAMP` is not lexicographically comparable with
-        // the encoding diesel binds for a `DateTime<Utc>` filter value, this arm
-        // binds `recorded_at` explicitly as an eighth column.
+        // SQLite stores JSON as TEXT, so no cast. Its `DEFAULT CURRENT_TIMESTAMP` does not compare
+        // lexicographically with diesel's `DateTime<Utc>` encoding, so `recorded_at` is bound.
         assert!(
             !SQLITE_INSERT_SQL.contains("::jsonb"),
             "the SQLite write must drop the jsonb cast: {SQLITE_INSERT_SQL}"
@@ -1160,7 +1143,6 @@ mod tests {
         let after = serde_json::json!({"title": "new", "body": "same", "published": true});
         let changes = compute_diff(&before, &after, &[]);
         let cols: Vec<&str> = changes.iter().map(|c| c.column.as_str()).collect();
-        // Only changed columns appear
         assert!(
             cols.contains(&"title"),
             "title should be in changes: {cols:?}"
@@ -1208,7 +1190,6 @@ mod tests {
         let before = serde_json::json!({"title": "new", "password_digest": "samehash"});
         let after = serde_json::json!({"title": "new", "password_digest": "samehash"});
         let changes = compute_diff(&before, &after, &["password_digest"]);
-        // If sensitive column didn't change, it should NOT appear (no info leak)
         assert!(changes.is_empty(), "no changes means no entries at all");
     }
 
@@ -1275,16 +1256,9 @@ mod tests {
 
     // ── owned-value siblings (#2429) ─────────────────────────────────
     //
-    // The macro call site (`autumn-macros/src/repository.rs`, `vh_insert_ts`)
-    // builds each `Value` fresh and throws it away immediately, so the
-    // borrowed entry points clone every retained key and value for nothing.
-    // The `*_owned` siblings move those keys/values straight into the
-    // `ColumnChange`. Because this is the audit-trail write path, every
-    // owned function is held to **exact** output parity with its borrowed
-    // twin, over a case matrix the two share, rather than to hand-written
-    // expectations: any future divergence — a dropped sensitive redaction, a
-    // mishandled "present in `after` but not `before`" column, a reordered
-    // changeset — fails here.
+    // Each `*_owned` function must match its borrowed twin exactly over a shared case table, so
+    // any divergence on this audit-trail path (a lost redaction, a column only in `after`, a
+    // reordered changeset) fails here.
 
     /// `(label, before, after, sensitive)` cases exercised by both the
     /// borrowed and the owned diff path.
@@ -1525,9 +1499,8 @@ mod tests {
 
     #[test]
     fn owned_changesets_serialize_identically_to_borrowed() {
-        // The generated code serializes the changeset to a string before it
-        // reaches the `_autumn_version_history` row, so parity has to hold at
-        // the JSON level too — including key order inside each entry.
+        // The generated code stores the changeset as a JSON string, so parity must hold there too,
+        // including key order.
         for (label, before, after, sensitive) in diff_parity_cases() {
             let borrowed =
                 serde_json::to_string(&compute_diff(&before, &after, sensitive)).unwrap();
@@ -1578,9 +1551,8 @@ mod tests {
 
     #[test]
     fn compute_diff_owned_never_leaks_a_sensitive_value() {
-        // Adversarial: a `.remove()`-based implementation that forgot the
-        // sensitive check would move the secret into the entry instead of
-        // dropping it.
+        // A `.remove()`-based implementation that skipped the sensitive check would move the
+        // secret into the entry.
         let before = serde_json::json!({"password_digest": "OLD_SECRET", "title": "t"});
         let after = serde_json::json!({"password_digest": "NEW_SECRET", "title": "t2"});
         assert_redacted(
@@ -1601,18 +1573,10 @@ mod tests {
         );
     }
 
-    // The parity tests above prove the owned path is *correct*. These prove it
-    // is actually cheaper, by the strictest statement available: the heap
-    // buffer that comes out of the owned entry point is the same allocation
-    // that went in. An `_owned` function implemented by delegating to its
-    // borrowed twin would still pass every parity test above, and fails here.
-    //
-    // The aggregate, whole-record version of the same claim — allocation blocks
-    // per mutation, against a pinned ceiling — lives in
-    // `autumn/tests/version_history_alloc_gate.rs`, which needs its own binary
-    // because `allocation-counter` installs a process-wide global allocator.
-    // These stay here because they are exact rather than statistical: they name
-    // *which* buffer, and cost nothing to run in the consolidated suite.
+    // These check that the owned path moves buffers: the heap buffer that comes out is the one
+    // that went in. An `_owned` function that delegated to its borrowed twin would pass the parity
+    // tests but fail here. `autumn/tests/version_history_alloc_gate.rs` counts allocations per
+    // mutation; it needs its own binary for its global allocator.
 
     /// Heap address of a column name inside a JSON object.
     fn key_ptr(v: &serde_json::Value, col: &str) -> *const u8 {
@@ -1642,8 +1606,8 @@ mod tests {
         let old = val_ptr(&before, "body");
         let new = val_ptr(&after, "body");
 
-        // Contrast: the borrowed entry point copies all three. `before`/`after`
-        // are still alive here, so the copies cannot reuse their addresses.
+        // The borrowed entry point copies all three. `before` and `after` are still alive, so the
+        // copies cannot reuse their addresses.
         let borrowed = compute_diff(&before, &after, &[]);
         assert_eq!(borrowed.len(), 1);
         assert_ne!(borrowed[0].column.as_ptr(), col);
@@ -1844,11 +1808,8 @@ mod tests {
 
     #[test]
     fn version_entry_op_is_not_mutable_via_public_api() {
-        // The entry type is non-exhaustive from the user's perspective:
-        // they can read all fields but the only construction path in real
-        // code is via the generated repository (no pub constructor that
-        // takes all fields). This test documents the "append-only" contract
-        // by verifying there is no public mutating method on VersionEntry.
+        // Documents the append-only contract: the fields are public, but `VersionEntry` has no
+        // `update()` or `delete()` method. A test cannot assert that absence.
         let mut entry = VersionEntry {
             id: 1,
             table_name: "posts".to_owned(),
@@ -1859,11 +1820,7 @@ mod tests {
             changes: vec![],
             recorded_at: Utc::now(),
         };
-        // Fields are pub so tests can construct them; however there is
-        // intentionally no `delete()` or `update()` method.
-        entry.actor = "reassigned-in-test".to_owned(); // allowed for test setup
+        entry.actor = "reassigned-in-test".to_owned();
         assert_eq!(entry.actor, "reassigned-in-test");
-        // What's NOT present: VersionEntry::delete(&mut db).await
-        // That's the append-only guarantee — enforced by absence.
     }
 }

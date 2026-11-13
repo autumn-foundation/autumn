@@ -64,8 +64,7 @@ struct ConnectionPresence {
 }
 
 struct PresenceInner {
-    // BTreeMap for the per-key layer so list() returns entries in stable key
-    // order — deterministic ordering prevents flaky tests and predictable UI.
+    // BTreeMap per topic so `list()` returns keys in a stable order.
     entries: HashMap<String, std::collections::BTreeMap<String, Vec<ConnectionPresence>>>,
     ttl: Duration,
 }
@@ -84,9 +83,8 @@ impl PresenceInner {
             meta,
             last_heartbeat: crate::time::ambient_instant(),
         };
-        // Probe with the borrowed names first. A join usually lands on a
-        // topic somebody is already on, and a second tab on a key already
-        // there; `entry` copied both names to probe a map that held them.
+        // Probe with borrowed names first: a join usually lands on an existing topic, often on an
+        // existing key, and `entry` would allocate owned copies just to probe.
         if let Some(by_key) = self.entries.get_mut(topic) {
             if let Some(connections) = by_key.get_mut(key) {
                 connections.push(connection);
@@ -286,8 +284,7 @@ impl Presence {
         let meta = meta.into();
         let connection_id = next_connection_id();
 
-        // Borrowed: the key and metadata move into the store and the handle
-        // below, so the event is encoded from them rather than from a copy.
+        // Encoded from borrows: `key` and `meta` move into the store and the handle below.
         let json = serde_json::to_string(&PresenceEventRef::Join {
             key: &key,
             meta: &meta,
@@ -372,8 +369,6 @@ impl Presence {
         let mut inner = self.inner.lock().expect("presence lock poisoned");
         let removed = inner.sweep_expired();
 
-        // Publish events while still holding the lock to preserve exact ordering
-        // relative to other track/drop events.
         for (topic, key) in removed {
             let event = PresenceEvent::Leave { key };
             let json = serde_json::to_string(&event).unwrap_or_default();
@@ -434,9 +429,7 @@ impl Drop for PresenceHandle {
         let mut inner = self.inner.lock().expect("presence lock poisoned");
         let key_fully_removed = inner.remove(&self.topic, &self.key, self.connection_id);
 
-        // Only broadcast Leave when this was the last connection for the key.
-        // If the same user still has other tabs open their key remains present,
-        // so emitting a Leave would incorrectly signal they have gone offline.
+        // Leave only on the key's last connection: another open tab keeps the user present.
         if key_fully_removed {
             let json = serde_json::to_string(&PresenceEventRef::Leave { key: &self.key })
                 .unwrap_or_default();
@@ -515,8 +508,6 @@ mod tests {
         let channels = Channels::new(16);
         Presence::new(channels)
     }
-
-    // ── RED PHASE TESTS ──────────────────────────────────────────────────────
 
     #[test]
     fn track_adds_one_entry() {
@@ -609,7 +600,6 @@ mod tests {
         let channels = Channels::new(16);
         let presence = Presence::with_ttl(channels, Duration::from_nanos(1));
 
-        // track and then wait just past TTL
         let _handle = presence.track("room:1", "alice", serde_json::json!({}));
         std::thread::sleep(Duration::from_millis(1));
 
@@ -620,17 +610,15 @@ mod tests {
     #[test]
     fn sweep_respects_refreshed_entries() {
         let channels = Channels::new(16);
-        // Generous TTL so the post-refresh sleep stays well within the window
-        // even on a loaded CI runner with imprecise sleep scheduling.
+        // Generous TTL so the 100 ms sleeps stay well inside it on a loaded CI runner.
         let presence = Presence::with_ttl(channels, Duration::from_millis(500));
 
         let handle = presence.track("room:1", "alice", serde_json::json!({}));
         std::thread::sleep(Duration::from_millis(100));
-        handle.refresh(); // reset heartbeat
+        handle.refresh();
         std::thread::sleep(Duration::from_millis(100));
 
         presence.sweep_expired();
-        // 100 ms since last refresh is well under the 500 ms TTL
         assert_eq!(presence.list("room:1").len(), 1);
     }
 
@@ -656,14 +644,13 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
 
-        // Drop h1 — alice still has h2 open, so no Leave should be broadcast.
+        // alice still has h2 open.
         drop(h1);
         let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(
             result.is_err(),
             "no Leave event should be emitted while another connection is open"
         );
-        // Alice is still present.
         assert_eq!(presence.list("room:1")[0].metas.len(), 1);
     }
 
@@ -779,7 +766,7 @@ mod tests {
         assert_eq!(borrowed, owned);
     }
 
-    // ── AC#4: TURNKEY PRESENCE HELPERS ──────────────────────────────────────
+    // ── Presence stream helpers ──────────────────────────────────────────────
 
     #[cfg(feature = "maud")]
     #[test]
@@ -807,13 +794,10 @@ mod tests {
         let state = crate::AppState::for_test();
         let presence_svc = state.presence().clone();
 
-        // Subscribe directly to the presence channel to observe published events.
         let mut rx = state.channels().subscribe("presence:stream-test");
 
-        // Track a member — this publishes a join event on presence:stream-test.
         let _handle = presence_svc.track("stream-test", "bob", serde_json::json!({}));
 
-        // The channel should receive the join event.
         let msg = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
             .expect("timed out waiting for join event")
@@ -823,7 +807,6 @@ mod tests {
         assert_eq!(val["type"], "join");
         assert_eq!(val["key"], "bob");
 
-        // Verify that the badge helper (used inside presence_stream) renders count.
         let count = presence_svc.list("stream-test").len();
         assert_eq!(count, 1);
         let badge = super::presence_badge(count);
@@ -831,7 +814,7 @@ mod tests {
         assert!(html.contains('1'));
         assert!(html.contains("presence-badge"));
 
-        // Verify the function itself builds (compilation check).
+        // Only checks that `presence_stream` builds.
         let _sse = presence_stream(&state, "stream-test");
     }
 
@@ -871,16 +854,14 @@ mod tests {
         let state = crate::AppState::for_test();
         let presence_svc = state.presence().clone();
 
-        // Build the SSE response; subscription is set up inside presence_stream.
+        // `presence_stream` subscribes here, before the join below.
         let sse = presence_stream(&state, "body-poll-test");
         let response = sse.into_response();
 
-        // Trigger a join event after the subscription is established.
         let _handle = presence_svc.track("body-poll-test", "frank", serde_json::json!({}));
 
         let mut body = response.into_body();
-        // Poll for one frame — this drives the map closure that builds the OOB badge.
-        // `frame()` returns Option<Result<Frame<Bytes>, Error>>.
+        // One frame drives the closure that builds the OOB badge.
         let frame_result =
             tokio::time::timeout(std::time::Duration::from_millis(500), body.frame())
                 .await
@@ -890,13 +871,12 @@ mod tests {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
                     let text = String::from_utf8_lossy(&data);
-                    // The SSE data line carries the OOB badge HTML.
                     assert!(
                         text.contains("presence-badge") || text.contains("hx-swap-oob"),
                         "expected OOB badge in SSE frame, got: {text}"
                     );
                 }
-                // If it's a trailers frame that's fine — the closure fired.
+                // A trailers frame is fine: the closure still fired.
             }
             Some(Err(e)) => panic!("SSE body error: {e}"),
             None => panic!("SSE body ended without yielding a frame"),

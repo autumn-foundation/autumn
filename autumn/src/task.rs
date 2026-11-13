@@ -513,12 +513,8 @@ mod tests {
 
     #[test]
     fn validate_unique_scheduled_task_names_rejects_duplicates() {
-        // Regression (#1342 review round 12): collect_retention_tasks()
-        // only catches collisions among retention-generated names, not a
-        // collision with a hand-declared `tasks![...]` entry (e.g. an
-        // operator's own #[scheduled] task that happens to be named
-        // `retention-sweep-<table>`). The merged list must be validated as
-        // a whole.
+        // `collect_retention_tasks()` only catches collisions among retention-generated names, so
+        // the merged list must also catch a hand-declared task named `retention-sweep-<table>`.
         fn handler(_state: AppState) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
             Box::pin(async { Ok(()) })
         }

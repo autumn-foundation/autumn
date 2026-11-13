@@ -278,8 +278,7 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) {
                 if idx > 0 {
                     out.push(',');
                 }
-                // A JSON string literal is exactly what `to_string` on a
-                // `Value::String` produces, escapes included.
+                // `to_string` on a `Value::String` yields the escaped JSON string literal.
                 out.push_str(&serde_json::Value::String(key.clone()).to_string());
                 out.push(':');
                 // `keys` came from `map`, so every lookup hits.
@@ -329,10 +328,8 @@ pub fn revision_hash(input: &RevisionHashInput<'_>) -> String {
         hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(bytes);
     }
-    // Nullable fields carry a presence tag before their bytes. Without it a
-    // `NULL` and an empty string hash identically, so flipping a revision's
-    // `tenant_id` from NULL to `''` — which changes which tenant's chain the row
-    // belongs to — would leave every stored hash valid.
+    // The presence tag keeps `NULL` and `''` from hashing alike: otherwise flipping `tenant_id`
+    // from NULL to `''` would move a row to another tenant's chain with every hash still valid.
     fn optional_field(hasher: &mut Sha256, value: Option<&str>) {
         field(hasher, if value.is_some() { b"\x01" } else { b"\x00" });
         field(hasher, value.unwrap_or("").as_bytes());
@@ -891,19 +888,14 @@ fn high_water_break(
     high_water: LedgerHighWaterState<'_>,
 ) -> Option<LedgerBreakReport> {
     let high_water = match high_water {
-        // Nothing was read, so there is nothing to disagree with.
         LedgerHighWaterState::NotChecked => return None,
         LedgerHighWaterState::Absent => None,
         LedgerHighWaterState::Present(mark) => Some(mark),
     };
     match (head, high_water) {
-        // No chain and no mark: a record that was never written, or one that
-        // predates the day its model was ledgered. Not an accusation — see
-        // `live_state_break` for why that false positive matters.
+        // Never written, or written before its model was ledgered. Not tampering.
         (None, None) => None,
-        // A mark with no chain at all. The mark is proof the chain existed, so
-        // this is the wholesale erasure that was previously indistinguishable
-        // from the case above.
+        // The mark proves a chain existed: the whole chain was erased.
         (None, Some(mark)) => Some(LedgerBreakReport {
             seq: 1,
             revision_id: None,
@@ -978,20 +970,10 @@ fn head_versus_mark(head: &ChainTip, mark: &LedgerHighWater) -> Option<LedgerBre
 /// Runs only after the chain itself verifies, so a mismatch here always means
 /// the *end* of the history is missing rather than its middle being edited.
 fn live_state_break(head: Option<&ChainTip>, live: LedgerLiveState) -> Option<LedgerBreakReport> {
-    // An empty chain is never a break, whatever the live row says.
-    //
-    // A record may simply never have been written, or may predate the day its model was
-    // ledgered. Ledgering is non-destructive but not retroactive, so rows written before
-    // the marker went on legitimately have no chain until their first subsequent write:
-    // that is the documented, expected state of every existing row on the day a team
-    // adopts the feature, and accusing it would put a false positive in front of every
-    // such deployment, against the one metric this module is held to.
-    //
-    // A wholly erased chain used to be indistinguishable from a pre-ledgering row from
-    // inside the database. `high_water_break` tells them apart now (#2323): the mark lives
-    // outside the deletable rows and survives the erasure, so a chain with a mark and no
-    // revisions is reported while one with neither stays silent. `revisions_checked == 0`
-    // on the report is still what makes the empty case visible to a caller that cares.
+    // An empty chain is never a break, whatever the live row says. Ledgering is not
+    // retroactive: every row written before a model was ledgered has no chain until its next
+    // write, and reporting those would be a false positive on every adopting deployment.
+    // `high_water_break` catches a wholly erased chain through its surviving mark.
     let head = head?;
 
     match live {
@@ -1642,8 +1624,8 @@ pub async fn read_revisions_page(
             "delete" => VersionOp::Delete,
             _ => VersionOp::Update,
         };
-        // A snapshot that does not parse, or is not its canonical text, is
-        // evidence of tampering (#2326). It is an error, not an empty record.
+        // A snapshot that does not parse or is not canonical is tampering: an error, not an
+        // empty record.
         let snapshot = parse_stored_snapshot(table_name, record_id, row.seq, &row.snapshot)?;
         revisions.push(LedgerRevision {
             id: row.id,
@@ -2347,17 +2329,12 @@ pub fn ensure_snapshot_recoverable(
     ))
 }
 
-// ── Runtime append (#2309 follow-up) ─────────────────────────────────
+// ── Runtime append ───────────────────────────────────────────────────
 //
-// `#[repository(ledgered)]` used to expand this whole read-then-write — a local
-// chain-state struct and two `QueryableByName` derives included — at every one of the
-// ~30 mutation sites `vh_insert_ts` covers. That alone took a ledgered repository's
-// generated source from 72 KB to 508 KB, and none of it was model-specific:
-// `RuntimeConnection` is a concrete type alias and every bound value is a primitive or a
-// `serde_json::Value` the caller already built. Hoisted here it compiles once per program
-// instead of once per repository. The generated code keeps only the parts that genuinely
-// need the model — the durable per-field snapshot codec, the typed `deleted_at` read-back
-// on the soft-delete path, and `LedgeredRecord::ledger_valid_from` — and calls this.
+// Nothing here is model-specific, so it lives in the crate and compiles once per program
+// instead of being expanded at every `#[repository(ledgered)]` mutation site. Generated code
+// keeps only the model-specific parts (snapshot codec, `deleted_at` read-back,
+// `ledger_valid_from`) and calls this.
 
 /// Everything the append reads before it can decide its own sequence number and
 /// transaction time.
@@ -2514,10 +2491,8 @@ async fn read_chain_state(
     {
         use diesel::sql_types::TimestamptzSqlite;
 
-        // `db_now` comes back as the `strftime` text rather than a bound
-        // timestamp: the accepted encoding is then pinned by
-        // `parse_sqlite_instant`'s own test in this crate instead of by
-        // whichever format list Diesel's SQLite decoder carries.
+        // `db_now` is read as `strftime` text, so `parse_sqlite_instant` (and its test) pins the
+        // accepted format rather than Diesel's SQLite decoder.
         #[derive(diesel::QueryableByName)]
         struct Row {
             #[diesel(sql_type = Text)]
@@ -2686,27 +2661,16 @@ impl ChainState {
 /// [`LedgerError::ChainUnreadable`].
 #[cfg(feature = "db")]
 fn plan_revision(state: &ChainState, append: &LedgerAppend<'_>) -> Result<PlannedRevision, String> {
-    // #2323: the mark is cross-checked on the write path too, not only by
-    // `ledger_verify`. Without this the append is a free repair — delete the newest
-    // revision and the mark, wait for ordinary traffic, and the append would re-create
-    // both consistently, exactly the laundering this issue exists to stop.
+    // The write path checks the mark too, or an append would re-create a deleted revision's
+    // mark and launder the evidence. Refuse where appending would destroy evidence; allow
+    // where it survives:
     //
-    // One rule decides which disagreements refuse: refuse where appending would destroy
-    // the evidence, allow where the evidence survives the append.
-    //
-    //   * Mark gone beside a live chain, and mark describing a different revision — a
-    //     different hash or a different instant — at the head's own sequence number: the
-    //     append would overwrite the mark and the disagreement with it. Refuse. The second
-    //     test is identical to the one `head_versus_mark` reports `HighWaterMismatch` on,
-    //     so nothing verify can see is something an ordinary write can erase.
-    //   * Mark behind the head: legitimate, since a pre-#2323 node in a mixed-version
-    //     fleet appends without raising the mark. Allow; the write heals it, as
-    //     `HighWaterBehind`'s docs promise.
-    //   * Mark ahead of the head, a deleted tail: the append allocates past the gap, which
-    //     is permanent. Allow.
-    //   * Mark present with no chain at all, a wholly erased chain: the append starts above
-    //     seq 1, which `verify` reports as a `MissingRevision` forever. Allow — bricking
-    //     the record would buy no evidence that is not already permanent.
+    //   * No mark beside a live chain, or a mark naming a different revision at the head's
+    //     seq: the append would overwrite the disagreement. Refuse.
+    //   * Mark behind the head: an older node in a mixed-version fleet appends without
+    //     raising it. Allow; the write heals it.
+    //   * Mark ahead of the head, or a mark with no chain: the append allocates past the gap,
+    //     which `verify` keeps reporting. Allow.
     if state.head_seq.is_some() && state.mark_seq.is_none() {
         return Err(
             "the record has revisions but no high-water mark; the mark that makes a \
@@ -2716,14 +2680,9 @@ fn plan_revision(state: &ChainState, append: &LedgerAppend<'_>) -> Result<Planne
                 .to_string(),
         );
     }
-    // A mark names a real revision, so its sequence number starts at 1. Below
-    // that it contributes nothing to the `max` below — the append would allocate
-    // as if no mark existed and then raise the mark over the top of it, erasing
-    // an accusation `ledger_verify` had already made (`MissingRevision` beside
-    // an empty chain, `HighWaterBehind` beside a live one). Both schemas carry a
-    // `CHECK (high_seq >= 1)` so the row cannot be written in the first place;
-    // this is the second lock on the same door, for a database whose constraint
-    // was dropped.
+    // A mark below 1 adds nothing to the `max` below, so the append would overwrite it and
+    // erase what `ledger_verify` reports. The schemas' `CHECK (high_seq >= 1)` forbids such a
+    // row; this covers a database whose constraint was dropped.
     if state.mark_seq.is_some_and(|seq| seq < 1) {
         return Err(
             "the record's high-water mark carries a sequence number below 1, which \
@@ -2733,12 +2692,9 @@ fn plan_revision(state: &ChainState, append: &LedgerAppend<'_>) -> Result<Planne
                 .to_string(),
         );
     }
-    // Deliberately the same condition `head_versus_mark` reports
-    // `HighWaterMismatch` on, `recorded_at` included. Anything verify calls a
-    // mismatch and the writer overwrites anyway is an accusation ordinary
-    // traffic launders away — the mark's instant carries no hash of its own, so
-    // rewriting only that field would otherwise be reported once and then
-    // quietly erased by the next append.
+    // The same condition `head_versus_mark` reports as `HighWaterMismatch`, `recorded_at`
+    // included: the mark's instant has no hash, so an edit to it alone would otherwise be
+    // erased by the next append.
     if state.mark_seq == state.head_seq
         && (state.mark_hash.as_deref() != state.head_hash.as_deref()
             || state.mark_recorded_at != state.head_recorded_at)
@@ -2752,16 +2708,11 @@ fn plan_revision(state: &ChainState, append: &LedgerAppend<'_>) -> Result<Planne
         );
     }
 
-    // The sequence number is allocated from the greater of the surviving chain
-    // head and the out-of-band high-water mark, never from the chain alone.
-    // Deleting the newest revision and letting an ordinary write land therefore
-    // leaves a gap where the deleted revision was, instead of quietly re-using
-    // its number.
+    // Allocate past the mark, not just the chain: a deleted newest revision leaves a gap
+    // instead of having its number reused.
     let seq_base: i64 = state.head_seq.unwrap_or(0).max(state.mark_seq.unwrap_or(0));
     if seq_base == i64::MAX {
-        // Saturating here would allocate `i64::MAX` a second time and fail on
-        // the chain unique index with an opaque constraint error, once per
-        // attempt, forever. Say what actually happened.
+        // Saturating would reuse `i64::MAX` and fail on the unique index with an opaque error.
         return Err(
             "the record's chain is at i64::MAX and cannot be continued; no further \
              revision can be numbered"
@@ -2769,22 +2720,16 @@ fn plan_revision(state: &ChainState, append: &LedgerAppend<'_>) -> Result<Planne
         );
     }
     let seq: i64 = seq_base.saturating_add(1);
-    // The chain still links to the revision that is actually there.
+    // Link to the surviving head, not to the mark.
     let prev_hash: Option<String> = state.head_hash.clone();
 
-    // Transaction time, sourced from the database rather than this host's clock
-    // and clamped so it can never precede the revision it follows. Truncated to
-    // microseconds, the precision both storage tiers keep, so the value that is
-    // hashed is the value that comes back on read and `ledger_verify` stays
-    // true.
+    // Transaction time comes from the database clock, clamped to never precede the previous
+    // revision, and truncated to microseconds (what both tiers store) so the hashed value is
+    // the value read back.
     //
-    // The mark's instant is used as a floor only when the mark reaches PAST the
-    // head — the truncation case, where the revision that carried the real
-    // instant is gone. Otherwise the head's own instant, which its hash covers,
-    // is the floor: the mark's carries no hash of its own, so trusting it in the
-    // ordinary case would let one out-of-band UPDATE ratchet the record's
-    // transaction time forward for good. `Option`'s ordering puts `None` below
-    // every `Some`, so `max` picks whichever floor exists.
+    // The mark's instant is a floor only when the mark is past the head (a deleted tail).
+    // Otherwise the head's hashed instant is: the mark's has no hash, so trusting it would
+    // let one out-of-band UPDATE ratchet transaction time forward. `None < Some` in `max`.
     let floor = if state.mark_seq > state.head_seq {
         state.head_recorded_at.max(state.mark_recorded_at)
     } else {
@@ -2798,8 +2743,7 @@ fn plan_revision(state: &ChainState, append: &LedgerAppend<'_>) -> Result<Planne
              than ratcheting",
         )
     })?;
-    // Valid time: the model's own instant when it declares one, else the
-    // transaction time (the fact became true when the database learned it).
+    // Valid time defaults to the transaction time when the model declares none.
     let valid_from = append.valid_from.map_or(recorded_at, truncate_to_micros);
 
     let hash: String = revision_hash(&RevisionHashInput {
@@ -3295,7 +3239,6 @@ async fn plan_batch(
         ));
     }
 
-    // Each chain one time, in first-seen order.
     let mut seen = std::collections::HashSet::with_capacity(appends.len());
     let keys: Vec<(i64, Option<&str>)> = appends
         .iter()
@@ -3544,10 +3487,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn ledger_append_statements_keep_their_contract() {
-        // The snapshot is stored as TEXT. A `::jsonb` cast would re-render every
-        // number through `numeric` and hand back different bytes than were
-        // hashed, so `ledger_verify` would report `HashMismatch` on an
-        // untampered chain.
+        // A `::jsonb` cast would re-render numbers through `numeric`, so the stored bytes would
+        // no longer match the hash.
         assert!(
             !REVISION_INSERT_SQL.contains("::jsonb"),
             "the snapshot must not be cast to jsonb: {REVISION_INSERT_SQL}"
@@ -3560,8 +3501,7 @@ mod tests {
             "the revision insert must name all twelve columns: {REVISION_INSERT_SQL}"
         );
 
-        // The mark can be raised but never lowered — that guard is what makes it
-        // monotonic in the database rather than merely in the code above it.
+        // The database itself refuses to lower the mark.
         assert!(
             HIGH_WATER_UPSERT_SQL.contains("ON CONFLICT (table_name, tenant_key, record_id)"),
             "the mark is keyed per (table, tenant, record): {HIGH_WATER_UPSERT_SQL}"
@@ -4222,12 +4162,8 @@ mod tests {
 
     #[test]
     fn verify_does_not_accuse_a_row_that_predates_ledgering() {
-        // Every existing row on the day a team adopts `ledgered` is in exactly
-        // this state — live, with no chain yet — and the migration guide says so.
-        // Reporting it as tampering would be a false positive on an untouched
-        // deployment. `revisions_checked` is what tells a caller the chain is
-        // empty; `verify_reports_a_wholly_erased_chain_against_its_mark` covers
-        // telling this apart from a wholly erased chain.
+        // Every existing row is live with no chain on the day a team adopts `ledgered`. That is
+        // not tampering; `revisions_checked == 0` tells the caller the chain is empty.
         let report = verify_chain_against(7, &[], LedgerLiveState::Diverged);
         assert!(report.is_intact(), "{report:?}");
         assert_eq!(report.revisions_checked, 0);
@@ -4375,8 +4311,7 @@ mod tests {
 
     #[test]
     fn verify_reports_a_truncated_tail_the_high_water_mark_remembers() {
-        // The #2318 live-row cross-check only sees this in the window before the
-        // next write. The mark sees it whenever `verify` runs.
+        // The live-row cross-check only sees this until the next write; the mark sees it always.
         let full = chain(3);
         let mark = mark_for(&full);
         let truncated = &full[..2];
@@ -4399,9 +4334,8 @@ mod tests {
 
     #[test]
     fn verify_reports_the_gap_a_post_truncation_append_leaves() {
-        // The issue's headline case. Revision 3 is deleted, then an ordinary
-        // write lands: because the writer allocates `max(head, mark) + 1` it
-        // takes 4, not 3, so the evidence survives the append.
+        // Revision 3 is deleted, then an ordinary write lands. The writer allocates
+        // `max(head, mark) + 1`, so it takes 4, not 3, and the gap survives the append.
         let full = chain(4);
         let mut surviving: Vec<LedgerRevision> = full[..2].to_vec();
         surviving.push(full[3].clone());
@@ -4420,9 +4354,7 @@ mod tests {
 
     #[test]
     fn verify_reports_a_wholly_erased_chain_against_its_mark() {
-        // Previously indistinguishable from a row that predates ledgering — the
-        // limitation `verify_does_not_accuse_a_row_that_predates_ledgering`
-        // documents. The mark tells the two apart.
+        // Without the mark this looks like a row that predates ledgering.
         let mark = mark_for(&chain(3));
         let broken = verify_chain_with_high_water(
             7,
@@ -4438,8 +4370,7 @@ mod tests {
 
     #[test]
     fn verify_still_accepts_a_row_that_predates_ledgering() {
-        // No revisions and no mark: exactly what every existing row looks like
-        // on the day a team adopts `ledgered`. Still not an accusation.
+        // No revisions and no mark: every existing row on the day a team adopts `ledgered`.
         let report = verify_chain_with_high_water(
             7,
             &[],
@@ -4452,8 +4383,8 @@ mod tests {
 
     #[test]
     fn verify_reports_a_deleted_high_water_row() {
-        // Deleting the mark is the obvious way to restore the original attack,
-        // so its absence beside a live chain is itself the accusation.
+        // Deleting the mark would re-enable silent tail truncation, so its absence beside a live
+        // chain is itself reported.
         let broken = verify_chain_with_high_water(
             7,
             &chain(3),
@@ -4561,8 +4492,7 @@ mod tests {
 
     #[test]
     fn verify_chain_against_still_checks_without_a_mark() {
-        // The three-argument entry point stays exactly as it was: no mark, no
-        // high-water reporting, so a caller that has not migrated is unaffected.
+        // The entry point without a mark does no high-water reporting.
         let report = verify_chain_against(7, &chain(3), LedgerLiveState::Matches);
         assert!(report.is_intact(), "{report:?}");
     }
@@ -4571,10 +4501,8 @@ mod tests {
 
     #[test]
     fn verify_reports_a_transaction_time_that_moves_backwards() {
-        // Sourcing `recorded_at` from the database and clamping it against the
-        // predecessor makes a regression impossible by construction, so one in
-        // stored data is either a forgery or a chain written by a pre-#2323
-        // writer across a clock step.
+        // The writer clamps `recorded_at` to its predecessor, so a regression in stored data is
+        // a forgery or an old writer's clock step.
         let mut revisions = chain(3);
         revisions[2].recorded_at = revisions[1].recorded_at - chrono::Duration::seconds(1);
         revisions[2].hash = revisions[2].compute_hash();
@@ -4588,10 +4516,9 @@ mod tests {
 
     #[test]
     fn a_transaction_time_regression_never_masks_a_real_break() {
-        // A chain written before #2323 can carry a legitimate regression across
-        // NTP skew between two application nodes, and its rows are immutable — so
-        // if the regression outranked the other checks it would blind them on
-        // that record forever. Both faults present: the truncation is reported.
+        // An old chain can carry a legitimate regression from clock skew between nodes, and its
+        // rows are immutable. If the regression outranked other checks it would hide them on
+        // that record forever, so the truncation is reported.
         let full = chain(4);
         let mark = mark_for(&full);
         let mut truncated = full[..3].to_vec();
@@ -4674,10 +4601,9 @@ mod tests {
 
     #[test]
     fn monotonic_recorded_at_refuses_a_floor_far_ahead_of_the_database_clock() {
-        // The high-water mark's instant carries no hash of its own, so an
-        // out-of-band UPDATE could otherwise ratchet a record's transaction time
-        // arbitrarily far forward — every later revision would hash a future
-        // instant correctly while `snapshot_as_of` quietly stopped returning it.
+        // The mark's instant has no hash, so an out-of-band UPDATE could ratchet transaction
+        // time forward: later revisions would hash a future instant and `snapshot_as_of` would
+        // stop returning them.
         let now = at(0);
         let inside = now + chrono::Duration::seconds(LEDGER_MAX_CLOCK_SKEW_SECS);
         assert_eq!(monotonic_recorded_at(now, Some(inside)), Some(inside));

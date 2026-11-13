@@ -1164,8 +1164,7 @@ mod tests {
             make_route("DELETE", "/items/{id}", plugin("inventory")),
         ];
         let (result, _) = check_collisions(&routes);
-        // Path is shown in normalized form ({id} → {}) so the reader
-        // sees the structural shape that Axum matches on.
+        // The path is normalized ({id} → {}) to the shape Axum matches on.
         assert!(
             result
                 .diagnostics
@@ -1251,8 +1250,7 @@ mod tests {
 
     #[test]
     fn collisions_catchall_vs_named_param_detected() {
-        // matchit treats {id} and {*rest} at the same position as a conflict:
-        // inserting /src/{file} after /src/{*filepath} returns InsertError::Conflict.
+        // matchit rejects a named param and a catch-all at the same position as a conflict.
         let routes = vec![
             make_route("GET", "/files/{id}", RouteSource::User),
             make_route("GET", "/files/{*rest}", plugin("storage")),
@@ -1576,9 +1574,8 @@ mod tests {
 
     #[test]
     fn run_conformance_no_routes_fails_closed_without_the_registered_name() {
-        // The plugin's own `contract()` has no `registered_as`: only
-        // `AppBuilder::plugin` fills it. The real route name is then unknown,
-        // so any plugin route contradicts `no_routes`.
+        // The plugin's own `contract()` has no `registered_as` (only `AppBuilder::plugin`
+        // fills it), so the route name is unknown and any plugin route contradicts `no_routes`.
         let routes = vec![make_route(
             "GET",
             "/cache/stats",
@@ -1600,9 +1597,8 @@ mod tests {
 
     #[test]
     fn run_conformance_no_routes_with_the_builder_contract() {
-        // The documented flow: a plugin with the default `Plugin::name()`
-        // (its type path) that mounts a route, and the contract that the
-        // builder enriched.
+        // The documented flow: a plugin with the default `Plugin::name()` (its type path)
+        // mounts a route, checked against the contract the builder enriched.
         #[crate::get("/cache/stats")]
         async fn stats() -> &'static str {
             "stats"
@@ -1955,8 +1951,7 @@ mod tests {
 
     #[test]
     fn path_with_admin_as_substring_of_longer_segment_not_sensitive() {
-        // "administrator" as a whole segment IS caught (starts_with("admin"))
-        // but this is intentional per the spec: admin-prefixed segments are sensitive
+        // "admiration" does not start with "admin"; "administrator" would be sensitive.
         assert!(!is_sensitive_path("/products/admiration"));
     }
 }

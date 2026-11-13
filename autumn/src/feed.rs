@@ -496,10 +496,9 @@ fn escape_into(out: &mut String, s: &str) {
 fn skip_clean(bytes: &[u8], from: usize) -> usize {
     let mut i = from;
     while let Some(block) = bytes.get(i..i + 16) {
-        // Accumulating into a `u8` (not a `bool`) is what lets LLVM vectorize
-        // the loop. `b | 1 == 0x27` matches `&`/`'`, `b | 2 == 0x3E` matches `<`/`>`;
-        // both are exact for the two characters they name and may over-flag
-        // others, which only sends the block to the exact table scan below.
+        // A `u8` accumulator (not a `bool`) lets LLVM vectorize the loop. `b | 1 == 0x27`
+        // matches `&`/`'` and `b | 2 == 0x3E` matches `<`/`>`; any other byte they over-flag
+        // only sends the block to the exact table scan below.
         let mut flagged = 0u8;
         for &b in block {
             // Non-short-circuit `|` on purpose: branch-free is what vectorizes.
@@ -643,16 +642,15 @@ mod proptests {
 
     #[test]
     fn escape_drops_control_bytes_on_an_otherwise_clean_ascii_string() {
-        // A bare control byte (below 0x20, not tab/newline/CR) has no special
-        // ASCII characters, so the fast path's own scan — not just the
-        // non-ASCII check — must still catch it.
+        // A bare control byte (below 0x20, not tab/newline/CR) is plain ASCII, so the fast
+        // path's own scan, not only its non-ASCII check, must catch it.
         assert_eq!(escape("a\u{1}b"), "ab");
     }
 
     #[test]
     fn escape_still_filters_noncharacters_in_non_ascii_input() {
-        // U+FFFE is dropped by `is_xml_char`; the fast path must route any
-        // non-ASCII input to the full per-char path so this still happens.
+        // `is_xml_char` drops U+FFFE, so the fast path must send non-ASCII input to the
+        // per-char path.
         assert_eq!(escape("café\u{FFFE}!"), "café!");
     }
 
@@ -700,10 +698,9 @@ mod proptests {
 
             let out = feed.render();
             prop_assert!(out.starts_with("<?xml version=\"1.0\""));
-            // The injected markers must not survive as raw tags.
             prop_assert!(!out.contains("<x>"));
-            // Structural `</feed>` appears exactly once (Atom) / zero times
-            // (RSS) — the injected copy in the body must not add another.
+            // The structural `</feed>` appears once (Atom) or never (RSS); the injected copy
+            // must not add another.
             let expected_close = usize::from(!rss);
             prop_assert_eq!(out.matches("</feed>").count(), expected_close);
         }

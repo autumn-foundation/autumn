@@ -137,35 +137,14 @@ impl PolicyContext {
     pub async fn from_session(session: &Session, auth_session_key: &str) -> Self {
         let user_id = session.get(auth_session_key).await;
 
-        // Seed the ambient current actor (#1383) with the authenticated session
-        // user, mirroring how `auth.rs` publishes the principal next to
-        // `log::context::set_user_id`. This is the single seam that covers every
-        // `#[repository(policy = ...)]` route which gates on a
-        // session-authenticated policy check but is NOT also wrapped by
-        // `RequireAuth`/`#[secured]`/an API-token bearer (the three existing
-        // `set_actor` sites) — without this, such a route's versioned writes
-        // would fall back to `SYSTEM_ACTOR` even though a real user is in scope.
+        // Publish the session user as the ambient actor (#1383), so versioned writes on a
+        // policy-gated route that has no `RequireAuth`/`#[secured]`/bearer token are attributed
+        // to them instead of `SYSTEM_ACTOR`. This is only a fallback: an actor already in scope
+        // (bearer token, `RequireAuth`, `with_actor`) wins. An empty request scope reads as `None`
+        // (it does not fall back to the process default), so the seed still fires there.
+        // `set_actor` is a no-op outside a request scope, so non-request callers are safe.
         //
-        // This session seed is only a *fallback*: it never overrides an
-        // already-established principal. If a stronger actor is already in scope
-        // — an API-token bearer, `RequireAuth`/`#[secured]`, or an explicit
-        // `with_actor(...)` scope — `Current::actor()` is already `Some`, so we
-        // skip the seed and the stronger actor wins (a request carrying both a
-        // bearer token and a session cookie stays attributed to the token
-        // principal). It also never overrides an explicit `AuditEvent` actor or a
-        // `before_*` hook's `ctx.actor`, which are applied downstream.
-        //
-        // In-request but with nothing yet published, the empty `CURRENT_ACTOR`
-        // scope makes `Current::actor()` return `None` (an in-scope unset does not
-        // consult the process default), so a pure policy+session route still gets
-        // seeded here. `set_actor` is a no-op outside an established request scope,
-        // so this stays panic-safe for non-request callers (e.g. hand-rolled
-        // policy unit tests), and it never publishes for an anonymous session
-        // (guarded on `Some`).
-        //
-        // Impersonation (#1394): when the session carries an impersonator, that
-        // operator — not the user the request resolves as — is the principal
-        // responsible for the writes this policy check gates.
+        // Under impersonation (#1394) the impersonating operator is the actor.
         if crate::current::Current::actor().is_none()
             && let Some(user_id) = &user_id
         {
@@ -1241,7 +1220,6 @@ mod tests {
 
     #[test]
     fn non_user_principal_authorizes_purely_on_scopes() {
-        // No user id, no roles — a pure service token — yet scopes authorize.
         let c = ctx(None, None).with_scopes(vec!["posts:write".to_owned()]);
         assert!(!c.is_authenticated());
         assert!(c.user_id_i64().is_none());
@@ -1259,12 +1237,8 @@ mod tests {
 
     #[tokio::test]
     async fn from_session_seeds_current_actor_for_authenticated_user() {
-        // Mirrors the request path: the log-context middleware establishes an
-        // empty current-actor scope, then a session-authenticated policy check
-        // resolves the user via `from_session`. Even without RequireAuth /
-        // #[secured] / an API-token bearer having fired, the resolved user must
-        // become the ambient actor so versioned writes attribute to them rather
-        // than falling back to SYSTEM_ACTOR (#1383).
+        // Mirrors the request path: middleware opens an empty actor scope, then a policy check
+        // resolves the session user, who must become the ambient actor (#1383).
         crate::current::scope_request(async {
             assert_eq!(crate::current::Current::actor(), None);
             let session = session_with(Some("42"), Some("editor"));
@@ -1277,8 +1251,6 @@ mod tests {
 
     #[tokio::test]
     async fn from_session_leaves_current_actor_none_for_anonymous() {
-        // An anonymous session must never publish an actor, so unauthenticated
-        // requests behave exactly as before this feature existed.
         crate::current::scope_request(async {
             let session = session_with(None, None);
             let c = PolicyContext::from_session(&session, "user_id").await;
@@ -1290,17 +1262,13 @@ mod tests {
 
     #[tokio::test]
     async fn from_session_does_not_override_existing_actor() {
-        // The session seed is only a fallback. When a stronger principal is
-        // already established — an API-token bearer, RequireAuth/#[secured], or an
-        // explicit `with_actor(...)` scope — `from_session` must NOT clobber it,
-        // even if the request also carries a session cookie for a different user.
+        // A principal already in scope (bearer token, `RequireAuth`, `with_actor`) must win over
+        // a session cookie for a different user.
         crate::current::scope_request(async {
             crate::current::Current::set_actor("token-principal".to_owned());
             let session = session_with(Some("42"), Some("editor"));
             let c = PolicyContext::from_session(&session, "user_id").await;
-            // The session user is still resolved into the context...
             assert_eq!(c.user_id.as_deref(), Some("42"));
-            // ...but the already-established principal wins as the ambient actor.
             assert_eq!(
                 crate::current::Current::actor(),
                 Some("token-principal".to_owned())
@@ -1503,7 +1471,6 @@ mod tests {
         let registry = PolicyRegistry::default();
         registry.register_policy::<Note, _>(AdminOrOwnerPolicy);
         let state = detached_state_with(registry.clone(), ForbiddenResponse::Forbidden403);
-        // `state` already has the registry we passed in via `detached_state_with`.
 
         let session = session_with(Some("99"), None); // not the owner, no role
         let n = Note { author_id: 42 };
@@ -1656,8 +1623,6 @@ mod tests {
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
         let session = session_with(Some("42"), None);
         let n = Note { author_id: 42 };
-        // The macro-internal alias goes through `authorize` — exercise
-        // the full round-trip.
         __check_policy::<Note>(&state, &session, "update", &n)
             .await
             .unwrap();
@@ -1673,7 +1638,6 @@ mod tests {
         let ctx = PolicyContext::from_request(&state, &session).await;
         assert_eq!(ctx.user_id.as_deref(), Some("7"));
         assert!(ctx.has_role("admin"));
-        // The registry was cloned from state — `Note` resolves.
         assert!(ctx.policy_registry.has_policy::<Note>());
     }
 
@@ -1682,11 +1646,9 @@ mod tests {
         let state = detached_state();
         let session = session_with(Some("1"), None);
         let ctx = PolicyContext::from_request(&state, &session).await;
-        // No scope registered for `Note`.
         let _query = Note::scope(&ctx);
-        // The `db`-feature `load(&mut conn)` form is exercised by the
-        // testcontainer suite; here we just confirm the registry-miss
-        // surfaces only at `.load()` time, not at `scope(&ctx)` time.
+        // A missing scope surfaces at `.load()`, not at `scope(&ctx)`; `load` itself is covered
+        // by the testcontainer suite.
         assert!(ctx.policy_registry.scope::<Note>().is_none());
     }
 

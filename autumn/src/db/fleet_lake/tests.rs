@@ -202,7 +202,7 @@ const TOTALS: &str = "SELECT COUNT(*) AS rows, SUM(n) AS total, SUM(price) AS pr
                       COUNT(data) AS blobs, group_concat(body, ',' ORDER BY body) AS bodies \
                       FROM notes";
 
-// ── AC: the lake matches the fleet, with no volume ──────────────────────────
+// ── The lake matches the fleet, with no volume ──────────────────────────────
 
 #[tokio::test]
 async fn three_tenants_aggregate_matches_the_fleet_with_no_volume() {
@@ -327,7 +327,7 @@ async fn more_tenants_than_the_attach_cap_load() {
     assert_eq!(order, sorted);
 }
 
-// ── AC: deleted tenants are excluded ────────────────────────────────────────
+// ── Deleted tenants are excluded ────────────────────────────────────────────
 
 #[tokio::test]
 async fn a_deleted_tenant_is_excluded_by_its_row_and_by_its_marker() {

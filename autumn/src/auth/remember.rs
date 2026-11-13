@@ -184,8 +184,6 @@ pub fn hash_remember_token(token: &str) -> String {
 /// without early-exit so timing does not leak how many leading bytes matched.
 #[must_use]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // `subtle::ConstantTimeEq` folds the whole slice into a single Choice with
-    // no data-dependent branches.
     use subtle::ConstantTimeEq as _;
     if a.len() != b.len() {
         return false;
@@ -402,8 +400,6 @@ mod tests {
 
     #[test]
     fn evaluate_current_token_rotates_even_with_previous_present() {
-        // With a previous token recorded, the CURRENT token must still Rotate
-        // (not merely Accept).
         let current = "current-token";
         let record = RememberRecord {
             series: "series-1".to_owned(),
@@ -420,8 +416,7 @@ mod tests {
 
     #[test]
     fn evaluate_previous_token_within_grace_is_accept() {
-        // A benign concurrent request: it presents the just-rotated-out token,
-        // and we are still inside the grace window since the rotation.
+        // A benign concurrent request still holding the just-rotated-out token.
         let previous = "just-rotated-out";
         let record = RememberRecord {
             series: "series-1".to_owned(),
@@ -444,8 +439,6 @@ mod tests {
 
     #[test]
     fn evaluate_previous_token_after_grace_is_theft() {
-        // Same previous token, but the grace window has elapsed → genuine
-        // replay of a rotated-out token → Theft.
         let previous = "rotated-out-long-ago";
         let record = RememberRecord {
             series: "series-1".to_owned(),
@@ -478,8 +471,7 @@ mod tests {
 
     #[test]
     fn evaluate_unknown_token_with_previous_present_is_theft() {
-        // A token that matches neither current nor previous → Theft, even
-        // within the grace window.
+        // Matches neither current nor previous: Theft even within the grace window.
         let record = RememberRecord {
             series: "series-1".to_owned(),
             token_hash: hash_remember_token("current-token"),
@@ -495,8 +487,7 @@ mod tests {
 
     #[test]
     fn evaluate_wrong_token_no_previous_is_theft_not_accept() {
-        // A record with no previous token presenting a wrong token must be
-        // Theft — the Accept path requires a recorded previous hash.
+        // Accept requires a recorded previous hash, so this is Theft.
         let record = RememberRecord {
             series: "series-1".to_owned(),
             token_hash: hash_remember_token("the-current-token"),
@@ -533,7 +524,6 @@ mod tests {
             evaluate_remember(token, Some(&record), ts(1_000), grace()),
             RememberDecision::Reject
         );
-        // now strictly after expiry.
         assert_eq!(
             evaluate_remember(token, Some(&record), ts(1_001), grace()),
             RememberDecision::Reject
@@ -615,9 +605,7 @@ mod tests {
     fn config_deserializes_partial_toml() {
         let config: RememberConfig =
             toml::from_str("duration_secs = 3600").expect("valid partial config");
-        // Overridden field takes effect...
         assert_eq!(config.duration_secs, 3_600);
-        // ...while the others fall back to their defaults.
         assert!(config.enabled);
         assert_eq!(config.cookie_name, "autumn.remember");
     }

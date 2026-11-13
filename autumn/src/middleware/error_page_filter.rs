@@ -67,18 +67,10 @@ impl ExceptionFilter for ErrorPageFilter {
             return response;
         }
 
-        // Preserve the headers already attached to the error response —
-        // `build_html_response` constructs a fresh response, so without this the
-        // rebuilt HTML error page would drop them. Two matter in particular:
-        //   * `X-Request-Id` (stamped by `RequestIdLayer`) — operators need it to
-        //     tie the page to their logs.
-        //   * CORS headers mirrored onto a timeout 503 by the request-timeout
-        //     middleware (`ProblemDetailsFilter` preserves these too). A
-        //     cross-origin HTML/HTMX request that times out would otherwise see an
-        //     opaque CORS failure instead of the styled error page.
-        // Body-representation headers (`Content-Type`/`Content-Length`/
-        // `Content-Encoding`/...) are dropped because this fresh, uncompressed
-        // HTML body sets its own — see `preserved_error_headers`.
+        // `build_html_response` builds a fresh response, so carry the error response's headers
+        // over: `X-Request-Id` ties the page to the logs, and the CORS headers the timeout
+        // middleware mirrors onto a 503 keep a cross-origin request from seeing an opaque CORS
+        // failure. Body-representation headers are dropped (see `preserved_error_headers`).
         let preserved_headers =
             crate::middleware::exception_filter::preserved_error_headers(&response);
 
@@ -300,10 +292,8 @@ where
     }
 
     fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
-        // Kept as the id itself, and the method as a `Method`: both are
-        // rendered to text only for an error response. The headers are the
-        // one input that must be copied now, before the request moves into
-        // the inner service; the cookies parsed from them wait as well.
+        // The id and method stay typed, and the cookies unparsed: they become text only for an
+        // error response. The headers must be copied now, before the request moves inward.
         let captures_body = self.is_dev && should_capture_body(Some(req.method().as_str()));
         let context = PendingContext {
             wants_html: accepts_html(&req),
@@ -333,17 +323,14 @@ where
             });
         }
 
-        // Dev mode reads the body before the inner call, so the inner service
-        // must move into the future. Use clone-and-replace so we can move inner
-        // into the async block while still having called poll_ready on the
-        // original.
+        // Dev mode reads the body before the inner call, so the inner service moves into the
+        // future. Swap in a clone so the moved service is the one `poll_ready` readied.
         let cloned = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, cloned);
 
         futures::future::Either::Right(Box::pin(async move {
             let mut context = context;
-            // Check Content-Length first to avoid consuming the body when it's
-            // clearly over the cap (preserving the stream for the inner service).
+            // Check Content-Length first so an over-cap body is never consumed.
             let declared_len = req
                 .headers()
                 .get(axum::http::header::CONTENT_LENGTH)
@@ -351,13 +338,10 @@ where
                 .and_then(|s| s.parse::<usize>().ok());
 
             let req = if declared_len.is_none_or(|len| len > BODY_CAPTURE_LIMIT) {
-                // Body size is unknown or known to be too large — don't consume
-                // the stream at all so the downstream handler receives it intact.
+                // Unknown or over-cap size: leave the stream intact for the handler.
                 context.body_truncated = declared_len.is_some_and(|len| len > BODY_CAPTURE_LIMIT);
                 req
             } else {
-                // Content-Length is present and within cap; read the full body
-                // so we can reconstruct it exactly for the downstream handler.
                 let (parts, body) = req.into_parts();
                 let bytes = axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1)
                     .await
@@ -392,8 +376,7 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
 /// Produced by the single canonical negotiator [`accept_preference`]; the
 /// public [`accept_prefers_html`] wrapper is defined in terms of it so all
 /// content negotiation in the crate shares one source of truth.
-// `pub` here is crate-visible only: the enclosing `error_page_filter` module is
-// itself `pub(crate)`, so this never escapes the crate (clippy::redundant_pub_crate).
+// `pub`, not `pub(crate)`: the module is already `pub(crate)` (clippy::redundant_pub_crate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptPreference {
     /// `text/html` wins (explicitly or via q-values).
@@ -428,8 +411,7 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
 /// [`Negotiate`](crate::negotiate::Negotiate) responder (effective-q
 /// resolution) build on this shared parse, so the crate never forks its
 /// `Accept` parsing.
-// `pub` (not `pub(crate)`): the enclosing `error_page_filter` module is itself
-// `pub(crate)`, so these never escape the crate (clippy::redundant_pub_crate).
+// `pub`, not `pub(crate)`: the module is already `pub(crate)` (clippy::redundant_pub_crate).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AcceptQualities {
     /// Best match for `text/html`.
@@ -514,8 +496,7 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
                 continue;
             }
 
-            // Parameter names are case-insensitive (RFC 7231 §3.1.1.1), so the
-            // quality parameter may arrive as `q=` or `Q=`.
+            // Parameter names are case-insensitive (RFC 7231 §3.1.1.1): `q=` or `Q=`.
             if let Some((name, value)) = segment.split_once('=')
                 && name.trim().eq_ignore_ascii_case("q")
                 && let Ok(parsed) = value.trim().parse::<f32>()
@@ -524,15 +505,9 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
             }
         }
 
-        // Record the entry even when `q == 0`: an explicit `q=0` means the type
-        // is *not acceptable* (RFC 7231 §5.3.1), which is distinct from the type
-        // being absent. Consumers that only care about positive preference (the
-        // legacy `accept_preference`/`accept_prefers_html` path) filter these
-        // `q == 0` slots back out; the `Negotiate` responder honours them as
-        // explicit exclusions.
-        // Media types and subtypes are case-insensitive (RFC 7231 §3.1.1.1), so
-        // `Application/JSON` must record the same slot as `application/json`.
-        // Compare without allocating a lowercased copy of the token.
+        // Record `q == 0` too: it means "not acceptable" (RFC 7231 §5.3.1), which differs from
+        // absent. `accept_preference` filters these out; `Negotiate` honours them as exclusions.
+        // Media types are case-insensitive (RFC 7231 §3.1.1.1).
         if mime.eq_ignore_ascii_case("text/html")
             && qualities.html.is_none_or(|(existing_q, _)| q > existing_q)
         {
@@ -582,8 +557,7 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
 fn combine_slots(a: Option<(f32, usize)>, b: Option<(f32, usize)>) -> Option<(f32, usize)> {
     match (a, b) {
         (Some((aq, ai)), Some((bq, bi))) => Some(if (aq - bq).abs() < f32::EPSILON {
-            // Equal q: the earlier list entry is the one the single-slot scan
-            // would have kept (it only replaced on strictly-greater q).
+            // Equal q: the earlier list entry wins.
             if ai <= bi { (aq, ai) } else { (bq, bi) }
         } else if aq > bq {
             (aq, ai)
@@ -604,9 +578,8 @@ fn combine_slots(a: Option<(f32, usize)>, b: Option<(f32, usize)>) -> Option<(f3
 /// earlier list position. Parsing is delegated to the shared
 /// [`accept_qualities`]; this function only applies the enum resolution policy.
 pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
-    // Distinguish a missing/empty `Accept` (no concrete preference at all) from
-    // one that is present but names no html/json/wildcard type. The shared
-    // parser collapses both to all-`None`, so the emptiness check stays here.
+    // `accept_qualities` gives all-`None` both for an empty header and for one naming no
+    // html/json/wildcard type; only the empty one is `Unspecified`.
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -615,9 +588,8 @@ pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
         return AcceptPreference::Unspecified;
     }
 
-    // The legacy enum negotiator predates type wildcards and intentionally does
-    // not consult the `text/*` / `application/*` slots — only the concrete types
-    // and the `*/*` wildcard — so `accept_prefers_html` stays byte-identical.
+    // The `text/*` and `application/*` slots are deliberately ignored here, so
+    // `accept_prefers_html` keeps its behaviour.
     let AcceptQualities {
         html,
         json,
@@ -626,17 +598,10 @@ pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
         ..
     } = accept_qualities(headers);
 
-    // Legacy resolution treats `application/problem+json` as a JSON signal (a
-    // problem+json client wants a JSON error body, not an HTML page). The shared
-    // parser now records it in its own slot, so recombine the two into one
-    // effective JSON signal here — higher q wins, ties broken by earlier list
-    // index — reproducing the original single-slot `(q, index)` semantics
-    // exactly so this path stays byte-identical.
+    // A problem+json client wants a JSON error body, not an HTML page, so it counts as JSON.
     let json = combine_slots(json, problem_json);
 
-    // Legacy resolution only cares about *positive* preference: a `q=0` slot
-    // (now retained by the shared parser) is treated as absent here, exactly
-    // reproducing the pre-`q=0`-aware behaviour of this enum negotiator.
+    // Only positive preference counts here: a `q=0` slot is treated as absent.
     let positive = |slot: Option<(f32, usize)>| slot.filter(|&(q, _)| q > 0.0);
     let (html, json, wildcard) = (positive(html), positive(json), positive(wildcard));
 
@@ -763,9 +728,6 @@ fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value 
 /// `"a[b][c]"` → `["a", "b", "c"]`
 /// `"simple"` → `["simple"]`
 fn bracket_key_segments(key: &str) -> Vec<String> {
-    // Bracket notation: `split_once` yields the head segment and the remainder
-    // past the first '[' without any index arithmetic or slicing, then each
-    // '['-delimited fragment contributes one more segment.
     if let Some((head, rest)) = key.split_once('[') {
         let mut parts = vec![head.to_owned()];
         for seg in rest.split('[') {
@@ -949,11 +911,10 @@ impl ErrorPageFilter {
         )
             .into_response();
 
-        // Re-attach error info so downstream filters still see it
+        // Re-attach the error info so downstream filters still see it.
         resp.extensions_mut().insert(error.clone());
 
-        // Ensure content-length is set correctly, as middleware might otherwise
-        // drop it in some environments like fallback routes.
+        // Set Content-Length explicitly: some paths, such as fallback routes, drop it otherwise.
         resp.headers_mut().insert(
             axum::http::header::CONTENT_LENGTH,
             axum::http::HeaderValue::from(content_length),
@@ -1049,7 +1010,6 @@ mod tests {
 
     #[test]
     fn prefers_html_for_ac_tie_case() {
-        // Acceptance-criteria case: html has the higher q-value and wins.
         let headers = header_map("application/json;q=0.9, text/html;q=1.0");
         assert!(accept_prefers_html(&headers));
         assert_eq!(accept_preference(&headers), AcceptPreference::Html);
@@ -1068,22 +1028,18 @@ mod tests {
 
     #[test]
     fn accept_preference_maps_cases_and_wrapper_is_unchanged() {
-        // Empty / missing header → Unspecified, wrapper → false.
         let empty = axum::http::HeaderMap::new();
         assert_eq!(accept_preference(&empty), AcceptPreference::Unspecified);
         assert!(!accept_prefers_html(&empty));
 
-        // `*/*` only → Any, wrapper → true.
         let any = header_map("*/*");
         assert_eq!(accept_preference(&any), AcceptPreference::Any);
         assert!(accept_prefers_html(&any));
 
-        // `text/html` → Html, wrapper → true.
         let html = header_map("text/html");
         assert_eq!(accept_preference(&html), AcceptPreference::Html);
         assert!(accept_prefers_html(&html));
 
-        // `application/json` → Json, wrapper → false.
         let json = header_map("application/json");
         assert_eq!(accept_preference(&json), AcceptPreference::Json);
         assert!(!accept_prefers_html(&json));
@@ -1091,8 +1047,6 @@ mod tests {
 
     #[test]
     fn accept_qualities_matches_media_types_case_insensitively() {
-        // Media types are case-insensitive (RFC 7231 §3.1.1.1): a mixed-case
-        // token must record the same slot as its lowercase form.
         let json = accept_qualities(&header_map("Application/JSON"));
         assert_eq!(json.json, Some((1.0, 0)));
         assert_eq!(json.html, None);
@@ -1108,7 +1062,6 @@ mod tests {
 
     #[test]
     fn accept_qualities_matches_q_parameter_case_insensitively() {
-        // Parameter names are case-insensitive: `Q=` must be honoured like `q=`.
         let q = accept_qualities(&header_map("text/html;Q=0.9, application/json;Q=1.0"));
         assert_eq!(q.html, Some((0.9, 0)));
         assert_eq!(q.json, Some((1.0, 1)));
@@ -1221,10 +1174,8 @@ mod tests {
 
     #[tokio::test]
     async fn html_error_page_preserves_mirrored_cors_and_request_id_headers() {
-        // A timeout 503 reaches the error-page filter already carrying the
-        // mirrored CORS headers and the request id, marked as wanting HTML.
-        // The HTML rebuild must not drop them, or a cross-origin browser/HTMX
-        // client sees an opaque CORS failure instead of the styled page.
+        // A timeout 503 arrives carrying mirrored CORS headers and a request id, marked as
+        // wanting HTML. Dropping CORS would show a cross-origin client an opaque CORS failure.
         let renderer = error_pages::default_renderer();
         let filter = ErrorPageFilter {
             renderer,
@@ -1284,10 +1235,8 @@ mod tests {
 
     #[tokio::test]
     async fn html_rebuild_drops_stale_content_encoding() {
-        // An inner response-transforming layer (e.g. a user `CompressionLayer`)
-        // may set `Content-Encoding: gzip` before the exception filter runs. The
-        // rebuilt HTML body is uncompressed, so the stale encoding header must be
-        // dropped or the browser fails to decode the page.
+        // An inner layer such as `CompressionLayer` may set `Content-Encoding: gzip`. The rebuilt
+        // body is uncompressed, so a stale header would make the browser fail to decode it.
         let renderer = error_pages::default_renderer();
         let filter = ErrorPageFilter {
             renderer,
@@ -1845,9 +1794,8 @@ mod tests {
 
     #[test]
     fn extract_path_params_root_wildcard_returns_empty_for_multisegment_uri() {
-        // A wildcard capture like `{*rest}` spans multiple URI segments but the
-        // naive segment-split produces a length mismatch; we should return empty
-        // rather than crashing or silently dropping segments.
+        // `{*rest}` spans several URI segments, so the segment counts differ: expect an empty
+        // map rather than a panic or dropped segments.
         let v = super::extract_path_params("/files/{*rest}", "/files/foo/bar/baz");
         assert_eq!(
             v.as_object().unwrap().len(),
@@ -1856,12 +1804,8 @@ mod tests {
         );
     }
 
-    // ── AC2: path param values scrubbed via ParameterFilter ──────────────────
-
     #[test]
     fn extract_path_params_scrubbed_by_parameter_filter() {
-        // A route like /reset/{token} would expose a sensitive value; the
-        // ParameterFilter should mask it before it appears in the overlay.
         let raw = super::extract_path_params("/reset/{token}", "/reset/abc123secret");
         let filter = crate::log::filter::ParameterFilter::default();
         let scrubbed = filter.scrub_json(&raw);
@@ -1871,12 +1815,8 @@ mod tests {
         );
     }
 
-    // ── AC3: Path Params section hidden when route has no path params ─────────
-
     #[tokio::test]
     async fn dev_badge_hides_path_params_section_for_static_route() {
-        // A route with no `{param}` segments must NOT render the Path Params
-        // section in the overlay.
         let app = test_router_with_error_pages_and_matched_path(true);
         let resp = tower::ServiceExt::oneshot(
             app,
@@ -1899,11 +1839,8 @@ mod tests {
         );
     }
 
-    // ── AC1: overlay shows parsed path params ────────────────────────────────
-
     #[tokio::test]
     async fn dev_badge_shows_path_params_in_overlay() {
-        // A route with a `{id}` param must render the parsed value in the overlay.
         let app = test_router_with_error_pages_and_matched_path(true);
         let resp = tower::ServiceExt::oneshot(
             app,
@@ -1930,14 +1867,10 @@ mod tests {
         );
     }
 
-    // ── AC2 integration: sensitive path param scrubbed in overlay ────────────
-
     #[tokio::test]
     async fn dev_badge_scrubs_sensitive_path_param_in_overlay() {
-        // Route is /tokens/{token}; "token" is a DEFAULT_FILTER_KEYS entry.
-        // The Path Params table must show [FILTERED], not the raw value.
-        // Note: the raw URI path still appears in the "Path" row — only the
-        // *parsed* params map is scrubbed by ParameterFilter.
+        // `token` is a default filter key. The raw URI still appears in the "Path" row; only the
+        // parsed params are scrubbed.
         let app = test_router_with_error_pages_and_matched_path(true);
         let resp = tower::ServiceExt::oneshot(
             app,
@@ -2171,7 +2104,6 @@ mod tests {
             .expect("bytes");
         let body_str = String::from_utf8(body.to_vec()).expect("utf8");
 
-        // In prod mode there is no dev badge at all, so no Body section
         assert!(
             !body_str.contains("autumn-dev-error-badge"),
             "prod mode must not include the dev badge"
@@ -2199,12 +2131,10 @@ mod tests {
             .expect("bytes");
         let body_str = String::from_utf8(body.to_vec()).expect("utf8");
 
-        // The overlay should exist but not have a Body section for GET
         assert!(
             body_str.contains("autumn-dev-error-badge"),
             "dev badge should appear on GET errors"
         );
-        // No "Body" label in the overlay for a GET request
         assert!(
             !body_str.contains(">Body<"),
             "GET requests should not show a Body section"
@@ -2213,12 +2143,11 @@ mod tests {
 
     #[tokio::test]
     async fn dev_badge_skips_body_capture_when_no_content_length() {
-        // Without a Content-Length header the body stream is left unconsumed
-        // so that downstream handlers receive it intact. The overlay simply
-        // shows no body section rather than a potentially truncated preview.
+        // Without Content-Length the stream is left unconsumed for the handler, so the overlay
+        // shows no body rather than a truncated preview.
         let app = test_router_with_error_pages(true);
 
-        // Build a body larger than the 64 KB cap but send no Content-Length.
+        // Larger than the 64 KiB cap, with no Content-Length.
         let large_body = format!("x={}", "a".repeat(70 * 1024));
 
         let response = tower::ServiceExt::oneshot(
@@ -2239,7 +2168,6 @@ mod tests {
             .expect("bytes");
         let body_str = String::from_utf8(body.to_vec()).expect("utf8");
 
-        // No body section and no truncation notice — stream was not consumed.
         assert!(
             !body_str.contains("truncated"),
             "body without Content-Length should not show a truncation notice, got:\n{body_str}"
@@ -2248,8 +2176,6 @@ mod tests {
 
     #[tokio::test]
     async fn dev_badge_truncates_when_content_length_header_exceeds_limit() {
-        // When Content-Length is declared over the cap the body stream is left
-        // unconsumed and the overlay shows a truncation notice immediately.
         let app = test_router_with_error_pages(true);
 
         let over_limit = (BODY_CAPTURE_LIMIT + 1).to_string();
@@ -2261,7 +2187,7 @@ mod tests {
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("content-length", over_limit)
-                // Actual body is small — only Content-Length matters for the early-exit path.
+                // Small body: only the declared Content-Length decides.
                 .body(Body::from("x=1"))
                 .expect("request"),
         )
@@ -2281,7 +2207,6 @@ mod tests {
 
     #[tokio::test]
     async fn dev_badge_scrubs_bracket_notation_form_body_fields() {
-        // user[password]=secret should be treated the same as password=secret.
         let app = test_router_with_error_pages(true);
 
         let response = tower::ServiceExt::oneshot(
@@ -2312,7 +2237,6 @@ mod tests {
             "bracket-prefixed password value must be filtered"
         );
         assert!(body_str.contains("[FILTERED]"), "should show [FILTERED]");
-        // The non-sensitive sibling field should still be visible.
         assert!(
             body_str.contains("alice"),
             "non-sensitive field should remain"
@@ -2321,7 +2245,6 @@ mod tests {
 
     #[tokio::test]
     async fn dev_badge_scrubs_dotted_notation_form_body_fields() {
-        // user.password=secret uses dot notation; must be split and scrubbed.
         let app = test_router_with_error_pages(true);
         let body_str_literal = "user.name=alice&user.password=secret123";
 
