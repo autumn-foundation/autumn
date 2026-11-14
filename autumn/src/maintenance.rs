@@ -14,6 +14,7 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -101,11 +102,24 @@ pub struct MaintenanceConfig {
 
 /// In-process maintenance state, cheaply cloneable across threads.
 ///
-/// Wraps `Arc<RwLock<Option<MaintenanceConfig>>>`:
+/// Holds an `Option<MaintenanceConfig>` behind a lock:
 /// - `None`  → maintenance is off
 /// - `Some(config)` → maintenance is on with that config
+///
+/// Every request asks whether maintenance is on, and it is almost never on.
+/// A flag beside the lock answers "off" with one load: no request takes the
+/// lock, or writes to memory the other workers read, to learn that.
 #[derive(Clone, Debug, Default)]
-pub struct MaintenanceState(Arc<RwLock<Option<MaintenanceConfig>>>);
+pub struct MaintenanceState(Arc<MaintenanceInner>);
+
+#[derive(Debug, Default)]
+struct MaintenanceInner {
+    /// `true` exactly when `config` holds a value. Written with the write
+    /// lock held, after the config, so a reader that sees `true` and then
+    /// takes the lock reads a state at least that new.
+    active: AtomicBool,
+    config: RwLock<Option<MaintenanceConfig>>,
+}
 
 impl MaintenanceState {
     /// Create a new [`MaintenanceState`] with maintenance initially off.
@@ -116,15 +130,10 @@ impl MaintenanceState {
 
     /// Returns `true` when maintenance mode is currently active.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned (a thread panicked while holding the lock).
+    /// Reads a flag and takes no lock.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.0
-            .read()
-            .expect("maintenance state lock poisoned")
-            .is_some()
+        self.0.active.load(Ordering::Acquire)
     }
 
     /// Returns the active [`MaintenanceConfig`], or `None` when off.
@@ -134,7 +143,11 @@ impl MaintenanceState {
     /// Panics if the internal `RwLock` is poisoned (a thread panicked while holding the lock).
     #[must_use]
     pub fn get(&self) -> Option<MaintenanceConfig> {
+        if !self.is_active() {
+            return None;
+        }
         self.0
+            .config
             .read()
             .expect("maintenance state lock poisoned")
             .clone()
@@ -145,8 +158,19 @@ impl MaintenanceState {
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned (a thread panicked while holding the lock).
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the flag is stored with the lock held, so the two never disagree for a reader \
+                  that holds the lock"
+    )]
     pub fn enable(&self, config: MaintenanceConfig) {
-        *self.0.write().expect("maintenance state lock poisoned") = Some(config);
+        let mut slot = self
+            .0
+            .config
+            .write()
+            .expect("maintenance state lock poisoned");
+        *slot = Some(config);
+        self.0.active.store(true, Ordering::Release);
     }
 
     /// Disable maintenance mode.
@@ -154,8 +178,18 @@ impl MaintenanceState {
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned (a thread panicked while holding the lock).
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the flag is stored with the lock held, as in `enable`"
+    )]
     pub fn disable(&self) {
-        *self.0.write().expect("maintenance state lock poisoned") = None;
+        let mut slot = self
+            .0
+            .config
+            .write()
+            .expect("maintenance state lock poisoned");
+        *slot = None;
+        self.0.active.store(false, Ordering::Release);
     }
 
     /// Load state from a JSON flag file written by `autumn maintenance on`.
@@ -268,6 +302,73 @@ const fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_flag_and_the_config_agree_through_every_change() {
+        let state = MaintenanceState::new();
+        let other = state.clone();
+        assert!(!state.is_active() && state.get().is_none());
+
+        let first = MaintenanceConfig {
+            message: Some("first".to_owned()),
+            ..Default::default()
+        };
+        state.enable(first);
+        assert!(other.is_active());
+        assert_eq!(
+            other.get().and_then(|c| c.message).as_deref(),
+            Some("first")
+        );
+
+        // A second `enable` replaces the config and stays on.
+        let second = MaintenanceConfig {
+            message: Some("second".to_owned()),
+            ..Default::default()
+        };
+        other.enable(second);
+        assert!(state.is_active());
+        assert_eq!(
+            state.get().and_then(|c| c.message).as_deref(),
+            Some("second")
+        );
+
+        state.disable();
+        assert!(!other.is_active() && other.get().is_none());
+        // Off twice is still off.
+        state.disable();
+        assert!(!state.is_active() && state.get().is_none());
+    }
+
+    #[test]
+    fn the_flag_and_the_config_agree_after_concurrent_changes() {
+        let state = MaintenanceState::new();
+        let writers: Vec<_> = (0..4)
+            .map(|n| {
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    for i in 0..2_000 {
+                        if (i + n) % 2 == 0 {
+                            state.enable(MaintenanceConfig::default());
+                        } else {
+                            state.disable();
+                        }
+                        // A reader never sees "on" with a config that a
+                        // later state could not hold: `get` is `Some` only
+                        // while a config is stored.
+                        let _ = state.get();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(state.is_active(), state.get().is_some());
+        state.enable(MaintenanceConfig::default());
+        assert!(state.is_active() && state.get().is_some());
+        state.disable();
+        assert!(!state.is_active() && state.get().is_none());
+    }
 
     #[test]
     fn maintenance_state_default_is_off() {

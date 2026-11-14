@@ -508,8 +508,9 @@ struct AmbientEntry {
     start: Duration,
 }
 
-/// The latest [`ambient_instant`] given out in this process, in nanoseconds
-/// after `MONOTONIC_ORIGIN`.
+/// The latest [`ambient_instant`] an installed clock gave out in this
+/// process, in nanoseconds after `MONOTONIC_ORIGIN`. Instants read from the
+/// system clock are not recorded: [`instant_floor`] reads that clock itself.
 ///
 /// A clock installed later starts its instants here, so a new timeline never
 /// starts before an earlier one's instants. State that outlives one `Sim` then
@@ -751,15 +752,23 @@ pub fn ambient_monotonic() -> MonotonicInstant {
 #[must_use]
 pub fn ambient_instant() -> std::time::Instant {
     let offset = match ambient_entry() {
-        Some((clock, floor, start)) => keep_thread_instants_forward(
-            floor.saturating_add(clock.monotonic().since_origin().saturating_sub(start)),
-        ),
+        Some((clock, floor, start)) => {
+            let offset = keep_thread_instants_forward(
+                floor.saturating_add(clock.monotonic().since_origin().saturating_sub(start)),
+            );
+            // Only an installed clock can give an instant ahead of the system
+            // clock, so only its instants move the mark.
+            INSTANT_HIGH_WATER.fetch_max(
+                u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            offset
+        }
+        // A system reading is never after the system reading `instant_floor`
+        // takes later, so it needs no mark. A served request reads this arm
+        // several times, on every worker: it must not write shared state.
         None => SystemClock.monotonic().since_origin(),
     };
-    INSTANT_HIGH_WATER.fetch_max(
-        u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX),
-        std::sync::atomic::Ordering::Relaxed,
-    );
     *MONOTONIC_ORIGIN + offset
 }
 
@@ -1059,6 +1068,33 @@ mod tests {
         assert!(fresh >= stored, "a new timeline does not go back");
         second.advance(hour);
         assert_eq!(ambient_instant().saturating_duration_since(fresh), hour);
+    }
+
+    #[test]
+    fn a_timeline_starts_after_system_instants_given_out_before_it() {
+        // No clock is installed on this thread, so these read the system
+        // clock and record nothing. A clock installed next still starts at or
+        // after them.
+        let before: Vec<std::time::Instant> = (0..64).map(|_| ambient_instant()).collect();
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(clock.clone()));
+        let first = ambient_instant();
+        for earlier in &before {
+            assert!(first >= *earlier, "a timeline does not start in the past");
+        }
+        clock.advance(std::time::Duration::from_secs(90));
+        let stored = ambient_instant();
+        drop(guard);
+
+        // The system clock is behind the 90 s the timeline gave out. A second
+        // timeline still starts after them: the mark holds it.
+        let second = TickingClock::starting_at(epoch);
+        let _guard = install_ambient(Arc::new(second));
+        assert!(
+            ambient_instant() >= stored,
+            "the mark keeps timelines forward"
+        );
     }
 
     #[test]
