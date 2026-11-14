@@ -999,7 +999,10 @@ mod tests {
 
     #[test]
     fn manifest_json_round_trip() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // `save_manifest` replaces the file. Windows cannot replace an open
+        // file, so use a path that no handle holds open.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join(".autumn-assets.json");
         let mut manifest = VendorManifest::default();
         manifest.assets.insert(
             "htmx".into(),
@@ -1010,8 +1013,8 @@ mod tests {
                 integrity: "sha384-abc".into(),
             },
         );
-        save_manifest(tmp.path(), &manifest).unwrap();
-        let loaded = load_manifest(tmp.path()).unwrap();
+        save_manifest(&path, &manifest).unwrap();
+        let loaded = load_manifest(&path).unwrap();
         assert_eq!(loaded.assets.len(), 1);
         let htmx = loaded.assets.get("htmx").unwrap();
         assert_eq!(htmx.version, "2.0.4");
