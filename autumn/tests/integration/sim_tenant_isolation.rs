@@ -130,6 +130,7 @@ fn config(isolated: bool) -> AutumnConfig {
     config.server.max_concurrent_requests = Some(400);
     config.tenancy.enabled = true;
     config.tenancy.source = "header".into();
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     config.tenancy.header_name = "x-tenant-id".into();
     config.jobs.workers = WORKERS;
     if isolated {

@@ -582,6 +582,7 @@ mod system_test_api;
 mod table_boundaries;
 #[cfg(feature = "db")]
 mod tenancy;
+mod tenancy_header_trust;
 mod tenancy_unit;
 mod tenant_bulkhead;
 mod tenant_cell_quota;

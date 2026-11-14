@@ -39,11 +39,13 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
         #[cfg(feature = "custom-domains")]
         let domains =
             state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
+        let proxies = header_proxy_trust(state, &config);
         let tenant_id = extract_tenant_impl(
             parts,
             &config,
             #[cfg(feature = "custom-domains")]
             domains.as_deref().map(AsRef::as_ref),
+            proxies.as_deref(),
         )
         .await?;
         Ok(Self(tenant_id))
@@ -94,6 +96,69 @@ pub async fn extract_tenant_from_parts(
         config,
         #[cfg(feature = "custom-domains")]
         None,
+        None,
+    )
+    .await
+}
+
+/// The proxies that can set the tenant header: the peer addresses in
+/// `security.trusted_proxies.ranges`. `trusted_hops` does not count, because a
+/// client that connects directly can forge the `X-Forwarded-For` chain.
+pub(crate) struct HeaderProxyTrust(Vec<crate::security::trusted_proxies::CidrRange>);
+
+impl HeaderProxyTrust {
+    fn from_config(proxies: &crate::security::TrustedProxiesConfig) -> Self {
+        if !proxies.trust_forwarded_headers {
+            return Self(Vec::new());
+        }
+        Self(
+            proxies
+                .ranges
+                .iter()
+                .filter_map(|range| crate::security::trusted_proxies::CidrRange::parse(range))
+                .collect(),
+        )
+    }
+
+    /// True when the peer address is in a trusted range.
+    fn allows(&self, parts: &axum::http::request::Parts) -> bool {
+        parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .is_some_and(|axum::extract::ConnectInfo(peer)| {
+                self.0.iter().any(|range| range.contains(peer.ip()))
+            })
+    }
+}
+
+/// The policy, built once per app, when the header source uses
+/// `header_trust = "trusted_proxy"`.
+pub(crate) fn header_proxy_trust(
+    state: &crate::AppState,
+    config: &crate::config::AutumnConfig,
+) -> Option<std::sync::Arc<HeaderProxyTrust>> {
+    (config.tenancy.source == "header"
+        && config.tenancy.header_trust == Some(crate::config::TenantHeaderTrust::TrustedProxy))
+    .then(|| {
+        state.extension_or_insert_with(|| {
+            HeaderProxyTrust::from_config(&config.security.trusted_proxies)
+        })
+    })
+}
+
+/// [`extract_tenant_from_parts`] with the trusted-proxy policy cached in `state`.
+pub(crate) async fn extract_tenant_with_state(
+    parts: &mut axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+    state: &crate::AppState,
+) -> Result<String, crate::AutumnError> {
+    let proxies = header_proxy_trust(state, config);
+    extract_tenant_impl(
+        parts,
+        config,
+        #[cfg(feature = "custom-domains")]
+        None,
+        proxies.as_deref(),
     )
     .await
 }
@@ -124,13 +189,16 @@ pub async fn extract_tenant_from_parts_with_domains(
     config: &crate::config::AutumnConfig,
     domains: Option<&crate::custom_domain::CustomDomainRegistry>,
 ) -> Result<String, crate::AutumnError> {
-    extract_tenant_impl(parts, config, domains).await
+    extract_tenant_impl(parts, config, domains, None).await
 }
 
+/// `proxies` is the cached policy for `header_trust = "trusted_proxy"`.
+/// `None` makes the header check build it from `config`.
 async fn extract_tenant_impl(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
     #[cfg(feature = "custom-domains")] domains: Option<&crate::custom_domain::CustomDomainRegistry>,
+    proxies: Option<&HeaderProxyTrust>,
 ) -> Result<String, crate::AutumnError> {
     let replayed = replayed_tenant();
     match &replayed {
@@ -160,13 +228,19 @@ async fn extract_tenant_impl(
         if matches!(replayed, ReplayedTenant::RecordedFailure) {
             return Err(tenant_resolved_after_recorded_failure());
         }
-        record_tenant(Some(&tenant_id));
-        return Ok(tenant_id);
+        let bound = check_session_tenant(parts, config, tenant_id).await;
+        record_tenant(bound.as_ref().ok().map(String::as_str));
+        return bound;
     }
     // A recorded failed lookup runs the real resolver again. The recorded
     // request's headers are restored verbatim, so a run whose recorded failure
-    // *was* a tenant-resolution error reproduces that error.
-    let resolved = extract_tenant_from_parts_inner(parts, config).await;
+    // *was* a tenant-resolution error reproduces that error. A capsule does not
+    // keep the session cookie, so a recorded session-binding failure can resolve
+    // here. The check below then fails the replay closed.
+    let resolved = match extract_tenant_from_parts_inner(parts, config, proxies).await {
+        Ok(tenant_id) => check_session_tenant(parts, config, tenant_id).await,
+        Err(error) => Err(error),
+    };
     // The recording failed here. A lookup that now succeeds would run the
     // request under a tenant production never had, so fail closed.
     if matches!(replayed, ReplayedTenant::RecordedFailure) && resolved.is_ok() {
@@ -176,6 +250,37 @@ async fn extract_tenant_impl(
     // recording never made.
     record_tenant(resolved.as_ref().ok().map(String::as_str));
     resolved
+}
+
+/// Check `tenant_id` against the tenant the session holds.
+///
+/// A session that holds `tenancy.session_key` binds the request to that
+/// tenant. Without this check, a user of tenant A can select tenant B with a
+/// header, a host name or a token. A session without the key does not bind.
+async fn check_session_tenant(
+    parts: &axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+    tenant_id: String,
+) -> Result<String, crate::AutumnError> {
+    // The session source read the tenant from this key.
+    if config.tenancy.source == "session" {
+        return Ok(tenant_id);
+    }
+    let Some(session) = parts.extensions.get::<crate::session::Session>() else {
+        return Ok(tenant_id);
+    };
+    // An empty value does not bind. The values must be equal, with the same case.
+    let mismatch = session
+        .value_matches(&config.tenancy.session_key, |bound| {
+            !bound.trim().is_empty() && bound != tenant_id
+        })
+        .await;
+    if mismatch {
+        return Err(crate::AutumnError::forbidden_msg(
+            "the tenant does not match the session",
+        ));
+    }
+    Ok(tenant_id)
 }
 
 // The `capsule` module is behind the `reporting` feature, so both halves of the
@@ -273,6 +378,34 @@ fn request_host(parts: &axum::http::request::Parts) -> Option<String> {
         })
 }
 
+/// Check that `tenancy.header_trust` lets this sender set the tenant header.
+fn check_header_sender(
+    parts: &axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+    proxies: Option<&HeaderProxyTrust>,
+) -> Result<(), crate::AutumnError> {
+    match config.tenancy.header_trust {
+        // `run` refuses this config at start. This arm covers a router built without `run`.
+        None => Err(crate::AutumnError::internal_server_error_msg(
+            crate::config::TENANT_HEADER_TRUST_MISSING,
+        )),
+        Some(crate::config::TenantHeaderTrust::AnyClient) => Ok(()),
+        Some(crate::config::TenantHeaderTrust::TrustedProxy) => {
+            let trusted = proxies.map_or_else(
+                || HeaderProxyTrust::from_config(&config.security.trusted_proxies).allows(parts),
+                |trust| trust.allows(parts),
+            );
+            if trusted {
+                Ok(())
+            } else {
+                Err(crate::AutumnError::forbidden_msg(
+                    "the tenant header is accepted only from a trusted proxy",
+                ))
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::needless_pass_by_ref_mut,
@@ -283,6 +416,7 @@ fn request_host(parts: &axum::http::request::Parts) -> Option<String> {
 async fn extract_tenant_from_parts_inner(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
+    proxies: Option<&HeaderProxyTrust>,
 ) -> Result<String, crate::AutumnError> {
     if !config.tenancy.enabled {
         return Err(crate::AutumnError::service_unavailable_msg(
@@ -292,15 +426,22 @@ async fn extract_tenant_from_parts_inner(
 
     match config.tenancy.source.as_str() {
         "header" => {
-            let header_value = parts
-                .headers
-                .get(&config.tenancy.header_name)
-                .ok_or_else(|| {
-                    crate::AutumnError::bad_request_msg(format!(
-                        "Missing required tenant header: {}",
-                        config.tenancy.header_name
-                    ))
-                })?;
+            check_header_sender(parts, config, proxies)?;
+            let mut values = parts.headers.get_all(&config.tenancy.header_name).iter();
+            let header_value = values.next().ok_or_else(|| {
+                crate::AutumnError::bad_request_msg(format!(
+                    "Missing required tenant header: {}",
+                    config.tenancy.header_name
+                ))
+            })?;
+            // A proxy that adds its value, and does not replace the client's,
+            // sends two. Do not guess which one is the proxy's.
+            if values.next().is_some() {
+                return Err(crate::AutumnError::bad_request_msg(format!(
+                    "More than one tenant header: {}",
+                    config.tenancy.header_name
+                )));
+            }
             let val = header_value
                 .to_str()
                 .map_err(|_| {
@@ -696,11 +837,13 @@ pub async fn tenancy_middleware(
 
     #[cfg(feature = "custom-domains")]
     let domains = crate::custom_domain::CustomDomainRegistry::from_state(&state);
+    let proxies = header_proxy_trust(&state, &config);
     let tenant_id = match extract_tenant_impl(
         &mut parts,
         &config,
         #[cfg(feature = "custom-domains")]
         domains.as_deref(),
+        proxies.as_deref(),
     )
     .await
     {
@@ -1046,6 +1189,7 @@ mod tests {
         let mut config = crate::config::AutumnConfig::default();
         config.tenancy.enabled = true;
         config.tenancy.source = "header".to_string();
+        config.tenancy.header_trust = Some(crate::config::TenantHeaderTrust::AnyClient);
         config.tenancy.header_name = "x-tenant-id".to_string();
         config.tenancy.max_db_connections = 1;
         state.insert_extension(config);

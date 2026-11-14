@@ -75,9 +75,9 @@ fails when metering adds more than 2% to p99.
 
 ### Tenant keys
 
-The tenant key is the tenant id. With `[tenancy] source = "header"` or
-`"subdomain"`, the client chooses the id. To keep memory bounded, these ids go
-into `_other`:
+The tenant key is the tenant id. With `[tenancy] source = "subdomain"`, or
+`"header"` with `header_trust = "any_client"`, the client chooses the id. To
+keep memory bounded, these ids go into `_other`:
 
 - an id longer than 64 bytes,
 - the reserved ids `_none` and `_other`,

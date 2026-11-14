@@ -133,6 +133,7 @@ fn other_tenancy_configs_boot_in_every_build() {
     for source in ["header", "subdomain", "session"] {
         let mut config = jwt_tenancy();
         source.clone_into(&mut config.tenancy.source);
+        config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
         assert!(
             config.validate_tenancy_source().is_ok(),
             "source {source:?} needs no feature"

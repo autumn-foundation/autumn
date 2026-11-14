@@ -210,6 +210,7 @@ fn header_tenancy() -> AutumnConfig {
     config.security.csrf.enabled = false;
     config.tenancy.enabled = true;
     config.tenancy.source = "header".to_owned();
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     config.tenancy.header_name = "x-tenant-id".to_owned();
     // Admin routes span tenants, so they run without one.
     config.tenancy.public_paths = vec!["/admin".to_owned()];

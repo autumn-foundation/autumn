@@ -558,6 +558,7 @@ async fn the_resolved_tenant_is_captured_and_replayed_without_live_tenant_config
     let mut config = capture_config(dir.path());
     config.tenancy.enabled = true;
     config.tenancy.source = "header".to_owned();
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     config.tenancy.header_name = "x-tenant-id".to_owned();
     let client = TestApp::new().config(config).routes(routes![whose]).build();
 

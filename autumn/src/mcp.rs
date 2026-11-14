@@ -3475,10 +3475,11 @@ fn build_request(
     if let Some(value) = headers.get(csrf_header) {
         builder = builder.header(csrf_header, value);
     }
-    if let Some(name) = tenant_header
-        && let Some(value) = headers.get(name)
-    {
-        builder = builder.header(name, value);
+    // Every value, so the tenancy check still rejects two values.
+    if let Some(name) = tenant_header {
+        for value in headers.get_all(name) {
+            builder = builder.header(name, value);
+        }
     }
 
     let body = if tool.has_body {
@@ -4905,6 +4906,25 @@ mod tests {
         let req =
             build_request(&t, &headers, &json!({}), "x-csrf-token", None).expect("request builds");
         assert!(req.headers().get("x-tenant-id").is_none());
+    }
+
+    /// The replay keeps every tenant header value, so tenancy rejects two.
+    #[test]
+    fn build_request_forwards_every_tenant_header_value() {
+        let t = tool("GET", "/api/todos", false, false);
+        let mut headers = HeaderMap::new();
+        headers.append("x-tenant-id", "tenant-b".parse().unwrap());
+        headers.append("x-tenant-id", "tenant-a".parse().unwrap());
+        let req = build_request(
+            &t,
+            &headers,
+            &json!({}),
+            "x-csrf-token",
+            Some("x-tenant-id"),
+        )
+        .expect("request builds");
+        let values: Vec<_> = req.headers().get_all("x-tenant-id").iter().collect();
+        assert_eq!(values, ["tenant-b", "tenant-a"]);
     }
 
     #[test]
