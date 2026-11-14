@@ -390,6 +390,22 @@ it is the documented env-over-TOML precedence applied to the spelling you did
   for an unfilled slot, so they can never silently drop a fleet list configured
   in the file.
 
+> **`autumn deploy` checks these keys before it runs a command.** A remote
+> shell line, `systemctl`, `ssh` and the systemd unit file use them.
+> `autumn deploy` refuses a value that is too long or that has a character
+> that one of them can read as code:
+>
+> | Key | Characters |
+> | --- | --- |
+> | `app_name`, `service_name`, `profile` | 1 to 128 ASCII letters, digits, `_`, `.`, `-`. Start with a letter, a digit or `_`. |
+> | `user` | 1 to 64 ASCII letters, digits, `_`, `.`, `-`, `@`. Start with a letter, a digit or `_`. |
+> | `app_dir` | An absolute path of 1 to 1024 ASCII letters, digits, `/`, `_`, `.`, `-`, `+`, `@`, `:`. |
+> | `host`, `hosts` | 1 to 255 ASCII letters, digits, `_`, `.`, `-`, `:`, `%`, `[`, `]`. Do not start with `-`. |
+>
+> The check also applies to a default. If you do not set `app_name`, it comes
+> from the package name or the directory name. If that name fails the check,
+> set `app_name`. `autumn doctor` reports the same failure as `deploy_config`.
+
 Put these two values in a project `.env` (git-ignored — never committed). The
 deploy reads them and writes **only** them to a `0600` env file
 (`app_dir/shared/autumn.env`) **on the server**:

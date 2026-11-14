@@ -31,7 +31,7 @@ use autumn_web::config::DeployBakeConfig;
 use autumn_web::slo::{PPM, ROLLBACK_BURN_TENTHS, Sli, Slo, format_decimal, max_error_ppm};
 use serde::Deserialize;
 
-use super::exec::{DeployExecutor, RemoteCommand, shell_quote};
+use super::exec::{DeployExecutor, RemoteCommand, shell_quote, unit_service_word};
 
 /// The step label of a bake failure, in fleet reports.
 pub(crate) const BAKE_LABEL: &str = "bake";
@@ -327,7 +327,7 @@ pub(crate) fn sample_command(target: &BakeTarget<'_>, sleep_secs: u64) -> Remote
     let restarts = format!(
         "printf '\\n%s\\n' {} && (systemctl show -p NRestarts --value {} || true)",
         shell_quote(RESTARTS_MARKER),
-        shell_quote(&format!("{}.service", target.unit)),
+        unit_service_word(target.unit),
     );
     let shell = if sleep_secs == 0 {
         format!("{curl} && {restarts}")

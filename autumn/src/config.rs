@@ -2013,6 +2013,9 @@ pub struct DeployConfig {
     pub hosts: Vec<String>,
 
     /// SSH user to connect as. Default: `"root"`.
+    ///
+    /// Use 1 to 64 ASCII letters, digits, `_`, `.`, `-` or `@`. Start with a
+    /// letter, a digit or `_`. `autumn deploy` refuses other values.
     #[serde(default = "default_deploy_user")]
     pub user: String,
 
@@ -2023,15 +2026,25 @@ pub struct DeployConfig {
     /// Application name used to derive remote paths and the service unit.
     /// Resolved to the project's package name when unset (at deploy time, not
     /// during deserialization).
+    ///
+    /// Use 1 to 128 ASCII letters, digits, `_`, `.` or `-`. Start with a
+    /// letter, a digit or `_`. `autumn deploy` refuses other values. This check
+    /// also applies to a value from the package name or the directory name.
     #[serde(default)]
     pub app_name: Option<String>,
 
     /// Remote install directory. Resolved to `/srv/autumn/{app_name}` when
     /// unset (at deploy time).
+    ///
+    /// Use an absolute path of 1 to 1024 ASCII letters, digits, `/`, `_`, `.`,
+    /// `-`, `+`, `@` or `:`. `autumn deploy` refuses other values.
     #[serde(default)]
     pub app_dir: Option<String>,
 
     /// systemd unit name. Resolved to `{app_name}` when unset (at deploy time).
+    ///
+    /// The rules for [`app_name`](Self::app_name) apply. `autumn deploy`
+    /// refuses other values.
     #[serde(default)]
     pub service_name: Option<String>,
 
@@ -2048,6 +2061,9 @@ pub struct DeployConfig {
     /// as `AUTUMN_ENV`). Defaults to the production profile (`"prod"`) so a
     /// deploy never silently runs the `dev` profile; set to e.g. `"staging"`
     /// for non-prod targets.
+    ///
+    /// The rules for [`app_name`](Self::app_name) apply. `autumn deploy`
+    /// refuses other values.
     #[serde(default = "default_deploy_profile")]
     pub profile: String,
 
