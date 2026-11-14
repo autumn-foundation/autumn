@@ -681,19 +681,30 @@ impl<T> Page<T> {
 /// own mount path. `first` and `last` are always emitted (offset pagination
 /// always knows both bounds); `prev`/`next` only when they exist.
 fn page_link_header_value(page: u32, size: u32, total_pages: u32, has_next: bool) -> String {
-    let mut links: Vec<String> = Vec::with_capacity(4);
-    let rel = |target: u32, name: &str| format!("<?page={target}&size={size}>; rel=\"{name}\"");
-    links.push(rel(1, "first"));
+    use std::fmt::Write as _;
+
+    // One buffer for the four links: a `String` for each link and a join made
+    // seven allocations of every page response. Four links with ten-digit
+    // numbers are 191 bytes.
+    let mut links = String::with_capacity(192);
+    let mut rel = |target: u32, name: &str| {
+        if !links.is_empty() {
+            links.push_str(", ");
+        }
+        // Writing to a `String` cannot fail.
+        let _ = write!(links, "<?page={target}&size={size}>; rel=\"{name}\"");
+    };
+    rel(1, "first");
     if page > 1 {
-        links.push(rel(page - 1, "prev"));
+        rel(page - 1, "prev");
     }
     if has_next {
-        links.push(rel(page + 1, "next"));
+        rel(page + 1, "next");
     }
     // Clamp so `last` stays a valid 1-indexed page even when `total_pages` is 0.
     let last_page = total_pages.max(1);
-    links.push(rel(last_page, "last"));
-    links.join(", ")
+    rel(last_page, "last");
+    links
 }
 
 impl<T> IntoResponse for Page<T>
@@ -704,8 +715,9 @@ where
         let (page, size, total_pages, has_next) =
             (self.page, self.size, self.total_pages, self.has_next);
         let mut response = axum::Json(self).into_response();
+        // The header takes the buffer: no second copy of the text.
         if let Ok(value) =
-            HeaderValue::from_str(&page_link_header_value(page, size, total_pages, has_next))
+            HeaderValue::try_from(page_link_header_value(page, size, total_pages, has_next))
         {
             response.headers_mut().insert(header::LINK, value);
         }
@@ -2214,6 +2226,43 @@ mod tests {
         assert!(link.contains("rel=\"next\""), "{link}");
         assert!(link.contains("rel=\"first\""), "{link}");
         assert!(link.contains("rel=\"last\""), "{link}");
+    }
+
+    #[test]
+    fn the_link_header_is_the_joined_list_of_its_links() {
+        // The value a list of formatted links joined with ", " gives.
+        let joined = |page: u32, size: u32, total_pages: u32, has_next: bool| {
+            let rel =
+                |target: u32, name: &str| format!("<?page={target}&size={size}>; rel=\"{name}\"");
+            let mut links = vec![rel(1, "first")];
+            if page > 1 {
+                links.push(rel(page - 1, "prev"));
+            }
+            if has_next {
+                links.push(rel(page + 1, "next"));
+            }
+            links.push(rel(total_pages.max(1), "last"));
+            links.join(", ")
+        };
+        for (page, size, total_pages, has_next) in [
+            (1, 20, 0, false),
+            (1, 20, 1, false),
+            (1, 20, 5, true),
+            (3, 20, 5, true),
+            (5, 20, 5, false),
+            (2, 1, 2, false),
+            (u32::MAX, u32::MAX, u32::MAX, false),
+            (u32::MAX - 1, u32::MAX, u32::MAX, true),
+        ] {
+            let value = page_link_header_value(page, size, total_pages, has_next);
+            assert_eq!(value, joined(page, size, total_pages, has_next));
+            assert!(
+                value.len() <= 192,
+                "the buffer holds any page: {}",
+                value.len()
+            );
+            assert!(HeaderValue::try_from(value).is_ok());
+        }
     }
 
     #[test]
